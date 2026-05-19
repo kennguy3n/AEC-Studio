@@ -6,6 +6,7 @@
 
 import type { AecApi } from "../../../electron/preload";
 import { AI_TOOLS } from "../../../electron/ai-tools";
+import { classifyTier } from "../../../electron/bridge";
 
 interface Recent {
   projectId: string;
@@ -162,12 +163,20 @@ export function rendererInProcessBackend(): AecApi {
       buildProposalPack: async () => ({ outPath: "/exports/proposal.pdf" }),
     },
     runtime: {
+      // Derive the tier from the same `classifyTier` the production
+      // backend uses so the test fixture cannot drift away from real
+      // classifier behaviour. The fixture deliberately includes a small
+      // discrete GPU so the Medium-tier code path is exercised end-to-end.
       status: async () => ({
-        tier: "Medium" as const,
+        tier: classifyTier(
+          /* cores */ 4,
+          /* totalMemMb */ 16384,
+          /* vramMb */ 4096,
+        ),
         cpu: { model: "test-cpu", physicalCores: 4, logicalCores: 8 },
         ramTotalMb: 16384,
         ramAvailableMb: 8192,
-        gpu: null,
+        gpu: { vendor: "test-gpu", model: "test-mid", vramMb: 4096 },
         os: "test",
       }),
     },

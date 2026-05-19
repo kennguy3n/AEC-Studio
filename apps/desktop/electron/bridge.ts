@@ -449,7 +449,10 @@ function inProcessBackend(): BridgeBackend {
     },
 
     async aiListTools() {
-      return AI_TOOLS;
+      // Return a defensive copy of the catalogue so that callers can't
+      // mutate the shared `AI_TOOLS` constant. This matches the renderer
+      // backend (see `rendererInProcessBackend.ai.listTools`).
+      return AI_TOOLS.map((t) => ({ ...t }));
     },
     async aiPlan(_p) {
       return { diffId: id("diff") };

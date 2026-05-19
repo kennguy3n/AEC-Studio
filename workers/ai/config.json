@@ -1,4 +1,5 @@
 {
+  "$comment": "Sidecar (llama-server / PrismML) configuration. The tool catalogue (max_entities_modified, allowed_scopes, grammar) lives in crates/aec_ai/data/ai_tools.json and is read by both the Rust safety validator and the TypeScript bridge. The sidecar inherits those limits via `tools_source` rather than duplicating them here, so drift is impossible.",
   "name": "aec-prismml-sidecar",
   "version": "0.1.0",
   "default_model": "prismml-7b-q4_k_m.gguf",
@@ -14,19 +15,7 @@
   "idle_timeout_seconds": 60,
   "request_timeout_seconds": 120,
   "grammar_dir": "../../crates/aec_ai/src/grammars",
-  "tools": [
-    {"id": "plan_detection", "max_entities_modified": 200},
-    {"id": "style_assistant", "max_entities_modified": 50},
-    {"id": "layout_suggestion", "max_entities_modified": 80},
-    {"id": "render_doctor", "max_entities_modified": 30},
-    {"id": "cad_cleanup", "max_entities_modified": 500},
-    {"id": "plan_to_wall", "max_entities_modified": 200},
-    {"id": "schedule_fill", "max_entities_modified": 1000},
-    {"id": "classification", "max_entities_modified": 500},
-    {"id": "property_fill", "max_entities_modified": 1000},
-    {"id": "validation_help", "max_entities_modified": 0},
-    {"id": "cover_page_draft", "max_entities_modified": 5}
-  ],
+  "tools_source": "../../crates/aec_ai/data/ai_tools.json",
   "safety": {
     "deny_network": true,
     "deny_filesystem_outside_project": true

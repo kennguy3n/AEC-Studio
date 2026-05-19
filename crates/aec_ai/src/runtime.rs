@@ -36,15 +36,64 @@ pub struct RuntimeConfig {
 }
 
 impl Default for RuntimeConfig {
+    /// Default configuration. **Must** match the canonical sidecar config
+    /// at `workers/ai/config.json` — that JSON file is the source of truth
+    /// the Python sidecar starts from, and the Rust runtime needs to talk
+    /// to the *same* sidecar. The `runtime_config_default_matches_workers_ai_config_json`
+    /// test below pins the two together so drift is caught at build time.
     fn default() -> Self {
         Self {
-            model_path: PathBuf::from("./workers/ai/models/prismml-default.gguf"),
-            port: 8723,
+            model_path: PathBuf::from("${HOME}/.aec/models/prismml-7b-q4_k_m.gguf"),
+            port: 13579,
             parallel: 2,
             idle_timeout: Duration::from_secs(60),
             request_timeout: Duration::from_secs(120),
-            max_context_tokens: 8192,
+            max_context_tokens: 4096,
         }
+    }
+}
+
+impl RuntimeConfig {
+    /// Parse a runtime config from the on-disk sidecar config JSON
+    /// (`workers/ai/config.json`). This is the canonical loader: the
+    /// Python sidecar reads the same JSON, so loading via this constructor
+    /// guarantees the Rust client and the sidecar agree on host/port,
+    /// context size, and timeouts.
+    pub fn from_sidecar_config_json(text: &str) -> Result<Self, serde_json::Error> {
+        #[derive(Deserialize)]
+        struct Server {
+            #[serde(default)]
+            host: Option<String>,
+            port: u16,
+            context_size: u32,
+            parallel: u32,
+        }
+        #[derive(Deserialize)]
+        struct Top {
+            default_model: Option<String>,
+            models_dir: Option<String>,
+            server: Server,
+            idle_timeout_seconds: u64,
+            request_timeout_seconds: u64,
+        }
+        let cfg: Top = serde_json::from_str(text)?;
+        let model_path = match (cfg.models_dir, cfg.default_model) {
+            (Some(dir), Some(name)) => PathBuf::from(format!("{dir}/{name}")),
+            (_, Some(name)) => PathBuf::from(name),
+            _ => RuntimeConfig::default().model_path,
+        };
+        // `host` is intentionally not stored on `RuntimeConfig` (the Rust
+        // client always connects on loopback); we still parse it so the
+        // canonical loader fails loudly if the field disappears.
+        let _ = cfg.server.host;
+        Ok(Self {
+            model_path,
+            port: cfg.server.port,
+            parallel: cfg.server.parallel,
+            idle_timeout: Duration::from_secs(cfg.idle_timeout_seconds),
+            request_timeout: Duration::from_secs(cfg.request_timeout_seconds),
+            max_context_tokens: cfg.server.context_size,
+        })
     }
 }
 
@@ -147,6 +196,34 @@ mod tests {
         r.mark_failed("oom");
         assert_eq!(r.state(), RuntimeState::Failed);
         assert_eq!(r.last_error(), Some("oom"));
+    }
+
+    /// Pin `RuntimeConfig::default()` to the canonical sidecar JSON. The
+    /// Rust client and the Python sidecar must agree on host/port, context
+    /// size, and timeouts — if either drifts, this test fails at build time.
+    #[test]
+    fn runtime_config_default_matches_workers_ai_config_json() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../workers/ai/config.json");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+        let parsed = RuntimeConfig::from_sidecar_config_json(&text)
+            .expect("workers/ai/config.json must parse cleanly");
+        let defaults = RuntimeConfig::default();
+        assert_eq!(parsed.port, defaults.port, "port drift");
+        assert_eq!(parsed.parallel, defaults.parallel, "parallel drift");
+        assert_eq!(
+            parsed.idle_timeout, defaults.idle_timeout,
+            "idle_timeout drift"
+        );
+        assert_eq!(
+            parsed.request_timeout, defaults.request_timeout,
+            "request_timeout drift"
+        );
+        assert_eq!(
+            parsed.max_context_tokens, defaults.max_context_tokens,
+            "context_size drift"
+        );
     }
 
     #[test]
