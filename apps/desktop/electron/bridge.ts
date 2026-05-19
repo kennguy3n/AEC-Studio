@@ -17,7 +17,12 @@ import * as path from "path";
 export interface BridgeBackend {
   projectCreateFromTemplate(templateKey: string, projectName: string): Promise<ProjectSummary>;
   projectOpen(projectPath: string): Promise<ProjectSummary>;
-  projectSave(projectPath: string): Promise<{ saved: true; path: string }>;
+  /**
+   * Persist the open project's manifest and return its summary. The native
+   * N-API bridge returns a `ProjectSummary` and the in-process fallback
+   * mirrors that shape so backends are interchangeable at runtime.
+   */
+  projectSave(projectPath: string): Promise<ProjectSummary>;
   projectListRecents(): Promise<ProjectSummary[]>;
   projectExportPackage(projectPath: string, outPath: string): Promise<{ outPath: string }>;
 
@@ -181,7 +186,7 @@ function adaptNative(n: NativeApi): BridgeBackend {
     projectCreateFromTemplate: async (k, p) =>
       n.project_create_from_template(k, p) as ProjectSummary,
     projectOpen: async (p) => n.project_open(p) as ProjectSummary,
-    projectSave: async (p) => n.project_save(p) as { saved: true; path: string },
+    projectSave: async (p) => n.project_save(p) as ProjectSummary,
     projectListRecents: async () => n.project_list_recents() as ProjectSummary[],
     runtimeStatus: async () => n.runtime_status() as RuntimeStatus,
   };
@@ -230,10 +235,18 @@ function inProcessBackend(): BridgeBackend {
     },
     async projectSave(projectPath) {
       const idx = recents.findIndex((r) => r.path === projectPath);
+      const now = new Date().toISOString();
       if (idx >= 0 && recents[idx]) {
-        recents[idx].modifiedAt = new Date().toISOString();
+        recents[idx].modifiedAt = now;
+        return { ...recents[idx] };
       }
-      return { saved: true, path: projectPath };
+      return {
+        projectId: id("proj"),
+        name: path.basename(projectPath, ".aecstudio"),
+        path: projectPath,
+        templateKey: null,
+        modifiedAt: now,
+      };
     },
     async projectListRecents() {
       return [...recents];

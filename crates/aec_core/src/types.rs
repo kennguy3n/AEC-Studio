@@ -200,14 +200,21 @@ impl Units {
 
 /// Regional defaults bundle. Controls default units, sheet sizes, ANSI vs ISO
 /// drawing conventions, and BIM classification preset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// Serializes as lowercase (`"eu"`, `"na"`, `"apac"`). Template JSON files
+/// authored by humans tend to use uppercase codes (`"EU"`, `"NA"`, `"APAC"`),
+/// so the deserializer also accepts those via `#[serde(alias = ...)]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum Region {
     /// Europe (ISO sheet sizes, IFC4 default, millimeters).
+    #[serde(alias = "EU")]
     Eu,
     /// North America (ANSI sheet sizes, IFC4 default, inches/feet).
+    #[serde(alias = "NA")]
     Na,
     /// Asia-Pacific (ISO sheet sizes, millimeters).
+    #[serde(alias = "APAC")]
     Apac,
 }
 
@@ -300,5 +307,22 @@ mod tests {
             let back: Region = serde_json::from_str(&s).unwrap();
             assert_eq!(region, back);
         }
+    }
+
+    #[test]
+    fn region_deserializes_uppercase_aliases() {
+        // Shipped template JSON files use uppercase region codes.
+        assert_eq!(
+            serde_json::from_str::<Region>("\"EU\"").unwrap(),
+            Region::Eu
+        );
+        assert_eq!(
+            serde_json::from_str::<Region>("\"NA\"").unwrap(),
+            Region::Na
+        );
+        assert_eq!(
+            serde_json::from_str::<Region>("\"APAC\"").unwrap(),
+            Region::Apac
+        );
     }
 }

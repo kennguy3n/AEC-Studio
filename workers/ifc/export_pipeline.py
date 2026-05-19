@@ -17,6 +17,39 @@ from __future__ import annotations
 from typing import Any
 
 
+def _create_property_set(f: Any, ifc_module: Any, name: str, properties: dict[str, Any]) -> Any:
+    """Build a property set in a way that works against both the stub
+    `IfcStubFile` (used in CI) and a real `ifcopenshell.file`.
+
+    The stub exposes a `create_property_set(name, properties)` helper that
+    returns a lightweight dataclass. Real `ifcopenshell` doesn't expose
+    that name, so we fall back to constructing the underlying
+    `IfcPropertySet` / `IfcPropertySingleValue` entities through the
+    public `create_entity` factory.
+
+    Production code never imports stub-internal symbols — it only relies
+    on duck-typed entry points the stub deliberately exposes to mirror
+    `ifcopenshell`.
+    """
+    if hasattr(f, "create_property_set"):
+        return f.create_property_set(name, properties)
+
+    single_values = [
+        f.create_entity(
+            "IfcPropertySingleValue",
+            Name=str(key),
+            NominalValue=value,
+        )
+        for key, value in properties.items()
+    ]
+    return f.create_entity(
+        "IfcPropertySet",
+        Name=name,
+        GlobalId=ifc_module.guid_new(),
+        HasProperties=single_values,
+    )
+
+
 def export_ifc(graph: dict[str, Any], path: str) -> dict[str, Any]:
     import ifcopenshell  # type: ignore
 
@@ -106,9 +139,7 @@ def export_ifc(graph: dict[str, Any], path: str) -> dict[str, Any]:
         if container_guid:
             by_container.setdefault(container_guid, []).append(el)
         for pset_name, pset_props in (el_data.get("properties") or {}).items():
-            from _ifc_stub import _PropertySet  # type: ignore
-
-            pset = _PropertySet(name=pset_name, properties=dict(pset_props))
+            pset = _create_property_set(f, ifcopenshell, pset_name, dict(pset_props))
             f.create_relationship(
                 "IfcRelDefinesByProperties",
                 related_objects=[el],

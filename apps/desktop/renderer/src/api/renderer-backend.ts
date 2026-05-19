@@ -51,6 +51,14 @@ export function rendererInProcessBackend(): AecApi {
       vendor: "Thonet",
       thumbnailDataUri: null,
     },
+    {
+      assetId: "vendor.cafe_table_700",
+      name: "Cafe Table 700",
+      tags: ["furniture", "table", "cafe"],
+      styleTags: ["industrial"],
+      vendor: "Atelier",
+      thumbnailDataUri: null,
+    },
   ];
 
   return {
@@ -77,7 +85,21 @@ export function rendererInProcessBackend(): AecApi {
         upsert(summary);
         return summary;
       },
-      save: async (projectPath) => ({ saved: true, path: projectPath }),
+      save: async (projectPath) => {
+        const idx = recents.findIndex((r) => r.path === projectPath);
+        const now = new Date().toISOString();
+        if (idx >= 0 && recents[idx]) {
+          recents[idx].modifiedAt = now;
+          return { ...recents[idx] };
+        }
+        return {
+          projectId: newId("proj"),
+          name: projectPath.split("/").pop()?.replace(".aecstudio", "") ?? "Project",
+          path: projectPath,
+          templateKey: null,
+          modifiedAt: now,
+        };
+      },
       listRecents: async () => [...recents],
       exportPackage: async (_p, outPath) => ({ outPath }),
     },

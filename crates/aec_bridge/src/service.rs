@@ -143,7 +143,7 @@ impl BridgeService {
         let root = self.config.projects_dir.join(format!("{slug}.aecstudio"));
         let settings = ProjectSettings {
             units: template.units,
-            region: template.region_defaults,
+            region: template.primary_region(),
             ..ProjectSettings::default()
         };
         let pkg = ProjectPackage::create(
@@ -252,9 +252,15 @@ mod tests {
             "name": format!("Test {id}"),
             "description": "test fixture",
             "units": "mm",
-            "region_defaults": "eu",
+            "region_defaults": {
+                "EU": {"units": "mm", "standards": ["IFC4"]}
+            },
             "rooms": [],
-            "default_walls": [],
+            "default_walls": {
+                "exterior_thickness_mm": 250,
+                "interior_thickness_mm": 100,
+                "material": "wall_white"
+            },
             "lighting_preset": "daylight",
             "asset_shelf": [],
             "camera_presets": []

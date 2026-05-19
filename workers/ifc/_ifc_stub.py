@@ -128,6 +128,17 @@ class IfcStubFile:
         self.entities.append(e)
         return e
 
+    def create_property_set(self, name: str, properties: dict[str, Any]) -> _PropertySet:
+        """Build a property set bundle the worker can attach to elements
+        via `create_relationship("IfcRelDefinesByProperties", ...)`.
+
+        Real `ifcopenshell` returns an `IfcPropertySet` entity; the stub
+        returns a lightweight dataclass with the same `.name` /
+        `.properties` shape so production export code doesn't need to
+        branch on type.
+        """
+        return _PropertySet(name=name, properties=dict(properties))
+
     def create_relationship(self, kind: str, **payload: Any) -> Any:
         if kind == "IfcRelContainedInSpatialStructure":
             rel = _RelContains(
