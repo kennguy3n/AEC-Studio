@@ -166,6 +166,15 @@ class _ScenesCollection:
     def __getitem__(self, key: str) -> _Scene:
         return self._items[key]
 
+    def __contains__(self, key: object) -> bool:
+        return isinstance(key, str) and key in self._items
+
+    def __iter__(self):
+        return iter(self._items.values())
+
+    def __len__(self) -> int:
+        return len(self._items)
+
 
 class _Data:
     def __init__(self) -> None:

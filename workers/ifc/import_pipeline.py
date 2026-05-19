@@ -134,11 +134,37 @@ def _entity_type(el: Any) -> str:
 
 
 def _spatial_container(el: Any) -> Any | None:
-    # Find via IfcRelContainedInSpatialStructure relations. Stub stores rels
-    # in IfcStubFile.rels; real ifcopenshell exposes Element.ContainedInStructure.
+    """Return the spatial structure that contains ``el`` (storey/space/site).
+
+    Real ifcopenshell exposes the inverse relationship directly on the
+    element as ``Element.ContainedInStructure``: a list of
+    ``IfcRelContainedInSpatialStructure`` entities, each with a
+    ``RelatingStructure`` attribute pointing at the container. We prefer
+    that path because it works regardless of which file the element came
+    from and does not rely on any module-level state.
+
+    The in-process test stub (``_ifc_stub.py``) cannot easily synthesise
+    the inverse on every element, so when ``ContainedInStructure`` is
+    missing we fall back to walking ``IfcStubFile.rels`` via the stub's
+    ``_State.current`` accessor.
+    """
+    # Real ifcopenshell path — every IFC entity carries inverse relationships.
+    inverse = getattr(el, "ContainedInStructure", None)
+    if inverse:
+        first = inverse[0] if isinstance(inverse, (list, tuple)) else inverse
+        relating = getattr(first, "RelatingStructure", None)
+        if relating is None:
+            relating = getattr(first, "relating_structure", None)
+        if relating is not None:
+            return relating
+
+    # Stub fallback path — used when ifcopenshell elements don't carry the
+    # inverse (e.g. our minimal `_ifc_stub`). The stub records rels on the
+    # currently-open file via `_State.current`.
     import ifcopenshell  # type: ignore
 
-    f = ifcopenshell._State.current if hasattr(ifcopenshell, "_State") else None  # type: ignore
+    f = getattr(ifcopenshell, "_State", None)
+    f = getattr(f, "current", None) if f is not None else None
     if f is None:
         return None
     for rel in getattr(f, "rels", []):

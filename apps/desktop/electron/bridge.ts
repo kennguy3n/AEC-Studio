@@ -492,13 +492,20 @@ function inProcessBackend(): BridgeBackend {
 function inProcessRuntimeStatus(): RuntimeStatus {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const nodeOs: typeof import("os") = require("os");
-  const cpuCount = nodeOs.cpus().length;
+  const logicalCores = nodeOs.cpus().length;
   const totalMem = Math.round(nodeOs.totalmem() / (1024 * 1024));
   const freeMem = Math.round(nodeOs.freemem() / (1024 * 1024));
   const cpuModel = nodeOs.cpus()[0]?.model ?? "host-cpu";
+  // Node `os` does NOT expose physical-vs-logical CPU counts (the
+  // distinction matters for SMT/Hyper-Threading machines where the
+  // governor's tier-up gate cares about physical cores, not SMT threads).
+  // We do a best-effort platform-specific probe here so the dev-mode
+  // fallback isn't actively misleading. The real numbers come from
+  // `aec_governor`'s sysinfo-backed profiler once the native bridge loads.
+  const physicalCores = detectPhysicalCores(nodeOs) ?? logicalCores;
   return {
-    tier: classifyTier(cpuCount, totalMem, /* vramMb */ 0),
-    cpu: { model: cpuModel, physicalCores: cpuCount, logicalCores: cpuCount },
+    tier: classifyTier(logicalCores, totalMem, /* vramMb */ 0),
+    cpu: { model: cpuModel, physicalCores, logicalCores },
     ramTotalMb: totalMem,
     ramAvailableMb: freeMem,
     // Node `os` has no GPU API; the in-process fallback intentionally
@@ -508,6 +515,70 @@ function inProcessRuntimeStatus(): RuntimeStatus {
     gpu: null,
     os: process.platform,
   };
+}
+
+/**
+ * Best-effort physical-core probe for the in-process (no-native) fallback.
+ *
+ * - Linux: parse `/proc/cpuinfo` and count unique `(physical id, core id)`
+ *   pairs.
+ * - macOS: `sysctl -n hw.physicalcpu` (synchronous, tiny, returns an int).
+ * - Other platforms (incl. Windows): return `null` — the caller falls
+ *   back to logical-core count rather than reporting a fabricated number.
+ *
+ * Failures are silently ignored: this only runs in dev/test mode and
+ * must never throw out of the status RPC.
+ */
+function detectPhysicalCores(nodeOs: typeof import("os")): number | null {
+  try {
+    if (nodeOs.platform() === "linux") {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const fs: typeof import("fs") = require("fs");
+      const text = fs.readFileSync("/proc/cpuinfo", "utf8");
+      const seen = new Set<string>();
+      let block: { physical?: string; core?: string } = {};
+      for (const line of text.split("\n")) {
+        if (line.trim() === "") {
+          if (block.physical != null && block.core != null) {
+            seen.add(`${block.physical}:${block.core}`);
+          }
+          block = {};
+          continue;
+        }
+        const idx = line.indexOf(":");
+        if (idx < 0) {
+          continue;
+        }
+        const key = line.slice(0, idx).trim();
+        const val = line.slice(idx + 1).trim();
+        if (key === "physical id") {
+          block.physical = val;
+        } else if (key === "core id") {
+          block.core = val;
+        }
+      }
+      // Tail block (file ends without a trailing blank line).
+      if (block.physical != null && block.core != null) {
+        seen.add(`${block.physical}:${block.core}`);
+      }
+      return seen.size > 0 ? seen.size : null;
+    }
+    if (nodeOs.platform() === "darwin") {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const cp: typeof import("child_process") = require("child_process");
+      const raw = cp
+        .execFileSync("/usr/sbin/sysctl", ["-n", "hw.physicalcpu"], {
+          encoding: "utf8",
+          timeout: 1000,
+        })
+        .trim();
+      const n = Number.parseInt(raw, 10);
+      return Number.isFinite(n) && n > 0 ? n : null;
+    }
+  } catch {
+    return null;
+  }
+  return null;
 }
 
 /**

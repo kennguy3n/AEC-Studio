@@ -61,6 +61,22 @@ class _Entity:
             and self in rel.related_objects
         ]
 
+    @property
+    def ContainedInStructure(self) -> list["_RelContains"]:
+        """Inverse of `_RelContains` from the element side.
+
+        Real ifcopenshell exposes this as the inverse attribute on every
+        IFC entity; production code reads it to find the spatial container.
+        Mirroring it here lets the import pipeline use a single code path
+        regardless of whether the stub or the real library is in use.
+        """
+        return [
+            rel
+            for rel in _State.current.rels
+            if rel.kind == "IfcRelContainedInSpatialStructure"
+            and self in rel.related_elements
+        ]
+
 
 @dataclass
 class _PropertySet:
@@ -73,6 +89,17 @@ class _RelContains:
     kind: str
     relating_structure: _Entity
     related_elements: list[_Entity]
+
+    # Real ifcopenshell exposes IFC attributes in PascalCase. We mirror
+    # the few the worker reads so production code is identical across
+    # the stub and the real library.
+    @property
+    def RelatingStructure(self) -> _Entity:
+        return self.relating_structure
+
+    @property
+    def RelatedElements(self) -> list[_Entity]:
+        return self.related_elements
 
 
 @dataclass

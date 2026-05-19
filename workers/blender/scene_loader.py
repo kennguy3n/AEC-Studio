@@ -37,8 +37,9 @@ def load_scene(scene: dict[str, Any]) -> dict[str, Any]:
     bpy = _bpy()
     name = scene.get("scene_name", "Scene")
     # Default scene is already named "Scene" — reuse it; otherwise add a new
-    # scene to bpy.data.scenes.
-    if name in bpy.data.scenes._items:
+    # scene to bpy.data.scenes. Both real Blender's BlendDataScenes and the
+    # in-process stub support the `in` operator.
+    if name in bpy.data.scenes:
         s = bpy.data.scenes[name]
     else:
         s = bpy.data.scenes.new(name)

@@ -246,23 +246,66 @@ fn find_windows_drive_path(s: &str) -> Option<usize> {
 
 /// Return the start index of a UNC path (`\\server\share` or its
 /// forward-slash equivalent `//server/share`) inside `s`.
+///
+/// A real UNC path always has the shape `<sep><sep><host><sep><share>` —
+/// in particular there must be **another separator** between the host
+/// segment and the share name. We require all four pieces so that purely
+/// arithmetic strings like `"50//50"` (which have `//` followed by digits
+/// but no terminating separator and share) are not mistaken for a UNC
+/// path. Host segments may legally contain alphanumerics, dots, and
+/// hyphens (covers DNS names *and* IP literals like `10.0.0.5`).
 fn find_unc_path(s: &str) -> Option<usize> {
+    fn is_host_char(b: u8) -> bool {
+        let c = b as char;
+        c.is_ascii_alphanumeric() || c == '.' || c == '-'
+    }
+    fn is_share_char(b: u8) -> bool {
+        let c = b as char;
+        c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_'
+    }
+
     let bytes = s.as_bytes();
     if bytes.len() < 5 {
         return None;
     }
-    for (i, w) in bytes.windows(2).enumerate() {
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        let w = &bytes[i..i + 2];
         if w == b"\\\\" || w == b"//" {
-            // Require at least one non-slash character after the prefix
-            // so we don't trip on stray `//` in URL-stripped strings.
-            let rest = &bytes[i + 2..];
-            let host_char = rest.iter().find(|b| **b != b'/' && **b != b'\\').copied();
-            if let Some(c) = host_char {
-                if (c as char).is_ascii_alphanumeric() {
-                    return Some(i);
-                }
+            let mut j = i + 2;
+            // Skip any additional slashes so a stray `///` doesn't match —
+            // a UNC has exactly two leading separators.
+            if j < bytes.len() && (bytes[j] == b'/' || bytes[j] == b'\\') {
+                i += 1;
+                continue;
             }
+            // Host segment: ≥1 char of host-class.
+            let host_start = j;
+            while j < bytes.len() && is_host_char(bytes[j]) {
+                j += 1;
+            }
+            if j == host_start {
+                i += 1;
+                continue;
+            }
+            // Separator between host and share.
+            if j >= bytes.len() || (bytes[j] != b'/' && bytes[j] != b'\\') {
+                i += 1;
+                continue;
+            }
+            j += 1;
+            // Share segment: ≥1 char of share-class.
+            let share_start = j;
+            while j < bytes.len() && is_share_char(bytes[j]) {
+                j += 1;
+            }
+            if j == share_start {
+                i += 1;
+                continue;
+            }
+            return Some(i);
         }
+        i += 1;
     }
     None
 }
@@ -450,6 +493,15 @@ mod tests {
         assert!(find_unc_path("////").is_none());
         assert!(find_unc_path(r"\\srv\share").is_some());
         assert!(find_unc_path("//srv/share").is_some());
+        // UNC detector must require BOTH a host AND a share separated by a
+        // separator — purely arithmetic strings like "50//50" must not
+        // match, and neither should "//host" without a trailing share.
+        assert!(find_unc_path("50//50").is_none());
+        assert!(find_unc_path("ratio 50//50 split").is_none());
+        assert!(find_unc_path("//hostonly").is_none());
+        assert!(find_unc_path("//host/").is_none());
+        // Host segment must be IP-literal-friendly (digits + dots allowed).
+        assert!(find_unc_path(r"\\10.0.0.5\backups").is_some());
         // URL scheme detector must reject "://" that isn't preceded by a
         // scheme (e.g. the bare delimiter inside a free-form sentence).
         assert!(find_url_scheme("look at this :// here").is_none());
