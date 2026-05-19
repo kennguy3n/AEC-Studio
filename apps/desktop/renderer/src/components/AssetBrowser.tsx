@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { aec, AssetSummary } from "../api/aec";
 import { AssetBrowserFilters } from "./AssetBrowserFilters";
 import { AssetBrowserGrid } from "./AssetBrowserGrid";
@@ -15,18 +15,39 @@ export function AssetBrowser() {
   const [page, setPage] = useState(1);
   const pageSize = 24;
 
+  // Monotonic generation counter used to discard stale fetch results.
+  //
+  // A simple per-effect `alive` flag handles the common case where the
+  // cleanup runs before each new effect, but it is fragile against
+  // rapid filter changes / strict-mode double-fires: an in-flight
+  // promise from generation N can still resolve while the user has
+  // already moved on to generation N+2, and the closure-captured
+  // `alive` flag does not reliably express "I am the latest".
+  //
+  // Using a ref-stored counter that we increment on every fetch — and
+  // comparing it inside the resolved callback — makes the ordering
+  // explicit: only the response whose generation matches the *current*
+  // counter wins, anything older is dropped on the floor.
+  const fetchGenerationRef = useRef(0);
+
   useEffect(() => {
-    let alive = true;
     // Whenever the filter set changes, refetch AND reset to page 1 so the
     // user never lands on an empty page beyond the new result set.
     setPage(1);
+    fetchGenerationRef.current += 1;
+    const myGen = fetchGenerationRef.current;
     void aec.design
       .listAssets({ tags, styleTags, search, limit: 100 })
       .then((rows) => {
-        if (alive) setAssets(rows as AssetSummary[]);
+        // Discard if a newer fetch has started since we kicked this off.
+        if (fetchGenerationRef.current !== myGen) return;
+        setAssets(rows as AssetSummary[]);
       });
     return () => {
-      alive = false;
+      // Bumping the generation in cleanup ensures any in-flight promise
+      // from this effect run is treated as stale even if its own
+      // closure hasn't been overwritten yet.
+      fetchGenerationRef.current += 1;
     };
   }, [tags, styleTags, search]);
 

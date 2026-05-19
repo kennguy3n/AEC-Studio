@@ -99,33 +99,72 @@ impl CommandEngine {
     }
 
     /// Undo the most recently executed command.
+    ///
+    /// The journal mutation is **two-phase**: we first detach the entry
+    /// from the undo stack, then attempt to apply its inverse deltas.
+    /// Only if the deltas apply cleanly do we commit the entry to the
+    /// redo stack. If the apply fails (and the graph rolls itself back
+    /// inside [`Self::apply_deltas`]) we put the entry back on the
+    /// undo stack so the journal and the graph stay in lock-step.
+    /// Without this, an `apply_deltas` failure would silently strand the
+    /// entry on the redo stack and the next `redo` call would re-apply
+    /// changes that are already in effect.
     pub fn undo(&mut self) -> Result<CommandResult> {
-        let entry = self.journal.pop_undo().ok_or(CommandError::NothingToUndo)?;
-        let applied = self.apply_deltas(&entry.inverse)?;
+        let entry = self
+            .journal
+            .take_undo()
+            .ok_or(CommandError::NothingToUndo)?;
+        let applied = match self.apply_deltas(&entry.inverse) {
+            Ok(a) => a,
+            Err(err) => {
+                // Replay failed; graph is already rolled back inside
+                // apply_deltas. Put the entry back where it came from so
+                // a subsequent undo() retries the same operation rather
+                // than skipping ahead.
+                self.journal.restore_undo(entry);
+                return Err(err);
+            }
+        };
         let envelope = self.audit.extend(
             &entry.command_id,
             &serde_json::json!({"undo": entry.command_id.as_str()}),
         );
-        Ok(CommandResult {
-            command_id: entry.command_id,
+        let result = CommandResult {
+            command_id: entry.command_id.clone(),
             applied,
             audit: envelope,
-        })
+        };
+        self.journal.commit_undone(entry);
+        Ok(result)
     }
 
     /// Redo the most recently undone command.
+    ///
+    /// Mirrors [`Self::undo`] with two-phase journal mutation — see that
+    /// method's docs for the rationale.
     pub fn redo(&mut self) -> Result<CommandResult> {
-        let entry = self.journal.pop_redo().ok_or(CommandError::NothingToRedo)?;
-        let applied = self.apply_deltas(&entry.forward)?;
+        let entry = self
+            .journal
+            .take_redo()
+            .ok_or(CommandError::NothingToRedo)?;
+        let applied = match self.apply_deltas(&entry.forward) {
+            Ok(a) => a,
+            Err(err) => {
+                self.journal.restore_redo(entry);
+                return Err(err);
+            }
+        };
         let envelope = self.audit.extend(
             &entry.command_id,
             &serde_json::json!({"redo": entry.command_id.as_str()}),
         );
-        Ok(CommandResult {
-            command_id: entry.command_id,
+        let result = CommandResult {
+            command_id: entry.command_id.clone(),
             applied,
             audit: envelope,
-        })
+        };
+        self.journal.commit_redone(entry);
+        Ok(result)
     }
 
     /// Apply a sequence of deltas atomically. If one fails, deltas already
@@ -309,6 +348,64 @@ mod tests {
         let mut e = CommandEngine::new(Scope::Design);
         let err = e.undo().unwrap_err();
         matches!(err, CommandError::NothingToUndo);
+    }
+
+    #[test]
+    fn failed_undo_keeps_entry_on_undo_stack() {
+        // Regression test for the two-phase journal invariant:
+        // if `apply_deltas` fails during `undo()`, the journal entry must
+        // stay on the undo stack rather than being silently shunted to the
+        // redo stack.
+        let mut e = CommandEngine::new(Scope::Design);
+        let create = wall_a();
+        let wall_id = create.entity_id.clone();
+        e.execute(Command::user(CommandKind::CreateWall(create)))
+            .unwrap();
+        assert_eq!(e.undo_len(), 1);
+
+        // Externally remove the wall so the inverse delta (Delete{record})
+        // will fail with EntityNotFound when undo() replays it.
+        let record = e.graph().get(&wall_id).cloned().unwrap();
+        e.graph_mut()
+            .apply(&crate::commands::EntityDelta::Delete { record })
+            .unwrap();
+        assert_eq!(e.graph().len(), 0);
+
+        let err = e.undo().unwrap_err();
+        assert!(matches!(err, CommandError::EntityNotFound(_)));
+        // Journal stays consistent: entry is back on undo, redo is empty.
+        assert_eq!(e.undo_len(), 1);
+        assert_eq!(e.redo_len(), 0);
+    }
+
+    #[test]
+    fn failed_redo_keeps_entry_on_redo_stack() {
+        // Symmetric to `failed_undo_keeps_entry_on_undo_stack`.
+        let mut e = CommandEngine::new(Scope::Design);
+        let create = wall_a();
+        let wall_id = create.entity_id.clone();
+        e.execute(Command::user(CommandKind::CreateWall(create)))
+            .unwrap();
+        e.undo().unwrap();
+        assert_eq!(e.redo_len(), 1);
+
+        // After the undo above, the graph is empty. Externally re-creating
+        // the wall makes the forward delta (Create) fail with
+        // EntityAlreadyExists when redo() replays it.
+        let record = crate::commands::EntityRecord {
+            id: wall_id.clone(),
+            kind: "wall".into(),
+            body: serde_json::json!({"sentinel": true}),
+            parent: None,
+        };
+        e.graph_mut()
+            .apply(&crate::commands::EntityDelta::Create { record })
+            .unwrap();
+
+        let err = e.redo().unwrap_err();
+        assert!(matches!(err, CommandError::EntityAlreadyExists(_)));
+        assert_eq!(e.redo_len(), 1);
+        assert_eq!(e.undo_len(), 0);
     }
 
     #[test]

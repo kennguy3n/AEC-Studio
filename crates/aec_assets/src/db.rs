@@ -197,8 +197,16 @@ impl AssetDatabase {
     /// vendor + name + license + indexed columns; tag/style-tag filters are
     /// applied in Rust (small libraries).
     pub fn query(&self, q: &AssetQuery) -> AssetResult<Vec<AssetMetadata>> {
+        // Build a heterogeneously-typed parameter list. The earlier
+        // implementation stuffed every binding (including LIMIT) into a
+        // `Vec<String>`, which leaned on SQLite's loose type affinity to
+        // coerce `"200"` back into an integer for LIMIT. That worked but
+        // it is structurally wrong — LIMIT is an integer column in the
+        // SQL grammar and should be bound as one. We now store each
+        // binding as a boxed `ToSql` value so LIKE/vendor stay strings
+        // while LIMIT is sent as a real `i64`.
         let mut sql = String::from("SELECT * FROM assets WHERE 1=1");
-        let mut bindings: Vec<String> = Vec::new();
+        let mut bindings: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(name) = &q.name_contains {
             // Escape SQLite LIKE wildcards (`%`, `_`) and the escape
             // character itself in user input before wrapping in `%...%`.
@@ -210,19 +218,21 @@ impl AssetDatabase {
             // a query like `name_contains = "50%"` matches the literal
             // string "50%", not "fifty-anything".
             sql.push_str(" AND name LIKE ? ESCAPE '\\'");
-            bindings.push(format!("%{}%", escape_like(name)));
+            bindings.push(Box::new(format!("%{}%", escape_like(name))));
         }
         if let Some(vendor) = &q.vendor_id {
             sql.push_str(" AND vendor_id = ?");
-            bindings.push(vendor.clone());
+            bindings.push(Box::new(vendor.clone()));
         }
         sql.push_str(" ORDER BY created_at DESC LIMIT ?");
-        let limit = q.limit.unwrap_or(200);
-        bindings.push(limit.to_string());
+        // Bind LIMIT as a typed i64 — not as a String — so SQLite gets an
+        // INTEGER value, not text it has to coerce. `u32 -> i64` is
+        // lossless and avoids the platform-dependent `usize` cast.
+        let limit: i64 = i64::from(q.limit.unwrap_or(200));
+        bindings.push(Box::new(limit));
 
         let mut stmt = self.conn.prepare(&sql)?;
-        let params_iter: Vec<&dyn rusqlite::ToSql> =
-            bindings.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let params_iter: Vec<&dyn rusqlite::ToSql> = bindings.iter().map(AsRef::as_ref).collect();
         let mut rows = stmt
             .query_map(
                 rusqlite::params_from_iter(params_iter.iter().copied()),

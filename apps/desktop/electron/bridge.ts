@@ -186,7 +186,7 @@ interface NativeApi {
  * Add a method override in {@link adaptNative} and remove the corresponding
  * entry from {@link NATIVE_FALLBACK_METHODS}.
  */
-const NATIVE_WIRED_METHODS: ReadonlyArray<keyof BridgeBackend> = [
+export const NATIVE_WIRED_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   "projectCreateFromTemplate",
   "projectOpen",
   "projectSave",
@@ -284,28 +284,36 @@ function adaptNative(n: NativeApi): BridgeBackend {
     projectListRecents: async () => n.project_list_recents() as ProjectSummary[],
     runtimeStatus: async () => n.runtime_status() as RuntimeStatus,
   };
-  // Self-check: the catalogue above must reference every BridgeBackend
-  // method exactly once. This trips during development if a new method is
-  // added without updating the lists.
-  const all = new Set<string>([
+  // Self-check: the two catalogues above must, together, reference every
+  // method on the in-process backend. We throw rather than warn so a new
+  // BridgeBackend method that is forgotten in the declarations fails
+  // fast at bridge initialisation — instead of silently falling through
+  // to the in-process implementation with no debug-logging wrapper.
+  // Tests can opt out by setting `AEC_BRIDGE_SKIP_SELFCHECK=1` (used by
+  // the `bridge_self_check` test to assert this throws).
+  const declared = new Set<string>([
     ...NATIVE_WIRED_METHODS,
     ...NATIVE_FALLBACK_METHODS,
   ]);
-  for (const key of Object.keys(base)) {
-    if (!all.has(key)) {
-      // eslint-disable-next-line no-console
-      console.warn(
-        `[aec_bridge] BridgeBackend method '${key}' is not declared in ` +
-          `NATIVE_WIRED_METHODS or NATIVE_FALLBACK_METHODS — please update bridge.ts`,
-      );
-    }
+  const missing = Object.keys(base).filter((key) => !declared.has(key));
+  if (missing.length > 0 && process.env.AEC_BRIDGE_SKIP_SELFCHECK !== "1") {
+    throw new Error(
+      `[aec_bridge] BridgeBackend method(s) ${JSON.stringify(missing)} not declared ` +
+        `in NATIVE_WIRED_METHODS or NATIVE_FALLBACK_METHODS \u2014 update bridge.ts ` +
+        `so every method has an explicit wired/fallback classification.`,
+    );
   }
   return native;
 }
 
 // ----- In-process backend -----
 
-function inProcessBackend(): BridgeBackend {
+/**
+ * Build a fresh in-process {@link BridgeBackend}. Exported for tests that
+ * want to assert invariants against the full method surface without
+ * touching the module-level singleton.
+ */
+export function inProcessBackend(): BridgeBackend {
   const recents: ProjectSummary[] = [];
   let nextId = 1;
 

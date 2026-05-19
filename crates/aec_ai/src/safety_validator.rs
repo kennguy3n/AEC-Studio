@@ -157,18 +157,33 @@ fn check_string_for_exfiltration(s: &str) -> Result<(), SafetyError> {
     //
     //    Match is case-insensitive on the ASCII portion so a sneaky
     //    `/HOME/...` is still caught.
+    // Keep this list sorted by category so additions stay deliberate:
+    //   - system trees:    /etc/, /var/, /usr/, /opt/, /sys/, /proc/, /run/
+    //   - user data:       /root/, /home/, /users/, /private/
+    //   - mount points:    /mnt/, /media/   (removable drives and shares)
+    //   - scratch:         /tmp/
+    //
+    // `/run/` is included because systemd writes runtime state (sockets,
+    // pid files, keyring material) there. `/mnt/` and `/media/` are
+    // common mount points for removable drives and network shares on
+    // Linux desktop and server distros; an AI response referencing
+    // `/mnt/usb/exfil.txt` is exactly the kind of out-of-sandbox file
+    // access this gate exists to prevent.
     const POSIX_PREFIXES: &[&str] = &[
         "/etc/",
         "/var/",
         "/usr/",
         "/opt/",
+        "/sys/",
+        "/proc/",
+        "/run/",
         "/root/",
         "/home/",
         "/users/",
-        "/tmp/",
-        "/proc/",
-        "/sys/",
         "/private/",
+        "/mnt/",
+        "/media/",
+        "/tmp/",
     ];
     let lower = s.to_ascii_lowercase();
     for pat in POSIX_PREFIXES {
@@ -442,6 +457,27 @@ mod tests {
             assert!(
                 matches!(err, SafetyError::Exfiltration(_)),
                 "UNC path {unc:?} was not rejected: payload={payload}",
+            );
+        }
+    }
+
+    #[test]
+    fn check_exfiltration_blocks_mount_points_and_runtime_dirs() {
+        // Mount points (/mnt/, /media/) and the systemd runtime tree
+        // (/run/) are sensitive on Linux — exfil attempts via removable
+        // drives or runtime sockets must be rejected just like /home/.
+        for path in [
+            "/mnt/usb/exfil.txt",
+            "/MNT/USB/exfil.txt",
+            "/media/cdrom/leak",
+            "/run/user/1000/keyring",
+            "/run/secrets/api_key",
+        ] {
+            let payload = format!(r#"{{"target":"{}"}}"#, path);
+            let err = check_exfiltration(&payload).unwrap_err();
+            assert!(
+                matches!(err, SafetyError::Exfiltration(_)),
+                "sensitive prefix {path:?} was not rejected",
             );
         }
     }
