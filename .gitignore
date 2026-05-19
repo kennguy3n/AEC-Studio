@@ -16,6 +16,13 @@ apps/desktop/dist-electron/
 apps/desktop/out/
 apps/desktop/.vite/
 
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+
 # OS
 .DS_Store
 Thumbs.db
