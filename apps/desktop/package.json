@@ -11,7 +11,7 @@
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest",
-    "lint": "eslint 'renderer/src/**/*.{ts,tsx}' 'electron/**/*.ts'",
+    "lint": "eslint renderer/src electron --ext .ts,.tsx",
     "type-check": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.electron.json"
   },
   "dependencies": {
