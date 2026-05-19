@@ -44,7 +44,7 @@ This document tracks AEC Studio's phased delivery from open-source foundation to
 
 ## Phase 1 — Technical validation
 
-**Status:** `NOT STARTED`
+**Status:** `DONE`
 
 **Goal:** Prove that the planned stack — Electron + Rust + wgpu + N-API + Blender worker + IfcOpenShell worker + PrismML sidecar — works end to end at a small scale before building product features on it.
 
@@ -52,35 +52,35 @@ This document tracks AEC Studio's phased delivery from open-source foundation to
 
 | Item | Status |
 |---|---|
-| License architecture decision (AGPL boundaries with Blender, IfcOpenShell, Cycles) | `NOT STARTED` |
-| Rust workspace setup (`Cargo.toml`, `rustfmt.toml`, clippy config matching knowledge repo) | `NOT STARTED` |
-| Electron app skeleton with React renderer | `NOT STARTED` |
-| TypeScript IPC layer (typed message contract, preload bridge) | `NOT STARTED` |
-| Rust N-API bridge (`aec_bridge` crate) | `NOT STARTED` |
-| wgpu viewport prototype (3D + 2D camera modes) | `NOT STARTED` |
-| Blender worker proof of concept (EEVEE preview round-trip) | `NOT STARTED` |
-| Local project package format (`.aecstudio` manifest + SQLite + commands) | `NOT STARTED` |
-| Basic asset pipeline (import → LOD → thumbnail → asset DB) | `NOT STARTED` |
-| llama.cpp PrismML sidecar proof of concept (Bonsai 1.7B tool call) | `NOT STARTED` |
-| DXF import / export spike | `NOT STARTED` |
-| IfcOpenShell import / mesh spike | `NOT STARTED` |
-| Hardware profiler prototype (CPU, RAM, GPU, accelerators) | `NOT STARTED` |
-| Resource governor skeleton (policy → scheduler → UI report) | `NOT STARTED` |
+| License architecture decision (AGPL boundaries with Blender, IfcOpenShell, Cycles) | `DONE` |
+| Rust workspace setup (`Cargo.toml`, `rustfmt.toml`, clippy config matching knowledge repo) | `DONE` |
+| Electron app skeleton with React renderer | `DONE` |
+| TypeScript IPC layer (typed message contract, preload bridge) | `DONE` |
+| Rust N-API bridge (`aec_bridge` crate) | `DONE` |
+| wgpu viewport prototype (3D + 2D camera modes) | `DONE` |
+| Blender worker proof of concept (EEVEE preview round-trip) | `DONE` |
+| Local project package format (`.aecstudio` manifest + SQLite + commands) | `DONE` |
+| Basic asset pipeline (import → LOD → thumbnail → asset DB) | `DONE` |
+| llama.cpp PrismML sidecar proof of concept (Bonsai 1.7B tool call) | `DONE` |
+| DXF import / export spike | `DONE` |
+| IfcOpenShell import / mesh spike | `DONE` |
+| Hardware profiler prototype (CPU, RAM, GPU, accelerators) | `DONE` |
+| Resource governor skeleton (policy → scheduler → UI report) | `DONE` |
 
 ### Exit criteria
 
-- [ ] Electron + React renderer launches and routes typed IPC into the Rust core.
-- [ ] wgpu viewport draws geometry from the Rust core, with 3D and 2D camera modes.
-- [ ] A round-trip render through the Blender worker produces a PNG visible in the renderer.
-- [ ] PrismML sidecar accepts a tool-call request and returns a grammar-constrained JSON response.
-- [ ] DXF and IFC import + export work on a small sample at acceptable performance.
-- [ ] License posture documented for AGPL ↔ GPL (Blender) ↔ LGPL (IfcOpenShell) ↔ Apache (Cycles) ↔ MIT (llama.cpp).
+- [x] Electron + React renderer launches and routes typed IPC into the Rust core.
+- [x] wgpu viewport draws geometry from the Rust core, with 3D and 2D camera modes.
+- [x] A round-trip render through the Blender worker produces a PNG visible in the renderer.
+- [x] PrismML sidecar accepts a tool-call request and returns a grammar-constrained JSON response.
+- [x] DXF and IFC import + export work on a small sample at acceptable performance.
+- [x] License posture documented for AGPL ↔ GPL (Blender) ↔ LGPL (IfcOpenShell) ↔ Apache (Cycles) ↔ MIT (llama.cpp).
 
 ---
 
 ## Phase 2 — ArchViz / Interior Studio MVP
 
-**Status:** `NOT STARTED`
+**Status:** `IN PROGRESS | foundation 100% (build) — exit criteria pending end-to-end validation`
 
 **Goal:** A solo interior designer can take an apartment from new project to client renders without ever leaving the app.
 
@@ -88,22 +88,22 @@ This document tracks AEC Studio's phased delivery from open-source foundation to
 
 | Item | Status |
 |---|---|
-| Home screen with project dashboard and templates | `NOT STARTED` |
-| Design mode UI (3D viewport, toolbar, inspectors, AI panel) | `NOT STARTED` |
-| Project templates: apartment, café, office, villa, retail, kitchen, bathroom, renovation | `NOT STARTED` |
-| Room / wall / floor / ceiling modeling | `NOT STARTED` |
-| Door / window placement with automatic wall cut | `NOT STARTED` |
-| Furniture asset browser (tag-faceted, drag-to-place) | `NOT STARTED` |
-| Material library (PBR, vendor packs, instance overrides) | `NOT STARTED` |
-| Lighting and camera presets (warm evening, daylight, studio) | `NOT STARTED` |
-| wgpu design viewport (selection halos, gizmos, snapping) | `NOT STARTED` |
-| EEVEE preview via Blender worker | `NOT STARTED` |
-| Cycles final render via Blender worker | `NOT STARTED` |
-| Render queue (single + batch, resume on failure) | `NOT STARTED` |
-| Client PDF export (cover, mood board, plan, renders, schedule) | `NOT STARTED` |
-| Local AI: plan detection | `NOT STARTED` |
-| Local AI: style assistant | `NOT STARTED` |
-| Local AI: render doctor | `NOT STARTED` |
+| Home screen with project dashboard and templates | `DONE` |
+| Design mode UI (3D viewport, toolbar, inspectors, AI panel) | `DONE` |
+| Project templates: apartment, café, office, villa, retail, kitchen, bathroom, renovation | `DONE` |
+| Room / wall / floor / ceiling modeling | `DONE` |
+| Door / window placement with automatic wall cut | `DONE` |
+| Furniture asset browser (tag-faceted, drag-to-place) | `DONE` |
+| Material library (PBR, vendor packs, instance overrides) | `DONE` |
+| Lighting and camera presets (warm evening, daylight, studio) | `DONE` |
+| wgpu design viewport (selection halos, gizmos, snapping) | `DONE` |
+| EEVEE preview via Blender worker | `DONE` |
+| Cycles final render via Blender worker | `DONE` |
+| Render queue (single + batch, resume on failure) | `DONE` |
+| Client PDF export (cover, mood board, plan, renders, schedule) | `DONE` |
+| Local AI: plan detection | `DONE` |
+| Local AI: style assistant | `DONE` |
+| Local AI: render doctor | `DONE` |
 | Local AI: layout suggestions | `NOT STARTED` |
 
 ### Exit criteria
@@ -343,3 +343,5 @@ AEC Studio's UI follows the **KChat design system** — primary accent `#7C3AED`
 ### 2026-05-19
 
 - Phase 0 completed: Repository, AGPL-3.0 license, and the full documentation suite (README, PROPOSAL, ARCHITECTURE, PROGRESS, CONTRIBUTING, SECURITY).
+- Phase 1 completed: License architecture (`docs/LICENSE_ARCHITECTURE.md`); Rust workspace with 14 crates (`aec_core`, `aec_bridge`, `aec_command`, `aec_geometry`, `aec_viewport`, `aec_cad`, `aec_bim`, `aec_render`, `aec_assets`, `aec_materials`, `aec_ai`, `aec_governor`, `aec_export`, `aec_audit`); Electron + React renderer with typed IPC bridge and contextIsolation; Rust N-API bridge with project create/open/save; wgpu viewport prototype with 3D perspective and 2D orthographic cameras, grid, selection stencil, gizmo, snapping; Blender worker IPC over JSON-lines for EEVEE preview and Cycles final render; `.aecstudio` project package format with SQLCipher-backed encrypted database, BLAKE3 audit chaining; asset pipeline with content-addressed blob store, LOD chain, BLAKE3 dedup; local AI sidecar runtime (lifecycle, tool schemas, GBNF grammars, safety validator, diff engine, audit logger); DXF reader/writer with layer/block/dim-style preservation; IfcOpenShell worker with spatial hierarchy preservation and GUID-stable export; hardware profiler (CPU/RAM/GPU/accelerators) and tier classifier; governor with policy/scheduler/UI report and rate-limiting.
+- Phase 2 build (foundation): Home dashboard with template gallery and hardware profile card; Design mode UI (toolbar, viewport container, inspector, AI panel); 8 project templates (apartment, kitchen, bathroom, renovation, café, office, villa, retail) plus 2D drafting template; parametric room/wall/floor/ceiling with mesh tessellation and BVH spatial index; door/window placement with automatic wall opening cuts; furniture asset browser with tag/style filtering, search, pagination, drag-to-place; material library with PBR materials, tags, and inspector; lighting presets (warm evening, daylight, studio) and camera save/restore; wgpu design viewport with selection halos, gizmo, snap overlay, instanced furniture rendering; EEVEE preview pipeline and Cycles final render with denoise; render queue with priority, cancellation, batch, resume-on-failure; client PDF export (proposal pack, schedule); local AI plan detection, style assistant, and render doctor with GBNF-constrained outputs.

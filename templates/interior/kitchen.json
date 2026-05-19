@@ -1,0 +1,29 @@
+{
+  "template_id": "interior.kitchen",
+  "category": "interior",
+  "name": "Kitchen Studio",
+  "description": "L-shape kitchen with island, appliances, plumbing rough-in.",
+  "region_defaults": {
+    "EU": {"units": "mm", "standards": ["EN 16878", "IFC4"]},
+    "NA": {"units": "inches", "standards": ["NKBA", "IFC4"]},
+    "APAC": {"units": "mm", "standards": ["IFC4"]}
+  },
+  "units": "mm",
+  "rooms": [
+    {"name": "Kitchen", "width_mm": 5400, "depth_mm": 4200, "height_mm": 2700}
+  ],
+  "default_walls": {"exterior_thickness_mm": 250, "interior_thickness_mm": 100, "material": "wall_white"},
+  "lighting_preset": "daylight",
+  "asset_shelf": [
+    "vendor.cabinet_base_600",
+    "vendor.cabinet_wall_600",
+    "vendor.sink_double_900",
+    "vendor.cooktop_induction_60",
+    "vendor.oven_built_in_60",
+    "vendor.fridge_freezer_70",
+    "vendor.island_3000"
+  ],
+  "camera_presets": [
+    {"name": "Cook Eye", "location_mm": [1200, 2400, 1600], "target_mm": [3500, 1500, 1500], "focal_length_mm": 24}
+  ]
+}

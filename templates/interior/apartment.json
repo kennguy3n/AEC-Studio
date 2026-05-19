@@ -1,0 +1,37 @@
+{
+  "template_id": "interior.apartment",
+  "category": "interior",
+  "name": "60m\u00b2 City Apartment",
+  "description": "Living/kitchen, one bedroom, bathroom. Typical urban floorplate, sub-3.0 m ceilings, daylight from south.",
+  "region_defaults": {
+    "EU": {"units": "mm", "standards": ["EN ISO 5457", "IFC4"]},
+    "NA": {"units": "inches", "standards": ["NCS", "IFC4"]},
+    "APAC": {"units": "mm", "standards": ["IFC4"]}
+  },
+  "units": "mm",
+  "rooms": [
+    {"name": "Living/Kitchen", "width_mm": 7500, "depth_mm": 4500, "height_mm": 2700},
+    {"name": "Bedroom", "width_mm": 3800, "depth_mm": 3600, "height_mm": 2700},
+    {"name": "Bathroom", "width_mm": 2200, "depth_mm": 2400, "height_mm": 2700},
+    {"name": "Hallway", "width_mm": 1200, "depth_mm": 4000, "height_mm": 2700}
+  ],
+  "default_walls": {
+    "exterior_thickness_mm": 250,
+    "interior_thickness_mm": 100,
+    "material": "wall_white"
+  },
+  "lighting_preset": "warm_evening",
+  "asset_shelf": [
+    "ikea.sofa_kivik_3s",
+    "ikea.coffee_table_lack",
+    "muuto.armchair_outline",
+    "ikea.bed_malm_140",
+    "ikea.wardrobe_pax_2m",
+    "vendor.bathroom_vanity_60"
+  ],
+  "camera_presets": [
+    {"name": "Entry", "location_mm": [-3000, 0, 1700], "target_mm": [3000, 0, 1500], "focal_length_mm": 24},
+    {"name": "Living Wide", "location_mm": [3700, -1200, 1700], "target_mm": [3700, 4500, 1500], "focal_length_mm": 18},
+    {"name": "Bedroom", "location_mm": [-1500, -1500, 1700], "target_mm": [1500, 2000, 1500], "focal_length_mm": 28}
+  ]
+}

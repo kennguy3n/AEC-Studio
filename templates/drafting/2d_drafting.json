@@ -1,0 +1,22 @@
+{
+  "template_id": "drafting.2d_drafting",
+  "category": "drafting",
+  "name": "2D Drafting",
+  "description": "Pure 2D template. No 3D scene. Sheet-first workflow with title blocks and dim styles.",
+  "region_defaults": {
+    "EU": {"units": "mm", "standards": ["ISO 7200"]},
+    "NA": {"units": "inches", "standards": ["NCS"]},
+    "APAC": {"units": "mm", "standards": ["JIS B 0001"]}
+  },
+  "units": "mm",
+  "rooms": [],
+  "default_walls": {"exterior_thickness_mm": 250, "interior_thickness_mm": 100, "material": null},
+  "lighting_preset": null,
+  "sheet_presets": [
+    {"name": "A1 Title Block", "size_mm": [841, 594], "title_block": "iso_7200"},
+    {"name": "A3 Detail", "size_mm": [420, 297], "title_block": "iso_7200"}
+  ],
+  "dim_styles": ["arch_metric", "structural_metric"],
+  "asset_shelf": [],
+  "camera_presets": []
+}

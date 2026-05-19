@@ -1,0 +1,23 @@
+{
+  "template_id": "interior.renovation",
+  "category": "interior",
+  "name": "Renovation Overlay",
+  "description": "Existing-condition overlay with demo/keep/new layers and as-built grid.",
+  "region_defaults": {
+    "EU": {"units": "mm", "standards": ["IFC4"]},
+    "NA": {"units": "inches", "standards": ["IFC4"]},
+    "APAC": {"units": "mm", "standards": ["IFC4"]}
+  },
+  "units": "mm",
+  "rooms": [],
+  "layers": [
+    {"name": "EXISTING", "color": [200, 200, 200], "purpose": "as_built"},
+    {"name": "DEMO", "color": [220, 60, 60], "purpose": "demolition"},
+    {"name": "KEEP", "color": [60, 200, 120], "purpose": "preserve"},
+    {"name": "NEW", "color": [60, 120, 220], "purpose": "new_work"}
+  ],
+  "default_walls": {"exterior_thickness_mm": 250, "interior_thickness_mm": 100, "material": "wall_white"},
+  "lighting_preset": "daylight",
+  "asset_shelf": [],
+  "camera_presets": []
+}

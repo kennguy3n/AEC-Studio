@@ -1,0 +1,24 @@
+[package]
+name = "aec_assets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Content-addressed asset pipeline: validate, normalize, LOD, hash, persist, query."
+
+[dependencies]
+aec_core = { path = "../aec_core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+blake3 = { workspace = true }
+rusqlite = { workspace = true }
+hex = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,23 @@
+[package]
+name = "aec_export"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Client-deliverable exports: proposal PDFs, schedules, mood boards."
+
+[dependencies]
+aec_core = { path = "../aec_core" }
+aec_materials = { path = "../aec_materials" }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+printpdf = "0.7"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

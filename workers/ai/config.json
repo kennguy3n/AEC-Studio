@@ -1,0 +1,23 @@
+{
+  "$comment": "Sidecar (llama-server / PrismML) configuration. The tool catalogue (max_entities_modified, allowed_scopes, grammar) lives in crates/aec_ai/data/ai_tools.json and is read by both the Rust safety validator and the TypeScript bridge. The sidecar inherits those limits via `tools_source` rather than duplicating them here, so drift is impossible.",
+  "name": "aec-prismml-sidecar",
+  "version": "0.1.0",
+  "default_model": "prismml-7b-q4_k_m.gguf",
+  "models_dir": "${HOME}/.aec/models",
+  "server": {
+    "host": "127.0.0.1",
+    "port": 13579,
+    "context_size": 4096,
+    "parallel": 2,
+    "n_gpu_layers": 0,
+    "embedding": false
+  },
+  "idle_timeout_seconds": 60,
+  "request_timeout_seconds": 120,
+  "grammar_dir": "../../crates/aec_ai/src/grammars",
+  "tools_source": "../../crates/aec_ai/data/ai_tools.json",
+  "safety": {
+    "deny_network": true,
+    "deny_filesystem_outside_project": true
+  }
+}

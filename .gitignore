@@ -1,0 +1,40 @@
+# Rust
+/target
+**/target/
+Cargo.lock.bak
+*.rs.bk
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Electron / Vite
+apps/desktop/dist/
+apps/desktop/dist-electron/
+apps/desktop/out/
+apps/desktop/.vite/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Local-only artifacts
+*.aecstudio.bak
+*.log
+.env
+.env.local

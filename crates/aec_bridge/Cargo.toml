@@ -1,0 +1,48 @@
+[package]
+name = "aec_bridge"
+version.workspace = true
+edition.workspace = true
+# napi-derive / napi-build use the `cargo::` directive syntax that was
+# introduced in Rust 1.77, so this crate raises its own MSRV above the
+# workspace baseline of 1.75. The rest of the workspace stays at 1.75.
+rust-version = "1.77"
+license.workspace = true
+repository.workspace = true
+description = "N-API bridge exposing aec_core / aec_command / aec_render to the Electron renderer."
+build = "build.rs"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# Bridge ships *without* the N-API symbols by default so `cargo test
+# --workspace` doesn't need a Node toolchain. Enable `napi` when packaging
+# the desktop app to produce the `.node` artifact.
+default = []
+napi = ["dep:napi", "dep:napi-derive"]
+
+[dependencies]
+aec_core = { path = "../aec_core" }
+aec_audit = { path = "../aec_audit" }
+aec_command = { path = "../aec_command" }
+aec_geometry = { path = "../aec_geometry" }
+aec_assets = { path = "../aec_assets" }
+aec_render = { path = "../aec_render" }
+aec_governor = { path = "../aec_governor" }
+aec_export = { path = "../aec_export" }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+napi = { version = "2", features = ["napi8"], optional = true }
+napi-derive = { version = "2", optional = true }
+
+[build-dependencies]
+napi-build = { version = "2", optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

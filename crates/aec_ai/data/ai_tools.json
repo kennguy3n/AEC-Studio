@@ -1,0 +1,94 @@
+{
+  "$comment": "Canonical AI tool catalogue. Single source of truth for both the Rust safety validator (crates/aec_ai/src/tool_schema.rs) and the TypeScript bridge (apps/desktop/electron/bridge.ts, apps/desktop/renderer/src/api/renderer-backend.ts). The bridge test in apps/desktop/renderer/src/__tests__/ai-tools-sync.test.ts asserts every TS array entry matches the values below.",
+  "version": 1,
+  "tools": [
+    {
+      "id": "plan_detection",
+      "display_name": "Plan detection",
+      "description": "Detect walls and openings from imported plan.",
+      "allowed_scopes": ["design", "draft"],
+      "max_entities_modified": 64,
+      "grammar_key": "plan_detection"
+    },
+    {
+      "id": "plan_to_wall",
+      "display_name": "Plan \u2192 walls",
+      "description": "Convert a detected plan into parametric walls.",
+      "allowed_scopes": ["design", "draft"],
+      "max_entities_modified": 64,
+      "grammar_key": "plan_detection"
+    },
+    {
+      "id": "style_assistant",
+      "display_name": "Style assistant",
+      "description": "Propose furniture and finishes for a given style brief.",
+      "allowed_scopes": ["design"],
+      "max_entities_modified": 24,
+      "grammar_key": "style_assistant"
+    },
+    {
+      "id": "layout_suggestion",
+      "display_name": "Layout suggestion",
+      "description": "Suggest a furniture layout for a room shape.",
+      "allowed_scopes": ["design"],
+      "max_entities_modified": 16,
+      "grammar_key": "style_assistant"
+    },
+    {
+      "id": "render_doctor",
+      "display_name": "Render doctor",
+      "description": "Diagnose noise, exposure, and lighting in a render.",
+      "allowed_scopes": ["render"],
+      "max_entities_modified": 8,
+      "grammar_key": "render_doctor"
+    },
+    {
+      "id": "cad_cleanup",
+      "display_name": "CAD cleanup",
+      "description": "Clean and rationalise an imported drawing.",
+      "allowed_scopes": ["draft"],
+      "max_entities_modified": 256,
+      "grammar_key": "cad_cleanup"
+    },
+    {
+      "id": "schedule_fill",
+      "display_name": "Schedule fill",
+      "description": "Fill BIM property schedules.",
+      "allowed_scopes": ["bim", "deliver"],
+      "max_entities_modified": 128,
+      "grammar_key": "schedule_fill"
+    },
+    {
+      "id": "classification",
+      "display_name": "BIM classification",
+      "description": "Classify imported geometry into IFC entities.",
+      "allowed_scopes": ["bim"],
+      "max_entities_modified": 128,
+      "grammar_key": "classification"
+    },
+    {
+      "id": "property_fill",
+      "display_name": "BIM property fill",
+      "description": "Populate property sets on classified elements.",
+      "allowed_scopes": ["bim"],
+      "max_entities_modified": 128,
+      "grammar_key": "property_fill"
+    },
+    {
+      "id": "validation_help",
+      "display_name": "Validation helper",
+      "description": "Explain BIM validation findings.",
+      "allowed_scopes": ["bim"],
+      "max_entities_modified": 64,
+      "grammar_key": "validation_help"
+    },
+    {
+      "id": "cover_page_draft",
+      "display_name": "Cover page draft",
+      "description": "Draft a proposal pack cover page.",
+      "allowed_scopes": ["deliver"],
+      "max_entities_modified": 4,
+      "grammar_key": "cover_page_draft"
+    }
+  ]
+}

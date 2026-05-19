@@ -1,0 +1,18 @@
+[package]
+name = "aec_governor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Hardware profiler + resource governor (render/AI rate limits, thermal back-off)."
+
+[dependencies]
+aec_core = { path = "../aec_core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+sysinfo = { workspace = true }
+
+[lints]
+workspace = true
