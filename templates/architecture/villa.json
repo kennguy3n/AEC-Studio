@@ -1,0 +1,52 @@
+{
+  "template_id": "architecture.villa",
+  "category": "architecture",
+  "name": "Multi-storey Villa",
+  "description": "Three-storey single-family residence with full BIM tree.",
+  "region_defaults": {
+    "EU": {"units": "mm", "standards": ["IFC4"]},
+    "NA": {"units": "inches", "standards": ["IFC4"]},
+    "APAC": {"units": "mm", "standards": ["IFC4"]}
+  },
+  "units": "mm",
+  "storeys": [
+    {
+      "name": "Basement",
+      "elevation_mm": -2800,
+      "rooms": [
+        {"name": "Garage", "width_mm": 6000, "depth_mm": 6000, "height_mm": 2400},
+        {"name": "Storage", "width_mm": 4000, "depth_mm": 4000, "height_mm": 2400}
+      ]
+    },
+    {
+      "name": "Ground",
+      "elevation_mm": 0,
+      "rooms": [
+        {"name": "Foyer", "width_mm": 3000, "depth_mm": 4000, "height_mm": 2900},
+        {"name": "Living", "width_mm": 7500, "depth_mm": 5500, "height_mm": 2900},
+        {"name": "Kitchen", "width_mm": 5500, "depth_mm": 4200, "height_mm": 2900},
+        {"name": "Dining", "width_mm": 4500, "depth_mm": 4000, "height_mm": 2900},
+        {"name": "Powder", "width_mm": 1800, "depth_mm": 2000, "height_mm": 2900}
+      ]
+    },
+    {
+      "name": "Upper",
+      "elevation_mm": 3200,
+      "rooms": [
+        {"name": "Master", "width_mm": 5500, "depth_mm": 4500, "height_mm": 2800},
+        {"name": "Master Bath", "width_mm": 3500, "depth_mm": 3000, "height_mm": 2800},
+        {"name": "Bedroom 2", "width_mm": 4000, "depth_mm": 4000, "height_mm": 2800},
+        {"name": "Bedroom 3", "width_mm": 4000, "depth_mm": 4000, "height_mm": 2800}
+      ]
+    }
+  ],
+  "default_walls": {"exterior_thickness_mm": 350, "interior_thickness_mm": 120, "material": "wall_white"},
+  "lighting_preset": "daylight",
+  "asset_shelf": [
+    "ikea.sofa_kivik_3s", "muuto.armchair_outline", "ikea.bed_malm_180"
+  ],
+  "camera_presets": [
+    {"name": "Front Hero", "location_mm": [-8000, -6000, 1800], "target_mm": [3000, 2000, 1500], "focal_length_mm": 24},
+    {"name": "Master Bedroom", "location_mm": [-1500, 0, 1700], "target_mm": [3500, 3000, 1500], "focal_length_mm": 28}
+  ]
+}

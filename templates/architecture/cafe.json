@@ -1,0 +1,30 @@
+{
+  "template_id": "architecture.cafe",
+  "category": "architecture",
+  "name": "120m\u00b2 Caf\u00e9",
+  "description": "Counter, back-of-house, banquette and tables. Storefront opening.",
+  "region_defaults": {
+    "EU": {"units": "mm", "standards": ["EN 16282", "IFC4"]},
+    "NA": {"units": "inches", "standards": ["IBC", "IFC4"]},
+    "APAC": {"units": "mm", "standards": ["IFC4"]}
+  },
+  "units": "mm",
+  "rooms": [
+    {"name": "Front of House", "width_mm": 10000, "depth_mm": 7000, "height_mm": 3200},
+    {"name": "Counter", "width_mm": 5400, "depth_mm": 1200, "height_mm": 3200},
+    {"name": "Back of House", "width_mm": 5000, "depth_mm": 4000, "height_mm": 3200}
+  ],
+  "default_walls": {"exterior_thickness_mm": 300, "interior_thickness_mm": 100, "material": "concrete_polished"},
+  "lighting_preset": "warm_evening",
+  "asset_shelf": [
+    "vendor.counter_l_3600",
+    "vendor.espresso_machine_2g",
+    "vendor.banquette_3000",
+    "vendor.cafe_chair_thonet",
+    "vendor.cafe_table_700"
+  ],
+  "camera_presets": [
+    {"name": "Entry Hero", "location_mm": [-2500, 0, 1700], "target_mm": [6000, 0, 1500], "focal_length_mm": 20},
+    {"name": "Counter", "location_mm": [3000, 4500, 1700], "target_mm": [6000, 1200, 1500], "focal_length_mm": 28}
+  ]
+}

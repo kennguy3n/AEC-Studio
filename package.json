@@ -2,7 +2,7 @@
   "name": "aec-studio",
   "version": "0.1.0",
   "private": true,
-  "description": "Local-first open-source AEC desktop suite (design, draft, BIM, render, deliver)",
+  "description": "Local-first AEC/architecture/interior design studio (Electron + Rust)",
   "license": "AGPL-3.0",
   "workspaces": [
     "apps/desktop"
@@ -10,7 +10,7 @@
   "scripts": {
     "dev": "npm run dev --workspace=apps/desktop",
     "build": "npm run build --workspace=apps/desktop",
-    "build:native": "cargo build --release -p aec_bridge",
+    "build:native": "cargo build --release -p aec_bridge --features napi",
     "test": "npm run test:ui && npm run test:rust",
     "test:ui": "npm run test --workspace=apps/desktop",
     "test:rust": "cargo test --all",

@@ -1,0 +1,26 @@
+{
+  "template_id": "interior.bathroom",
+  "category": "interior",
+  "name": "Bathroom",
+  "description": "Bathroom with shower, vanity, WC, tiled wet areas.",
+  "region_defaults": {
+    "EU": {"units": "mm", "standards": ["EN 17210", "IFC4"]},
+    "NA": {"units": "inches", "standards": ["IPC", "IFC4"]},
+    "APAC": {"units": "mm", "standards": ["IFC4"]}
+  },
+  "units": "mm",
+  "rooms": [
+    {"name": "Bathroom", "width_mm": 2400, "depth_mm": 2800, "height_mm": 2600}
+  ],
+  "default_walls": {"exterior_thickness_mm": 200, "interior_thickness_mm": 100, "material": "tile_white"},
+  "lighting_preset": "daylight",
+  "asset_shelf": [
+    "vendor.vanity_900",
+    "vendor.wc_wall_hung",
+    "vendor.shower_walk_in",
+    "vendor.mirror_circular_600"
+  ],
+  "camera_presets": [
+    {"name": "Vanity", "location_mm": [-1000, 1400, 1600], "target_mm": [1200, 1400, 1500], "focal_length_mm": 28}
+  ]
+}

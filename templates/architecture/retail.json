@@ -1,0 +1,29 @@
+{
+  "template_id": "architecture.retail",
+  "category": "architecture",
+  "name": "Retail Storefront",
+  "description": "Boutique retail floorplate with display fixtures and signage.",
+  "region_defaults": {
+    "EU": {"units": "mm", "standards": ["IFC4"]},
+    "NA": {"units": "inches", "standards": ["IFC4"]},
+    "APAC": {"units": "mm", "standards": ["IFC4"]}
+  },
+  "units": "mm",
+  "rooms": [
+    {"name": "Showroom", "width_mm": 10000, "depth_mm": 8000, "height_mm": 3500},
+    {"name": "Fitting Rooms", "width_mm": 3000, "depth_mm": 2400, "height_mm": 3500},
+    {"name": "Stockroom", "width_mm": 4000, "depth_mm": 4000, "height_mm": 3500}
+  ],
+  "default_walls": {"exterior_thickness_mm": 300, "interior_thickness_mm": 100, "material": "wall_white"},
+  "lighting_preset": "studio",
+  "asset_shelf": [
+    "vendor.retail_table_2000",
+    "vendor.retail_rail_1800",
+    "vendor.mannequin_full",
+    "vendor.signage_brand_2400",
+    "vendor.cashwrap_2400"
+  ],
+  "camera_presets": [
+    {"name": "Storefront", "location_mm": [-3000, -2000, 1700], "target_mm": [5000, 4000, 1500], "focal_length_mm": 20}
+  ]
+}

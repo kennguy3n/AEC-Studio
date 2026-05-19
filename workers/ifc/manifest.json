@@ -1,0 +1,16 @@
+{
+  "name": "aec-ifc-worker",
+  "version": "0.1.0",
+  "ifcopenshell_min": "0.8.0",
+  "entrypoint": "aec_ifc_worker.py",
+  "capabilities": [
+    "ifc.import",
+    "ifc.export",
+    "ifc.validate"
+  ],
+  "ipc": {
+    "transport": "stdio",
+    "encoding": "utf-8",
+    "framing": "json-lines"
+  }
+}

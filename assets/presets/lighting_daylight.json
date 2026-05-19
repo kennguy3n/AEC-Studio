@@ -1,0 +1,18 @@
+{
+  "name": "daylight",
+  "category": "lighting",
+  "description": "Mid-morning overcast daylight, low colour cast. Default for marketing shots.",
+  "sun": {
+    "elevation_degrees": 45.0,
+    "azimuth_degrees": 160.0,
+    "energy": 3.5,
+    "color": [1.0, 0.98, 0.96]
+  },
+  "world": {
+    "strength": 1.0,
+    "color": [0.55, 0.65, 0.80],
+    "hdri": null
+  },
+  "interior_fills": [],
+  "white_balance_k": 5500
+}

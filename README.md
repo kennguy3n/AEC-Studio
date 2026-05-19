@@ -252,6 +252,7 @@ AGPL-3.0 — see [LICENSE](LICENSE).
 - [PROGRESS.md](PROGRESS.md) — phased delivery tracker
 - [CONTRIBUTING.md](CONTRIBUTING.md) — contribution guide
 - [SECURITY.md](SECURITY.md) — security policy
+- [docs/LICENSE_ARCHITECTURE.md](docs/LICENSE_ARCHITECTURE.md) — AGPL boundary analysis (Blender / IfcOpenShell / Cycles / llama.cpp)
 - [kennguy3n/llama.cpp@prism](https://github.com/kennguy3n/llama.cpp) — local AI inference
 - [kennguy3n/IfcOpenShell](https://github.com/kennguy3n/IfcOpenShell) — BIM/IFC engine
 - [kennguy3n/cycles](https://github.com/kennguy3n/cycles) — path-traced renderer

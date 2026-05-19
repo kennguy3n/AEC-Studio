@@ -1,0 +1,64 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: var(--aec-font-sans);
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--aec-color-text-primary);
+  background: var(--aec-color-bg);
+  -webkit-font-smoothing: antialiased;
+}
+
+.app-shell {
+  display: grid;
+  grid-template-columns: var(--aec-mode-rail-width) 1fr;
+  grid-template-rows: 1fr var(--aec-status-bar-height);
+  grid-template-areas:
+    "rail main"
+    "status status";
+  height: 100vh;
+  width: 100vw;
+}
+
+.app-main {
+  grid-area: main;
+  overflow: auto;
+  padding: var(--aec-space-5);
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  margin: 0;
+  font-weight: 600;
+  color: var(--aec-color-text-primary);
+}
+
+a {
+  color: var(--aec-color-accent);
+  text-decoration: none;
+}
+
+button {
+  font: inherit;
+  cursor: pointer;
+}
+
+input,
+textarea,
+select {
+  font: inherit;
+}

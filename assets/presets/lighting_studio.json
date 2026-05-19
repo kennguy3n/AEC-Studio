@@ -1,0 +1,20 @@
+{
+  "name": "studio",
+  "category": "lighting",
+  "description": "Three-point studio setup for retail and product hero shots.",
+  "sun": null,
+  "world": {
+    "strength": 0.05,
+    "color": [0.0, 0.0, 0.0],
+    "hdri": null
+  },
+  "interior_fills": [
+    {"name": "Key", "type": "AREA", "energy": 800.0, "color": [1.0, 0.97, 0.94],
+     "position_mm": [-3000, -2500, 2400], "size_mm": [1500, 1500], "softbox": true},
+    {"name": "Fill", "type": "AREA", "energy": 300.0, "color": [1.0, 0.97, 0.94],
+     "position_mm": [3000, -2500, 2400], "size_mm": [2400, 2400], "softbox": true},
+    {"name": "Rim", "type": "SPOT", "energy": 200.0, "color": [1.0, 1.0, 1.0],
+     "position_mm": [0, 3000, 2800], "spot_size_degrees": 30.0}
+  ],
+  "white_balance_k": 5200
+}

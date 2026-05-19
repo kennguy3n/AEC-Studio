@@ -1,0 +1,23 @@
+{
+  "name": "warm_evening",
+  "category": "lighting",
+  "description": "Low golden sun + warm interior fill. Suitable for hero living-room shots.",
+  "sun": {
+    "elevation_degrees": 7.0,
+    "azimuth_degrees": 240.0,
+    "energy": 0.4,
+    "color": [1.0, 0.62, 0.32]
+  },
+  "world": {
+    "strength": 0.12,
+    "color": [0.05, 0.05, 0.08],
+    "hdri": null
+  },
+  "interior_fills": [
+    {"name": "Warm Sconce Left", "type": "AREA", "energy": 60.0, "color": [1.0, 0.78, 0.50],
+     "position_mm": [1200, 1800, 1900], "size_mm": [400, 200]},
+    {"name": "Floor Lamp Right", "type": "POINT", "energy": 50.0, "color": [1.0, 0.82, 0.55],
+     "position_mm": [4200, 1200, 1500]}
+  ],
+  "white_balance_k": 3200
+}

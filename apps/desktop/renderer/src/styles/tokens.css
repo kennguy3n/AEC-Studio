@@ -1,0 +1,73 @@
+/**
+ * KChat design tokens. Pulled directly from PROPOSAL.md.
+ * Primary accent #7C3AED, Inter font, white / lavender surfaces,
+ * pill buttons with 12 px radius, subtle shadows.
+ */
+
+:root {
+  /* Brand */
+  --aec-color-accent: #7c3aed;
+  --aec-color-accent-strong: #6d28d9;
+  --aec-color-accent-soft: rgba(124, 58, 237, 0.12);
+  --aec-color-accent-on: #ffffff;
+
+  /* Surfaces */
+  --aec-color-bg: #f8f7fb;
+  --aec-color-bg-elevated: #ffffff;
+  --aec-color-surface: #ffffff;
+  --aec-color-surface-muted: #f3f0fb;
+  --aec-color-surface-rail: #faf8ff;
+
+  /* Text */
+  --aec-color-text-primary: #1f1b2d;
+  --aec-color-text-secondary: #5a566b;
+  --aec-color-text-muted: #8c879d;
+  --aec-color-text-inverse: #ffffff;
+
+  /* Borders */
+  --aec-color-border: #e6e1f1;
+  --aec-color-border-strong: #cdc4e3;
+
+  /* Status */
+  --aec-color-success: #14a44d;
+  --aec-color-warning: #f59f00;
+  --aec-color-danger: #d92d20;
+  --aec-color-info: #2f80ed;
+
+  /* Typography */
+  --aec-font-sans:
+    "Inter",
+    -apple-system,
+    "Segoe UI",
+    Roboto,
+    sans-serif;
+  --aec-font-mono:
+    "JetBrains Mono",
+    ui-monospace,
+    "SF Mono",
+    monospace;
+
+  /* Radii */
+  --aec-radius-sm: 6px;
+  --aec-radius-md: 12px;
+  --aec-radius-lg: 18px;
+  --aec-radius-pill: 999px;
+
+  /* Spacing */
+  --aec-space-1: 4px;
+  --aec-space-2: 8px;
+  --aec-space-3: 12px;
+  --aec-space-4: 16px;
+  --aec-space-5: 24px;
+  --aec-space-6: 32px;
+  --aec-space-7: 48px;
+
+  /* Shadows */
+  --aec-shadow-sm: 0 1px 2px rgba(31, 27, 45, 0.05);
+  --aec-shadow-md: 0 4px 10px rgba(31, 27, 45, 0.08);
+  --aec-shadow-lg: 0 12px 24px rgba(31, 27, 45, 0.12);
+
+  /* Mode rail */
+  --aec-mode-rail-width: 80px;
+  --aec-status-bar-height: 32px;
+}

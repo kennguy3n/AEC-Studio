@@ -1,0 +1,30 @@
+{
+  "template_id": "architecture.office",
+  "category": "architecture",
+  "name": "Workplace Floor",
+  "description": "Open workstations, meeting rooms, phone booths, kitchenette.",
+  "region_defaults": {
+    "EU": {"units": "mm", "standards": ["IFC4"]},
+    "NA": {"units": "inches", "standards": ["IFC4"]},
+    "APAC": {"units": "mm", "standards": ["IFC4"]}
+  },
+  "units": "mm",
+  "rooms": [
+    {"name": "Open Office", "width_mm": 18000, "depth_mm": 12000, "height_mm": 3000},
+    {"name": "Meeting 6p", "width_mm": 4000, "depth_mm": 3000, "height_mm": 3000},
+    {"name": "Phone Booth", "width_mm": 1200, "depth_mm": 1800, "height_mm": 2400},
+    {"name": "Kitchenette", "width_mm": 3500, "depth_mm": 3000, "height_mm": 3000}
+  ],
+  "default_walls": {"exterior_thickness_mm": 250, "interior_thickness_mm": 100, "material": "wall_white"},
+  "lighting_preset": "daylight",
+  "asset_shelf": [
+    "vendor.workstation_1400",
+    "vendor.task_chair_aeron",
+    "vendor.meeting_table_2400",
+    "vendor.phone_booth_acoustic",
+    "vendor.kitchen_cabinet_2400"
+  ],
+  "camera_presets": [
+    {"name": "Open Office Wide", "location_mm": [-2000, -2000, 1700], "target_mm": [12000, 6000, 1500], "focal_length_mm": 18}
+  ]
+}
