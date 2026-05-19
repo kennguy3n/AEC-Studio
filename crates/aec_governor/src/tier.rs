@@ -18,12 +18,27 @@ pub enum HardwareTier {
 }
 
 impl HardwareTier {
+    /// Lowercase identifier used for serde / log lines / CLI output.
+    /// Matches the `serde(rename_all = "snake_case")` representation.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
             Self::Pro => "pro",
+        }
+    }
+
+    /// PascalCase label used for UI surfaces (status bar, CSS class names,
+    /// the TypeScript `RuntimeStatus["tier"]` union, etc.). Keep this in
+    /// lockstep with `apps/desktop/electron/bridge.ts` `RuntimeStatus["tier"]`
+    /// and the `is-tier-*` CSS classes in `renderer/src/styles/components.css`.
+    pub fn display(self) -> &'static str {
+        match self {
+            Self::Low => "Low",
+            Self::Medium => "Medium",
+            Self::High => "High",
+            Self::Pro => "Pro",
         }
     }
 

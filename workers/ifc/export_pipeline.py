@@ -17,6 +17,42 @@ from __future__ import annotations
 from typing import Any
 
 
+def _wrap_nominal_value(f: Any, value: Any) -> Any:
+    """Wrap a Python value in the appropriate IFC simple-type entity for
+    ``IfcPropertySingleValue.NominalValue``.
+
+    Real ifcopenshell expects ``NominalValue`` to be an IFC value entity
+    (``IfcBoolean``, ``IfcInteger``, ``IfcReal``, ``IfcLabel`` / ``IfcText``)
+    rather than a raw Python ``bool`` / ``int`` / ``float`` / ``str``.
+    Passing a raw value works against our minimal stub but produces a
+    malformed IFC at write time on the real library — the property reads
+    back as ``None``. We map Python types to IFC value types here so the
+    same export code path produces a correct IFC file in both worlds.
+
+    Mapping:
+
+    * ``bool``                       -> ``IfcBoolean``
+    * ``int``                        -> ``IfcInteger``
+    * ``float``                      -> ``IfcReal``
+    * ``str`` (<= 255 chars)         -> ``IfcLabel``
+    * ``str`` (> 255 chars)          -> ``IfcText``
+    * anything else                  -> ``IfcLabel`` of ``str(value)``
+    """
+    # ``bool`` is a subclass of ``int`` in Python; check it first so we
+    # don't route ``True`` through the integer branch.
+    if isinstance(value, bool):
+        return f.create_entity("IfcBoolean", value)
+    if isinstance(value, int):
+        return f.create_entity("IfcInteger", value)
+    if isinstance(value, float):
+        return f.create_entity("IfcReal", value)
+    if isinstance(value, str):
+        # IFC label is limited to 255 chars; longer strings must use IfcText.
+        return f.create_entity("IfcText" if len(value) > 255 else "IfcLabel", value)
+    # Last-resort: stringify so the export still completes deterministically.
+    return f.create_entity("IfcLabel", str(value))
+
+
 def _create_property_set(f: Any, ifc_module: Any, name: str, properties: dict[str, Any]) -> Any:
     """Build a property set in a way that works against both the stub
     `IfcStubFile` (used in CI) and a real `ifcopenshell.file`.
@@ -25,9 +61,11 @@ def _create_property_set(f: Any, ifc_module: Any, name: str, properties: dict[st
     returns a lightweight dataclass. Real `ifcopenshell` doesn't expose
     that name, so we fall back to constructing the underlying
     `IfcPropertySet` / `IfcPropertySingleValue` entities through the
-    public `create_entity` factory.
+    public `create_entity` factory. In that path we wrap each Python
+    value with the appropriate IFC simple-type entity for
+    ``NominalValue`` -- see ``_wrap_nominal_value``.
 
-    Production code never imports stub-internal symbols — it only relies
+    Production code never imports stub-internal symbols -- it only relies
     on duck-typed entry points the stub deliberately exposes to mirror
     `ifcopenshell`.
     """
@@ -38,7 +76,7 @@ def _create_property_set(f: Any, ifc_module: Any, name: str, properties: dict[st
         f.create_entity(
             "IfcPropertySingleValue",
             Name=str(key),
-            NominalValue=value,
+            NominalValue=_wrap_nominal_value(f, value),
         )
         for key, value in properties.items()
     ]

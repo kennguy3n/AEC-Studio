@@ -83,6 +83,13 @@ class _PropertySet:
     name: str
     properties: dict[str, Any] = field(default_factory=dict)
 
+    # Real ifcopenshell exposes the IFC attribute as PascalCase
+    # ``Name``. Mirror it so production code that reads ``pset.Name`` works
+    # against the stub too.
+    @property
+    def Name(self) -> str:
+        return self.name
+
 
 @dataclass
 class _RelContains:
@@ -108,12 +115,33 @@ class _RelAggregates:
     relating_object: _Entity
     related_objects: list[_Entity]
 
+    # Mirror real ifcopenshell, which exposes IFC attributes in PascalCase
+    # (the schema-canonical form). Production import code reads `.RelatingObject`
+    # / `.RelatedObjects`; the stub exposes both spellings so the same code
+    # path works against the stub in CI and the real library in production.
+    @property
+    def RelatingObject(self) -> _Entity:
+        return self.relating_object
+
+    @property
+    def RelatedObjects(self) -> list[_Entity]:
+        return self.related_objects
+
 
 @dataclass
 class _RelDefinesByProperties:
     kind: str
     related_objects: list[_Entity]
     relating_property_definition: _PropertySet
+
+    # PascalCase aliases for parity with real ifcopenshell.
+    @property
+    def RelatedObjects(self) -> list[_Entity]:
+        return self.related_objects
+
+    @property
+    def RelatingPropertyDefinition(self) -> _PropertySet:
+        return self.relating_property_definition
 
 
 class _State:

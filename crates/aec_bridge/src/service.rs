@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -13,7 +14,7 @@ use aec_core::config::ProjectSettings;
 use aec_core::package::{ProjectPackage, ProjectSummary as CoreProjectSummary};
 use aec_core::templates::TemplateLoader;
 use aec_core::types::ProjectId;
-use aec_governor::profiler::{GpuProfile, HardwareProfiler};
+use aec_governor::profiler::{CpuProfile, GpuProfile, HardwareProfiler};
 use aec_governor::tier::HardwareTier;
 
 use crate::recents::{RecentsStore, RecentsStoreError};
@@ -48,6 +49,12 @@ pub struct ProjectSummary {
     pub project_id: ProjectId,
     pub name: String,
     pub path: String,
+    /// Last-write timestamp from the manifest. The N-API layer renders
+    /// this as ISO-8601 and the TypeScript `ProjectSummary.modifiedAt`
+    /// field consumes it directly. Carrying it through the service layer
+    /// (instead of resynthesising it in the bridge) is what lets the
+    /// recents list show a real timestamp on Home/dashboard tiles.
+    pub updated_at: DateTime<Utc>,
     pub template_id: Option<String>,
 }
 
@@ -57,19 +64,28 @@ impl From<CoreProjectSummary> for ProjectSummary {
             project_id: s.project_id,
             name: s.name,
             path: s.path,
+            updated_at: s.updated_at,
             template_id: s.template_id,
         }
     }
 }
 
+/// Hardware-status snapshot. The shape mirrors the TypeScript
+/// `RuntimeStatus` interface in `apps/desktop/electron/bridge.ts` so that
+/// the JS bridge can hand the value to React components without a runtime
+/// transformation. The N-API layer turns this struct into a JS object with
+/// nested `cpu`/`gpu` fields and a PascalCase `tier` string.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RuntimeStatusReport {
     pub tier: HardwareTier,
-    pub cpu_model: String,
-    pub physical_cores: u32,
-    pub total_ram_gb: f32,
-    pub gpu_vendor: Option<String>,
-    pub gpu_model: Option<String>,
+    pub cpu: CpuProfile,
+    pub total_ram_mb: u64,
+    pub available_ram_mb: u64,
+    /// `None` when the bridge runs outside Electron (e.g. CLI tools, the
+    /// Vitest fallback path). The Electron main process owns the wgpu
+    /// instance and supplies the real GPU descriptor via
+    /// [`BridgeService::runtime_status_with_gpu`].
+    pub gpu: Option<GpuProfile>,
     pub os: String,
 }
 
@@ -185,6 +201,13 @@ impl BridgeService {
                 project_id: e.project_id.clone(),
                 name: e.name.clone(),
                 path: e.path.clone(),
+                // Recents tracks the last-opened moment rather than the
+                // manifest's `updated_at`. For the Home page "recent
+                // projects" tiles the user-perceived freshness is when
+                // they last touched it, so use that here. If/when the
+                // recents store grows a separate `updated_at` field we
+                // can prefer it.
+                updated_at: e.last_opened_at,
                 template_id: None,
             })
             .collect())
@@ -192,27 +215,46 @@ impl BridgeService {
 
     /// Snapshot of the host hardware. Read fresh each call so the status
     /// bar reflects current OS-level state.
+    ///
+    /// GPU detection lives in the Electron main process (which owns the
+    /// wgpu instance). When the bridge runs outside Electron — e.g. from
+    /// CLI tools, unit tests, or the Vitest fallback — we report `None`
+    /// for `gpu` rather than fabricating a "software" placeholder.
+    /// Callers that DO have a GPU descriptor should use
+    /// [`Self::runtime_status_with_gpu`] instead.
     pub fn runtime_status(&self) -> RuntimeStatusReport {
+        Self::runtime_status_impl(None)
+    }
+
+    /// Same as [`Self::runtime_status`] but with a caller-supplied GPU
+    /// descriptor. The Electron main process calls this with the wgpu
+    /// adapter info it already has, avoiding a second probe.
+    pub fn runtime_status_with_gpu(&self, gpu: GpuProfile) -> RuntimeStatusReport {
+        Self::runtime_status_impl(Some(gpu))
+    }
+
+    fn runtime_status_impl(gpu_hint: Option<GpuProfile>) -> RuntimeStatusReport {
         let mut p = HardwareProfiler::new();
-        // GPU detection lives in the Electron main process (which owns the
-        // wgpu instance); when the bridge is invoked outside Electron we
-        // fall back to a "software" GPU descriptor.
-        let gpu = GpuProfile {
+        // The profiler insists on receiving a GPU descriptor so that the
+        // classifier can read it back. When the bridge has none we feed
+        // a `vram_mb: 0` software placeholder for tier classification
+        // ONLY and then drop it from the report so the JS side sees a
+        // proper `null` gpu (not a misleading software fake).
+        let gpu_for_profile = gpu_hint.clone().unwrap_or_else(|| GpuProfile {
             vendor: "software".into(),
             model: "software".into(),
             vram_mb: 0,
             backend: "software".into(),
             accelerators: Vec::new(),
-        };
-        let profile = p.profile(gpu);
+        });
+        let profile = p.profile(gpu_for_profile);
         let tier = HardwareTier::classify(&profile);
         RuntimeStatusReport {
             tier,
-            cpu_model: profile.cpu.model.clone(),
-            physical_cores: profile.cpu.physical_cores,
-            total_ram_gb: (profile.total_ram_mb as f32) / 1024.0,
-            gpu_vendor: Some(profile.gpu.vendor.clone()),
-            gpu_model: Some(profile.gpu.model.clone()),
+            cpu: profile.cpu.clone(),
+            total_ram_mb: profile.total_ram_mb,
+            available_ram_mb: profile.available_ram_mb,
+            gpu: gpu_hint,
             os: profile.os.clone(),
         }
     }
@@ -318,8 +360,26 @@ mod tests {
     fn runtime_status_returns_finite_values() {
         let (s, _g) = service();
         let r = s.runtime_status();
-        assert!(r.total_ram_gb > 0.0);
-        assert!(r.physical_cores > 0);
+        assert!(r.total_ram_mb > 0);
+        assert!(r.cpu.physical_cores > 0);
+        // Outside Electron the bridge has no wgpu adapter; gpu must be
+        // None rather than a misleading "software" placeholder.
+        assert!(r.gpu.is_none());
+    }
+
+    #[test]
+    fn runtime_status_with_gpu_carries_descriptor_through() {
+        let (s, _g) = service();
+        let gpu = GpuProfile {
+            vendor: "TestCorp".into(),
+            model: "TestGPU".into(),
+            vram_mb: 8192,
+            backend: "vulkan".into(),
+            accelerators: vec!["vulkan".into()],
+        };
+        let r = s.runtime_status_with_gpu(gpu.clone());
+        assert_eq!(r.gpu.as_ref().unwrap().vram_mb, 8192);
+        assert_eq!(r.gpu.as_ref().unwrap().vendor, "TestCorp");
     }
 
     #[test]

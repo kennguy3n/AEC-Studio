@@ -90,7 +90,7 @@ def _serialise_storey(storey: Any) -> dict[str, Any]:
     contained = []
     if hasattr(storey, "ContainsElements"):
         for rel in storey.ContainsElements:
-            for el in rel.related_elements:
+            for el in _related_elements(rel):
                 contained.append(_gid(el))
     return {
         "guid": _gid(storey),
@@ -105,7 +105,7 @@ def _aggregated(entity: Any) -> list[Any]:
         return []
     out: list[Any] = []
     for rel in entity.IsDecomposedBy:
-        out.extend(rel.related_objects)
+        out.extend(_related_objects(rel))
     return out
 
 
@@ -168,7 +168,7 @@ def _spatial_container(el: Any) -> Any | None:
     if f is None:
         return None
     for rel in getattr(f, "rels", []):
-        if rel.kind == "IfcRelContainedInSpatialStructure" and el in rel.related_elements:
+        if rel.kind == "IfcRelContainedInSpatialStructure" and el in _related_elements(rel):
             return rel.relating_structure
     return None
 
@@ -178,11 +178,42 @@ def _properties(el: Any) -> dict[str, dict[str, Any]]:
     if not hasattr(el, "IsDefinedBy"):
         return out
     for rel in el.IsDefinedBy:
-        pset = getattr(rel, "relating_property_definition", None)
+        pset = _relating_property_definition(rel)
         if pset is None:
             continue
-        out[pset.name] = dict(pset.properties)
+        out[_name(pset)] = dict(getattr(pset, "properties", {}))
     return out
+
+
+# --- Cross-version attribute accessors ---
+#
+# Real ifcopenshell exposes IFC attributes in the schema-canonical PascalCase
+# (``rel.RelatedElements``, ``rel.RelatedObjects``,
+# ``rel.RelatingPropertyDefinition``). Older versions and our in-process stub
+# may also expose snake_case aliases (``related_elements`` etc.). The worker
+# is responsible for being source-compatible with both, so all relationship
+# attribute access goes through these helpers.
+
+
+def _related_elements(rel: Any) -> list[Any]:
+    value = getattr(rel, "RelatedElements", None)
+    if value is None:
+        value = getattr(rel, "related_elements", None)
+    return list(value) if value is not None else []
+
+
+def _related_objects(rel: Any) -> list[Any]:
+    value = getattr(rel, "RelatedObjects", None)
+    if value is None:
+        value = getattr(rel, "related_objects", None)
+    return list(value) if value is not None else []
+
+
+def _relating_property_definition(rel: Any) -> Any | None:
+    pset = getattr(rel, "RelatingPropertyDefinition", None)
+    if pset is None:
+        pset = getattr(rel, "relating_property_definition", None)
+    return pset
 
 
 def _first(seq: list[Any]) -> Any | None:

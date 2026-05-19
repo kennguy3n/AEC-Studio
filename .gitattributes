@@ -39,7 +39,7 @@ Makefile   text eol=lf
 *.exe      binary
 *.node     binary
 *.wasm     binary
-*.gltf     binary
+*.gltf     text eol=lf
 *.glb      binary
 *.fbx      binary
 *.dxf      binary
