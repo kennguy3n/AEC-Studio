@@ -1,0 +1,13 @@
+[package]
+name = "aec_viewport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Placeholder while aec_viewport is being implemented."
+
+[dependencies]
+
+[lints]
+workspace = true

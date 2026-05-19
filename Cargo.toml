@@ -1,0 +1,76 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/aec_core",
+    "crates/aec_bridge",
+    "crates/aec_command",
+    "crates/aec_geometry",
+    "crates/aec_viewport",
+    "crates/aec_cad",
+    "crates/aec_bim",
+    "crates/aec_render",
+    "crates/aec_assets",
+    "crates/aec_materials",
+    "crates/aec_ai",
+    "crates/aec_governor",
+    "crates/aec_export",
+    "crates/aec_audit",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "AGPL-3.0"
+repository = "https://github.com/kennguy3n/AEC-Studio"
+
+[workspace.dependencies]
+thiserror = "1"
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
+blake3 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+tempfile = "3"
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+sysinfo = { version = "0.31", default-features = false, features = ["system"] }
+glam = { version = "0.27", features = ["serde"] }
+napi = { version = "2", features = ["napi8", "serde-json"] }
+napi-derive = "2"
+hex = "0.4"
+printpdf = "0.7"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+similar_names = "allow"
+too_many_lines = "allow"
+return_self_not_must_use = "allow"
+needless_pass_by_value = "allow"
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+cast_lossless = "allow"
+cast_precision_loss = "allow"
+float_cmp = "allow"
+doc_markdown = "allow"
+struct_excessive_bools = "allow"
+multiple_crate_versions = "allow"
+ignored_unit_patterns = "allow"
+explicit_iter_loop = "allow"
+needless_raw_string_hashes = "allow"
+type_complexity = "allow"
+single_match = "allow"
+items_after_statements = "allow"
+unreadable_literal = "allow"
+uninlined_format_args = "allow"
+needless_continue = "allow"
+match_same_arms = "allow"
