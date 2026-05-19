@@ -61,10 +61,25 @@ export function registerIpcHandlers(): void {
   });
 
   // ----- Draft -----
-  ipcMain.handle("draft:drawPrimitive", async (_e, p) => getBridge().draftDrawPrimitive(p));
-  ipcMain.handle("draft:editTool", async (_e, p) => getBridge().draftEditTool(p));
-  ipcMain.handle("draft:createSheet", async (_e, p) => getBridge().draftCreateSheet(p));
-  ipcMain.handle("draft:setLayerState", async (_e, p) => getBridge().draftSetLayerState(p));
+  // Same object-shape validation as the Design handlers above. We don't
+  // want one renderer-side bug to send `undefined` / a number across the
+  // IPC boundary into the native bridge.
+  ipcMain.handle("draft:drawPrimitive", async (_e, p) => {
+    assertObject(p, "params");
+    return getBridge().draftDrawPrimitive(p);
+  });
+  ipcMain.handle("draft:editTool", async (_e, p) => {
+    assertObject(p, "params");
+    return getBridge().draftEditTool(p);
+  });
+  ipcMain.handle("draft:createSheet", async (_e, p) => {
+    assertObject(p, "params");
+    return getBridge().draftCreateSheet(p);
+  });
+  ipcMain.handle("draft:setLayerState", async (_e, p) => {
+    assertObject(p, "params");
+    return getBridge().draftSetLayerState(p);
+  });
   ipcMain.handle("draft:importDxf", async (_e, { path }) => {
     assertString(path, "path");
     return getBridge().draftImportDxf(path);
@@ -83,11 +98,23 @@ export function registerIpcHandlers(): void {
     assertString(path, "path");
     return getBridge().bimExportIfc(path);
   });
-  ipcMain.handle("bim:classify", async (_e, p) => getBridge().bimClassify(p));
-  ipcMain.handle("bim:setProperty", async (_e, p) => getBridge().bimSetProperty(p));
-  ipcMain.handle("bim:generateSchedule", async (_e, p) => getBridge().bimGenerateSchedule(p));
+  ipcMain.handle("bim:classify", async (_e, p) => {
+    assertObject(p, "params");
+    return getBridge().bimClassify(p);
+  });
+  ipcMain.handle("bim:setProperty", async (_e, p) => {
+    assertObject(p, "params");
+    return getBridge().bimSetProperty(p);
+  });
+  ipcMain.handle("bim:generateSchedule", async (_e, p) => {
+    assertObject(p, "params");
+    return getBridge().bimGenerateSchedule(p);
+  });
   ipcMain.handle("bim:validate", async () => getBridge().bimValidate());
-  ipcMain.handle("bim:diff", async (_e, p) => getBridge().bimDiff(p));
+  ipcMain.handle("bim:diff", async (_e, p) => {
+    assertObject(p, "params");
+    return getBridge().bimDiff(p);
+  });
 
   // ----- Render -----
   ipcMain.handle("render:enqueueRender", async (_e, p) => {
@@ -99,7 +126,10 @@ export function registerIpcHandlers(): void {
     assertString(jobId, "jobId");
     return getBridge().renderCancelJob(jobId);
   });
-  ipcMain.handle("render:applyPreset", async (_e, p) => getBridge().renderApplyPreset(p));
+  ipcMain.handle("render:applyPreset", async (_e, p) => {
+    assertObject(p, "params");
+    return getBridge().renderApplyPreset(p);
+  });
   ipcMain.handle("render:diagnose", async (_e, { jobId }) => {
     assertString(jobId, "jobId");
     return getBridge().renderDiagnose(jobId);
@@ -107,7 +137,10 @@ export function registerIpcHandlers(): void {
 
   // ----- AI -----
   ipcMain.handle("ai:listTools", async () => getBridge().aiListTools());
-  ipcMain.handle("ai:plan", async (_e, p) => getBridge().aiPlan(p));
+  ipcMain.handle("ai:plan", async (_e, p) => {
+    assertObject(p, "params");
+    return getBridge().aiPlan(p);
+  });
   ipcMain.handle("ai:acceptDiff", async (_e, { diffId }) => {
     assertString(diffId, "diffId");
     return getBridge().aiAcceptDiff(diffId);
@@ -123,13 +156,26 @@ export function registerIpcHandlers(): void {
   ipcMain.handle("ai:runtimeStatus", async () => getBridge().aiRuntimeStatus());
 
   // ----- Export -----
-  ipcMain.handle("export:exportPdf", async (_e, p) => getBridge().exportPdf(p));
-  ipcMain.handle("export:exportDxf", async (_e, p) => getBridge().exportDxf(p));
-  ipcMain.handle("export:exportIfc", async (_e, p) => getBridge().exportIfc(p));
-  ipcMain.handle("export:exportGltf", async (_e, p) => getBridge().exportGltf(p));
-  ipcMain.handle("export:buildProposalPack", async (_e, p) =>
-    getBridge().exportBuildProposalPack(p),
-  );
+  ipcMain.handle("export:exportPdf", async (_e, p) => {
+    assertObject(p, "params");
+    return getBridge().exportPdf(p);
+  });
+  ipcMain.handle("export:exportDxf", async (_e, p) => {
+    assertObject(p, "params");
+    return getBridge().exportDxf(p);
+  });
+  ipcMain.handle("export:exportIfc", async (_e, p) => {
+    assertObject(p, "params");
+    return getBridge().exportIfc(p);
+  });
+  ipcMain.handle("export:exportGltf", async (_e, p) => {
+    assertObject(p, "params");
+    return getBridge().exportGltf(p);
+  });
+  ipcMain.handle("export:buildProposalPack", async (_e, p) => {
+    assertObject(p, "params");
+    return getBridge().exportBuildProposalPack(p);
+  });
 
   // ----- Runtime -----
   ipcMain.handle("runtime:status", async () => getBridge().runtimeStatus());

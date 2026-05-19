@@ -54,7 +54,14 @@ pub fn bridge_init(opts: InitOptions) -> Result<()> {
         max_recents: opts.max_recents as usize,
     };
     let svc = BridgeService::new(cfg, key).map_err(|e| Error::from_reason(e.to_string()))?;
-    *SERVICE.lock().unwrap() = Some(svc);
+    // Use the same poison-tolerant pattern as `with_service` and
+    // `runtime_status` so a previously-panicked init can't bring down the
+    // Electron host with a cryptic `PoisonError` — surface the failure as
+    // a typed N-API error and let the renderer recover gracefully.
+    let mut guard = SERVICE
+        .lock()
+        .map_err(|e| Error::from_reason(e.to_string()))?;
+    *guard = Some(svc);
     Ok(())
 }
 

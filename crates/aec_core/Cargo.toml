@@ -16,6 +16,7 @@ chrono = { workspace = true }
 blake3 = { workspace = true }
 rusqlite = { workspace = true }
 hex = { workspace = true }
+getrandom = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

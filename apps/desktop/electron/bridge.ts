@@ -14,6 +14,10 @@
 import * as fs from "fs";
 import * as path from "path";
 
+import { AI_TOOLS, type AiTool } from "./ai-tools";
+
+export { AI_TOOLS, type AiTool };
+
 export interface BridgeBackend {
   projectCreateFromTemplate(templateKey: string, projectName: string): Promise<ProjectSummary>;
   projectOpen(projectPath: string): Promise<ProjectSummary>;
@@ -91,13 +95,6 @@ export interface RenderJob {
   status: "queued" | "running" | "completed" | "failed" | "cancelled";
   preset: string;
   progress: number;
-}
-
-export interface AiTool {
-  id: string;
-  scope: string;
-  maxEntitiesModified: number;
-  description: string;
 }
 
 export interface RuntimeStatus {
@@ -179,10 +176,107 @@ interface NativeApi {
   runtime_status(): unknown;
 }
 
+/**
+ * Methods that are currently routed through the N-API native bridge.
+ * Every other backend method falls back to the in-process implementation
+ * (see {@link NATIVE_FALLBACK_METHODS}).
+ *
+ * Keep this set in sync with the `#[napi]` exports in
+ * `crates/aec_bridge/src/napi_api.rs`. Adding a new exported function?
+ * Add a method override in {@link adaptNative} and remove the corresponding
+ * entry from {@link NATIVE_FALLBACK_METHODS}.
+ */
+const NATIVE_WIRED_METHODS: ReadonlyArray<keyof BridgeBackend> = [
+  "projectCreateFromTemplate",
+  "projectOpen",
+  "projectSave",
+  "projectListRecents",
+  "runtimeStatus",
+];
+
+/**
+ * Methods that **intentionally** fall back to the in-process backend even
+ * when the native artefact is loaded. Phase 1/2 only exposes project +
+ * runtime over N-API; the rest is realistic dev-mode behaviour that the
+ * UI exercises end-to-end. Removing entries from this list means we have
+ * wired more domain crates (aec_command, aec_render, aec_ai, …) through
+ * the N-API surface.
+ *
+ * Documented here so the gap between `BridgeBackend` and the N-API surface
+ * is explicit and grep-able, rather than implicit in the spread operator
+ * inside {@link adaptNative}.
+ */
+export const NATIVE_FALLBACK_METHODS: ReadonlyArray<keyof BridgeBackend> = [
+  "projectExportPackage",
+  "designPlaceFurniture",
+  "designPaintMaterial",
+  "designSetLighting",
+  "designSaveCamera",
+  "designListAssets",
+  "draftDrawPrimitive",
+  "draftEditTool",
+  "draftCreateSheet",
+  "draftSetLayerState",
+  "draftImportDxf",
+  "draftExportDxf",
+  "bimImportIfc",
+  "bimExportIfc",
+  "bimClassify",
+  "bimSetProperty",
+  "bimGenerateSchedule",
+  "bimValidate",
+  "bimDiff",
+  "renderEnqueue",
+  "renderListJobs",
+  "renderCancelJob",
+  "renderApplyPreset",
+  "renderDiagnose",
+  "aiListTools",
+  "aiPlan",
+  "aiAcceptDiff",
+  "aiRejectDiff",
+  "aiCancelJob",
+  "aiRuntimeStatus",
+  "exportPdf",
+  "exportDxf",
+  "exportIfc",
+  "exportGltf",
+  "exportBuildProposalPack",
+];
+
+/**
+ * Wrap a freshly-loaded N-API library with the {@link BridgeBackend} shape.
+ *
+ * The N-API surface is intentionally narrow today (project lifecycle +
+ * runtime status). Every other domain method falls through to the
+ * in-process backend — a deliberate Phase 1/2 scoping choice. When a
+ * fallback method is invoked while a native backend is loaded we emit a
+ * `console.debug` so the dev console makes the boundary obvious instead
+ * of silently masking it.
+ */
 function adaptNative(n: NativeApi): BridgeBackend {
   const base = inProcessBackend();
-  return {
-    ...base,
+  const fallbackNames = new Set<string>(NATIVE_FALLBACK_METHODS);
+  const wrapped: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(base) as [string, unknown][]) {
+    if (fallbackNames.has(key) && typeof value === "function") {
+      const fn = value as (...args: unknown[]) => unknown;
+      wrapped[key] = (...args: unknown[]) => {
+        // Loud-but-cheap signal in development so a missing N-API binding
+        // doesn't masquerade as "the native bridge handled it". Suppressed
+        // in tests by node's default console filter.
+        if (process.env.AEC_LOG_BACKEND === "1") {
+          // eslint-disable-next-line no-console
+          console.debug(`[aec_bridge] in-process fallback for ${key}`);
+        }
+        return fn(...args);
+      };
+    } else {
+      wrapped[key] = value;
+    }
+  }
+  const native: BridgeBackend = {
+    ...(wrapped as unknown as BridgeBackend),
     projectCreateFromTemplate: async (k, p) =>
       n.project_create_from_template(k, p) as ProjectSummary,
     projectOpen: async (p) => n.project_open(p) as ProjectSummary,
@@ -190,6 +284,23 @@ function adaptNative(n: NativeApi): BridgeBackend {
     projectListRecents: async () => n.project_list_recents() as ProjectSummary[],
     runtimeStatus: async () => n.runtime_status() as RuntimeStatus,
   };
+  // Self-check: the catalogue above must reference every BridgeBackend
+  // method exactly once. This trips during development if a new method is
+  // added without updating the lists.
+  const all = new Set<string>([
+    ...NATIVE_WIRED_METHODS,
+    ...NATIVE_FALLBACK_METHODS,
+  ]);
+  for (const key of Object.keys(base)) {
+    if (!all.has(key)) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[aec_bridge] BridgeBackend method '${key}' is not declared in ` +
+          `NATIVE_WIRED_METHODS or NATIVE_FALLBACK_METHODS — please update bridge.ts`,
+      );
+    }
+  }
+  return native;
 }
 
 // ----- In-process backend -----
@@ -475,16 +586,6 @@ function filterAssets(assets: AssetSummary[], query: Record<string, unknown>): A
     .slice(0, limit);
 }
 
-const AI_TOOLS: AiTool[] = [
-  { id: "plan_detection", scope: "design,draft,bim", maxEntitiesModified: 200, description: "Detect walls and openings from imported plan." },
-  { id: "style_assistant", scope: "design", maxEntitiesModified: 50, description: "Propose furniture and finishes for a given style brief." },
-  { id: "layout_suggestion", scope: "design", maxEntitiesModified: 80, description: "Suggest a furniture layout for a room shape." },
-  { id: "render_doctor", scope: "render", maxEntitiesModified: 30, description: "Diagnose noise, exposure, and lighting in a render." },
-  { id: "cad_cleanup", scope: "draft", maxEntitiesModified: 500, description: "Clean and rationalise an imported drawing." },
-  { id: "plan_to_wall", scope: "design,draft", maxEntitiesModified: 200, description: "Convert a detected plan into parametric walls." },
-  { id: "schedule_fill", scope: "bim,deliver", maxEntitiesModified: 1000, description: "Fill BIM property schedules." },
-  { id: "classification", scope: "bim", maxEntitiesModified: 500, description: "Classify imported geometry into IFC entities." },
-  { id: "property_fill", scope: "bim", maxEntitiesModified: 1000, description: "Populate property sets on classified elements." },
-  { id: "validation_help", scope: "bim", maxEntitiesModified: 0, description: "Explain BIM validation findings." },
-  { id: "cover_page_draft", scope: "deliver", maxEntitiesModified: 5, description: "Draft a proposal pack cover page." },
-];
+// `AI_TOOLS` and `AiTool` are sourced from `./ai-tools` and re-exported
+// at the top of this file. The in-process backend reads the shared
+// catalogue, so any change to the tool list happens in one place.

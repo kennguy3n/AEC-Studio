@@ -41,4 +41,7 @@ pub enum AecError {
 
     #[error("recents store is corrupt: {0}")]
     CorruptRecents(String),
+
+    #[error("OS random source unavailable: {0}")]
+    Random(#[from] getrandom::Error),
 }

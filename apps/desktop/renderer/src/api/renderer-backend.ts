@@ -5,6 +5,7 @@
  */
 
 import type { AecApi } from "../../../electron/preload";
+import { AI_TOOLS } from "../../../electron/ai-tools";
 
 interface Recent {
   projectId: string;
@@ -144,20 +145,9 @@ export function rendererInProcessBackend(): AecApi {
       diagnose: async (jobId) => ({ jobId, suggestions: [] }),
     },
     ai: {
-      listTools: async () => [
-        {
-          id: "plan_detection",
-          scope: "design,draft,bim",
-          maxEntitiesModified: 200,
-          description: "Detect walls and openings from imported plan.",
-        },
-        {
-          id: "style_assistant",
-          scope: "design",
-          maxEntitiesModified: 50,
-          description: "Propose furniture and finishes for a given style brief.",
-        },
-      ],
+      // Return a defensive copy so callers (and Vitest harnesses) can't
+      // mutate the shared catalogue.
+      listTools: async () => AI_TOOLS.map((t) => ({ ...t })),
       plan: async () => ({ diffId: newId("diff") }),
       acceptDiff: async () => ({ accepted: true }),
       rejectDiff: async () => ({ rejected: true }),

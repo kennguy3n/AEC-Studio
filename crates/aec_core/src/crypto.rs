@@ -65,15 +65,24 @@ pub fn derive_project_key(master_key: &[u8; 32], project_nonce: &[u8]) -> Key32 
     Key32(out)
 }
 
-/// Generate a fresh random nonce for a new project. Uses
-/// `getrandom`-equivalent entropy via `Uuid::new_v4`'s underlying RNG.
-pub fn generate_project_nonce() -> [u8; 32] {
-    let a = uuid::Uuid::new_v4();
-    let b = uuid::Uuid::new_v4();
+/// Generate a fresh random nonce for a new project.
+///
+/// Sourced directly from the OS CSPRNG via [`getrandom::getrandom`]. We
+/// used to derive the nonce by concatenating two `Uuid::new_v4` values
+/// (each backed by `getrandom` internally), but that path donated four
+/// bits per UUID to version/variant tagging — full bytes from
+/// `getrandom` are both cleaner and architecturally identical to what
+/// every other AEC Studio crypto primitive expects.
+///
+/// # Errors
+///
+/// Returns [`getrandom::Error`] if the OS RNG is unavailable (extremely
+/// rare; only happens on broken or pre-init kernels). Callers in the
+/// project-package layer surface this through [`crate::error::AecError`].
+pub fn generate_project_nonce() -> Result<[u8; 32], getrandom::Error> {
     let mut out = [0u8; 32];
-    out[..16].copy_from_slice(a.as_bytes());
-    out[16..].copy_from_slice(b.as_bytes());
-    out
+    getrandom::getrandom(&mut out)?;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -120,9 +129,22 @@ mod tests {
 
     #[test]
     fn generate_project_nonce_is_unique() {
-        let n1 = generate_project_nonce();
-        let n2 = generate_project_nonce();
+        let n1 = generate_project_nonce().unwrap();
+        let n2 = generate_project_nonce().unwrap();
         assert_ne!(n1, n2);
+    }
+
+    #[test]
+    fn generate_project_nonce_has_high_entropy() {
+        // Spot-check that we're not getting a zero buffer / single repeated
+        // byte. `getrandom` is supposed to fill all 32 bytes with CSPRNG
+        // output, so we expect at least a handful of distinct values.
+        let n = generate_project_nonce().unwrap();
+        let distinct = n.iter().copied().collect::<std::collections::HashSet<_>>();
+        assert!(
+            distinct.len() >= 8,
+            "nonce had suspiciously low byte diversity: {n:?}"
+        );
     }
 
     #[test]

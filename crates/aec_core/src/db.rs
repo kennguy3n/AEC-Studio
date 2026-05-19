@@ -156,7 +156,7 @@ mod tests {
     fn open_encrypted_initializes_schema() {
         let (_td, p) = temp_db();
         let master = [11u8; 32];
-        let nonce = generate_project_nonce();
+        let nonce = generate_project_nonce().unwrap();
         let key = derive_project_key(&master, &nonce);
         let conn = open_encrypted(&p, &key).unwrap();
         assert_eq!(
@@ -174,7 +174,7 @@ mod tests {
     fn correct_key_reopens_the_db() {
         let (_td, p) = temp_db();
         let master = [11u8; 32];
-        let nonce = generate_project_nonce();
+        let nonce = generate_project_nonce().unwrap();
         let key = derive_project_key(&master, &nonce);
         {
             let conn = open_encrypted(&p, &key).unwrap();
@@ -195,7 +195,7 @@ mod tests {
     fn wrong_key_fails_to_open() {
         let (_td, p) = temp_db();
         let master = [11u8; 32];
-        let nonce = generate_project_nonce();
+        let nonce = generate_project_nonce().unwrap();
         let key = derive_project_key(&master, &nonce);
         {
             let _conn = open_encrypted(&p, &key).unwrap();

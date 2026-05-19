@@ -39,6 +39,7 @@ glam = { version = "0.27", features = ["serde"] }
 napi = { version = "2", features = ["napi8", "serde-json"] }
 napi-derive = "2"
 hex = "0.4"
+getrandom = { version = "0.2", features = ["std"] }
 printpdf = "0.7"
 
 [workspace.lints.rust]

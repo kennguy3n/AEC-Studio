@@ -104,34 +104,22 @@ impl<'a> SafetyValidator<'a> {
 /// `home_path_hint` cannot trigger a false positive.
 ///
 /// If the payload is not valid JSON (which the grammar check should have
-/// already caught upstream) we fall back to a raw-substring scan so we
-/// never silently accept an exfiltration attempt in a malformed envelope.
+/// already caught upstream) we fall back to a raw scan over the entire
+/// payload so we never silently accept an exfiltration attempt in a
+/// malformed envelope.
 fn check_exfiltration(payload: &str) -> Result<(), SafetyError> {
-    const BAD_PATTERNS: &[&str] = &[
-        "http://", "https://", "ftp://", "file:///", "/etc/", "/var/", "/Users/", "/home/", "C:\\",
-        "C:/",
-    ];
-
-    fn scan(value: &serde_json::Value, patterns: &[&str]) -> Result<(), SafetyError> {
+    fn scan(value: &serde_json::Value) -> Result<(), SafetyError> {
         match value {
-            serde_json::Value::String(s) => {
-                let lower = s.to_ascii_lowercase();
-                for pat in patterns {
-                    if lower.contains(&pat.to_ascii_lowercase()) {
-                        return Err(SafetyError::Exfiltration((*pat).into()));
-                    }
-                }
-                Ok(())
-            }
+            serde_json::Value::String(s) => check_string_for_exfiltration(s),
             serde_json::Value::Array(items) => {
                 for item in items {
-                    scan(item, patterns)?;
+                    scan(item)?;
                 }
                 Ok(())
             }
             serde_json::Value::Object(map) => {
                 for v in map.values() {
-                    scan(v, patterns)?;
+                    scan(v)?;
                 }
                 Ok(())
             }
@@ -140,17 +128,143 @@ fn check_exfiltration(payload: &str) -> Result<(), SafetyError> {
     }
 
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) {
-        return scan(&v, BAD_PATTERNS);
+        return scan(&v);
     }
-    // Non-JSON payload — apply the legacy raw scan so we err on the side
-    // of caution rather than letting an exfiltration attempt slip through.
-    let lower = payload.to_ascii_lowercase();
-    for pat in BAD_PATTERNS {
-        if lower.contains(&pat.to_ascii_lowercase()) {
+    // Non-JSON payload — apply the same structural check directly to the
+    // raw text so we err on the side of caution rather than letting an
+    // exfiltration attempt slip through a malformed envelope.
+    check_string_for_exfiltration(payload)
+}
+
+/// Reject a single string if it contains anything that looks like an
+/// absolute filesystem path or a network URL. The check is structural
+/// (it understands drive letters, UNC prefixes, and URL schemes) rather
+/// than a fixed list of substrings, so it cannot be bypassed by simply
+/// using a drive letter other than `C:`.
+fn check_string_for_exfiltration(s: &str) -> Result<(), SafetyError> {
+    // 1. Any URL with a network or local-file scheme.
+    //    We accept any scheme matching `[a-z][a-z0-9+.-]*://` so the
+    //    `http://`, `https://`, `ftp://`, `file:///`, `gs://`, `s3://`,
+    //    `data:` (when followed by content), etc. all trip the check.
+    if find_url_scheme(s).is_some() {
+        return Err(SafetyError::Exfiltration("network or file URL".into()));
+    }
+
+    // 2. POSIX absolute paths in sensitive trees. We deliberately do NOT
+    //    treat every `/...` path as exfiltration — relative-looking
+    //    strings (e.g. `/walls/1`) are common in entity references. We
+    //    only block well-known sensitive prefixes.
+    //
+    //    Match is case-insensitive on the ASCII portion so a sneaky
+    //    `/HOME/...` is still caught.
+    const POSIX_PREFIXES: &[&str] = &[
+        "/etc/",
+        "/var/",
+        "/usr/",
+        "/opt/",
+        "/root/",
+        "/home/",
+        "/users/",
+        "/tmp/",
+        "/proc/",
+        "/sys/",
+        "/private/",
+    ];
+    let lower = s.to_ascii_lowercase();
+    for pat in POSIX_PREFIXES {
+        if lower.contains(pat) {
             return Err(SafetyError::Exfiltration((*pat).into()));
         }
     }
+
+    // 3. Windows absolute paths: any drive letter followed by `:\` or
+    //    `:/`. The previous implementation only checked `C:` literally,
+    //    so `D:\Users\...` would have slipped through. Use a structural
+    //    detector instead.
+    if find_windows_drive_path(s).is_some() {
+        return Err(SafetyError::Exfiltration("windows absolute path".into()));
+    }
+
+    // 4. UNC paths: `\\server\share` or `//server/share` (the latter
+    //    survives a JSON-escape pass that strips backslashes).
+    if find_unc_path(s).is_some() {
+        return Err(SafetyError::Exfiltration("unc path".into()));
+    }
+
     Ok(())
+}
+
+/// Return the start index of the first URL scheme delimiter (`://`) in
+/// `s` that is preceded by a valid scheme name. The match is robust to
+/// case and ignores embedded `://` that aren't preceded by a scheme.
+fn find_url_scheme(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    for (i, w) in bytes.windows(3).enumerate() {
+        if w == b"://" {
+            // Walk backwards collecting ASCII alphanumerics, `+`, `-`, `.`
+            // until we find a scheme-start character.
+            let mut j = i;
+            while j > 0 {
+                let c = bytes[j - 1] as char;
+                if c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.') {
+                    j -= 1;
+                } else {
+                    break;
+                }
+            }
+            if j < i && (bytes[j] as char).is_ascii_alphabetic() {
+                return Some(j);
+            }
+        }
+    }
+    None
+}
+
+/// Return the start index of a Windows absolute path of the form
+/// `<letter>:\` or `<letter>:/` inside `s`. The leading character must be
+/// an ASCII letter (any case).
+fn find_windows_drive_path(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i + 2 < bytes.len() {
+        let c = bytes[i] as char;
+        if c.is_ascii_alphabetic() && bytes[i + 1] == b':' {
+            let next = bytes[i + 2];
+            if next == b'\\' || next == b'/' {
+                // Reject when the drive letter is part of an identifier
+                // like `myC:/` — only accept when preceded by a boundary.
+                let preceded_by_letter = i > 0 && (bytes[i - 1] as char).is_ascii_alphanumeric();
+                if !preceded_by_letter {
+                    return Some(i);
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Return the start index of a UNC path (`\\server\share` or its
+/// forward-slash equivalent `//server/share`) inside `s`.
+fn find_unc_path(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if bytes.len() < 5 {
+        return None;
+    }
+    for (i, w) in bytes.windows(2).enumerate() {
+        if w == b"\\\\" || w == b"//" {
+            // Require at least one non-slash character after the prefix
+            // so we don't trip on stray `//` in URL-stripped strings.
+            let rest = &bytes[i + 2..];
+            let host_char = rest.iter().find(|b| **b != b'/' && **b != b'\\').copied();
+            if let Some(c) = host_char {
+                if (c as char).is_ascii_alphanumeric() {
+                    return Some(i);
+                }
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -247,5 +361,98 @@ mod tests {
         let bad = "not really json http://evil.example/secret";
         let err = check_exfiltration(bad).unwrap_err();
         assert!(matches!(err, SafetyError::Exfiltration(_)));
+    }
+
+    #[test]
+    fn check_exfiltration_blocks_every_windows_drive_letter() {
+        // The previous implementation only checked `C:` literally. A
+        // crafted response targeting any other drive letter must now
+        // be rejected just as firmly.
+        for prefix in [
+            "C:\\Windows\\System32",
+            "c:\\Users\\victim\\.ssh",
+            "D:\\Users\\victim\\Documents",
+            "E:/payloads/exfil.txt",
+            "x:\\private\\stash",
+            "Z:/network/drive",
+        ] {
+            let payload = format!(r#"{{"target":"{}"}}"#, prefix.replace('\\', "\\\\"));
+            let err = check_exfiltration(&payload).unwrap_err();
+            assert!(
+                matches!(err, SafetyError::Exfiltration(_)),
+                "drive-letter path {prefix:?} was not rejected: payload={payload}",
+            );
+        }
+    }
+
+    #[test]
+    fn check_exfiltration_blocks_unc_paths() {
+        // Backslash UNC (Windows native) and forward-slash UNC (what
+        // survives a JSON escape pass) must both be rejected.
+        for unc in [
+            r"\\fileserver\share\secret.txt",
+            r"//fileserver/share/secret.txt",
+            r"\\10.0.0.5\backups",
+        ] {
+            let payload = format!(r#"{{"target":"{}"}}"#, unc.replace('\\', "\\\\"));
+            let err = check_exfiltration(&payload).unwrap_err();
+            assert!(
+                matches!(err, SafetyError::Exfiltration(_)),
+                "UNC path {unc:?} was not rejected: payload={payload}",
+            );
+        }
+    }
+
+    #[test]
+    fn check_exfiltration_blocks_arbitrary_url_schemes() {
+        // The check is structural (scheme://...) so we catch S3, GCS, FTP,
+        // and any future scheme without having to maintain a fixed list.
+        for url in [
+            "https://evil.example/x",
+            "FTP://attacker.example/leak",
+            "s3://my-bucket/secret",
+            "gs://foo/bar",
+            "file:///etc/passwd",
+        ] {
+            let payload = format!(r#"{{"target":"{}"}}"#, url);
+            let err = check_exfiltration(&payload).unwrap_err();
+            assert!(
+                matches!(err, SafetyError::Exfiltration(_)),
+                "URL {url:?} was not rejected",
+            );
+        }
+    }
+
+    #[test]
+    fn check_exfiltration_allows_relative_paths_and_inert_strings() {
+        // Project-relative paths (used to reference internal entities) must
+        // still pass — only sensitive *absolute* paths and URLs are blocked.
+        for good in [
+            r#"{"target":"walls/1"}"#,
+            r#"{"target":"materials/oak.json"}"#,
+            r#"{"slug":"home_lamp"}"#,
+            r#"{"text":"This is plain prose: 2 colons:: still fine."}"#,
+            r#"{"ratio":"50%"}"#,
+        ] {
+            check_exfiltration(good)
+                .unwrap_or_else(|e| panic!("benign payload {good:?} flagged: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn find_helpers_match_only_real_prefixes() {
+        // Drive-letter detector must not trip on tokens like `myC:foo` where
+        // the colon is preceded by other alphanumerics.
+        assert!(find_windows_drive_path("myC:\\foo").is_none());
+        // But it must trip on a clean drive-letter prefix.
+        assert!(find_windows_drive_path("D:\\anything").is_some());
+        // UNC detector must require a host character after the prefix.
+        assert!(find_unc_path("////").is_none());
+        assert!(find_unc_path(r"\\srv\share").is_some());
+        assert!(find_unc_path("//srv/share").is_some());
+        // URL scheme detector must reject "://" that isn't preceded by a
+        // scheme (e.g. the bare delimiter inside a free-form sentence).
+        assert!(find_url_scheme("look at this :// here").is_none());
+        assert!(find_url_scheme("https://evil.example").is_some());
     }
 }

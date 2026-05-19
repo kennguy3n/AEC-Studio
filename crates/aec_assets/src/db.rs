@@ -200,8 +200,17 @@ impl AssetDatabase {
         let mut sql = String::from("SELECT * FROM assets WHERE 1=1");
         let mut bindings: Vec<String> = Vec::new();
         if let Some(name) = &q.name_contains {
-            sql.push_str(" AND name LIKE ?");
-            bindings.push(format!("%{}%", name));
+            // Escape SQLite LIKE wildcards (`%`, `_`) and the escape
+            // character itself in user input before wrapping in `%...%`.
+            // Without this, `_` would silently match any single character
+            // and `%` would match any substring — both surprise the user
+            // when they type a literal underscore or percent sign.
+            //
+            // We use `\` as the escape character via an `ESCAPE` clause so
+            // a query like `name_contains = "50%"` matches the literal
+            // string "50%", not "fifty-anything".
+            sql.push_str(" AND name LIKE ? ESCAPE '\\'");
+            bindings.push(format!("%{}%", escape_like(name)));
         }
         if let Some(vendor) = &q.vendor_id {
             sql.push_str(" AND vendor_id = ?");
@@ -229,6 +238,27 @@ impl AssetDatabase {
         });
         Ok(rows)
     }
+}
+
+/// Escape SQLite LIKE wildcards in user input.
+///
+/// SQLite's LIKE treats `%` as "zero or more chars" and `_` as "any single
+/// char". When user input is wrapped in `%...%` for a "contains" search we
+/// must escape both, *and* the escape character itself, so the pattern
+/// matches the literal input. The caller is responsible for declaring
+/// `ESCAPE '\'` in the SQL.
+fn escape_like(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        match c {
+            '\\' | '%' | '_' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 fn row_to_metadata(row: &Row<'_>) -> rusqlite::Result<AssetMetadata> {
@@ -342,6 +372,54 @@ mod tests {
         let res = db.query(&q).unwrap();
         assert_eq!(res.len(), 1);
         assert_eq!(res[0].asset_id, "a1");
+    }
+
+    #[test]
+    fn escape_like_escapes_wildcards_and_backslash() {
+        assert_eq!(escape_like("plain"), "plain");
+        assert_eq!(escape_like("50%"), "50\\%");
+        assert_eq!(escape_like("foo_bar"), "foo\\_bar");
+        assert_eq!(escape_like("a\\b"), "a\\\\b");
+        assert_eq!(escape_like("%_\\"), "\\%\\_\\\\");
+    }
+
+    #[test]
+    fn name_contains_treats_underscore_and_percent_as_literals() {
+        let mut db = AssetDatabase::open_in_memory().unwrap();
+        let chain = LodChain::from_ratios(1000, &[]);
+
+        // Three assets whose names look adversarial w.r.t. LIKE wildcards.
+        let mut a = sample("a1");
+        a.name = "Sofa 50%".into();
+        let mut b = sample("a2");
+        b.name = "Sofa 50X".into(); // would match `50_` under bare LIKE
+        let mut c = sample("a3");
+        c.name = "Sofa Five".into();
+        db.upsert_metadata(&a, &chain).unwrap();
+        db.upsert_metadata(&b, &chain).unwrap();
+        db.upsert_metadata(&c, &chain).unwrap();
+
+        // `50%` must match only the literal "50%", not "50X".
+        let q_pct = AssetQuery {
+            name_contains: Some("50%".into()),
+            ..AssetQuery::default()
+        };
+        let r_pct = db.query(&q_pct).unwrap();
+        assert_eq!(r_pct.len(), 1);
+        assert_eq!(r_pct[0].asset_id, "a1");
+
+        // `50_` should match nothing — there's no asset whose name contains
+        // a literal underscore. Without escaping this would have matched
+        // "Sofa 50%" and "Sofa 50X" via the `_` wildcard.
+        let q_us = AssetQuery {
+            name_contains: Some("50_".into()),
+            ..AssetQuery::default()
+        };
+        let r_us = db.query(&q_us).unwrap();
+        assert!(
+            r_us.is_empty(),
+            "underscore was treated as wildcard: {r_us:?}"
+        );
     }
 
     #[test]

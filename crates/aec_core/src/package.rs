@@ -80,7 +80,7 @@ impl ProjectPackage {
         // Write the nonce file, derive the encryption key, and create the
         // encrypted SQLite database. The nonce file is plaintext on
         // purpose: deleting it is the crypto-forget gesture.
-        let nonce = generate_project_nonce();
+        let nonce = generate_project_nonce()?;
         let nonce_path = root.join("project.nonce");
         fs::write(&nonce_path, nonce)?;
         let key = derive_project_key(master_key, &nonce);
