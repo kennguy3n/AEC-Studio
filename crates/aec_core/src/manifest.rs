@@ -52,7 +52,9 @@ impl ProjectManifest {
 
     pub fn validate(&self) -> Result<(), AecError> {
         if self.name.trim().is_empty() {
-            return Err(AecError::InvalidManifest("project name must not be empty".into()));
+            return Err(AecError::InvalidManifest(
+                "project name must not be empty".into(),
+            ));
         }
         if self.schema_version != SCHEMA_VERSION {
             return Err(AecError::SchemaMismatch {
@@ -84,24 +86,14 @@ mod tests {
 
     #[test]
     fn manifest_rejects_empty_name() {
-        let mut m = ProjectManifest::new(
-            ProjectId::new(),
-            "ok",
-            ProjectSettings::default(),
-            None,
-        );
+        let mut m = ProjectManifest::new(ProjectId::new(), "ok", ProjectSettings::default(), None);
         m.name = "   ".into();
         assert!(m.validate().is_err());
     }
 
     #[test]
     fn manifest_detects_schema_mismatch() {
-        let mut m = ProjectManifest::new(
-            ProjectId::new(),
-            "p",
-            ProjectSettings::default(),
-            None,
-        );
+        let mut m = ProjectManifest::new(ProjectId::new(), "p", ProjectSettings::default(), None);
         m.schema_version = 999;
         let err = m.validate().unwrap_err();
         matches!(err, AecError::SchemaMismatch { .. });

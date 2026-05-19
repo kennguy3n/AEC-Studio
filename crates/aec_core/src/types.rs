@@ -61,10 +61,26 @@ macro_rules! typed_id {
     };
 }
 
-typed_id!(ProjectId, "proj", "Identifier for an AEC Studio project package.");
-typed_id!(EntityId, "ent", "Identifier for a single entity in the project graph.");
-typed_id!(CommandId, "cmd", "Identifier for a single executed command.");
-typed_id!(DiffId, "diff", "Identifier for a previewable diff produced by a command or AI plan.");
+typed_id!(
+    ProjectId,
+    "proj",
+    "Identifier for an AEC Studio project package."
+);
+typed_id!(
+    EntityId,
+    "ent",
+    "Identifier for a single entity in the project graph."
+);
+typed_id!(
+    CommandId,
+    "cmd",
+    "Identifier for a single executed command."
+);
+typed_id!(
+    DiffId,
+    "diff",
+    "Identifier for a previewable diff produced by a command or AI plan."
+);
 
 /// The five user-facing workflow modes plus the `Home` dashboard scope.
 ///
@@ -94,7 +110,13 @@ impl Scope {
 
     /// Iterate all scopes in canonical mode-rail order.
     pub fn all() -> &'static [Self] {
-        &[Self::Design, Self::Draft, Self::Bim, Self::Render, Self::Deliver]
+        &[
+            Self::Design,
+            Self::Draft,
+            Self::Bim,
+            Self::Render,
+            Self::Deliver,
+        ]
     }
 }
 
@@ -124,11 +146,17 @@ pub struct Actor {
 
 impl Actor {
     pub fn user() -> Self {
-        Self { kind: ActorKind::User, tool: None }
+        Self {
+            kind: ActorKind::User,
+            tool: None,
+        }
     }
 
     pub fn ai(tool: impl Into<String>) -> Self {
-        Self { kind: ActorKind::Ai, tool: Some(tool.into()) }
+        Self {
+            kind: ActorKind::Ai,
+            tool: Some(tool.into()),
+        }
     }
 }
 

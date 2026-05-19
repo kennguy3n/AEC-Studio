@@ -74,8 +74,8 @@ impl TemplateLoader {
             return Err(AecError::TemplateNotFound(key.to_string()));
         }
         let raw = fs::read_to_string(&path)?;
-        let tpl: TemplateDefinition = serde_json::from_str(&raw)
-            .map_err(|e| AecError::InvalidTemplate(e.to_string()))?;
+        let tpl: TemplateDefinition =
+            serde_json::from_str(&raw).map_err(|e| AecError::InvalidTemplate(e.to_string()))?;
         if tpl.template_id != key {
             return Err(AecError::InvalidTemplate(format!(
                 "template_id in file is '{}' but path key is '{}'",
@@ -152,8 +152,11 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let cat_dir = td.path().join("interior");
         std::fs::create_dir_all(&cat_dir).unwrap();
-        std::fs::write(cat_dir.join("apartment.json"), sample_template_json("apartment"))
-            .unwrap();
+        std::fs::write(
+            cat_dir.join("apartment.json"),
+            sample_template_json("apartment"),
+        )
+        .unwrap();
         let loader = TemplateLoader::new(td.path());
         let tpl = loader.load("interior.apartment").unwrap();
         assert_eq!(tpl.name, "Sample apartment");
@@ -165,8 +168,11 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let cat_dir = td.path().join("interior");
         std::fs::create_dir_all(&cat_dir).unwrap();
-        std::fs::write(cat_dir.join("apartment.json"), sample_template_json("kitchen"))
-            .unwrap();
+        std::fs::write(
+            cat_dir.join("apartment.json"),
+            sample_template_json("kitchen"),
+        )
+        .unwrap();
         let loader = TemplateLoader::new(td.path());
         let err = loader.load("interior.apartment").unwrap_err();
         match err {
@@ -180,9 +186,16 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let cat_dir = td.path().join("interior");
         std::fs::create_dir_all(&cat_dir).unwrap();
-        std::fs::write(cat_dir.join("apartment.json"), sample_template_json("apartment"))
-            .unwrap();
-        std::fs::write(cat_dir.join("kitchen.json"), sample_template_json("kitchen")).unwrap();
+        std::fs::write(
+            cat_dir.join("apartment.json"),
+            sample_template_json("apartment"),
+        )
+        .unwrap();
+        std::fs::write(
+            cat_dir.join("kitchen.json"),
+            sample_template_json("kitchen"),
+        )
+        .unwrap();
         let loader = TemplateLoader::new(td.path());
         let mut keys = loader.discover().unwrap();
         keys.sort();

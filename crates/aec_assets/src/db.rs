@@ -158,7 +158,7 @@ impl AssetDatabase {
             .query_row(
                 "SELECT * FROM assets WHERE asset_id = ?1",
                 params![asset_id],
-                |row| row_to_metadata(row),
+                row_to_metadata,
             )
             .optional()?;
         let Some(mut meta) = row else { return Ok(None) };
@@ -215,15 +215,14 @@ impl AssetDatabase {
         let params_iter: Vec<&dyn rusqlite::ToSql> =
             bindings.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
         let mut rows = stmt
-            .query_map(rusqlite::params_from_iter(params_iter.iter().copied()), |row| {
-                row_to_metadata(row)
-            })?
+            .query_map(
+                rusqlite::params_from_iter(params_iter.iter().copied()),
+                row_to_metadata,
+            )?
             .collect::<Result<Vec<_>, _>>()?;
         // Apply tag/style-tag filters in Rust.
         rows.retain(|m| {
-            q.tags
-                .iter()
-                .all(|tag| m.tags.iter().any(|t| t == tag))
+            q.tags.iter().all(|tag| m.tags.iter().any(|t| t == tag))
                 && q.style_tags
                     .iter()
                     .all(|tag| m.style_tags.iter().any(|t| t == tag))
@@ -233,13 +232,11 @@ impl AssetDatabase {
 }
 
 fn row_to_metadata(row: &Row<'_>) -> rusqlite::Result<AssetMetadata> {
-    use rusqlite::Error::FromSqlConversionFailure;
     use rusqlite::types::Type;
+    use rusqlite::Error::FromSqlConversionFailure;
     let parse_json = |idx: usize| -> rusqlite::Result<serde_json::Value> {
         let s: String = row.get(idx)?;
-        serde_json::from_str(&s).map_err(|e| {
-            FromSqlConversionFailure(idx, Type::Text, Box::new(e))
-        })
+        serde_json::from_str(&s).map_err(|e| FromSqlConversionFailure(idx, Type::Text, Box::new(e)))
     };
     let tags: Vec<String> = serde_json::from_value(parse_json(8)?)
         .map_err(|e| FromSqlConversionFailure(8, Type::Text, Box::new(e)))?;
@@ -285,16 +282,32 @@ mod tests {
         let mut m = AssetMetadata::new(
             id,
             format!("Asset {id}"),
-            Vendor { id: "vendor_a".into(), name: "Vendor A".into(), url: None },
+            Vendor {
+                id: "vendor_a".into(),
+                name: "Vendor A".into(),
+                url: None,
+            },
             "1.0",
             License::CcBy,
         );
         m.tags = vec!["sofa".into(), "living".into()];
         m.style_tags = vec!["scandinavian".into()];
         m.lods = vec![
-            MeshBlob { mesh_hash: format!("blake3:{id}_0"), vertex_count: 800, triangle_count: 1000 },
-            MeshBlob { mesh_hash: format!("blake3:{id}_1"), vertex_count: 400, triangle_count: 500 },
-            MeshBlob { mesh_hash: format!("blake3:{id}_2"), vertex_count: 200, triangle_count: 250 },
+            MeshBlob {
+                mesh_hash: format!("blake3:{id}_0"),
+                vertex_count: 800,
+                triangle_count: 1000,
+            },
+            MeshBlob {
+                mesh_hash: format!("blake3:{id}_1"),
+                vertex_count: 400,
+                triangle_count: 500,
+            },
+            MeshBlob {
+                mesh_hash: format!("blake3:{id}_2"),
+                vertex_count: 200,
+                triangle_count: 250,
+            },
         ];
         m.thumbnail_kind = ThumbnailKind::Placeholder;
         m.thumbnail_hash = format!("blake3:thumb_{id}");

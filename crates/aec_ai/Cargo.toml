@@ -5,9 +5,20 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Placeholder while aec_ai is being implemented."
+description = "Local AI sidecar runtime: PrismML/llama.cpp control, grammars, safety validator, audit."
 
 [dependencies]
+aec_core = { path = "../aec_core" }
+aec_audit = { path = "../aec_audit" }
+blake3 = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

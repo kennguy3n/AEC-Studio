@@ -26,20 +26,31 @@ impl LodChain {
     /// extended by `extra_ratios`).
     pub fn from_ratios(base_triangle_count: u32, extra_ratios: &[f32]) -> Self {
         let default = [1.0_f32, 0.5, 0.25];
-        let mut ratios: Vec<f32> = default.iter().copied().chain(extra_ratios.iter().copied()).collect();
+        let mut ratios: Vec<f32> = default
+            .iter()
+            .copied()
+            .chain(extra_ratios.iter().copied())
+            .collect();
         ratios.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
         ratios.dedup();
         let mut levels = Vec::with_capacity(ratios.len());
         for (i, ratio) in ratios.iter().enumerate() {
-            let triangle_count =
-                ((base_triangle_count as f32) * ratio).round().max(1.0) as u32;
-            levels.push(LodLevel { level: i as u8, ratio: *ratio, triangle_count });
+            let triangle_count = ((base_triangle_count as f32) * ratio).round().max(1.0) as u32;
+            levels.push(LodLevel {
+                level: i as u8,
+                ratio: *ratio,
+                triangle_count,
+            });
         }
         Self { levels }
     }
 
     pub fn min_triangles(&self) -> u32 {
-        self.levels.iter().map(|l| l.triangle_count).min().unwrap_or(0)
+        self.levels
+            .iter()
+            .map(|l| l.triangle_count)
+            .min()
+            .unwrap_or(0)
     }
 }
 

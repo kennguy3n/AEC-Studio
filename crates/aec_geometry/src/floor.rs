@@ -46,7 +46,13 @@ impl Floor {
             let b_d = [tri[1][0] as f32, tri[1][1] as f32, z_bot as f32];
             let c_d = [tri[2][0] as f32, tri[2][1] as f32, z_bot as f32];
             // Bottom face wound the other way.
-            mesh.push_triangle(a_d, c_d, b_d, normal_dn, [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0]]);
+            mesh.push_triangle(
+                a_d,
+                c_d,
+                b_d,
+                normal_dn,
+                [[0.0, 0.0], [0.0, 1.0], [1.0, 0.0]],
+            );
         }
         // Side walls (skirts) connecting top to bottom.
         let n = self.boundary_mm.len();
@@ -132,25 +138,22 @@ fn is_convex(a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> bool {
 }
 
 fn point_in_tri(p: [f64; 2], a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> bool {
-    let v0x = c[0] - a[0];
-    let v0y = c[1] - a[1];
-    let v1x = b[0] - a[0];
-    let v1y = b[1] - a[1];
-    let v2x = p[0] - a[0];
-    let v2y = p[1] - a[1];
-    let dot00 = v0x * v0x + v0y * v0y;
-    let dot01 = v0x * v1x + v0y * v1y;
-    let dot02 = v0x * v2x + v0y * v2y;
-    let dot11 = v1x * v1x + v1y * v1y;
-    let dot12 = v1x * v2x + v1y * v2y;
+    let edge0 = (c[0] - a[0], c[1] - a[1]);
+    let edge1 = (b[0] - a[0], b[1] - a[1]);
+    let to_p = (p[0] - a[0], p[1] - a[1]);
+    let dot00 = edge0.0 * edge0.0 + edge0.1 * edge0.1;
+    let dot01 = edge0.0 * edge1.0 + edge0.1 * edge1.1;
+    let dot02 = edge0.0 * to_p.0 + edge0.1 * to_p.1;
+    let dot11 = edge1.0 * edge1.0 + edge1.1 * edge1.1;
+    let dot12 = edge1.0 * to_p.0 + edge1.1 * to_p.1;
     let denom = dot00 * dot11 - dot01 * dot01;
     if denom.abs() < 1e-12 {
         return false;
     }
     let inv = 1.0 / denom;
-    let u = (dot11 * dot02 - dot01 * dot12) * inv;
-    let v = (dot00 * dot12 - dot01 * dot02) * inv;
-    u >= 0.0 && v >= 0.0 && (u + v) < 1.0
+    let bary_u = (dot11 * dot02 - dot01 * dot12) * inv;
+    let bary_v = (dot00 * dot12 - dot01 * dot02) * inv;
+    bary_u >= 0.0 && bary_v >= 0.0 && (bary_u + bary_v) < 1.0
 }
 
 fn any_point_inside(

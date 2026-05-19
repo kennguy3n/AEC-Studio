@@ -28,7 +28,11 @@ pub struct UndoRedoJournal {
 impl UndoRedoJournal {
     /// `capacity == 0` means unbounded (Phase 2 keeps it bounded at 1024).
     pub fn with_capacity(capacity: usize) -> Self {
-        Self { undo: Vec::new(), redo: Vec::new(), capacity }
+        Self {
+            undo: Vec::new(),
+            redo: Vec::new(),
+            capacity,
+        }
     }
 
     pub fn record(&mut self, entry: JournalEntry) {
@@ -77,7 +81,9 @@ mod tests {
         JournalEntry {
             command_id: CommandId::new(),
             applied_at: chrono::Utc::now(),
-            forward: vec![EntityDelta::Create { record: record.clone() }],
+            forward: vec![EntityDelta::Create {
+                record: record.clone(),
+            }],
             inverse: vec![EntityDelta::Delete { record }],
         }
     }

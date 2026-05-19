@@ -54,7 +54,11 @@ pub fn snap_to(
     let mut candidate = |point: DVec2, target: SnapTarget| {
         let d = (point - q).length();
         if d <= tolerance_mm {
-            let candidate = SnapResult { point_mm: [point.x, point.y], target, distance_mm: d };
+            let candidate = SnapResult {
+                point_mm: [point.x, point.y],
+                target,
+                distance_mm: d,
+            };
             best = Some(match &best {
                 Some(b) => {
                     let diff = (b.distance_mm - d).abs();
@@ -111,23 +115,20 @@ pub fn snap_to(
     best
 }
 
-fn segment_intersection(
-    s1: ([f64; 2], [f64; 2]),
-    s2: ([f64; 2], [f64; 2]),
-) -> Option<[f64; 2]> {
-    let p = DVec2::new(s1.0[0], s1.0[1]);
-    let r = DVec2::new(s1.1[0] - s1.0[0], s1.1[1] - s1.0[1]);
-    let q = DVec2::new(s2.0[0], s2.0[1]);
-    let s = DVec2::new(s2.1[0] - s2.0[0], s2.1[1] - s2.0[1]);
-    let rxs = r.x * s.y - r.y * s.x;
-    if rxs.abs() < 1e-9 {
+fn segment_intersection(s1: ([f64; 2], [f64; 2]), s2: ([f64; 2], [f64; 2])) -> Option<[f64; 2]> {
+    let start1 = DVec2::new(s1.0[0], s1.0[1]);
+    let dir1 = DVec2::new(s1.1[0] - s1.0[0], s1.1[1] - s1.0[1]);
+    let start2 = DVec2::new(s2.0[0], s2.0[1]);
+    let dir2 = DVec2::new(s2.1[0] - s2.0[0], s2.1[1] - s2.0[1]);
+    let cross = dir1.x * dir2.y - dir1.y * dir2.x;
+    if cross.abs() < 1e-9 {
         return None;
     }
-    let qp = q - p;
-    let t = (qp.x * s.y - qp.y * s.x) / rxs;
-    let u = (qp.x * r.y - qp.y * r.x) / rxs;
+    let delta = start2 - start1;
+    let t = (delta.x * dir2.y - delta.y * dir2.x) / cross;
+    let u = (delta.x * dir1.y - delta.y * dir1.x) / cross;
     if (0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&u) {
-        Some([p.x + r.x * t, p.y + r.y * t])
+        Some([start1.x + dir1.x * t, start1.y + dir1.y * t])
     } else {
         None
     }

@@ -22,20 +22,28 @@ pub struct EntityRecord {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EntityDelta {
-    Create { record: EntityRecord },
+    Create {
+        record: EntityRecord,
+    },
     Update {
         id: EntityId,
         before: serde_json::Value,
         after: serde_json::Value,
     },
-    Delete { record: EntityRecord },
+    Delete {
+        record: EntityRecord,
+    },
 }
 
 impl EntityDelta {
     pub fn invert(&self) -> Self {
         match self {
-            Self::Create { record } => Self::Delete { record: record.clone() },
-            Self::Delete { record } => Self::Create { record: record.clone() },
+            Self::Create { record } => Self::Delete {
+                record: record.clone(),
+            },
+            Self::Delete { record } => Self::Create {
+                record: record.clone(),
+            },
             Self::Update { id, before, after } => Self::Update {
                 id: id.clone(),
                 before: after.clone(),
@@ -166,9 +174,7 @@ mod tests {
     fn delete_missing_errors() {
         let mut g = ProjectGraph::new();
         let r = record("wall");
-        let err = g
-            .apply(&EntityDelta::Delete { record: r })
-            .unwrap_err();
+        let err = g.apply(&EntityDelta::Delete { record: r }).unwrap_err();
         matches!(err, crate::error::CommandError::EntityNotFound(_));
     }
 }

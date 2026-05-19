@@ -29,7 +29,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::config::ProjectSettings;
-use crate::crypto::{Key32, derive_project_key, generate_project_nonce};
+use crate::crypto::{derive_project_key, generate_project_nonce, Key32};
 use crate::db;
 use crate::error::{AecError, AecResult};
 use crate::manifest::ProjectManifest;
@@ -163,7 +163,10 @@ impl ProjectPackage {
     pub fn append_command_log(&self, line: &serde_json::Value) -> AecResult<()> {
         let date = Utc::now().format("%Y-%m-%d").to_string();
         let file = self.root.join("commands").join(format!("{date}.jsonl"));
-        let mut f = fs::OpenOptions::new().create(true).append(true).open(file)?;
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(file)?;
         let serialized = serde_json::to_string(line)?;
         f.write_all(serialized.as_bytes())?;
         f.write_all(b"\n")?;
@@ -214,13 +217,17 @@ impl RecentsStore {
         let path = path.into();
         let entries = if path.exists() {
             let raw = fs::read_to_string(&path)?;
-            let parsed: Vec<RecentEntry> = serde_json::from_str(&raw)
-                .map_err(|e| AecError::CorruptRecents(e.to_string()))?;
+            let parsed: Vec<RecentEntry> =
+                serde_json::from_str(&raw).map_err(|e| AecError::CorruptRecents(e.to_string()))?;
             parsed
         } else {
             Vec::new()
         };
-        Ok(Self { path, max_entries, entries })
+        Ok(Self {
+            path,
+            max_entries,
+            entries,
+        })
     }
 
     pub fn entries(&self) -> &[RecentEntry] {
@@ -335,8 +342,10 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let (path, _master) = make_pkg(&td);
         let pkg = ProjectPackage::open(&path).unwrap();
-        pkg.append_command_log(&serde_json::json!({"cmd": 1})).unwrap();
-        pkg.append_command_log(&serde_json::json!({"cmd": 2})).unwrap();
+        pkg.append_command_log(&serde_json::json!({"cmd": 1}))
+            .unwrap();
+        pkg.append_command_log(&serde_json::json!({"cmd": 2}))
+            .unwrap();
         let date = Utc::now().format("%Y-%m-%d").to_string();
         let logfile = path.join("commands").join(format!("{date}.jsonl"));
         let raw = fs::read_to_string(logfile).unwrap();

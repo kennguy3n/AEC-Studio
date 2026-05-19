@@ -86,7 +86,11 @@ impl CommandEngine {
             forward: applied.clone(),
             inverse,
         });
-        Ok(CommandResult { command_id: cmd.command_id, applied, audit: envelope })
+        Ok(CommandResult {
+            command_id: cmd.command_id,
+            applied,
+            audit: envelope,
+        })
     }
 
     /// Return the deltas this command *would* produce without mutating.
@@ -102,7 +106,11 @@ impl CommandEngine {
             &entry.command_id,
             &serde_json::json!({"undo": entry.command_id.as_str()}),
         );
-        Ok(CommandResult { command_id: entry.command_id, applied, audit: envelope })
+        Ok(CommandResult {
+            command_id: entry.command_id,
+            applied,
+            audit: envelope,
+        })
     }
 
     /// Redo the most recently undone command.
@@ -113,7 +121,11 @@ impl CommandEngine {
             &entry.command_id,
             &serde_json::json!({"redo": entry.command_id.as_str()}),
         );
-        Ok(CommandResult { command_id: entry.command_id, applied, audit: envelope })
+        Ok(CommandResult {
+            command_id: entry.command_id,
+            applied,
+            audit: envelope,
+        })
     }
 
     /// Apply a sequence of deltas atomically. If one fails, deltas already
@@ -192,8 +204,8 @@ impl CommandEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::CommandKind;
     use crate::commands::room::CreateRoom;
+    use crate::commands::{camera, lighting, material, opening, wall, CommandKind};
     use aec_core::types::EntityId;
 
     fn wall_a() -> wall::CreateWall {
@@ -248,8 +260,13 @@ mod tests {
         let mut e = CommandEngine::new(Scope::Design);
         let create = wall_a();
         let id = create.entity_id.clone();
-        e.execute(Command::user(CommandKind::CreateWall(create))).unwrap();
-        let mv = wall::MoveWall { entity_id: id.clone(), new_start_mm: [10.0, 0.0], new_end_mm: [4500.0, 0.0] };
+        e.execute(Command::user(CommandKind::CreateWall(create)))
+            .unwrap();
+        let mv = wall::MoveWall {
+            entity_id: id.clone(),
+            new_start_mm: [10.0, 0.0],
+            new_end_mm: [4500.0, 0.0],
+        };
         e.execute(Command::user(CommandKind::MoveWall(mv))).unwrap();
         let body = &e.graph().get(&id).unwrap().body;
         assert_eq!(body["start_mm"], serde_json::json!([10.0, 0.0]));
@@ -269,7 +286,8 @@ mod tests {
         let mut e = CommandEngine::new(Scope::Design);
         let w = wall_a();
         let wall_id = w.entity_id.clone();
-        e.execute(Command::user(CommandKind::CreateWall(w))).unwrap();
+        e.execute(Command::user(CommandKind::CreateWall(w)))
+            .unwrap();
         let door = opening::PlaceDoor {
             entity_id: EntityId::new(),
             host_wall_id: wall_id.clone(),
@@ -279,7 +297,8 @@ mod tests {
             door_kind: opening::DoorKind::SingleSwing,
         };
         let door_id = door.entity_id.clone();
-        e.execute(Command::user(CommandKind::PlaceDoor(door))).unwrap();
+        e.execute(Command::user(CommandKind::PlaceDoor(door)))
+            .unwrap();
         let rec = e.graph().get(&door_id).unwrap();
         assert_eq!(rec.kind, "door");
         assert_eq!(rec.parent, Some(wall_id));
@@ -312,7 +331,8 @@ mod tests {
         // Create a wall first
         let w = wall_a();
         let wid = w.entity_id.clone();
-        e.execute(Command::user(CommandKind::CreateWall(w))).unwrap();
+        e.execute(Command::user(CommandKind::CreateWall(w)))
+            .unwrap();
 
         // Empty material id -> rejected
         let bad = material::PaintMaterial {
@@ -320,7 +340,9 @@ mod tests {
             material_id: "  ".into(),
             surface: None,
         };
-        let err = e.execute(Command::user(CommandKind::PaintMaterial(bad))).unwrap_err();
+        let err = e
+            .execute(Command::user(CommandKind::PaintMaterial(bad)))
+            .unwrap_err();
         matches!(err, CommandError::InvalidArguments { .. });
 
         // Valid paint applies
@@ -329,7 +351,8 @@ mod tests {
             material_id: "mat_oak".into(),
             surface: None,
         };
-        e.execute(Command::user(CommandKind::PaintMaterial(ok))).unwrap();
+        e.execute(Command::user(CommandKind::PaintMaterial(ok)))
+            .unwrap();
         let body = &e.graph().get(&wid).unwrap().body;
         assert_eq!(body["material_id"], serde_json::json!("mat_oak"));
     }
@@ -351,7 +374,8 @@ mod tests {
             },
         };
         let id = cam.entity_id.clone();
-        e.execute(Command::user(CommandKind::SaveCamera(cam))).unwrap();
+        e.execute(Command::user(CommandKind::SaveCamera(cam)))
+            .unwrap();
         let rec = e.graph().get(&id).unwrap();
         assert_eq!(rec.kind, "camera");
     }
@@ -368,12 +392,15 @@ mod tests {
             },
         };
         let id = light_cmd.entity_id.clone();
-        e.execute(Command::user(CommandKind::AddLight(light_cmd))).unwrap();
+        e.execute(Command::user(CommandKind::AddLight(light_cmd)))
+            .unwrap();
         assert!(e.graph().get(&id).is_some());
 
-        e.execute(Command::user(CommandKind::RemoveLight(lighting::RemoveLight {
-            entity_id: id.clone(),
-        })))
+        e.execute(Command::user(CommandKind::RemoveLight(
+            lighting::RemoveLight {
+                entity_id: id.clone(),
+            },
+        )))
         .unwrap();
         assert!(e.graph().get(&id).is_none());
     }

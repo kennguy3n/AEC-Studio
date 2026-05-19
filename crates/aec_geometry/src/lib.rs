@@ -27,7 +27,7 @@ pub use lighting::{LightingPreset, LightingPresetId};
 pub use mesh::{Mesh, MeshAttribute, Triangle};
 pub use opening::Opening;
 pub use room::Room;
-pub use snap::{SnapResult, SnapTarget, snap_to};
+pub use snap::{snap_to, SnapResult, SnapTarget};
 pub use spatial_index::{Bvh, BvhAabb};
 pub use wall::Wall;
 pub use window::{Window, WindowKind};

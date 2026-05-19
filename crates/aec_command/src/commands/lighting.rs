@@ -83,6 +83,8 @@ impl RemoveLight {
         let record = graph
             .get(&self.entity_id)
             .ok_or_else(|| CommandError::EntityNotFound(self.entity_id.to_string()))?;
-        Ok(EntityDelta::Delete { record: record.clone() })
+        Ok(EntityDelta::Delete {
+            record: record.clone(),
+        })
     }
 }

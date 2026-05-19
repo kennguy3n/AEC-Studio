@@ -59,10 +59,12 @@ impl ModifyFloor {
             .get(&self.entity_id)
             .ok_or_else(|| CommandError::EntityNotFound(self.entity_id.to_string()))?;
         let mut after = record.body.clone();
-        let obj = after.as_object_mut().ok_or_else(|| CommandError::InvalidArguments {
-            tool: "design.modify_floor".into(),
-            reason: "stored floor body is not an object".into(),
-        })?;
+        let obj = after
+            .as_object_mut()
+            .ok_or_else(|| CommandError::InvalidArguments {
+                tool: "design.modify_floor".into(),
+                reason: "stored floor body is not an object".into(),
+            })?;
         if let Some(b) = &self.new_boundary_mm {
             obj.insert("boundary_mm".into(), serde_json::to_value(b)?);
         }

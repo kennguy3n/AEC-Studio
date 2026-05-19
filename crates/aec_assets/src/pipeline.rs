@@ -71,7 +71,9 @@ impl<'a> AssetImportPipeline<'a> {
             return Err(AssetError::EmptyMesh);
         }
         if req.asset_id.trim().is_empty() {
-            return Err(AssetError::InvalidManifest("asset_id must not be empty".into()));
+            return Err(AssetError::InvalidManifest(
+                "asset_id must not be empty".into(),
+            ));
         }
         if req.base_triangle_count == 0 {
             return Err(AssetError::InvalidManifest(
@@ -155,7 +157,11 @@ mod tests {
         ImportRequest {
             asset_id: id.into(),
             name: format!("Asset {id}"),
-            vendor: Vendor { id: "v".into(), name: "V".into(), url: None },
+            vendor: Vendor {
+                id: "v".into(),
+                name: "V".into(),
+                url: None,
+            },
             version: "1.0".into(),
             license: License::CcBy,
             attribution: None,

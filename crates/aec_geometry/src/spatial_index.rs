@@ -100,8 +100,15 @@ impl BvhAabb {
 
 #[derive(Debug, Clone)]
 enum BvhNode {
-    Leaf { primitive: usize, aabb: BvhAabb },
-    Internal { aabb: BvhAabb, left: Box<BvhNode>, right: Box<BvhNode> },
+    Leaf {
+        primitive: usize,
+        aabb: BvhAabb,
+    },
+    Internal {
+        aabb: BvhAabb,
+        left: Box<BvhNode>,
+        right: Box<BvhNode>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -112,14 +119,16 @@ pub struct Bvh {
 
 impl Bvh {
     pub fn build(primitives: &[BvhAabb]) -> Self {
-        let mut indexed: Vec<(usize, BvhAabb)> =
-            primitives.iter().copied().enumerate().collect();
+        let mut indexed: Vec<(usize, BvhAabb)> = primitives.iter().copied().enumerate().collect();
         let root = if indexed.is_empty() {
             None
         } else {
             Some(build_recursive(&mut indexed))
         };
-        Self { root, primitive_count: primitives.len() }
+        Self {
+            root,
+            primitive_count: primitives.len(),
+        }
     }
 
     pub fn primitive_count(&self) -> usize {
@@ -127,9 +136,8 @@ impl Bvh {
     }
 
     pub fn root_aabb(&self) -> Option<BvhAabb> {
-        match &self.root {
-            Some(BvhNode::Leaf { aabb, .. }) | Some(BvhNode::Internal { aabb, .. }) => Some(*aabb),
-            None => None,
+        match self.root.as_ref()? {
+            BvhNode::Leaf { aabb, .. } | BvhNode::Internal { aabb, .. } => Some(*aabb),
         }
     }
 
@@ -158,7 +166,10 @@ impl Bvh {
 fn build_recursive(items: &mut [(usize, BvhAabb)]) -> BvhNode {
     if items.len() == 1 {
         let (idx, aabb) = items[0];
-        return BvhNode::Leaf { primitive: idx, aabb };
+        return BvhNode::Leaf {
+            primitive: idx,
+            aabb,
+        };
     }
     let mut bounds = items[0].1;
     for (_, a) in items.iter().skip(1) {
@@ -180,15 +191,14 @@ fn build_recursive(items: &mut [(usize, BvhAabb)]) -> BvhNode {
             BvhNode::Leaf { aabb: ra, .. } | BvhNode::Internal { aabb: ra, .. },
         ) => la.union(ra),
     };
-    BvhNode::Internal { aabb, left: Box::new(left), right: Box::new(right) }
+    BvhNode::Internal {
+        aabb,
+        left: Box::new(left),
+        right: Box::new(right),
+    }
 }
 
-fn collect(
-    node: &BvhNode,
-    origin: [f64; 3],
-    dir: [f64; 3],
-    out: &mut Vec<(usize, f64)>,
-) {
+fn collect(node: &BvhNode, origin: [f64; 3], dir: [f64; 3], out: &mut Vec<(usize, f64)>) {
     match node {
         BvhNode::Leaf { primitive, aabb } => {
             if let Some(t) = aabb.ray_intersect(origin, dir, 0.0, f64::INFINITY) {
@@ -196,7 +206,10 @@ fn collect(
             }
         }
         BvhNode::Internal { aabb, left, right } => {
-            if aabb.ray_intersect(origin, dir, 0.0, f64::INFINITY).is_some() {
+            if aabb
+                .ray_intersect(origin, dir, 0.0, f64::INFINITY)
+                .is_some()
+            {
                 collect(left, origin, dir, out);
                 collect(right, origin, dir, out);
             }
@@ -258,7 +271,7 @@ mod tests {
         let c = BvhAabb::new([0.5, 0.5, 0.5], [2.0, 2.0, 2.0]);
         let bvh = Bvh::build(&[a, b, c]);
         let mut hits = bvh.aabb_query(&BvhAabb::new([0.0, 0.0, 0.0], [1.5, 1.5, 1.5]));
-        hits.sort();
+        hits.sort_unstable();
         assert_eq!(hits, vec![0, 2]);
     }
 }

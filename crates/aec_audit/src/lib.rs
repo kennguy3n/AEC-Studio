@@ -23,7 +23,11 @@ pub enum AuditError {
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
     #[error("audit chain mismatch at line {line}: expected prev_hash {expected}, found {found}")]
-    ChainMismatch { line: usize, expected: String, found: String },
+    ChainMismatch {
+        line: usize,
+        expected: String,
+        found: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,11 +75,15 @@ impl AuditLog {
                         found: entry.prev_hash,
                     });
                 }
-                head = entry.hash.clone();
+                head.clone_from(&entry.hash);
                 entries.push(entry);
             }
         }
-        Ok(Self { path, head, entries })
+        Ok(Self {
+            path,
+            head,
+            entries,
+        })
     }
 
     pub fn head(&self) -> &str {
@@ -116,7 +124,10 @@ impl AuditLog {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut file = OpenOptions::new().create(true).append(true).open(&self.path)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
         let line = serde_json::to_string(&entry)?;
         writeln!(file, "{}", line)?;
         self.entries.push(entry);

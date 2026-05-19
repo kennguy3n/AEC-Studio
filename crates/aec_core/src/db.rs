@@ -15,7 +15,7 @@
 
 use std::path::Path;
 
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{params, Connection, OpenFlags};
 
 use crate::crypto::Key32;
 use crate::error::AecResult;
@@ -159,7 +159,10 @@ mod tests {
         let nonce = generate_project_nonce();
         let key = derive_project_key(&master, &nonce);
         let conn = open_encrypted(&p, &key).unwrap();
-        assert_eq!(schema_version(&conn).unwrap(), crate::manifest::SCHEMA_VERSION);
+        assert_eq!(
+            schema_version(&conn).unwrap(),
+            crate::manifest::SCHEMA_VERSION
+        );
 
         // entities table exists and is empty
         let mut stmt = conn.prepare("SELECT count(*) FROM entities").unwrap();

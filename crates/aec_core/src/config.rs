@@ -14,7 +14,11 @@ pub struct ProjectConfig {
 
 impl ProjectConfig {
     pub fn new(name: impl Into<String>, settings: ProjectSettings) -> Self {
-        Self { project_id: ProjectId::new(), name: name.into(), settings }
+        Self {
+            project_id: ProjectId::new(),
+            name: name.into(),
+            settings,
+        }
     }
 }
 
@@ -30,7 +34,11 @@ pub struct ProjectSettings {
 
 impl ProjectSettings {
     pub fn from_region(region: Region) -> Self {
-        Self { units: region.default_units(), region, standards: None }
+        Self {
+            units: region.default_units(),
+            region,
+            standards: None,
+        }
     }
 }
 
@@ -83,7 +91,11 @@ mod tests {
 
     #[test]
     fn project_settings_roundtrip() {
-        let s = ProjectSettings { units: Units::Mm, region: Region::Eu, standards: None };
+        let s = ProjectSettings {
+            units: Units::Mm,
+            region: Region::Eu,
+            standards: None,
+        };
         let j = serde_json::to_string(&s).unwrap();
         let back: ProjectSettings = serde_json::from_str(&j).unwrap();
         assert_eq!(s, back);

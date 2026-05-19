@@ -23,7 +23,9 @@ pub struct AuditHashChain {
 
 impl AuditHashChain {
     pub fn new() -> Self {
-        Self { head: "blake3:genesis".to_string() }
+        Self {
+            head: "blake3:genesis".to_string(),
+        }
     }
 
     pub fn head(&self) -> &str {
@@ -37,13 +39,12 @@ impl AuditHashChain {
         hasher.update(command_id.as_str().as_bytes());
         hasher.update(&canonical);
         let next = format!("blake3:{}", hasher.finalize().to_hex());
-        let envelope = AuditEnvelope {
+        AuditEnvelope {
             command_id: command_id.clone(),
             hash: next.clone(),
             previous_hash: std::mem::replace(&mut self.head, next),
             signed: false,
-        };
-        envelope
+        }
     }
 }
 
