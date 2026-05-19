@@ -5,9 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Placeholder while aec_geometry is being implemented."
+description = "Parametric geometry primitives (walls, floors, ceilings, rooms, openings, lighting, cameras) and supporting algorithms (mesh tessellation, BVH spatial index, snapping)."
 
 [dependencies]
+aec_core = { path = "../aec_core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+glam = { workspace = true }
 
 [lints]
 workspace = true
