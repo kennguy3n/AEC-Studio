@@ -70,6 +70,13 @@ impl BvhAabb {
 
     /// Ray-AABB intersection (slab method). Returns `Some(t_enter)` if hit
     /// within `[t_min, t_max]`.
+    ///
+    /// Handles negative direction components (via slab swap), parallel rays
+    /// (the resulting `±inf` propagates correctly), and degenerate slabs of
+    /// zero thickness — the latter via a strict `<` miss test so that an
+    /// infinitesimally thin AABB along one axis still registers a hit. This
+    /// is the canonical ray–AABB implementation in the codebase; callers
+    /// (BVH, viewport picker, etc.) all route through it.
     pub fn ray_intersect(
         &self,
         origin: [f64; 3],
@@ -90,7 +97,7 @@ impl BvhAabb {
             if t1 < t_max {
                 t_max = t1;
             }
-            if t_max <= t_min {
+            if t_max < t_min {
                 return None;
             }
         }

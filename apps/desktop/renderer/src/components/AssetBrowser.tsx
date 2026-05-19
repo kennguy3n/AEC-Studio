@@ -17,6 +17,9 @@ export function AssetBrowser() {
 
   useEffect(() => {
     let alive = true;
+    // Whenever the filter set changes, refetch AND reset to page 1 so the
+    // user never lands on an empty page beyond the new result set.
+    setPage(1);
     void aec.design
       .listAssets({ tags, styleTags, search, limit: 100 })
       .then((rows) => {
@@ -26,6 +29,13 @@ export function AssetBrowser() {
       alive = false;
     };
   }, [tags, styleTags, search]);
+
+  // Defense-in-depth: if assets shrink below the current page window
+  // (e.g. native backend returns fewer rows for the same filters), clamp.
+  const lastPage = Math.max(1, Math.ceil(assets.length / pageSize));
+  useEffect(() => {
+    if (page > lastPage) setPage(lastPage);
+  }, [page, lastPage]);
 
   const paged = useMemo(
     () => assets.slice((page - 1) * pageSize, page * pageSize),

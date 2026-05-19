@@ -8,6 +8,7 @@ use glam::Vec3A;
 use serde::{Deserialize, Serialize};
 
 use aec_core::types::EntityId;
+use aec_geometry::spatial_index::BvhAabb;
 
 use crate::camera::Ray;
 use crate::scene::{SceneGraph, SceneNodeKind};
@@ -97,23 +98,27 @@ pub fn pick(graph: &SceneGraph, ray: &Ray) -> Option<EntityId> {
 
 /// Slab-method ray–AABB intersection. Returns the nearest positive `t`, or
 /// `None` if the ray misses or hits behind the camera.
+///
+/// Delegates to the canonical implementation in `aec_geometry::spatial_index`
+/// so the viewport picker and the BVH used elsewhere in the engine cannot
+/// diverge.
 pub fn ray_aabb_intersection(ray: &Ray, min: Vec3A, max: Vec3A) -> Option<f32> {
-    let inv = Vec3A::new(
-        1.0 / ray.direction.x.max(1e-9_f32.copysign(ray.direction.x)),
-        1.0 / ray.direction.y.max(1e-9_f32.copysign(ray.direction.y)),
-        1.0 / ray.direction.z.max(1e-9_f32.copysign(ray.direction.z)),
+    let aabb = BvhAabb::new(
+        [min.x as f64, min.y as f64, min.z as f64],
+        [max.x as f64, max.y as f64, max.z as f64],
     );
-    let t0 = (min - Vec3A::from(ray.origin)) * inv;
-    let t1 = (max - Vec3A::from(ray.origin)) * inv;
-    let tmin = Vec3A::min(t0, t1);
-    let tmax = Vec3A::max(t0, t1);
-    let near = tmin.x.max(tmin.y).max(tmin.z);
-    let far = tmax.x.min(tmax.y).min(tmax.z);
-    if near > far || far < 0.0 {
-        None
-    } else {
-        Some(near.max(0.0))
-    }
+    let origin = [
+        ray.origin.x as f64,
+        ray.origin.y as f64,
+        ray.origin.z as f64,
+    ];
+    let dir = [
+        ray.direction.x as f64,
+        ray.direction.y as f64,
+        ray.direction.z as f64,
+    ];
+    aabb.ray_intersect(origin, dir, 0.0, f64::INFINITY)
+        .map(|t| t as f32)
 }
 
 #[cfg(test)]
@@ -170,5 +175,35 @@ mod tests {
             direction: Vec3::new(1.0, 0.0, 0.0).normalize(),
         };
         assert!(pick(&g, &ray).is_none());
+    }
+
+    #[test]
+    fn ray_aabb_intersection_handles_negative_direction() {
+        // A ray firing along -Z from in front of the cube must hit it.
+        // The previous clamp-based implementation produced a near-zero
+        // inv-direction for negative components and returned `None` here.
+        let min = Vec3A::new(-500.0, 0.0, -500.0);
+        let max = Vec3A::new(500.0, 1000.0, 500.0);
+        let ray = Ray {
+            origin: Vec3::new(0.0, 500.0, 3000.0),
+            direction: Vec3::new(0.0, 0.0, -1.0).normalize(),
+        };
+        let t = ray_aabb_intersection(&ray, min, max);
+        assert!(t.is_some(), "ray with negative direction must hit the AABB");
+        let hit = t.unwrap();
+        assert!(hit > 2000.0 && hit < 4000.0, "unexpected t: {hit}");
+    }
+
+    #[test]
+    fn pick_finds_mesh_with_negative_direction_ray() {
+        let mut g = SceneGraph::new();
+        let root = g.ensure_root();
+        let id = g.add_node(&root, SceneNode::new_mesh(unit_cube())).unwrap();
+        let ray = Ray {
+            origin: Vec3::new(0.0, 500.0, 3000.0),
+            direction: Vec3::new(0.0, 0.0, -1.0).normalize(),
+        };
+        let hit = pick(&g, &ray);
+        assert_eq!(hit, Some(id));
     }
 }

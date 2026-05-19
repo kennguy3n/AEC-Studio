@@ -97,15 +97,53 @@ impl<'a> SafetyValidator<'a> {
     }
 }
 
+/// Reject any absolute paths or network URLs that escape the project
+/// sandbox. We parse the payload as JSON and recursively inspect every
+/// **string value** — keys, structural punctuation, and numeric/bool
+/// literals are intentionally not checked, so a field name like
+/// `home_path_hint` cannot trigger a false positive.
+///
+/// If the payload is not valid JSON (which the grammar check should have
+/// already caught upstream) we fall back to a raw-substring scan so we
+/// never silently accept an exfiltration attempt in a malformed envelope.
 fn check_exfiltration(payload: &str) -> Result<(), SafetyError> {
-    // Reject any absolute paths or network URLs that escape the project
-    // sandbox. These patterns deliberately catch the common attempts to
-    // exfiltrate local data via an AI-suggested asset URL or to overwrite
-    // files outside the project package.
     const BAD_PATTERNS: &[&str] = &[
         "http://", "https://", "ftp://", "file:///", "/etc/", "/var/", "/Users/", "/home/", "C:\\",
         "C:/",
     ];
+
+    fn scan(value: &serde_json::Value, patterns: &[&str]) -> Result<(), SafetyError> {
+        match value {
+            serde_json::Value::String(s) => {
+                let lower = s.to_ascii_lowercase();
+                for pat in patterns {
+                    if lower.contains(&pat.to_ascii_lowercase()) {
+                        return Err(SafetyError::Exfiltration((*pat).into()));
+                    }
+                }
+                Ok(())
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    scan(item, patterns)?;
+                }
+                Ok(())
+            }
+            serde_json::Value::Object(map) => {
+                for v in map.values() {
+                    scan(v, patterns)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) {
+        return scan(&v, BAD_PATTERNS);
+    }
+    // Non-JSON payload — apply the legacy raw scan so we err on the side
+    // of caution rather than letting an exfiltration attempt slip through.
     let lower = payload.to_ascii_lowercase();
     for pat in BAD_PATTERNS {
         if lower.contains(&pat.to_ascii_lowercase()) {
@@ -186,6 +224,28 @@ mod tests {
         let err = v
             .validate(&ctx(ToolName::StyleAssistant, Scope::Design, 1, payload))
             .unwrap_err();
+        assert!(matches!(err, SafetyError::Exfiltration(_)));
+    }
+
+    #[test]
+    fn check_exfiltration_ignores_keys_and_inspects_values() {
+        // A key called `home_path_hint` MUST NOT trigger; only string values
+        // are scanned. The values themselves are benign here.
+        let benign = r#"{"home_path_hint":"living_room","tags":["sofa","home_lamp"]}"#;
+        assert!(check_exfiltration(benign).is_ok());
+
+        // Same shape, but a value points at the user's home directory —
+        // that must still be rejected.
+        let exfil = r#"{"home_path_hint":"living_room","target":"/home/user/.ssh/id_rsa"}"#;
+        let err = check_exfiltration(exfil).unwrap_err();
+        assert!(matches!(err, SafetyError::Exfiltration(_)));
+    }
+
+    #[test]
+    fn check_exfiltration_falls_back_to_raw_scan_for_invalid_json() {
+        // Malformed payload — fallback raw scan must still catch the URL.
+        let bad = "not really json http://evil.example/secret";
+        let err = check_exfiltration(bad).unwrap_err();
         assert!(matches!(err, SafetyError::Exfiltration(_)));
     }
 }

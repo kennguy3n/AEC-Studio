@@ -116,25 +116,53 @@ export function setBridge(replacement: BridgeBackend): void {
   backend = replacement;
 }
 
+/**
+ * Locate and load the compiled N-API `aec_bridge` library, falling back to
+ * the in-process backend if it can't be found.
+ *
+ * `cargo build` produces different file names per platform:
+ *   - Linux:   `libaec_bridge.so`
+ *   - macOS:   `libaec_bridge.dylib`
+ *   - Windows: `aec_bridge.dll`     (note: no `lib` prefix)
+ *
+ * For `require()` to load any of them they must be renamed to `.node`.
+ * The build script (`npm run build:native`) does this rename. We probe
+ * every reasonable candidate so a developer who renamed by hand —
+ * particularly on Windows where the `lib` prefix is unconventional —
+ * still gets the native backend wired up.
+ */
 function loadNativeBackend(): BridgeBackend | null {
-  const candidate = path.resolve(
-    __dirname,
-    "..",
-    "..",
-    "..",
-    "target",
-    "release",
-    "libaec_bridge.node",
+  const targetDir = path.resolve(__dirname, "..", "..", "..", "target", "release");
+  const candidates = nativeLibraryCandidates(process.platform).map((name) =>
+    path.join(targetDir, name),
   );
-  if (!fs.existsSync(candidate)) {
+  const found = candidates.find((c) => fs.existsSync(c));
+  if (!found) {
     return null;
   }
   try {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const native = require(candidate);
+    const native = require(found);
     return adaptNative(native);
   } catch {
     return null;
+  }
+}
+
+/**
+ * Return platform-specific candidate file names for the native bridge,
+ * in priority order. The two `.node` variants are what the build script
+ * normally produces; the raw cdylib names are fallbacks for ad-hoc builds.
+ */
+export function nativeLibraryCandidates(platform: NodeJS.Platform): string[] {
+  switch (platform) {
+    case "win32":
+      // napi-rs on Windows omits the `lib` prefix.
+      return ["aec_bridge.node", "aec_bridge.dll"];
+    case "darwin":
+      return ["libaec_bridge.node", "libaec_bridge.dylib"];
+    default:
+      return ["libaec_bridge.node", "libaec_bridge.so"];
   }
 }
 
@@ -343,20 +371,38 @@ function inProcessRuntimeStatus(): RuntimeStatus {
   const cpuCount = nodeOs.cpus().length;
   const totalMem = Math.round(nodeOs.totalmem() / (1024 * 1024));
   const freeMem = Math.round(nodeOs.freemem() / (1024 * 1024));
+  const cpuModel = nodeOs.cpus()[0]?.model ?? "host-cpu";
   return {
-    tier: classifyTier(cpuCount, totalMem),
-    cpu: { model: "host-cpu", physicalCores: cpuCount, logicalCores: cpuCount },
+    tier: classifyTier(cpuCount, totalMem, /* vramMb */ 0),
+    cpu: { model: cpuModel, physicalCores: cpuCount, logicalCores: cpuCount },
     ramTotalMb: totalMem,
     ramAvailableMb: freeMem,
+    // Node `os` has no GPU API; the in-process fallback intentionally
+    // reports `null` GPU and is therefore capped at `Low` by
+    // `classifyTier`. The real Rust profiler (in `aec_governor`) does the
+    // full detection when the native bridge is loaded.
     gpu: null,
     os: process.platform,
   };
 }
 
-function classifyTier(cores: number, totalMemMb: number): RuntimeStatus["tier"] {
-  if (cores >= 16 && totalMemMb >= 32 * 1024) return "Pro";
-  if (cores >= 8 && totalMemMb >= 16 * 1024) return "High";
-  if (cores >= 4 && totalMemMb >= 8 * 1024) return "Medium";
+/**
+ * Classify hardware into a tier. This mirrors `HardwareTier::classify` in
+ * `crates/aec_governor/src/tier.rs` — including the VRAM gate, which is the
+ * reason a machine without a discrete GPU (or where we simply can't see one)
+ * is always classified as `Low`. Keep this function and the Rust version in
+ * lockstep.
+ */
+export function classifyTier(
+  cores: number,
+  totalMemMb: number,
+  vramMb: number,
+): RuntimeStatus["tier"] {
+  const ramGb = Math.floor(totalMemMb / 1024);
+  const vramGb = Math.floor(vramMb / 1024);
+  if (cores >= 16 && ramGb >= 32 && vramGb >= 12) return "Pro";
+  if (cores >= 8 && ramGb >= 16 && vramGb >= 8) return "High";
+  if (cores >= 4 && ramGb >= 8 && vramGb >= 4) return "Medium";
   return "Low";
 }
 
