@@ -7,7 +7,7 @@ pub mod scheduler;
 pub mod tier;
 pub mod ui_report;
 
-pub use policy::{AiModelTier, AiPolicy, GovernorPolicy, RenderPolicy};
+pub use policy::{AiModelTier, AiPolicy, GovernorPolicy, PresetKey, RenderPolicy};
 pub use profiler::{CpuProfile, GpuProfile, HardwareProfile, HardwareProfiler};
 pub use report::ProfileReport;
 pub use scheduler::{BackoffReason, GovernorScheduler, ScheduleVerdict, SchedulerError};

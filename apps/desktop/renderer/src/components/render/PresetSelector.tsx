@@ -41,7 +41,11 @@ export const PRESETS: PresetDetail[] = [
     label: "EEVEE Preview",
     shortDescription: "Fast realtime preview",
     samples: 64,
-    resolution: [960, 540],
+    // Matches `RenderPreset::eevee_preview()` in
+    // crates/aec_render/src/preset.rs (1280×720). The governor's
+    // `eevee_resolution_scale` is applied at draw time — the preset
+    // itself stores the unscaled resolution.
+    resolution: [1280, 720],
   },
   {
     id: "quick",
@@ -64,7 +68,8 @@ export const PRESETS: PresetDetail[] = [
     label: "High",
     shortDescription: "Presentation",
     samples: 256,
-    resolution: [2560, 1440],
+    // Matches `RenderPreset::high()` in crates/aec_render/src/preset.rs.
+    resolution: [1920, 1080],
     defaultForTier: "High",
   },
   {

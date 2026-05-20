@@ -133,16 +133,21 @@ impl LightingPreset {
                 self.sun_color_temperature_k,
             ));
         }
-        let total_energy: f32 = self.sun_intensity
-            + self
-                .accent_lights
-                .iter()
-                .map(|l| match l {
-                    RenderLight::SunSky { intensity, .. }
-                    | RenderLight::Area { intensity, .. }
-                    | RenderLight::Point { intensity, .. } => *intensity,
-                })
-                .sum::<f32>();
+        // Sky and ambient illumination both contribute to the render —
+        // a scene without a sun disc but with a strong sky still produces
+        // a non-black image. Count them so purely-ambient outdoor presets
+        // (e.g. overcast skies, interior light wells) validate cleanly.
+        let accent_energy: f32 = self
+            .accent_lights
+            .iter()
+            .map(|l| match l {
+                RenderLight::SunSky { intensity, .. }
+                | RenderLight::Area { intensity, .. }
+                | RenderLight::Point { intensity, .. } => *intensity,
+            })
+            .sum::<f32>();
+        let total_energy =
+            self.sun_intensity + accent_energy + self.sky.strength + self.ambient_strength;
         if total_energy <= 0.0 {
             return Err(LightingValidationError::ZeroEnergy);
         }
@@ -710,7 +715,35 @@ mod tests {
         let mut p = LightingPreset::overcast();
         p.sun_intensity = 0.0;
         p.accent_lights.clear();
+        // Ambient + sky also count toward the energy budget — zero them
+        // out so this case truly has no light contribution.
+        p.sky.strength = 0.0;
+        p.ambient_strength = 0.0;
         assert_eq!(p.validate(), Err(LightingValidationError::ZeroEnergy));
+    }
+
+    #[test]
+    fn validate_accepts_sky_only_preset() {
+        // A purely sky-lit scene (no sun disc, no accent lights, no
+        // ambient) — e.g. an open-air overcast scene — should validate
+        // because the sky shader still produces light.
+        let mut p = LightingPreset::overcast();
+        p.sun_intensity = 0.0;
+        p.accent_lights.clear();
+        p.ambient_strength = 0.0;
+        p.sky.strength = 1.5;
+        assert!(p.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_ambient_only_preset() {
+        // Pure ambient (interior scenes lit only by their environment).
+        let mut p = LightingPreset::overcast();
+        p.sun_intensity = 0.0;
+        p.accent_lights.clear();
+        p.sky.strength = 0.0;
+        p.ambient_strength = 0.5;
+        assert!(p.validate().is_ok());
     }
 
     #[test]

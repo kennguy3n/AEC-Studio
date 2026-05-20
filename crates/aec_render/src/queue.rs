@@ -271,11 +271,45 @@ impl RenderQueue {
         let mut job = self.completed.remove(idx);
         job.status = RenderJobStatus::Queued;
         job.error = None;
+        // For walkthrough jobs, completed_frames is preserved so the
+        // worker knows where to pick up. Progress is recomputed from
+        // the count of completed frames vs total expected (callers can
+        // set this back to 0 if they're treating it as a fresh job).
         job.progress = 0.0;
         job.started_at = None;
         job.completed_at = None;
         self.queued.push_back(job);
         Ok(())
+    }
+
+    /// Persist the current queue state to a single JSON file. Atomic
+    /// via write-to-temp-then-rename so a crash mid-write doesn't
+    /// corrupt the on-disk state.
+    pub fn persist(&self, path: &std::path::Path) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension("json.tmp");
+        let bytes = serde_json::to_vec_pretty(self).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+        })?;
+        std::fs::write(&tmp, bytes)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Load queue state previously written by [`Self::persist`]. Missing
+    /// file yields an empty queue rather than an error so callers can
+    /// always use `persist` -> `load` symmetrically.
+    pub fn load(path: &std::path::Path) -> std::io::Result<Self> {
+        if !path.exists() {
+            return Ok(Self::new());
+        }
+        let bytes = std::fs::read(path)?;
+        let q: RenderQueue = serde_json::from_slice(&bytes).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+        })?;
+        Ok(q)
     }
 
     pub fn list_jobs(&self) -> Vec<&RenderJob> {
@@ -456,5 +490,52 @@ mod tests {
     fn batch_progress_unknown_returns_none() {
         let q = RenderQueue::new();
         assert!(q.batch_progress("batch_nope").is_none());
+    }
+
+    #[test]
+    fn persist_and_load_roundtrip_preserves_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.json");
+
+        let mut q = RenderQueue::new();
+        let cams = vec![make_camera("A"), make_camera("B")];
+        let _sub = q.submit_batch(&cams, RenderPreset::standard(), &RenderScene::new());
+        // Drive one job to failed so we exercise all queue states.
+        let first = q.admit().unwrap();
+        q.fail(&first.id, "test failure").unwrap();
+
+        q.persist(&path).unwrap();
+        let loaded = RenderQueue::load(&path).unwrap();
+
+        assert_eq!(loaded.list_jobs().len(), q.list_jobs().len());
+        assert!(loaded
+            .list_jobs()
+            .iter()
+            .any(|j| j.status == RenderJobStatus::Failed));
+    }
+
+    #[test]
+    fn load_returns_empty_queue_for_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = RenderQueue::load(&dir.path().join("missing.json")).unwrap();
+        assert_eq!(q.queued_count(), 0);
+        assert_eq!(q.list_jobs().len(), 0);
+    }
+
+    #[test]
+    fn resume_walkthrough_preserves_completed_frames() {
+        let mut q = RenderQueue::new();
+        let mut job = make_job(0);
+        // Stamp the job with walkthrough progress before submitting.
+        job.mark_frame_completed(0);
+        job.mark_frame_completed(1);
+        job.mark_frame_completed(2);
+        let id = q.submit(job);
+        let _ = q.admit().unwrap();
+        q.fail(&id, "crash at frame 3").unwrap();
+        q.resume(&id).unwrap();
+        let resumed = q.get(&id).unwrap();
+        assert_eq!(resumed.completed_frames, vec![0, 1, 2]);
+        assert_eq!(resumed.next_walkthrough_frame(), Some(3));
     }
 }

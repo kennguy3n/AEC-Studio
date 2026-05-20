@@ -58,7 +58,7 @@ impl RenderPreset {
 
     pub fn quick() -> Self {
         Self {
-            id: "cycles_quick".into(),
+            id: "quick".into(),
             display_name: "Quick".into(),
             config: RenderPresetConfig {
                 quality: RenderQuality::Quick,
@@ -75,7 +75,7 @@ impl RenderPreset {
 
     pub fn standard() -> Self {
         Self {
-            id: "cycles_standard".into(),
+            id: "standard".into(),
             display_name: "Standard".into(),
             config: RenderPresetConfig {
                 quality: RenderQuality::Standard,
@@ -92,7 +92,7 @@ impl RenderPreset {
 
     pub fn high() -> Self {
         Self {
-            id: "cycles_high".into(),
+            id: "high".into(),
             display_name: "High".into(),
             config: RenderPresetConfig {
                 quality: RenderQuality::High,
@@ -109,7 +109,7 @@ impl RenderPreset {
 
     pub fn studio() -> Self {
         Self {
-            id: "cycles_studio".into(),
+            id: "studio".into(),
             display_name: "Studio".into(),
             config: RenderPresetConfig {
                 quality: RenderQuality::Studio,
@@ -126,7 +126,7 @@ impl RenderPreset {
 
     pub fn walkthrough() -> Self {
         Self {
-            id: "cycles_walkthrough".into(),
+            id: "walkthrough".into(),
             display_name: "Walkthrough".into(),
             config: RenderPresetConfig {
                 quality: RenderQuality::Walkthrough,
@@ -143,7 +143,7 @@ impl RenderPreset {
 
     pub fn panorama() -> Self {
         Self {
-            id: "cycles_panorama".into(),
+            id: "panorama".into(),
             display_name: "Panorama".into(),
             config: RenderPresetConfig {
                 quality: RenderQuality::Panorama,
@@ -385,7 +385,7 @@ mod tests {
         let mut clash = RenderPreset::quick();
         clash.display_name = "User Quick".into();
         let err = store.insert_custom(clash).unwrap_err();
-        assert!(matches!(err, PresetError::ReservedId(id) if id == "cycles_quick"));
+        assert!(matches!(err, PresetError::ReservedId(id) if id == "quick"));
     }
 
     #[test]
