@@ -56,8 +56,11 @@ dependencies = [
 name = "aec_bim"
 version = "0.1.0"
 dependencies = [
+ "aec_ai",
  "aec_cad",
  "aec_core",
+ "aec_export",
+ "aec_render",
  "blake3",
  "rust_xlsxwriter 0.71.0",
  "serde",
@@ -97,6 +100,7 @@ dependencies = [
  "bitflags 2.11.1",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
 ]
 
@@ -104,7 +108,14 @@ dependencies = [
 name = "aec_command"
 version = "0.1.0"
 dependencies = [
+ "aec_ai",
+ "aec_audit",
+ "aec_bim",
+ "aec_cad",
  "aec_core",
+ "aec_export",
+ "aec_materials",
+ "aec_render",
  "blake3",
  "chrono",
  "serde",

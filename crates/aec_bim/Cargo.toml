@@ -18,6 +18,9 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+aec_ai = { path = "../aec_ai" }
+aec_export = { path = "../aec_export" }
+aec_render = { path = "../aec_render" }
 tempfile = { workspace = true }
 
 [lints]
