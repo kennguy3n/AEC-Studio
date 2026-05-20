@@ -41,6 +41,7 @@ pub enum ToolName {
     PropertyFill,
     ValidationHelp,
     CoverPageDraft,
+    LightingBalance,
 }
 
 impl ToolName {
@@ -57,6 +58,7 @@ impl ToolName {
             Self::PropertyFill => "property_fill",
             Self::ValidationHelp => "validation_help",
             Self::CoverPageDraft => "cover_page_draft",
+            Self::LightingBalance => "lighting_balance",
         }
     }
 }
@@ -168,11 +170,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_contain_eleven_tools() {
+    fn defaults_contain_all_tools() {
         let r = ToolSchemaRegistry::defaults();
-        assert_eq!(r.len(), 11);
+        assert_eq!(r.len(), 12);
         assert!(r.get(ToolName::PlanDetection).is_some());
         assert!(r.get(ToolName::CoverPageDraft).is_some());
+        assert!(r.get(ToolName::LightingBalance).is_some());
     }
 
     #[test]
@@ -246,6 +249,12 @@ mod tests {
                 &[Scope::Deliver],
                 4,
                 "cover_page_draft",
+            ),
+            (
+                ToolName::LightingBalance,
+                &[Scope::Render],
+                8,
+                "lighting_balance",
             ),
         ];
         for (name, scopes, max, grammar) in cases {

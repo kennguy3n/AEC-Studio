@@ -46,4 +46,6 @@ pub use preset::{
 };
 pub use queue::{QueueError, RenderQueue};
 pub use scene::{RenderCamera, RenderLight, RenderScene, SerializedMesh};
-pub use worker::{BlenderRequest, BlenderResponse, BlenderWorker, WorkerError, WorkerState};
+pub use worker::{
+    BlenderRequest, BlenderResponse, BlenderWorker, WalkthroughOutput, WorkerError, WorkerState,
+};

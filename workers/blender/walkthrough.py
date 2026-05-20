@@ -272,3 +272,151 @@ def _set_attr(target: Any, name: str, value: Any) -> None:
         target[name] = value
     else:
         setattr(target, name, value)
+
+
+def stitch_frames(
+    out_dir: str,
+    output_path: str,
+    *,
+    fps: int = 24,
+    frame_pattern: str = "frame_%05d.png",
+    ffmpeg_path: str | None = None,
+) -> dict[str, Any]:
+    """Stitch the still-frame sequence in `out_dir` into an MP4 video.
+
+    Returns a dict shaped:
+
+        {"kind": "video", "path": "/abs/out.mp4", "fps": 24,
+         "frame_count": N, "ffmpeg": "/path/to/ffmpeg"}
+
+    or, if FFmpeg is unavailable on this machine:
+
+        {"kind": "image_sequence", "dir": "/abs/out", "frame_count": N}
+
+    The Rust side maps the two shapes to `WalkthroughOutput::Video` /
+    `WalkthroughOutput::ImageSequence` respectively.
+
+    Error contract:
+
+    * **FFmpeg is not installed** — we never raise. Returning the
+      image-sequence dict is a legitimate outcome (some studios prefer
+      to stitch with their own tooling so they can apply LUTs in the
+      process).
+    * **FFmpeg is installed but the encode fails** (non-zero exit,
+      corrupted install, codec missing, frame mismatch) — we raise
+      `RuntimeError` with the stderr tail. A present-but-failing FFmpeg
+      almost always indicates a real problem the caller should hear
+      about; silently degrading to an image sequence would mask render
+      breakage.
+    * **Argument validation** (`fps <= 0`, missing `out_dir`, no
+      frames) — we raise `ValueError`. These are caller bugs, not
+      environmental fall-backs.
+    """
+
+    import fnmatch
+    import re
+    import shutil
+    import subprocess
+
+    out_path = Path(out_dir)
+    if not out_path.is_dir():
+        raise ValueError(f"out_dir does not exist or is not a directory: {out_dir}")
+    if fps <= 0:
+        raise ValueError(f"fps must be positive (got {fps})")
+
+    # Count only files that *actually match* `frame_pattern`. FFmpeg's
+    # `-i frame_%05d.png` only ingests files matching that printf
+    # pattern, so counting unrelated images (thumbnails, leftover
+    # reference frames, frames from a previous run with a different
+    # pattern) is misleading on two fronts:
+    #
+    # 1. We could pass the `frame_count == 0` guard when nothing
+    #    actually matches the pattern, leaving the user with a cryptic
+    #    FFmpeg "No such file or directory" instead of a clear caller
+    #    error.
+    # 2. When FFmpeg is absent we return `frame_count` in the
+    #    image-sequence fall-back; reporting a count that includes
+    #    non-frame files would inflate the result and confuse the Rust
+    #    side that maps this back to `WalkthroughOutput::ImageSequence`.
+    #
+    # Patterns without a literal prefix before `%d` (e.g. `%05d.png` →
+    # glob `*.png`) would silently match every PNG in the directory,
+    # defeating the whole point of pattern-checking. Reject those at
+    # the boundary so callers cannot accidentally pass an ambiguous
+    # pattern and get a wrong frame count.
+    percent_idx = frame_pattern.find("%")
+    if percent_idx == -1:
+        raise ValueError(
+            f"frame_pattern '{frame_pattern}' has no printf placeholder (`%d`/`%05d`)"
+        )
+    if percent_idx == 0:
+        raise ValueError(
+            f"frame_pattern '{frame_pattern}' lacks a literal prefix before the "
+            f"frame number; require something like 'frame_%05d.png' so the glob "
+            f"can be disambiguated from unrelated files in the same directory"
+        )
+    glob_pattern = re.sub(r"%0?\d*d", "*", frame_pattern)
+    frame_count = sum(
+        1
+        for p in out_path.iterdir()
+        if p.is_file() and fnmatch.fnmatchcase(p.name, glob_pattern)
+    )
+    if frame_count == 0:
+        raise ValueError(
+            f"no frames matching '{frame_pattern}' found in {out_dir}"
+        )
+
+    if ffmpeg_path is not None:
+        # Caller pinned a specific binary. Verify it exists and is
+        # executable before invoking — otherwise fall back gracefully
+        # (this is the behaviour studios on machines without FFmpeg
+        # actually exercise).
+        candidate = Path(ffmpeg_path)
+        ffmpeg = str(candidate) if candidate.is_file() else None
+    else:
+        ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        return {
+            "kind": "image_sequence",
+            "dir": str(out_path.absolute()),
+            "frame_count": int(frame_count),
+        }
+
+    output_abs = Path(output_path)
+    output_abs.parent.mkdir(parents=True, exist_ok=True)
+
+    # Use yuv420p so the result is compatible with QuickTime / web players.
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-framerate",
+        str(int(fps)),
+        "-i",
+        str(out_path / frame_pattern),
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-crf",
+        "18",
+        str(output_abs),
+    ]
+    completed = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(
+            "ffmpeg failed with exit code "
+            f"{completed.returncode}: {completed.stderr.strip()}"
+        )
+
+    return {
+        "kind": "video",
+        "path": str(output_abs.absolute()),
+        "fps": int(fps),
+        "frame_count": int(frame_count),
+        "ffmpeg": ffmpeg,
+    }

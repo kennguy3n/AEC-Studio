@@ -12,15 +12,21 @@ function renderAt(path: string) {
 }
 
 describe("App", () => {
-  it("renders the mode rail with all six modes", () => {
+  it("renders the mode rail with all seven modes", () => {
     renderAt("/");
-    expect(screen.getAllByRole("link")).toHaveLength(6);
+    expect(screen.getAllByRole("link")).toHaveLength(7);
     expect(screen.getByText("Home")).toBeInTheDocument();
     expect(screen.getByText("Design")).toBeInTheDocument();
     expect(screen.getByText("Draft")).toBeInTheDocument();
     expect(screen.getByText("BIM")).toBeInTheDocument();
     expect(screen.getByText("Render")).toBeInTheDocument();
     expect(screen.getByText("Deliver")).toBeInTheDocument();
+    expect(screen.getByText("Settings")).toBeInTheDocument();
+  });
+
+  it("renders the settings page when navigating to /settings", () => {
+    renderAt("/settings");
+    expect(screen.getByTestId("settings-page")).toBeInTheDocument();
   });
 
   it("renders the design page when navigating to /design", () => {

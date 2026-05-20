@@ -12,6 +12,7 @@ pub mod gizmo;
 pub mod grid;
 pub mod instancing;
 pub mod material_preview;
+pub mod reference_image;
 pub mod renderer;
 pub mod scene;
 pub mod selection;
@@ -26,6 +27,10 @@ pub use gizmo::{GizmoAxis, GizmoMode, TransformGizmo};
 pub use grid::{Grid, GridStyle};
 pub use instancing::{Instance, InstanceBatch};
 pub use material_preview::{MaterialPreview, MaterialPreviewSlot};
+pub use reference_image::{
+    decode as decode_reference_image, ReferenceImage, ReferenceImageBitmap, ReferenceImageError,
+    ReferenceImageKind, ReferenceImageOverlay, MAX_IMAGE_DIMENSION_PX,
+};
 pub use renderer::{RendererBackend, ViewportRenderer};
 pub use scene::{SceneGraph, SceneMesh, SceneNode, SceneNodeKind};
 pub use selection::{Selection, SelectionMode};

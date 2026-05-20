@@ -10,6 +10,7 @@ description = "Real-time viewport: wgpu renderer, scene graph, camera, grid, sel
 [dependencies]
 aec_core = { path = "../aec_core" }
 aec_geometry = { path = "../aec_geometry" }
+blake3 = { workspace = true }
 glam = { version = "0.27", features = ["serde"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

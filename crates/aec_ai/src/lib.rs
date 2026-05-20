@@ -13,6 +13,7 @@ pub mod cover_draft;
 pub mod diff_engine;
 pub mod grammars;
 pub mod layout_suggestion;
+pub mod lighting_balance;
 pub mod plan_detection;
 pub mod plan_to_wall;
 pub mod planner;
@@ -20,8 +21,10 @@ pub mod property_fill;
 pub mod render_doctor;
 pub mod runtime;
 pub mod safety_validator;
+pub mod schedule_fill;
 pub mod style_assistant;
 pub mod tool_schema;
+pub mod validation_help;
 
 pub use audit::{AiAuditLogger, AiAuditRecord};
 pub use bim_classification::{
@@ -37,6 +40,9 @@ pub use cover_draft::{CoverDraftError, CoverDraftTone, CoverPageDraft};
 pub use diff_engine::{Diff, DiffEngine, DiffOperation, DiffStatus};
 pub use grammars::{Grammar, GrammarRegistry};
 pub use layout_suggestion::{LayoutProposal, LayoutSuggestionResult, LayoutValidationError};
+pub use lighting_balance::{
+    AccentLight, AccentLightKind, LightingBalanceError, LightingBalanceResult, MAX_ACCENT_LIGHTS,
+};
 pub use plan_detection::{PlanDetectionResult, PolylineProposal};
 pub use plan_to_wall::{
     convert as plan_to_wall_convert, convert_from_polylines as plan_to_wall_from_polylines,
@@ -50,5 +56,9 @@ pub use property_fill::{
 pub use render_doctor::{RenderDoctorFinding, RenderDoctorResult, RenderIssue};
 pub use runtime::{RuntimeConfig, RuntimeError, RuntimeState, SidecarRuntime};
 pub use safety_validator::{SafetyError, SafetyValidator, SafetyViolation};
+pub use schedule_fill::{
+    FilledRow, ScheduleFillError, ScheduleFillResult, REVIEW_CONFIDENCE_THRESHOLD,
+};
 pub use style_assistant::{StyleAssistantResult, StyleSuggestion};
 pub use tool_schema::{ToolName, ToolSchema, ToolSchemaRegistry};
+pub use validation_help::{FixAction, ValidationFix, ValidationHelpError, ValidationHelpResult};

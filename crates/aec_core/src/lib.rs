@@ -20,6 +20,12 @@ pub mod config;
 pub mod crypto;
 pub mod db;
 pub mod error;
+#[cfg(feature = "kchat")]
+pub mod kchat;
+#[cfg(feature = "kchat")]
+pub mod kchat_config;
+#[cfg(feature = "kchat")]
+pub mod kchat_sync;
 pub mod manifest;
 pub mod package;
 pub mod revision;
@@ -29,6 +35,16 @@ pub mod version_diff;
 
 pub use config::{HardwareProfile, ProjectConfig, ProjectSettings};
 pub use error::{AecError, AecResult};
+#[cfg(feature = "kchat")]
+pub use kchat::{
+    ingest_review, ingest_review_card, ApprovalStatus, ArtifactCard, AssetPackEntry,
+    AssetPackEntryKind, AssetPackManifest, AssetPackReference, InMemoryPublisher, KChatArtifact,
+    KChatError, KChatPublisher, ProjectAuditEntry, PublishResult, ReviewCard, ReviewComment,
+};
+#[cfg(feature = "kchat")]
+pub use kchat_config::{AssetPackPublishOutcome, KChatConfig, KChatIntegration};
+#[cfg(feature = "kchat")]
+pub use kchat_sync::CommentSync;
 pub use manifest::{ProjectManifest, SCHEMA_VERSION};
 pub use package::{ProjectPackage, ProjectSummary, RecentEntry, RecentsStore};
 pub use revision::{Revision, RevisionDraft, RevisionEntity, RevisionStore};

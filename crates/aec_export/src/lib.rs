@@ -17,10 +17,12 @@ pub mod svg_export;
 pub mod xlsx;
 
 pub use before_after::{BeforeAfterPdfError, BeforeAfterPdfOptions, BeforeAfterRenderPair};
-pub use bim_pack::{BimPack, BimPackError};
+pub use bim_pack::{BimPack, BimPackError, ValidationReport, ValidationReportKind};
 pub use boq::{BoqExport, BoqExportError, BoqLine, BoqSection, RegionalConfig};
-pub use contractor_pack::{ContractorPack, ContractorPackError, PackManifest};
-pub use interior_pack::{InteriorPack, InteriorPackError};
+pub use contractor_pack::{
+    ContractorPack, ContractorPackError, ManifestEntry, PackFile, PackManifest,
+};
+pub use interior_pack::{InteriorPack, InteriorPackError, InteriorRender};
 pub use pdf::{PdfBuilder, PdfBuilderError};
 pub use pdf_sheet::SheetPdfBuilder;
 pub use plot_style::{PlotStyle, PlotStyleTable};

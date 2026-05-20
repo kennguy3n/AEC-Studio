@@ -1,0 +1,79 @@
+# electron-builder config for macOS targets.
+#
+# All resource paths below are expressed *relative to the project
+# directory*, which is `apps/desktop/` (where package.json lives) —
+# that's how electron-builder resolves every path in its config. The
+# packaging assets themselves live one level up at the repo root, so
+# paths use the `../../packaging/macos/...` prefix.
+#
+# Build the renderer + electron main bundle first (`npm run build` in
+# apps/desktop/), then invoke electron-builder from `apps/desktop`:
+#
+#   cd apps/desktop
+#   npx electron-builder --mac \
+#     --config ../../packaging/macos/electron-builder.macos.yml
+#
+# or from the repo root with an explicit projectDir:
+#
+#   npx electron-builder --mac \
+#     --config packaging/macos/electron-builder.macos.yml \
+#     --projectDir apps/desktop
+#
+# Either invocation resolves `../../packaging/macos/resources/...`
+# correctly because projectDir is always `apps/desktop`.
+#
+# Targets:
+# * dmg — disk image, primary distribution form.
+# * zip — flat zip, used for auto-update channels.
+#
+# Code signing: leave CSC_LINK / CSC_KEY_PASSWORD unset for local
+# unsigned builds. CI sets them from secrets when releasing.
+
+appId: ai.aec.studio
+productName: AEC Studio
+copyright: "© 2026 AEC Studio Authors"
+
+directories:
+  # Paths are relative to projectDir = apps/desktop.
+  buildResources: ../../packaging/macos/resources
+  output: dist/installers/macos
+
+files:
+  - dist-electron/**
+  - dist/**
+  - package.json
+  - node_modules/**
+
+mac:
+  category: public.app-category.graphics-design
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  # Both Intel and Apple-Silicon arches; electron-builder builds a
+  # universal binary when both are listed.
+  target:
+    - target: dmg
+      arch:
+        - x64
+        - arm64
+    - target: zip
+      arch:
+        - x64
+        - arm64
+  # PNG source — electron-builder converts to .icns at build time using
+  # the macos-latest runner's bundled `iconutil`. Studios shipping
+  # production builds can drop a real `.icns` file at this path; the
+  # builder accepts either format here.
+  icon: ../../packaging/macos/resources/icon.png
+  entitlements: ../../packaging/macos/resources/entitlements.mac.plist
+  entitlementsInherit: ../../packaging/macos/resources/entitlements.mac.plist
+  extendInfo:
+    NSHighResolutionCapable: true
+    LSMinimumSystemVersion: "11.0"
+    NSCameraUsageDescription: "AEC Studio does not access the camera."
+    NSMicrophoneUsageDescription: "AEC Studio does not access the microphone."
+
+dmg:
+  artifactName: "${productName}-${version}-${arch}.dmg"
+  sign: false
+
+publish: null

@@ -59,8 +59,8 @@ describe("AI tool catalogue sync (TS ↔ Rust canonical JSON)", () => {
     expect(canonical.version).toBe(1);
   });
 
-  it("ships exactly the 11 tools the Rust safety validator expects", () => {
-    expect(canonical.tools).toHaveLength(11);
+  it("ships exactly the 12 tools the Rust safety validator expects", () => {
+    expect(canonical.tools).toHaveLength(12);
     expect(AI_TOOLS).toHaveLength(canonical.tools.length);
   });
 

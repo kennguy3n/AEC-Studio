@@ -135,3 +135,87 @@ jobs:
           path: |
             apps/desktop/dist/installers/linux/*.AppImage
             apps/desktop/dist/installers/linux/*.deb
+
+  package-macos:
+    name: Package (macOS)
+    runs-on: macos-latest
+    needs: [typescript]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build renderer + electron
+        run: npm run build
+
+      - name: Install electron-builder
+        run: npm install --no-save electron-builder@^24.13.0
+
+      - name: Build dmg + zip
+        working-directory: apps/desktop
+        env:
+          # Skip notarization in CI; signing keys are populated only in
+          # release jobs from secrets.
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: |
+          npx electron-builder --mac dmg zip \
+            --config ../../packaging/macos/electron-builder.macos.yml
+
+      - name: Upload macOS installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-installers
+          path: |
+            apps/desktop/dist/installers/macos/*.dmg
+            apps/desktop/dist/installers/macos/*.zip
+
+  package-windows:
+    name: Package (Windows)
+    runs-on: windows-latest
+    needs: [typescript]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build renderer + electron
+        run: npm run build
+
+      - name: Install electron-builder
+        run: npm install --no-save electron-builder@^24.13.0
+
+      - name: Build nsis + msi
+        working-directory: apps/desktop
+        run: |
+          npx electron-builder --win nsis msi `
+            --config ../../packaging/windows/electron-builder.windows.yml
+
+      - name: Upload Windows installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installers
+          path: |
+            apps/desktop/dist/installers/windows/*.exe
+            apps/desktop/dist/installers/windows/*.msi
