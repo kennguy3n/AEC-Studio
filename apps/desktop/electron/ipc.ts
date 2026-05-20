@@ -211,6 +211,69 @@ export function registerIpcHandlers(): void {
     return getBridge().exportBuildProposalPack(p);
   });
 
+  // ----- Deliver -----
+  ipcMain.handle("deliver:createRevision", async (_e, p) => {
+    assertObject(p, "params");
+    assertString(p.tag, "tag");
+    const description = typeof p.description === "string" ? p.description : "";
+    const entities = Array.isArray(p.entities)
+      ? (p.entities as Array<Record<string, unknown>>).map((e) => {
+          assertString(e.category, "entity.category");
+          assertString(e.id, "entity.id");
+          assertString(e.payloadHash, "entity.payloadHash");
+          return {
+            category: e.category as string,
+            id: e.id as string,
+            payloadHash: e.payloadHash as string,
+            label: typeof e.label === "string" ? (e.label as string) : null,
+          };
+        })
+      : undefined;
+    return getBridge().deliverCreateRevision({
+      tag: p.tag,
+      description,
+      entities,
+    });
+  });
+  ipcMain.handle("deliver:listRevisions", async () =>
+    getBridge().deliverListRevisions(),
+  );
+  ipcMain.handle("deliver:compareRevisions", async (_e, p) => {
+    assertObject(p, "params");
+    assertString(p.baseId, "baseId");
+    assertString(p.headId, "headId");
+    return getBridge().deliverCompareRevisions({
+      baseId: p.baseId,
+      headId: p.headId,
+    });
+  });
+  ipcMain.handle("deliver:buildPack", async (_e, p) => {
+    assertObject(p, "params");
+    assertString(p.kind, "kind");
+    assertString(p.outPath, "outPath");
+    const allowedKinds = new Set(["concept", "interior", "contractor", "bim"]);
+    if (!allowedKinds.has(p.kind)) {
+      throw new IpcValidationError(
+        `kind must be one of concept|interior|contractor|bim (got ${p.kind})`,
+      );
+    }
+    const region =
+      typeof p.region === "string" &&
+      ["eu", "na", "apac"].includes(p.region as string)
+        ? (p.region as "eu" | "na" | "apac")
+        : undefined;
+    return getBridge().deliverBuildPack({
+      kind: p.kind as "concept" | "interior" | "contractor" | "bim",
+      outPath: p.outPath,
+      includeRenders: typeof p.includeRenders === "boolean" ? p.includeRenders : undefined,
+      includeSheets: typeof p.includeSheets === "boolean" ? p.includeSheets : undefined,
+      includeIfc: typeof p.includeIfc === "boolean" ? p.includeIfc : undefined,
+      includeBoq: typeof p.includeBoq === "boolean" ? p.includeBoq : undefined,
+      includeProposal: typeof p.includeProposal === "boolean" ? p.includeProposal : undefined,
+      region,
+    });
+  });
+
   // ----- Runtime -----
   ipcMain.handle("runtime:status", async () => getBridge().runtimeStatus());
 }

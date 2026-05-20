@@ -11,12 +11,21 @@
  * native artefact.
  */
 
+import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
 
 import { AI_TOOLS, type AiTool } from "./ai-tools";
 
-export { AI_TOOLS, type AiTool };
+/**
+ * 16-hex random id helper used by the in-process backend for ids that
+ * the renderer treats as opaque (revision ids, draft ids, …). Uses
+ * Node's crypto so id collisions are vanishingly unlikely even when
+ * many revisions are created in rapid succession during tests.
+ */
+function randomId(): string {
+  return crypto.randomBytes(8).toString("hex");
+}
 
 /**
  * Response shape for the AI plan request. The `parsed` field is
@@ -136,7 +145,91 @@ export interface BridgeBackend {
   exportGltf(params: Record<string, unknown>): Promise<{ outPath: string }>;
   exportBuildProposalPack(params: Record<string, unknown>): Promise<{ outPath: string }>;
 
+  // ----- Deliver mode -----
+
+  deliverCreateRevision(params: {
+    tag: string;
+    description: string;
+    entities?: Array<{
+      category: string;
+      id: string;
+      payloadHash: string;
+      label?: string | null;
+    }>;
+  }): Promise<RevisionSummary>;
+  deliverListRevisions(): Promise<RevisionSummary[]>;
+  deliverCompareRevisions(params: {
+    baseId: string;
+    headId: string;
+  }): Promise<VersionDiffSummary>;
+  deliverBuildPack(params: {
+    kind: "concept" | "interior" | "contractor" | "bim";
+    outPath: string;
+    includeRenders?: boolean;
+    includeSheets?: boolean;
+    includeIfc?: boolean;
+    includeBoq?: boolean;
+    includeProposal?: boolean;
+    region?: "eu" | "na" | "apac";
+  }): Promise<DeliverPackResult>;
+
   runtimeStatus(): Promise<RuntimeStatus>;
+}
+
+/**
+ * Renderer-facing projection of a Rust `Revision` (see
+ * `crates/aec_core/src/revision.rs`). Field names use camelCase per
+ * the rest of the bridge surface; the Rust side serialises in
+ * snake_case but the adaptor in `inProcessBackend` converts.
+ */
+export interface RevisionSummary {
+  revisionId: string;
+  tag: string;
+  description: string;
+  createdAt: string;
+  auditChainHead: string;
+  manifestName: string;
+  manifestAppVersion: string;
+  trackedEntities: Array<{
+    category: string;
+    id: string;
+    payloadHash: string;
+    label: string | null;
+  }>;
+}
+
+/** Renderer-facing projection of a Rust `VersionDiff`. */
+export interface VersionDiffSummary {
+  baseRevisionId: string;
+  headRevisionId: string;
+  changes: Array<{
+    category: string;
+    id: string;
+    kind: "added" | "removed" | "modified" | "unchanged";
+    beforeHash: string | null;
+    afterHash: string | null;
+    label: string | null;
+  }>;
+  /** Per-category counts. */
+  byCategory: Record<
+    string,
+    {
+      added: number;
+      removed: number;
+      modified: number;
+      unchanged: number;
+    }
+  >;
+}
+
+/** Result returned by `deliver:buildPack`. */
+export interface DeliverPackResult {
+  /** Path on disk where the pack ZIP / PDF was written. */
+  outPath: string;
+  /** Files included in the pack. */
+  contents: string[];
+  /** Total bytes of all files in the pack. */
+  totalBytes: number;
 }
 
 export interface ProjectSummary {
@@ -315,6 +408,10 @@ export const NATIVE_FALLBACK_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   "exportIfc",
   "exportGltf",
   "exportBuildProposalPack",
+  "deliverCreateRevision",
+  "deliverListRevisions",
+  "deliverCompareRevisions",
+  "deliverBuildPack",
 ];
 
 /**
@@ -651,10 +748,191 @@ export function inProcessBackend(): BridgeBackend {
       return { outPath: "/exports/proposal.pdf" };
     },
 
+    async deliverCreateRevision(params) {
+      const tag = params.tag.trim();
+      if (!tag) {
+        throw new Error("revision tag must not be empty");
+      }
+      if (inProcessRevisions.some((r) => r.tag === tag)) {
+        throw new Error(`revision tag already exists: ${tag}`);
+      }
+      const rev: RevisionSummary = {
+        revisionId: `rev_${randomId()}`,
+        tag,
+        description: params.description,
+        createdAt: new Date().toISOString(),
+        auditChainHead: AUDIT_HEAD_PLACEHOLDER,
+        manifestName: "Apartment 12B",
+        manifestAppVersion: "0.1.0",
+        trackedEntities: (params.entities ?? []).map((e) => ({
+          category: e.category,
+          id: e.id,
+          payloadHash: e.payloadHash,
+          label: e.label ?? null,
+        })),
+      };
+      inProcessRevisions.push(rev);
+      return rev;
+    },
+    async deliverListRevisions() {
+      return inProcessRevisions
+        .slice()
+        .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    },
+    async deliverCompareRevisions({ baseId, headId }) {
+      const base = inProcessRevisions.find((r) => r.revisionId === baseId);
+      const head = inProcessRevisions.find((r) => r.revisionId === headId);
+      if (!base) throw new Error(`unknown base revision: ${baseId}`);
+      if (!head) throw new Error(`unknown head revision: ${headId}`);
+      return diffRevisionsInProcess(base, head);
+    },
+    async deliverBuildPack(params) {
+      // The native side writes the actual ZIP/PDF. For the in-process
+      // backend we synthesise the file list a Rust pack would produce
+      // so the renderer can show a realistic preview.
+      const contents = packContents(params);
+      const totalBytes = contents.reduce(
+        (acc, _name, i) => acc + 1024 + i * 256,
+        0,
+      );
+      return { outPath: params.outPath, contents, totalBytes };
+    },
+
     async runtimeStatus() {
       return inProcessRuntimeStatus();
     },
   };
+}
+
+const AUDIT_HEAD_PLACEHOLDER =
+  "0000000000000000000000000000000000000000000000000000000000000000";
+
+/**
+ * In-process scratch store of revisions for the dev backend. Kept
+ * module-local so `inProcessBackend()` can be invoked multiple times
+ * (e.g. by `adaptNative`) without losing state across calls.
+ */
+const inProcessRevisions: RevisionSummary[] = [];
+
+/**
+ * JS port of `crates/aec_core/src/version_diff.rs::compare_revisions`.
+ * The shapes are identical so the renderer code path is bridge-agnostic.
+ */
+export function diffRevisionsInProcess(
+  base: RevisionSummary,
+  head: RevisionSummary,
+): VersionDiffSummary {
+  type Key = string;
+  const keyOf = (category: string, id: string): Key => `${category}\u0000${id}`;
+  const baseMap = new Map<Key, RevisionSummary["trackedEntities"][number]>();
+  const headMap = new Map<Key, RevisionSummary["trackedEntities"][number]>();
+  for (const e of base.trackedEntities) baseMap.set(keyOf(e.category, e.id), e);
+  for (const e of head.trackedEntities) headMap.set(keyOf(e.category, e.id), e);
+
+  const byCategory: VersionDiffSummary["byCategory"] = {};
+  const bucket = (cat: string) =>
+    (byCategory[cat] ??= { added: 0, removed: 0, modified: 0, unchanged: 0 });
+
+  const allKeys = new Set<Key>([...baseMap.keys(), ...headMap.keys()]);
+  const changes: VersionDiffSummary["changes"] = [];
+
+  for (const key of [...allKeys].sort()) {
+    const b = baseMap.get(key);
+    const h = headMap.get(key);
+    if (b && h) {
+      const counts = bucket(b.category);
+      if (b.payloadHash === h.payloadHash) {
+        counts.unchanged += 1;
+        changes.push({
+          category: b.category,
+          id: b.id,
+          kind: "unchanged",
+          beforeHash: b.payloadHash,
+          afterHash: h.payloadHash,
+          label: h.label ?? b.label,
+        });
+      } else {
+        counts.modified += 1;
+        changes.push({
+          category: b.category,
+          id: b.id,
+          kind: "modified",
+          beforeHash: b.payloadHash,
+          afterHash: h.payloadHash,
+          label: h.label ?? b.label,
+        });
+      }
+    } else if (h) {
+      bucket(h.category).added += 1;
+      changes.push({
+        category: h.category,
+        id: h.id,
+        kind: "added",
+        beforeHash: null,
+        afterHash: h.payloadHash,
+        label: h.label,
+      });
+    } else if (b) {
+      bucket(b.category).removed += 1;
+      changes.push({
+        category: b.category,
+        id: b.id,
+        kind: "removed",
+        beforeHash: b.payloadHash,
+        afterHash: null,
+        label: b.label,
+      });
+    }
+  }
+
+  return {
+    baseRevisionId: base.revisionId,
+    headRevisionId: head.revisionId,
+    changes,
+    byCategory,
+  };
+}
+
+function packContents(params: {
+  kind: "concept" | "interior" | "contractor" | "bim";
+  includeRenders?: boolean;
+  includeSheets?: boolean;
+  includeIfc?: boolean;
+  includeBoq?: boolean;
+  includeProposal?: boolean;
+}): string[] {
+  const base: string[] = [];
+  if (params.kind === "concept") {
+    base.push("concept_pack.pdf");
+    if (params.includeRenders ?? true) base.push("renders/01_cover.png");
+    if (params.includeSheets ?? true) base.push("sheets/A100.pdf");
+    base.push("manifest.json");
+    return base;
+  }
+  if (params.kind === "interior") {
+    base.push("interior_summary.pdf");
+    if (params.includeRenders ?? true) {
+      base.push("renders/01_living.png", "renders/02_kitchen.png");
+    }
+    base.push("schedules/materials.xlsx", "manifest.json");
+    return base;
+  }
+  if (params.kind === "contractor") {
+    if (params.includeSheets ?? true)
+      base.push("sheets/A100.pdf", "sheets/A101.pdf");
+    if (params.includeBoq ?? true) base.push("schedules/boq.xlsx");
+    base.push("schedules/materials.xlsx");
+    if (params.includeIfc ?? true) base.push("model/project.ifc");
+    if (params.includeProposal ?? true) base.push("proposal.pdf");
+    base.push("manifest.json");
+    return base;
+  }
+  // bim
+  if (params.includeIfc ?? true) base.push("model/project.ifc");
+  if (params.includeSheets ?? true)
+    base.push("sheets/A100.pdf", "sheets/A101.pdf");
+  base.push("validation_report.pdf", "manifest.json");
+  return base;
 }
 
 /**

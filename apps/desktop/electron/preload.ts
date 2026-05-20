@@ -102,6 +102,33 @@ const api = {
       ipcRenderer.invoke("export:buildProposalPack", params),
   },
 
+  // ----- Deliver -----
+  deliver: {
+    createRevision: (params: {
+      tag: string;
+      description: string;
+      entities?: Array<{
+        category: string;
+        id: string;
+        payloadHash: string;
+        label?: string | null;
+      }>;
+    }) => ipcRenderer.invoke("deliver:createRevision", params),
+    listRevisions: () => ipcRenderer.invoke("deliver:listRevisions"),
+    compareRevisions: (params: { baseId: string; headId: string }) =>
+      ipcRenderer.invoke("deliver:compareRevisions", params),
+    buildPack: (params: {
+      kind: "concept" | "interior" | "contractor" | "bim";
+      outPath: string;
+      includeRenders?: boolean;
+      includeSheets?: boolean;
+      includeIfc?: boolean;
+      includeBoq?: boolean;
+      includeProposal?: boolean;
+      region?: "eu" | "na" | "apac";
+    }) => ipcRenderer.invoke("deliver:buildPack", params),
+  },
+
   // ----- Runtime -----
   runtime: {
     status: () => ipcRenderer.invoke("runtime:status"),

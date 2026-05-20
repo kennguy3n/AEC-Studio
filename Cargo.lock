@@ -59,7 +59,7 @@ dependencies = [
  "aec_cad",
  "aec_core",
  "blake3",
- "rust_xlsxwriter",
+ "rust_xlsxwriter 0.71.0",
  "serde",
  "serde_json",
  "tempfile",
@@ -136,12 +136,16 @@ dependencies = [
  "aec_cad",
  "aec_core",
  "aec_materials",
+ "blake3",
  "chrono",
+ "hex",
  "printpdf",
+ "rust_xlsxwriter 0.77.0",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
+ "zip",
 ]
 
 [[package]]
@@ -1459,6 +1463,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "16505ad28ecaf73f4c169614333c0519d4549675f158c9e886eb045c4dfde6c5"
 dependencies = [
  "regex",
+ "zip",
+]
+
+[[package]]
+name = "rust_xlsxwriter"
+version = "0.77.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1ba1186cc2b2d0710edd3420d12cbb247c513063d568ca9e5bf52e20068abfb"
+dependencies = [
  "zip",
 ]
 
