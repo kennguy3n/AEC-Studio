@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { aec } from "../../api/aec";
 
 /**
@@ -120,6 +120,20 @@ function PsetRow({
 }: RowProps) {
   const [draft, setDraft] = useState<string>(String(value));
   const [saving, setSaving] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  // Sync `draft` from the `value` prop whenever a new value arrives. This
+  // covers the case where React reuses the same `PsetRow` instance for a
+  // different entity (keyed by propertyKey only) or when the parent pushes
+  // an externally-edited value back into this row. We guard against
+  // overwriting the user's in-progress edit by skipping the sync while the
+  // input is focused — a focused field implies an active edit that must
+  // not be stomped by external updates.
+  useEffect(() => {
+    if (document.activeElement !== inputRef.current) {
+      setDraft(String(value));
+    }
+  }, [value, entityId, psetName, propertyKey]);
 
   const commit = async () => {
     const typed = coerce(value, draft);
@@ -172,6 +186,7 @@ function PsetRow({
       <th scope="row">{propertyKey}</th>
       <td>
         <input
+          ref={inputRef}
           type={typeof value === "number" ? "number" : "text"}
           step={typeof value === "number" ? "any" : undefined}
           value={draft}
