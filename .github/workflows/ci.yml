@@ -5,6 +5,14 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    # Defaults (opened, synchronize, reopened) plus the label events.
+    # Adding `test-all-platforms` to an existing PR re-fires the
+    # workflow with that label visible in `github.event.pull_request.labels`,
+    # so the gate job can flip into the full matrix without the
+    # contributor having to push an empty commit or click "Re-run".
+    # `unlabeled` is included for symmetry — removing the label
+    # snaps the next run back to the Ubuntu-only baseline.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
 
 env:
   CARGO_TERM_COLOR: always
@@ -41,7 +49,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       os_matrix: ${{ steps.matrix.outputs.os_matrix }}
-      full_matrix: ${{ steps.matrix.outputs.full_matrix }}
     steps:
       - id: matrix
         env:
@@ -53,21 +60,31 @@ jobs:
           stable='["ubuntu-latest"]'
           if [ "$EVENT_NAME" = "push" ]; then
             os="$full"
-            is_full="true"
+            mode="FULL (push to main)"
           # `$PR_LABELS` is the JSON-encoded array of label names
           # (e.g. `["test-all-platforms","needs-review"]`), so we
           # match the *quoted* form to avoid substring false
           # positives like `no-test-all-platforms-please`.
           elif echo "$PR_LABELS" | grep -qF '"test-all-platforms"'; then
             os="$full"
-            is_full="true"
+            mode="FULL (test-all-platforms label)"
           else
             os="$stable"
-            is_full="false"
+            mode="STABLE (Ubuntu-only baseline)"
           fi
-          echo "Computed os_matrix=$os (full=$is_full)"
+          echo "Gate decision: $mode"
+          echo "os_matrix=$os"
           echo "os_matrix=$os" >> "$GITHUB_OUTPUT"
-          echo "full_matrix=$is_full" >> "$GITHUB_OUTPUT"
+          # Also surface the decision in the job summary so the run
+          # is self-documenting in the GitHub UI without having to
+          # drill into step logs.
+          {
+            echo "### CI gate decision"
+            echo
+            echo "- Event: \`$EVENT_NAME\`"
+            echo "- Mode: **$mode**"
+            echo "- OS matrix: \`$os\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   rust:
     name: Rust (${{ matrix.os }})
