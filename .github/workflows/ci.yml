@@ -5,6 +5,56 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    # Defaults (opened, synchronize, reopened) plus the label events.
+    # Adding `test-all-platforms` to an existing PR re-fires the
+    # workflow with that label visible in `github.event.pull_request.labels`,
+    # so the gate job can flip into the full matrix without the
+    # contributor having to push an empty commit or click "Re-run".
+    # `unlabeled` is included for symmetry — removing the label
+    # snaps the next run back to the Ubuntu-only baseline.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+# Cancel in-progress PR runs when a new commit / label change
+# supersedes them, so a contributor pushing a fixup commit (or
+# adding the `test-all-platforms` label after a `synchronize` run
+# already started) doesn't burn two parallel runner sets on the
+# same PR. Push events on `main` are intentionally NOT cancelled
+# — every commit on `main` must produce a CI result for the
+# `package-*` gate and release traceability.
+#
+# `cancel-in-progress` is further gated on the *kind* of new event:
+# only `synchronize` / `opened` / `reopened` (the default PR
+# actions) and a `labeled`/`unlabeled` on the scope-changing
+# `test-all-platforms` label may supersede an in-progress run.
+# An unrelated label triage event (e.g. adding `needs-review`)
+# must NOT cancel a legitimate run — the gate job's own `if:`
+# predicate skips the replacement run for unrelated labels, so an
+# unconditional cancel would leave the PR with zero CI results
+# until the next push.
+#
+# The concurrency `group` key intentionally uses `github.sha` on
+# push events and `github.ref` on PR events. PR events still
+# share a per-branch group so a `synchronize` run supersedes the
+# previous one for the same PR. Push events, on the other hand,
+# need a per-SHA group: GitHub Actions cancels any *pending*
+# (queued) run in the same group when a third run arrives, even
+# with `cancel-in-progress: false` (`false` only protects the
+# *running* workflow). Without per-SHA isolation, a burst of
+# rapid merges to `main` (or a merge queue) would drop the CI
+# results for intermediate commits, violating the
+# "every commit on `main` must produce a CI result for the
+# `package-*` gate and release traceability" invariant.
+concurrency:
+  group: >-
+    ci-${{ github.workflow }}-${{
+      github.event_name == 'push' && github.sha || github.ref
+    }}
+  cancel-in-progress: >-
+    ${{ github.event_name == 'pull_request'
+        && (
+          (github.event.action != 'labeled' && github.event.action != 'unlabeled')
+          || github.event.label.name == 'test-all-platforms'
+        ) }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -12,13 +62,95 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
+  # ---------------------------------------------------------------
+  # gate: compute which OS matrix the rust/typescript jobs should
+  # run on for this trigger.
+  #
+  # Defaults:
+  #   * push to main           → full matrix (ubuntu + macos + windows)
+  #   * PR with label
+  #     `test-all-platforms`   → full matrix
+  #   * any other PR           → ubuntu only
+  #
+  # Rationale: platform-specific CI (especially the Electron-install
+  # path on macOS-arm64 and Windows) is occasionally flaky for
+  # reasons unrelated to the PR's diff (npm registry / electron CDN
+  # 404s, runner image regressions, etc.). For PRs that don't touch
+  # platform-specific code (Rust-only, docs-only, etc.) we run a
+  # fast and stable baseline — Ubuntu Rust + Ubuntu TypeScript +
+  # Python workers — and gate the full cross-platform sweep on the
+  # merge to main, where any real platform regression is caught
+  # before it can affect a release.
+  #
+  # To opt a PR into the full matrix (e.g. when you intentionally
+  # touch Electron / packaging / OS-specific Rust code), add the
+  # `test-all-platforms` label to the PR.
+  # ---------------------------------------------------------------
+  gate:
+    name: Gate (compute OS matrix)
+    runs-on: ubuntu-latest
+    # Skip the entire workflow when the trigger is a `labeled` /
+    # `unlabeled` event on a label that doesn't change CI scope.
+    # `test-all-platforms` flips the matrix; any other label
+    # (e.g. `needs-review`, `priority-high`) must not burn runner
+    # minutes (the concurrency block above also prevents the
+    # replacement run from cancelling an in-progress legitimate
+    # run for the same unrelated label event). The first conjunct
+    # keeps the default `opened`, `synchronize`, `reopened`, and
+    # all `push` events flowing. Explicit parens make the
+    # operator precedence (`&&` binds tighter than `||`) visible
+    # without having to remember the GitHub Actions expression
+    # grammar.
+    if: >-
+      (github.event.action != 'labeled' && github.event.action != 'unlabeled')
+      || github.event.label.name == 'test-all-platforms'
+    outputs:
+      os_matrix: ${{ steps.matrix.outputs.os_matrix }}
+    steps:
+      - id: matrix
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          set -euo pipefail
+          full='["ubuntu-latest","macos-latest","windows-latest"]'
+          stable='["ubuntu-latest"]'
+          if [ "$EVENT_NAME" = "push" ]; then
+            os="$full"
+            mode="FULL (push to main)"
+          # `$PR_LABELS` is the JSON-encoded array of label names
+          # (e.g. `["test-all-platforms","needs-review"]`), so we
+          # match the *quoted* form to avoid substring false
+          # positives like `no-test-all-platforms-please`.
+          elif echo "$PR_LABELS" | grep -qF '"test-all-platforms"'; then
+            os="$full"
+            mode="FULL (test-all-platforms label)"
+          else
+            os="$stable"
+            mode="STABLE (Ubuntu-only baseline)"
+          fi
+          echo "Gate decision: $mode"
+          echo "os_matrix=$os"
+          echo "os_matrix=$os" >> "$GITHUB_OUTPUT"
+          # Also surface the decision in the job summary so the run
+          # is self-documenting in the GitHub UI without having to
+          # drill into step logs.
+          {
+            echo "### CI gate decision"
+            echo
+            echo "- Event: \`$EVENT_NAME\`"
+            echo "- Mode: **$mode**"
+            echo "- OS matrix: \`$os\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   rust:
     name: Rust (${{ matrix.os }})
+    needs: gate
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: ${{ fromJSON(needs.gate.outputs.os_matrix) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -49,11 +181,12 @@ jobs:
 
   typescript:
     name: TypeScript (${{ matrix.os }})
+    needs: gate
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: ${{ fromJSON(needs.gate.outputs.os_matrix) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -78,6 +211,11 @@ jobs:
   python-workers:
     name: Python workers (ubuntu-latest)
     runs-on: ubuntu-latest
+    # `needs: gate` is structural — the gate guards the whole
+    # workflow against unrelated label-change re-fires (see the
+    # `if:` on `gate`). Without this dependency, label triage on an
+    # unrelated label would still spin up the Python worker matrix.
+    needs: gate
     steps:
       - uses: actions/checkout@v4
 
@@ -94,10 +232,19 @@ jobs:
         working-directory: workers/ifc
         run: python -m unittest discover -s tests -p 'test_*.py' -v
 
+  # ---------------------------------------------------------------
+  # package-*: produce installable artefacts.
+  #
+  # `needs: [rust, typescript]` gates packaging on a fully green
+  # Rust matrix AND a fully green TypeScript matrix — a Rust
+  # regression on `main` (e.g. a clippy failure on macOS-latest)
+  # must not allow `electron-builder` to ship an installer that
+  # links in a broken `aec_bridge` native addon.
+  # ---------------------------------------------------------------
   package-linux:
     name: Package (Linux)
     runs-on: ubuntu-latest
-    needs: [typescript]
+    needs: [rust, typescript]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v4
@@ -106,6 +253,17 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-3-0 libnss3 libxss1 libasound2 libnotify4
+
+      # `npm run build` invokes the napi-rs build for the
+      # `aec_bridge` native addon, which needs a Rust toolchain on
+      # the packaging runner itself (the `rust` job runs on a
+      # different machine, its toolchain is not shared). Without
+      # this step the Linux installer would either fail at
+      # `npm run build` or link in a stale prebuilt addon.
+      # Matches the equivalent step in `package-macos` and
+      # `package-windows`.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Install Node.js
         uses: actions/setup-node@v4
@@ -139,7 +297,7 @@ jobs:
   package-macos:
     name: Package (macOS)
     runs-on: macos-latest
-    needs: [typescript]
+    needs: [rust, typescript]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v4
@@ -183,7 +341,7 @@ jobs:
   package-windows:
     name: Package (Windows)
     runs-on: windows-latest
-    needs: [typescript]
+    needs: [rust, typescript]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v4

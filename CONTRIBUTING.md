@@ -186,6 +186,8 @@ use_try_shorthand = true
    - `npm run lint`
    - `npm run type-check`
    - `npm test`
+
+   CI runs a **stable Ubuntu-only baseline** on every PR (Rust + TypeScript + Python workers). The full cross-platform matrix (macOS + Windows) runs automatically on every push to `main` and gates the next release. If your PR touches Electron, packaging configs, or OS-specific Rust code and you want the full matrix to run on the PR itself, add the `test-all-platforms` label — the workflow re-fires immediately on `labeled` (you do not need to push another commit), so the next CI run sweeps all three OSes. Removing the label snaps the *next* run back to the Ubuntu-only baseline. This keeps PR turnaround fast and avoids surfacing flakes from platform-specific runners (e.g. Electron CDN 404s on macOS-arm64) on diffs that can't have caused them.
 5. **Write a clear PR description** — explain what changed, why, and how to test it.
 
 ### Commit message conventions
