@@ -10,6 +10,7 @@ pub mod cache;
 pub mod classification;
 pub mod diff;
 pub mod drawing_gen;
+pub mod ifc;
 pub mod properties;
 pub mod relations;
 pub mod schedules;

@@ -26,6 +26,7 @@
 //! header so the pack write goes through real `Read::read_to_end` and
 //! the manifest BLAKE3 hash is computed against legitimate bytes.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -40,6 +41,7 @@ use aec_cad::sheets::{Margins, Orientation, PaperSize, Sheet, SheetSet, TitleBlo
 use aec_core::templates::TemplateLoader;
 use aec_core::types::EntityId;
 use aec_export::contractor_pack::{ContractorPack, PackFile};
+use aec_export::pdf::{PageSize, PdfBuilder};
 use aec_render::{
     cameras::CameraSnapshot,
     job::RenderJobStatus,
@@ -175,11 +177,16 @@ fn architecture_studio_journey_end_to_end() {
     let storey = project
         .add_child(&building, IfcClass::IfcBuildingStorey, "Ground")
         .expect("storey");
-    // Spaces (rooms) from the template.
+    // Spaces (rooms) from the template. We retain the space IDs so
+    // we can attach `Pset_SpaceCommon` + `Qto_SpaceBaseQuantities` to
+    // each one — without those the room schedule would have empty
+    // fields and the test would only validate row count.
+    let mut space_ids: Vec<EntityId> = Vec::new();
     for room in &tpl.rooms {
-        project
+        let sid = project
             .add_child(&storey, IfcClass::IfcSpace, room.name.clone())
             .expect("space");
+        space_ids.push(sid);
     }
 
     let tmp = tempfile::tempdir().unwrap();
@@ -211,6 +218,13 @@ fn architecture_studio_journey_end_to_end() {
         let mut q = QuantitySet::new("Qto_WallBaseQuantities");
         q.quantities
             .insert("NetSideArea".into(), PropertyValue::Area(area_m2));
+        // `boq.rs::quantity` reads `Qto_WallBaseQuantities::NetVolume`
+        // for `IfcWall::Volume`; without it the wall row in the BOQ
+        // would silently drop its volume. We record both `NetVolume`
+        // and `GrossVolume` so the round-trip exercises real schema
+        // expectations from `boq.rs`.
+        q.quantities
+            .insert("NetVolume".into(), PropertyValue::Volume(volume_m3));
         q.quantities
             .insert("GrossVolume".into(), PropertyValue::Volume(volume_m3));
         q.quantities
@@ -330,13 +344,84 @@ fn architecture_studio_journey_end_to_end() {
     );
 
     // ---------------------------------------------------------------
+    // Space properties — attach `Pset_SpaceCommon` +
+    // `Qto_SpaceBaseQuantities` for every space so the room schedule
+    // has real fields to surface (Reference / Category / Area /
+    // Perimeter / Height), not just row count.
+    // ---------------------------------------------------------------
+    let space_meta: &[(
+        &str,
+        &str,
+        &str,
+        &str,
+        &str,
+        f64,
+        f64,
+        f64,
+    )] = &[
+        // (number, category, floor, wall, ceiling, area_m2, perim_m, height_m)
+        (
+            "R-01",
+            "Public",
+            "polished_concrete",
+            "tinted_plaster",
+            "exposed_concrete",
+            28.0,
+            22.0,
+            3.2,
+        ),
+        (
+            "R-02",
+            "Service",
+            "epoxy_resin",
+            "stainless_steel_panel",
+            "acoustic_tile",
+            8.0,
+            12.0,
+            2.8,
+        ),
+        (
+            "R-03",
+            "BoH",
+            "sealed_concrete",
+            "painted_block",
+            "exposed_slab",
+            6.5,
+            10.5,
+            2.6,
+        ),
+    ];
+    for (i, sid) in space_ids.iter().enumerate() {
+        let (number, category, floor, wall, ceiling, area, perim, height) = space_meta[i];
+        let mut common = PropertySet::new("Pset_SpaceCommon");
+        common.set("Reference", PropertyValue::Label(number.into()));
+        common.set("Category", PropertyValue::Label(category.into()));
+        common.set("IsExternal", PropertyValue::Boolean(false));
+        props.entry(sid.clone()).upsert_pset(common);
+        let mut finishes = PropertySet::new("Pset_SpaceFinishes");
+        finishes.set("FloorFinish", PropertyValue::Label(floor.into()));
+        finishes.set("WallFinish", PropertyValue::Label(wall.into()));
+        finishes.set("CeilingFinish", PropertyValue::Label(ceiling.into()));
+        props.entry(sid.clone()).upsert_pset(finishes);
+        let mut q = QuantitySet::new("Qto_SpaceBaseQuantities");
+        q.quantities
+            .insert("NetFloorArea".into(), PropertyValue::Area(area));
+        // `room_schedule.rs` reads `GrossPerimeter` for `perimeter_m`,
+        // not `NetPerimeter`, so we author the correct quantity key.
+        q.quantities
+            .insert("GrossPerimeter".into(), PropertyValue::Length(perim));
+        q.quantities
+            .insert("Height".into(), PropertyValue::Length(height));
+        props.entry(sid.clone()).upsert_qset(q);
+    }
+
+    // ---------------------------------------------------------------
     // 3. AI fire-rating fill via real `fill_properties`.
     //    Build an `ElementContext` for each door, run the fill
     //    pipeline against a `ProjectStandards` rule that supplies
     //    `FireRating = FD60` for doors, and apply the proposals to
     //    the property store.
     // ---------------------------------------------------------------
-    use std::collections::BTreeMap;
     let mut standards = ProjectStandards::default();
     let mut defaults: BTreeMap<String, BTreeMap<String, PropertyValue>> = BTreeMap::new();
     let mut door_common = BTreeMap::new();
@@ -425,8 +510,36 @@ fn architecture_studio_journey_end_to_end() {
     let door_xlsx = tmp.path().join("door_schedule.xlsx");
     door_sheet.write_xlsx(&door_xlsx).expect("door xlsx");
     let (room_entries, room_sheet) = generate_room_schedule(&project, &props);
-    let _ = &room_entries; // silence unused if asserts change
     assert_eq!(room_entries.len(), 3, "room schedule covers all 3 spaces");
+    // With Pset_SpaceCommon + Qto_SpaceBaseQuantities attached above,
+    // the schedule must surface real content for every row, not just
+    // a row-count match.
+    for (i, entry) in room_entries.iter().enumerate() {
+        let (number, category, floor, wall, ceiling, area, perim, height) = space_meta[i];
+        assert_eq!(entry.number, number, "room number");
+        assert_eq!(entry.category, category, "room category");
+        assert_eq!(entry.floor_finish, floor, "room {} floor finish", number);
+        assert_eq!(entry.wall_finish, wall, "room {} wall finish", number);
+        assert_eq!(entry.ceiling_finish, ceiling, "room {} ceiling finish", number);
+        assert_eq!(
+            entry.area_m2,
+            Some(area),
+            "room {} area_m2 populated from Qto_SpaceBaseQuantities",
+            number
+        );
+        assert_eq!(
+            entry.perimeter_m,
+            Some(perim),
+            "room {} perimeter_m populated from Qto_SpaceBaseQuantities::GrossPerimeter",
+            number
+        );
+        assert_eq!(
+            entry.height_m,
+            Some(height),
+            "room {} height_m populated from Qto_SpaceBaseQuantities",
+            number
+        );
+    }
     let room_xlsx = tmp.path().join("room_schedule.xlsx");
     room_sheet.write_xlsx(&room_xlsx).expect("room xlsx");
 
@@ -462,7 +575,6 @@ fn architecture_studio_journey_end_to_end() {
 
     // Render each sheet as a tiny PDF stub via the export crate's
     // PDF builder so we have real bytes for the contractor pack.
-    use aec_export::pdf::{PageSize, PdfBuilder};
     let mut sheet_files: Vec<PackFile> = Vec::new();
     for (n, code, label) in &sheet_meta {
         let mut b = PdfBuilder::new(n.to_string(), PageSize::A4_LANDSCAPE).expect("pdf");

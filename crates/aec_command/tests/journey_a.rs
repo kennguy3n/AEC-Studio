@@ -44,7 +44,7 @@ use aec_core::{
 };
 use aec_export::{
     interior_pack::{InteriorPack, InteriorRender},
-    ScheduleSheet,
+    ProposalPack, ScheduleSheet,
 };
 use aec_render::{
     cameras::CameraSnapshot,
@@ -403,7 +403,6 @@ fn interior_designer_journey_end_to_end() {
     }
     // We re-use the proposal PDF builder as the "concept" PDF — that's
     // the same path the desktop app uses for the interior summary.
-    use aec_export::ProposalPack;
     let mut p = ProposalPack::new("Apartment 12B", "Ms. K");
     p.material_schedule = material_schedule.clone();
     let summary_pdf_path = tmp.path().join("apartment_12b_summary.pdf");
