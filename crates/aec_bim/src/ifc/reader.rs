@@ -115,7 +115,7 @@ impl IfcReader {
                 "IFCOWNERHISTORY" => {}
                 "IFCPROJECT" | "IFCSITE" | "IFCBUILDING" | "IFCBUILDINGSTOREY"
                 | "IFCSPACE" => {
-                    let class = ifc_class_from_tag(&g.kind)?;
+                    let class = ifc_class_from_tag(&g.kind, &g.raw_kind)?;
                     let name = g.string_arg(3)?;
                     // Spatial nodes are authored by the writer with the
                     // user-facing display name ("Café", "Ground"). They
@@ -177,25 +177,28 @@ impl IfcReader {
                     // `tag::eid` name is an element.
                     if let Ok(name) = g.string_arg(3) {
                         if let Some((tag, eid)) = name.split_once("::") {
-                            if let Ok(class) = ifc_class_from_tag(other) {
-                                let guid = g.string_arg(0)?;
-                                let entity = EntityId::from_string(eid).map_err(|e| {
-                                    IfcReadError::Malformed(format!(
-                                        "embedded EntityId `{eid}` is invalid: {e}"
-                                    ))
-                                })?;
-                                elements.insert(
-                                    g.step_id,
-                                    ElementRow {
-                                        entity,
-                                        guid,
-                                        class,
-                                        tag: tag.to_string(),
-                                    },
-                                );
-                            } else {
-                                return Err(IfcReadError::UnknownType(other.to_string()));
-                            }
+                            // Unknown tags fall back to
+                            // `IfcClass::Other(raw_kind)` so values
+                            // produced by the AI classifier (e.g.
+                            // `IfcBuildingElementProxy`) round-trip
+                            // verbatim. Casing is preserved from the
+                            // original STEP bytes via `raw_kind`.
+                            let class = ifc_class_from_tag(other, &g.raw_kind)?;
+                            let guid = g.string_arg(0)?;
+                            let entity = EntityId::from_string(eid).map_err(|e| {
+                                IfcReadError::Malformed(format!(
+                                    "embedded EntityId `{eid}` is invalid: {e}"
+                                ))
+                            })?;
+                            elements.insert(
+                                g.step_id,
+                                ElementRow {
+                                    entity,
+                                    guid,
+                                    class,
+                                    tag: tag.to_string(),
+                                },
+                            );
                         }
                     }
                 }
@@ -419,7 +422,14 @@ impl IfcReader {
 #[derive(Debug, Clone)]
 struct StepRecord {
     step_id: u32,
+    /// STEP entity kind, normalized to ASCII uppercase for matching
+    /// against canonical STEP entity names (`IFCWALL`, `IFCSITE`, ...).
     kind: String,
+    /// The kind exactly as it appeared in the source bytes, before
+    /// any case normalization. Used to round-trip
+    /// [`IfcClass::Other`] values whose tag carries non-canonical
+    /// casing (e.g. `"IfcBuildingElementProxy"`).
+    raw_kind: String,
     args: Vec<String>,
 }
 
@@ -499,12 +509,14 @@ fn parse_step_groups(text: &str) -> IfcReadResult<Vec<StepRecord>> {
         let close = rhs
             .rfind(')')
             .ok_or_else(|| IfcReadError::Malformed(format!("missing ')' in '{rhs}'")))?;
-        let kind = rhs[..open].trim().to_uppercase();
+        let raw_kind = rhs[..open].trim().to_string();
+        let kind = raw_kind.to_ascii_uppercase();
         let inner = &rhs[open + 1..close];
         let args = split_step_args(inner);
         groups.push(StepRecord {
             step_id,
             kind,
+            raw_kind,
             args,
         });
     }
@@ -569,7 +581,7 @@ impl StepRecord {
                 self.kind
             )));
         }
-        Ok(s[1..s.len() - 1].replace("\\'", "'"))
+        Ok(unescape_step_string(&s[1..s.len() - 1]))
     }
 
     fn ref_arg(&self, idx: usize) -> IfcReadResult<u32> {
@@ -627,9 +639,17 @@ impl StepRecord {
 // IFC class lookup (mirror of writer's `IfcClass::ifc_tag`)
 // ---------------------------------------------------------------------
 
-fn ifc_class_from_tag(tag: &str) -> IfcReadResult<IfcClass> {
+/// Resolve a STEP entity name back into an [`IfcClass`].
+///
+/// `tag` is the canonical (uppercased) form used for matching;
+/// `raw_tag` is the original spelling as it appeared in the STEP
+/// bytes. Unknown tags are not an error — they round-trip through
+/// [`IfcClass::Other`] using `raw_tag` so author-provided casing
+/// (e.g. `"IfcBuildingElementProxy"` from the AI classifier) is
+/// preserved verbatim across export/import.
+fn ifc_class_from_tag(tag: &str, raw_tag: &str) -> IfcReadResult<IfcClass> {
     // STEP entity names are uppercase ("IFCWALL"), our `ifc_tag()`
-    // returns mixed case ("IfcWall"). Normalize both.
+    // returns mixed case ("IfcWall"). Normalize for matching.
     let up = tag.to_ascii_uppercase();
     let cls = match up.as_str() {
         "IFCPROJECT" => IfcClass::IfcProject,
@@ -655,7 +675,7 @@ fn ifc_class_from_tag(tag: &str) -> IfcReadResult<IfcClass> {
         "IFCLIGHTFIXTURE" => IfcClass::IfcLightFixture,
         "IFCPLUMBINGFIXTURE" => IfcClass::IfcPlumbingFixture,
         "IFCOPENINGELEMENT" => IfcClass::IfcOpeningElement,
-        _ => return Err(IfcReadError::UnknownType(tag.to_string())),
+        _ => IfcClass::Other(raw_tag.to_string()),
     };
     Ok(cls)
 }
@@ -709,7 +729,40 @@ fn unquote(s: &str) -> IfcReadResult<String> {
             "expected quoted string, got '{s}'"
         )));
     }
-    Ok(s[1..s.len() - 1].replace("\\'", "'"))
+    Ok(unescape_step_string(&s[1..s.len() - 1]))
+}
+
+/// Reverse the writer's STEP string escaping.
+///
+/// The writer encodes single quotes as `\'` and backslashes as `\\`.
+/// Chained `replace` calls cannot undo this safely (a naive
+/// `.replace("\\\\", "\\").replace("\\'", "'")` would turn the
+/// encoded literal `\\\'` — meaning a literal backslash followed by
+/// a literal quote — into `\'` and then into a literal quote, losing
+/// the backslash). A single left-to-right pass that consumes
+/// `\` + next-char as one unit is the only correct decoder.
+fn unescape_step_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('\\') => out.push('\\'),
+                Some('\'') => out.push('\''),
+                Some(other) => {
+                    // Unknown escape — keep the backslash and the
+                    // following character verbatim so we don't
+                    // silently drop content we don't recognize.
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn parse_real(s: &str) -> IfcReadResult<f64> {
@@ -843,6 +896,150 @@ mod tests {
         assert_eq!(
             pset.properties.get("Reference"),
             Some(&PropertyValue::Text("O'Brien".into()))
+        );
+    }
+
+    #[test]
+    fn roundtrips_names_containing_backslashes() {
+        // Regression test for the writer/reader pair handling
+        // backslash escaping symmetrically.
+        //
+        // Previously the writer only escaped `'` as `\'` but left
+        // raw `\` alone. The reader's tokenizer treats `\` as an
+        // escape character, so a value ending in `\` (or containing
+        // `\` followed by `'`) would corrupt the parse: the closing
+        // `'` would be consumed by the escape state machine and the
+        // string would never terminate.
+        let mut project = Project::new(r"vendor\Acme");
+        let site = project
+            .add_child(&project.root.clone(), IfcClass::IfcSite, r"path\to\site")
+            .unwrap();
+        let bldg = project
+            .add_child(&site, IfcClass::IfcBuilding, r"ends-in-backslash\")
+            .unwrap();
+        let storey = project
+            .add_child(
+                &bldg,
+                IfcClass::IfcBuildingStorey,
+                r"mixed\'special\chars'",
+            )
+            .unwrap();
+
+        let mut classification = ClassificationStore::new();
+        let mut props = PropertyStore::new();
+        let el = EntityId::new();
+        project.attach_element(&storey, el.clone());
+        classification.assign_manual(el.clone(), IfcClass::IfcWall);
+        let mut pc = PropertySet::new("Pset_WallCommon");
+        pc.set(
+            "Reference",
+            PropertyValue::Text(r"C:\Users\O'Brien\plan.dwg".into()),
+        );
+        pc.set(
+            "Tag",
+            PropertyValue::Label(r"raw\\double".into()),
+        );
+        props.entry(el.clone()).upsert_pset(pc);
+
+        let s = crate::ifc::IfcWriter::to_string(&project, &classification, &props);
+        let snap = IfcReader::from_string(&s).expect("parses backslash-bearing strings");
+
+        let project_node = snap.project.nodes.get(&snap.project.root).unwrap();
+        assert_eq!(project_node.name, r"vendor\Acme");
+        // Walk children by name to find each storey-ancestor.
+        let nodes = &snap.project.nodes;
+        nodes
+            .values()
+            .find(|n| n.name == r"path\to\site")
+            .expect("site round-trips");
+        nodes
+            .values()
+            .find(|n| n.name == r"ends-in-backslash\")
+            .expect("trailing backslash round-trips");
+        nodes
+            .values()
+            .find(|n| n.name == r"mixed\'special\chars'")
+            .expect("mixed escape round-trips");
+
+        let p = snap.properties.get(&el).expect("element props");
+        let pset = p.psets.get("Pset_WallCommon").unwrap();
+        assert_eq!(
+            pset.properties.get("Reference"),
+            Some(&PropertyValue::Text(r"C:\Users\O'Brien\plan.dwg".into())),
+        );
+        assert_eq!(
+            pset.properties.get("Tag"),
+            Some(&PropertyValue::Label(r"raw\\double".into())),
+        );
+    }
+
+    #[test]
+    fn unescape_step_string_is_a_single_pass_inverse_of_escape() {
+        // The encoder is `escape_step_string` in the writer; this is
+        // the decoder. They must be exact inverses for any input,
+        // including pathological combinations of `\` and `'`.
+        let cases = [
+            "",
+            "plain text",
+            "with 'single' quotes",
+            r"with \ backslash",
+            r"ends in \\",
+            r"both \ and ' mixed",
+            r"\\'",          // backslash then escaped quote
+            r"\\\\",         // four backslashes
+            r"don't \stop",  // common natural text
+        ];
+        for input in cases {
+            // Encode the same way the writer does, char-by-char.
+            let mut encoded = String::new();
+            for c in input.chars() {
+                match c {
+                    '\\' => encoded.push_str("\\\\"),
+                    '\'' => encoded.push_str("\\'"),
+                    _ => encoded.push(c),
+                }
+            }
+            let decoded = unescape_step_string(&encoded);
+            assert_eq!(decoded, input, "round-trip failed for {input:?}");
+        }
+    }
+
+    #[test]
+    fn ifc_class_other_roundtrips_through_writer_and_reader() {
+        // The AI classifier produces `IfcClass::Other(...)` for
+        // shapes that don't match any known IFC element type. Make
+        // sure these round-trip without being dropped or rejected.
+        let mut project = Project::new("OtherRT");
+        let site = project
+            .add_child(&project.root.clone(), IfcClass::IfcSite, "S")
+            .unwrap();
+        let bldg = project
+            .add_child(&site, IfcClass::IfcBuilding, "B")
+            .unwrap();
+        let storey = project
+            .add_child(&bldg, IfcClass::IfcBuildingStorey, "L01")
+            .unwrap();
+
+        let mut classification = ClassificationStore::new();
+        let props = PropertyStore::new();
+        let el = EntityId::new();
+        project.attach_element(&storey, el.clone());
+        // This is the exact string the AI fallback emits today.
+        classification.assign_manual(
+            el.clone(),
+            IfcClass::Other("IfcBuildingElementProxy".into()),
+        );
+
+        let s = crate::ifc::IfcWriter::to_string(&project, &classification, &props);
+        let snap = IfcReader::from_string(&s).expect("Other(...) round-trips");
+        let class = snap
+            .classification
+            .accepted_for(&el)
+            .expect("element classified");
+        assert_eq!(
+            class,
+            &IfcClass::Other("IfcBuildingElementProxy".into()),
+            "Other variant preserves the original spelling",
         );
     }
 }

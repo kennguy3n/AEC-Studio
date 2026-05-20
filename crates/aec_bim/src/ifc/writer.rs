@@ -200,7 +200,15 @@ DATA;\n";
                     format!(
                         "{tag}('{guid}',#{owner},$,'{name}',$,$,$,$,$)",
                         owner = owner_history,
-                        name = format!("{tag}::{}", el.to_string()),
+                        // Defense in depth: even though `tag` and the
+                        // EntityId Display are ASCII-safe today, route
+                        // the composed name through `escape_step_string`
+                        // so adding any future user-supplied component
+                        // can't break STEP tokenization.
+                        name = escape_step_string(&format!(
+                            "{tag}::{}",
+                            el.to_string()
+                        )),
                     ),
                 );
                 contained_refs.push(format!("#{step_id}"));
@@ -354,8 +362,32 @@ DATA;\n";
     }
 }
 
+/// Escape `s` for embedding inside a STEP single-quoted string.
+///
+/// The on-wire format used by the writer/reader pair is:
+///
+///   * `\` is escaped as `\\`
+///   * `'` is escaped as `\'`
+///
+/// Order matters: backslashes must be doubled BEFORE single quotes are
+/// rewritten to `\'`, otherwise the `\` introduced for the quote would
+/// itself be doubled and corrupt the encoding.
+///
+/// This is not ISO 10303-21 canonical (canonical STEP doubles single
+/// quotes as `''`), but matches the reader's single-pass unescape in
+/// [`unescape_step_string`]. The module docs explicitly state this
+/// reader/writer pair is for AEC Studio's in-process IFC pipeline and
+/// not intended for interop with third-party IFC tooling.
 fn escape_step_string(s: &str) -> String {
-    s.replace('\'', "\\'")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 fn serialize_property_value(v: &PropertyValue) -> (String, &'static str) {
