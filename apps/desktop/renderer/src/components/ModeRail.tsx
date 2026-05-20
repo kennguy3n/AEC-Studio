@@ -7,6 +7,7 @@ const MODES = [
   { to: "/bim", label: "BIM", icon: "◫" },
   { to: "/render", label: "Render", icon: "◉" },
   { to: "/deliver", label: "Deliver", icon: "⤓" },
+  { to: "/settings", label: "Settings", icon: "⚙" },
 ];
 
 export function ModeRail() {

@@ -44,6 +44,7 @@ printpdf = "0.7"
 bitflags = { version = "2", features = ["serde"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 rust_xlsxwriter = "0.77"
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

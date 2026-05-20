@@ -654,6 +654,7 @@ AEC Studio's UI follows the **KChat design system** (same tokens as [kennguy3n/T
 - [README.md](README.md) — project overview
 - [ARCHITECTURE.md](ARCHITECTURE.md) — technical architecture
 - [PROGRESS.md](PROGRESS.md) — phased delivery tracker
+- [PHASES.md](PHASES.md) — top-line phase status
 - [CONTRIBUTING.md](CONTRIBUTING.md) — contribution guide
 - [SECURITY.md](SECURITY.md) — security policy
 - [kennguy3n/llama.cpp@prism](https://github.com/kennguy3n/llama.cpp) — local AI inference

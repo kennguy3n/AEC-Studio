@@ -126,12 +126,19 @@ impl fmt::Display for Scope {
     }
 }
 
-/// Whether an action originated from a user gesture or an AI tool call.
+/// Whether an action originated from a user gesture, an AI tool call,
+/// or an external integration like KChat.
+///
+/// `KChat` is used when a KChat review comment is ingested into the
+/// audit trail (see `aec_core::kchat::ingest_review`). KChat entries
+/// are always *read-only* with respect to project data — the variant
+/// exists only so the audit chain can attribute the source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActorKind {
     User,
     Ai,
+    KChat,
 }
 
 /// An actor record attached to every command and audit entry.
@@ -139,7 +146,8 @@ pub enum ActorKind {
 pub struct Actor {
     pub kind: ActorKind,
     /// For `ActorKind::Ai`, the name of the tool that produced the action
-    /// (e.g. `style_assistant`, `plan_detection`).
+    /// (e.g. `style_assistant`, `plan_detection`). For
+    /// `ActorKind::KChat`, the commenter handle (e.g. `@alice`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool: Option<String>,
 }
@@ -156,6 +164,16 @@ impl Actor {
         Self {
             kind: ActorKind::Ai,
             tool: Some(tool.into()),
+        }
+    }
+
+    /// Build a KChat-sourced actor. The `commenter` handle is stored
+    /// in the `tool` field so the audit-trail viewer can show who
+    /// posted the review comment without a separate column.
+    pub fn kchat(commenter: impl Into<String>) -> Self {
+        Self {
+            kind: ActorKind::KChat,
+            tool: Some(commenter.into()),
         }
     }
 }

@@ -39,11 +39,11 @@
 
 ## Platforms
 
-| Platform | Status |
-|---|---|
-| macOS (Intel & Apple Silicon) | Planned |
-| Windows (x64) | Planned |
-| Linux (x64) | Planned |
+| Platform | Status | Installers |
+|---|---|---|
+| macOS (Intel & Apple Silicon) | Alpha | `.dmg` + `.zip` (universal binary, hardened runtime) |
+| Windows (x64) | Alpha | `.exe` (NSIS) + `.msi` |
+| Linux (x64) | Alpha | `.AppImage` + `.deb` + `.snap` |
 
 Desktop only. Supports **CPU-only** and **CPU+GPU** configurations.
 
@@ -96,6 +96,21 @@ For the full technical architecture, see [ARCHITECTURE.md](ARCHITECTURE.md).
 | **BIM** | IFC import/export, classification, property editing, schedules, takeoff | BIM coordinators, small firms |
 | **Render** | EEVEE previews, Cycles final renders, batch queues, walkthroughs, panoramas | Visualizers |
 | **Deliver** | Proposal packs, contractor handoff, BOQ exports, IFC packs, PDF/DXF | Project leads |
+| **Settings** | Hardware profile, AI model tier override, render defaults, units, KChat integration toggle, Blender path | Everyone |
+
+A Ctrl/Cmd+K **command palette** opens from any mode, fuzzy-searching every registered command and shortcut. Navigation shortcuts: `Ctrl/Cmd+1..6` for Home / Design / Draft / BIM / Render / Deliver, `Ctrl/Cmd+,` for Settings.
+
+---
+
+## KChat integration (optional, Phase 7)
+
+AEC Studio ships with optional **KChat** integration that's strictly local-first:
+
+- **Outbound** — artefacts (renders, sheets, revision packs, BOQ snapshots) can be published as inline cards to a KChat thread with one click. The user supplies the transport; nothing routes through a centralised AEC Studio service.
+- **Inbound** — review and approval comments on those cards are ingested back into the project's audit trail with `ActorKind::KChat` so every decision is traceable.
+- **Off by default** — when the KChat toggle in Settings is off, every publish/sync method returns `KChatDisabled` and the corresponding UI hides itself. AEC Studio remains fully functional without ever touching KChat.
+
+The full Phase 7 component listing lives in [PHASES.md](PHASES.md) and the technical design is in [ARCHITECTURE.md](ARCHITECTURE.md#96-kchat-integration).
 
 ---
 
@@ -271,6 +286,7 @@ AGPL-3.0 — see [LICENSE](LICENSE).
 - [PROPOSAL.md](PROPOSAL.md) — full product proposal
 - [ARCHITECTURE.md](ARCHITECTURE.md) — technical architecture
 - [PROGRESS.md](PROGRESS.md) — phased delivery tracker
+- [PHASES.md](PHASES.md) — top-line phase status
 - [CONTRIBUTING.md](CONTRIBUTING.md) — contribution guide
 - [SECURITY.md](SECURITY.md) — security policy
 - [docs/LICENSE_ARCHITECTURE.md](docs/LICENSE_ARCHITECTURE.md) — AGPL boundary analysis (Blender / IfcOpenShell / Cycles / llama.cpp)

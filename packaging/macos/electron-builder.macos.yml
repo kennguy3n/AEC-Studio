@@ -1,0 +1,58 @@
+# electron-builder config for macOS targets.
+# Build the renderer + electron main bundle first (`npm run build` in
+# apps/desktop/), then point electron-builder at this file:
+#
+#   npx electron-builder --mac \
+#     --config packaging/macos/electron-builder.macos.yml \
+#     --projectDir apps/desktop
+#
+# Targets:
+# * dmg — disk image, primary distribution form.
+# * zip — flat zip, used for auto-update channels.
+#
+# Code signing: leave CSC_LINK / CSC_KEY_PASSWORD unset for local
+# unsigned builds. CI sets them from secrets when releasing.
+
+appId: ai.aec.studio
+productName: AEC Studio
+copyright: "© 2026 AEC Studio Authors"
+
+directories:
+  buildResources: packaging/macos/resources
+  output: dist/installers/macos
+
+files:
+  - dist-electron/**
+  - dist/**
+  - package.json
+  - node_modules/**
+
+mac:
+  category: public.app-category.graphics-design
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  # Both Intel and Apple-Silicon arches; electron-builder builds a
+  # universal binary when both are listed.
+  target:
+    - target: dmg
+      arch:
+        - x64
+        - arm64
+    - target: zip
+      arch:
+        - x64
+        - arm64
+  icon: packaging/macos/resources/icons/icon.icns
+  entitlements: packaging/macos/resources/entitlements.mac.plist
+  entitlementsInherit: packaging/macos/resources/entitlements.mac.plist
+  extendInfo:
+    NSHighResolutionCapable: true
+    LSMinimumSystemVersion: "11.0"
+    NSCameraUsageDescription: "AEC Studio does not access the camera."
+    NSMicrophoneUsageDescription: "AEC Studio does not access the microphone."
+
+dmg:
+  artifactName: "${productName}-${version}-${arch}.dmg"
+  sign: false
+
+publish: null

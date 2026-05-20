@@ -409,6 +409,89 @@ class BlenderWorkerTests(unittest.TestCase):
         lines = [json.loads(l) for l in sout.getvalue().strip().splitlines()]
         self.assertEqual(lines[0]["error"]["code"], "BAD_JSON")
 
+    # ----- stitch_frames -----
+
+    def test_stitch_frames_returns_image_sequence_when_ffmpeg_missing(self):
+        from walkthrough import stitch_frames  # type: ignore
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            (tmp_path / "frame_00001.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+            (tmp_path / "frame_00002.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+            out = stitch_frames(
+                str(tmp_path),
+                str(tmp_path / "walkthrough.mp4"),
+                ffmpeg_path="/definitely/does/not/exist",
+            )
+            self.assertEqual(out["kind"], "image_sequence")
+            self.assertEqual(out["frame_count"], 2)
+
+    def test_stitch_frames_rejects_missing_directory(self):
+        from walkthrough import stitch_frames  # type: ignore
+
+        with self.assertRaises(ValueError):
+            stitch_frames(
+                "/this/path/should/never/exist",
+                "/tmp/walkthrough.mp4",
+            )
+
+    def test_stitch_frames_rejects_zero_fps(self):
+        from walkthrough import stitch_frames  # type: ignore
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            (tmp_path / "frame_00001.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+            with self.assertRaises(ValueError):
+                stitch_frames(
+                    str(tmp_path),
+                    str(tmp_path / "out.mp4"),
+                    fps=0,
+                )
+
+    def test_stitch_frames_rejects_empty_directory(self):
+        from walkthrough import stitch_frames  # type: ignore
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError):
+                stitch_frames(
+                    tmp,
+                    str(Path(tmp) / "out.mp4"),
+                )
+
+    def test_stitch_frames_invokes_ffmpeg_when_present(self):
+        from walkthrough import stitch_frames  # type: ignore
+        import tempfile
+        import textwrap
+        import os
+        import stat
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            (tmp_path / "frame_00001.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+            (tmp_path / "frame_00002.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+
+            fake_ffmpeg = tmp_path / "fake_ffmpeg"
+            fake_ffmpeg.write_text(textwrap.dedent("""\
+                #!/usr/bin/env bash
+                touch \"${@: -1}\"
+                exit 0
+                """))
+            os.chmod(fake_ffmpeg, os.stat(fake_ffmpeg).st_mode | stat.S_IEXEC)
+
+            output = tmp_path / "out.mp4"
+            result = stitch_frames(
+                str(tmp_path),
+                str(output),
+                fps=24,
+                ffmpeg_path=str(fake_ffmpeg),
+            )
+            self.assertEqual(result["kind"], "video")
+            self.assertTrue(output.exists())
+            self.assertEqual(result["fps"], 24)
+
 
 if __name__ == "__main__":
     unittest.main()

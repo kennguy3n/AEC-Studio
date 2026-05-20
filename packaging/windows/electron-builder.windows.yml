@@ -1,0 +1,63 @@
+# electron-builder config for Windows targets.
+# Build the renderer + electron main bundle first (`npm run build` in
+# apps/desktop/), then point electron-builder at this file:
+#
+#   npx electron-builder --win \
+#     --config packaging/windows/electron-builder.windows.yml \
+#     --projectDir apps/desktop
+#
+# Targets:
+# * nsis — single .exe installer, primary distribution form.
+# * msi  — Windows Installer package for enterprise deployments.
+
+appId: ai.aec.studio
+productName: AEC Studio
+copyright: "© 2026 AEC Studio Authors"
+
+directories:
+  buildResources: packaging/windows/resources
+  output: dist/installers/windows
+
+files:
+  - dist-electron/**
+  - dist/**
+  - package.json
+  - node_modules/**
+
+win:
+  publisherName: AEC Studio
+  fileAssociations:
+    - ext: aec
+      name: AEC Studio Project
+      description: AEC Studio project file
+  protocols:
+    - name: AEC Studio
+      schemes:
+        - aec
+  target:
+    - target: nsis
+      arch:
+        - x64
+    - target: msi
+      arch:
+        - x64
+  icon: packaging/windows/resources/icons/icon.ico
+  legalTrademarks: AEC Studio
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: AEC Studio
+  artifactName: "${productName}-Setup-${version}-${arch}.exe"
+  installerIcon: packaging/windows/resources/icons/icon.ico
+  uninstallerIcon: packaging/windows/resources/icons/icon.ico
+
+msi:
+  oneClick: false
+  perMachine: false
+  artifactName: "${productName}-${version}-${arch}.msi"
+
+publish: null

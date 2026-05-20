@@ -308,7 +308,7 @@ workers/blender/
 ├── lighting.py                 # Sun/sky, area lights, IES profiles
 ├── eevee_preview.py            # EEVEE preview pipeline
 ├── cycles_final.py             # Cycles final render with denoise
-├── walkthrough.py              # Camera path animation
+├── walkthrough.py              # Camera path animation + stitch_frames() FFmpeg MP4 encode (graceful fallback to image sequence)
 ├── panorama.py                 # Equirectangular panorama renders
 └── manifest.json               # Pinned Blender version range
 ```
@@ -385,6 +385,7 @@ The BIM cache lets large IFC models open in seconds on re-open and lets export s
 
 ```
 crates/aec_render/
+├── benches/eevee_latency.rs    # Criterion benchmark for Rust-side IPC overhead (250ms budget)
 ├── blender_discovery.rs        # Cross-platform Blender binary discovery (env → known paths → PATH)
 ├── cameras.rs                  # CameraSnapshot, CameraStore, CameraJournal, preset thumbnails
 ├── cycles.rs                   # Cycles final-render pipeline
@@ -396,8 +397,55 @@ crates/aec_render/
 ├── preset.rs                   # Quick / Standard / High / Studio / EEVEE Preview / Walkthrough / Panorama + recommend_preset(tier)
 ├── queue.rs                    # Render queue (single, batch, matrix); resume on failure; governor-bounded concurrency
 ├── scene.rs                    # RenderScene, RenderCamera, RenderLight serialization
-└── worker.rs                   # JSON-line IPC to the Blender worker
+└── worker.rs                   # JSON-line IPC to the Blender worker; StitchWalkthrough request + WalkthroughOutput enum
 ```
+
+---
+
+## 9.6 KChat integration
+
+KChat integration is the **only** optional cross-organisation surface in AEC Studio. It is gated by a feature flag (`#[cfg(feature = "kchat")]`) at the crate level and by a runtime `KChatConfig::enabled` toggle in Settings. When the config is disabled, every publish/sync method returns `KChatDisabled` and the corresponding UI elements hide themselves.
+
+```
+crates/aec_core/
+├── kchat.rs                    # KChatArtifact, ArtifactCard, KChatPublisher trait,
+│                               # InMemoryPublisher (tests), ReviewComment / ApprovalStatus / ReviewCard,
+│                               # AssetPackReference, publish_asset_pack, subscribe_asset_pack
+├── kchat_sync.rs               # One-way comment sync (KChat thread → audit trail) with dedup by
+│                               # (thread_id, timestamp, commenter) so re-imports are no-ops
+└── kchat_config.rs             # Local-first config (enabled: bool, default_thread_id: Option<String>);
+                                # `KChatIntegration` gates every operation on `enabled`
+```
+
+```
+apps/desktop/renderer/src/components/kchat/
+├── PublishCardModal.tsx        # Preview an ArtifactCard before publishing
+└── ArtifactCardPreview.tsx     # Image + caption + metadata preview tile
+```
+
+### Data flow
+
+```
+┌──────────────────────────────┐
+│  AEC Studio (local-first)    │
+│                              │
+│  ┌────────┐    ┌──────────┐  │           ┌─────────────────┐
+│  │ Render │───▶│ Artifact │──┼──publish──▶│  KChat thread   │
+│  │  Sheet │    │   Card   │  │  (one-way) │  (user owned)   │
+│  └────────┘    └──────────┘  │           └────────┬────────┘
+│                              │                    │ inline comments
+│  ┌──────────────────────┐    │                    ▼
+│  │ AuditEntry           │◀───┼──ingest_review─── ReviewComment
+│  │  actor.kind=KChat    │    │  (kchat_sync.rs, dedup'd)
+│  └──────────────────────┘    │
+└──────────────────────────────┘
+```
+
+- **Outbound only.** Project data never leaves AEC Studio except through an explicit publish. `KChatPublisher` is a trait; the user supplies the transport (HTTP, IPC, file drop) — there is no centralised AEC Studio service.
+- **Inbound is comments only.** `kchat_sync.rs` imports `ReviewComment`s and turns them into `AuditEntry` rows with `ActorKind::KChat`. No project blobs are downloaded; team asset packs use the user's own transport for blobs and only sync manifest hashes.
+- **Local-first guarantee.** Tests in `crates/aec_core/src/kchat_config.rs` confirm that a disabled config rejects every publish/sync method. The Settings page exposes the toggle so users can keep AEC Studio entirely offline.
+
+---
 
 ### Camera and render state
 
@@ -784,20 +832,27 @@ aec-studio/
 │       ├── electron/           # Electron main process (main.ts, preload.ts, ipc.ts)
 │       └── renderer/           # React / TypeScript UI (pages, components, hooks, styles)
 ├── crates/                     # Rust core engine
-│   ├── aec_core/               # Core types, config, errors, project graph
+│   ├── aec_core/               # Core types, config, errors, project graph,
+│   │                             revision/version_diff, KChat (kchat.rs, kchat_sync.rs, kchat_config.rs)
 │   ├── aec_bridge/             # N-API bridge for Electron
 │   ├── aec_command/            # Command engine, undo/redo journal
 │   ├── aec_geometry/           # Geometry index, spatial queries, mesh cache
-│   ├── aec_viewport/           # wgpu viewport, 2D CAD canvas, selection overlays
+│   ├── aec_viewport/           # wgpu viewport, 2D CAD canvas, selection overlays, reference_image.rs
 │   ├── aec_cad/                # 2D CAD: primitives, layers, blocks, snaps, dims
 │   ├── aec_bim/                # BIM/IFC: IfcOpenShell adapter, spatial hierarchy
-│   ├── aec_render/             # Render queue, Blender/Cycles worker orchestration
+│   ├── aec_render/             # Render queue, Blender/Cycles worker orchestration,
+│   │                             EEVEE latency benchmark (benches/eevee_latency.rs)
 │   ├── aec_assets/             # Asset database, import pipeline, LOD, thumbnails
-│   ├── aec_materials/          # PBR material library, texture management
-│   ├── aec_ai/                 # AI command planner, tool schema, safety validator
-│   ├── aec_governor/           # Resource governor, hardware profiler, scheduling
-│   ├── aec_export/             # PDF, DXF, IFC, glTF, proposal pack export
-│   └── aec_audit/              # Audit trail, project history
+│   ├── aec_materials/          # PBR material library, texture management, mood_board.rs
+│   ├── aec_ai/                 # AI command planner, tool schema, safety validator,
+│   │                             layout_suggestion.rs, cover_draft.rs, lighting_balance.rs,
+│   │                             schedule_fill.rs, validation_help.rs
+│   ├── aec_governor/           # Resource governor, hardware profiler, scheduling,
+│   │                             Linux soak test (tests/linux_soak.rs)
+│   ├── aec_export/             # PDF, DXF, IFC, glTF, proposal pack export;
+│   │                             boq.rs, interior_pack.rs, contractor_pack.rs, bim_pack.rs,
+│   │                             before_after.rs, xlsx.rs; determinism + contractor_perf + phase6_e2e tests
+│   └── aec_audit/              # Audit trail, project history (ActorKind::KChat for review comments)
 ├── workers/                    # Native worker processes
 │   ├── blender/                # Blender worker scripts (Python)
 │   ├── ifc/                    # IfcOpenShell worker
@@ -853,6 +908,7 @@ AEC Studio's UI follows the **KChat design system** (same tokens as [kennguy3n/T
 - [README.md](README.md) — project overview
 - [PROPOSAL.md](PROPOSAL.md) — product proposal
 - [PROGRESS.md](PROGRESS.md) — phased delivery tracker
+- [PHASES.md](PHASES.md) — top-line phase status
 - [CONTRIBUTING.md](CONTRIBUTING.md) — contribution guide
 - [SECURITY.md](SECURITY.md) — security policy
 - [kennguy3n/llama.cpp@prism](https://github.com/kennguy3n/llama.cpp) — local AI inference

@@ -69,8 +69,32 @@ pub enum BlenderRequest {
         frame_start: u32,
         frame_end: u32,
     },
+    /// Stitch a directory of walkthrough frames into an MP4 video.
+    /// When the worker has no FFmpeg available it returns
+    /// [`WalkthroughOutput::ImageSequence`] pointing at `input_dir`.
+    StitchWalkthrough {
+        input_dir: String,
+        output_path: String,
+        /// Frames per second of the resulting MP4. 24 is the default
+        /// the renderer pipeline uses.
+        fps: u32,
+        /// Glob pattern for the frame files; defaults to
+        /// `frame_%05d.png` when None.
+        frame_pattern: Option<String>,
+    },
     /// Graceful shutdown.
     Shutdown,
+}
+
+/// Output of a [`BlenderRequest::StitchWalkthrough`] request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WalkthroughOutput {
+    /// FFmpeg produced an MP4 at this path.
+    Video { path: String },
+    /// FFmpeg was unavailable — the worker left the still frames in
+    /// this directory so the user can stitch them externally.
+    ImageSequence { dir: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -87,6 +111,11 @@ pub enum BlenderResponse {
     RenderCompleted {
         job_id: String,
         output_path: String,
+    },
+    /// Reply to `BlenderRequest::StitchWalkthrough`.
+    WalkthroughStitched {
+        job_id: String,
+        output: WalkthroughOutput,
     },
     Error {
         message: String,
