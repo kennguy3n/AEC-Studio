@@ -87,14 +87,32 @@ pub enum BlenderRequest {
 }
 
 /// Output of a [`BlenderRequest::StitchWalkthrough`] request.
+///
+/// Mirrors the dict shape returned by `workers/blender/walkthrough.py::stitch_frames`.
+/// Both variants carry `frame_count` so callers can report progress and
+/// summarise the result without re-walking the directory; the `Video`
+/// variant additionally carries `fps` (echoed from the request) so a
+/// downstream consumer encoding the playback contract for a UI player
+/// has the canonical frame rate without re-parsing the MP4.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WalkthroughOutput {
     /// FFmpeg produced an MP4 at this path.
-    Video { path: String },
+    Video {
+        path: String,
+        /// Number of input frames the MP4 was assembled from.
+        frame_count: u32,
+        /// Frames per second the MP4 was encoded at.
+        fps: u32,
+    },
     /// FFmpeg was unavailable — the worker left the still frames in
     /// this directory so the user can stitch them externally.
-    ImageSequence { dir: String },
+    ImageSequence {
+        dir: String,
+        /// Number of frames found in `dir` that matched the request's
+        /// `frame_pattern`. Excludes thumbnails / reference images.
+        frame_count: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -216,6 +234,56 @@ mod tests {
         w.mark_busy();
         w.stop();
         assert_eq!(w.state(), WorkerState::Stopped);
+    }
+
+    #[test]
+    fn walkthrough_output_matches_python_dict_shape() {
+        // Regression: the Rust enum must round-trip against the exact
+        // dict shape `workers/blender/walkthrough.py::stitch_frames`
+        // emits. Previously we silently dropped `frame_count` / `fps`
+        // on deserialize, leaving downstream Rust consumers blind to
+        // useful metadata that Python had already computed.
+        let video_json =
+            r#"{"kind":"video","path":"/tmp/walkthrough.mp4","frame_count":120,"fps":24}"#;
+        let video: WalkthroughOutput = serde_json::from_str(video_json).unwrap();
+        match video {
+            WalkthroughOutput::Video {
+                ref path,
+                frame_count,
+                fps,
+            } => {
+                assert_eq!(path, "/tmp/walkthrough.mp4");
+                assert_eq!(frame_count, 120);
+                assert_eq!(fps, 24);
+            }
+            other @ WalkthroughOutput::ImageSequence { .. } => {
+                panic!("expected Video, got {other:?}")
+            }
+        }
+        // Round-trip back through serde and confirm the re-encoded
+        // shape matches what Python expects (key order is irrelevant
+        // because serde_json preserves struct field order, but the
+        // *set* of keys must include path/frame_count/fps).
+        let re_json = serde_json::to_string(&video).unwrap();
+        assert!(re_json.contains("\"kind\":\"video\""));
+        assert!(re_json.contains("\"path\":\"/tmp/walkthrough.mp4\""));
+        assert!(re_json.contains("\"frame_count\":120"));
+        assert!(re_json.contains("\"fps\":24"));
+
+        let seq_json = r#"{"kind":"image_sequence","dir":"/tmp/out","frame_count":48}"#;
+        let seq: WalkthroughOutput = serde_json::from_str(seq_json).unwrap();
+        match seq {
+            WalkthroughOutput::ImageSequence {
+                ref dir,
+                frame_count,
+            } => {
+                assert_eq!(dir, "/tmp/out");
+                assert_eq!(frame_count, 48);
+            }
+            other @ WalkthroughOutput::Video { .. } => {
+                panic!("expected ImageSequence, got {other:?}")
+            }
+        }
     }
 
     #[test]
