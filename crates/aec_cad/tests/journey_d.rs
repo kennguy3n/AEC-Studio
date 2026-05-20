@@ -9,6 +9,7 @@
 //! Acceptance: DXF roundtrip preserves layers, blocks, dim styles,
 //! and text styles.
 
+use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use aec_cad::command_line::{CommandKind, CommandParser};
@@ -41,8 +42,8 @@ fn vendor_dxf_str() -> String {
     s.push_str("0\nTABLE\n2\nLAYER\n");
     for (n, c) in [("0", 7), ("WALLS", 1), ("DOORS", 3)] {
         s.push_str("0\nLAYER\n");
-        s.push_str(&format!("2\n{n}\n"));
-        s.push_str(&format!("62\n{c}\n"));
+        writeln!(s, "2\n{n}").unwrap();
+        writeln!(s, "62\n{c}").unwrap();
         s.push_str("6\nCONTINUOUS\n");
         s.push_str("370\n25\n");
     }

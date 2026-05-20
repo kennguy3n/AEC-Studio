@@ -313,7 +313,7 @@ fn studio_lead_journey_end_to_end() {
             "Villa Solaris",
             env!("CARGO_PKG_VERSION"),
         ),
-        |d, e| d.add_entity(e),
+        aec_core::RevisionDraft::add_entity,
     );
     let baseline = rev_store.create(baseline_draft).expect("baseline revision");
 
@@ -344,7 +344,7 @@ fn studio_lead_journey_end_to_end() {
             "Villa Solaris",
             env!("CARGO_PKG_VERSION"),
         ),
-        |d, e| d.add_entity(e),
+        aec_core::RevisionDraft::add_entity,
     );
     let revised = rev_store.create(revised_draft).expect("revised revision");
 

@@ -180,23 +180,23 @@ fn interior_designer_journey_end_to_end() {
     let mut ai_command_ids: Vec<aec_core::CommandId> = Vec::new();
 
     for (room_idx, room) in tpl.rooms.iter().enumerate() {
-        let o = room.origin_mm;
-        let w = room.width_mm;
-        let d = room.depth_mm;
-        let h = room.height_mm;
+        let origin = room.origin_mm;
+        let width = room.width_mm;
+        let depth = room.depth_mm;
+        let height = room.height_mm;
         let corners = [
-            [o[0], o[1]],
-            [o[0] + w, o[1]],
-            [o[0] + w, o[1] + d],
-            [o[0], o[1] + d],
+            [origin[0], origin[1]],
+            [origin[0] + width, origin[1]],
+            [origin[0] + width, origin[1] + depth],
+            [origin[0], origin[1] + depth],
         ];
         let mut wall_ids: Vec<EntityId> = Vec::new();
-        for i in 0..4 {
+        for side in 0..4 {
             let wall = CreateWall {
                 entity_id: EntityId::new(),
-                start_mm: corners[i],
-                end_mm: corners[(i + 1) % 4],
-                height_mm: h,
+                start_mm: corners[side],
+                end_mm: corners[(side + 1) % 4],
+                height_mm: height,
                 thickness_mm: 100.0,
                 material_id: None,
             };
@@ -204,17 +204,17 @@ fn interior_designer_journey_end_to_end() {
             let kind = CommandKind::CreateWall(wall);
             // First wall of the first room is from the plan-detection
             // AI tool (the "accept diff" branch in the journey).
-            let cmd = if room_idx == 0 && i == 0 {
+            let cmd = if room_idx == 0 && side == 0 {
                 ai_authored += 1;
-                let c = Command {
+                let ai_cmd = Command {
                     command_id: aec_core::CommandId::new(),
                     ts: chrono::Utc::now(),
                     scope: kind.scope(),
                     actor: Actor::ai("plan_detection"),
                     kind,
                 };
-                ai_command_ids.push(c.command_id.clone());
-                c
+                ai_command_ids.push(ai_cmd.command_id.clone());
+                ai_cmd
             } else {
                 Command::user(kind)
             };

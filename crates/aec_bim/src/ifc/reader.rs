@@ -113,7 +113,7 @@ impl IfcReader {
             match g.kind.as_str() {
                 "IFCOWNERHISTORY" => {}
                 "IFCPROJECT" | "IFCSITE" | "IFCBUILDING" | "IFCBUILDINGSTOREY" | "IFCSPACE" => {
-                    let class = ifc_class_from_tag(&g.kind, &g.raw_kind)?;
+                    let class = ifc_class_from_tag(&g.kind, &g.raw_kind);
                     let name = g.string_arg(3)?;
                     // Spatial nodes are authored by the writer with the
                     // user-facing display name ("Café", "Ground"). They
@@ -194,7 +194,7 @@ impl IfcReader {
                             // `IfcBuildingElementProxy`) round-trip
                             // verbatim. Casing is preserved from the
                             // original STEP bytes via `raw_kind`.
-                            let class = ifc_class_from_tag(other, &g.raw_kind)?;
+                            let class = ifc_class_from_tag(other, &g.raw_kind);
                             let guid = g.string_arg(0)?;
                             let entity = EntityId::from_string(eid).map_err(|e| {
                                 IfcReadError::Malformed(format!(
@@ -496,9 +496,8 @@ fn parse_step_groups(text: &str) -> IfcReadResult<Vec<StepRecord>> {
         if !line.starts_with('#') {
             continue;
         }
-        let body = match line.strip_suffix(';') {
-            Some(s) => s,
-            None => continue,
+        let Some(body) = line.strip_suffix(';') else {
+            continue;
         };
         // "#N = TYPE(args)"
         let (lhs, rhs) = body
@@ -677,11 +676,11 @@ impl StepRecord {
 /// [`IfcClass::Other`] using `raw_tag` so author-provided casing
 /// (e.g. `"IfcBuildingElementProxy"` from the AI classifier) is
 /// preserved verbatim across export/import.
-fn ifc_class_from_tag(tag: &str, raw_tag: &str) -> IfcReadResult<IfcClass> {
+fn ifc_class_from_tag(tag: &str, raw_tag: &str) -> IfcClass {
     // STEP entity names are uppercase ("IFCWALL"), our `ifc_tag()`
     // returns mixed case ("IfcWall"). Normalize for matching.
     let up = tag.to_ascii_uppercase();
-    let cls = match up.as_str() {
+    match up.as_str() {
         "IFCPROJECT" => IfcClass::IfcProject,
         "IFCSITE" => IfcClass::IfcSite,
         "IFCBUILDING" => IfcClass::IfcBuilding,
@@ -706,8 +705,7 @@ fn ifc_class_from_tag(tag: &str, raw_tag: &str) -> IfcReadResult<IfcClass> {
         "IFCPLUMBINGFIXTURE" => IfcClass::IfcPlumbingFixture,
         "IFCOPENINGELEMENT" => IfcClass::IfcOpeningElement,
         _ => IfcClass::Other(raw_tag.to_string()),
-    };
-    Ok(cls)
+    }
 }
 
 // ---------------------------------------------------------------------

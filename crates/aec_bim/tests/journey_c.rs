@@ -335,15 +335,10 @@ fn construction_pm_journey_end_to_end() {
     for id in &unknowns {
         classification.assign_ai(id.clone(), IfcClass::IfcCovering, 0.92);
     }
-    assert!(unknowns
-        .iter()
-        .all(|id| classification
-            .get(id)
-            .map_or(false, |a| a.confidence >= 0.85
-                && matches!(
-                    a.source,
-                    aec_bim::classification::ClassificationSource::Ai
-                ))));
+    assert!(unknowns.iter().all(
+        |id| classification.get(id).is_some_and(|a| a.confidence >= 0.85
+            && matches!(a.source, aec_bim::classification::ClassificationSource::Ai))
+    ));
 
     let post_report = validate_project(&project, &classification, &props, &relations);
     let still_missing = post_report

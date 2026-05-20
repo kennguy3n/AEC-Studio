@@ -205,15 +205,14 @@ DATA;\n";
                         // the composed name through `escape_step_string`
                         // so adding any future user-supplied component
                         // can't break STEP tokenization.
-                        name = escape_step_string(&format!("{tag}::{}", el.to_string())),
+                        name = escape_step_string(&format!("{tag}::{el}")),
                     ),
                 );
                 contained_refs.push(format!("#{step_id}"));
             }
             if !contained_refs.is_empty() {
                 let rel = buf.alloc();
-                let rel_guid =
-                    derive_guid_from_str(&format!("rel-contained::{}", storey_id.to_string()));
+                let rel_guid = derive_guid_from_str(&format!("rel-contained::{storey_id}"));
                 buf.write_line(
                     rel,
                     format!(
@@ -251,8 +250,7 @@ DATA;\n";
                     })
                     .collect();
                 let pset_step = buf.alloc();
-                let pset_guid =
-                    derive_guid_from_str(&format!("pset::{}::{}", el.to_string(), name));
+                let pset_guid = derive_guid_from_str(&format!("pset::{el}::{name}"));
                 buf.write_line(
                     pset_step,
                     format!(
@@ -267,8 +265,7 @@ DATA;\n";
                     ),
                 );
                 let rel = buf.alloc();
-                let rel_guid =
-                    derive_guid_from_str(&format!("rel-pset::{}::{}", el.to_string(), name));
+                let rel_guid = derive_guid_from_str(&format!("rel-pset::{el}::{name}"));
                 buf.write_line(
                     rel,
                     format!(
@@ -298,8 +295,7 @@ DATA;\n";
                     })
                     .collect();
                 let qset_step = buf.alloc();
-                let qset_guid =
-                    derive_guid_from_str(&format!("qset::{}::{}", el.to_string(), name));
+                let qset_guid = derive_guid_from_str(&format!("qset::{el}::{name}"));
                 buf.write_line(
                     qset_step,
                     format!(
@@ -314,8 +310,7 @@ DATA;\n";
                     ),
                 );
                 let rel = buf.alloc();
-                let rel_guid =
-                    derive_guid_from_str(&format!("rel-qset::{}::{}", el.to_string(), name));
+                let rel_guid = derive_guid_from_str(&format!("rel-qset::{el}::{name}"));
                 buf.write_line(
                     rel,
                     format!(

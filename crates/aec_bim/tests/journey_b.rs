@@ -561,7 +561,7 @@ fn architecture_studio_journey_end_to_end() {
     // PDF builder so we have real bytes for the contractor pack.
     let mut sheet_files: Vec<PackFile> = Vec::new();
     for (n, code, label) in &sheet_meta {
-        let mut b = PdfBuilder::new(n.to_string(), PageSize::A4_LANDSCAPE).expect("pdf");
+        let mut b = PdfBuilder::new((*n).to_string(), PageSize::A4_LANDSCAPE).expect("pdf");
         b.add_cover_page(Some(label)).expect("cover page");
         b.add_text_page(
             "Architecture Studio",
@@ -618,15 +618,16 @@ fn architecture_studio_journey_end_to_end() {
     // 9. Contractor pack. Must complete in well under 60s; we
     //    assert < 5s to leave headroom for the slowest CI runners.
     // ---------------------------------------------------------------
-    let mut schedules = Vec::new();
-    schedules.push(PackFile {
-        archive_name: "schedules/doors.xlsx".into(),
-        source_path: door_xlsx,
-    });
-    schedules.push(PackFile {
-        archive_name: "schedules/rooms.xlsx".into(),
-        source_path: room_xlsx,
-    });
+    let schedules = vec![
+        PackFile {
+            archive_name: "schedules/doors.xlsx".into(),
+            source_path: door_xlsx,
+        },
+        PackFile {
+            archive_name: "schedules/rooms.xlsx".into(),
+            source_path: room_xlsx,
+        },
+    ];
     let boq_pack = PackFile {
         archive_name: "schedules/boq.xlsx".into(),
         source_path: boq_xlsx,
@@ -667,6 +668,10 @@ fn architecture_studio_journey_end_to_end() {
         .filter(|e| e.name.starts_with("schedules/"))
         .count();
     assert_eq!(schedule_entries, 3, "doors + rooms + boq are bundled");
-    let has_ifc = manifest.entries.iter().any(|e| e.name.ends_with(".ifc"));
+    let has_ifc = manifest.entries.iter().any(|e| {
+        std::path::Path::new(&e.name)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("ifc"))
+    });
     assert!(has_ifc, "IFC is bundled in the contractor pack");
 }
