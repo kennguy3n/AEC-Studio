@@ -78,6 +78,33 @@ pub fn derive_guid_from_str(seed: &str) -> String {
     out
 }
 
+/// Validate that `guid` matches the IFC4 `IfcGloballyUniqueId` grammar
+/// (exactly 22 characters from the 64-char compressed alphabet).
+///
+/// Returns `true` if the GUID is safe to interpolate directly into a
+/// STEP single-quoted string. Used by the writer as defense-in-depth
+/// against user-supplied GUIDs that contain `'`, `\`, control chars,
+/// or are the wrong length — any of which would corrupt the IFC file
+/// or break the reader's tokenizer.
+pub fn is_valid_ifc_guid(guid: &str) -> bool {
+    guid.len() == 22
+        && guid
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'$')
+}
+
+/// Return `guid` if it is valid IFC syntax, otherwise return a stable
+/// fallback derived from `fallback_seed`. Writers use this to guarantee
+/// the emitted STEP record is always parseable, even if upstream code
+/// stored a malformed GUID.
+pub fn sanitize_ifc_guid(guid: &str, fallback_seed: &str) -> String {
+    if is_valid_ifc_guid(guid) {
+        guid.to_owned()
+    } else {
+        derive_guid_from_str(fallback_seed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,5 +127,48 @@ mod tests {
         let a = compress_entity_id_to_guid(&EntityId::new());
         let b = compress_entity_id_to_guid(&EntityId::new());
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn validates_well_formed_ifc_guids() {
+        // 22-char alphanumeric ± `_$` GUID is valid.
+        assert!(is_valid_ifc_guid("1xS3BCk291UvhgP2a6eflL"));
+        assert!(is_valid_ifc_guid("AAAAAAAAAAAAAAAAAAAAAA"));
+        assert!(is_valid_ifc_guid("________$$$$$$$$$$$$$$"));
+    }
+
+    #[test]
+    fn rejects_malformed_ifc_guids() {
+        // Wrong length.
+        assert!(!is_valid_ifc_guid(""));
+        assert!(!is_valid_ifc_guid("short"));
+        assert!(!is_valid_ifc_guid("1xS3BCk291UvhgP2a6eflLZ"));
+        // Embedded quote — would break STEP tokenization.
+        assert!(!is_valid_ifc_guid("1xS3BCk291Uvhg'P2a6eflL"));
+        // Embedded backslash — would break STEP escape handling.
+        assert!(!is_valid_ifc_guid("1xS3BCk291Uvhg\\P2a6eflL"));
+        // Embedded comma — would break STEP arg-split.
+        assert!(!is_valid_ifc_guid("1xS3BCk291Uvhg,P2a6eflL"));
+        // Embedded NUL.
+        assert!(!is_valid_ifc_guid("1xS3BCk291Uvhg\0P2a6eflL"));
+        // Unicode.
+        assert!(!is_valid_ifc_guid("1xS3BCk291Uvhgéa6eflLZZ"));
+    }
+
+    #[test]
+    fn sanitize_passes_valid_guids_through() {
+        let good = "1xS3BCk291UvhgP2a6eflL";
+        assert_eq!(sanitize_ifc_guid(good, "ignored"), good);
+    }
+
+    #[test]
+    fn sanitize_replaces_malformed_guids_with_deterministic_fallback() {
+        let bad = "ev'il\\guid,";
+        let a = sanitize_ifc_guid(bad, "seed-1");
+        let b = sanitize_ifc_guid(bad, "seed-1");
+        assert_eq!(a, b, "fallback is deterministic from seed");
+        assert!(is_valid_ifc_guid(&a), "fallback is a valid IFC GUID");
+        let c = sanitize_ifc_guid(bad, "seed-2");
+        assert_ne!(a, c, "different seed produces different GUID");
     }
 }

@@ -143,10 +143,10 @@ fn dxf_roundtrip_preserves_layers_blocks_dim_styles_and_entities() {
     }));
     doc.push(DxfEntity::Hatch(DxfHatch {
         layer: "A-WALL".into(),
-        pattern_name: "SOLID".into(),
-        solid: true,
+        pattern_name: "ANSI31".into(),
+        solid: false,
         scale: 1.0,
-        angle: 0.0,
+        angle: 45.0,
         elevation: 0.0,
         loops: vec![DxfHatchLoop {
             vertices: vec![[0.0, 0.0], [500.0, 0.0], [500.0, 500.0], [0.0, 500.0]],
@@ -267,6 +267,15 @@ fn dxf_roundtrip_preserves_layers_blocks_dim_styles_and_entities() {
             "entity discriminant preserved"
         );
         assert_eq!(src.layer(), got.layer(), "entity layer preserved");
+        // Hatch-specific: verify the pattern name roundtrips (code-2
+        // fix for pre-existing reader bug where code 2 was only routed
+        // to block_name).
+        if let (DxfEntity::Hatch(s), DxfEntity::Hatch(g)) = (src, got) {
+            assert_eq!(
+                g.pattern_name, s.pattern_name,
+                "hatch pattern_name preserved"
+            );
+        }
     }
 }
 

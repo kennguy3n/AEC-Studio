@@ -9,9 +9,10 @@
 //!
 //!   * Synthetic 40-MB-equivalent IFC model: 50 elements (walls,
 //!     slabs, doors, windows, finishes) attached to the spatial
-//!     hierarchy via `Project::attach_element`.  Each carries a
-//!     deterministic IFC GUID via `Project::set_ifc_guid` so we can
-//!     verify GUID preservation later if we expand the test.
+//!     hierarchy via `Project::attach_element`.  Element GUIDs are
+//!     deterministically derived from `EntityId` by the IFC writer
+//!     via `compress_entity_id_to_guid`; `set_ifc_guid` only applies
+//!     to spatial nodes, not elements.
 //!   * Real `ClassificationStore::assign_imported` for the elements
 //!     that arrive pre-classified, and real `assign_ai` (>= 0.85
 //!     confidence) for the ones the importer had to leave unknown.
@@ -68,31 +69,16 @@ fn write_ifc(dir: &Path, project_name: &str) -> PathBuf {
     path
 }
 
-fn deterministic_guid(seed: u64) -> String {
-    // 22-character base-64-ish GUID derived deterministically from `seed`.
-    const ALPHABET: &[u8] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_$";
-    let mut s = String::with_capacity(22);
-    let mut n = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    for _ in 0..22 {
-        s.push(ALPHABET[(n & 0x3F) as usize] as char);
-        n = n.wrapping_shr(6).wrapping_add(0x1234_5678_9ABC_DEF0);
-    }
-    s
-}
-
 fn attach_wall(
     project: &mut Project,
     storey: &EntityId,
     props: &mut PropertyStore,
     classification: &mut ClassificationStore,
     name: &str,
-    seed: u64,
     material: &str,
 ) -> EntityId {
     let id = EntityId::new();
     project.attach_element(storey, id.clone());
-    project.set_ifc_guid(&id, deterministic_guid(seed));
     let _ = name;
     classification.assign_imported(id.clone(), IfcClass::IfcWall);
     let mut common = PropertySet::new("Pset_WallCommon");
@@ -118,12 +104,10 @@ fn attach_slab(
     storey: &EntityId,
     props: &mut PropertyStore,
     classification: &mut ClassificationStore,
-    seed: u64,
     material: &str,
 ) -> EntityId {
     let id = EntityId::new();
     project.attach_element(storey, id.clone());
-    project.set_ifc_guid(&id, deterministic_guid(seed));
     classification.assign_imported(id.clone(), IfcClass::IfcSlab);
     let mut common = PropertySet::new("Pset_SlabCommon");
     common.set("Material", PropertyValue::Text(material.into()));
@@ -146,13 +130,11 @@ fn attach_door(
     storey: &EntityId,
     props: &mut PropertyStore,
     classification: &mut ClassificationStore,
-    seed: u64,
     mark: &str,
     fire: Option<&str>,
 ) -> EntityId {
     let id = EntityId::new();
     project.attach_element(storey, id.clone());
-    project.set_ifc_guid(&id, deterministic_guid(seed));
     classification.assign_imported(id.clone(), IfcClass::IfcDoor);
     let mut common = PropertySet::new("Pset_DoorCommon");
     common.set("Reference", PropertyValue::Label(mark.into()));
@@ -180,12 +162,10 @@ fn attach_window(
     storey: &EntityId,
     props: &mut PropertyStore,
     classification: &mut ClassificationStore,
-    seed: u64,
     mark: &str,
 ) -> EntityId {
     let id = EntityId::new();
     project.attach_element(storey, id.clone());
-    project.set_ifc_guid(&id, deterministic_guid(seed));
     classification.assign_imported(id.clone(), IfcClass::IfcWindow);
     let mut common = PropertySet::new("Pset_WindowCommon");
     common.set("Reference", PropertyValue::Label(mark.into()));
@@ -213,12 +193,10 @@ fn attach_unknown(
     project: &mut Project,
     storey: &EntityId,
     props: &mut PropertyStore,
-    seed: u64,
     material: &str,
 ) -> EntityId {
     let id = EntityId::new();
     project.attach_element(storey, id.clone());
-    project.set_ifc_guid(&id, deterministic_guid(seed));
     let mut mat = PropertySet::new("Pset_ElementMaterial");
     mat.set("Material", PropertyValue::Text(material.into()));
     props.entry(id.clone()).upsert_pset(mat);
@@ -276,18 +254,16 @@ fn construction_pm_journey_end_to_end() {
             &mut props,
             &mut classification,
             "wall",
-            10_000 + i,
             mat,
         ));
     }
     let mut slabs: Vec<EntityId> = Vec::new();
-    for i in 0..8 {
+    for _ in 0..8 {
         slabs.push(attach_slab(
             &mut project,
             &storey,
             &mut props,
             &mut classification,
-            20_000 + i,
             "concrete_250",
         ));
     }
@@ -299,7 +275,6 @@ fn construction_pm_journey_end_to_end() {
             &storey,
             &mut props,
             &mut classification,
-            30_000 + i,
             &format!("D-{:02}", i + 1),
             fire,
         ));
@@ -311,17 +286,15 @@ fn construction_pm_journey_end_to_end() {
             &storey,
             &mut props,
             &mut classification,
-            40_000 + i,
             &format!("W-{:02}", i + 1),
         ));
     }
     let mut unknowns: Vec<EntityId> = Vec::new();
-    for i in 0..6 {
+    for _ in 0..6 {
         unknowns.push(attach_unknown(
             &mut project,
             &storey,
             &mut props,
-            50_000 + i,
             "finish_paint",
         ));
     }

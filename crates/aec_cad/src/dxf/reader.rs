@@ -476,7 +476,14 @@ fn build_entity(
                     text.clone_from(val);
                 }
             }
-            2 => block_name.clone_from(val),
+            2 => {
+                if kind == "HATCH" {
+                    // DXF spec: code 2 is the hatch pattern name.
+                    hatch_pattern.clone_from(val);
+                } else {
+                    block_name.clone_from(val);
+                }
+            }
             _ => {}
         }
     }

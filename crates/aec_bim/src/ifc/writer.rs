@@ -33,7 +33,7 @@ use crate::classification::{ClassificationStore, IfcClass};
 use crate::properties::{PropertyStore, PropertyValue};
 use crate::spatial::Project;
 
-use super::{compress_entity_id_to_guid, derive_guid_from_str};
+use super::{compress_entity_id_to_guid, derive_guid_from_str, sanitize_ifc_guid};
 
 #[derive(Debug, Error)]
 pub enum IfcWriteError {
@@ -103,10 +103,14 @@ DATA;\n";
             let Some(node) = project.nodes.get(&id) else {
                 continue;
             };
-            let guid = node
-                .ifc_guid
-                .clone()
-                .unwrap_or_else(|| compress_entity_id_to_guid(&id));
+            // Sanitize any user-supplied GUID so we never interpolate
+            // an embedded `'`, `\`, control char, or wrong-length value
+            // into the STEP single-quoted string (which would corrupt
+            // the file and break the reader's tokenizer).
+            let guid = match node.ifc_guid.as_deref() {
+                Some(g) => sanitize_ifc_guid(g, &id.to_string()),
+                None => compress_entity_id_to_guid(&id),
+            };
             let step_id = buf.alloc();
             spatial_step.insert(id.clone(), step_id);
             spatial_guid.insert(id.clone(), guid.clone());
@@ -378,7 +382,19 @@ fn serialize_quantity_value(v: &PropertyValue) -> (String, &'static str) {
         PropertyValue::Volume(x) => (format_real(*x), "IFCQUANTITYVOLUME"),
         PropertyValue::Integer(i) => (i.to_string(), "IFCQUANTITYCOUNT"),
         PropertyValue::Real(x) => (format_real(*x), "IFCQUANTITYWEIGHT"),
-        PropertyValue::Ratio(x) => (format_real(*x), "IFCQUANTITYWEIGHT"),
+        PropertyValue::Ratio(_) => {
+            // IFC4 has no IfcQuantityRatio — Ratio values belong in
+            // Psets (IFCPOSITIVERATIOMEASURE) not Qsets. Emit as
+            // IFCQUANTITYWEIGHT so the file stays parseable, but flag
+            // this at dev-time so the authoring code can be corrected.
+            debug_assert!(
+                false,
+                "PropertyValue::Ratio in a QuantitySet has no lossless IFC4 \
+                 representation; move it to a PropertySet where \
+                 IFCPOSITIVERATIOMEASURE preserves type fidelity"
+            );
+            (format_real(match v { PropertyValue::Ratio(x) => *x, _ => 0.0 }), "IFCQUANTITYWEIGHT")
+        }
         // Boolean / text quantities aren't standard IFC; fall through
         // as IfcQuantityCount(0) so the file still parses.
         _ => ("0".into(), "IFCQUANTITYCOUNT"),

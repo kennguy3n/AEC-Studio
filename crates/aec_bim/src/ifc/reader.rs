@@ -522,6 +522,15 @@ fn split_step_args(s: &str) -> Vec<String> {
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
+            '\\' if in_str => {
+                // The writer's escape_step_string emits \' for embedded
+                // single-quotes. Consume the backslash + the following
+                // character so we don't mis-toggle `in_str`.
+                buf.push(c);
+                if let Some(next) = chars.next() {
+                    buf.push(next);
+                }
+            }
             '\'' => {
                 in_str = !in_str;
                 buf.push(c);
@@ -799,6 +808,42 @@ mod tests {
     fn rejects_non_ifc_input() {
         let err = IfcReader::from_string("not ifc").unwrap_err();
         assert!(matches!(err, IfcReadError::MissingSection(_)));
+    }
+
+    #[test]
+    fn roundtrips_names_containing_single_quotes() {
+        let mut project = Project::new("Café's Place");
+        let site = project
+            .add_child(&project.root.clone(), IfcClass::IfcSite, "Owner's Suite")
+            .unwrap();
+        let bldg = project
+            .add_child(&site, IfcClass::IfcBuilding, "St. Mary's")
+            .unwrap();
+        let storey = project
+            .add_child(&bldg, IfcClass::IfcBuildingStorey, "L01")
+            .unwrap();
+
+        let mut classification = ClassificationStore::new();
+        let mut props = PropertyStore::new();
+        let el = EntityId::new();
+        project.attach_element(&storey, el.clone());
+        classification.assign_manual(el.clone(), IfcClass::IfcWall);
+        let mut pc = PropertySet::new("Pset_WallCommon");
+        pc.set("Reference", PropertyValue::Text("O'Brien".into()));
+        props.entry(el.clone()).upsert_pset(pc);
+
+        let s = crate::ifc::IfcWriter::to_string(&project, &classification, &props);
+        let snap = IfcReader::from_string(&s).expect("parses names with quotes");
+        // Verify the spatial names survived.
+        let project_node = snap.project.nodes.get(&snap.project.root).unwrap();
+        assert_eq!(project_node.name, "Café's Place");
+        // Check the "O'Brien" text property round-tripped.
+        let p = snap.properties.get(&el).expect("element props");
+        let pset = p.psets.get("Pset_WallCommon").unwrap();
+        assert_eq!(
+            pset.properties.get("Reference"),
+            Some(&PropertyValue::Text("O'Brien".into()))
+        );
     }
 }
 
