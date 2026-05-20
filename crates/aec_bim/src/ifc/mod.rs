@@ -58,6 +58,15 @@ pub fn derive_guid_from_str(seed: &str) -> String {
     let raw = &hash.as_bytes()[..16];
 
     let mut out = String::with_capacity(22);
+    // Sliding 6-bit window over the 16 input bytes. `acc` is intentionally
+    // `u32` (not `u64`) — the left-shift by 8 below relies on Rust's
+    // defined wrap-on-overflow for `<<` so the top bits drop off
+    // cleanly after each byte is fully consumed. The invariant we
+    // maintain is `bits <= 14` at the top of the loop (it cycles
+    // 0→8→2→10→4→12→6→0 across bytes), so the `acc >> bits` extraction
+    // never reads beyond the live window: the bits we'd "lose" to
+    // wrap-around have already been emitted into `out` on a prior
+    // iteration. `& 0x3F` masks the 6 target bits regardless.
     let mut acc: u32 = 0;
     let mut bits: u32 = 0;
     for &b in raw {

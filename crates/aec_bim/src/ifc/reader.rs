@@ -507,7 +507,7 @@ fn parse_step_groups(text: &str) -> IfcReadResult<Vec<StepRecord>> {
         let raw_kind = rhs[..open].trim().to_string();
         let kind = raw_kind.to_ascii_uppercase();
         let inner = &rhs[open + 1..close];
-        let args = split_step_args(inner);
+        let args = split_step_args(inner)?;
         groups.push(StepRecord {
             step_id,
             kind,
@@ -521,8 +521,18 @@ fn parse_step_groups(text: &str) -> IfcReadResult<Vec<StepRecord>> {
 /// Split the argument list of a STEP record, respecting nested
 /// parentheses (e.g. measure wrappers like `IFCLENGTHMEASURE(0.9)`)
 /// and single-quoted strings.
-fn split_step_args(s: &str) -> Vec<String> {
+///
+/// Returns `IfcReadError::Malformed` if the input is structurally
+/// invalid — closing paren without a matching open, unclosed paren at
+/// end of input, or an unterminated quoted string. The writer only ever
+/// emits balanced output, but failing loudly on malformed bytes prevents
+/// later parsers from silently consuming an un-split argument as a
+/// single literal.
+fn split_step_args(s: &str) -> IfcReadResult<Vec<String>> {
     let mut out: Vec<String> = Vec::new();
+    // u32 + saturating arithmetic would also work, but i32 lets us
+    // explicitly diagnose underflow as a `Malformed` error so the file
+    // surface fails early instead of producing garbage downstream.
     let mut depth = 0i32;
     let mut in_str = false;
     let mut buf = String::new();
@@ -531,8 +541,9 @@ fn split_step_args(s: &str) -> Vec<String> {
         match c {
             '\\' if in_str => {
                 // The writer's escape_step_string emits \' for embedded
-                // single-quotes. Consume the backslash + the following
-                // character so we don't mis-toggle `in_str`.
+                // single-quotes and \\ for embedded backslashes. Consume
+                // the backslash + the following character so we don't
+                // mis-toggle `in_str` on an escaped `'`.
                 buf.push(c);
                 if let Some(next) = chars.next() {
                     buf.push(next);
@@ -548,6 +559,11 @@ fn split_step_args(s: &str) -> Vec<String> {
             }
             ')' if !in_str => {
                 depth -= 1;
+                if depth < 0 {
+                    return Err(IfcReadError::Malformed(format!(
+                        "STEP arg list has ')' without a matching '(': {s:?}"
+                    )));
+                }
                 buf.push(c);
             }
             ',' if !in_str && depth == 0 => {
@@ -557,10 +573,20 @@ fn split_step_args(s: &str) -> Vec<String> {
             _ => buf.push(c),
         }
     }
+    if in_str {
+        return Err(IfcReadError::Malformed(format!(
+            "STEP arg list has an unterminated quoted string: {s:?}"
+        )));
+    }
+    if depth != 0 {
+        return Err(IfcReadError::Malformed(format!(
+            "STEP arg list has unbalanced parens (depth={depth}): {s:?}"
+        )));
+    }
     if !buf.trim().is_empty() {
         out.push(buf.trim().to_string());
     }
-    out
+    Ok(out)
 }
 
 impl StepRecord {
@@ -1018,6 +1044,83 @@ mod tests {
             &IfcClass::Other("IfcBuildingElementProxy".into()),
             "Other variant preserves the original spelling",
         );
+    }
+
+    #[test]
+    fn split_step_args_rejects_unbalanced_close_paren() {
+        // `')'` before any `'('` would previously drive the depth
+        // counter negative and silently produce a single un-split arg.
+        // We now fail loudly so a corrupted IFC byte stream surfaces
+        // as `IfcReadError::Malformed` instead of garbage downstream.
+        let err = split_step_args("a),b").expect_err("must reject extra ')'");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("')' without a matching '('"),
+            "unexpected error message: {msg}",
+        );
+    }
+
+    #[test]
+    fn split_step_args_rejects_unbalanced_open_paren() {
+        let err = split_step_args("a,(b").expect_err("must reject unclosed '('");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unbalanced parens"),
+            "unexpected error message: {msg}",
+        );
+    }
+
+    #[test]
+    fn split_step_args_rejects_unterminated_quoted_string() {
+        let err = split_step_args("a,'oops").expect_err("must reject unterminated string");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unterminated quoted string"),
+            "unexpected error message: {msg}",
+        );
+    }
+
+    #[test]
+    fn split_step_args_accepts_balanced_nested_parens_and_quotes() {
+        // Sanity: well-formed args (the only shape the writer emits)
+        // still split correctly. Includes a measure wrapper and a
+        // quoted string containing both an escaped quote and an
+        // escaped backslash.
+        let args =
+            split_step_args("'a\\'b',IFCLENGTHMEASURE(3.5),'c\\\\d',(#1,#2)").expect("balanced");
+        assert_eq!(
+            args,
+            vec![
+                "'a\\'b'".to_string(),
+                "IFCLENGTHMEASURE(3.5)".to_string(),
+                "'c\\\\d'".to_string(),
+                "(#1,#2)".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn from_string_surfaces_malformed_arg_list_as_error() {
+        // End-to-end: a STEP envelope whose inner arg list contains a
+        // bare unmatched `)` (e.g. produced by a corrupted serializer)
+        // must return `Err(Malformed)`, not panic and not
+        // succeed-with-garbage. `parse_step_groups` strips the outer
+        // `IFCSITE( ... )` envelope using `find('(')` / `rfind(')')`,
+        // so the embedded `)` between commas — outside any quoted
+        // string — is what reaches `split_step_args` and trips the
+        // negative-depth guard.
+        let bad = "ISO-10303-21;\n\
+HEADER;\n\
+FILE_DESCRIPTION(('x'),'2;1');\n\
+FILE_NAME('a.ifc','x',('x'),('x'),'x','x','');\n\
+FILE_SCHEMA(('IFC4'));\n\
+ENDSEC;\n\
+DATA;\n\
+#1 = IFCSITE('00000000000000000000aa',$,$,'Site',a),$,$,$,$);\n\
+ENDSEC;\n\
+END-ISO-10303-21;\n";
+        let err = IfcReader::from_string(bad).expect_err("malformed arg list must error");
+        assert!(matches!(err, IfcReadError::Malformed(_)), "{err:?}");
     }
 }
 
