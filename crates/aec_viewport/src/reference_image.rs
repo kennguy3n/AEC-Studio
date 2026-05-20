@@ -310,7 +310,14 @@ fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
         let length = u16::from_be_bytes(bytes[cursor..cursor + 2].try_into().ok()?) as usize;
         // SOF markers — anything in 0xC0..=0xCF except 0xC4 (DHT), 0xC8 (RES), 0xCC (DAC).
         if (0xC0..=0xCF).contains(&marker) && marker != 0xC4 && marker != 0xC8 && marker != 0xCC {
-            // After length (2 bytes) we have: precision (1) + height (2) + width (2)
+            // After length (2 bytes) we have: precision (1) + height (2) + width (2).
+            // A truncated JPEG can end mid-SOF — we already validated the
+            // length field but not the dimension fields themselves, so guard
+            // the slice explicitly. Returning `None` here drops us back into
+            // the caller's "not a valid JPEG" fallback instead of panicking.
+            if cursor + 7 > bytes.len() {
+                return None;
+            }
             let h = u16::from_be_bytes(bytes[cursor + 3..cursor + 5].try_into().ok()?) as u32;
             let w = u16::from_be_bytes(bytes[cursor + 5..cursor + 7].try_into().ok()?) as u32;
             if w == 0 || h == 0 {
@@ -543,6 +550,42 @@ mod tests {
     fn pdf_mediabox_rejects_inverted_box() {
         let pdf = b"%PDF-1.4\n1 0 obj\n<< /MediaBox [200 200 100 100] >>\nendobj\n";
         assert!(pdf_first_page_dimensions(pdf).is_none());
+    }
+
+    #[test]
+    fn jpeg_dimensions_truncated_after_sof_marker_returns_none() {
+        // SOI + SOF0 with a length that says "the dimensions are coming"
+        // but the file ends before the precision/height/width bytes. Prior
+        // to the bounds-check fix this panicked with an out-of-bounds
+        // slice; the function must now return None so the caller falls
+        // back gracefully.
+        let mut jpeg = vec![0xFFu8, 0xD8, 0xFF, 0xC0, 0x00, 0x11];
+        // Truncate immediately after the length field — no precision /
+        // height / width bytes follow.
+        assert!(jpeg_dimensions(&jpeg).is_none());
+
+        // Two more bytes (precision + one byte of height) is still short
+        // enough to be missing the width; must also return None.
+        jpeg.extend_from_slice(&[0x08, 0x00]);
+        assert!(jpeg_dimensions(&jpeg).is_none());
+    }
+
+    #[test]
+    fn jpeg_dimensions_decodes_well_formed_sof0() {
+        // SOI, SOF0 length=17, precision=8, height=0x012C (300),
+        // width=0x01F4 (500), components etc. (rest is filler we never
+        // read — we only validate the dimension fields).
+        let jpeg = [
+            0xFF, 0xD8, // SOI
+            0xFF, 0xC0, 0x00, 0x11, // SOF0 marker + length=17
+            0x08, // precision
+            0x01, 0x2C, // height = 300
+            0x01, 0xF4, // width = 500
+            0x03, // 3 components (Y, Cb, Cr)
+            // Component bytes (we never reach this in the parser)
+            0x01, 0x22, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01,
+        ];
+        assert_eq!(jpeg_dimensions(&jpeg), Some((500, 300)));
     }
 
     #[test]

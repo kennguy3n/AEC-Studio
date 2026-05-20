@@ -89,6 +89,14 @@
       "allowed_scopes": ["deliver"],
       "max_entities_modified": 4,
       "grammar_key": "cover_page_draft"
+    },
+    {
+      "id": "lighting_balance",
+      "display_name": "Lighting balance",
+      "description": "Suggest accent lights to match a reference mood.",
+      "allowed_scopes": ["render"],
+      "max_entities_modified": 8,
+      "grammar_key": "lighting_balance"
     }
   ]
 }

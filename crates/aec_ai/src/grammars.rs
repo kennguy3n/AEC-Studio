@@ -42,6 +42,7 @@ impl Grammar {
             "property_fill" => match_property_fill(&value),
             "validation_help" => match_validation_help(&value),
             "cover_page_draft" => match_cover_page_draft(&value),
+            "lighting_balance" => match_lighting_balance(&value),
             _ => true, // unknown grammar: accept (validator handled elsewhere)
         }
     }
@@ -134,6 +135,37 @@ fn match_cover_page_draft(v: &serde_json::Value) -> bool {
         && v.get("subtitle").and_then(|s| s.as_str()).is_some()
 }
 
+fn match_lighting_balance(v: &serde_json::Value) -> bool {
+    let Some(rationale) = v.get("rationale").and_then(|s| s.as_str()) else {
+        return false;
+    };
+    if rationale.trim().is_empty() {
+        return false;
+    }
+    let Some(arr) = v.get("suggested_accents").and_then(|a| a.as_array()) else {
+        return false;
+    };
+    arr.iter().all(|light| {
+        let pos_ok = light
+            .get("position_mm")
+            .and_then(|p| p.as_array())
+            .is_some_and(|coords| coords.len() == 3 && coords.iter().all(|c| c.as_f64().is_some()));
+        let kind_ok = light
+            .get("kind")
+            .and_then(|s| s.as_str())
+            .is_some_and(|s| s == "area" || s == "point");
+        let intensity_ok = light
+            .get("intensity")
+            .and_then(serde_json::Value::as_f64)
+            .is_some();
+        let temp_ok = light
+            .get("color_temperature_k")
+            .and_then(serde_json::Value::as_f64)
+            .is_some();
+        pos_ok && kind_ok && intensity_ok && temp_ok
+    })
+}
+
 const PLAN_DETECTION_GBNF: &str = r#"
 root      ::= "{" ws "\"polylines\"" ws ":" ws polylist ws "}"
 polylist  ::= "[" ws (poly ("," ws poly)*)? ws "]"
@@ -153,6 +185,17 @@ ws        ::= [ \t\n]*
 
 const LAYOUT_SUGGESTION_GBNF: &str = include_str!("grammars/layout_suggestion.gbnf");
 const COVER_PAGE_DRAFT_GBNF: &str = include_str!("grammars/cover_page_draft.gbnf");
+
+const LIGHTING_BALANCE_GBNF: &str = r#"
+root        ::= "{" ws "\"rationale\"" ws ":" ws str ws "," ws "\"suggested_accents\"" ws ":" ws lights ws "}"
+lights      ::= "[" ws (light ("," ws light)*)? ws "]"
+light       ::= "{" ws "\"kind\"" ws ":" ws kind ws "," ws "\"position_mm\"" ws ":" ws triple ws "," ws "\"intensity\"" ws ":" ws number ws "," ws "\"color_temperature_k\"" ws ":" ws number ws ("," ws "\"rationale\"" ws ":" ws str ws)? "}"
+kind        ::= "\"area\"" | "\"point\""
+triple      ::= "[" ws number ws "," ws number ws "," ws number ws "]"
+number      ::= "-"? [0-9]+ ("." [0-9]+)?
+str         ::= "\"" [^"]+ "\""
+ws          ::= [ \t\n]*
+"#;
 
 const RENDER_DOCTOR_GBNF: &str = r#"
 root      ::= "{" ws "\"findings\"" ws ":" ws findlist ws "}"
@@ -249,6 +292,11 @@ impl GrammarRegistry {
             gbnf: COVER_PAGE_DRAFT_GBNF.into(),
             example: r#"{"title":"Loft 12B","subtitle":"A warm home for a family of three","paragraph":"A sun-drenched apartment that pairs open-plan living with intimate corners for slow weekends.","tone":"warm"}"#.into(),
         });
+        r.insert(Grammar {
+            key: "lighting_balance".into(),
+            gbnf: LIGHTING_BALANCE_GBNF.into(),
+            example: r#"{"rationale":"warm fill from west","suggested_accents":[{"kind":"area","position_mm":[1200.0,2200.0,2400.0],"intensity":1.4,"color_temperature_k":3200.0}]}"#.into(),
+        });
         for key in ["cad_cleanup", "schedule_fill", "validation_help"] {
             r.insert(Grammar {
                 key: key.into(),
@@ -273,6 +321,32 @@ mod tests {
         assert!(r.get("plan_detection").is_some());
         assert!(r.get("style_assistant").is_some());
         assert!(r.get("render_doctor").is_some());
+        assert!(r.get("lighting_balance").is_some());
+    }
+
+    #[test]
+    fn lighting_balance_grammar_matches() {
+        let g = GrammarRegistry::defaults();
+        let l = g.get("lighting_balance").unwrap();
+        assert!(l.matches(
+            r#"{"rationale":"warm fill","suggested_accents":[{"kind":"area","position_mm":[1.0,2.0,3.0],"intensity":1.2,"color_temperature_k":3200.0}]}"#
+        ));
+        // missing rationale -> reject
+        assert!(!l.matches(
+            r#"{"suggested_accents":[{"kind":"area","position_mm":[1.0,2.0,3.0],"intensity":1.2,"color_temperature_k":3200.0}]}"#
+        ));
+        // empty rationale -> reject
+        assert!(!l.matches(
+            r#"{"rationale":"  ","suggested_accents":[{"kind":"area","position_mm":[1.0,2.0,3.0],"intensity":1.2,"color_temperature_k":3200.0}]}"#
+        ));
+        // unknown kind -> reject
+        assert!(!l.matches(
+            r#"{"rationale":"x","suggested_accents":[{"kind":"spot","position_mm":[1.0,2.0,3.0],"intensity":1.2,"color_temperature_k":3200.0}]}"#
+        ));
+        // wrong position shape -> reject
+        assert!(!l.matches(
+            r#"{"rationale":"x","suggested_accents":[{"kind":"point","position_mm":[1.0,2.0],"intensity":1.0,"color_temperature_k":3200.0}]}"#
+        ));
     }
 
     #[test]

@@ -101,4 +101,10 @@ export const AI_TOOLS: AiTool[] = [
     maxEntitiesModified: 4,
     description: "Draft a proposal pack cover page.",
   },
+  {
+    id: "lighting_balance",
+    scope: "render",
+    maxEntitiesModified: 8,
+    description: "Suggest accent lights to match a reference mood.",
+  },
 ];

@@ -31,8 +31,20 @@ pub enum LightingBalanceError {
     Json(#[from] serde_json::Error),
     #[error("too many accent lights: {count} (max {max})")]
     TooManyLights { count: usize, max: usize },
+    /// Reserved for actual NaN / ±Infinity floats that escape the JSON
+    /// parser (e.g. via `"NaN"` numeric literals on some non-strict
+    /// inputs, or values produced from arithmetic before validation).
+    /// Out-of-range but finite values are reported via [`OutOfRange`]
+    /// so callers can give the user a precise reason.
     #[error("non-finite numeric value for `{field}`")]
     NonFinite { field: &'static str },
+    /// Finite but outside the accepted range for the field.
+    #[error("`{field}` out of range: got {value}, expected {expected}")]
+    OutOfRange {
+        field: &'static str,
+        value: f32,
+        expected: &'static str,
+    },
     #[error("rationale must not be empty")]
     EmptyRationale,
 }
@@ -105,14 +117,26 @@ impl LightingBalanceResult {
                     });
                 }
             }
-            if !light.intensity.is_finite() || light.intensity < 0.0 {
+            if !light.intensity.is_finite() {
                 return Err(LightingBalanceError::NonFinite { field: "intensity" });
             }
-            if !light.color_temperature_k.is_finite()
-                || !(1000.0..=12_000.0).contains(&light.color_temperature_k)
-            {
+            if light.intensity < 0.0 {
+                return Err(LightingBalanceError::OutOfRange {
+                    field: "intensity",
+                    value: light.intensity,
+                    expected: ">= 0.0",
+                });
+            }
+            if !light.color_temperature_k.is_finite() {
                 return Err(LightingBalanceError::NonFinite {
                     field: "color_temperature_k",
+                });
+            }
+            if !(1000.0..=12_000.0).contains(&light.color_temperature_k) {
+                return Err(LightingBalanceError::OutOfRange {
+                    field: "color_temperature_k",
+                    value: light.color_temperature_k,
+                    expected: "1000.0..=12000.0 K",
                 });
             }
             let _ = idx;
@@ -206,7 +230,27 @@ mod tests {
         let mut payload = good_payload();
         payload["suggested_accents"][0]["color_temperature_k"] = serde_json::json!(50_000.0);
         let err = LightingBalanceResult::parse(&payload.to_string()).unwrap_err();
-        assert!(matches!(err, LightingBalanceError::NonFinite { .. }));
+        assert!(matches!(
+            err,
+            LightingBalanceError::OutOfRange {
+                field: "color_temperature_k",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_negative_intensity_as_out_of_range() {
+        let mut payload = good_payload();
+        payload["suggested_accents"][0]["intensity"] = serde_json::json!(-0.25);
+        let err = LightingBalanceResult::parse(&payload.to_string()).unwrap_err();
+        assert!(matches!(
+            err,
+            LightingBalanceError::OutOfRange {
+                field: "intensity",
+                ..
+            }
+        ));
     }
 
     #[test]

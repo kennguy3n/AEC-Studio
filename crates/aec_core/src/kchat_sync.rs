@@ -1,9 +1,16 @@
 //! One-way sync from KChat threads to the project audit trail.
 //!
 //! Only ingests *into* the project — never exports project data
-//! back to KChat. The sync is deduplicated by
-//! `(thread_id, timestamp, commenter)` so re-importing the same batch
-//! does not produce duplicate audit entries.
+//! back to KChat. The sync is deduplicated using
+//! [`crate::kchat::ReviewCommentKey`], a 4-tuple of
+//! `(thread_id, timestamp, commenter, blake3(text))`. The text
+//! fingerprint is part of the key on purpose: if a reviewer edits
+//! their KChat comment after the first ingest — keeping the same
+//! author, thread, and timestamp — the edit must land in the audit
+//! trail as a *new* entry rather than being collapsed onto the
+//! original, otherwise later readers would never learn the reviewer
+//! changed their mind. See [`crate::kchat::ReviewComment::dedup_key`]
+//! for the full rationale.
 //!
 //! `CommentSync` is **stateful**: it keeps a `HashSet` of dedup keys
 //! it has already seen so a long-running session can call `ingest` /
@@ -12,7 +19,7 @@
 //! audit trail itself acts as the canonical persisted record, so a
 //! `CommentSync` rehydrated from an audit log (via
 //! [`CommentSync::from_existing_entries`]) recovers the dedup set
-//! automatically.
+//! automatically, including the text fingerprint component.
 
 use std::collections::HashSet;
 
