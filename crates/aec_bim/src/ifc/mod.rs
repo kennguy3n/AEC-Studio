@@ -160,20 +160,52 @@ mod tests {
 
     #[test]
     fn rejects_malformed_ifc_guids() {
-        // Wrong length.
+        // ---- Wrong length (covers the len() == 22 short-circuit) ----
         assert!(!is_valid_ifc_guid(""));
         assert!(!is_valid_ifc_guid("short"));
+        // 23 chars — one too long.
         assert!(!is_valid_ifc_guid("1xS3BCk291UvhgP2a6eflLZ"));
+        // 21 chars — one too short.
+        assert!(!is_valid_ifc_guid("1xS3BCk291UvhgP2a6efl"));
+
+        // ---- Wrong charset at the right length ----
+        //
+        // Each of these strings is *exactly* 22 ASCII bytes long
+        // (`len() == 22`) and replaces one valid char with a
+        // STEP-hostile char. This exercises the charset branch of
+        // `is_valid_ifc_guid`, not the length branch — the previous
+        // version of these tests inserted extra characters which
+        // made the strings 23-bytes and the length check rejected
+        // them before the charset check ran.
         // Embedded quote — would break STEP tokenization.
-        assert!(!is_valid_ifc_guid("1xS3BCk291Uvhg'P2a6eflL"));
+        assert!(!is_valid_ifc_guid("1xS3BCk291Uvhg'2a6eflL"));
         // Embedded backslash — would break STEP escape handling.
-        assert!(!is_valid_ifc_guid("1xS3BCk291Uvhg\\P2a6eflL"));
+        assert!(!is_valid_ifc_guid("1xS3BCk291Uvhg\\2a6eflL"));
         // Embedded comma — would break STEP arg-split.
-        assert!(!is_valid_ifc_guid("1xS3BCk291Uvhg,P2a6eflL"));
-        // Embedded NUL.
-        assert!(!is_valid_ifc_guid("1xS3BCk291Uvhg\0P2a6eflL"));
-        // Unicode.
-        assert!(!is_valid_ifc_guid("1xS3BCk291Uvhgéa6eflLZZ"));
+        assert!(!is_valid_ifc_guid("1xS3BCk291Uvhg,2a6eflL"));
+        // Embedded semicolon — STEP statement terminator.
+        assert!(!is_valid_ifc_guid("1xS3BCk291Uvhg;2a6eflL"));
+        // Embedded parenthesis — STEP arg-list delimiter.
+        assert!(!is_valid_ifc_guid("1xS3BCk291Uvhg(2a6eflL"));
+        // Embedded NUL. (Use `\x00` rather than `\0` so the next
+        // char `2` doesn't get parsed as part of an octal escape.)
+        assert!(!is_valid_ifc_guid("1xS3BCk291Uvhg\x002a6eflL"));
+        // Embedded space.
+        assert!(!is_valid_ifc_guid("1xS3BCk291Uvhg 2a6eflL"));
+        // ASCII exclamation — outside the 64-char IFC alphabet.
+        assert!(!is_valid_ifc_guid("1xS3BCk291Uvhg!2a6eflL"));
+        // Non-ASCII byte in a 22-byte string: `é` is 0xC3 0xA9 (two
+        // UTF-8 bytes), so we replace TWO ASCII chars with one `é`
+        // to keep the byte length at exactly 22 and force the
+        // charset branch to see a non-ASCII byte. (If we instead
+        // inserted `é` without removing any chars, the byte length
+        // would be 23 and the length check would short-circuit
+        // before the charset check ran.)
+        let mut s_non_ascii = String::from("1xS3BCk291Uvh");
+        s_non_ascii.push('é'); // 2 bytes
+        s_non_ascii.push_str("2a6eflL"); // 7 bytes — total 13 + 2 + 7 = 22
+        assert_eq!(s_non_ascii.len(), 22);
+        assert!(!is_valid_ifc_guid(&s_non_ascii));
     }
 
     #[test]

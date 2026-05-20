@@ -265,8 +265,19 @@ DATA;\n";
         }
 
         // ---- Psets + Qtos ----
+        //
+        // Per IFC4 schema, `IfcRelDefinesByProperties.RelatedObjects`
+        // is `SET[1:?] OF IfcObjectDefinition` — i.e. both building
+        // elements (`IfcElement` subtypes) AND spatial structure
+        // elements (`IfcSpatialStructureElement` subtypes:
+        // `IfcSpace` / `IfcBuildingStorey` / `IfcBuilding` / …) can
+        // own Psets and Qtos. Most notably `Pset_SpaceCommon` and
+        // `Qto_SpaceBaseQuantities` are normally attached to
+        // `IfcSpace` instances. Resolve the property owner against
+        // both the element table and the spatial table so neither
+        // side is silently dropped on export.
         for (el, props) in properties.iter() {
-            let Some(&owner_step) = element_step.get(el) else {
+            let Some(&owner_step) = element_step.get(el).or_else(|| spatial_step.get(el)) else {
                 continue;
             };
             for (name, pset) in &props.psets {

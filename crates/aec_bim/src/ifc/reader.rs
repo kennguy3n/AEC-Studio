@@ -354,6 +354,20 @@ impl IfcReader {
         let mut props = PropertyStore::new();
         let mut pset_count = 0usize;
         let mut qset_count = 0usize;
+        // Resolve a step id to the underlying EntityId, accepting
+        // either a building element or a spatial structure node.
+        // Per IFC4, both element subtypes and spatial subtypes are
+        // valid `IfcObjectDefinition` targets of an
+        // `IfcRelDefinesByProperties` relation (e.g. `IfcSpace` can
+        // own `Pset_SpaceCommon`). Falling back to the spatial table
+        // here matches the writer's owner-step resolution so neither
+        // side is silently dropped on import.
+        let resolve_object = |step: &u32| -> Option<EntityId> {
+            elements
+                .get(step)
+                .map(|el| el.entity.clone())
+                .or_else(|| spatial.get(step).map(|sp| sp.entity.clone()))
+        };
         for (elem_steps, pset_or_qset_step) in &defines_pset {
             // pset_or_qset_step may be either an IFCPROPERTYSET or
             // an IFCELEMENTQUANTITY entity.
@@ -365,8 +379,8 @@ impl IfcReader {
                     }
                 }
                 for elem_step in elem_steps {
-                    if let Some(el) = elements.get(elem_step) {
-                        props.entry(el.entity.clone()).upsert_pset(set.clone());
+                    if let Some(entity) = resolve_object(elem_step) {
+                        props.entry(entity).upsert_pset(set.clone());
                     }
                 }
                 pset_count += 1;
@@ -378,8 +392,8 @@ impl IfcReader {
                     }
                 }
                 for elem_step in elem_steps {
-                    if let Some(el) = elements.get(elem_step) {
-                        props.entry(el.entity.clone()).upsert_qset(set.clone());
+                    if let Some(entity) = resolve_object(elem_step) {
+                        props.entry(entity).upsert_qset(set.clone());
                     }
                 }
                 qset_count += 1;
@@ -1293,6 +1307,166 @@ mod tests {
         assert!(
             snap.guid_by_entity.contains_key(&el),
             "EntityId must survive the unsafe-tag proxy fallback",
+        );
+    }
+
+    #[test]
+    fn spatial_node_psets_and_qsets_roundtrip() {
+        // Per IFC4, spatial structure elements (`IfcSpace`,
+        // `IfcBuildingStorey`, …) can own Psets and Qtos —
+        // `Pset_SpaceCommon` and `Qto_SpaceBaseQuantities` are the
+        // canonical examples on `IfcSpace`. The writer must emit
+        // these IfcRelDefinesByProperties relations (resolving the
+        // owner step against the spatial table, not just the element
+        // table), and the reader must restore them on the
+        // corresponding spatial EntityId on import.
+        let mut project = Project::new("SpatialPsetRT");
+        let site = project
+            .add_child(&project.root.clone(), IfcClass::IfcSite, "S")
+            .unwrap();
+        let bldg = project
+            .add_child(&site, IfcClass::IfcBuilding, "B")
+            .unwrap();
+        let storey = project
+            .add_child(&bldg, IfcClass::IfcBuildingStorey, "L01")
+            .unwrap();
+        let space = project
+            .add_child(&storey, IfcClass::IfcSpace, "Living Room")
+            .unwrap();
+
+        let classification = ClassificationStore::new();
+        let mut properties = PropertyStore::new();
+
+        // Realistic Pset_SpaceCommon on the space.
+        let mut pset_common = PropertySet::new("Pset_SpaceCommon");
+        pset_common.set(
+            "Reference".to_string(),
+            PropertyValue::Text("R-101".to_string()),
+        );
+        pset_common.set(
+            "Category".to_string(),
+            PropertyValue::Text("Living".to_string()),
+        );
+        pset_common.set(
+            "PubliclyAccessible".to_string(),
+            PropertyValue::Boolean(false),
+        );
+        properties
+            .entry(space.clone())
+            .upsert_pset(pset_common.clone());
+
+        // Realistic Qto_SpaceBaseQuantities on the space.
+        let mut qset_base = QuantitySet::new("Qto_SpaceBaseQuantities");
+        qset_base
+            .quantities
+            .insert("NetFloorArea".into(), PropertyValue::Area(28.5));
+        qset_base
+            .quantities
+            .insert("NetPerimeter".into(), PropertyValue::Length(22.0));
+        qset_base
+            .quantities
+            .insert("Height".into(), PropertyValue::Length(2.7));
+        properties
+            .entry(space.clone())
+            .upsert_qset(qset_base.clone());
+
+        // Pset on a storey for good measure (covers the multi-class
+        // spatial-owner case).
+        let mut pset_storey = PropertySet::new("Pset_BuildingStoreyCommon");
+        pset_storey.set("AboveGround".to_string(), PropertyValue::Boolean(true));
+        properties
+            .entry(storey.clone())
+            .upsert_pset(pset_storey.clone());
+
+        let s = crate::ifc::IfcWriter::to_string(&project, &classification, &properties);
+
+        // Two IFCRELDEFINESBYPROPERTIES rels for the space (one pset
+        // + one qset) plus one for the storey = at least 3 rels in
+        // the emitted STEP file.
+        let rel_count = s
+            .lines()
+            .filter(|l| l.contains("IFCRELDEFINESBYPROPERTIES("))
+            .count();
+        assert!(
+            rel_count >= 3,
+            "expected >= 3 IFCRELDEFINESBYPROPERTIES (space pset + qset + storey pset), got {rel_count}: \n{s}",
+        );
+
+        let snap = IfcReader::from_string(&s).expect("spatial-owned psets must round-trip");
+
+        // Spatial nodes are reborn with fresh EntityIds on read (the
+        // STEP record only carries the GUID, not the original
+        // EntityId). Build a GUID → new EntityId map so the test can
+        // look up the reborn space/storey via the same GUID the
+        // writer produced from the original EntityId.
+        let entity_by_guid: HashMap<String, EntityId> = snap
+            .guid_by_entity
+            .iter()
+            .map(|(eid, guid)| (guid.clone(), eid.clone()))
+            .collect();
+        let space_guid = crate::ifc::compress_entity_id_to_guid(&space);
+        let storey_guid = crate::ifc::compress_entity_id_to_guid(&storey);
+        let space_reborn = entity_by_guid
+            .get(&space_guid)
+            .expect("space GUID must survive round-trip")
+            .clone();
+        let storey_reborn = entity_by_guid
+            .get(&storey_guid)
+            .expect("storey GUID must survive round-trip")
+            .clone();
+
+        // Space Pset_SpaceCommon must be reconstructed.
+        let space_props = snap
+            .properties
+            .get(&space_reborn)
+            .expect("space must have properties on round-trip");
+        let space_pset = space_props
+            .psets
+            .get("Pset_SpaceCommon")
+            .expect("Pset_SpaceCommon must survive round-trip on IfcSpace");
+        assert_eq!(
+            space_pset.properties.get("Reference"),
+            Some(&PropertyValue::Text("R-101".to_string())),
+        );
+        assert_eq!(
+            space_pset.properties.get("Category"),
+            Some(&PropertyValue::Text("Living".to_string())),
+        );
+        assert_eq!(
+            space_pset.properties.get("PubliclyAccessible"),
+            Some(&PropertyValue::Boolean(false)),
+        );
+
+        // Space Qto_SpaceBaseQuantities must be reconstructed.
+        let space_qset = space_props
+            .qsets
+            .get("Qto_SpaceBaseQuantities")
+            .expect("Qto_SpaceBaseQuantities must survive round-trip on IfcSpace");
+        assert_eq!(
+            space_qset.quantities.get("NetFloorArea"),
+            Some(&PropertyValue::Area(28.5)),
+        );
+        assert_eq!(
+            space_qset.quantities.get("NetPerimeter"),
+            Some(&PropertyValue::Length(22.0)),
+        );
+        assert_eq!(
+            space_qset.quantities.get("Height"),
+            Some(&PropertyValue::Length(2.7)),
+        );
+
+        // Storey Pset must also be reconstructed.
+        let storey_props = snap
+            .properties
+            .get(&storey_reborn)
+            .expect("storey must have properties on round-trip");
+        let storey_pset = storey_props
+            .psets
+            .get("Pset_BuildingStoreyCommon")
+            .expect("Pset_BuildingStoreyCommon must survive round-trip on IfcBuildingStorey");
+        assert_eq!(
+            storey_pset.properties.get("AboveGround"),
+            Some(&PropertyValue::Boolean(true)),
         );
     }
 
