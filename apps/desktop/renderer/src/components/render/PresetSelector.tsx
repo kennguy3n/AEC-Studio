@@ -91,6 +91,9 @@ export const PRESETS: PresetDetail[] = [
   },
 ];
 
+/** All preset ids in display order — convenient for batch selectors. */
+export const PRESET_IDS: RenderPresetKey[] = PRESETS.map((p) => p.id);
+
 /** Pick the preset id recommended for a given hardware tier. */
 export function recommendedPresetFor(tier: HardwareTier): RenderPresetKey {
   switch (tier) {

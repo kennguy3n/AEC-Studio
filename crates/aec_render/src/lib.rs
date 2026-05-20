@@ -8,6 +8,7 @@ pub mod cameras;
 pub mod cycles;
 pub mod doctor;
 pub mod eevee;
+pub mod history;
 pub mod job;
 pub mod lighting;
 pub mod preset;
@@ -25,6 +26,10 @@ pub use doctor::{
     DEFAULT_MAX_TEXTURE_EDGE_PX,
 };
 pub use eevee::EeveePipeline;
+pub use history::{
+    compare as compare_history, CompareResult, FieldDiff, HistoryError, RenderHistory,
+    RenderHistoryEntry,
+};
 pub use job::{RenderJob, RenderJobStatus};
 pub use lighting::{
     kelvin_to_rgb, IesParseError, IesPhotometricType, IesProfile, LightingPayload,

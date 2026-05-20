@@ -52,10 +52,34 @@ export interface BridgeBackend {
   bimDiff(params: Record<string, unknown>): Promise<{ diffId: string }>;
 
   renderEnqueue(params: Record<string, unknown>): Promise<{ jobId: string }>;
+  renderEnqueueBatch(params: {
+    cameraIds: string[];
+    presetIds?: string[];
+    presetId?: string;
+  }): Promise<{ batchId: string; jobIds: string[] }>;
+  renderBatchProgress(batchId: string): Promise<{
+    batchId: string;
+    total: number;
+    queued: number;
+    running: number;
+    completed: number;
+    failed: number;
+    cancelled: number;
+    averageProgress: number;
+  } | null>;
   renderListJobs(): Promise<RenderJob[]>;
   renderCancelJob(jobId: string): Promise<{ cancelled: true }>;
   renderApplyPreset(params: Record<string, unknown>): Promise<{ ok: true }>;
   renderDiagnose(jobId: string): Promise<{ jobId: string; suggestions: string[] }>;
+  renderCheckMaterials(): Promise<{
+    findings: Array<{
+      code: string;
+      severity: "info" | "warning" | "error";
+      materialId: string | null;
+      message: string;
+      fix: string | null;
+    }>;
+  }>;
 
   aiListTools(): Promise<AiTool[]>;
   aiPlan(params: Record<string, unknown>): Promise<{ diffId: string }>;
@@ -95,6 +119,10 @@ export interface RenderJob {
   status: "queued" | "running" | "completed" | "failed" | "cancelled";
   preset: string;
   progress: number;
+  /** Camera entity id this job is rendering (batch / matrix submissions). */
+  cameraId?: string | null;
+  /** Batch id when this job was submitted as part of a batch. */
+  batchId?: string | null;
 }
 
 export interface RuntimeStatus {
@@ -441,6 +469,75 @@ export function inProcessBackend(): BridgeBackend {
       jobs.unshift(job);
       return { jobId: job.jobId };
     },
+    async renderEnqueueBatch(params) {
+      // Mirror the Rust aec_render::queue::RenderQueue::submit_batch /
+      // submit_matrix: one job per (camera × preset) pair, all sharing
+      // one batch id.
+      const presets: string[] =
+        params.presetIds && params.presetIds.length > 0
+          ? params.presetIds
+          : params.presetId
+          ? [params.presetId]
+          : ["standard"];
+      const batchId = id("batch");
+      const created: string[] = [];
+      for (const cameraId of params.cameraIds) {
+        for (const preset of presets) {
+          const job: RenderJob = {
+            jobId: id("job"),
+            status: "queued",
+            preset,
+            progress: 0,
+            cameraId,
+            batchId,
+          };
+          jobs.unshift(job);
+          created.push(job.jobId);
+        }
+      }
+      return { batchId, jobIds: created };
+    },
+    async renderBatchProgress(batchId) {
+      const inBatch = jobs.filter((j) => j.batchId === batchId);
+      if (inBatch.length === 0) return null;
+      let queued = 0;
+      let running = 0;
+      let completed = 0;
+      let failed = 0;
+      let cancelled = 0;
+      let progressSum = 0;
+      for (const j of inBatch) {
+        switch (j.status) {
+          case "queued":
+            queued += 1;
+            break;
+          case "running":
+            running += 1;
+            progressSum += j.progress;
+            break;
+          case "completed":
+            completed += 1;
+            progressSum += 1;
+            break;
+          case "failed":
+            failed += 1;
+            break;
+          case "cancelled":
+            cancelled += 1;
+            break;
+        }
+      }
+      return {
+        batchId,
+        total: inBatch.length,
+        queued,
+        running,
+        completed,
+        failed,
+        cancelled,
+        averageProgress: progressSum / inBatch.length,
+      };
+    },
     async renderListJobs() {
       return [...jobs];
     },
@@ -454,6 +551,12 @@ export function inProcessBackend(): BridgeBackend {
     },
     async renderDiagnose(jobId) {
       return { jobId, suggestions: [] };
+    },
+    async renderCheckMaterials() {
+      // The native bridge will run check_materials() against the live
+      // RenderScene + material library; the in-process backend has no
+      // scene state, so it returns an empty findings array.
+      return { findings: [] };
     },
 
     async aiListTools() {

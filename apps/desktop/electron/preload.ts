@@ -68,6 +68,14 @@ const api = {
     applyPreset: (params: Record<string, unknown>) =>
       ipcRenderer.invoke("render:applyPreset", params),
     diagnose: (jobId: string) => ipcRenderer.invoke("render:diagnose", { jobId }),
+    enqueueBatch: (params: {
+      cameraIds: string[];
+      presetIds?: string[];
+      presetId?: string;
+    }) => ipcRenderer.invoke("render:enqueueBatch", params),
+    batchProgress: (batchId: string) =>
+      ipcRenderer.invoke("render:batchProgress", { batchId }),
+    checkMaterials: () => ipcRenderer.invoke("render:checkMaterials"),
   },
 
   // ----- AI -----

@@ -134,6 +134,40 @@ export function registerIpcHandlers(): void {
     assertString(jobId, "jobId");
     return getBridge().renderDiagnose(jobId);
   });
+  ipcMain.handle("render:enqueueBatch", async (_e, p) => {
+    assertObject(p, "params");
+    const cameraIds = (p as { cameraIds?: unknown }).cameraIds;
+    if (!Array.isArray(cameraIds) || cameraIds.length === 0) {
+      throw new Error("renderEnqueueBatch: cameraIds must be a non-empty array");
+    }
+    if (!cameraIds.every((c) => typeof c === "string")) {
+      throw new Error("renderEnqueueBatch: cameraIds must contain strings");
+    }
+    const presetIds = (p as { presetIds?: unknown }).presetIds;
+    if (
+      presetIds !== undefined &&
+      (!Array.isArray(presetIds) ||
+        !presetIds.every((s) => typeof s === "string"))
+    ) {
+      throw new Error("renderEnqueueBatch: presetIds must be string[]");
+    }
+    const presetId = (p as { presetId?: unknown }).presetId;
+    if (presetId !== undefined && typeof presetId !== "string") {
+      throw new Error("renderEnqueueBatch: presetId must be a string");
+    }
+    return getBridge().renderEnqueueBatch({
+      cameraIds: cameraIds as string[],
+      presetIds: presetIds as string[] | undefined,
+      presetId: presetId as string | undefined,
+    });
+  });
+  ipcMain.handle("render:batchProgress", async (_e, { batchId }) => {
+    assertString(batchId, "batchId");
+    return getBridge().renderBatchProgress(batchId);
+  });
+  ipcMain.handle("render:checkMaterials", async () =>
+    getBridge().renderCheckMaterials(),
+  );
 
   // ----- AI -----
   ipcMain.handle("ai:listTools", async () => getBridge().aiListTools());

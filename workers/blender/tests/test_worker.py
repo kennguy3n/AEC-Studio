@@ -31,6 +31,8 @@ class BlenderWorkerTests(unittest.TestCase):
             "lighting",
             "eevee_preview",
             "cycles_final",
+            "panorama",
+            "walkthrough",
         ]:
             sys.modules.pop(m, None)
 
@@ -159,6 +161,133 @@ class BlenderWorkerTests(unittest.TestCase):
 
         self.assertEqual(bpy.context.scene.cycles.samples, 256)
         self.assertEqual(bpy.context.scene.render.engine, "CYCLES")
+
+    # ----- panorama -----
+
+    def test_panorama_render_configures_pano_camera(self):
+        from panorama import render_panorama  # type: ignore
+
+        out = render_panorama(
+            "/tmp/pano.png",
+            samples=64,
+            resolution_x=512,
+            resolution_y=256,
+            denoise=False,
+        )
+        self.assertEqual(out["mode"], "panorama")
+        self.assertEqual(out["panorama_type"], "EQUIRECTANGULAR")
+        self.assertEqual(out["samples"], 64)
+        self.assertEqual(out["resolution_x"], 512)
+        self.assertEqual(out["resolution_y"], 256)
+
+        import bpy  # type: ignore
+
+        # The camera data block must have type=PANO + panorama_type=EQUIRECTANGULAR.
+        cam_data = bpy.data.cameras["PanoramaCamera"]
+        self.assertEqual(cam_data["type"], "PANO")
+        self.assertEqual(cam_data["panorama_type"], "EQUIRECTANGULAR")
+
+        # Render engine + dimensions must match the panorama preset.
+        self.assertEqual(bpy.context.scene.render.engine, "CYCLES")
+        self.assertEqual(bpy.context.scene.render.resolution_x, 512)
+        self.assertEqual(bpy.context.scene.render.resolution_y, 256)
+        # write_still must be true so the image is flushed to disk.
+        self.assertTrue(bpy.op_log[-1]["write_still"])
+
+    def test_panorama_render_rejects_non_2to1_aspect(self):
+        from panorama import render_panorama  # type: ignore
+
+        with self.assertRaises(ValueError):
+            render_panorama(
+                "/tmp/pano.png",
+                resolution_x=1920,
+                resolution_y=1080,
+            )
+
+    def test_panorama_render_rejects_unknown_format(self):
+        from panorama import render_panorama  # type: ignore
+
+        with self.assertRaises(ValueError):
+            render_panorama(
+                "/tmp/pano.png",
+                resolution_x=512,
+                resolution_y=256,
+                output_format="WEBP",
+            )
+
+    # ----- walkthrough -----
+
+    def test_walkthrough_renders_each_frame(self):
+        import tempfile
+
+        from walkthrough import render_walkthrough  # type: ignore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            keyframes = [
+                {"frame": 1, "position": [0, -5000, 1500], "target": [0, 0, 1500]},
+                {"frame": 10, "position": [3000, -5000, 1500], "target": [0, 0, 1500]},
+            ]
+            out = render_walkthrough(
+                tmp,
+                keyframes=keyframes,
+                samples=8,
+                resolution_x=320,
+                resolution_y=180,
+                frame_start=1,
+                frame_end=3,
+            )
+            self.assertEqual(out["mode"], "walkthrough")
+            self.assertEqual(out["frame_start"], 1)
+            self.assertEqual(out["frame_end"], 3)
+            self.assertEqual(len(out["frames"]), 3)
+            self.assertEqual([f["frame"] for f in out["frames"]], [1, 2, 3])
+
+            import bpy  # type: ignore
+
+            self.assertEqual(bpy.context.scene.render.engine, "CYCLES")
+            self.assertEqual(bpy.context.scene.cycles.samples, 8)
+            # write_still must be true on every frame render.
+            renders = [op for op in bpy.op_log if op.get("op") == "render"]
+            self.assertEqual(len(renders), 3)
+            self.assertTrue(all(r["write_still"] for r in renders))
+
+    def test_walkthrough_requires_keyframes(self):
+        from walkthrough import render_walkthrough  # type: ignore
+
+        with self.assertRaises(ValueError):
+            render_walkthrough("/tmp", keyframes=[])
+
+    def test_walkthrough_interpolates_between_keyframes(self):
+        # Direct unit test of the interpolation helper rather than going
+        # through the bpy stub — this verifies the math without needing
+        # the worker side effects.
+        from walkthrough import _interp  # type: ignore
+
+        kf = [
+            {"frame": 1, "position": [0, 0, 0], "target": [10, 0, 0]},
+            {"frame": 11, "position": [10, 0, 0], "target": [10, 10, 0]},
+        ]
+        pos, target = _interp(kf, 6)
+        # halfway between (0,0,0) -> (10,0,0): (5,0,0)
+        self.assertAlmostEqual(pos[0], 5.0)
+        self.assertAlmostEqual(pos[1], 0.0)
+        # halfway between (10,0,0) -> (10,10,0): (10,5,0)
+        self.assertAlmostEqual(target[0], 10.0)
+        self.assertAlmostEqual(target[1], 5.0)
+
+    def test_walkthrough_rejects_duplicate_keyframes(self):
+        from walkthrough import render_walkthrough  # type: ignore
+
+        with self.assertRaises(ValueError):
+            render_walkthrough(
+                "/tmp",
+                keyframes=[
+                    {"frame": 1, "position": [0, 0, 0], "target": [1, 0, 0]},
+                    {"frame": 1, "position": [0, 0, 0], "target": [1, 0, 0]},
+                ],
+                frame_start=1,
+                frame_end=1,
+            )
 
     # ----- dispatcher / serve -----
 

@@ -144,6 +144,31 @@ export function rendererInProcessBackend(): AecApi {
       cancelJob: async () => ({ cancelled: true }),
       applyPreset: async () => ({ ok: true }),
       diagnose: async (jobId) => ({ jobId, suggestions: [] }),
+      enqueueBatch: async (params) => {
+        const presets =
+          (params.presetIds && params.presetIds.length > 0
+            ? params.presetIds
+            : params.presetId
+              ? [params.presetId]
+              : ["standard"]);
+        const batchId = newId("batch");
+        const jobIds: string[] = [];
+        for (let i = 0; i < params.cameraIds.length * presets.length; i++) {
+          jobIds.push(newId("job"));
+        }
+        return { batchId, jobIds };
+      },
+      batchProgress: async (batchId) => ({
+        batchId,
+        total: 0,
+        queued: 0,
+        running: 0,
+        completed: 0,
+        failed: 0,
+        cancelled: 0,
+        averageProgress: 0,
+      }),
+      checkMaterials: async () => ({ findings: [] }),
     },
     ai: {
       // Return a defensive copy so callers (and Vitest harnesses) can't

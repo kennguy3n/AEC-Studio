@@ -349,6 +349,107 @@ pub fn render_thumbnail_rgba8(snapshot: &CameraSnapshot) -> Vec<u8> {
     out
 }
 
+/// A single keyframe in a [`CameraPath`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CameraKeyframe {
+    pub frame: u32,
+    pub position_mm: [f32; 3],
+    pub target_mm: [f32; 3],
+}
+
+/// Ordered sequence of camera keyframes used by walkthrough renders.
+/// Keyframes are sorted by `frame` on insert; the path also enforces
+/// that frame numbers are unique so interpolation has a well-defined
+/// bracket for every requested frame.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CameraPath {
+    keyframes: Vec<CameraKeyframe>,
+}
+
+impl CameraPath {
+    pub fn new() -> Self {
+        Self { keyframes: Vec::new() }
+    }
+
+    pub fn from_keyframes(mut kf: Vec<CameraKeyframe>) -> Result<Self, CameraPathError> {
+        kf.sort_by_key(|k| k.frame);
+        for win in kf.windows(2) {
+            if win[0].frame == win[1].frame {
+                return Err(CameraPathError::DuplicateFrame(win[0].frame));
+            }
+        }
+        Ok(Self { keyframes: kf })
+    }
+
+    pub fn keyframes(&self) -> &[CameraKeyframe] {
+        &self.keyframes
+    }
+
+    pub fn len(&self) -> usize {
+        self.keyframes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keyframes.is_empty()
+    }
+
+    pub fn frame_range(&self) -> Option<(u32, u32)> {
+        if self.keyframes.is_empty() {
+            return None;
+        }
+        Some((
+            self.keyframes.first().unwrap().frame,
+            self.keyframes.last().unwrap().frame,
+        ))
+    }
+
+    /// Linear interpolation at `frame` — clamps to the first/last
+    /// keyframe outside the defined range.
+    pub fn sample(&self, frame: u32) -> Option<CameraKeyframe> {
+        if self.keyframes.is_empty() {
+            return None;
+        }
+        if frame <= self.keyframes.first().unwrap().frame {
+            return Some(self.keyframes.first().unwrap().clone());
+        }
+        if frame >= self.keyframes.last().unwrap().frame {
+            return Some(self.keyframes.last().unwrap().clone());
+        }
+        for win in self.keyframes.windows(2) {
+            let a = &win[0];
+            let b = &win[1];
+            if a.frame <= frame && frame <= b.frame {
+                let span = (b.frame - a.frame) as f32;
+                if span == 0.0 {
+                    return Some(a.clone());
+                }
+                let t = (frame - a.frame) as f32 / span;
+                let lerp = |x: f32, y: f32| x + (y - x) * t;
+                return Some(CameraKeyframe {
+                    frame,
+                    position_mm: [
+                        lerp(a.position_mm[0], b.position_mm[0]),
+                        lerp(a.position_mm[1], b.position_mm[1]),
+                        lerp(a.position_mm[2], b.position_mm[2]),
+                    ],
+                    target_mm: [
+                        lerp(a.target_mm[0], b.target_mm[0]),
+                        lerp(a.target_mm[1], b.target_mm[1]),
+                        lerp(a.target_mm[2], b.target_mm[2]),
+                    ],
+                });
+            }
+        }
+        None
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum CameraPathError {
+    #[error("duplicate keyframe at frame {0}")]
+    DuplicateFrame(u32),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,5 +613,58 @@ mod tests {
         let json = serde_json::to_string(&cam).unwrap();
         let back: CameraSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(back, cam);
+    }
+
+    fn kf(frame: u32, x: f32, tx: f32) -> CameraKeyframe {
+        CameraKeyframe {
+            frame,
+            position_mm: [x, 0.0, 1500.0],
+            target_mm: [tx, 0.0, 1500.0],
+        }
+    }
+
+    #[test]
+    fn camera_path_sorts_by_frame_on_construction() {
+        let path = CameraPath::from_keyframes(vec![
+            kf(10, 100.0, 0.0),
+            kf(1, 0.0, 0.0),
+            kf(5, 50.0, 0.0),
+        ])
+        .unwrap();
+        let frames: Vec<u32> = path.keyframes().iter().map(|k| k.frame).collect();
+        assert_eq!(frames, vec![1, 5, 10]);
+    }
+
+    #[test]
+    fn camera_path_rejects_duplicate_frames() {
+        let err =
+            CameraPath::from_keyframes(vec![kf(5, 0.0, 0.0), kf(5, 1.0, 0.0)]).unwrap_err();
+        assert_eq!(err, CameraPathError::DuplicateFrame(5));
+    }
+
+    #[test]
+    fn camera_path_interpolates_linearly() {
+        let path = CameraPath::from_keyframes(vec![kf(0, 0.0, 0.0), kf(10, 100.0, 200.0)])
+            .unwrap();
+        let mid = path.sample(5).unwrap();
+        assert!((mid.position_mm[0] - 50.0).abs() < 1e-3);
+        assert!((mid.target_mm[0] - 100.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn camera_path_clamps_outside_range() {
+        let path =
+            CameraPath::from_keyframes(vec![kf(5, 0.0, 0.0), kf(10, 100.0, 0.0)]).unwrap();
+        let pre = path.sample(1).unwrap();
+        let post = path.sample(50).unwrap();
+        assert_eq!(pre.position_mm[0], 0.0);
+        assert_eq!(post.position_mm[0], 100.0);
+    }
+
+    #[test]
+    fn camera_path_frame_range_is_min_max() {
+        let path =
+            CameraPath::from_keyframes(vec![kf(3, 0.0, 0.0), kf(9, 0.0, 0.0)]).unwrap();
+        assert_eq!(path.frame_range(), Some((3, 9)));
     }
 }

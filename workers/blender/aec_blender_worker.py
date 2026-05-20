@@ -35,7 +35,9 @@ from cycles_final import render_cycles_final
 from eevee_preview import render_eevee_preview
 from lighting import apply_lighting
 from materials import apply_materials
+from panorama import render_panorama
 from scene_loader import load_scene
+from walkthrough import render_walkthrough
 
 
 Method = Callable[[dict[str, Any]], Any]
@@ -57,6 +59,27 @@ def _methods() -> dict[str, Method]:
             denoise=bool(p.get("denoise", True)),
             device=str(p.get("device", "CPU")),
             tile_size=int(p.get("tile_size", 256)),
+        ),
+        "render.panorama": lambda p: render_panorama(
+            out_path=p["output"],
+            samples=int(p.get("samples", 512)),
+            resolution_x=int(p.get("resolution_x", 4096)),
+            resolution_y=int(p.get("resolution_y", 2048)),
+            denoise=bool(p.get("denoise", True)),
+            device=str(p.get("device", "CPU")),
+            output_format=str(p.get("output_format", "PNG")),
+            camera_name=str(p.get("camera_name", "PanoramaCamera")),
+        ),
+        "render.walkthrough": lambda p: render_walkthrough(
+            out_dir=p["output_dir"],
+            keyframes=p.get("keyframes", []),
+            samples=int(p.get("samples", 96)),
+            resolution_x=int(p.get("resolution_x", 1920)),
+            resolution_y=int(p.get("resolution_y", 1080)),
+            denoise=bool(p.get("denoise", True)),
+            device=str(p.get("device", "CPU")),
+            frame_start=int(p.get("frame_start", 1)),
+            frame_end=int(p.get("frame_end", 60)),
         ),
         "materials.apply": lambda p: apply_materials(p.get("materials", [])),
         "lighting.apply": apply_lighting,
