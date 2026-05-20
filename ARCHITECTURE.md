@@ -398,7 +398,7 @@ crates/aec_render/
   white balance (K), depth of field (f-stop + focus distance), and aspect ratio.
 - `CameraStore` is the source of truth for saved cameras; every mutation flows through
   `CameraJournal`, which folds into the global command engine for undo/redo.
-- Thumbnails are rendered deterministically (64×64 RGBA8) from the snapshot so the camera tile
+- Thumbnails are rendered deterministically (32×32 RGBA8) from the snapshot so the camera tile
   grid is reproducible across machines.
 - Camera presets (`InteriorCloseUp`, `Wide`, `EyeLevel`, `BirdsEye`) configure focal/sensor/DoF
   parameters; render presets configure the engine (EEVEE/Cycles), sample count, and resolution.

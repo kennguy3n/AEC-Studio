@@ -25,43 +25,49 @@ export function CommandLine({ log, onLog }: Props) {
     const raw = input.trim();
     if (raw.length === 0) return;
     setInput("");
-    const next: CommandLineLogEntry[] = [...log, { text: raw, kind: "input" }];
-    onLog(next);
+    // Build the input echo line and the response (prompt / ack / error) in a
+    // single `next` array so callers see exactly one `onLog` call per
+    // submission. This keeps the spy contract simple and avoids briefly
+    // flashing an echo-only log line.
+    const echo: CommandLineLogEntry = { text: raw, kind: "input" };
+    const respond = (entry: CommandLineLogEntry) => {
+      onLog([...log, echo, entry]);
+    };
     const cmd = raw.toUpperCase();
     try {
       if (cmd === "L" || cmd === "LINE") {
-        onLog([...next, { text: "Specify first point:", kind: "prompt" }]);
+        respond({ text: "Specify first point:", kind: "prompt" });
         return;
       }
       if (cmd === "PL" || cmd === "POLYLINE") {
-        onLog([...next, { text: "Specify start point or [Close]:", kind: "prompt" }]);
+        respond({ text: "Specify start point or [Close]:", kind: "prompt" });
         return;
       }
       if (cmd === "C" || cmd === "CIRCLE") {
-        onLog([...next, { text: "Specify center point for circle:", kind: "prompt" }]);
+        respond({ text: "Specify center point for circle:", kind: "prompt" });
         return;
       }
       if (cmd === "A" || cmd === "ARC") {
-        onLog([...next, { text: "Specify start point of arc:", kind: "prompt" }]);
+        respond({ text: "Specify start point of arc:", kind: "prompt" });
         return;
       }
       if (cmd === "U" || cmd === "UNDO") {
         await aec.draft.editTool({ tool: "undo" });
-        onLog([...next, { text: "Undone.", kind: "prompt" }]);
+        respond({ text: "Undone.", kind: "prompt" });
         return;
       }
       if (cmd === "REDO") {
         await aec.draft.editTool({ tool: "redo" });
-        onLog([...next, { text: "Redone.", kind: "prompt" }]);
+        respond({ text: "Redone.", kind: "prompt" });
         return;
       }
       if (cmd.startsWith("LAYER")) {
-        onLog([...next, { text: "Enter layer name:", kind: "prompt" }]);
+        respond({ text: "Enter layer name:", kind: "prompt" });
         return;
       }
-      onLog([...next, { text: `Unknown command: ${raw}`, kind: "error" }]);
+      respond({ text: `Unknown command: ${raw}`, kind: "error" });
     } catch (e) {
-      onLog([...next, { text: `Error: ${(e as Error).message}`, kind: "error" }]);
+      respond({ text: `Error: ${(e as Error).message}`, kind: "error" });
     }
   }, [input, log, onLog]);
 

@@ -203,11 +203,26 @@ pub fn generate_section(elements: &[ElementGeometry], plane: &SectionPlane) -> D
 }
 
 fn polyline_from_footprint(footprint: &[[f64; 2]], layer: &str) -> Polyline {
-    let vertices = footprint.iter().copied().map(PolylineVertex::new).collect();
+    // Closed-polygon fixtures often duplicate the first vertex at the end of
+    // the loop (GeoJSON / IFC convention). `Polyline::iter_segments` for a
+    // closed polyline already wraps the last segment from `v[n-1]` to `v[0]`,
+    // so we strip the trailing duplicate to avoid a zero-length closing
+    // segment that would otherwise produce rendering artifacts.
+    let closed = footprint.first() == footprint.last() && footprint.len() > 2;
+    let trim_to = if closed {
+        footprint.len() - 1
+    } else {
+        footprint.len()
+    };
+    let vertices = footprint[..trim_to]
+        .iter()
+        .copied()
+        .map(PolylineVertex::new)
+        .collect();
     Polyline {
         layer: layer.to_string(),
         vertices,
-        closed: footprint.first() == footprint.last() && footprint.len() > 2,
+        closed,
         elevation: 0.0,
         color_override: None,
         lineweight_override: None,

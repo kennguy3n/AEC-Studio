@@ -37,6 +37,20 @@ describe("CommandLine", () => {
     expect(spy).not.toHaveBeenCalled();
   });
 
+  it("calls onLog exactly once per submission with echo + response", async () => {
+    const spy = vi.fn<[log: CommandLineLogEntry[]], void>();
+    render(<CommandLine log={[]} onLog={spy} />);
+    const input = screen.getByTestId("command-line-input") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "L" } });
+    fireEvent.submit(input.form!);
+    await waitFor(() => expect(spy).toHaveBeenCalled());
+    expect(spy).toHaveBeenCalledTimes(1);
+    const entries = spy.mock.calls[0][0];
+    expect(entries).toHaveLength(2);
+    expect(entries[0]).toEqual({ text: "L", kind: "input" });
+    expect(entries[1].kind).toBe("prompt");
+  });
+
   it("renders supplied log lines", () => {
     const log: CommandLineLogEntry[] = [
       { text: "L", kind: "input" },

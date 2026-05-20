@@ -78,36 +78,53 @@ impl TrimTool {
         })
     }
 
-    /// Trim the source line at its (nearest) intersection with a circle.
+    /// Trim the source line at its intersection with a circle. `pick_point`
+    /// is the point of the source the user clicked on — the piece *containing*
+    /// `pick_point` is removed, mirroring [`Self::trim_line_at_line`].
+    ///
+    /// When the line crosses the circle twice and `pick_point` lies between
+    /// the two intersections, the inner segment is removed and the result is
+    /// undefined (returns `None`) — `apply` callers should split into two
+    /// separate trims for that case.
     pub fn trim_line_at_circle(source: &Line, cut: &Circle, pick_point: [f64; 2]) -> Option<Line> {
         let hits = line_circle_intersections(source, cut);
         if hits.is_empty() {
             return None;
         }
-        // Use the intersection nearest to the *opposite* end from pick_point.
         let d_start = sq(source.start, pick_point);
-        let keep_start = d_end_closer(source.start, source.end, pick_point);
-        let target = if keep_start { source.end } else { source.start };
-        let hit = hits
-            .into_iter()
-            .min_by(|p, q| {
-                sq(*p, target)
-                    .partial_cmp(&sq(*q, target))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .unwrap();
-        let _ = d_start;
-        Some(if keep_start {
-            Line {
-                end: hit,
-                ..source.clone()
-            }
-        } else {
-            Line {
+        let d_end = sq(source.end, pick_point);
+        // Pick the intersection nearest the picked endpoint — this is the
+        // boundary between the removed piece (containing `pick_point`) and
+        // the kept piece.
+        if d_start < d_end {
+            let hit = hits
+                .into_iter()
+                .min_by(|p, q| {
+                    sq(*p, source.start)
+                        .partial_cmp(&sq(*q, source.start))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .unwrap();
+            // Pick is closer to start → remove start side, keep [hit, end].
+            Some(Line {
                 start: hit,
                 ..source.clone()
-            }
-        })
+            })
+        } else {
+            let hit = hits
+                .into_iter()
+                .min_by(|p, q| {
+                    sq(*p, source.end)
+                        .partial_cmp(&sq(*q, source.end))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .unwrap();
+            // Pick is closer to end → remove end side, keep [start, hit].
+            Some(Line {
+                end: hit,
+                ..source.clone()
+            })
+        }
     }
 
     pub fn apply(source: &Primitive, cut: &Primitive, pick_point: [f64; 2]) -> Option<Primitive> {
@@ -125,10 +142,6 @@ impl TrimTool {
 
 fn sq(a: [f64; 2], b: [f64; 2]) -> f64 {
     (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)
-}
-
-fn d_end_closer(start: [f64; 2], end: [f64; 2], pick: [f64; 2]) -> bool {
-    sq(end, pick) > sq(start, pick)
 }
 
 #[cfg(test)]
@@ -166,5 +179,26 @@ mod tests {
         let c = Circle::new("0", [0.0, 0.0], 5.0);
         let hits = line_circle_intersections(&l, &c);
         assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn trim_line_at_circle_pick_near_start_removes_start_side() {
+        // Line from (-10,0) to (10,0), circle radius 5 at origin → hits at ±5.
+        // Pick at (-9,0) → start side contains pick → remove start side, keep [-5, 10].
+        let src = Line::new("0", [-10.0, 0.0], [10.0, 0.0]);
+        let cut = Circle::new("0", [0.0, 0.0], 5.0);
+        let trimmed = TrimTool::trim_line_at_circle(&src, &cut, [-9.0, 0.0]).unwrap();
+        assert!((trimmed.start[0] - (-5.0)).abs() < 1e-9);
+        assert!((trimmed.end[0] - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn trim_line_at_circle_pick_near_end_removes_end_side() {
+        // Same line/circle but pick at (9,0) → end side contains pick → keep [-10, 5].
+        let src = Line::new("0", [-10.0, 0.0], [10.0, 0.0]);
+        let cut = Circle::new("0", [0.0, 0.0], 5.0);
+        let trimmed = TrimTool::trim_line_at_circle(&src, &cut, [9.0, 0.0]).unwrap();
+        assert!((trimmed.start[0] - (-10.0)).abs() < 1e-9);
+        assert!((trimmed.end[0] - 5.0).abs() < 1e-9);
     }
 }

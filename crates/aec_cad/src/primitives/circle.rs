@@ -99,9 +99,14 @@ impl Snappable for Circle {
 }
 
 impl Transformable for Circle {
+    /// Apply an affine transform. A non-uniform scale would turn a circle
+    /// into an ellipse, which is not representable here; the editing tools
+    /// (`scale_tool`, `mirror_tool`) only emit uniform scales so this is
+    /// safe in normal use. When the input scale is non-uniform we fall
+    /// back to the mean of the two scale factors as a defensive
+    /// approximation rather than picking a single axis arbitrarily.
     fn transformed(&self, t: &Affine2) -> Self {
         let new_center = t.apply(self.center);
-        // Scale radius by the magnitude of the affine's first-column.
         let scale = (t.scale[0].abs() + t.scale[1].abs()) * 0.5;
         Self {
             layer: self.layer.clone(),
