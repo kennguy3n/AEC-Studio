@@ -1,6 +1,9 @@
 //! Render presets. Mirror the table in `ARCHITECTURE.md`:
 //! Quick=32, Standard=128, High=256, Studio=1024.
 
+use std::collections::BTreeMap;
+
+use aec_governor::HardwareTier;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -167,6 +170,155 @@ impl RenderPreset {
             Self::panorama(),
         ]
     }
+
+    /// Bundled preset for a given quality enum.
+    pub fn from_quality(q: RenderQuality) -> Self {
+        match q {
+            RenderQuality::Eevee => Self::eevee_preview(),
+            RenderQuality::Quick => Self::quick(),
+            RenderQuality::Standard => Self::standard(),
+            RenderQuality::High => Self::high(),
+            RenderQuality::Studio => Self::studio(),
+            RenderQuality::Walkthrough => Self::walkthrough(),
+            RenderQuality::Panorama => Self::panorama(),
+        }
+    }
+}
+
+/// Pick the recommended Cycles preset for the given hardware tier per
+/// ARCHITECTURE.md §10.2. Walkthrough/Panorama presets are
+/// off-mainline (animation/360) so they're never the default
+/// recommendation — they're selected explicitly by the user.
+pub fn recommend_preset(tier: HardwareTier) -> RenderQuality {
+    match tier {
+        HardwareTier::Low => RenderQuality::Quick,
+        HardwareTier::Medium => RenderQuality::Standard,
+        HardwareTier::High => RenderQuality::High,
+        HardwareTier::Pro => RenderQuality::Studio,
+    }
+}
+
+/// Persistent registry of render presets. Holds the bundled defaults plus
+/// any user-defined custom presets. The currently selected preset is
+/// stable across save/load cycles via the [`Self::selected`] field.
+///
+/// Serializes as a plain JSON object so the project package can store
+/// it alongside the other domain stores (cameras, layers, schedules).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RenderPresetStore {
+    /// Custom (user-authored) presets keyed by id. The bundled defaults
+    /// are kept in code and merged into [`Self::all`] on demand.
+    pub custom: BTreeMap<String, RenderPreset>,
+    /// The currently selected preset id. Always one of the bundled
+    /// preset ids or a key from [`Self::custom`].
+    pub selected: String,
+    /// User override that pins the recommendation to a specific
+    /// quality instead of using the hardware-tier derived default.
+    /// When `None` the governor-recommended preset wins.
+    #[serde(default)]
+    pub recommendation_override: Option<RenderQuality>,
+}
+
+impl Default for RenderPresetStore {
+    fn default() -> Self {
+        Self {
+            custom: BTreeMap::new(),
+            selected: RenderPreset::standard().id,
+            recommendation_override: None,
+        }
+    }
+}
+
+impl RenderPresetStore {
+    /// Construct a store seeded with the bundled defaults and the
+    /// recommendation for the given hardware tier preselected.
+    pub fn for_tier(tier: HardwareTier) -> Self {
+        let q = recommend_preset(tier);
+        Self {
+            custom: BTreeMap::new(),
+            selected: RenderPreset::from_quality(q).id,
+            recommendation_override: None,
+        }
+    }
+
+    /// Bundled defaults + custom presets in insertion order.
+    pub fn all(&self) -> Vec<RenderPreset> {
+        let mut out = RenderPreset::defaults();
+        out.extend(self.custom.values().cloned());
+        out
+    }
+
+    /// Look up a preset by id. Bundled defaults take precedence over
+    /// custom presets with the same id, so users cannot accidentally
+    /// shadow a built-in preset.
+    pub fn get(&self, id: &str) -> Option<RenderPreset> {
+        RenderPreset::defaults()
+            .into_iter()
+            .find(|p| p.id == id)
+            .or_else(|| self.custom.get(id).cloned())
+    }
+
+    /// Resolve the currently selected preset, falling back to
+    /// `Standard` if the stored id no longer exists (e.g. after a
+    /// removed custom preset).
+    pub fn current(&self) -> RenderPreset {
+        self.get(&self.selected)
+            .unwrap_or_else(RenderPreset::standard)
+    }
+
+    /// Set the currently selected preset by id. Returns `false` if the
+    /// id is unknown (in which case the selection is left untouched).
+    pub fn select(&mut self, id: &str) -> bool {
+        if self.get(id).is_some() {
+            self.selected = id.to_string();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Insert or update a custom preset. The bundled default presets
+    /// cannot be overridden — attempts to register a preset whose id
+    /// collides with a built-in are rejected.
+    pub fn insert_custom(&mut self, preset: RenderPreset) -> Result<(), PresetError> {
+        if RenderPreset::defaults().iter().any(|p| p.id == preset.id) {
+            return Err(PresetError::ReservedId(preset.id.clone()));
+        }
+        self.custom.insert(preset.id.clone(), preset);
+        Ok(())
+    }
+
+    /// Remove a custom preset. Returns `true` if the preset existed and
+    /// was removed. Cannot remove bundled defaults.
+    pub fn remove_custom(&mut self, id: &str) -> bool {
+        if self.custom.remove(id).is_some() {
+            // If we just removed the active preset, fall back to the
+            // bundled standard one so `current()` always resolves.
+            if self.selected == id {
+                self.selected = RenderPreset::standard().id;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Return the preset recommended for the supplied hardware tier,
+    /// taking [`Self::recommendation_override`] into account. The
+    /// governor-recommended preset is the default; an override lets a
+    /// user pin (for example) `Quick` on a Pro machine when iterating.
+    pub fn recommended(&self, tier: HardwareTier) -> RenderPreset {
+        let quality = self
+            .recommendation_override
+            .unwrap_or_else(|| recommend_preset(tier));
+        RenderPreset::from_quality(quality)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PresetError {
+    #[error("preset id `{0}` is reserved by a bundled preset")]
+    ReservedId(String),
 }
 
 #[cfg(test)]
@@ -187,5 +339,88 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), presets.len());
+    }
+
+    #[test]
+    fn recommend_preset_maps_each_tier_per_architecture_md() {
+        // ARCHITECTURE.md §10.2 pins these mappings. The test ensures
+        // tier-derived defaults never silently drift.
+        assert_eq!(recommend_preset(HardwareTier::Low), RenderQuality::Quick);
+        assert_eq!(
+            recommend_preset(HardwareTier::Medium),
+            RenderQuality::Standard
+        );
+        assert_eq!(recommend_preset(HardwareTier::High), RenderQuality::High);
+        assert_eq!(recommend_preset(HardwareTier::Pro), RenderQuality::Studio);
+    }
+
+    #[test]
+    fn store_for_tier_preselects_the_recommendation() {
+        let store = RenderPresetStore::for_tier(HardwareTier::High);
+        assert_eq!(store.current().config.quality, RenderQuality::High);
+        let store_low = RenderPresetStore::for_tier(HardwareTier::Low);
+        assert_eq!(store_low.current().config.quality, RenderQuality::Quick);
+    }
+
+    #[test]
+    fn store_roundtrips_via_serde() {
+        let mut store = RenderPresetStore::for_tier(HardwareTier::Pro);
+        let mut custom = RenderPreset::standard();
+        custom.id = "studio_high_iso".into();
+        custom.display_name = "Studio (high ISO)".into();
+        custom.config.samples = 768;
+        store.insert_custom(custom.clone()).unwrap();
+        assert!(store.select("studio_high_iso"));
+
+        let bytes = serde_json::to_vec(&store).unwrap();
+        let loaded: RenderPresetStore = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(loaded, store);
+        assert_eq!(loaded.current().id, "studio_high_iso");
+        assert_eq!(loaded.current().config.samples, 768);
+    }
+
+    #[test]
+    fn store_rejects_custom_id_collisions_with_bundled() {
+        let mut store = RenderPresetStore::default();
+        let mut clash = RenderPreset::quick();
+        clash.display_name = "User Quick".into();
+        let err = store.insert_custom(clash).unwrap_err();
+        assert!(matches!(err, PresetError::ReservedId(id) if id == "cycles_quick"));
+    }
+
+    #[test]
+    fn remove_custom_falls_back_to_standard_for_active_preset() {
+        let mut store = RenderPresetStore::default();
+        let mut custom = RenderPreset::standard();
+        custom.id = "draft_preset".into();
+        store.insert_custom(custom).unwrap();
+        store.select("draft_preset");
+        assert_eq!(store.current().id, "draft_preset");
+        assert!(store.remove_custom("draft_preset"));
+        assert_eq!(store.current().id, RenderPreset::standard().id);
+    }
+
+    #[test]
+    fn recommendation_override_pins_quality() {
+        let mut store = RenderPresetStore::for_tier(HardwareTier::Pro);
+        store.recommendation_override = Some(RenderQuality::Quick);
+        assert_eq!(
+            store.recommended(HardwareTier::Pro).config.quality,
+            RenderQuality::Quick
+        );
+        // Without an override, the tier-based default is restored.
+        store.recommendation_override = None;
+        assert_eq!(
+            store.recommended(HardwareTier::Pro).config.quality,
+            RenderQuality::Studio
+        );
+    }
+
+    #[test]
+    fn store_select_rejects_unknown_ids() {
+        let mut store = RenderPresetStore::default();
+        let original = store.selected.clone();
+        assert!(!store.select("nope"));
+        assert_eq!(store.selected, original);
     }
 }

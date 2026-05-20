@@ -6,8 +6,10 @@
 
 pub mod cameras;
 pub mod cycles;
+pub mod doctor;
 pub mod eevee;
 pub mod job;
+pub mod lighting;
 pub mod preset;
 pub mod queue;
 pub mod scene;
@@ -18,9 +20,21 @@ pub use cameras::{
     CameraStore, CameraValidationError,
 };
 pub use cycles::CyclesPipeline;
+pub use doctor::{
+    check_materials, CheckMaterialsOptions, MaterialCheckResult, MaterialFinding,
+    DEFAULT_MAX_TEXTURE_EDGE_PX,
+};
 pub use eevee::EeveePipeline;
 pub use job::{RenderJob, RenderJobStatus};
-pub use preset::{RenderPreset, RenderPresetConfig, RenderQuality};
+pub use lighting::{
+    kelvin_to_rgb, IesParseError, IesPhotometricType, IesProfile, LightingPayload,
+    LightingPreset, LightingPresetKind, LightingPresetStore, LightingValidationError, SkyParams,
+    WorkerLight, WorkerWorld,
+};
+pub use preset::{
+    recommend_preset, PresetError, RenderPreset, RenderPresetConfig, RenderPresetStore,
+    RenderQuality,
+};
 pub use queue::{QueueError, RenderQueue};
 pub use scene::{RenderCamera, RenderLight, RenderScene, SerializedMesh};
 pub use worker::{BlenderRequest, BlenderResponse, BlenderWorker, WorkerError, WorkerState};

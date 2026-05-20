@@ -98,6 +98,46 @@ class BlenderWorkerTests(unittest.TestCase):
         )
         self.assertEqual(out["preset"], "warm_evening")
         self.assertEqual(out["lights"], ["Sun", "Fill"])
+        self.assertEqual(out["ies_attached"], [])
+        self.assertEqual(out["world_strength"], 0.15)
+
+    def test_lighting_apply_attaches_ies_profile(self):
+        import tempfile
+        from lighting import apply_lighting  # type: ignore
+
+        ies_text = (
+            "IESNA:LM-63-2002\n"
+            "TILT=NONE\n"
+            "1 1000.0 1.0 5 1 1 2 0.0 0.0 0.0\n"
+            "1.0 1.0 100.0\n"
+            "0.0 22.5 45.0 67.5 90.0\n"
+            "0.0\n"
+            "10.0 8.0 6.0 4.0 2.0\n"
+        )
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".ies", delete=False
+        ) as fh:
+            fh.write(ies_text)
+            ies_path = fh.name
+        out = apply_lighting(
+            {
+                "name": "studio",
+                "lights": [
+                    {
+                        "name": "Key",
+                        "type": "AREA",
+                        "energy": 800.0,
+                        "ies_path": ies_path,
+                    },
+                ],
+                "world": {"strength": 0.1},
+            }
+        )
+        self.assertEqual(out["ies_attached"], ["Key"])
+        # The stub records the attachment on the light data.
+        key_light = self.stub.data.lights._items["Key"]  # type: ignore[attr-defined]
+        self.assertEqual(key_light.ies_profile["path"], ies_path)
+        self.assertGreater(key_light.ies_profile["bytes"], 0)
 
     def test_eevee_preview_invokes_render(self):
         from eevee_preview import render_eevee_preview  # type: ignore

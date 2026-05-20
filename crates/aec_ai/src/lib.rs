@@ -11,6 +11,7 @@ pub mod bim_classification;
 pub mod cad_cleanup;
 pub mod diff_engine;
 pub mod grammars;
+pub mod layout_suggestion;
 pub mod plan_detection;
 pub mod plan_to_wall;
 pub mod planner;
@@ -33,6 +34,7 @@ pub use cad_cleanup::{
 };
 pub use diff_engine::{Diff, DiffEngine, DiffOperation, DiffStatus};
 pub use grammars::{Grammar, GrammarRegistry};
+pub use layout_suggestion::{LayoutProposal, LayoutSuggestionResult, LayoutValidationError};
 pub use plan_detection::{PlanDetectionResult, PolylineProposal};
 pub use plan_to_wall::{
     convert as plan_to_wall_convert, convert_from_polylines as plan_to_wall_from_polylines,

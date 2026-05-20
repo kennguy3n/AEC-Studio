@@ -182,6 +182,8 @@ version = "0.1.0"
 dependencies = [
  "aec_audit",
  "aec_core",
+ "aec_governor",
+ "aec_materials",
  "chrono",
  "serde",
  "serde_json",

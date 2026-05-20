@@ -34,6 +34,7 @@ impl Grammar {
         match self.key.as_str() {
             "plan_detection" => match_plan_detection(&value),
             "style_assistant" => match_style_assistant(&value),
+            "layout_suggestion" => match_layout_suggestion(&value),
             "render_doctor" => match_render_doctor(&value),
             "cad_cleanup" => match_cad_cleanup(&value),
             "schedule_fill" => match_schedule_fill(&value),
@@ -66,6 +67,27 @@ fn match_style_assistant(v: &serde_json::Value) -> bool {
         && v.get("lighting_preset_id")
             .and_then(|s| s.as_str())
             .is_some()
+}
+
+fn match_layout_suggestion(v: &serde_json::Value) -> bool {
+    let Some(_anchor) = v.get("room_anchor").and_then(|s| s.as_str()) else {
+        return false;
+    };
+    let Some(arr) = v.get("proposals").and_then(|a| a.as_array()) else {
+        return false;
+    };
+    arr.iter().all(|p| {
+        // Each proposal must carry a position triple and either an
+        // asset_id (insert) or a target_entity (reposition).
+        let pos_ok = p
+            .get("position_mm")
+            .and_then(|x| x.as_array())
+            .is_some_and(|coords| coords.len() == 3 && coords.iter().all(|c| c.as_f64().is_some()));
+        let has_target =
+            p.get("asset_id").and_then(|s| s.as_str()).is_some()
+                || p.get("target_entity").and_then(|s| s.as_str()).is_some();
+        pos_ok && has_target
+    })
 }
 
 fn match_render_doctor(v: &serde_json::Value) -> bool {
@@ -129,6 +151,8 @@ strlist   ::= "[" ws (str ("," ws str)*)? ws "]"
 str       ::= "\"" [^"]+ "\""
 ws        ::= [ \t\n]*
 "#;
+
+const LAYOUT_SUGGESTION_GBNF: &str = include_str!("grammars/layout_suggestion.gbnf");
 
 const RENDER_DOCTOR_GBNF: &str = r#"
 root      ::= "{" ws "\"findings\"" ws ":" ws findlist ws "}"
@@ -196,6 +220,11 @@ impl GrammarRegistry {
             key: "style_assistant".into(),
             gbnf: STYLE_ASSISTANT_GBNF.into(),
             example: r#"{"furniture_ids":["ast:sofa_a"],"material_ids":["mat:oak_light"],"lighting_preset_id":"warm_evening"}"#.into(),
+        });
+        r.insert(Grammar {
+            key: "layout_suggestion".into(),
+            gbnf: LAYOUT_SUGGESTION_GBNF.into(),
+            example: r#"{"room_anchor":"ent_living","proposals":[{"asset_id":"ast:sofa_a","position_mm":[1200.0,800.0,0.0],"rotation_deg":90.0}]}"#.into(),
         });
         r.insert(Grammar {
             key: "render_doctor".into(),
@@ -271,5 +300,30 @@ mod tests {
         let d = g.get("render_doctor").unwrap();
         assert!(d.matches(r#"{"findings":[{"issue":"noise","severity":"high"}]}"#));
         assert!(!d.matches(r#"{"findings":[{"issue":"noise"}]}"#));
+    }
+
+    #[test]
+    fn layout_suggestion_grammar_matches() {
+        let g = GrammarRegistry::defaults();
+        let l = g.get("layout_suggestion").unwrap();
+        assert!(l.matches(
+            r#"{"room_anchor":"ent_living","proposals":[{"asset_id":"ast:sofa","position_mm":[0.0,0.0,0.0],"rotation_deg":90.0}]}"#
+        ));
+        // accepts target_entity-only proposals (repositioning existing furniture)
+        assert!(l.matches(
+            r#"{"room_anchor":"ent_living","proposals":[{"target_entity":"ent_sofa","position_mm":[100.0,200.0,0.0],"rotation_deg":0.0}]}"#
+        ));
+        // rejects missing room_anchor
+        assert!(!l.matches(
+            r#"{"proposals":[{"asset_id":"ast:sofa","position_mm":[0.0,0.0,0.0],"rotation_deg":0.0}]}"#
+        ));
+        // rejects proposal missing both asset_id and target_entity
+        assert!(!l.matches(
+            r#"{"room_anchor":"ent_living","proposals":[{"position_mm":[0.0,0.0,0.0],"rotation_deg":0.0}]}"#
+        ));
+        // rejects malformed position triple
+        assert!(!l.matches(
+            r#"{"room_anchor":"ent_living","proposals":[{"asset_id":"ast:sofa","position_mm":[0.0,0.0],"rotation_deg":0.0}]}"#
+        ));
     }
 }

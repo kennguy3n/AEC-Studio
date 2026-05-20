@@ -135,4 +135,43 @@ mod tests {
         assert_eq!(r.tool, ToolName::StyleAssistant);
         assert!(r.parsed.get("furniture_ids").is_some());
     }
+
+    #[test]
+    fn finalize_layout_suggestion_passes_safety_gate() {
+        let s = ToolSchemaRegistry::defaults();
+        let g = GrammarRegistry::defaults();
+        let planner = ToolPlanner::new(&s, &g);
+        let payload = r#"{"room_anchor":"ent_living","proposals":[{"asset_id":"ast:sofa","position_mm":[1200.0,800.0,0.0],"rotation_deg":90.0}]}"#;
+        let r = planner
+            .finalize(
+                ToolName::LayoutSuggestion,
+                Scope::Design,
+                1,
+                payload.into(),
+            )
+            .unwrap();
+        assert_eq!(r.tool, ToolName::LayoutSuggestion);
+        assert!(r.parsed.get("proposals").is_some());
+    }
+
+    #[test]
+    fn finalize_rejects_layout_suggestion_with_old_style_assistant_shape() {
+        // A payload that satisfies style_assistant must NOT pass the
+        // layout_suggestion grammar — the two tools were intentionally
+        // decoupled so the safety validator rejects shape drift.
+        let s = ToolSchemaRegistry::defaults();
+        let g = GrammarRegistry::defaults();
+        let planner = ToolPlanner::new(&s, &g);
+        let payload =
+            r#"{"furniture_ids":["a"],"material_ids":["b"],"lighting_preset_id":"warm_evening"}"#;
+        let err = planner
+            .finalize(
+                ToolName::LayoutSuggestion,
+                Scope::Design,
+                1,
+                payload.into(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, PlanError::Safety(_)));
+    }
 }

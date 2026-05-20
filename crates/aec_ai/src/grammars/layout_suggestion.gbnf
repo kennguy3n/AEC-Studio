@@ -1,0 +1,31 @@
+# GBNF for the `layout_suggestion` AI tool.
+#
+# Constrains llama.cpp's sampler to emit a JSON document of the form
+#
+#   {
+#     "room_anchor": "ent_xxx",
+#     "proposals": [
+#       {
+#         "asset_id":      "ast:sofa_a",        // either asset_id...
+#         "target_entity": "ent_yyy",            // ...or target_entity must be set
+#         "position_mm": [1200.0, 800.0, 0.0],
+#         "rotation_deg": 90.0
+#       }
+#     ]
+#   }
+#
+# The Rust validator (`crate::grammars::match_layout_suggestion`) mirrors
+# the structural part of this grammar so malformed payloads are rejected
+# at the Rust boundary, not only in the sidecar.
+
+root        ::= "{" ws "\"room_anchor\"" ws ":" ws str ws "," ws "\"proposals\"" ws ":" ws plist ws "}"
+plist       ::= "[" ws (proposal ("," ws proposal)*)? ws "]"
+proposal    ::= "{" ws propentry ("," ws propentry)* ws "}"
+propentry   ::= aidkey | tgtkey | poskey | rotkey
+aidkey      ::= "\"asset_id\""      ws ":" ws str
+tgtkey      ::= "\"target_entity\"" ws ":" ws str
+poskey      ::= "\"position_mm\""   ws ":" ws "[" ws number ws "," ws number ws "," ws number ws "]"
+rotkey      ::= "\"rotation_deg\""  ws ":" ws number
+str         ::= "\"" [^"]+ "\""
+number      ::= "-"? [0-9]+ ("." [0-9]+)?
+ws          ::= [ \t\n]*
