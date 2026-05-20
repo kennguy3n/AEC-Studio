@@ -1311,6 +1311,69 @@ mod tests {
     }
 
     #[test]
+    fn writer_output_is_deterministic_across_runs() {
+        // The writer's spatial-aggregation and containment-relation
+        // loops previously iterated `Project::nodes` (a HashMap),
+        // which produces records in different orders run-to-run on a
+        // randomized hasher. Correctness was fine (the reader
+        // cross-references by `#N`), but byte-identical output
+        // matters for golden tests, fingerprinting, and
+        // content-addressed export caches. Both loops now walk a
+        // deterministic DFS order captured during the spatial pass.
+        // Build a tree wide enough at every level to make HashMap
+        // iteration order observably non-deterministic if it were
+        // still in use (5 children per level, two levels deep), and
+        // attach elements to every leaf to also exercise the
+        // containment loop.
+        let mut project = Project::new("DetCheck");
+        let site = project
+            .add_child(&project.root.clone(), IfcClass::IfcSite, "Site")
+            .unwrap();
+        let bldg = project
+            .add_child(&site, IfcClass::IfcBuilding, "Building")
+            .unwrap();
+        for s in 0..5 {
+            let storey = project
+                .add_child(&bldg, IfcClass::IfcBuildingStorey, format!("Storey {s}"))
+                .unwrap();
+            for _ in 0..5 {
+                let space = project
+                    .add_child(&storey, IfcClass::IfcSpace, "Space")
+                    .unwrap();
+                assert!(project.attach_element(&space, EntityId::new()));
+            }
+            for _ in 0..3 {
+                assert!(project.attach_element(&storey, EntityId::new()));
+            }
+        }
+
+        let classification = ClassificationStore::new();
+        let properties = PropertyStore::new();
+
+        let s1 = crate::ifc::IfcWriter::to_string(&project, &classification, &properties);
+        let s2 = crate::ifc::IfcWriter::to_string(&project, &classification, &properties);
+        let s3 = crate::ifc::IfcWriter::to_string(&project, &classification, &properties);
+        assert_eq!(
+            s1, s2,
+            "IfcWriter::to_string must be byte-identical across runs",
+        );
+        assert_eq!(
+            s1, s3,
+            "IfcWriter::to_string must be byte-identical across runs",
+        );
+
+        // And the deterministic output must still parse cleanly via
+        // the reader (i.e. the DFS-ordered rels haven't broken
+        // anything for the round-trip path).
+        let snap = crate::ifc::IfcReader::from_string(&s1)
+            .expect("deterministic IFC output must still round-trip");
+        // 1 project + 1 site + 1 building + 5 storeys + 25 spaces.
+        assert_eq!(snap.stats.spatial_nodes, 1 + 1 + 1 + 5 + 25);
+        // 25 element/space + 5 storey * 3 = 40 elements total.
+        assert_eq!(snap.stats.elements, 25 + 5 * 3);
+    }
+
+    #[test]
     fn spatial_node_psets_and_qsets_roundtrip() {
         // Per IFC4, spatial structure elements (`IfcSpace`,
         // `IfcBuildingStorey`, …) can own Psets and Qtos —

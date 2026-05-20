@@ -96,7 +96,16 @@ DATA;\n";
         );
 
         // ---- Spatial graph (DFS from root) ----
+        //
+        // We collect the visited order into `spatial_order` so the
+        // subsequent aggregation- and containment-relation loops can
+        // iterate the spatial tree in deterministic DFS order rather
+        // than HashMap iteration order. Correctness doesn't depend on
+        // it (the reader cross-references by `#N`), but byte-identical
+        // output matters for fingerprinting, golden tests, and
+        // content-addressed export caches.
         let mut spatial_step: HashMap<EntityId, u32> = HashMap::new();
+        let mut spatial_order: Vec<EntityId> = Vec::new();
         let mut stack = vec![project.root.clone()];
         while let Some(id) = stack.pop() {
             let Some(node) = project.nodes.get(&id) else {
@@ -112,6 +121,7 @@ DATA;\n";
             };
             let step_id = buf.alloc();
             spatial_step.insert(id.clone(), step_id);
+            spatial_order.push(id.clone());
             // Spatial-structure classes (IfcProject/Site/Building/Storey/
             // Space) are baked into the IfcClass enum and never originate
             // from user-supplied strings, so their `ifc_tag()` is always a
@@ -151,7 +161,14 @@ DATA;\n";
         }
 
         // ---- Spatial aggregation: parent IFCRELAGGREGATES list of children ----
-        for (id, node) in &project.nodes {
+        //
+        // Walk `spatial_order` (deterministic DFS) rather than the
+        // backing HashMap so the emitted aggregation rels appear in a
+        // reproducible order across runs.
+        for id in &spatial_order {
+            let Some(node) = project.nodes.get(id) else {
+                continue;
+            };
             if node.children.is_empty() {
                 continue;
             }
@@ -180,8 +197,15 @@ DATA;\n";
         }
 
         // ---- Elements + IFCRELCONTAINEDINSPATIALSTRUCTURE per storey ----
+        //
+        // Same deterministic-DFS iteration as the aggregation pass —
+        // ensures contained-element rels (and the element STEP records
+        // they reference) emit in stable storey order.
         let mut element_step: HashMap<EntityId, u32> = HashMap::new();
-        for (storey_id, node) in &project.nodes {
+        for storey_id in &spatial_order {
+            let Some(node) = project.nodes.get(storey_id) else {
+                continue;
+            };
             if node.elements.is_empty() {
                 continue;
             }
