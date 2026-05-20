@@ -122,11 +122,11 @@ fn parse_proposal(v: &serde_json::Value) -> Option<LayoutProposal> {
     for (i, slot) in position.iter_mut().enumerate() {
         *slot = pos.get(i)?.as_f64()?;
     }
-    let rotation_deg = v.get("rotation_deg").and_then(|x| x.as_f64()).unwrap_or(0.0);
-    let asset_id = v
-        .get("asset_id")
-        .and_then(|x| x.as_str())
-        .map(String::from);
+    let rotation_deg = v
+        .get("rotation_deg")
+        .and_then(|x| x.as_f64())
+        .unwrap_or(0.0);
+    let asset_id = v.get("asset_id").and_then(|x| x.as_str()).map(String::from);
     let target_entity = v
         .get("target_entity")
         .and_then(|x| x.as_str())

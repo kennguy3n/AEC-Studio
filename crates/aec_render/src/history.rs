@@ -150,8 +150,7 @@ impl RenderHistory {
             return Ok(Self::new());
         }
         let bytes = fs::read(&path)?;
-        serde_json::from_slice(&bytes)
-            .map_err(|e| HistoryError::Corrupt(e.to_string()))
+        serde_json::from_slice(&bytes).map_err(|e| HistoryError::Corrupt(e.to_string()))
     }
 
     /// Persist the history to `<project_root>/renders/history.json`.
@@ -161,8 +160,8 @@ impl RenderHistory {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let pretty = serde_json::to_vec_pretty(self)
-            .map_err(|e| HistoryError::Corrupt(e.to_string()))?;
+        let pretty =
+            serde_json::to_vec_pretty(self).map_err(|e| HistoryError::Corrupt(e.to_string()))?;
         fs::write(path, pretty)?;
         Ok(())
     }
@@ -237,10 +236,7 @@ pub struct FieldDiff {
 }
 
 /// Compare two completed renders by their history entries.
-pub fn compare(
-    a: &RenderHistoryEntry,
-    b: &RenderHistoryEntry,
-) -> CompareResult {
+pub fn compare(a: &RenderHistoryEntry, b: &RenderHistoryEntry) -> CompareResult {
     let mut diffs = Vec::new();
     if a.preset_id != b.preset_id {
         diffs.push(FieldDiff {
@@ -277,8 +273,8 @@ pub fn compare(
             to: b.image_hash.clone().unwrap_or_else(|| "(none)".into()),
         });
     }
-    let duration_delta_ms = (b.render_duration().as_millis() as i64)
-        - (a.render_duration().as_millis() as i64);
+    let duration_delta_ms =
+        (b.render_duration().as_millis() as i64) - (a.render_duration().as_millis() as i64);
     CompareResult {
         a_job_id: a.job_id.clone(),
         b_job_id: b.job_id.clone(),

@@ -83,9 +83,8 @@ fn match_layout_suggestion(v: &serde_json::Value) -> bool {
             .get("position_mm")
             .and_then(|x| x.as_array())
             .is_some_and(|coords| coords.len() == 3 && coords.iter().all(|c| c.as_f64().is_some()));
-        let has_target =
-            p.get("asset_id").and_then(|s| s.as_str()).is_some()
-                || p.get("target_entity").and_then(|s| s.as_str()).is_some();
+        let has_target = p.get("asset_id").and_then(|s| s.as_str()).is_some()
+            || p.get("target_entity").and_then(|s| s.as_str()).is_some();
         pos_ok && has_target
     })
 }

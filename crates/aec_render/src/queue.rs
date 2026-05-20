@@ -91,7 +91,10 @@ impl RenderQueue {
                 .with_batch_id(batch_id.clone());
             ids.push(self.submit(job));
         }
-        BatchSubmission { batch_id, job_ids: ids }
+        BatchSubmission {
+            batch_id,
+            job_ids: ids,
+        }
     }
 
     /// Submit a camera × preset matrix — one job per combination.
@@ -113,7 +116,10 @@ impl RenderQueue {
                 ids.push(self.submit(job));
             }
         }
-        BatchSubmission { batch_id, job_ids: ids }
+        BatchSubmission {
+            batch_id,
+            job_ids: ids,
+        }
     }
 
     /// All jobs (across all states) tagged with the given batch id.
@@ -290,9 +296,8 @@ impl RenderQueue {
             std::fs::create_dir_all(parent)?;
         }
         let tmp = path.with_extension("json.tmp");
-        let bytes = serde_json::to_vec_pretty(self).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-        })?;
+        let bytes = serde_json::to_vec_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         std::fs::write(&tmp, bytes)?;
         std::fs::rename(&tmp, path)?;
         Ok(())
@@ -306,9 +311,8 @@ impl RenderQueue {
             return Ok(Self::new());
         }
         let bytes = std::fs::read(path)?;
-        let q: RenderQueue = serde_json::from_slice(&bytes).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-        })?;
+        let q: RenderQueue = serde_json::from_slice(&bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         Ok(q)
     }
 
@@ -431,8 +435,10 @@ mod tests {
         let batch_jobs = q.jobs_in_batch(&sub.batch_id);
         assert_eq!(batch_jobs.len(), 3);
         // every job carries the same batch_id and a distinct camera_id.
-        let cam_ids: std::collections::HashSet<_> =
-            batch_jobs.iter().filter_map(|j| j.camera_id.clone()).collect();
+        let cam_ids: std::collections::HashSet<_> = batch_jobs
+            .iter()
+            .filter_map(|j| j.camera_id.clone())
+            .collect();
         assert_eq!(cam_ids.len(), 3);
         for j in &batch_jobs {
             assert_eq!(j.batch_id.as_deref(), Some(sub.batch_id.as_str()));
@@ -454,12 +460,7 @@ mod tests {
         let batch_jobs = q.jobs_in_batch(&sub.batch_id);
         let pairs: std::collections::HashSet<_> = batch_jobs
             .iter()
-            .map(|j| {
-                (
-                    j.camera_id.clone().unwrap_or_default(),
-                    j.preset.id.clone(),
-                )
-            })
+            .map(|j| (j.camera_id.clone().unwrap_or_default(), j.preset.id.clone()))
             .collect();
         assert_eq!(pairs.len(), 4);
     }

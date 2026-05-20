@@ -143,12 +143,7 @@ mod tests {
         let planner = ToolPlanner::new(&s, &g);
         let payload = r#"{"room_anchor":"ent_living","proposals":[{"asset_id":"ast:sofa","position_mm":[1200.0,800.0,0.0],"rotation_deg":90.0}]}"#;
         let r = planner
-            .finalize(
-                ToolName::LayoutSuggestion,
-                Scope::Design,
-                1,
-                payload.into(),
-            )
+            .finalize(ToolName::LayoutSuggestion, Scope::Design, 1, payload.into())
             .unwrap();
         assert_eq!(r.tool, ToolName::LayoutSuggestion);
         assert!(r.parsed.get("proposals").is_some());
@@ -165,12 +160,7 @@ mod tests {
         let payload =
             r#"{"furniture_ids":["a"],"material_ids":["b"],"lighting_preset_id":"warm_evening"}"#;
         let err = planner
-            .finalize(
-                ToolName::LayoutSuggestion,
-                Scope::Design,
-                1,
-                payload.into(),
-            )
+            .finalize(ToolName::LayoutSuggestion, Scope::Design, 1, payload.into())
             .unwrap_err();
         assert!(matches!(err, PlanError::Safety(_)));
     }

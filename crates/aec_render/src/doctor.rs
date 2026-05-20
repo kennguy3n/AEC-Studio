@@ -40,10 +40,7 @@ pub enum MaterialFinding {
     },
     /// The material has at least one PBR parameter outside the
     /// physically plausible range. The detail string explains which.
-    NonPbrMaterial {
-        material_id: String,
-        detail: String,
-    },
+    NonPbrMaterial { material_id: String, detail: String },
     /// Heuristic: a texture bound to one channel looks like it
     /// belongs to a different channel (e.g. flat-blue normal map
     /// plugged into albedo).
@@ -322,10 +319,7 @@ fn push_material_findings(
     if !(1.0..=3.0).contains(&mat.ior) {
         findings.push(MaterialFinding::NonPbrMaterial {
             material_id: mat.id.clone(),
-            detail: format!(
-                "ior {} is outside the realistic 1.0..=3.0 range",
-                mat.ior
-            ),
+            detail: format!("ior {} is outside the realistic 1.0..=3.0 range", mat.ior),
         });
     }
 }
@@ -427,18 +421,11 @@ mod tests {
         let mut m = mat("mat:oak");
         m.metallic = 1.4;
         let scene = scene_with(&["mat:oak"]);
-        let result = check_materials(
-            &scene,
-            &[m],
-            &Default::default(),
-            &Default::default(),
-        );
-        assert!(
-            result
-                .findings
-                .iter()
-                .any(|f| matches!(f, MaterialFinding::NonPbrMaterial { .. }))
-        );
+        let result = check_materials(&scene, &[m], &Default::default(), &Default::default());
+        assert!(result
+            .findings
+            .iter()
+            .any(|f| matches!(f, MaterialFinding::NonPbrMaterial { .. })));
     }
 
     #[test]
@@ -452,14 +439,17 @@ mod tests {
             height: 1024,
         });
         let scene = scene_with(&["mat:oak"]);
-        let known: std::collections::BTreeSet<String> =
-            ["h1".to_string()].into_iter().collect();
+        let known: std::collections::BTreeSet<String> = ["h1".to_string()].into_iter().collect();
         let result = check_materials(&scene, &[m], &known, &Default::default());
         let has_swap = result
             .findings
             .iter()
             .any(|f| matches!(f, MaterialFinding::SwappedChannels { .. }));
-        assert!(has_swap, "expected swapped-channel finding, got {:?}", result);
+        assert!(
+            has_swap,
+            "expected swapped-channel finding, got {:?}",
+            result
+        );
     }
 
     #[test]
@@ -472,26 +462,18 @@ mod tests {
             height: 8192,
         });
         let scene = scene_with(&["mat:oak"]);
-        let known: std::collections::BTreeSet<String> =
-            ["h1".to_string()].into_iter().collect();
+        let known: std::collections::BTreeSet<String> = ["h1".to_string()].into_iter().collect();
         let result = check_materials(&scene, &[m], &known, &Default::default());
-        assert!(
-            result
-                .findings
-                .iter()
-                .any(|f| matches!(f, MaterialFinding::OversizedTexture { .. }))
-        );
+        assert!(result
+            .findings
+            .iter()
+            .any(|f| matches!(f, MaterialFinding::OversizedTexture { .. })));
     }
 
     #[test]
     fn material_referenced_but_missing_from_library_is_flagged() {
         let scene = scene_with(&["mat:ghost"]);
-        let result = check_materials(
-            &scene,
-            &[],
-            &Default::default(),
-            &Default::default(),
-        );
+        let result = check_materials(&scene, &[], &Default::default(), &Default::default());
         assert_eq!(result.findings.len(), 1);
         assert_eq!(result.findings[0].material_id(), "mat:ghost");
         assert!(matches!(
@@ -556,8 +538,7 @@ mod tests {
             height: 1024,
         });
         let scene = scene_with(&["mat:oak"]);
-        let known: std::collections::BTreeSet<String> =
-            ["h1".to_string()].into_iter().collect();
+        let known: std::collections::BTreeSet<String> = ["h1".to_string()].into_iter().collect();
         let opts = CheckMaterialsOptions {
             enable_swap_heuristic: false,
             ..Default::default()

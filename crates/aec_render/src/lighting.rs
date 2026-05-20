@@ -563,13 +563,14 @@ impl IesProfile {
         let candela_multiplier = take_f32(&tokens, &mut cursor)?;
         let num_v = take_u32(&tokens, &mut cursor)? as usize;
         let num_h = take_u32(&tokens, &mut cursor)? as usize;
-        let photo_type = tokens
-            .get(cursor)
-            .copied()
-            .ok_or(IesParseError::TruncatedCandelaTable {
-                expected: cursor + 1,
-                got: tokens.len(),
-            })?;
+        let photo_type =
+            tokens
+                .get(cursor)
+                .copied()
+                .ok_or(IesParseError::TruncatedCandelaTable {
+                    expected: cursor + 1,
+                    got: tokens.len(),
+                })?;
         let photometric_type = IesPhotometricType::parse(photo_type)?;
         cursor += 1;
         // skip units, width, length, height

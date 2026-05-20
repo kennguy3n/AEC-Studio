@@ -301,10 +301,7 @@ mod tests {
         let diff = DiffEngine::build(&p);
         assert_eq!(diff.operations.len(), 1);
         match &diff.operations[0] {
-            DiffOperation::Update {
-                target: t,
-                patch,
-            } => {
+            DiffOperation::Update { target: t, patch } => {
                 assert_eq!(*t, target);
                 assert!(patch.get("position_mm").is_some());
                 assert!(patch.get("rotation_deg").is_some());

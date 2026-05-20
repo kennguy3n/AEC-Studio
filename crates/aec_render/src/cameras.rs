@@ -368,7 +368,9 @@ pub struct CameraPath {
 
 impl CameraPath {
     pub fn new() -> Self {
-        Self { keyframes: Vec::new() }
+        Self {
+            keyframes: Vec::new(),
+        }
     }
 
     pub fn from_keyframes(mut kf: Vec<CameraKeyframe>) -> Result<Self, CameraPathError> {
@@ -625,27 +627,22 @@ mod tests {
 
     #[test]
     fn camera_path_sorts_by_frame_on_construction() {
-        let path = CameraPath::from_keyframes(vec![
-            kf(10, 100.0, 0.0),
-            kf(1, 0.0, 0.0),
-            kf(5, 50.0, 0.0),
-        ])
-        .unwrap();
+        let path =
+            CameraPath::from_keyframes(vec![kf(10, 100.0, 0.0), kf(1, 0.0, 0.0), kf(5, 50.0, 0.0)])
+                .unwrap();
         let frames: Vec<u32> = path.keyframes().iter().map(|k| k.frame).collect();
         assert_eq!(frames, vec![1, 5, 10]);
     }
 
     #[test]
     fn camera_path_rejects_duplicate_frames() {
-        let err =
-            CameraPath::from_keyframes(vec![kf(5, 0.0, 0.0), kf(5, 1.0, 0.0)]).unwrap_err();
+        let err = CameraPath::from_keyframes(vec![kf(5, 0.0, 0.0), kf(5, 1.0, 0.0)]).unwrap_err();
         assert_eq!(err, CameraPathError::DuplicateFrame(5));
     }
 
     #[test]
     fn camera_path_interpolates_linearly() {
-        let path = CameraPath::from_keyframes(vec![kf(0, 0.0, 0.0), kf(10, 100.0, 200.0)])
-            .unwrap();
+        let path = CameraPath::from_keyframes(vec![kf(0, 0.0, 0.0), kf(10, 100.0, 200.0)]).unwrap();
         let mid = path.sample(5).unwrap();
         assert!((mid.position_mm[0] - 50.0).abs() < 1e-3);
         assert!((mid.target_mm[0] - 100.0).abs() < 1e-3);
@@ -653,8 +650,7 @@ mod tests {
 
     #[test]
     fn camera_path_clamps_outside_range() {
-        let path =
-            CameraPath::from_keyframes(vec![kf(5, 0.0, 0.0), kf(10, 100.0, 0.0)]).unwrap();
+        let path = CameraPath::from_keyframes(vec![kf(5, 0.0, 0.0), kf(10, 100.0, 0.0)]).unwrap();
         let pre = path.sample(1).unwrap();
         let post = path.sample(50).unwrap();
         assert_eq!(pre.position_mm[0], 0.0);
@@ -663,8 +659,7 @@ mod tests {
 
     #[test]
     fn camera_path_frame_range_is_min_max() {
-        let path =
-            CameraPath::from_keyframes(vec![kf(3, 0.0, 0.0), kf(9, 0.0, 0.0)]).unwrap();
+        let path = CameraPath::from_keyframes(vec![kf(3, 0.0, 0.0), kf(9, 0.0, 0.0)]).unwrap();
         assert_eq!(path.frame_range(), Some((3, 9)));
     }
 }

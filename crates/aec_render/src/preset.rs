@@ -475,7 +475,10 @@ mod tests {
         assert_eq!(migrate_legacy_preset_id("cycles_standard"), "standard");
         assert_eq!(migrate_legacy_preset_id("cycles_high"), "high");
         assert_eq!(migrate_legacy_preset_id("cycles_studio"), "studio");
-        assert_eq!(migrate_legacy_preset_id("cycles_walkthrough"), "walkthrough");
+        assert_eq!(
+            migrate_legacy_preset_id("cycles_walkthrough"),
+            "walkthrough"
+        );
         assert_eq!(migrate_legacy_preset_id("cycles_panorama"), "panorama");
         assert_eq!(
             migrate_legacy_preset_id("cycles_eevee_preview"),
