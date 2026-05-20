@@ -330,7 +330,9 @@ fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
 fn pdf_first_page_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     let needle = b"/MediaBox";
     let pos = find_subseq(bytes, needle)?;
-    // Look for `[ x y w h ]` within the next 256 bytes.
+    // PDF MediaBox is `[ llx lly urx ury ]` — lower-left and
+    // upper-right corners in PDF user units. The page dimensions are
+    // the *delta* between the two corners, not the absolute coords.
     let slice_end = (pos + 256).min(bytes.len());
     let slice = &bytes[pos..slice_end];
     let text = std::str::from_utf8(slice).ok()?;
@@ -338,10 +340,12 @@ fn pdf_first_page_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     let close = text[open..].find(']')?;
     let inner = &text[open + 1..open + close];
     let mut iter = inner.split_whitespace();
-    let _x = iter.next()?.parse::<f32>().ok()?;
-    let _y = iter.next()?.parse::<f32>().ok()?;
-    let w_pts = iter.next()?.parse::<f32>().ok()?;
-    let h_pts = iter.next()?.parse::<f32>().ok()?;
+    let llx = iter.next()?.parse::<f32>().ok()?;
+    let lly = iter.next()?.parse::<f32>().ok()?;
+    let urx = iter.next()?.parse::<f32>().ok()?;
+    let ury = iter.next()?.parse::<f32>().ok()?;
+    let w_pts = urx - llx;
+    let h_pts = ury - lly;
     if w_pts <= 0.0 || h_pts <= 0.0 {
         return None;
     }
@@ -513,6 +517,32 @@ mod tests {
         let b1 = decode(&r).unwrap();
         let b2 = decode(&r).unwrap();
         assert_eq!(b1, b2);
+    }
+
+    #[test]
+    fn pdf_mediabox_uses_corner_delta_not_absolute() {
+        // Origin at (50, 50), upper-right at (595, 841): real page is
+        // 545 × 791 PDF units, not 595 × 841.
+        let pdf = b"%PDF-1.4\n1 0 obj\n<< /Type /Page /MediaBox [50 50 595 841] >>\nendobj\n";
+        let (w_px, h_px) = pdf_first_page_dimensions(pdf).expect("parses");
+        let dpi = 200.0_f32 / 72.0;
+        let expect_w = ((595.0 - 50.0) * dpi) as u32;
+        let expect_h = ((841.0 - 50.0) * dpi) as u32;
+        assert_eq!((w_px, h_px), (expect_w, expect_h));
+    }
+
+    #[test]
+    fn pdf_mediabox_zero_origin_unchanged() {
+        let pdf = b"%PDF-1.4\n1 0 obj\n<< /Type /Page /MediaBox [0 0 595 842] >>\nendobj\n";
+        let (w_px, h_px) = pdf_first_page_dimensions(pdf).expect("parses");
+        let dpi = 200.0_f32 / 72.0;
+        assert_eq!((w_px, h_px), ((595.0 * dpi) as u32, (842.0 * dpi) as u32));
+    }
+
+    #[test]
+    fn pdf_mediabox_rejects_inverted_box() {
+        let pdf = b"%PDF-1.4\n1 0 obj\n<< /MediaBox [200 200 100 100] >>\nendobj\n";
+        assert!(pdf_first_page_dimensions(pdf).is_none());
     }
 
     #[test]

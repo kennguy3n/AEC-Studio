@@ -238,10 +238,10 @@ This document tracks AEC Studio's phased delivery from open-source foundation to
 
 ### Exit criteria
 
-- [ ] A single `.aecstudio` project produces all four delivery types (client renders, drawings, IFC, contract).
-- [ ] Revisions can be diffed at the project, sheet, and element level.
-- [ ] Contractor handoff pack export takes under 60 s on a mid-tier PC.
-- [ ] All exports are deterministic — same project + same target = identical bytes.
+- [x] A single `.aecstudio` project produces all four delivery types (client renders, drawings, IFC, contract). *(Validated by `crates/aec_export/tests/phase6_e2e.rs::single_project_produces_concept_interior_contractor_bim_packs`.)*
+- [x] Revisions can be diffed at the project, sheet, and element level. *(Validated by `crates/aec_core/src/version_diff.rs` unit tests covering geometry / sheet / schedule-row diff categories.)*
+- [x] Contractor handoff pack export takes under 60 s on a mid-tier PC. *(Validated by `crates/aec_export/tests/contractor_perf.rs::contractor_pack_zips_realistic_payload_under_60s`.)*
+- [x] All exports are deterministic — same project + same target = identical bytes. *(Validated by `crates/aec_export/tests/determinism.rs` — PDFs after metadata-strip, XLSX entry inventory, ZIP manifest hashes.)*
 
 ---
 

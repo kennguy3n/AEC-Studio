@@ -9,7 +9,7 @@
  * Shortcuts are normalised to a stable string form so they can also
  * appear next to commands in the {@link CommandPalette}.
  */
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 
 export interface ShortcutCommand {
   /** Stable id used by the command palette and tests. */
@@ -119,15 +119,23 @@ export function useKeyboardShortcuts(): void {
 /**
  * Register a single shortcut for the lifetime of the calling component.
  *
- * The hook depends on the command's `id` and `keys` only — handlers
- * are wrapped in a stable ref-like closure so callers don't need to
- * memoise.
+ * Handler identity is allowed to vary between renders: we store the
+ * latest `cmd.handler` in a ref and the registered command invokes
+ * `handlerRef.current()`, so callers do not need to memoise their
+ * handler. The registry entry itself is only re-attached when the
+ * shortcut's `id` or `keys` change.
  */
 export function useShortcut(cmd: ShortcutCommand): void {
+  const handlerRef = useRef(cmd.handler);
+  handlerRef.current = cmd.handler;
+
   useEffect(() => {
-    return shortcutRegistry.register(cmd);
-    // We intentionally only re-register when the id or key combo
-    // changes; handler identity is allowed to vary between renders.
+    return shortcutRegistry.register({
+      ...cmd,
+      handler: () => handlerRef.current(),
+    });
+    // Intentionally only re-register when the id or key combo changes;
+    // `handler` updates are picked up live via `handlerRef`.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cmd.id, cmd.keys]);
 }

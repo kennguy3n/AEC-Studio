@@ -224,17 +224,55 @@ pub struct ReviewComment {
     pub artifact_ref: Option<EntityId>,
 }
 
+/// BLAKE3 hex digest of a comment body, used as part of the dedup
+/// key so an *edit* to a previously-ingested comment shows up as a
+/// new audit entry rather than being silently dropped.
+fn text_fingerprint(text: &str) -> String {
+    blake3::hash(text.as_bytes()).to_hex().to_string()
+}
+
+/// Stable identity tuple for a KChat review comment in the audit
+/// trail. See [`ReviewComment::dedup_key`] for why `text` is folded
+/// into the key via a BLAKE3 digest.
+pub type ReviewCommentKey = (String, chrono::DateTime<chrono::Utc>, String, String);
+
 impl ReviewComment {
-    /// Dedup key — two comments with the same (thread, timestamp,
-    /// commenter) are treated as a re-import of the same logical
-    /// event by [`crate::kchat_sync::CommentSync`].
-    pub fn dedup_key(&self) -> (String, chrono::DateTime<chrono::Utc>, String) {
+    /// Dedup key — two comments with the same
+    /// `(thread_id, timestamp, commenter, blake3(text))` are treated
+    /// as a re-import of the same logical event by
+    /// [`crate::kchat_sync::CommentSync`].
+    ///
+    /// **Why the text fingerprint is part of the key.** The audit
+    /// trail is the source of truth for what reviewers said about a
+    /// project. If a commenter edits their KChat comment after the
+    /// first sync — even keeping the same author and timestamp — the
+    /// edit must land in the audit trail as its own entry, otherwise
+    /// later readers see the original text and never learn the
+    /// reviewer changed their mind. Hashing the text gives idempotent
+    /// re-imports for unchanged comments and turns edits into
+    /// independent audit rows that share `(thread_id, commenter)` and
+    /// can be ordered by timestamp to reconstruct the edit history.
+    pub fn dedup_key(&self) -> ReviewCommentKey {
         (
             self.thread_id.clone(),
             self.timestamp,
             self.commenter.clone(),
+            text_fingerprint(&self.text),
         )
     }
+}
+
+/// Rebuild a [`ReviewCommentKey`] from a persisted audit entry. Used
+/// by [`crate::kchat_sync::CommentSync::from_existing_entries`] so
+/// resumed sessions keep their dedup set consistent with the on-disk
+/// audit log.
+pub fn audit_entry_dedup_key(entry: &ProjectAuditEntry) -> ReviewCommentKey {
+    (
+        entry.thread_id.clone(),
+        entry.timestamp,
+        entry.actor.tool.clone().unwrap_or_default(),
+        text_fingerprint(&entry.text),
+    )
 }
 
 /// Full review card — a comment plus an explicit approval status.

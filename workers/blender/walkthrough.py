@@ -294,10 +294,23 @@ def stitch_frames(
         {"kind": "image_sequence", "dir": "/abs/out", "frame_count": N}
 
     The Rust side maps the two shapes to `WalkthroughOutput::Video` /
-    `WalkthroughOutput::ImageSequence` respectively. We never raise on
-    a missing FFmpeg — falling back to the image sequence is a
-    legitimate outcome (some studios prefer to stitch with their own
-    tooling so they can apply LUTs in the process).
+    `WalkthroughOutput::ImageSequence` respectively.
+
+    Error contract:
+
+    * **FFmpeg is not installed** — we never raise. Returning the
+      image-sequence dict is a legitimate outcome (some studios prefer
+      to stitch with their own tooling so they can apply LUTs in the
+      process).
+    * **FFmpeg is installed but the encode fails** (non-zero exit,
+      corrupted install, codec missing, frame mismatch) — we raise
+      `RuntimeError` with the stderr tail. A present-but-failing FFmpeg
+      almost always indicates a real problem the caller should hear
+      about; silently degrading to an image sequence would mask render
+      breakage.
+    * **Argument validation** (`fps <= 0`, missing `out_dir`, no
+      frames) — we raise `ValueError`. These are caller bugs, not
+      environmental fall-backs.
     """
 
     import shutil

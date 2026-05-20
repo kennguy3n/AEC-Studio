@@ -7,10 +7,14 @@
  * *override* surfaces (AI model tier, render defaults, Blender path,
  * KChat integration).
  *
- * Settings are persisted locally via the `aec.settings.*` bridge when
- * available; in tests and during early development the bridge is
- * absent, so the page falls back to in-memory state and the form
- * still works end-to-end for visual regression tests.
+ * Persistence is **in-memory only** in this build: the page holds the
+ * user's choices for the duration of the session and surfaces a
+ * `Saved at …` timestamp when the user clicks Save. A persistent
+ * `aec.settings.*` bridge method is on the Phase 7 follow-up list; once
+ * it lands, `onSave` will write through to the project file. Until
+ * then, deliberately do **not** add a fake IPC — surfacing a Save
+ * action that silently does nothing on app restart would be worse
+ * than the honest in-memory state.
  */
 
 import { useCallback, useEffect, useMemo, useState } from "react";

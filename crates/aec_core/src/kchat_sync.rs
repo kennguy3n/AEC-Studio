@@ -16,12 +16,14 @@
 
 use std::collections::HashSet;
 
-use crate::kchat::{ingest_review, ProjectAuditEntry, ReviewComment};
+use crate::kchat::{
+    audit_entry_dedup_key, ingest_review, ProjectAuditEntry, ReviewComment, ReviewCommentKey,
+};
 
 /// Stateful comment-sync engine.
 #[derive(Debug, Default)]
 pub struct CommentSync {
-    seen: HashSet<(String, chrono::DateTime<chrono::Utc>, String)>,
+    seen: HashSet<ReviewCommentKey>,
 }
 
 impl CommentSync {
@@ -39,13 +41,7 @@ impl CommentSync {
         let seen = entries
             .into_iter()
             .filter(|e| e.actor.kind == crate::types::ActorKind::KChat)
-            .map(|e| {
-                (
-                    e.thread_id.clone(),
-                    e.timestamp,
-                    e.actor.tool.clone().unwrap_or_default(),
-                )
-            })
+            .map(audit_entry_dedup_key)
             .collect();
         Self { seen }
     }
@@ -152,6 +148,49 @@ mod tests {
         ]);
         assert_eq!(reimport.len(), 1);
         assert_eq!(reimport[0].text, "fresh");
+    }
+
+    #[test]
+    fn edited_comment_is_reingested_as_new_entry() {
+        // Same thread + commenter + timestamp, but the text changed
+        // (e.g. the reviewer edited their KChat message after the
+        // initial sync). The audit trail must capture the edit as its
+        // own entry rather than silently dropping it.
+        let mut sync = CommentSync::new();
+        let original = make_comment("t1", "@a", "looks ok", 0);
+        let edited = ReviewComment {
+            text: "actually, push hero render lighting up".into(),
+            ..original.clone()
+        };
+        let first = sync.ingest(original).expect("first import is new");
+        let second = sync.ingest(edited).expect("edited text is new");
+        assert_eq!(first.text, "looks ok");
+        assert_eq!(second.text, "actually, push hero render lighting up");
+        assert_eq!(sync.seen_count(), 2);
+    }
+
+    #[test]
+    fn unchanged_text_reimport_is_still_dropped() {
+        // Idempotency contract: identical (thread, ts, commenter,
+        // text) is a no-op even after the text-fingerprint change.
+        let mut sync = CommentSync::new();
+        let c = make_comment("t1", "@a", "same words", 0);
+        assert!(sync.ingest(c.clone()).is_some());
+        assert!(sync.ingest(c).is_none());
+        assert_eq!(sync.seen_count(), 1);
+    }
+
+    #[test]
+    fn from_existing_entries_dedups_by_text_fingerprint() {
+        // Persisted audit entries with the same text must round-trip
+        // through `from_existing_entries`: re-importing the original
+        // is a no-op, but the edited version comes through.
+        let original = ingest_review(make_comment("t1", "@a", "v1", 0));
+        let mut sync = CommentSync::from_existing_entries([&original]);
+        let identical_reimport = sync.ingest(make_comment("t1", "@a", "v1", 0));
+        let edited_reimport = sync.ingest(make_comment("t1", "@a", "v2", 0));
+        assert!(identical_reimport.is_none());
+        assert!(edited_reimport.is_some());
     }
 
     #[test]

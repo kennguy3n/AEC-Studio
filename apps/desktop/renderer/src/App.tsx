@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useState } from "react";
 import { Routes, Route, Navigate, useNavigate } from "react-router-dom";
 import { ModeRail } from "./components/ModeRail";
 import { StatusBar } from "./components/StatusBar";
@@ -17,10 +17,21 @@ import { Settings } from "./pages/Settings";
 
 function AppCommands({
   onOpenPalette,
+  onClosePalette,
 }: {
   onOpenPalette: () => void;
+  onClosePalette: () => void;
 }): null {
   const navigate = useNavigate();
+  // Navigation shortcuts dismiss any open palette so the user lands on
+  // the new route with the overlay cleared.
+  const goto = useCallback(
+    (path: string) => {
+      onClosePalette();
+      navigate(path);
+    },
+    [navigate, onClosePalette],
+  );
   useShortcut({
     id: "open-command-palette",
     label: "Open command palette",
@@ -34,49 +45,49 @@ function AppCommands({
     label: "Go to Home",
     group: "navigation",
     keys: "mod+1",
-    handler: () => navigate("/"),
+    handler: () => goto("/"),
   });
   useShortcut({
     id: "goto-design",
     label: "Go to Design",
     group: "navigation",
     keys: "mod+2",
-    handler: () => navigate("/design"),
+    handler: () => goto("/design"),
   });
   useShortcut({
     id: "goto-draft",
     label: "Go to Draft",
     group: "navigation",
     keys: "mod+3",
-    handler: () => navigate("/draft"),
+    handler: () => goto("/draft"),
   });
   useShortcut({
     id: "goto-bim",
     label: "Go to BIM",
     group: "navigation",
     keys: "mod+4",
-    handler: () => navigate("/bim"),
+    handler: () => goto("/bim"),
   });
   useShortcut({
     id: "goto-render",
     label: "Go to Render",
     group: "navigation",
     keys: "mod+5",
-    handler: () => navigate("/render"),
+    handler: () => goto("/render"),
   });
   useShortcut({
     id: "goto-deliver",
     label: "Go to Deliver",
     group: "navigation",
     keys: "mod+6",
-    handler: () => navigate("/deliver"),
+    handler: () => goto("/deliver"),
   });
   useShortcut({
     id: "goto-settings",
     label: "Go to Settings",
     group: "navigation",
     keys: "mod+,",
-    handler: () => navigate("/settings"),
+    handler: () => goto("/settings"),
   });
   return null;
 }
@@ -88,21 +99,11 @@ export default function App() {
 
   useKeyboardShortcuts();
 
-  // Close palette on route changes from non-shortcut sources (e.g.
-  // mouse clicks). The Escape key is handled inside the palette
-  // itself.
-  useEffect(() => {
-    if (!paletteOpen) return;
-    const onMouseUp = () => {};
-    window.addEventListener("mouseup", onMouseUp);
-    return () => window.removeEventListener("mouseup", onMouseUp);
-  }, [paletteOpen]);
-
   return (
     <div className="app-shell">
       <ModeRail />
       <main className="app-main">
-        <AppCommands onOpenPalette={openPalette} />
+        <AppCommands onOpenPalette={openPalette} onClosePalette={closePalette} />
         <Routes>
           <Route path="/" element={<Home />} />
           <Route path="/design" element={<Design />} />
