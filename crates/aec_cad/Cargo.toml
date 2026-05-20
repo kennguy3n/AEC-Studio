@@ -9,6 +9,7 @@ description = "2D CAD core: DXF reader/writer, layer system, drawing primitives.
 
 [dependencies]
 aec_core = { path = "../aec_core" }
+bitflags = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

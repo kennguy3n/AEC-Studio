@@ -4,6 +4,7 @@
 //! The Blender process itself lives in `workers/blender/`; this crate only
 //! speaks to it over a JSON-line stdio protocol.
 
+pub mod cameras;
 pub mod cycles;
 pub mod eevee;
 pub mod job;
@@ -12,6 +13,10 @@ pub mod queue;
 pub mod scene;
 pub mod worker;
 
+pub use cameras::{
+    render_thumbnail_rgba8, CameraJournal, CameraJournalEntry, CameraPresetKind, CameraSnapshot,
+    CameraStore, CameraValidationError,
+};
 pub use cycles::CyclesPipeline;
 pub use eevee::EeveePipeline;
 pub use job::{RenderJob, RenderJobStatus};

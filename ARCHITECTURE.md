@@ -381,6 +381,30 @@ The BIM cache lets large IFC models open in seconds on re-open and lets export s
 
 ---
 
+## 9.5 Render worker
+
+```
+crates/aec_render/
+├── cameras.rs                  # CameraSnapshot, CameraStore, CameraJournal, preset thumbnails
+├── queue/                      # Render job queue, status (queued/rendering/done/failed/cancelled), ETA
+├── presets/                    # Quick / Standard / High / Studio / EEVEE Preview / Walkthrough / Panorama
+├── doctor/                     # AI render diagnostics (noise, lighting, materials)
+└── ipc/                        # Bridge to the Blender worker over JSON-lines
+```
+
+### Camera and render state
+
+- `CameraSnapshot` captures position, target, up, focal length (mm), sensor size, exposure (EV),
+  white balance (K), depth of field (f-stop + focus distance), and aspect ratio.
+- `CameraStore` is the source of truth for saved cameras; every mutation flows through
+  `CameraJournal`, which folds into the global command engine for undo/redo.
+- Thumbnails are rendered deterministically (64×64 RGBA8) from the snapshot so the camera tile
+  grid is reproducible across machines.
+- Camera presets (`InteriorCloseUp`, `Wide`, `EyeLevel`, `BirdsEye`) configure focal/sensor/DoF
+  parameters; render presets configure the engine (EEVEE/Cycles), sample count, and resolution.
+
+---
+
 ## 10.1 Resource governor
 
 ```

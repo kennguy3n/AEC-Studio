@@ -138,6 +138,27 @@ str       ::= "\"" [^"]+ "\""
 ws        ::= [ \t\n]*
 "#;
 
+const CLASSIFICATION_GBNF: &str = r#"
+root        ::= "{" ws "\"assignments\"" ws ":" ws assignlist ws "}"
+assignlist  ::= "[" ws (assign ("," ws assign)*)? ws "]"
+assign      ::= "{" ws "\"entity\"" ws ":" ws str ws "," ws "\"ifc_class\"" ws ":" ws str ws ("," ws "\"confidence\"" ws ":" ws number ws)? "}"
+str         ::= "\"" [^"]+ "\""
+number      ::= "-"? [0-9]+ ("." [0-9]+)?
+ws          ::= [ \t\n]*
+"#;
+
+const PROPERTY_FILL_GBNF: &str = r#"
+root        ::= "{" ws "\"psets\"" ws ":" ws psetlist ws "}"
+psetlist    ::= "[" ws (pset ("," ws pset)*)? ws "]"
+pset        ::= "{" ws "\"entity\"" ws ":" ws str ws "," ws "\"pset\"" ws ":" ws str ws "," ws "\"properties\"" ws ":" ws proplist ws ("," ws "\"confidence\"" ws ":" ws number ws)? "}"
+proplist    ::= "[" ws (prop ("," ws prop)*)? ws "]"
+prop        ::= "{" ws "\"key\"" ws ":" ws str ws "," ws "\"value\"" ws ":" ws (str | number | bool) ws "}"
+str         ::= "\"" [^"]+ "\""
+number      ::= "-"? [0-9]+ ("." [0-9]+)?
+bool        ::= "true" | "false"
+ws          ::= [ \t\n]*
+"#;
+
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GrammarRegistry {
     grammars: HashMap<String, Grammar>,
@@ -181,11 +202,22 @@ impl GrammarRegistry {
             gbnf: RENDER_DOCTOR_GBNF.into(),
             example: r#"{"findings":[{"issue":"underexposed","severity":"medium","recommendation":"increase exposure by 0.5 EV"}]}"#.into(),
         });
+        r.insert(Grammar {
+            key: "classification".into(),
+            gbnf: CLASSIFICATION_GBNF.into(),
+            example:
+                r#"{"assignments":[{"entity":"ent_001","ifc_class":"IfcWall","confidence":0.92}]}"#
+                    .into(),
+        });
+        r.insert(Grammar {
+            key: "property_fill".into(),
+            gbnf: PROPERTY_FILL_GBNF.into(),
+            example: r#"{"psets":[{"entity":"ent_001","pset":"Pset_WallCommon","properties":[{"key":"FireRating","value":"EI60"}],"confidence":0.91}]}"#
+                .into(),
+        });
         for key in [
             "cad_cleanup",
             "schedule_fill",
-            "classification",
-            "property_fill",
             "validation_help",
             "cover_page_draft",
         ] {

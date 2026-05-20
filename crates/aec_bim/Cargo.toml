@@ -9,11 +9,16 @@ description = "BIM core: spatial hierarchy, IFC classification, property sets, c
 
 [dependencies]
 aec_core = { path = "../aec_core" }
+aec_cad = { path = "../aec_cad" }
 blake3 = { workspace = true }
+rust_xlsxwriter = "0.71"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

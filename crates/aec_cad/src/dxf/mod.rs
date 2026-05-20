@@ -6,7 +6,8 @@ pub mod tables;
 pub mod writer;
 
 pub use entities::{
-    DxfArc, DxfCircle, DxfDimStyle, DxfEntity, DxfInsert, DxfLine, DxfPolyline, DxfText,
+    DxfArc, DxfCircle, DxfDimStyle, DxfDimension, DxfDimensionKind, DxfEllipse, DxfEntity,
+    DxfHatch, DxfHatchLoop, DxfInsert, DxfLine, DxfPolyline, DxfPolylineVertex, DxfSpline, DxfText,
 };
 pub use reader::DxfReader;
 pub use tables::{DxfBlockRecord, DxfLayer};

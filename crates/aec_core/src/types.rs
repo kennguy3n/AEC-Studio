@@ -11,7 +11,7 @@ use crate::error::{AecError, AecResult};
 macro_rules! typed_id {
     ($name:ident, $prefix:expr, $doc:literal) => {
         #[doc = $doc]
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
         #[serde(transparent)]
         pub struct $name(String);
 

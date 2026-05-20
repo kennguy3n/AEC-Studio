@@ -9,6 +9,7 @@ description = "Client-deliverable exports: proposal PDFs, schedules, mood boards
 
 [dependencies]
 aec_core = { path = "../aec_core" }
+aec_cad = { path = "../aec_cad" }
 aec_materials = { path = "../aec_materials" }
 chrono = { workspace = true }
 serde = { workspace = true }
