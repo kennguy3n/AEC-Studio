@@ -62,7 +62,7 @@ dependencies = [
  "aec_export",
  "aec_render",
  "blake3",
- "rust_xlsxwriter 0.71.0",
+ "rust_xlsxwriter",
  "serde",
  "serde_json",
  "tempfile",
@@ -151,7 +151,7 @@ dependencies = [
  "chrono",
  "hex",
  "printpdf",
- "rust_xlsxwriter 0.77.0",
+ "rust_xlsxwriter",
  "serde",
  "serde_json",
  "tempfile",
@@ -1626,16 +1626,6 @@ dependencies = [
  "hashlink",
  "libsqlite3-sys",
  "smallvec",
-]
-
-[[package]]
-name = "rust_xlsxwriter"
-version = "0.71.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16505ad28ecaf73f4c169614333c0519d4549675f158c9e886eb045c4dfde6c5"
-dependencies = [
- "regex",
- "zip",
 ]
 
 [[package]]

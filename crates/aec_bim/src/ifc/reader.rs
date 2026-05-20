@@ -188,13 +188,26 @@ impl IfcReader {
                     // always the suffix after the final `::`.
                     if let Ok(name) = g.string_arg(3) {
                         if let Some((tag, eid)) = name.rsplit_once("::") {
-                            // Unknown tags fall back to
-                            // `IfcClass::Other(raw_kind)` so values
-                            // produced by the AI classifier (e.g.
-                            // `IfcBuildingElementProxy`) round-trip
-                            // verbatim. Casing is preserved from the
-                            // original STEP bytes via `raw_kind`.
-                            let class = ifc_class_from_tag(other, &g.raw_kind);
+                            // Prefer the tag carried in the Name field
+                            // over the STEP entity type. The two are
+                            // identical for safe classes (the writer
+                            // emits `{ifc_tag}::{eid}` and uses
+                            // `ifc_tag` as the STEP type), but for
+                            // `IfcClass::Other(s)` where `s` contains
+                            // STEP-unsafe chars like `(`, `)` or `'`,
+                            // the writer falls back to STEP type
+                            // `IfcBuildingElementProxy` and keeps the
+                            // original `s` only in the Name field.
+                            // Reading the class from the Name tag
+                            // therefore makes the round-trip lossless
+                            // even for arbitrary user-supplied
+                            // extension classifier strings. We pass
+                            // `tag` for both the case-normalised match
+                            // and the raw (case-preserving) fallback
+                            // so `Other("Some::Custom::Type")`
+                            // round-trips verbatim.
+                            let class = ifc_class_from_tag(tag, tag);
+                            let _ = other; // STEP type is informational
                             let guid = g.string_arg(0)?;
                             let entity = EntityId::from_string(eid).map_err(|e| {
                                 IfcReadError::Malformed(format!(
@@ -1215,6 +1228,98 @@ mod tests {
             "EntityId must survive the rsplit_once boundary: {:?}",
             snap.guid_by_entity.keys().collect::<Vec<_>>(),
         );
+    }
+
+    #[test]
+    fn ifc_class_other_with_step_unsafe_chars_roundtrips_via_proxy_fallback() {
+        // `IfcClass::Other(s)` can be produced by extension classifiers
+        // that aren't bound to STEP-21 SIMPLE_ID syntax (no `(`, `)`,
+        // `'`, `,`, `;`, whitespace, or control chars allowed in an
+        // entity-type name). If the writer naively used such a tag as
+        // the STEP entity type, the reader's `parse_step_groups` would
+        // split at the stray `(` and the line would be unparseable.
+        //
+        // The writer's contract: when the tag is not a STEP-safe
+        // SIMPLE_ID, emit the STEP type as the canonical IFC catch-all
+        // `IfcBuildingElementProxy` while still encoding the original
+        // tag in the Name field (`{original_tag}::{entity_id}`). The
+        // reader prefers the Name-field tag over the STEP type when
+        // reconstructing the class, so `Other("Foo(Bar)'baz,qux;")`
+        // survives a write→read cycle losslessly.
+        let mut project = Project::new("OtherUnsafeRT");
+        let site = project
+            .add_child(&project.root.clone(), IfcClass::IfcSite, "S")
+            .unwrap();
+        let bldg = project
+            .add_child(&site, IfcClass::IfcBuilding, "B")
+            .unwrap();
+        let storey = project
+            .add_child(&bldg, IfcClass::IfcBuildingStorey, "L01")
+            .unwrap();
+
+        // The full STEP-special charset that would otherwise corrupt
+        // the writer's output: parens, single-quote, comma, semicolon,
+        // and embedded whitespace.
+        let unsafe_tag = "Foo(Bar)'baz,qux; spam";
+        let mut classification = ClassificationStore::new();
+        let props = PropertyStore::new();
+        let el = EntityId::new();
+        project.attach_element(&storey, el.clone());
+        classification.assign_manual(el.clone(), IfcClass::Other(unsafe_tag.into()));
+
+        let s = crate::ifc::IfcWriter::to_string(&project, &classification, &props);
+        // Sanity check: the STEP-type position MUST be the canonical
+        // proxy fallback — otherwise the file would be unparseable.
+        assert!(
+            !s.contains(&format!("{unsafe_tag}(")),
+            "writer must NOT emit STEP-unsafe tag verbatim as entity type: \n{s}"
+        );
+        assert!(
+            s.contains("IfcBuildingElementProxy("),
+            "writer must fall back to IfcBuildingElementProxy as STEP type: \n{s}"
+        );
+
+        let snap =
+            IfcReader::from_string(&s).expect("Other(...) with STEP-special chars must round-trip");
+        let class = snap
+            .classification
+            .accepted_for(&el)
+            .expect("element classified");
+        assert_eq!(
+            class,
+            &IfcClass::Other(unsafe_tag.into()),
+            "the original Other(tag) must be reconstructed verbatim despite the proxy fallback",
+        );
+        assert!(
+            snap.guid_by_entity.contains_key(&el),
+            "EntityId must survive the unsafe-tag proxy fallback",
+        );
+    }
+
+    #[test]
+    fn step_safe_simple_id_validator_classifies_correctly() {
+        // The writer's safety predicate guards against STEP-21
+        // SIMPLE_ID violations. Anchor the contract here so a future
+        // edit can't silently broaden the safe set and reintroduce the
+        // unparseable-line corruption mode.
+        use crate::ifc::writer::is_step_safe_simple_id;
+
+        // Safe: real IFC class tags + the `Other(_)` rsplit-once form.
+        assert!(is_step_safe_simple_id("IfcWall"));
+        assert!(is_step_safe_simple_id("IfcBuildingElementProxy"));
+        assert!(is_step_safe_simple_id("Some::Custom::Type"));
+        assert!(is_step_safe_simple_id("_underscored"));
+
+        // Unsafe: each character below would individually corrupt
+        // `parse_step_groups`.
+        assert!(!is_step_safe_simple_id(""));
+        assert!(!is_step_safe_simple_id("9StartsWithDigit"));
+        assert!(!is_step_safe_simple_id("Foo(Bar)"));
+        assert!(!is_step_safe_simple_id("Foo,Bar"));
+        assert!(!is_step_safe_simple_id("Foo'Bar"));
+        assert!(!is_step_safe_simple_id("Foo;Bar"));
+        assert!(!is_step_safe_simple_id("Foo Bar"));
+        assert!(!is_step_safe_simple_id("Foo\nBar"));
     }
 
     #[test]

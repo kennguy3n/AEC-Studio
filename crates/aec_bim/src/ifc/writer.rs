@@ -97,7 +97,6 @@ DATA;\n";
 
         // ---- Spatial graph (DFS from root) ----
         let mut spatial_step: HashMap<EntityId, u32> = HashMap::new();
-        let mut spatial_guid: HashMap<EntityId, String> = HashMap::new();
         let mut stack = vec![project.root.clone()];
         while let Some(id) = stack.pop() {
             let Some(node) = project.nodes.get(&id) else {
@@ -113,7 +112,13 @@ DATA;\n";
             };
             let step_id = buf.alloc();
             spatial_step.insert(id.clone(), step_id);
-            spatial_guid.insert(id.clone(), guid.clone());
+            // Spatial-structure classes (IfcProject/Site/Building/Storey/
+            // Space) are baked into the IfcClass enum and never originate
+            // from user-supplied strings, so their `ifc_tag()` is always a
+            // valid STEP SIMPLE_ID. We still route the *Name* field
+            // through `escape_step_string` for defense in depth (e.g. a
+            // user-supplied space label containing `'` or `\n`), but no
+            // STEP-type sanitisation is required here.
             let tag = node.class.ifc_tag();
             // IfcProject has an extra (RepContext, UnitAssign) slot; we
             // pass placeholders ($) so the round-trip stays
@@ -176,7 +181,6 @@ DATA;\n";
 
         // ---- Elements + IFCRELCONTAINEDINSPATIALSTRUCTURE per storey ----
         let mut element_step: HashMap<EntityId, u32> = HashMap::new();
-        let mut element_guid: HashMap<EntityId, String> = HashMap::new();
         for (storey_id, node) in &project.nodes {
             if node.elements.is_empty() {
                 continue;
@@ -193,19 +197,36 @@ DATA;\n";
                 let guid = compress_entity_id_to_guid(el);
                 let step_id = buf.alloc();
                 element_step.insert(el.clone(), step_id);
-                element_guid.insert(el.clone(), guid.clone());
-                let tag = class.ifc_tag();
+                // The original tag preserves the case for `Other(s)` so
+                // the reader can reconstruct it verbatim; the *emitted*
+                // STEP type must additionally be a valid STEP SIMPLE_ID
+                // (no `(`, `)`, `'`, `,`, `;`, whitespace, or control
+                // chars), otherwise the reader's `parse_step_groups`
+                // would split the line at the first stray `(` and treat
+                // the rest as garbage. For unsafe `Other(...)` strings we
+                // fall back to the canonical IFC catch-all type
+                // `IfcBuildingElementProxy`; the original tag is still
+                // carried in the Name field as `{original_tag}::{eid}`
+                // so the reader's name-prefers-tag path reconstructs
+                // `Other(original_tag)` losslessly.
+                let original_tag = class.ifc_tag();
+                let step_type_tag = if is_step_safe_simple_id(original_tag) {
+                    original_tag
+                } else {
+                    "IfcBuildingElementProxy"
+                };
                 buf.write_line(
                     step_id,
                     format!(
-                        "{tag}('{guid}',#{owner},$,'{name}',$,$,$,$,$)",
+                        "{step_type_tag}('{guid}',#{owner},$,'{name}',$,$,$,$,$)",
                         owner = owner_history,
-                        // Defense in depth: even though `tag` and the
-                        // EntityId Display are ASCII-safe today, route
-                        // the composed name through `escape_step_string`
-                        // so adding any future user-supplied component
-                        // can't break STEP tokenization.
-                        name = escape_step_string(&format!("{tag}::{el}")),
+                        // Always route the composed name through
+                        // `escape_step_string` — for the unsafe-tag
+                        // fallback this is the *only* place the
+                        // original tag survives, so corruption here
+                        // would lose the `Other(...)` payload on
+                        // re-import.
+                        name = escape_step_string(&format!("{original_tag}::{el}")),
                     ),
                 );
                 contained_refs.push(format!("#{step_id}"));
@@ -368,6 +389,30 @@ DATA;\n";
 /// [`unescape_step_string`]. The module docs explicitly state this
 /// reader/writer pair is for AEC Studio's in-process IFC pipeline and
 /// not intended for interop with third-party IFC tooling.
+/// Returns true when `s` is a valid STEP-21 SIMPLE_ID safe to embed as
+/// the entity-type prefix of a STEP record.
+///
+/// Per ISO 10303-21 a SIMPLE_ID matches `[A-Za-z_][A-Za-z0-9_]*`. The
+/// AEC Studio in-process round-trip additionally accepts `:` so that
+/// `IfcClass::Other("Some::Custom::Type")` produced by an extension
+/// classifier can be emitted verbatim (`:` does not collide with any
+/// STEP delimiter and the reader splits the Name field with
+/// `rsplit_once("::")`). Characters that *would* corrupt
+/// `parse_step_groups` in the reader — `(`, `)`, `'`, `,`, `;`,
+/// whitespace, control chars — are rejected so the writer can fall
+/// back to a canonical proxy type instead of emitting a malformed line.
+pub(crate) fn is_step_safe_simple_id(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    let mut chars = s.chars();
+    let first = chars.next().expect("non-empty");
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+}
+
 fn escape_step_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
