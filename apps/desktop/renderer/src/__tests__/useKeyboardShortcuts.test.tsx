@@ -129,4 +129,72 @@ describe("useKeyboardShortcuts", () => {
     expect(allowed).toHaveBeenCalledTimes(1);
     document.body.removeChild(input);
   });
+
+  it("picks up live changes to whenInputFocused without re-keying", () => {
+    // Regression: previously `useShortcut` captured `whenInputFocused`
+    // at first registration and only re-registered when `id` or `keys`
+    // changed. Toggling the flag between renders should now take
+    // effect immediately because the registered entry reads through a
+    // ref.
+    const fired = vi.fn();
+    const { rerender } = renderHook(
+      ({ allowInForms }: { allowInForms: boolean }) => {
+        useKeyboardShortcuts();
+        useShortcut({
+          id: "live-focus",
+          label: "Live focus",
+          keys: "mod+j",
+          handler: fired,
+          whenInputFocused: allowInForms,
+        });
+      },
+      { initialProps: { allowInForms: false } },
+    );
+
+    const input = document.createElement("input");
+    document.body.appendChild(input);
+    input.focus();
+
+    act(() => {
+      fireEvent.keyDown(input, { key: "j", ctrlKey: true });
+    });
+    expect(fired).not.toHaveBeenCalled();
+
+    rerender({ allowInForms: true });
+
+    act(() => {
+      fireEvent.keyDown(input, { key: "j", ctrlKey: true });
+    });
+    expect(fired).toHaveBeenCalledTimes(1);
+
+    document.body.removeChild(input);
+  });
+
+  it("exposes the latest label and handler to registry consumers", () => {
+    // The CommandPalette renders `shortcutRegistry.all()`. If a label
+    // changes across renders, the palette must see the new value.
+    const { rerender } = renderHook(
+      ({ label, handler }: { label: string; handler: () => void }) => {
+        useShortcut({
+          id: "live-label",
+          label,
+          keys: "mod+i",
+          handler,
+        });
+      },
+      {
+        initialProps: { label: "First label", handler: vi.fn() },
+      },
+    );
+
+    expect(shortcutRegistry.findByKeys("mod+i")?.label).toBe("First label");
+
+    const newHandler = vi.fn();
+    rerender({ label: "Second label", handler: newHandler });
+
+    const entry = shortcutRegistry.findByKeys("mod+i");
+    expect(entry?.label).toBe("Second label");
+    entry?.handler();
+    expect(newHandler).toHaveBeenCalledTimes(1);
+  });
 });

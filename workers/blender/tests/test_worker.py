@@ -461,6 +461,50 @@ class BlenderWorkerTests(unittest.TestCase):
                     str(Path(tmp) / "out.mp4"),
                 )
 
+    def test_stitch_frames_ignores_non_pattern_images(self):
+        # Regression: previously `frame_count` counted every .png/.jpg/.jpeg
+        # in the directory, which both bypassed the empty-directory guard
+        # when only non-frame images existed and inflated the
+        # image-sequence frame_count for FFmpeg-absent callers. Verify
+        # that files not matching `frame_pattern` are excluded from the
+        # count, and that a directory containing only non-frame images
+        # is treated the same as an empty directory.
+        from walkthrough import stitch_frames  # type: ignore
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            (tmp_path / "frame_00001.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+            (tmp_path / "frame_00002.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+            (tmp_path / "thumbnail.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+            (tmp_path / "reference.jpg").write_bytes(b"\xff\xd8\xff")
+            out = stitch_frames(
+                str(tmp_path),
+                str(tmp_path / "walkthrough.mp4"),
+                ffmpeg_path="/definitely/does/not/exist",
+            )
+            self.assertEqual(out["kind"], "image_sequence")
+            self.assertEqual(
+                out["frame_count"],
+                2,
+                "non-frame images must not be counted",
+            )
+
+    def test_stitch_frames_rejects_directory_with_only_non_pattern_images(self):
+        from walkthrough import stitch_frames  # type: ignore
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            (tmp_path / "thumbnail.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+            (tmp_path / "reference.jpg").write_bytes(b"\xff\xd8\xff")
+            with self.assertRaises(ValueError) as ctx:
+                stitch_frames(
+                    str(tmp_path),
+                    str(tmp_path / "out.mp4"),
+                )
+            self.assertIn("frame_%05d.png", str(ctx.exception))
+
     def test_stitch_frames_invokes_ffmpeg_when_present(self):
         from walkthrough import stitch_frames  # type: ignore
         import tempfile

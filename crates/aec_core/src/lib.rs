@@ -37,7 +37,7 @@ pub use kchat::{
     AssetPackEntryKind, AssetPackManifest, AssetPackReference, InMemoryPublisher, KChatArtifact,
     KChatError, KChatPublisher, ProjectAuditEntry, PublishResult, ReviewCard, ReviewComment,
 };
-pub use kchat_config::{KChatConfig, KChatIntegration};
+pub use kchat_config::{AssetPackPublishOutcome, KChatConfig, KChatIntegration};
 pub use kchat_sync::CommentSync;
 pub use manifest::{ProjectManifest, SCHEMA_VERSION};
 pub use package::{ProjectPackage, ProjectSummary, RecentEntry, RecentsStore};

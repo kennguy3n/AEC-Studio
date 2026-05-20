@@ -119,23 +119,41 @@ export function useKeyboardShortcuts(): void {
 /**
  * Register a single shortcut for the lifetime of the calling component.
  *
- * Handler identity is allowed to vary between renders: we store the
- * latest `cmd.handler` in a ref and the registered command invokes
- * `handlerRef.current()`, so callers do not need to memoise their
- * handler. The registry entry itself is only re-attached when the
- * shortcut's `id` or `keys` change.
+ * **Live-binding semantics.** `id` and `keys` define the registry
+ * entry's *identity*; we only re-register when either changes. Every
+ * other field (`handler`, `label`, `group`, `whenInputFocused`) is
+ * proxied through a ref so callers can flip `whenInputFocused` on the
+ * fly, rename a label, or swap an inline handler between renders
+ * without losing the registration.
+ *
+ * The previous implementation only re-routed `handler` through a ref
+ * and captured the rest with `...cmd` at registration time. That meant
+ * a caller switching e.g. `whenInputFocused: false` → `true` while a
+ * form was focused would still be ignored, and the
+ * {@link CommandPalette} would keep showing stale labels until the
+ * shortcut was actually re-keyed.
  */
 export function useShortcut(cmd: ShortcutCommand): void {
-  const handlerRef = useRef(cmd.handler);
-  handlerRef.current = cmd.handler;
+  const cmdRef = useRef(cmd);
+  cmdRef.current = cmd;
 
   useEffect(() => {
     return shortcutRegistry.register({
-      ...cmd,
-      handler: () => handlerRef.current(),
+      id: cmd.id,
+      keys: cmd.keys,
+      get label() {
+        return cmdRef.current.label;
+      },
+      get group() {
+        return cmdRef.current.group;
+      },
+      get whenInputFocused() {
+        return cmdRef.current.whenInputFocused;
+      },
+      handler: () => cmdRef.current.handler(),
     });
-    // Intentionally only re-register when the id or key combo changes;
-    // `handler` updates are picked up live via `handlerRef`.
+    // Identity is `(id, keys)`; non-identity fields are read live via
+    // `cmdRef`, so we intentionally exclude them from the dep array.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cmd.id, cmd.keys]);
 }

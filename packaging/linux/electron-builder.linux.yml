@@ -1,6 +1,19 @@
 # electron-builder config for Linux targets.
+#
+# All resource paths below are expressed *relative to the project
+# directory*, which is `apps/desktop/` (where package.json lives) —
+# that's how electron-builder resolves every path in its config. The
+# packaging assets themselves live one level up at the repo root, so
+# paths use the `../../packaging/linux/...` prefix.
+#
 # Build the renderer + electron main bundle first (`npm run build` in
-# apps/desktop/), then point electron-builder at this file:
+# apps/desktop/), then invoke electron-builder from `apps/desktop`:
+#
+#   cd apps/desktop
+#   npx electron-builder --linux \
+#     --config ../../packaging/linux/electron-builder.linux.yml
+#
+# or from the repo root with an explicit projectDir:
 #
 #   npx electron-builder --linux \
 #     --config packaging/linux/electron-builder.linux.yml \
@@ -19,7 +32,8 @@ productName: AEC Studio
 copyright: "© 2026 AEC Studio Authors"
 
 directories:
-  buildResources: packaging/linux/resources
+  # Paths are relative to projectDir = apps/desktop.
+  buildResources: ../../packaging/linux/resources
   output: dist/installers/linux
 
 files:
@@ -44,7 +58,7 @@ linux:
     - AppImage
     - deb
     - snap
-  icon: packaging/linux/resources/icons
+  icon: ../../packaging/linux/resources/icons
 
 appImage:
   license: LICENSE

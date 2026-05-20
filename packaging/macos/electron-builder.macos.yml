@@ -1,10 +1,26 @@
 # electron-builder config for macOS targets.
+#
+# All resource paths below are expressed *relative to the project
+# directory*, which is `apps/desktop/` (where package.json lives) —
+# that's how electron-builder resolves every path in its config. The
+# packaging assets themselves live one level up at the repo root, so
+# paths use the `../../packaging/macos/...` prefix.
+#
 # Build the renderer + electron main bundle first (`npm run build` in
-# apps/desktop/), then point electron-builder at this file:
+# apps/desktop/), then invoke electron-builder from `apps/desktop`:
+#
+#   cd apps/desktop
+#   npx electron-builder --mac \
+#     --config ../../packaging/macos/electron-builder.macos.yml
+#
+# or from the repo root with an explicit projectDir:
 #
 #   npx electron-builder --mac \
 #     --config packaging/macos/electron-builder.macos.yml \
 #     --projectDir apps/desktop
+#
+# Either invocation resolves `../../packaging/macos/resources/...`
+# correctly because projectDir is always `apps/desktop`.
 #
 # Targets:
 # * dmg — disk image, primary distribution form.
@@ -18,7 +34,8 @@ productName: AEC Studio
 copyright: "© 2026 AEC Studio Authors"
 
 directories:
-  buildResources: packaging/macos/resources
+  # Paths are relative to projectDir = apps/desktop.
+  buildResources: ../../packaging/macos/resources
   output: dist/installers/macos
 
 files:
@@ -42,9 +59,9 @@ mac:
       arch:
         - x64
         - arm64
-  icon: packaging/macos/resources/icons/icon.icns
-  entitlements: packaging/macos/resources/entitlements.mac.plist
-  entitlementsInherit: packaging/macos/resources/entitlements.mac.plist
+  icon: ../../packaging/macos/resources/icons/icon.icns
+  entitlements: ../../packaging/macos/resources/entitlements.mac.plist
+  entitlementsInherit: ../../packaging/macos/resources/entitlements.mac.plist
   extendInfo:
     NSHighResolutionCapable: true
     LSMinimumSystemVersion: "11.0"

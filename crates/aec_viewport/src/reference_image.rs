@@ -180,14 +180,26 @@ pub struct ReferenceImageOverlay {
 }
 
 impl ReferenceImageOverlay {
+    /// Install or replace the overlay image.
+    ///
+    /// Only invalidates the cached bitmap when the source *path*
+    /// changes. When the caller is just tweaking transform fields
+    /// (opacity, position, scale, locked) we keep the previously
+    /// decoded bitmap so the renderer doesn't pay the decode cost for
+    /// a parameter-only update.
+    ///
+    /// Replacing the file on disk under the same path is **not**
+    /// detected here; if that matters to a caller (e.g. a watched
+    /// "reload" action) it should `clear()` the overlay first and
+    /// then `set_image`. The regression test
+    /// `overlay_set_image_keeps_bitmap_when_path_unchanged` pins this
+    /// contract.
     pub fn set_image(&mut self, image: ReferenceImage) {
-        // Clear the cache when the source changes — even if the path
-        // is the same, the user may have replaced the file on disk.
-        if !self
+        let same_path = self
             .image
             .as_ref()
-            .is_some_and(|i| i.source_path == image.source_path)
-        {
+            .is_some_and(|i| i.source_path == image.source_path);
+        if !same_path {
             self.bitmap = None;
         }
         self.image = Some(image);

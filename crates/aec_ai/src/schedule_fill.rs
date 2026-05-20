@@ -26,8 +26,16 @@ pub enum ScheduleFillError {
     EmptyRow,
     #[error("cell confidence must be in 0.0..=1.0, got {0}")]
     InvalidConfidence(f32),
-    #[error("row {row} cell `{cell}` missing")]
+    /// A cell key in `row.cells` has no matching entry in
+    /// `row.confidence`.
+    #[error("row {row} cell `{cell}` missing confidence")]
     MissingCell { row: usize, cell: String },
+    /// A confidence key has no matching cell in `row.cells`. The
+    /// model is required to score exactly the cells it filled —
+    /// extras almost always indicate a hallucinated column that the
+    /// reviewer would otherwise never see in the schedule UI.
+    #[error("row {row} confidence key `{key}` has no matching cell")]
+    ExtraConfidence { row: usize, key: String },
     #[error("rationale must not be empty")]
     EmptyRationale,
 }
@@ -95,11 +103,29 @@ impl ScheduleFillResult {
             if row.cells.is_empty() {
                 return Err(ScheduleFillError::EmptyRow);
             }
-            for (cell, _) in row.cells.iter() {
+            // Every cell must have a confidence …
+            for cell in row.cells.keys() {
                 if !row.confidence.contains_key(cell) {
                     return Err(ScheduleFillError::MissingCell {
                         row: row_idx,
                         cell: cell.clone(),
+                    });
+                }
+            }
+            // … and every confidence key must have a corresponding
+            // cell. Without this check a model could emit a payload
+            // like `{"cells": {"id": "D-001"}, "confidence": {"id":
+            // 0.9, "fire_rating": 0.4}}` which would slip through and
+            // bury the (hallucinated) low confidence on `fire_rating`
+            // — the reviewer would never see it because the schedule
+            // UI only renders columns present in `cells`. Rejecting
+            // extras at parse time keeps validation symmetric with
+            // [`Self::MissingCell`].
+            for key in row.confidence.keys() {
+                if !row.cells.contains_key(key) {
+                    return Err(ScheduleFillError::ExtraConfidence {
+                        row: row_idx,
+                        key: key.clone(),
                     });
                 }
             }
@@ -194,6 +220,27 @@ mod tests {
             .remove("fire_rating");
         let err = ScheduleFillResult::parse(&payload.to_string()).unwrap_err();
         assert!(matches!(err, ScheduleFillError::MissingCell { .. }));
+    }
+
+    #[test]
+    fn extra_confidence_key_without_matching_cell_is_rejected() {
+        // A confidence key with no corresponding cell would otherwise
+        // be silently accepted and the reviewer would never see the
+        // (likely hallucinated) low-confidence score because the
+        // schedule UI only renders columns present in `cells`.
+        let mut payload = good_payload();
+        payload["filled_rows"][0]["confidence"]
+            .as_object_mut()
+            .unwrap()
+            .insert("hallucinated_column".into(), serde_json::json!(0.42));
+        let err = ScheduleFillResult::parse(&payload.to_string()).unwrap_err();
+        match err {
+            ScheduleFillError::ExtraConfidence { row, key } => {
+                assert_eq!(row, 0);
+                assert_eq!(key, "hallucinated_column");
+            }
+            other => panic!("expected ExtraConfidence, got {other:?}"),
+        }
     }
 
     #[test]

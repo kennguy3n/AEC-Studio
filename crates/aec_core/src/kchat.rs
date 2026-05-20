@@ -56,6 +56,12 @@ pub enum KChatArtifact {
     Sheet,
     RevisionPack,
     BoqSnapshot,
+    /// Reference to a team asset pack (geometry / materials / props).
+    /// The card carries the manifest hash so a subscriber on the
+    /// other end of the thread can verify the pack they pulled from
+    /// their own transport (Dropbox / OneDrive / USB) matches the
+    /// one the publisher intended.
+    AssetPack,
 }
 
 impl KChatArtifact {
@@ -65,6 +71,7 @@ impl KChatArtifact {
             Self::Sheet => "sheet",
             Self::RevisionPack => "revision_pack",
             Self::BoqSnapshot => "boq_snapshot",
+            Self::AssetPack => "asset_pack",
         }
     }
 
@@ -75,6 +82,7 @@ impl KChatArtifact {
             Self::Sheet => "Sheet",
             Self::RevisionPack => "Revision pack",
             Self::BoqSnapshot => "BOQ snapshot",
+            Self::AssetPack => "Asset pack",
         }
     }
 }
@@ -380,6 +388,44 @@ impl AssetPackManifest {
             manifest_blake3: self.manifest_hash()?,
             thread_id: thread_id.into(),
         })
+    }
+
+    /// Render the manifest as an [`ArtifactCard`] suitable for
+    /// publishing to a KChat thread. This is the bridge that lets
+    /// `KChatIntegration::publish_asset_pack` actually route an
+    /// asset-pack announcement *through* the configured transport
+    /// instead of just building a metadata struct.
+    pub fn artifact_card(
+        &self,
+        reference: &AssetPackReference,
+    ) -> ArtifactCard {
+        let mut metadata = HashMap::new();
+        metadata.insert("pack_id".to_string(), reference.pack_id.clone());
+        metadata.insert("version".to_string(), reference.version.clone());
+        metadata.insert(
+            "manifest_blake3".to_string(),
+            reference.manifest_blake3.clone(),
+        );
+        metadata.insert(
+            "entry_count".to_string(),
+            self.entries.len().to_string(),
+        );
+        let total_bytes: u64 = self.entries.iter().map(|e| e.size_bytes).sum();
+        metadata.insert("total_bytes".to_string(), total_bytes.to_string());
+
+        ArtifactCard {
+            artifact: KChatArtifact::AssetPack,
+            caption: format!(
+                "Asset pack “{}” v{}",
+                self.display_name, self.version
+            ),
+            project_link: format!(
+                "aecstudio://asset-pack/{}/{}",
+                self.pack_id, self.version
+            ),
+            thumbnail_blake3: None,
+            metadata,
+        }
     }
 }
 

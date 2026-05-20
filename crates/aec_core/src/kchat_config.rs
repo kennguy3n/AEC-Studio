@@ -16,6 +16,16 @@ use crate::kchat::{
     ProjectAuditEntry, PublishResult, ReviewCard, ReviewComment,
 };
 
+/// Outcome of [`KChatIntegration::publish_asset_pack`]. Carries both
+/// the shareable reference *and* the publisher's response so the
+/// project audit can record the transport message id alongside the
+/// pack metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssetPackPublishOutcome {
+    pub reference: AssetPackReference,
+    pub publish: PublishResult,
+}
+
 /// Configuration knob persisted in the project package.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KChatConfig {
@@ -70,6 +80,12 @@ where
         self.config.enabled
     }
 
+    /// Borrow the underlying publisher. Primarily useful for tests
+    /// that need to assert on the publisher's recorded history.
+    pub fn publisher(&self) -> &P {
+        &self.publisher
+    }
+
     /// Publish an artefact card. Returns [`KChatError::Disabled`]
     /// when the integration is disabled — *before* the card is
     /// validated, so callers can rely on disabled being a no-op.
@@ -100,11 +116,26 @@ where
     /// `thread_id` when the caller wants to override). The blobs are
     /// out of scope — the user transports them through Dropbox /
     /// OneDrive / USB / wherever.
+    ///
+    /// This method now actually **publishes through the configured
+    /// transport** in addition to building the reference: it renders
+    /// an [`ArtifactCard`] from the manifest and calls
+    /// [`KChatPublisher::publish`] on it. Returns both the reference
+    /// (shared with subscribers so they can verify the manifest they
+    /// pulled from their out-of-band transport) and the
+    /// [`PublishResult`] reported by the transport (so the project
+    /// audit can record "published to thread X at time Y").
+    ///
+    /// Earlier revisions only constructed the reference and never
+    /// touched the publisher, which made the method name actively
+    /// misleading. Callers that just want the reference without
+    /// publishing should use [`AssetPackManifest::reference`]
+    /// directly.
     pub fn publish_asset_pack(
         &self,
         manifest: &AssetPackManifest,
         thread_id: Option<&str>,
-    ) -> Result<AssetPackReference, KChatError> {
+    ) -> Result<AssetPackPublishOutcome, KChatError> {
         if !self.config.enabled {
             return Err(KChatError::Disabled);
         }
@@ -114,7 +145,10 @@ where
             .ok_or_else(|| {
                 KChatError::Transport("no thread_id provided and no default configured".into())
             })?;
-        manifest.reference(target)
+        let reference = manifest.reference(target)?;
+        let card = manifest.artifact_card(&reference);
+        let publish = self.publisher.publish(card)?;
+        Ok(AssetPackPublishOutcome { reference, publish })
     }
 
     /// Subscribe to an asset pack — verify the manifest matches the
@@ -241,10 +275,40 @@ mod tests {
     fn publish_asset_pack_uses_default_thread_when_provided() {
         let integ = KChatIntegration::new(
             KChatConfig::enabled_with_thread("default-thread"),
-            InMemoryPublisher::new("ignored"),
+            InMemoryPublisher::new("default-thread"),
         );
-        let r = integ.publish_asset_pack(&manifest(), None).unwrap();
-        assert_eq!(r.thread_id, "default-thread");
+        let outcome = integ.publish_asset_pack(&manifest(), None).unwrap();
+        // The reference carries the *target* thread the manifest is
+        // published into. Subscribers verify against this.
+        assert_eq!(outcome.reference.thread_id, "default-thread");
+        // The publish result carries the *transport's* bound thread —
+        // they agree because the integration was wired correctly.
+        assert_eq!(outcome.publish.thread_id, "default-thread");
+    }
+
+    #[test]
+    fn publish_asset_pack_actually_pushes_through_transport() {
+        // Regression: earlier revisions only constructed the
+        // reference and returned it, leaving the configured publisher
+        // untouched. Verify the publisher actually receives the card.
+        let publisher = InMemoryPublisher::new("t");
+        let integ = KChatIntegration::new(KChatConfig::enabled(), publisher);
+        let outcome = integ.publish_asset_pack(&manifest(), Some("t")).unwrap();
+        // Grab the history off the integration's publisher.
+        let history = integ.publisher().history();
+        assert_eq!(history.len(), 1);
+        let (card, result) = &history[0];
+        assert_eq!(card.artifact, KChatArtifact::AssetPack);
+        assert_eq!(card.metadata.get("pack_id").map(String::as_str), Some("pack"));
+        assert_eq!(card.metadata.get("version").map(String::as_str), Some("0.1.0"));
+        assert_eq!(
+            card.metadata.get("manifest_blake3").map(String::as_str),
+            Some(outcome.reference.manifest_blake3.as_str())
+        );
+        // The PublishResult returned through the outcome matches the
+        // history entry — same message_id, same thread.
+        assert_eq!(result.message_id, outcome.publish.message_id);
+        assert_eq!(result.thread_id, "t");
     }
 
     #[test]

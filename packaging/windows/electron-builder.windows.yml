@@ -1,9 +1,22 @@
 # electron-builder config for Windows targets.
-# Build the renderer + electron main bundle first (`npm run build` in
-# apps/desktop/), then point electron-builder at this file:
 #
-#   npx electron-builder --win \
-#     --config packaging/windows/electron-builder.windows.yml \
+# All resource paths below are expressed *relative to the project
+# directory*, which is `apps/desktop/` (where package.json lives) —
+# that's how electron-builder resolves every path in its config. The
+# packaging assets themselves live one level up at the repo root, so
+# paths use the `../../packaging/windows/...` prefix.
+#
+# Build the renderer + electron main bundle first (`npm run build` in
+# apps/desktop/), then invoke electron-builder from `apps/desktop`:
+#
+#   cd apps/desktop
+#   npx electron-builder --win `
+#     --config ../../packaging/windows/electron-builder.windows.yml
+#
+# or from the repo root with an explicit projectDir:
+#
+#   npx electron-builder --win `
+#     --config packaging/windows/electron-builder.windows.yml `
 #     --projectDir apps/desktop
 #
 # Targets:
@@ -15,7 +28,8 @@ productName: AEC Studio
 copyright: "© 2026 AEC Studio Authors"
 
 directories:
-  buildResources: packaging/windows/resources
+  # Paths are relative to projectDir = apps/desktop.
+  buildResources: ../../packaging/windows/resources
   output: dist/installers/windows
 
 files:
@@ -41,7 +55,7 @@ win:
     - target: msi
       arch:
         - x64
-  icon: packaging/windows/resources/icons/icon.ico
+  icon: ../../packaging/windows/resources/icons/icon.ico
   legalTrademarks: AEC Studio
 
 nsis:
@@ -52,8 +66,8 @@ nsis:
   createStartMenuShortcut: true
   shortcutName: AEC Studio
   artifactName: "${productName}-Setup-${version}-${arch}.exe"
-  installerIcon: packaging/windows/resources/icons/icon.ico
-  uninstallerIcon: packaging/windows/resources/icons/icon.ico
+  installerIcon: ../../packaging/windows/resources/icons/icon.ico
+  uninstallerIcon: ../../packaging/windows/resources/icons/icon.ico
 
 msi:
   oneClick: false

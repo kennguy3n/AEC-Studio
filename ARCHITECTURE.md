@@ -408,13 +408,16 @@ KChat integration is the **only** optional cross-organisation surface in AEC Stu
 
 ```
 crates/aec_core/
-├── kchat.rs                    # KChatArtifact, ArtifactCard, KChatPublisher trait,
-│                               # InMemoryPublisher (tests), ReviewComment / ApprovalStatus / ReviewCard,
-│                               # AssetPackReference, publish_asset_pack, subscribe_asset_pack
+├── kchat.rs                    # KChatArtifact (incl. AssetPack variant), ArtifactCard, KChatPublisher
+│                               # trait, InMemoryPublisher (tests), ReviewComment / ApprovalStatus /
+│                               # ReviewCard, AssetPackReference + AssetPackManifest::artifact_card
 ├── kchat_sync.rs               # One-way comment sync (KChat thread → audit trail) with dedup by
 │                               # (thread_id, timestamp, commenter) so re-imports are no-ops
 └── kchat_config.rs             # Local-first config (enabled: bool, default_thread_id: Option<String>);
-                                # `KChatIntegration` gates every operation on `enabled`
+                                # `KChatIntegration` gates every operation on `enabled`. Its
+                                # `publish_asset_pack` routes the manifest *through* the transport as
+                                # an asset-pack ArtifactCard and returns `AssetPackPublishOutcome`
+                                # (reference + PublishResult).
 ```
 
 ```

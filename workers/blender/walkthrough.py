@@ -313,6 +313,8 @@ def stitch_frames(
       environmental fall-backs.
     """
 
+    import fnmatch
+    import re
     import shutil
     import subprocess
 
@@ -322,14 +324,30 @@ def stitch_frames(
     if fps <= 0:
         raise ValueError(f"fps must be positive (got {fps})")
 
-    # Discover how many frames exist so we can report it in the result.
+    # Count only files that *actually match* `frame_pattern`. FFmpeg's
+    # `-i frame_%05d.png` only ingests files matching that printf
+    # pattern, so counting unrelated images (thumbnails, leftover
+    # reference frames, frames from a previous run with a different
+    # pattern) is misleading on two fronts:
+    #
+    # 1. We could pass the `frame_count == 0` guard when nothing
+    #    actually matches the pattern, leaving the user with a cryptic
+    #    FFmpeg "No such file or directory" instead of a clear caller
+    #    error.
+    # 2. When FFmpeg is absent we return `frame_count` in the
+    #    image-sequence fall-back; reporting a count that includes
+    #    non-frame files would inflate the result and confuse the Rust
+    #    side that maps this back to `WalkthroughOutput::ImageSequence`.
+    glob_pattern = re.sub(r"%0?\d*d", "*", frame_pattern)
     frame_count = sum(
         1
         for p in out_path.iterdir()
-        if p.is_file() and p.suffix.lower() in {".png", ".jpg", ".jpeg"}
+        if p.is_file() and fnmatch.fnmatchcase(p.name, glob_pattern)
     )
     if frame_count == 0:
-        raise ValueError(f"no frames found in {out_dir}")
+        raise ValueError(
+            f"no frames matching '{frame_pattern}' found in {out_dir}"
+        )
 
     if ffmpeg_path is not None:
         # Caller pinned a specific binary. Verify it exists and is
