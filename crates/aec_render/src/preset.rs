@@ -198,6 +198,42 @@ pub fn recommend_preset(tier: HardwareTier) -> RenderQuality {
     }
 }
 
+/// Map a legacy `cycles_<quality>` preset id to its current short form.
+///
+/// Pre-2026-05 project packages serialised preset ids with the
+/// `cycles_` prefix (e.g. `cycles_standard`). The new canonical
+/// form drops the prefix to align with the TypeScript `RenderPresetKey`
+/// union and the Blender worker names. Anywhere we look up a preset id
+/// — in [`RenderPresetStore::get`] and inside the custom Deserialize
+/// hook on [`RenderPresetStore::selected`] — we route through this
+/// function so on-disk project files written by older builds keep
+/// resolving without a phantom "Standard fallback" diff appearing in
+/// the render history.
+pub fn migrate_legacy_preset_id(id: &str) -> &str {
+    match id {
+        "cycles_quick" => "quick",
+        "cycles_standard" => "standard",
+        "cycles_high" => "high",
+        "cycles_studio" => "studio",
+        "cycles_walkthrough" => "walkthrough",
+        "cycles_panorama" => "panorama",
+        "cycles_eevee_preview" => "eevee_preview",
+        other => other,
+    }
+}
+
+/// Serde adapter that rewrites a legacy `cycles_*` preset id to the
+/// canonical short form when deserialising. Lets old project packages
+/// roundtrip cleanly through the new code without surprising the user
+/// with a silent "Standard fallback" on load.
+fn deserialize_migrated_preset_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    Ok(migrate_legacy_preset_id(&raw).to_string())
+}
+
 /// Persistent registry of render presets. Holds the bundled defaults plus
 /// any user-defined custom presets. The currently selected preset is
 /// stable across save/load cycles via the [`Self::selected`] field.
@@ -210,7 +246,10 @@ pub struct RenderPresetStore {
     /// are kept in code and merged into [`Self::all`] on demand.
     pub custom: BTreeMap<String, RenderPreset>,
     /// The currently selected preset id. Always one of the bundled
-    /// preset ids or a key from [`Self::custom`].
+    /// preset ids or a key from [`Self::custom`]. Old project files
+    /// using the `cycles_*` prefix are migrated to the short form at
+    /// deserialize time via [`migrate_legacy_preset_id`].
+    #[serde(deserialize_with = "deserialize_migrated_preset_id")]
     pub selected: String,
     /// User override that pins the recommendation to a specific
     /// quality instead of using the hardware-tier derived default.
@@ -250,12 +289,15 @@ impl RenderPresetStore {
 
     /// Look up a preset by id. Bundled defaults take precedence over
     /// custom presets with the same id, so users cannot accidentally
-    /// shadow a built-in preset.
+    /// shadow a built-in preset. Legacy `cycles_*` ids are migrated to
+    /// the canonical short form before lookup so old render-history
+    /// entries (which embed the id) keep resolving after the rename.
     pub fn get(&self, id: &str) -> Option<RenderPreset> {
+        let migrated = migrate_legacy_preset_id(id);
         RenderPreset::defaults()
             .into_iter()
-            .find(|p| p.id == id)
-            .or_else(|| self.custom.get(id).cloned())
+            .find(|p| p.id == migrated)
+            .or_else(|| self.custom.get(migrated).cloned())
     }
 
     /// Resolve the currently selected preset, falling back to
@@ -422,5 +464,53 @@ mod tests {
         let original = store.selected.clone();
         assert!(!store.select("nope"));
         assert_eq!(store.selected, original);
+    }
+
+    #[test]
+    fn migrate_legacy_preset_id_maps_all_known_legacy_ids() {
+        // Every preset that ever shipped with a `cycles_` prefix must
+        // map to its current canonical short id; unknown ids pass
+        // through unchanged.
+        assert_eq!(migrate_legacy_preset_id("cycles_quick"), "quick");
+        assert_eq!(migrate_legacy_preset_id("cycles_standard"), "standard");
+        assert_eq!(migrate_legacy_preset_id("cycles_high"), "high");
+        assert_eq!(migrate_legacy_preset_id("cycles_studio"), "studio");
+        assert_eq!(migrate_legacy_preset_id("cycles_walkthrough"), "walkthrough");
+        assert_eq!(migrate_legacy_preset_id("cycles_panorama"), "panorama");
+        assert_eq!(
+            migrate_legacy_preset_id("cycles_eevee_preview"),
+            "eevee_preview"
+        );
+        // Already-canonical ids are untouched.
+        assert_eq!(migrate_legacy_preset_id("standard"), "standard");
+        // Unknown ids pass through (custom user presets, etc.).
+        assert_eq!(migrate_legacy_preset_id("custom_evening"), "custom_evening");
+    }
+
+    #[test]
+    fn store_deserializes_legacy_cycles_ids() {
+        // Mimics a project package written before the 2026-05 rename:
+        // the `selected` field uses the `cycles_` prefix. After load
+        // it must resolve to a real preset, not silently fall back to
+        // Standard, so the render history doesn't show a phantom diff.
+        let legacy_json = r#"{
+            "custom": {},
+            "selected": "cycles_high",
+            "recommendation_override": null
+        }"#;
+        let store: RenderPresetStore = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(store.selected, "high");
+        assert_eq!(store.current().id, "high");
+    }
+
+    #[test]
+    fn store_get_accepts_legacy_id_at_runtime() {
+        // Defensive: even if a legacy id reaches `get()` at runtime
+        // (e.g. from a render-history entry that bypassed deserialize
+        // migration), it must resolve to the canonical preset rather
+        // than returning None.
+        let store = RenderPresetStore::default();
+        let preset = store.get("cycles_studio").expect("legacy id resolves");
+        assert_eq!(preset.id, "studio");
     }
 }

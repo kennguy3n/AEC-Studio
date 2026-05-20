@@ -6,7 +6,7 @@
 
 import type { AecApi } from "../../../electron/preload";
 import { AI_TOOLS } from "../../../electron/ai-tools";
-import { classifyTier } from "../../../electron/bridge";
+import { classifyTier, inProcessParsedForTool } from "../../../electron/bridge";
 
 interface Recent {
   projectId: string;
@@ -174,7 +174,11 @@ export function rendererInProcessBackend(): AecApi {
       // Return a defensive copy so callers (and Vitest harnesses) can't
       // mutate the shared catalogue.
       listTools: async () => AI_TOOLS.map((t) => ({ ...t })),
-      plan: async () => ({ diffId: newId("diff") }),
+      plan: async (params: Record<string, unknown>) => {
+        const tool = typeof params.tool === "string" ? params.tool : null;
+        const parsed = inProcessParsedForTool(tool, params);
+        return { diffId: newId("diff"), parsed };
+      },
       acceptDiff: async () => ({ accepted: true }),
       rejectDiff: async () => ({ rejected: true }),
       cancelJob: async () => ({ cancelled: true }),

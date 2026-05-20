@@ -22,6 +22,21 @@ use thiserror::Error;
 
 use crate::cameras::CameraSnapshot;
 use crate::job::{RenderJob, RenderJobStatus};
+use crate::preset::migrate_legacy_preset_id;
+
+/// Serde adapter that rewrites a legacy `cycles_*` preset id to its
+/// canonical short form when deserialising a [`RenderHistoryEntry`].
+/// Without this, history entries written before the 2026-05 preset
+/// rename would silently surface as "cycles_standard" etc. and the
+/// before/after compare UI would diff "cycles_standard → standard"
+/// even though nothing actually changed.
+fn deserialize_migrated_preset_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    Ok(migrate_legacy_preset_id(&raw).to_string())
+}
 
 const HISTORY_FILE: &str = "history.json";
 
@@ -47,6 +62,9 @@ pub enum HistoryError {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RenderHistoryEntry {
     pub job_id: String,
+    /// Preset id, migrated from the legacy `cycles_*` form at
+    /// deserialize time so old `history.json` files load cleanly.
+    #[serde(deserialize_with = "deserialize_migrated_preset_id")]
     pub preset_id: String,
     pub camera: Option<CameraSnapshot>,
     pub created_at: DateTime<Utc>,

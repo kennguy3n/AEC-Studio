@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { PRESET_IDS } from "./PresetSelector";
 
 export interface BatchCameraOption {
@@ -38,6 +38,18 @@ export function BatchRenderModal({
     () => new Set([defaultPresetId]),
   );
   const [busy, setBusy] = useState(false);
+
+  // The modal is rendered as `null` when `open === false` but never
+  // unmounted by the parent, so re-opening with a different `cameras`
+  // prop would otherwise show stale checkbox state from the previous
+  // open. Re-seed the selection every time the modal opens or the
+  // caller-supplied cameras change so the visible checkboxes always
+  // match the current camera list.
+  useEffect(() => {
+    if (!open) return;
+    setSelectedCameras(new Set(cameras.map((c) => c.id)));
+    setSelectedPresets(new Set([defaultPresetId]));
+  }, [open, cameras, defaultPresetId]);
 
   const jobCount = useMemo(
     () => selectedCameras.size * selectedPresets.size,

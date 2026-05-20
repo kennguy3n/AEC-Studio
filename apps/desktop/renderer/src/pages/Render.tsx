@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { aec, RenderJob, RuntimeStatus } from "../api/aec";
 import { RenderQueue } from "../components/render/RenderQueue";
 import {
@@ -45,6 +45,12 @@ export function Render() {
   const [preset, setPreset] = useState<RenderPresetKey>("standard");
   const [lighting, setLighting] = useState<LightingPresetId>("daylight");
   const [tier, setTier] = useState<RuntimeStatus["tier"] | null>(null);
+  // Has the user made an explicit preset choice yet? If so, we never
+  // override their selection from the tier default — even if the
+  // component remounts because the user navigated away and back. Using
+  // a ref instead of state keeps the value stable across renders
+  // without re-triggering the runtime-status effect.
+  const userChosePresetRef = useRef(false);
   const [selectedCameras, setSelectedCameras] = useState<Set<string>>(
     new Set(),
   );
@@ -63,9 +69,13 @@ export function Render() {
       if (!alive) return;
       const rs = status as RuntimeStatus;
       setTier(rs.tier);
-      // Pre-select the recommended preset for the detected tier so the
-      // first render matches the machine's capabilities. Users can
-      // still pick anything they like afterwards.
+      // Pre-select the recommended preset for the detected tier on the
+      // first mount only. Once the user has picked a preset (tracked
+      // via `userChosePresetRef`), we never overwrite their choice
+      // when the runtime status reloads or the page remounts. The
+      // tier badge in `PresetSelector` continues to advertise the
+      // recommended preset so the user can switch back manually.
+      if (userChosePresetRef.current) return;
       const recommended = recommendedFor(rs.tier);
       if (recommended) setPreset(recommended);
     });
@@ -76,6 +86,7 @@ export function Render() {
 
   const changePreset = useCallback((next: RenderPresetKey) => {
     setPreset(next);
+    userChosePresetRef.current = true;
     // Persist the choice on the backend so other surfaces (queue UI,
     // diagnostics) see the active preset. The bridge stub returns
     // `{ ok: true }` in dev; the real backend persists.

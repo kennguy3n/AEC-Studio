@@ -18,6 +18,40 @@ import { AI_TOOLS, type AiTool } from "./ai-tools";
 
 export { AI_TOOLS, type AiTool };
 
+/**
+ * Response shape for the AI plan request. The `parsed` field is
+ * tool-specific structured data, used by panels that need to display
+ * proposals before the user accepts or rejects the diff. It is always
+ * a JSON-safe object so it can cross the IPC boundary; consumers cast
+ * to a narrower tool-specific type (e.g. `LayoutSuggestionParsed`).
+ */
+export interface AiPlanResponse {
+  diffId: string;
+  /** Tool-specific parsed payload. `null` when no parse was produced. */
+  parsed?: AiPlanParsed | null;
+}
+
+/** Parsed payloads for individual AI tools, tagged by `tool`. */
+export type AiPlanParsed =
+  | LayoutSuggestionParsed
+  | { tool: string; [key: string]: unknown };
+
+/**
+ * Mirrors Rust `LayoutSuggestionResult` in
+ * `crates/aec_ai/src/layout_suggestion.rs`. Field names use snake_case
+ * to match the on-wire JSON the Rust side produces.
+ */
+export interface LayoutSuggestionParsed {
+  tool: "layout_suggestion";
+  room_anchor: string;
+  proposals: Array<{
+    asset_id?: string | null;
+    target_entity?: string | null;
+    position_mm: [number, number, number];
+    rotation_deg: number;
+  }>;
+}
+
 export interface BridgeBackend {
   projectCreateFromTemplate(templateKey: string, projectName: string): Promise<ProjectSummary>;
   projectOpen(projectPath: string): Promise<ProjectSummary>;
@@ -82,7 +116,15 @@ export interface BridgeBackend {
   }>;
 
   aiListTools(): Promise<AiTool[]>;
-  aiPlan(params: Record<string, unknown>): Promise<{ diffId: string }>;
+  /**
+   * Submit an AI tool request and receive both a diff id (for accept /
+   * reject) and an optional `parsed` payload — the structured
+   * tool-specific response that the renderer needs to display
+   * proposals before the user accepts. The shape of `parsed` is
+   * tool-dependent and mirrors the corresponding Rust result type
+   * (e.g. `LayoutSuggestionResult` for `tool = "layout_suggestion"`).
+   */
+  aiPlan(params: Record<string, unknown>): Promise<AiPlanResponse>;
   aiAcceptDiff(diffId: string): Promise<{ accepted: true }>;
   aiRejectDiff(diffId: string): Promise<{ rejected: true }>;
   aiCancelJob(jobId: string): Promise<{ cancelled: true }>;
@@ -255,10 +297,13 @@ export const NATIVE_FALLBACK_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   "bimValidate",
   "bimDiff",
   "renderEnqueue",
+  "renderEnqueueBatch",
+  "renderBatchProgress",
   "renderListJobs",
   "renderCancelJob",
   "renderApplyPreset",
   "renderDiagnose",
+  "renderCheckMaterials",
   "aiListTools",
   "aiPlan",
   "aiAcceptDiff",
@@ -565,8 +610,17 @@ export function inProcessBackend(): BridgeBackend {
       // backend (see `rendererInProcessBackend.ai.listTools`).
       return AI_TOOLS.map((t) => ({ ...t }));
     },
-    async aiPlan(_p) {
-      return { diffId: id("diff") };
+    async aiPlan(params) {
+      // Pick a realistic parsed payload based on the requested tool so
+      // the renderer's AI panels can display proposals end-to-end
+      // before the native sidecar lands. The shapes intentionally
+      // match the Rust result types in `crates/aec_ai/src/` so the
+      // renderer never has to branch on "native vs in-process".
+      const parsed = inProcessParsedForTool(
+        typeof params.tool === "string" ? params.tool : null,
+        params,
+      );
+      return { diffId: id("diff"), parsed };
     },
     async aiAcceptDiff(_d) {
       return { accepted: true };
@@ -601,6 +655,56 @@ export function inProcessBackend(): BridgeBackend {
       return inProcessRuntimeStatus();
     },
   };
+}
+
+/**
+ * Pick a realistic structured `parsed` payload for an AI plan request,
+ * matching the shape of the Rust result types. The native bridge will
+ * eventually return the real sidecar output here; until then this
+ * fixture lets the renderer exercise the full Propose → Review → Apply
+ * flow end-to-end in dev / vitest without a sidecar.
+ *
+ * Returns `null` when the tool has no client-visible parsed payload
+ * (everything goes through diff acceptance instead).
+ */
+export function inProcessParsedForTool(
+  tool: string | null,
+  params: Record<string, unknown>,
+): AiPlanParsed | null {
+  if (tool === "layout_suggestion") {
+    const ctx = (params.context ?? {}) as Record<string, unknown>;
+    const roomAnchor =
+      typeof ctx.room_anchor === "string" ? ctx.room_anchor : "room.unknown";
+    // A small but realistic 3-proposal layout: a sofa, a side chair
+    // facing it, and a coffee table between them. Coordinates are in
+    // millimetres relative to the room anchor's origin, matching the
+    // Rust `LayoutProposal::position_mm` contract.
+    return {
+      tool: "layout_suggestion",
+      room_anchor: roomAnchor,
+      proposals: [
+        {
+          asset_id: "ikea.sofa_kivik_3s",
+          target_entity: null,
+          position_mm: [1200, 0, 600],
+          rotation_deg: 0,
+        },
+        {
+          asset_id: "muuto.armchair_outline",
+          target_entity: null,
+          position_mm: [-1100, 0, 800],
+          rotation_deg: 90,
+        },
+        {
+          asset_id: "vendor.coffee_table_round",
+          target_entity: null,
+          position_mm: [0, 0, 700],
+          rotation_deg: 0,
+        },
+      ],
+    };
+  }
+  return null;
 }
 
 function inProcessRuntimeStatus(): RuntimeStatus {

@@ -138,6 +138,13 @@ export function LayoutSuggestionsPanel({
  * Helper that runs `aec.ai.plan` for the `layout_suggestion` tool. Kept
  * here (rather than in the panel) so tests can render the component
  * without going through IPC.
+ *
+ * Returns the proposals from the `parsed` payload that the bridge
+ * attaches alongside the `diffId` — the bridge's `AiPlanResponse`
+ * mirrors the Rust `LayoutSuggestionResult` shape for the
+ * `layout_suggestion` tool. When the parsed payload is absent (e.g. a
+ * native backend that hasn't been wired yet) we return an empty array
+ * so the panel renders its "no proposals" state instead of crashing.
  */
 export async function suggestLayout(
   roomAnchor: string,
@@ -149,16 +156,21 @@ export async function suggestLayout(
     context: { room_anchor: roomAnchor },
     max_entities_modified: 16,
   })) as {
+    diffId: string;
     parsed?: {
+      tool?: string;
+      room_anchor?: string;
       proposals?: Array<{
-        asset_id?: string;
-        target_entity?: string;
+        asset_id?: string | null;
+        target_entity?: string | null;
         position_mm: [number, number, number];
         rotation_deg: number;
       }>;
-    };
+    } | null;
   };
-  const rows = response.parsed?.proposals ?? [];
+  const parsed = response.parsed ?? null;
+  if (!parsed || parsed.tool !== "layout_suggestion") return [];
+  const rows = parsed.proposals ?? [];
   return rows.map((r) => ({
     assetId: r.asset_id ?? null,
     targetEntity: r.target_entity ?? null,

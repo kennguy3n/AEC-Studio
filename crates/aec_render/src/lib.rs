@@ -37,8 +37,8 @@ pub use lighting::{
     WorkerLight, WorkerWorld,
 };
 pub use preset::{
-    recommend_preset, PresetError, RenderPreset, RenderPresetConfig, RenderPresetStore,
-    RenderQuality,
+    migrate_legacy_preset_id, recommend_preset, PresetError, RenderPreset, RenderPresetConfig,
+    RenderPresetStore, RenderQuality,
 };
 pub use queue::{QueueError, RenderQueue};
 pub use scene::{RenderCamera, RenderLight, RenderScene, SerializedMesh};

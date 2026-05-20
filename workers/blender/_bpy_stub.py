@@ -137,13 +137,28 @@ class _Scene:
         self.frame_current = 1
 
 
+class _ImageFormatSettings:
+    """Mirrors Blender's `bpy.types.ImageFormatSettings`.
+
+    The real Blender API exposes this as a *sub-object* on
+    `scene.render.image_settings`, not as a flat attribute on
+    `scene.render` — workers must set `scene.render.image_settings.file_format`.
+    Modelling it correctly here is what lets the unit tests catch the
+    "stale flat attribute" mistake the previous stub silently allowed.
+    """
+
+    file_format: str = "PNG"
+
+
 class _Render:
     engine: str = "BLENDER_EEVEE"
     resolution_x: int = 1920
     resolution_y: int = 1080
     resolution_percentage: int = 100
     filepath: str = "/tmp/render.png"
-    image_settings_file_format: str = "PNG"
+
+    def __init__(self) -> None:
+        self.image_settings = _ImageFormatSettings()
 
 
 class _Cycles:

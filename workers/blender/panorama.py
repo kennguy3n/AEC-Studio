@@ -59,7 +59,7 @@ def render_panorama(
     scene.render.resolution_y = int(resolution_y)
     scene.render.resolution_percentage = 100
     scene.render.filepath = str(out_path)
-    scene.render.image_settings_file_format = output_format.upper()
+    scene.render.image_settings.file_format = output_format.upper()
 
     # 2. Cycles config — panorama renders need a lot of samples to avoid
     # fireflies because every direction contributes.

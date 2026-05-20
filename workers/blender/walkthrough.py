@@ -65,7 +65,7 @@ def render_walkthrough(
     scene.render.resolution_x = int(resolution_x)
     scene.render.resolution_y = int(resolution_y)
     scene.render.resolution_percentage = 100
-    scene.render.image_settings_file_format = "PNG"
+    scene.render.image_settings.file_format = "PNG"
     scene.cycles.samples = int(samples)
     scene.cycles.use_denoising = bool(denoise)
     scene.cycles.denoiser = "OPENIMAGEDENOISE"
