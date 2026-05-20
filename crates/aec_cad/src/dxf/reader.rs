@@ -56,6 +56,12 @@ fn parse(groups: &[Group]) -> CadResult<DxfDocument> {
     let mut doc = DxfDocument::new();
     // Clear the auto-added "0" so we can re-insert it from the file if present.
     doc.layers = LayerSystem::default();
+    // The constructor seeds a default STANDARD dim style for new
+    // documents. When parsing an existing DXF the dim-style table is
+    // the source of truth, so drop the seed and re-populate from the
+    // file. Without this the roundtrip would silently grow STANDARD on
+    // every read.
+    doc.dim_styles.clear();
     let mut i = 0;
     while i < groups.len() {
         if groups[i].code == 0 && groups[i].value == "SECTION" {
@@ -470,7 +476,14 @@ fn build_entity(
                     text.clone_from(val);
                 }
             }
-            2 => block_name.clone_from(val),
+            2 => {
+                if kind == "HATCH" {
+                    // DXF spec: code 2 is the hatch pattern name.
+                    hatch_pattern.clone_from(val);
+                } else {
+                    block_name.clone_from(val);
+                }
+            }
             _ => {}
         }
     }

@@ -56,10 +56,13 @@ dependencies = [
 name = "aec_bim"
 version = "0.1.0"
 dependencies = [
+ "aec_ai",
  "aec_cad",
  "aec_core",
+ "aec_export",
+ "aec_render",
  "blake3",
- "rust_xlsxwriter 0.71.0",
+ "rust_xlsxwriter",
  "serde",
  "serde_json",
  "tempfile",
@@ -97,6 +100,7 @@ dependencies = [
  "bitflags 2.11.1",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
 ]
 
@@ -104,7 +108,14 @@ dependencies = [
 name = "aec_command"
 version = "0.1.0"
 dependencies = [
+ "aec_ai",
+ "aec_audit",
+ "aec_bim",
+ "aec_cad",
  "aec_core",
+ "aec_export",
+ "aec_materials",
+ "aec_render",
  "blake3",
  "chrono",
  "serde",
@@ -142,7 +153,7 @@ dependencies = [
  "chrono",
  "hex",
  "printpdf",
- "rust_xlsxwriter 0.77.0",
+ "rust_xlsxwriter",
  "serde",
  "serde_json",
  "tempfile",
@@ -1764,16 +1775,6 @@ dependencies = [
  "hashlink",
  "libsqlite3-sys",
  "smallvec",
-]
-
-[[package]]
-name = "rust_xlsxwriter"
-version = "0.71.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16505ad28ecaf73f4c169614333c0519d4549675f158c9e886eb045c4dfde6c5"
-dependencies = [
- "regex",
- "zip",
 ]
 
 [[package]]

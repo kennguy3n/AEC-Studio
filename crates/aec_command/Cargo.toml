@@ -16,6 +16,13 @@ thiserror = { workspace = true }
 blake3 = { workspace = true }
 
 [dev-dependencies]
+aec_ai = { path = "../aec_ai" }
+aec_audit = { path = "../aec_audit" }
+aec_bim = { path = "../aec_bim" }
+aec_cad = { path = "../aec_cad" }
+aec_export = { path = "../aec_export" }
+aec_materials = { path = "../aec_materials" }
+aec_render = { path = "../aec_render" }
 tempfile = { workspace = true }
 
 [lints]
