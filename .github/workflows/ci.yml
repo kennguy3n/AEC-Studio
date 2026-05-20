@@ -54,7 +54,11 @@ jobs:
           if [ "$EVENT_NAME" = "push" ]; then
             os="$full"
             is_full="true"
-          elif echo "$PR_LABELS" | grep -q 'test-all-platforms'; then
+          # `$PR_LABELS` is the JSON-encoded array of label names
+          # (e.g. `["test-all-platforms","needs-review"]`), so we
+          # match the *quoted* form to avoid substring false
+          # positives like `no-test-all-platforms-please`.
+          elif echo "$PR_LABELS" | grep -qF '"test-all-platforms"'; then
             os="$full"
             is_full="true"
           else
