@@ -615,11 +615,7 @@ impl IesProfile {
 
     /// Peak candela value across the entire distribution.
     pub fn peak_candela(&self) -> f32 {
-        self.candela
-            .iter()
-            .copied()
-            .fold(0.0_f32, f32::max)
-            * self.candela_multiplier
+        self.candela.iter().copied().fold(0.0_f32, f32::max) * self.candela_multiplier
     }
 }
 

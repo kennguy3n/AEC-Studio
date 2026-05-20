@@ -210,9 +210,7 @@ mod tests {
 
     #[test]
     fn path_search_picks_blender_when_known_paths_miss() {
-        let exists: HashSet<PathBuf> = [PathBuf::from("/opt/extra/blender")]
-            .into_iter()
-            .collect();
+        let exists: HashSet<PathBuf> = [PathBuf::from("/opt/extra/blender")].into_iter().collect();
         let d = discover_blender_with(
             None,
             None,

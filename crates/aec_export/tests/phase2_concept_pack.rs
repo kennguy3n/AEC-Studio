@@ -24,6 +24,7 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
+use aec_export::boq::QuantityUnit;
 use aec_export::{
     bim_pack::{BimPack, ValidationReport, ValidationReportKind},
     contractor_pack::{ContractorPack, PackFile},
@@ -31,7 +32,6 @@ use aec_export::{
     BoqExport, BoqLine, ProposalAssets, ProposalBranding, ProposalPack, RegionalConfig,
     RenderAttachment, ScheduleSheet,
 };
-use aec_export::boq::QuantityUnit;
 
 fn write_fake_png(dir: &std::path::Path, name: &str) -> PathBuf {
     // A real 1×1 PNG so the pack's hashing path runs against
@@ -106,7 +106,10 @@ fn full_concept_pack_produces_valid_pdf_and_zips() {
         .to_pdf(&pdf_path)
         .expect("proposal PDF must build with renders + cover paragraph");
     let bytes = fs::read(written).unwrap();
-    assert!(bytes.starts_with(b"%PDF"), "proposal PDF must start with %PDF");
+    assert!(
+        bytes.starts_with(b"%PDF"),
+        "proposal PDF must start with %PDF"
+    );
     assert!(
         bytes.len() > 4096,
         "proposal with 4 renders + 2 schedules + cover should be > 4 KiB; got {}",

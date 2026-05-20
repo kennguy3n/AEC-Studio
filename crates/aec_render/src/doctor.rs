@@ -421,7 +421,12 @@ mod tests {
         let mut m = mat("mat:oak");
         m.metallic = 1.4;
         let scene = scene_with(&["mat:oak"]);
-        let result = check_materials(&scene, &[m], &std::collections::BTreeSet::new(), &CheckMaterialsOptions::default());
+        let result = check_materials(
+            &scene,
+            &[m],
+            &std::collections::BTreeSet::new(),
+            &CheckMaterialsOptions::default(),
+        );
         assert!(result
             .findings
             .iter()
@@ -473,7 +478,12 @@ mod tests {
     #[test]
     fn material_referenced_but_missing_from_library_is_flagged() {
         let scene = scene_with(&["mat:ghost"]);
-        let result = check_materials(&scene, &[], &std::collections::BTreeSet::new(), &CheckMaterialsOptions::default());
+        let result = check_materials(
+            &scene,
+            &[],
+            &std::collections::BTreeSet::new(),
+            &CheckMaterialsOptions::default(),
+        );
         assert_eq!(result.findings.len(), 1);
         assert_eq!(result.findings[0].material_id(), "mat:ghost");
         assert!(matches!(

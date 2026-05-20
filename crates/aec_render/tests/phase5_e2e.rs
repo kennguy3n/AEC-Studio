@@ -159,7 +159,10 @@ fn render_history_surfaces_before_after_compare() {
     assert_eq!(history.len(), 2);
 
     let cmp = compare(&entry_a, &entry_b);
-    assert!(cmp.camera_changed, "compare must flag camera change: {cmp:?}");
+    assert!(
+        cmp.camera_changed,
+        "compare must flag camera change: {cmp:?}"
+    );
     assert!(
         cmp.image_hash_changed,
         "compare must flag image hash change: {cmp:?}"

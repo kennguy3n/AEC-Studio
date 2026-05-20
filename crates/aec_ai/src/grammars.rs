@@ -249,11 +249,7 @@ impl GrammarRegistry {
             gbnf: COVER_PAGE_DRAFT_GBNF.into(),
             example: r#"{"title":"Loft 12B","subtitle":"A warm home for a family of three","paragraph":"A sun-drenched apartment that pairs open-plan living with intimate corners for slow weekends.","tone":"warm"}"#.into(),
         });
-        for key in [
-            "cad_cleanup",
-            "schedule_fill",
-            "validation_help",
-        ] {
+        for key in ["cad_cleanup", "schedule_fill", "validation_help"] {
             r.insert(Grammar {
                 key: key.into(),
                 gbnf: format!(

@@ -47,10 +47,7 @@ fn apartment_template_drives_walls_rooms_and_cameras_through_engine() {
     let tpl = loader
         .load("interior.apartment")
         .expect("interior.apartment template must load");
-    assert!(
-        !tpl.rooms.is_empty(),
-        "apartment template ships with rooms"
-    );
+    assert!(!tpl.rooms.is_empty(), "apartment template ships with rooms");
     assert!(
         !tpl.camera_presets.is_empty(),
         "apartment template ships with camera presets"

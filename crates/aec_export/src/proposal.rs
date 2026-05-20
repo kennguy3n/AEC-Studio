@@ -264,8 +264,7 @@ mod tests {
         let mut with_cover = ProposalPack::new("Loft 12B", "Eva K.");
         with_cover.assets.mood_board.push("warm woods".into());
         with_cover.assets.cover_paragraph = Some(
-            "A warm, sun-drenched home built around natural materials and an open plan."
-                .repeat(4),
+            "A warm, sun-drenched home built around natural materials and an open plan.".repeat(4),
         );
         let cover_path = with_cover.to_pdf(dir.path().join("cover.pdf")).unwrap();
         let cover_size = std::fs::metadata(&cover_path).unwrap().len();

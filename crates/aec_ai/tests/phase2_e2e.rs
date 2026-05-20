@@ -70,7 +70,9 @@ fn plan_detection_diff_produces_wall_inserts_and_is_auditable() {
         scope: Scope::Design,
         status: DiffStatus::Accepted,
         diff_id: diff.id.to_string(),
-        payload_hash: blake3::hash(payload.to_string().as_bytes()).to_hex().to_string(),
+        payload_hash: blake3::hash(payload.to_string().as_bytes())
+            .to_hex()
+            .to_string(),
         ts: chrono::Utc::now(),
     };
     let entry = logger.append(record).unwrap();
@@ -96,8 +98,7 @@ fn style_assistant_diff_emits_furniture_material_and_lighting() {
     let diff = DiffEngine::build(&plan);
     // 2 furniture + 1 material + 1 lighting preset = 4 ops, all Inserts.
     assert_eq!(diff.operations.len(), 4);
-    let mut kinds: std::collections::BTreeMap<&str, usize> =
-        std::collections::BTreeMap::new();
+    let mut kinds: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
     for op in &diff.operations {
         match op {
             DiffOperation::Insert { entity_kind, .. } => {
@@ -140,10 +141,10 @@ fn layout_suggestion_diff_carries_proposals() {
     // Layout suggestion can be either Insert (new furniture) or
     // Update (repositioning existing furniture); the contract is
     // that both kinds are allowed and at least one is present.
-    assert!(diff
-        .operations
-        .iter()
-        .all(|op| matches!(op, DiffOperation::Insert { .. } | DiffOperation::Update { .. })));
+    assert!(diff.operations.iter().all(|op| matches!(
+        op,
+        DiffOperation::Insert { .. } | DiffOperation::Update { .. }
+    )));
 }
 
 #[test]
