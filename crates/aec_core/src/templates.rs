@@ -204,10 +204,7 @@ impl TemplateLoader {
         self.load(key)
     }
 
-    fn load_extension_template(
-        ext: &LoadedExtension,
-        key: &str,
-    ) -> AecResult<TemplateDefinition> {
+    fn load_extension_template(ext: &LoadedExtension, key: &str) -> AecResult<TemplateDefinition> {
         let Some(body) = ext.manifest.template.as_ref() else {
             return Err(AecError::TemplateNotFound(key.to_string()));
         };
