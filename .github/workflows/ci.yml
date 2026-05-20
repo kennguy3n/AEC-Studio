@@ -21,9 +21,24 @@ on:
 # same PR. Push events on `main` are intentionally NOT cancelled
 # — every commit on `main` must produce a CI result for the
 # `package-*` gate and release traceability.
+#
+# `cancel-in-progress` is further gated on the *kind* of new event:
+# only `synchronize` / `opened` / `reopened` (the default PR
+# actions) and a `labeled`/`unlabeled` on the scope-changing
+# `test-all-platforms` label may supersede an in-progress run.
+# An unrelated label triage event (e.g. adding `needs-review`)
+# must NOT cancel a legitimate run — the gate job's own `if:`
+# predicate skips the replacement run for unrelated labels, so an
+# unconditional cancel would leave the PR with zero CI results
+# until the next push.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: >-
+    ${{ github.event_name == 'pull_request'
+        && (
+          (github.event.action != 'labeled' && github.event.action != 'unlabeled')
+          || github.event.label.name == 'test-all-platforms'
+        ) }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -62,13 +77,17 @@ jobs:
     # `unlabeled` event on a label that doesn't change CI scope.
     # `test-all-platforms` flips the matrix; any other label
     # (e.g. `needs-review`, `priority-high`) must not burn runner
-    # minutes or cancel an in-progress legitimate run. The first
-    # half of the predicate keeps the default `opened`,
-    # `synchronize`, `reopened`, and all `push` events flowing.
+    # minutes (the concurrency block above also prevents the
+    # replacement run from cancelling an in-progress legitimate
+    # run for the same unrelated label event). The first conjunct
+    # keeps the default `opened`, `synchronize`, `reopened`, and
+    # all `push` events flowing. Explicit parens make the
+    # operator precedence (`&&` binds tighter than `||`) visible
+    # without having to remember the GitHub Actions expression
+    # grammar.
     if: >-
-      github.event.action != 'labeled' &&
-      github.event.action != 'unlabeled' ||
-      github.event.label.name == 'test-all-platforms'
+      (github.event.action != 'labeled' && github.event.action != 'unlabeled')
+      || github.event.label.name == 'test-all-platforms'
     outputs:
       os_matrix: ${{ steps.matrix.outputs.os_matrix }}
     steps:
