@@ -341,6 +341,10 @@ AEC Studio's UI follows the **KChat design system** — primary accent `#7C3AED`
 
 ## Changelog
 
+### 2026-05-20 (CI gating — Ubuntu-only PR baseline, full matrix on `main`)
+
+- **CI workflow gating.** `.github/workflows/ci.yml` now drives the `rust` and `typescript` job matrices off a small `gate` job that computes the OS list at run time. Default policy: PRs run an **Ubuntu-only** baseline (Rust + TypeScript + Python workers) so platform-specific runner flakes (e.g. occasional Electron CDN 404s on `macos-latest` during `npm ci`) can never block a PR that didn't touch platform code; the **full `ubuntu-latest` + `macos-latest` + `windows-latest` matrix** runs unconditionally on every push to `main`, which is the merge gate for the next release. Opt-in label `test-all-platforms` flips a PR into the full matrix when a contributor intentionally touches Electron, packaging configs, or OS-specific Rust code. Documented in `CONTRIBUTING.md` ("Pass CI" section) so the policy is discoverable from the contributor flow rather than buried in workflow YAML.
+
 ### 2026-05-20 (Phase 8 — extension system)
 
 - **Extension system foundation.** New `crates/aec_core/src/extensions.rs` implementing the PROPOSAL.md §8 manifest schema end-to-end: `ExtensionManifest` with six type-specific bodies (`AssetPackBody`, `TemplateBody`, `ScheduleBody`, `ExportTargetBody`, `AiToolBody`, `ImporterBody`), `ExtensionLoader` that scans `extensions/<id>/manifest.json`, `ExtensionRegistry` indexed by id + kind with `find_template` / `find_schedule` / `find_export_target` / `find_ai_tool` accessors, and `canonical_payload_bytes` returning byte-stable JSON for signing.

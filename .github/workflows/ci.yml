@@ -12,13 +12,67 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
+  # ---------------------------------------------------------------
+  # gate: compute which OS matrix the rust/typescript jobs should
+  # run on for this trigger.
+  #
+  # Defaults:
+  #   * push to main           → full matrix (ubuntu + macos + windows)
+  #   * PR with label
+  #     `test-all-platforms`   → full matrix
+  #   * any other PR           → ubuntu only
+  #
+  # Rationale: platform-specific CI (especially the Electron-install
+  # path on macOS-arm64 and Windows) is occasionally flaky for
+  # reasons unrelated to the PR's diff (npm registry / electron CDN
+  # 404s, runner image regressions, etc.). For PRs that don't touch
+  # platform-specific code (Rust-only, docs-only, etc.) we run a
+  # fast and stable baseline — Ubuntu Rust + Ubuntu TypeScript +
+  # Python workers — and gate the full cross-platform sweep on the
+  # merge to main, where any real platform regression is caught
+  # before it can affect a release.
+  #
+  # To opt a PR into the full matrix (e.g. when you intentionally
+  # touch Electron / packaging / OS-specific Rust code), add the
+  # `test-all-platforms` label to the PR.
+  # ---------------------------------------------------------------
+  gate:
+    name: Gate (compute OS matrix)
+    runs-on: ubuntu-latest
+    outputs:
+      os_matrix: ${{ steps.matrix.outputs.os_matrix }}
+      full_matrix: ${{ steps.matrix.outputs.full_matrix }}
+    steps:
+      - id: matrix
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          set -euo pipefail
+          full='["ubuntu-latest","macos-latest","windows-latest"]'
+          stable='["ubuntu-latest"]'
+          if [ "$EVENT_NAME" = "push" ]; then
+            os="$full"
+            is_full="true"
+          elif echo "$PR_LABELS" | grep -q 'test-all-platforms'; then
+            os="$full"
+            is_full="true"
+          else
+            os="$stable"
+            is_full="false"
+          fi
+          echo "Computed os_matrix=$os (full=$is_full)"
+          echo "os_matrix=$os" >> "$GITHUB_OUTPUT"
+          echo "full_matrix=$is_full" >> "$GITHUB_OUTPUT"
+
   rust:
     name: Rust (${{ matrix.os }})
+    needs: gate
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: ${{ fromJSON(needs.gate.outputs.os_matrix) }}
     steps:
       - uses: actions/checkout@v4
 
@@ -49,11 +103,12 @@ jobs:
 
   typescript:
     name: TypeScript (${{ matrix.os }})
+    needs: gate
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: ${{ fromJSON(needs.gate.outputs.os_matrix) }}
     steps:
       - uses: actions/checkout@v4
 
