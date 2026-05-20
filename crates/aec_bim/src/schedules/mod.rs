@@ -6,10 +6,15 @@
 //! XLSX via [`ScheduleSheet::write_xlsx`].
 
 pub mod door_schedule;
+pub mod extension_host;
 pub mod material_schedule;
 pub mod room_schedule;
 pub mod window_schedule;
 pub mod xlsx;
+
+pub use extension_host::{
+    build_all_extension_schedules, build_extension_schedule, ScheduleExtensionError,
+};
 
 pub use door_schedule::{generate_door_schedule, DoorScheduleEntry};
 pub use material_schedule::{generate_material_schedule, MaterialScheduleEntry};

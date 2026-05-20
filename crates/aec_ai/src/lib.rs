@@ -11,6 +11,7 @@ pub mod bim_classification;
 pub mod cad_cleanup;
 pub mod cover_draft;
 pub mod diff_engine;
+pub mod extension_tools;
 pub mod grammars;
 pub mod layout_suggestion;
 pub mod lighting_balance;

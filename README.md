@@ -287,6 +287,7 @@ AGPL-3.0 — see [LICENSE](LICENSE).
 - [ARCHITECTURE.md](ARCHITECTURE.md) — technical architecture
 - [PROGRESS.md](PROGRESS.md) — phased delivery tracker
 - [PHASES.md](PHASES.md) — top-line phase status
+- [EXTENSIONS.md](EXTENSIONS.md) — extension system: manifest schema, permissions, signatures
 - [CONTRIBUTING.md](CONTRIBUTING.md) — contribution guide
 - [SECURITY.md](SECURITY.md) — security policy
 - [docs/LICENSE_ARCHITECTURE.md](docs/LICENSE_ARCHITECTURE.md) — AGPL boundary analysis (Blender / IfcOpenShell / Cycles / llama.cpp)
