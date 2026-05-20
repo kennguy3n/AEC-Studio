@@ -31,8 +31,24 @@ on:
 # predicate skips the replacement run for unrelated labels, so an
 # unconditional cancel would leave the PR with zero CI results
 # until the next push.
+#
+# The concurrency `group` key intentionally uses `github.sha` on
+# push events and `github.ref` on PR events. PR events still
+# share a per-branch group so a `synchronize` run supersedes the
+# previous one for the same PR. Push events, on the other hand,
+# need a per-SHA group: GitHub Actions cancels any *pending*
+# (queued) run in the same group when a third run arrives, even
+# with `cancel-in-progress: false` (`false` only protects the
+# *running* workflow). Without per-SHA isolation, a burst of
+# rapid merges to `main` (or a merge queue) would drop the CI
+# results for intermediate commits, violating the
+# "every commit on `main` must produce a CI result for the
+# `package-*` gate and release traceability" invariant.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: >-
+    ci-${{ github.workflow }}-${{
+      github.event_name == 'push' && github.sha || github.ref
+    }}
   cancel-in-progress: >-
     ${{ github.event_name == 'pull_request'
         && (
