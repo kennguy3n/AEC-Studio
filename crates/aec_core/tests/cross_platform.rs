@@ -79,7 +79,10 @@ fn blake3_audit_hash_is_deterministic_per_payload() {
     let mut b = blake3::Hasher::new();
     b.update(b"command:create_wall");
     b.update(b"\x01\x02\x03\x04");
-    assert_eq!(a.finalize().to_hex().to_string(), b.finalize().to_hex().to_string());
+    assert_eq!(
+        a.finalize().to_hex().to_string(),
+        b.finalize().to_hex().to_string()
+    );
 }
 
 #[test]
@@ -100,5 +103,5 @@ fn path_separators_round_trip_through_pathbuf() {
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
         .collect();
     assert_eq!(comps, vec!["a", "b", "c.json"]);
-    assert!(s.contains("a") && s.contains("b") && s.contains("c.json"));
+    assert!(s.contains('a') && s.contains('b') && s.contains("c.json"));
 }

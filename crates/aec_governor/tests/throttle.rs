@@ -113,11 +113,17 @@ fn background_ai_is_paused_while_render_runs_on_low_tier() {
     let mut sched = GovernorScheduler::new(policy);
     sched.set_available_ram_mb(64 * 1024);
 
-    assert!(sched.admit_ai().admitted, "AI is admitted when no render is running");
+    assert!(
+        sched.admit_ai().admitted,
+        "AI is admitted when no render is running"
+    );
 
     sched.commit_render_start();
     let denied = sched.admit_ai();
-    assert!(!denied.admitted, "AI must be denied while a render is running");
+    assert!(
+        !denied.admitted,
+        "AI must be denied while a render is running"
+    );
     assert_eq!(denied.backoff_reason, Some(BackoffReason::ConcurrencyLimit));
 
     sched.commit_render_end();

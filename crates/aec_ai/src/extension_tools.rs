@@ -71,10 +71,12 @@ pub fn resolve_extension_ai_tool(
     };
     let mut scopes = Vec::with_capacity(body.allowed_scopes.len());
     for raw in &body.allowed_scopes {
-        scopes.push(parse_scope(raw).ok_or_else(|| ExtensionAiToolError::UnknownScope {
-            ext: ext.manifest.id.0.clone(),
-            scope: raw.clone(),
-        })?);
+        scopes.push(
+            parse_scope(raw).ok_or_else(|| ExtensionAiToolError::UnknownScope {
+                ext: ext.manifest.id.0.clone(),
+                scope: raw.clone(),
+            })?,
+        );
     }
     Ok(ExtensionAiToolSchema {
         tool_id: body.tool_id.clone(),

@@ -199,13 +199,12 @@ impl TemplateLoader {
         key: &str,
     ) -> AecResult<TemplateDefinition> {
         if let Some(ext) = registry.find_template(key) {
-            return self.load_extension_template(ext, key);
+            return Self::load_extension_template(ext, key);
         }
         self.load(key)
     }
 
     fn load_extension_template(
-        &self,
         ext: &LoadedExtension,
         key: &str,
     ) -> AecResult<TemplateDefinition> {
@@ -216,7 +215,8 @@ impl TemplateLoader {
         if !path.is_file() {
             return Err(AecError::InvalidTemplate(format!(
                 "extension {} template file {} not found",
-                ext.manifest.id, path.display()
+                ext.manifest.id,
+                path.display()
             )));
         }
         let raw = fs::read_to_string(&path)?;
@@ -240,10 +240,7 @@ impl TemplateLoader {
 
     /// Discover keys from both on-disk templates and extension manifests.
     /// Extension keys win on conflict.
-    pub fn discover_with_extensions(
-        &self,
-        registry: &ExtensionRegistry,
-    ) -> AecResult<Vec<String>> {
+    pub fn discover_with_extensions(&self, registry: &ExtensionRegistry) -> AecResult<Vec<String>> {
         let mut keys: std::collections::BTreeSet<String> = self.discover()?.into_iter().collect();
         for ext in registry.by_kind(ExtensionType::Template) {
             if let Some(body) = ext.manifest.template.as_ref() {

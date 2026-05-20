@@ -192,8 +192,6 @@ fn estimate_triangles(bytes: &[u8]) -> u32 {
     (bytes.len().div_ceil(96)).min(u32::MAX as usize) as u32
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;

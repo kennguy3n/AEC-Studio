@@ -663,13 +663,8 @@ impl ExtensionRegistry {
     /// extensions collide on a key. Hosts that need conflict
     /// detection can iterate `by_kind` themselves.
     pub fn find_template(&self, key: &str) -> Option<&LoadedExtension> {
-        self.by_kind(ExtensionType::Template).find(|e| {
-            e.manifest
-                .template
-                .as_ref()
-                .map(|b| b.key == key)
-                .unwrap_or(false)
-        })
+        self.by_kind(ExtensionType::Template)
+            .find(|e| e.manifest.template.as_ref().is_some_and(|b| b.key == key))
     }
 
     /// Look up a `Schedule` extension by id. Schedule bodies don't
@@ -685,8 +680,7 @@ impl ExtensionRegistry {
             e.manifest
                 .export_target
                 .as_ref()
-                .map(|b| b.target_id == target_id)
-                .unwrap_or(false)
+                .is_some_and(|b| b.target_id == target_id)
         })
     }
 
@@ -696,8 +690,7 @@ impl ExtensionRegistry {
             e.manifest
                 .ai_tool
                 .as_ref()
-                .map(|b| b.tool_id == tool_id)
-                .unwrap_or(false)
+                .is_some_and(|b| b.tool_id == tool_id)
         })
     }
 

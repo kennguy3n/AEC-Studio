@@ -158,7 +158,10 @@ fn ten_commands_unwind_and_replay_with_intact_audit_chain() {
     // Audit chain validation
     // ---------------------------------------------------------------
     // 1) Every envelope has a unique hash.
-    let mut hashes: Vec<String> = results.iter().map(|r| r.result.audit.hash.clone()).collect();
+    let mut hashes: Vec<String> = results
+        .iter()
+        .map(|r| r.result.audit.hash.clone())
+        .collect();
     hashes.sort();
     hashes.dedup();
     assert_eq!(
@@ -226,8 +229,10 @@ fn ten_commands_unwind_and_replay_with_intact_audit_chain() {
     // Redo emits *new* audit envelopes (the chain is append-only —
     // redo is a new event in history, not a rewind). Confirm the new
     // hashes are distinct from every prior hash.
-    let mut all_hashes: Vec<String> =
-        results.iter().map(|r| r.result.audit.hash.clone()).collect();
+    let mut all_hashes: Vec<String> = results
+        .iter()
+        .map(|r| r.result.audit.hash.clone())
+        .collect();
     all_hashes.extend(redo_results.iter().map(|r| r.audit.hash.clone()));
     let mut sorted = all_hashes.clone();
     sorted.sort();
@@ -287,5 +292,9 @@ fn ai_command_undo_reverses_the_diff_and_does_not_corrupt_audit() {
     // The wall should still exist (we only undid the paint). Reading
     // the wall after undo is the cheap way to catch a wall-delete bug
     // sneaking into PaintMaterial::revert.
-    assert_eq!(engine.graph().len(), 1, "wall must still exist after AI paint undo");
+    assert_eq!(
+        engine.graph().len(),
+        1,
+        "wall must still exist after AI paint undo"
+    );
 }

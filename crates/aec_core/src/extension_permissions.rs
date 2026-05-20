@@ -78,9 +78,7 @@ pub fn validate_manifest(m: &ExtensionManifest) -> Vec<ManifestError> {
     if m.id.0.is_empty() {
         errors.push(ManifestError::EmptyId);
     } else if m.id.0.contains('/') || m.id.0.contains('\\') || m.id.0.contains("..") {
-        errors.push(ManifestError::UnsafeId {
-            id: m.id.0.clone(),
-        });
+        errors.push(ManifestError::UnsafeId { id: m.id.0.clone() });
     }
     if m.name.is_empty() {
         errors.push(ManifestError::EmptyName);
@@ -199,7 +197,7 @@ fn looks_like_semver(v: &str) -> bool {
     // Cheap, dependency-free semver check that accepts `X.Y.Z` with
     // optional `-prerelease` and `+build` suffixes. Each of the three
     // core segments must be a non-empty digit run.
-    let core_end = v.find(|c| c == '-' || c == '+').unwrap_or(v.len());
+    let core_end = v.find(['-', '+']).unwrap_or(v.len());
     let core = &v[..core_end];
     let parts: Vec<&str> = core.split('.').collect();
     if parts.len() != 3 {
@@ -235,8 +233,12 @@ pub enum Operation {
     /// `scope` is a free-form host hint (e.g. `"project_dir"`,
     /// `"user_assets"`) used for audit-log entries; the gate only cares
     /// about the [`Permission::FilesystemWrite`] declaration itself.
-    WriteFile { scope: String },
-    ReadFile { scope: String },
+    WriteFile {
+        scope: String,
+    },
+    ReadFile {
+        scope: String,
+    },
     UseAiTool,
     WriteAuditLog,
     NetworkAccess,
@@ -701,8 +703,8 @@ mod tests {
         // Tamper with the name → signature must fail.
         let mut tampered = m.clone();
         tampered.name = "evil".into();
-        let err = verify_signature_against(&tampered, m.signature.as_ref().unwrap(), &trust)
-            .unwrap_err();
+        let err =
+            verify_signature_against(&tampered, m.signature.as_ref().unwrap(), &trust).unwrap_err();
         assert!(matches!(err, SignatureError::VerifyFailed));
     }
 
@@ -723,8 +725,7 @@ mod tests {
                 .to_bytes(),
         ))
         .unwrap();
-        let err =
-            verify_signature_against(&m, m.signature.as_ref().unwrap(), &other).unwrap_err();
+        let err = verify_signature_against(&m, m.signature.as_ref().unwrap(), &other).unwrap_err();
         assert!(matches!(err, SignatureError::UntrustedKey));
     }
 
