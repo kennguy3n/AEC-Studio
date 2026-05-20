@@ -146,8 +146,15 @@ pub fn generate_mood_board(
                 e.count += 1;
                 // Re-average so the displayed swatch tracks the bin's
                 // average rather than the first material that landed in it.
+                //
+                // `e.count` is a u32 but `f32` exactly represents every
+                // integer up to 2^24 (16M), which is far beyond the hard
+                // cap of `MAX_SWATCHES_PER_PAGE * 8 = 96` materials taken
+                // earlier in this function — so the lossless `as f32`
+                // cast is safe and the previous u16-clamp dead-code that
+                // froze precision at 65 535 is gone.
+                let n = e.count as f32;
                 for axis in 0..3 {
-                    let n = f32::from(e.count.min(u32::from(u16::MAX)) as u16);
                     e.albedo[axis] = (e.albedo[axis] * (n - 1.0) + m.albedo[axis]) / n;
                 }
             })

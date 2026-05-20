@@ -55,7 +55,7 @@ win:
     - target: msi
       arch:
         - x64
-  icon: ../../packaging/windows/resources/icons/icon.ico
+  icon: ../../packaging/windows/resources/icon.ico
   legalTrademarks: AEC Studio
 
 nsis:
@@ -66,8 +66,8 @@ nsis:
   createStartMenuShortcut: true
   shortcutName: AEC Studio
   artifactName: "${productName}-Setup-${version}-${arch}.exe"
-  installerIcon: ../../packaging/windows/resources/icons/icon.ico
-  uninstallerIcon: ../../packaging/windows/resources/icons/icon.ico
+  installerIcon: ../../packaging/windows/resources/icon.ico
+  uninstallerIcon: ../../packaging/windows/resources/icon.ico
 
 msi:
   oneClick: false

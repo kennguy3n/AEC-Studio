@@ -338,6 +338,23 @@ def stitch_frames(
     #    image-sequence fall-back; reporting a count that includes
     #    non-frame files would inflate the result and confuse the Rust
     #    side that maps this back to `WalkthroughOutput::ImageSequence`.
+    #
+    # Patterns without a literal prefix before `%d` (e.g. `%05d.png` →
+    # glob `*.png`) would silently match every PNG in the directory,
+    # defeating the whole point of pattern-checking. Reject those at
+    # the boundary so callers cannot accidentally pass an ambiguous
+    # pattern and get a wrong frame count.
+    percent_idx = frame_pattern.find("%")
+    if percent_idx == -1:
+        raise ValueError(
+            f"frame_pattern '{frame_pattern}' has no printf placeholder (`%d`/`%05d`)"
+        )
+    if percent_idx == 0:
+        raise ValueError(
+            f"frame_pattern '{frame_pattern}' lacks a literal prefix before the "
+            f"frame number; require something like 'frame_%05d.png' so the glob "
+            f"can be disambiguated from unrelated files in the same directory"
+        )
     glob_pattern = re.sub(r"%0?\d*d", "*", frame_pattern)
     frame_count = sum(
         1

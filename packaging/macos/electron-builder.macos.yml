@@ -59,7 +59,11 @@ mac:
       arch:
         - x64
         - arm64
-  icon: ../../packaging/macos/resources/icons/icon.icns
+  # PNG source — electron-builder converts to .icns at build time using
+  # the macos-latest runner's bundled `iconutil`. Studios shipping
+  # production builds can drop a real `.icns` file at this path; the
+  # builder accepts either format here.
+  icon: ../../packaging/macos/resources/icon.png
   entitlements: ../../packaging/macos/resources/entitlements.mac.plist
   entitlementsInherit: ../../packaging/macos/resources/entitlements.mac.plist
   extendInfo:

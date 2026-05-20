@@ -490,6 +490,39 @@ class BlenderWorkerTests(unittest.TestCase):
                 "non-frame images must not be counted",
             )
 
+    def test_stitch_frames_rejects_pattern_without_literal_prefix(self):
+        # Regression: a printf pattern like `%05d.png` converts to the
+        # glob `*.png`, which would silently match every PNG in the
+        # directory (thumbnails, reference frames, anything else) and
+        # over-report `frame_count`. Reject the ambiguous pattern at
+        # the boundary so callers get a clear error instead of a wrong
+        # answer.
+        from walkthrough import stitch_frames  # type: ignore
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            (tmp_path / "001.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+            (tmp_path / "thumbnail.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+            with self.assertRaises(ValueError) as ctx:
+                stitch_frames(
+                    str(tmp_path),
+                    str(tmp_path / "out.mp4"),
+                    frame_pattern="%03d.png",
+                )
+            self.assertIn("literal prefix", str(ctx.exception))
+
+        # And a pattern with no `%d` at all should also be rejected, so
+        # callers passing in a static filename by mistake fail fast.
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError) as ctx:
+                stitch_frames(
+                    tmp,
+                    str(Path(tmp) / "out.mp4"),
+                    frame_pattern="frame.png",
+                )
+            self.assertIn("printf placeholder", str(ctx.exception))
+
     def test_stitch_frames_rejects_directory_with_only_non_pattern_images(self):
         from walkthrough import stitch_frames  # type: ignore
         import tempfile

@@ -247,7 +247,7 @@ This document tracks AEC Studio's phased delivery from open-source foundation to
 
 ## Phase 7 — Optional KChat integration
 
-**Status:** `NOT STARTED`
+**Status:** `DONE`
 
 **Goal:** Teams using KChat can publish AEC Studio artifacts and route review comments back to the audit trail without giving up local-first.
 

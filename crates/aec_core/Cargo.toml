@@ -7,6 +7,24 @@ license.workspace = true
 repository.workspace = true
 description = "Core types, configuration, errors, and the `.aecstudio` project package format for AEC Studio."
 
+[features]
+# Compile-time gate for the optional KChat integration (artifact card
+# publishing, review-comment ingestion, asset-pack manifests, comment sync,
+# the KChatConfig/KChatIntegration runtime layer). Enabled by default so a
+# stock workspace build retains every public surface the desktop app
+# relies on; downstream builds that need to strip KChat entirely (e.g. a
+# server-only headless variant) can disable default features and re-enable
+# only the pieces they need:
+#
+#   aec_core = { workspace = true, default-features = false }
+#
+# Disabling `kchat` removes the kchat, kchat_config, and kchat_sync modules
+# from the compiled crate and elides their public re-exports from
+# `aec_core::*`. The `ActorKind::KChat` enum variant stays present
+# unconditionally — it costs nothing and keeps the audit-log type stable.
+default = ["kchat"]
+kchat = []
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }

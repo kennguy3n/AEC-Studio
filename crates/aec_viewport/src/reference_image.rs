@@ -142,6 +142,12 @@ impl ReferenceImageBitmap {
     /// Build a fresh bitmap from raw RGBA + dimensions. Validates
     /// that the buffer has the expected length.
     pub fn from_rgba(width: u32, height: u32, rgba: Vec<u8>) -> Result<Self, ReferenceImageError> {
+        // Check dimensions first so a caller passing e.g. `(0, 5, vec![1])`
+        // gets the more precise "zero-sized bitmap" error instead of a
+        // "length mismatch" that obscures the real problem (width=0).
+        if width == 0 || height == 0 {
+            return Err(ReferenceImageError::Malformed("zero-sized bitmap".into()));
+        }
         let expected = (width as usize)
             .checked_mul(height as usize)
             .and_then(|p| p.checked_mul(4))
@@ -154,9 +160,6 @@ impl ReferenceImageBitmap {
                 height,
                 expected
             )));
-        }
-        if width == 0 || height == 0 {
-            return Err(ReferenceImageError::Malformed("zero-sized bitmap".into()));
         }
         let blake3 = blake3::hash(&rgba).to_hex().to_string();
         Ok(Self {
@@ -443,6 +446,35 @@ mod tests {
     fn bitmap_from_rgba_validates_buffer_length() {
         let err = ReferenceImageBitmap::from_rgba(2, 2, vec![0; 10]).unwrap_err();
         assert!(matches!(err, ReferenceImageError::Malformed(_)));
+    }
+
+    #[test]
+    fn bitmap_from_rgba_zero_dim_returns_zero_sized_error() {
+        // Regression: previously this returned a generic "length
+        // mismatch" because the length check ran first, hiding the
+        // real reason. The dimension check now runs first so the user
+        // sees the precise zero-sized-bitmap error.
+        let err = ReferenceImageBitmap::from_rgba(0, 5, vec![1]).unwrap_err();
+        match err {
+            ReferenceImageError::Malformed(ref msg) => {
+                assert!(
+                    msg.contains("zero-sized"),
+                    "expected zero-sized error, got: {msg}"
+                );
+            }
+            other => panic!("expected Malformed(zero-sized), got {other:?}"),
+        }
+
+        let err = ReferenceImageBitmap::from_rgba(0, 0, Vec::new()).unwrap_err();
+        match err {
+            ReferenceImageError::Malformed(ref msg) => {
+                assert!(
+                    msg.contains("zero-sized"),
+                    "expected zero-sized error, got: {msg}"
+                );
+            }
+            other => panic!("expected Malformed(zero-sized), got {other:?}"),
+        }
     }
 
     #[test]

@@ -404,7 +404,10 @@ crates/aec_render/
 
 ## 9.6 KChat integration
 
-KChat integration is the **only** optional cross-organisation surface in AEC Studio. It is gated by a feature flag (`#[cfg(feature = "kchat")]`) at the crate level and by a runtime `KChatConfig::enabled` toggle in Settings. When the config is disabled, every publish/sync method returns `KChatDisabled` and the corresponding UI elements hide themselves.
+KChat integration is the **only** optional cross-organisation surface in AEC Studio. It is gated on two axes:
+
+1. **Compile-time** by the `kchat` cargo feature on `aec_core` (default-enabled). Disabling default features strips the `kchat`, `kchat_config`, and `kchat_sync` modules and their re-exports from the compiled crate; the `ActorKind::KChat` enum variant stays unconditional so the audit-log type remains stable across feature configurations.
+2. **Runtime** by the `KChatConfig::enabled` toggle exposed in Settings. When the config is disabled, every publish/sync method returns `KChatError::KChatDisabled` and the corresponding UI elements hide themselves.
 
 ```
 crates/aec_core/
