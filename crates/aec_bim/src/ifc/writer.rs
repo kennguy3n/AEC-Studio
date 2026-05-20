@@ -210,11 +210,29 @@ DATA;\n";
                 // so the reader's name-prefers-tag path reconstructs
                 // `Other(original_tag)` losslessly.
                 let original_tag = class.ifc_tag();
-                let step_type_tag = if is_step_safe_simple_id(original_tag) {
-                    original_tag
-                } else {
-                    "IfcBuildingElementProxy"
-                };
+                // Two reasons to fall back to `IfcBuildingElementProxy`
+                // as the STEP entity type:
+                //   1. The tag isn't a valid STEP SIMPLE_ID — e.g. an
+                //      extension classifier produced
+                //      `Other("Foo(Bar)")` and emitting it verbatim
+                //      would corrupt `parse_step_groups`.
+                //   2. The tag IS a STEP-safe identifier but it names
+                //      one of the IFC4 spatial-structure classes
+                //      (Project / Site / Building / Storey / Space).
+                //      The reader dispatches those into the spatial
+                //      branch on first pass and never tries to decode
+                //      the embedded `{tag}::{eid}`, so the original
+                //      EntityId would be lost on round-trip.
+                // In both cases the Name field still carries
+                // `{original_tag}::{eid}` and the reader's
+                // name-prefers-tag path reconstructs the class
+                // losslessly.
+                let step_type_tag =
+                    if is_step_safe_simple_id(original_tag) && !is_spatial_ifc_class(&class) {
+                        original_tag
+                    } else {
+                        "IfcBuildingElementProxy"
+                    };
                 buf.write_line(
                     step_id,
                     format!(
@@ -360,6 +378,59 @@ DATA;\n";
     }
 }
 
+/// Returns true when `s` is a valid STEP-21 SIMPLE_ID safe to embed as
+/// the entity-type prefix of a STEP record.
+///
+/// Per ISO 10303-21 a SIMPLE_ID matches `[A-Za-z_][A-Za-z0-9_]*`. The
+/// AEC Studio in-process round-trip additionally accepts `:` so that
+/// `IfcClass::Other("Some::Custom::Type")` produced by an extension
+/// classifier can be emitted verbatim (`:` does not collide with any
+/// STEP delimiter and the reader splits the Name field with
+/// `rsplit_once("::")`). Characters that *would* corrupt
+/// `parse_step_groups` in the reader — `(`, `)`, `'`, `,`, `;`,
+/// whitespace, control chars — are rejected so the writer can fall
+/// back to a canonical proxy type instead of emitting a malformed line.
+pub(crate) fn is_step_safe_simple_id(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    let mut chars = s.chars();
+    let first = chars.next().expect("non-empty");
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+}
+
+/// Returns true when `class` is one of the IFC4 *spatial structure*
+/// classes (Project / Site / Building / Storey / Space) that the
+/// writer emits as a top-level `SpatialRow` and that the reader's
+/// first-pass dispatch routes into the spatial-node branch (rather
+/// than the element branch that decodes `{tag}::{eid}` from the Name
+/// field).
+///
+/// If an element — i.e. something attached via
+/// `Project::attach_element` — were emitted with a spatial entity
+/// type, the reader would silently re-classify it as a spatial node
+/// with a fresh EntityId and the original element identity would be
+/// lost on round-trip. Currently no code in the crate does this, but
+/// the writer guards against the misuse defensively (same pattern as
+/// the STEP-unsafe `Other(_)` tag fallback): if an element is
+/// classified as one of these spatial classes, the writer emits the
+/// STEP type as `IfcBuildingElementProxy` and keeps the original tag
+/// in the Name field, so the reader's name-prefers-tag path
+/// reconstructs the class losslessly.
+pub(crate) fn is_spatial_ifc_class(class: &IfcClass) -> bool {
+    matches!(
+        class,
+        IfcClass::IfcProject
+            | IfcClass::IfcSite
+            | IfcClass::IfcBuilding
+            | IfcClass::IfcBuildingStorey
+            | IfcClass::IfcSpace
+    )
+}
+
 /// Escape `s` for embedding inside a STEP single-quoted string.
 ///
 /// The on-wire format used by the writer/reader pair is:
@@ -389,30 +460,6 @@ DATA;\n";
 /// [`unescape_step_string`]. The module docs explicitly state this
 /// reader/writer pair is for AEC Studio's in-process IFC pipeline and
 /// not intended for interop with third-party IFC tooling.
-/// Returns true when `s` is a valid STEP-21 SIMPLE_ID safe to embed as
-/// the entity-type prefix of a STEP record.
-///
-/// Per ISO 10303-21 a SIMPLE_ID matches `[A-Za-z_][A-Za-z0-9_]*`. The
-/// AEC Studio in-process round-trip additionally accepts `:` so that
-/// `IfcClass::Other("Some::Custom::Type")` produced by an extension
-/// classifier can be emitted verbatim (`:` does not collide with any
-/// STEP delimiter and the reader splits the Name field with
-/// `rsplit_once("::")`). Characters that *would* corrupt
-/// `parse_step_groups` in the reader — `(`, `)`, `'`, `,`, `;`,
-/// whitespace, control chars — are rejected so the writer can fall
-/// back to a canonical proxy type instead of emitting a malformed line.
-pub(crate) fn is_step_safe_simple_id(s: &str) -> bool {
-    if s.is_empty() {
-        return false;
-    }
-    let mut chars = s.chars();
-    let first = chars.next().expect("non-empty");
-    if !(first.is_ascii_alphabetic() || first == '_') {
-        return false;
-    }
-    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
-}
-
 fn escape_step_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {

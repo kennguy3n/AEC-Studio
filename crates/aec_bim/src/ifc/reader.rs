@@ -1297,6 +1297,89 @@ mod tests {
     }
 
     #[test]
+    fn element_classified_with_spatial_class_roundtrips_via_proxy_fallback() {
+        // Defense in depth: if an element is attached via
+        // `Project::attach_element` AND classified as one of the
+        // spatial-structure classes (Project / Site / Building /
+        // Storey / Space), the writer must NOT emit it with the
+        // spatial entity type — the reader's first-pass dispatch
+        // would re-classify it as a spatial node with a fresh
+        // EntityId and the original element identity would be lost.
+        // Instead the writer emits `IfcBuildingElementProxy` as the
+        // STEP type and stashes the original tag in the Name field;
+        // the reader's name-prefers-tag path reconstructs the class
+        // losslessly.
+        //
+        // No current production code does this — `IfcSpace` is for
+        // `add_child()`, not `attach_element()` — but tools / tests
+        // / extension classifiers could trigger the misuse, so the
+        // round-trip must remain correct.
+        let mut project = Project::new("SpatialEltRT");
+        let site = project
+            .add_child(&project.root.clone(), IfcClass::IfcSite, "S")
+            .unwrap();
+        let bldg = project
+            .add_child(&site, IfcClass::IfcBuilding, "B")
+            .unwrap();
+        let storey = project
+            .add_child(&bldg, IfcClass::IfcBuildingStorey, "L01")
+            .unwrap();
+
+        let mut classification = ClassificationStore::new();
+        let props = PropertyStore::new();
+        let el = EntityId::new();
+        project.attach_element(&storey, el.clone());
+        // The misuse under test: classify an element as a spatial
+        // class. The writer must defend against it.
+        classification.assign_manual(el.clone(), IfcClass::IfcSpace);
+
+        let s = crate::ifc::IfcWriter::to_string(&project, &classification, &props);
+
+        // The misclassified element MUST be emitted as
+        // `IfcBuildingElementProxy(...)` carrying `IfcSpace::{eid}`
+        // in the Name field — exactly one occurrence (containment
+        // rel still references the proxy, not the actual storey).
+        assert!(
+            s.contains(&format!("IfcSpace::{el}")),
+            "Name field must carry the original IfcSpace::{{eid}}: {s}",
+        );
+        let proxy_lines: Vec<&str> = s
+            .lines()
+            .filter(|l| l.starts_with('#') && l.contains("IfcBuildingElementProxy("))
+            .collect();
+        assert_eq!(
+            proxy_lines.len(),
+            1,
+            "expected exactly one IfcBuildingElementProxy line (the misclassified element): {s}"
+        );
+
+        let snap = IfcReader::from_string(&s)
+            .expect("element with spatial-class classification must round-trip");
+        let class = snap
+            .classification
+            .accepted_for(&el)
+            .expect("element classified");
+        assert_eq!(
+            class,
+            &IfcClass::IfcSpace,
+            "original IfcSpace classification must be reconstructed from the Name-field tag",
+        );
+        assert!(
+            snap.guid_by_entity.contains_key(&el),
+            "EntityId must survive the spatial-class proxy fallback",
+        );
+        // The actual spatial storey must still have its own
+        // `IfcSpace`-free hierarchy — i.e. the proxy element is
+        // attached to the storey via the containment rel, NOT
+        // hijacked into the spatial graph.
+        assert!(
+            snap.element_parent.contains_key(&el),
+            "the misclassified element must remain an element (have a containing storey), \
+             not be promoted to a spatial node",
+        );
+    }
+
+    #[test]
     fn step_safe_simple_id_validator_classifies_correctly() {
         // The writer's safety predicate guards against STEP-21
         // SIMPLE_ID violations. Anchor the contract here so a future
