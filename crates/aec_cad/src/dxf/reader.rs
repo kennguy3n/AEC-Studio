@@ -1,13 +1,14 @@
 //! DXF ASCII reader. Implements a working subset of the spec covering the
-//! header/tables/blocks/entities sections, the entities `LINE`, `LWPOLYLINE`,
-//! `POLYLINE` (with VERTEX members), `ARC`, `CIRCLE`, `TEXT`, `MTEXT`,
-//! `DIMENSION`, `INSERT`, and the `LAYER` + `BLOCK_RECORD` + `DIMSTYLE`
-//! tables.
+//! header/tables/blocks/entities sections, the entities `LINE`,
+//! `LWPOLYLINE`, `POLYLINE` (with VERTEX members), `ARC`, `CIRCLE`,
+//! `ELLIPSE`, `SPLINE`, `HATCH`, `TEXT`, `MTEXT`, `DIMENSION`, `INSERT`,
+//! and the `LAYER` + `BLOCK_RECORD` + `DIMSTYLE` tables.
 
 use std::io::{BufRead, BufReader, Read};
 
 use crate::dxf::entities::{
-    DxfArc, DxfCircle, DxfDimStyle, DxfEntity, DxfInsert, DxfLine, DxfPolyline, DxfText,
+    DxfArc, DxfCircle, DxfDimStyle, DxfDimension, DxfDimensionKind, DxfEllipse, DxfEntity,
+    DxfHatch, DxfHatchLoop, DxfInsert, DxfLine, DxfPolyline, DxfPolylineVertex, DxfSpline, DxfText,
 };
 use crate::dxf::tables::DxfBlockRecord;
 use crate::dxf::DxfDocument;
@@ -100,7 +101,6 @@ fn parse_tables(groups: &[Group], mut i: usize, doc: &mut DxfDocument) -> CadRes
             return Ok(i + 1);
         }
         if g.code == 0 && g.value == "TABLE" {
-            // Find the table name (code 2) and then iterate the entries.
             i += 1;
             let table_name = if i < groups.len() && groups[i].code == 2 {
                 let n = groups[i].value.clone();
@@ -129,7 +129,6 @@ fn parse_table_entries(
             return Ok(i + 1);
         }
         if g.code == 0 {
-            // Start of a new table entry; read up to the next 0-code.
             let entry_type = g.value.clone();
             let mut fields: Vec<(i32, String)> = Vec::new();
             i += 1;
@@ -217,18 +216,19 @@ fn parse_entities(groups: &[Group], mut i: usize, doc: &mut DxfDocument) -> usiz
         }
         if g.code == 0 {
             let entity_type = g.value.clone();
-            let mut fields: Vec<(i32, String)> = Vec::new();
-            i += 1;
-            // Collect this entity's fields. For POLYLINE we need to keep
-            // reading VERTEX/SEQEND pseudo-entities; LWPOLYLINE is flat.
+            // HATCH has nested boundary records, which we handle below.
             let is_polyline = entity_type == "POLYLINE";
+            let is_hatch = entity_type == "HATCH";
+            let mut fields: Vec<(i32, String)> = Vec::new();
+            // Hatch boundary loop accumulation.
+            let mut hatch_loops: Vec<DxfHatchLoop> = Vec::new();
+            let mut hatch_current_loop: Vec<[f64; 2]> = Vec::new();
+            i += 1;
             while i < groups.len() {
                 if groups[i].code == 0 {
                     if is_polyline && (groups[i].value == "VERTEX" || groups[i].value == "SEQEND") {
-                        // Inline vertex data: parse and append.
                         if groups[i].value == "SEQEND" {
                             i += 1;
-                            // consume SEQEND's fields (handles/layer)
                             while i < groups.len() && groups[i].code != 0 {
                                 i += 1;
                             }
@@ -237,26 +237,60 @@ fn parse_entities(groups: &[Group], mut i: usize, doc: &mut DxfDocument) -> usiz
                         i += 1;
                         let mut x = 0.0;
                         let mut y = 0.0;
+                        let mut bulge = 0.0;
                         while i < groups.len() && groups[i].code != 0 {
                             match groups[i].code {
                                 10 => x = groups[i].value.parse().unwrap_or(0.0),
                                 20 => y = groups[i].value.parse().unwrap_or(0.0),
+                                42 => bulge = groups[i].value.parse().unwrap_or(0.0),
                                 _ => {}
                             }
                             i += 1;
                         }
-                        // Encode the vertex as synthetic fields the entity
-                        // builder picks up.
                         fields.push((10, x.to_string()));
                         fields.push((20, y.to_string()));
+                        fields.push((42, bulge.to_string()));
                         continue;
                     }
                     break;
                 }
+                // Hatch boundary loop vertices live under code-10/code-20 pairs
+                // and a code-93 vertex count terminates the loop. We capture
+                // them here.
+                if is_hatch {
+                    match groups[i].code {
+                        93 if !hatch_current_loop.is_empty() => {
+                            // New loop is starting; flush the previous one.
+                            hatch_loops.push(DxfHatchLoop {
+                                vertices: std::mem::take(&mut hatch_current_loop),
+                            });
+                        }
+                        93 => {
+                            // Empty loop counter, nothing to flush.
+                        }
+                        10 => {
+                            // Pair with the following code-20 to form a vertex.
+                            let x: f64 = groups[i].value.parse().unwrap_or(0.0);
+                            // Look ahead for the y.
+                            let mut y = 0.0;
+                            if i + 1 < groups.len() && groups[i + 1].code == 20 {
+                                y = groups[i + 1].value.parse().unwrap_or(0.0);
+                                i += 1;
+                            }
+                            hatch_current_loop.push([x, y]);
+                        }
+                        _ => {}
+                    }
+                }
                 fields.push((groups[i].code, groups[i].value.clone()));
                 i += 1;
             }
-            if let Some(entity) = build_entity(&entity_type, &fields) {
+            if is_hatch && !hatch_current_loop.is_empty() {
+                hatch_loops.push(DxfHatchLoop {
+                    vertices: hatch_current_loop,
+                });
+            }
+            if let Some(entity) = build_entity(&entity_type, &fields, &hatch_loops) {
                 doc.entities.push(entity);
             }
         } else {
@@ -266,17 +300,30 @@ fn parse_entities(groups: &[Group], mut i: usize, doc: &mut DxfDocument) -> usiz
     i
 }
 
-fn build_entity(kind: &str, fields: &[(i32, String)]) -> Option<DxfEntity> {
+fn build_entity(
+    kind: &str,
+    fields: &[(i32, String)],
+    hatch_loops: &[DxfHatchLoop],
+) -> Option<DxfEntity> {
     let mut layer = "0".to_string();
+    let mut style = "STANDARD".to_string();
     let mut x1 = 0.0;
     let mut y1 = 0.0;
     let mut z1 = 0.0;
     let mut x2 = 0.0;
     let mut y2 = 0.0;
     let mut z2 = 0.0;
+    let mut x3 = 0.0;
+    let mut y3 = 0.0;
+    let mut z3 = 0.0;
+    let mut x4 = 0.0;
+    let mut y4 = 0.0;
+    let mut z4 = 0.0;
     let mut radius = 0.0;
     let mut start_angle = 0.0;
     let mut end_angle = 0.0;
+    let mut start_param = 0.0;
+    let mut end_param = std::f64::consts::TAU;
     let mut height = 0.0;
     let mut rotation = 0.0;
     let mut text = String::new();
@@ -286,44 +333,112 @@ fn build_entity(kind: &str, fields: &[(i32, String)]) -> Option<DxfEntity> {
     let mut sz = 1.0;
     let mut flags = 0i32;
     let mut elevation = 0.0;
-    let mut polyline_vertices: Vec<[f64; 2]> = Vec::new();
-    // Buffer for LWPOLYLINE vertices (paired 10/20 fields).
+    let mut polyline_vertices: Vec<DxfPolylineVertex> = Vec::new();
     let mut current_x: Option<f64> = None;
+    let mut ratio = 1.0;
+    let mut degree: i32 = 3;
+    let mut knots: Vec<f64> = Vec::new();
+    let mut control_points: Vec<[f64; 3]> = Vec::new();
+    let mut spline_x: Option<f64> = None;
+    let mut hatch_solid = false;
+    let mut hatch_pattern = "SOLID".to_string();
+    let mut hatch_scale = 1.0;
+    let mut hatch_angle = 0.0;
+    let mut dim_kind_code: i32 = 0;
+    let mut measured_value: Option<f64> = None;
+    let mut override_text: Option<String> = None;
 
     for (code, val) in fields {
         match code {
             8 => layer.clone_from(val),
+            3 => {
+                if kind == "DIMENSION" {
+                    style.clone_from(val);
+                } else if kind == "HATCH" {
+                    hatch_pattern.clone_from(val);
+                }
+            }
             10 => {
                 if kind == "LWPOLYLINE" || kind == "POLYLINE" {
                     current_x = Some(val.parse().unwrap_or(0.0));
+                } else if kind == "SPLINE" {
+                    spline_x = Some(val.parse().unwrap_or(0.0));
                 } else {
+                    // ELLIPSE and other 10-code-having entities both
+                    // record the X of their first defining point here.
                     x1 = val.parse().unwrap_or(0.0);
                 }
             }
             20 => {
                 if kind == "LWPOLYLINE" || kind == "POLYLINE" {
                     if let Some(x) = current_x.take() {
-                        polyline_vertices.push([x, val.parse().unwrap_or(0.0)]);
+                        let y = val.parse().unwrap_or(0.0);
+                        polyline_vertices.push(DxfPolylineVertex { x, y, bulge: 0.0 });
                     } else {
                         y1 = val.parse().unwrap_or(0.0);
+                    }
+                } else if kind == "SPLINE" {
+                    if let Some(x) = spline_x.take() {
+                        let y = val.parse().unwrap_or(0.0);
+                        control_points.push([x, y, 0.0]);
                     }
                 } else {
                     y1 = val.parse().unwrap_or(0.0);
                 }
             }
-            30 => z1 = val.parse().unwrap_or(0.0),
+            30 => {
+                if kind == "SPLINE" {
+                    if let Some(last) = control_points.last_mut() {
+                        last[2] = val.parse().unwrap_or(0.0);
+                    }
+                } else {
+                    z1 = val.parse().unwrap_or(0.0);
+                }
+            }
             11 => x2 = val.parse().unwrap_or(0.0),
             21 => y2 = val.parse().unwrap_or(0.0),
             31 => z2 = val.parse().unwrap_or(0.0),
+            12 => x3 = val.parse().unwrap_or(0.0),
+            22 => y3 = val.parse().unwrap_or(0.0),
+            32 => z3 = val.parse().unwrap_or(0.0),
+            13 => x4 = val.parse().unwrap_or(0.0),
+            23 => y4 = val.parse().unwrap_or(0.0),
+            33 => z4 = val.parse().unwrap_or(0.0),
             40 => {
                 if kind == "TEXT" || kind == "MTEXT" {
                     height = val.parse().unwrap_or(0.0);
+                } else if kind == "ELLIPSE" {
+                    ratio = val.parse().unwrap_or(1.0);
+                } else if kind == "SPLINE" {
+                    knots.push(val.parse().unwrap_or(0.0));
+                } else if kind == "HATCH" {
+                    hatch_scale = val.parse().unwrap_or(1.0);
                 } else {
                     radius = val.parse().unwrap_or(0.0);
                 }
             }
-            41 => sx = val.parse().unwrap_or(1.0),
-            42 => sy = val.parse().unwrap_or(1.0),
+            41 => {
+                if kind == "ELLIPSE" {
+                    start_param = val.parse().unwrap_or(0.0);
+                } else if kind == "HATCH" {
+                    hatch_angle = val.parse().unwrap_or(0.0);
+                } else {
+                    sx = val.parse().unwrap_or(1.0);
+                }
+            }
+            42 => {
+                if kind == "ELLIPSE" {
+                    end_param = val.parse().unwrap_or(std::f64::consts::TAU);
+                } else if kind == "LWPOLYLINE" || kind == "POLYLINE" {
+                    if let Some(last) = polyline_vertices.last_mut() {
+                        last.bulge = val.parse().unwrap_or(0.0);
+                    }
+                } else if kind == "DIMENSION" {
+                    measured_value = val.parse().ok();
+                } else {
+                    sy = val.parse().unwrap_or(1.0);
+                }
+            }
             43 => sz = val.parse().unwrap_or(1.0),
             50 => {
                 if kind == "TEXT" || kind == "MTEXT" || kind == "INSERT" {
@@ -333,9 +448,28 @@ fn build_entity(kind: &str, fields: &[(i32, String)]) -> Option<DxfEntity> {
                 }
             }
             51 => end_angle = val.parse().unwrap_or(0.0),
-            70 => flags = val.parse().unwrap_or(0),
+            70 => {
+                if kind == "DIMENSION" {
+                    dim_kind_code = val.parse().unwrap_or(0);
+                } else if kind == "HATCH" {
+                    hatch_solid = val.parse().unwrap_or(0) != 0;
+                } else {
+                    flags = val.parse().unwrap_or(0);
+                }
+            }
+            71 if kind == "SPLINE" => {
+                degree = val.parse().unwrap_or(3);
+            }
             38 => elevation = val.parse().unwrap_or(0.0),
-            1 => text.clone_from(val),
+            1 => {
+                if kind == "DIMENSION" {
+                    if !val.is_empty() {
+                        override_text = Some(val.clone());
+                    }
+                } else {
+                    text.clone_from(val);
+                }
+            }
             2 => block_name.clone_from(val),
             _ => {}
         }
@@ -365,6 +499,30 @@ fn build_entity(kind: &str, fields: &[(i32, String)]) -> Option<DxfEntity> {
             center: [x1, y1, z1],
             radius,
         })),
+        "ELLIPSE" => Some(DxfEntity::Ellipse(DxfEllipse {
+            layer,
+            center: [x1, y1, z1],
+            major_axis: [x2, y2, z2],
+            ratio,
+            start_param,
+            end_param,
+        })),
+        "SPLINE" => Some(DxfEntity::Spline(DxfSpline {
+            layer,
+            degree,
+            knots,
+            control_points,
+            closed: (flags & 1) != 0,
+        })),
+        "HATCH" => Some(DxfEntity::Hatch(DxfHatch {
+            layer,
+            pattern_name: hatch_pattern,
+            solid: hatch_solid,
+            scale: hatch_scale,
+            angle: hatch_angle,
+            elevation,
+            loops: hatch_loops.to_vec(),
+        })),
         "TEXT" | "MTEXT" => Some(DxfEntity::Text(DxfText {
             layer,
             position: [x1, y1, z1],
@@ -379,6 +537,26 @@ fn build_entity(kind: &str, fields: &[(i32, String)]) -> Option<DxfEntity> {
             scale: [sx, sy, sz],
             rotation,
         })),
+        "DIMENSION" => {
+            let dim_kind = match dim_kind_code & 0x07 {
+                1 => DxfDimensionKind::Aligned,
+                2 => DxfDimensionKind::Angular,
+                3 => DxfDimensionKind::Diameter,
+                4 => DxfDimensionKind::Radial,
+                _ => DxfDimensionKind::Linear,
+            };
+            Some(DxfEntity::Dimension(DxfDimension {
+                layer,
+                style,
+                kind: dim_kind,
+                def_point: [x1, y1, z1],
+                text_position: [x2, y2, z2],
+                def_point_a: [x3, y3, z3],
+                def_point_b: [x4, y4, z4],
+                override_text,
+                measured_value,
+            }))
+        }
         _ => None,
     }
 }

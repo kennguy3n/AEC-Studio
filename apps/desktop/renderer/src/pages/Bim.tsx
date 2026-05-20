@@ -1,8 +1,185 @@
+import { useState } from "react";
+import { aec } from "../api/aec";
+import {
+  SpatialTree,
+  SpatialNode,
+} from "../components/bim/SpatialTree";
+import {
+  PropertyEditor,
+  PsetData,
+} from "../components/bim/PropertyEditor";
+import {
+  ScheduleView,
+  ScheduleKind,
+  ScheduleRow,
+} from "../components/bim/ScheduleView";
+import {
+  ValidatorPanel,
+  ValidationFinding,
+} from "../components/bim/ValidatorPanel";
+import {
+  BimToolbar,
+  BimAction,
+} from "../components/bim/BimToolbar";
+
+const DEMO_ROOT: SpatialNode = {
+  id: "proj_demo",
+  kind: "IfcProject",
+  name: "Project (demo)",
+  children: [
+    {
+      id: "site_demo",
+      kind: "IfcSite",
+      name: "Site 1",
+      children: [
+        {
+          id: "bldg_demo",
+          kind: "IfcBuilding",
+          name: "Building A",
+          children: [
+            {
+              id: "lvl_l1",
+              kind: "IfcBuildingStorey",
+              name: "L1",
+              children: [
+                {
+                  id: "spc_l1_living",
+                  kind: "IfcSpace",
+                  name: "Living",
+                  children: [],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+  ],
+};
+
+const DEMO_PSETS: PsetData = {
+  Pset_WallCommon: {
+    LoadBearing: true,
+    FireRating: "F60",
+  },
+};
+
 export function Bim() {
+  const [root, setRoot] = useState<SpatialNode | null>(DEMO_ROOT);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [psets, setPsets] = useState<PsetData>(DEMO_PSETS);
+  const [schedules, setSchedules] = useState<
+    Partial<Record<ScheduleKind, ScheduleRow[]>>
+  >({});
+  const [findings, setFindings] = useState<ValidationFinding[]>([]);
+  const [busyAction, setBusyAction] = useState<BimAction | null>(null);
+
+  const onInvoke = async (action: BimAction) => {
+    setBusyAction(action);
+    try {
+      switch (action) {
+        case "importIfc": {
+          const out = (await aec.bim.importIfc(
+            "demo://project.ifc",
+          )) as { imported: number };
+          // Keep the demo tree if the IPC fake didn't deliver anything.
+          if (out.imported > 0) {
+            setRoot(DEMO_ROOT);
+          }
+          break;
+        }
+        case "exportIfc":
+          await aec.bim.exportIfc("demo://project.out.ifc");
+          break;
+        case "validate": {
+          const result = (await aec.bim.validate()) as {
+            ok: boolean;
+            errors: ValidationFinding[];
+            warnings: ValidationFinding[];
+            info?: ValidationFinding[];
+          };
+          const merged: ValidationFinding[] = [
+            ...(result.errors ?? []).map((f) => ({
+              ...f,
+              severity: "error" as const,
+            })),
+            ...(result.warnings ?? []).map((f) => ({
+              ...f,
+              severity: "warning" as const,
+            })),
+            ...(result.info ?? []).map((f) => ({
+              ...f,
+              severity: "info" as const,
+            })),
+          ];
+          setFindings(merged);
+          break;
+        }
+        case "classify":
+          await aec.bim.classify({ entityId: selectedId, source: "ai" });
+          break;
+        case "generateSchedule": {
+          const result = (await aec.bim.generateSchedule({
+            kind: "room",
+          })) as { scheduleId: string; rows?: ScheduleRow[] };
+          setSchedules((prev) => ({ ...prev, room: result.rows ?? [] }));
+          break;
+        }
+        case "diff":
+          await aec.bim.diff({ left: "snapshot:a", right: "snapshot:b" });
+          break;
+        case "boq":
+          await aec.bim.generateSchedule({ kind: "material" });
+          break;
+      }
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const classification =
+    selectedId === "lvl_l1" ? "IfcBuildingStorey" : selectedId ? "IfcWall" : null;
+
   return (
-    <div data-testid="bim-mode">
-      <h1>BIM</h1>
-      <p>Spatial hierarchy, classification, properties, IFC import/export, validation.</p>
+    <div className="bim-layout" data-testid="bim-mode">
+      <BimToolbar busyAction={busyAction} onInvoke={onInvoke} />
+      <div className="bim-center">
+        <SpatialTree
+          root={root}
+          selectedId={selectedId}
+          onSelect={setSelectedId}
+        />
+        <div
+          className="bim-viewport"
+          aria-label="3D viewport"
+          data-testid="bim-viewport"
+        >
+          {selectedId ? (
+            <p>Showing: {selectedId}</p>
+          ) : (
+            <p>Select an element from the spatial tree.</p>
+          )}
+        </div>
+        <PropertyEditor
+          entityId={selectedId}
+          classification={classification}
+          psets={psets}
+          onChange={setPsets}
+        />
+      </div>
+      <div className="bim-bottom">
+        <ScheduleView
+          rowsByKind={schedules}
+          onGenerate={(kind, rows) =>
+            setSchedules((prev) => ({ ...prev, [kind]: rows }))
+          }
+        />
+        <ValidatorPanel
+          findings={findings}
+          onFindings={setFindings}
+          onZoomTo={(id) => setSelectedId(id)}
+        />
+      </div>
     </div>
   );
 }

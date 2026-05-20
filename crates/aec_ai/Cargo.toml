@@ -10,6 +10,7 @@ description = "Local AI sidecar runtime: PrismML/llama.cpp control, grammars, sa
 [dependencies]
 aec_core = { path = "../aec_core" }
 aec_audit = { path = "../aec_audit" }
+aec_bim = { path = "../aec_bim" }
 blake3 = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }

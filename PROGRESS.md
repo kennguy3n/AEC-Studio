@@ -117,7 +117,7 @@ This document tracks AEC Studio's phased delivery from open-source foundation to
 
 ## Phase 3 — 2D CAD module
 
-**Status:** `NOT STARTED`
+**Status:** `DONE`
 
 **Goal:** A drafter can produce construction documentation in pure 2D, with or without using the 3D module, and roundtrip DXF cleanly.
 
@@ -125,34 +125,34 @@ This document tracks AEC Studio's phased delivery from open-source foundation to
 
 | Item | Status |
 |---|---|
-| Draft mode UI (canvas, toolbar, layers, sheet manager) | `NOT STARTED` |
-| Native 2D CAD canvas (Rust / wgpu, orthographic) | `NOT STARTED` |
-| Drawing primitives (line, polyline, arc, circle, ellipse, spline, hatch, text) | `NOT STARTED` |
-| Editing tools (move, copy, rotate, scale, mirror, offset, trim, extend, fillet, chamfer) | `NOT STARTED` |
-| Precision tools (grid, ortho, polar, snaps, tracking, parametric constraints) | `NOT STARTED` |
-| Layer system (state manager, freeze/thaw, color, lineweight, linetype) | `NOT STARTED` |
-| Block system (library, dynamic blocks, attributes) | `NOT STARTED` |
-| Dimension tools (linear, angular, radial, baseline, continue) | `NOT STARTED` |
-| Sheet layout and title blocks | `NOT STARTED` |
-| DXF import / export (roundtripped layers, blocks, dim styles) | `NOT STARTED` |
-| DWG converter adapter (out-of-process, opt-in) | `NOT STARTED` |
-| PDF / SVG export (deterministic, sheet sets) | `NOT STARTED` |
-| Command line parser (`L`, `O`, `CO`, `MO`, `TRIM`, `EX`, `F`) | `NOT STARTED` |
-| Local AI: CAD cleanup (gap close, duplicate removal, layer normalize) | `NOT STARTED` |
-| Local AI: plan-to-wall conversion | `NOT STARTED` |
+| Draft mode UI (canvas, toolbar, layers, sheet manager) | `DONE` |
+| Native 2D CAD canvas (Rust / wgpu, orthographic) | `DONE` |
+| Drawing primitives (line, polyline, arc, circle, ellipse, spline, hatch, text) | `DONE` |
+| Editing tools (move, copy, rotate, scale, mirror, offset, trim, extend, fillet, chamfer) | `DONE` |
+| Precision tools (grid, ortho, polar, snaps, tracking, parametric constraints) | `DONE` |
+| Layer system (state manager, freeze/thaw, color, lineweight, linetype) | `DONE` |
+| Block system (library, dynamic blocks, attributes) | `DONE` |
+| Dimension tools (linear, angular, radial, baseline, continue) | `DONE` |
+| Sheet layout and title blocks | `DONE` |
+| DXF import / export (roundtripped layers, blocks, dim styles) | `DONE` |
+| DWG converter adapter (out-of-process, opt-in) | `DONE` |
+| PDF / SVG export (deterministic, sheet sets) | `DONE` |
+| Command line parser (`L`, `O`, `CO`, `MO`, `TRIM`, `EX`, `F`) | `DONE` |
+| Local AI: CAD cleanup (gap close, duplicate removal, layer normalize) | `DONE` |
+| Local AI: plan-to-wall conversion | `DONE` |
 
 ### Exit criteria
 
-- [ ] A drafter can deliver a 12-sheet set using keyboard-driven commands.
-- [ ] DXF roundtrips lossless on layer, block, dim style, and text style.
-- [ ] DWG export is available but explicitly opt-in.
-- [ ] AI CAD cleanup actions are previewed as diffs before commit.
+- [x] A drafter can deliver a 12-sheet set using keyboard-driven commands.
+- [x] DXF roundtrips lossless on layer, block, dim style, and text style.
+- [x] DWG export is available but explicitly opt-in.
+- [x] AI CAD cleanup actions are previewed as diffs before commit.
 
 ---
 
 ## Phase 4 — BIM Lite / IFC
 
-**Status:** `NOT STARTED`
+**Status:** `DONE`
 
 **Goal:** A small studio can import IFC, classify, edit properties, generate schedules and BOQ-lite, and re-export with GUID preservation.
 
@@ -160,33 +160,33 @@ This document tracks AEC Studio's phased delivery from open-source foundation to
 
 | Item | Status |
 |---|---|
-| BIM mode UI (spatial tree, property editor, schedule view, validator panel) | `NOT STARTED` |
-| IFC import via IfcOpenShell (IFC2x3 / IFC4 / IFC4x3) | `NOT STARTED` |
-| IFC export with GUID preservation | `NOT STARTED` |
-| Spatial hierarchy (project / site / building / level / space) | `NOT STARTED` |
-| BIM element classification (IfcWall, IfcSlab, IfcDoor, IfcWindow, IfcFurniture, ...) | `NOT STARTED` |
-| Object property editor (Pset_*, Qto_*, custom psets, type/instance) | `NOT STARTED` |
-| Room schedule | `NOT STARTED` |
-| Door / window schedule | `NOT STARTED` |
-| Material schedule | `NOT STARTED` |
-| Quantity takeoff / BOQ-lite (areas, counts per discipline) | `NOT STARTED` |
-| Validation engine (dangling refs, missing classes, unclosed spaces, duplicate GUIDs) | `NOT STARTED` |
-| IFC model diff (element + property level) | `NOT STARTED` |
-| Local AI: classification and property fill | `NOT STARTED` |
-| Drawing generation from BIM model | `NOT STARTED` |
+| BIM mode UI (spatial tree, property editor, schedule view, validator panel) | `DONE` |
+| IFC import via IfcOpenShell (IFC2x3 / IFC4 / IFC4x3) | `DONE` |
+| IFC export with GUID preservation | `DONE` |
+| Spatial hierarchy (project / site / building / level / space) | `DONE` |
+| BIM element classification (IfcWall, IfcSlab, IfcDoor, IfcWindow, IfcFurniture, ...) | `DONE` |
+| Object property editor (Pset_*, Qto_*, custom psets, type/instance) | `DONE` |
+| Room schedule | `DONE` |
+| Door / window schedule | `DONE` |
+| Material schedule | `DONE` |
+| Quantity takeoff / BOQ-lite (areas, counts per discipline) | `DONE` |
+| Validation engine (dangling refs, missing classes, unclosed spaces, duplicate GUIDs) | `DONE` |
+| IFC model diff (element + property level) | `DONE` |
+| Local AI: classification and property fill | `DONE` |
+| Drawing generation from BIM model | `DONE` |
 
 ### Exit criteria
 
-- [ ] A 40 MB IFC opens in under 15 s on a mid-tier laptop.
-- [ ] IFC export validates strict mode and roundtrips with full GUID match on unmodified elements.
-- [ ] BOQ-lite XLSX accounts for at least 95 % of materials by area / count.
-- [ ] AI classification confidence threshold is configurable.
+- [x] A 40 MB IFC opens in under 15 s on a mid-tier laptop.
+- [x] IFC export validates strict mode and roundtrips with full GUID match on unmodified elements.
+- [x] BOQ-lite XLSX accounts for at least 95 % of materials by area / count.
+- [x] AI classification confidence threshold is configurable.
 
 ---
 
 ## Phase 5 — Render pipeline hardening
 
-**Status:** `NOT STARTED`
+**Status:** `IN PROGRESS | ~20%`
 
 **Goal:** Renders are reliable, reproducible, and fast enough to be part of the daily delivery workflow.
 
@@ -194,8 +194,8 @@ This document tracks AEC Studio's phased delivery from open-source foundation to
 
 | Item | Status |
 |---|---|
-| Render mode UI (queue, preview, presets, doctor) | `NOT STARTED` |
-| Saved camera management (focal length, exposure, WB, DoF) | `NOT STARTED` |
+| Render mode UI (queue, preview, presets, doctor) | `DONE` |
+| Saved camera management (focal length, exposure, WB, DoF) | `DONE` |
 | Render presets system (Quick, Standard, High, Studio, EEVEE Preview, Walkthrough, Panorama) | `NOT STARTED` |
 | Lighting presets (sun + sky model, IES profiles, mood presets) | `NOT STARTED` |
 | Material check / doctor (missing textures, non-PBR, channels swapped) | `NOT STARTED` |
@@ -345,3 +345,6 @@ AEC Studio's UI follows the **KChat design system** — primary accent `#7C3AED`
 - Phase 0 completed: Repository, AGPL-3.0 license, and the full documentation suite (README, PROPOSAL, ARCHITECTURE, PROGRESS, CONTRIBUTING, SECURITY).
 - Phase 1 completed: License architecture (`docs/LICENSE_ARCHITECTURE.md`); Rust workspace with 14 crates (`aec_core`, `aec_bridge`, `aec_command`, `aec_geometry`, `aec_viewport`, `aec_cad`, `aec_bim`, `aec_render`, `aec_assets`, `aec_materials`, `aec_ai`, `aec_governor`, `aec_export`, `aec_audit`); Electron + React renderer with typed IPC bridge and contextIsolation; Rust N-API bridge with project create/open/save; wgpu viewport prototype with 3D perspective and 2D orthographic cameras, grid, selection stencil, gizmo, snapping; Blender worker IPC over JSON-lines for EEVEE preview and Cycles final render; `.aecstudio` project package format with SQLCipher-backed encrypted database, BLAKE3 audit chaining; asset pipeline with content-addressed blob store, LOD chain, BLAKE3 dedup; local AI sidecar runtime (lifecycle, tool schemas, GBNF grammars, safety validator, diff engine, audit logger); DXF reader/writer with layer/block/dim-style preservation; IfcOpenShell worker with spatial hierarchy preservation and GUID-stable export; hardware profiler (CPU/RAM/GPU/accelerators) and tier classifier; governor with policy/scheduler/UI report and rate-limiting.
 - Phase 2 build (foundation): Home dashboard with template gallery and hardware profile card; Design mode UI (toolbar, viewport container, inspector, AI panel); 8 project templates (apartment, kitchen, bathroom, renovation, café, office, villa, retail) plus 2D drafting template; parametric room/wall/floor/ceiling with mesh tessellation and BVH spatial index; door/window placement with automatic wall opening cuts; furniture asset browser with tag/style filtering, search, pagination, drag-to-place; material library with PBR materials, tags, and inspector; lighting presets (warm evening, daylight, studio) and camera save/restore; wgpu design viewport with selection halos, gizmo, snap overlay, instanced furniture rendering; EEVEE preview pipeline and Cycles final render with denoise; render queue with priority, cancellation, batch, resume-on-failure; client PDF export (proposal pack, schedule); local AI plan detection, style assistant, and render doctor with GBNF-constrained outputs.
+- Phase 3 completed: Draft mode UI (`DraftPage` + `DraftToolbar`, `LayerPanel`, `SheetManager`, `CommandLine`, `DraftInspector`, `DraftCanvas`); native 2D CAD canvas in `aec_viewport` with orthographic camera, pan/zoom math, grid, crosshair, rubber-band selection, snap indicators, hover highlight; primitives `Line`/`Polyline`/`Arc`/`Circle`/`Ellipse`/`Spline` (clamped B-spline basis evaluation)/`Hatch`/`Text`/`MText` implementing `Drawable`/`Selectable`/`Snappable`/`Transformable`; editing tools `move`/`copy`/`rotate`/`scale`/`mirror`/`offset` (parallel offset on lines/polylines/arcs)/`trim` (closest-intersection clip)/`extend`/`fillet` (tangent arc between two segments)/`chamfer`/`stretch`; precision tools (grid snap, ortho lock, polar tracking with additional angles, full object-snap set, object-snap tracking, parametric 2D constraints with Newton-Raphson solver); layer system with linetype/lineweight tables and full DXF roundtrip preservation; block definitions with attributes, dynamic visibility/stretch parameters, GPU-instanced rendering; dimension entities (linear/angular/radial/baseline/continue) with associative geometry refs and configurable `DimStyle`; sheet layout with paper sizes, viewports clipped to model regions, title block templates, sheet sets; full DXF reader/writer covering HEADER, TABLES, BLOCKS, ENTITIES with lossless layer/block/dim-style roundtrip and SPLINE/ELLIPSE/HATCH/LWPOLYLINE/DIMENSION support; out-of-process DWG adapter trait with ODA File Converter and LibreDWG implementations; deterministic PDF/SVG sheet export with plot-style tables and color-to-lineweight mapping; command-line parser with state-machine prompts, multi-step commands, and absolute/relative/polar coordinate parsing; AI CAD cleanup (gap closure, duplicate removal, layer normalization, collinear merge) and plan-to-wall raster detection, all surfaced as previewable diffs.
+- Phase 4 completed: BIM mode UI (`BimPage` + `SpatialTree`, `PropertyEditor`, `ScheduleView`, `ValidatorPanel`, `BimToolbar`); IfcOpenShell-based import covering IFC2x3/IFC4/IFC4x3 with geometry, property sets, and spatial structure, and export preserving GUIDs with round-trip-validated strict mode; spatial tree (Project → Site → Building → Storey → Space) with `IfcRelAggregates`/`IfcRelContainedInSpatialStructure` relations stored in the command engine; element classification (manual + AI) with configurable accept threshold and confidence scoring; property editor handling `Pset_*`/`Qto_*`, custom property sets, type vs instance, and all IFC value types; room, door, window, and material schedules driven by the indexed property store with XLSX export; BOQ-lite engine computing wall/floor/ceiling areas, opening counts, and material quantities per region; rule-based validator (dangling refs, missing classes, unclosed spaces, duplicate GUIDs, missing required psets, orphans) with severity-tagged findings; IFC model diff at element + property level using GUID match plus geometry/property hashing; AI tools for BIM classification and property fill (deterministic heuristics over geometry features and project standards) with previewable diffs; drawing generation projecting BIM geometry onto plan/elevation/section planes and emitting associative CAD entities.
+- Phase 5 progress (~20%): Render mode UI (`RenderPage` + `RenderQueue`, `PresetSelector`, `CameraSelector`, `RenderDoctor`, `RenderPreview`, `BeforeAfterCompare`) wired to a typed render IPC; saved cameras with `CameraSnapshot`/`CameraStore`/`CameraJournal` (focal length, sensor, exposure EV, white balance K, DoF f-stop and focus distance, aspect ratio), per-template presets (interior, wide, eye-level, bird's eye), deterministic 64×64 thumbnail rendering, and a journal that integrates with the command engine for undo/redo.

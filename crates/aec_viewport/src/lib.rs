@@ -6,6 +6,7 @@
 //! `aec_command` only ever talks to the state layer; the GPU code reads
 //! state but never mutates application data.
 
+pub mod cad_canvas;
 pub mod camera;
 pub mod gizmo;
 pub mod grid;
@@ -16,6 +17,10 @@ pub mod scene;
 pub mod selection;
 pub mod snap_overlay;
 
+pub use cad_canvas::{
+    compute_crosshair, compute_grid, CadCanvasState, CadGrid, CrosshairLines, GridLines,
+    OrthoCamera2D, RubberBand, WorldRect,
+};
 pub use camera::{Camera, CameraMode, OrbitController, Ray};
 pub use gizmo::{GizmoAxis, GizmoMode, TransformGizmo};
 pub use grid::{Grid, GridStyle};

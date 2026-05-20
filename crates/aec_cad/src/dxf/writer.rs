@@ -3,7 +3,8 @@
 use std::io::Write;
 
 use crate::dxf::entities::{
-    DxfArc, DxfCircle, DxfEntity, DxfInsert, DxfLine, DxfPolyline, DxfText,
+    DxfArc, DxfCircle, DxfDimension, DxfDimensionKind, DxfEllipse, DxfEntity, DxfHatch, DxfInsert,
+    DxfLine, DxfPolyline, DxfSpline, DxfText,
 };
 use crate::dxf::DxfDocument;
 use crate::error::CadResult;
@@ -28,8 +29,6 @@ impl DxfWriter {
 }
 
 fn write_pair<W: Write>(w: &mut W, code: i32, value: &str) -> CadResult<()> {
-    // DXF wants `code` right-aligned in width 3, but most parsers (including
-    // ours) accept any whitespace-stripped integer.
     writeln!(w, "{:>3}", code)?;
     writeln!(w, "{}", value)?;
     Ok(())
@@ -128,8 +127,12 @@ fn write_entities<W: Write>(doc: &DxfDocument, w: &mut W) -> CadResult<()> {
             DxfEntity::Polyline(e) => write_polyline(e, w)?,
             DxfEntity::Arc(e) => write_arc(e, w)?,
             DxfEntity::Circle(e) => write_circle(e, w)?,
+            DxfEntity::Ellipse(e) => write_ellipse(e, w)?,
+            DxfEntity::Spline(e) => write_spline(e, w)?,
+            DxfEntity::Hatch(e) => write_hatch(e, w)?,
             DxfEntity::Text(e) => write_text(e, w)?,
             DxfEntity::Insert(e) => write_insert(e, w)?,
+            DxfEntity::Dimension(e) => write_dimension(e, w)?,
         }
     }
     write_pair(w, 0, "ENDSEC")?;
@@ -155,8 +158,11 @@ fn write_polyline<W: Write>(e: &DxfPolyline, w: &mut W) -> CadResult<()> {
     write_pair(w, 70, &i32::from(e.closed).to_string())?;
     write_pair(w, 38, &fmt_f(e.elevation))?;
     for v in &e.vertices {
-        write_pair(w, 10, &fmt_f(v[0]))?;
-        write_pair(w, 20, &fmt_f(v[1]))?;
+        write_pair(w, 10, &fmt_f(v.x))?;
+        write_pair(w, 20, &fmt_f(v.y))?;
+        if v.bulge != 0.0 {
+            write_pair(w, 42, &fmt_f(v.bulge))?;
+        }
     }
     Ok(())
 }
@@ -180,6 +186,59 @@ fn write_circle<W: Write>(e: &DxfCircle, w: &mut W) -> CadResult<()> {
     write_pair(w, 20, &fmt_f(e.center[1]))?;
     write_pair(w, 30, &fmt_f(e.center[2]))?;
     write_pair(w, 40, &fmt_f(e.radius))?;
+    Ok(())
+}
+
+fn write_ellipse<W: Write>(e: &DxfEllipse, w: &mut W) -> CadResult<()> {
+    write_pair(w, 0, "ELLIPSE")?;
+    write_pair(w, 8, &e.layer)?;
+    write_pair(w, 10, &fmt_f(e.center[0]))?;
+    write_pair(w, 20, &fmt_f(e.center[1]))?;
+    write_pair(w, 30, &fmt_f(e.center[2]))?;
+    write_pair(w, 11, &fmt_f(e.major_axis[0]))?;
+    write_pair(w, 21, &fmt_f(e.major_axis[1]))?;
+    write_pair(w, 31, &fmt_f(e.major_axis[2]))?;
+    write_pair(w, 40, &fmt_f(e.ratio))?;
+    write_pair(w, 41, &fmt_f(e.start_param))?;
+    write_pair(w, 42, &fmt_f(e.end_param))?;
+    Ok(())
+}
+
+fn write_spline<W: Write>(e: &DxfSpline, w: &mut W) -> CadResult<()> {
+    write_pair(w, 0, "SPLINE")?;
+    write_pair(w, 8, &e.layer)?;
+    let flags = i32::from(e.closed);
+    write_pair(w, 70, &flags.to_string())?;
+    write_pair(w, 71, &e.degree.to_string())?;
+    write_pair(w, 72, &e.knots.len().to_string())?;
+    write_pair(w, 73, &e.control_points.len().to_string())?;
+    for k in &e.knots {
+        write_pair(w, 40, &fmt_f(*k))?;
+    }
+    for cp in &e.control_points {
+        write_pair(w, 10, &fmt_f(cp[0]))?;
+        write_pair(w, 20, &fmt_f(cp[1]))?;
+        write_pair(w, 30, &fmt_f(cp[2]))?;
+    }
+    Ok(())
+}
+
+fn write_hatch<W: Write>(e: &DxfHatch, w: &mut W) -> CadResult<()> {
+    write_pair(w, 0, "HATCH")?;
+    write_pair(w, 8, &e.layer)?;
+    write_pair(w, 2, &e.pattern_name)?;
+    write_pair(w, 70, &i32::from(e.solid).to_string())?;
+    write_pair(w, 38, &fmt_f(e.elevation))?;
+    write_pair(w, 40, &fmt_f(e.scale))?;
+    write_pair(w, 41, &fmt_f(e.angle))?;
+    write_pair(w, 91, &e.loops.len().to_string())?;
+    for lp in &e.loops {
+        write_pair(w, 93, &lp.vertices.len().to_string())?;
+        for v in &lp.vertices {
+            write_pair(w, 10, &fmt_f(v[0]))?;
+            write_pair(w, 20, &fmt_f(v[1]))?;
+        }
+    }
     Ok(())
 }
 
@@ -209,14 +268,50 @@ fn write_insert<W: Write>(e: &DxfInsert, w: &mut W) -> CadResult<()> {
     Ok(())
 }
 
+fn write_dimension<W: Write>(e: &DxfDimension, w: &mut W) -> CadResult<()> {
+    write_pair(w, 0, "DIMENSION")?;
+    write_pair(w, 8, &e.layer)?;
+    write_pair(w, 3, &e.style)?;
+    let kind_code = match e.kind {
+        DxfDimensionKind::Linear => 0,
+        DxfDimensionKind::Aligned => 1,
+        DxfDimensionKind::Angular => 2,
+        DxfDimensionKind::Diameter => 3,
+        DxfDimensionKind::Radial => 4,
+    };
+    write_pair(w, 70, &kind_code.to_string())?;
+    write_pair(w, 10, &fmt_f(e.def_point[0]))?;
+    write_pair(w, 20, &fmt_f(e.def_point[1]))?;
+    write_pair(w, 30, &fmt_f(e.def_point[2]))?;
+    write_pair(w, 11, &fmt_f(e.text_position[0]))?;
+    write_pair(w, 21, &fmt_f(e.text_position[1]))?;
+    write_pair(w, 31, &fmt_f(e.text_position[2]))?;
+    write_pair(w, 12, &fmt_f(e.def_point_a[0]))?;
+    write_pair(w, 22, &fmt_f(e.def_point_a[1]))?;
+    write_pair(w, 32, &fmt_f(e.def_point_a[2]))?;
+    write_pair(w, 13, &fmt_f(e.def_point_b[0]))?;
+    write_pair(w, 23, &fmt_f(e.def_point_b[1]))?;
+    write_pair(w, 33, &fmt_f(e.def_point_b[2]))?;
+    if let Some(t) = &e.override_text {
+        write_pair(w, 1, t)?;
+    }
+    if let Some(v) = e.measured_value {
+        write_pair(w, 42, &fmt_f(v))?;
+    }
+    Ok(())
+}
+
 fn fmt_f(v: f64) -> String {
-    // DXF uses dot decimal separator regardless of locale.
     format!("{:.10}", v)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dxf::entities::{
+        DxfDimension, DxfDimensionKind, DxfEllipse, DxfHatch, DxfHatchLoop, DxfPolylineVertex,
+        DxfSpline,
+    };
     use crate::dxf::DxfReader;
     use crate::layers::Layer;
 
@@ -239,7 +334,16 @@ mod tests {
         }));
         doc.push(DxfEntity::Polyline(DxfPolyline {
             layer: "WALLS".into(),
-            vertices: vec![[0.0, 0.0], [4000.0, 0.0], [4000.0, 3000.0], [0.0, 3000.0]],
+            vertices: vec![
+                DxfPolylineVertex::new(0.0, 0.0),
+                DxfPolylineVertex {
+                    x: 4000.0,
+                    y: 0.0,
+                    bulge: 0.5,
+                },
+                DxfPolylineVertex::new(4000.0, 3000.0),
+                DxfPolylineVertex::new(0.0, 3000.0),
+            ],
             closed: true,
             elevation: 0.0,
         }));
@@ -255,6 +359,37 @@ mod tests {
             center: [2000.0, 1500.0, 0.0],
             radius: 100.0,
         }));
+        doc.push(DxfEntity::Ellipse(DxfEllipse {
+            layer: "WALLS".into(),
+            center: [3000.0, 1500.0, 0.0],
+            major_axis: [500.0, 0.0, 0.0],
+            ratio: 0.5,
+            start_param: 0.0,
+            end_param: std::f64::consts::TAU,
+        }));
+        doc.push(DxfEntity::Spline(DxfSpline {
+            layer: "WALLS".into(),
+            degree: 3,
+            knots: vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+            control_points: vec![
+                [0.0, 0.0, 0.0],
+                [100.0, 100.0, 0.0],
+                [200.0, 100.0, 0.0],
+                [300.0, 0.0, 0.0],
+            ],
+            closed: false,
+        }));
+        doc.push(DxfEntity::Hatch(DxfHatch {
+            layer: "WALLS".into(),
+            pattern_name: "SOLID".into(),
+            solid: true,
+            scale: 1.0,
+            angle: 0.0,
+            elevation: 0.0,
+            loops: vec![DxfHatchLoop {
+                vertices: vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]],
+            }],
+        }));
         doc.push(DxfEntity::Text(DxfText {
             layer: "DIMS".into(),
             position: [500.0, 500.0, 0.0],
@@ -269,6 +404,17 @@ mod tests {
             scale: [1.0, 1.0, 1.0],
             rotation: 0.0,
         }));
+        doc.push(DxfEntity::Dimension(DxfDimension {
+            layer: "DIMS".into(),
+            style: "ARCH".into(),
+            kind: DxfDimensionKind::Linear,
+            def_point: [0.0, 0.0, 0.0],
+            text_position: [2000.0, -200.0, 0.0],
+            def_point_a: [0.0, 0.0, 0.0],
+            def_point_b: [4000.0, 0.0, 0.0],
+            override_text: None,
+            measured_value: Some(4000.0),
+        }));
         doc
     }
 
@@ -277,15 +423,11 @@ mod tests {
         let doc = rich_doc();
         let text = DxfWriter::write_to_string(&doc).unwrap();
         let parsed = DxfReader::read_str(&text).unwrap();
-        // Layer table preserved (3: "0" auto, plus 2 user-added).
         assert!(parsed.layers.get("WALLS").is_some());
         assert!(parsed.layers.get("DIMS").is_some());
-        // Block records preserved.
         assert_eq!(parsed.block_records.len(), 1);
         assert_eq!(parsed.block_records[0].name, "DOOR_900");
-        // DimStyles preserved (STANDARD + ARCH).
         assert!(parsed.dim_styles.iter().any(|d| d.name == "ARCH"));
-        // Entities preserved (order).
         assert_eq!(parsed.entities.len(), doc.entities.len());
         for (a, b) in parsed.entities.iter().zip(doc.entities.iter()) {
             assert_eq!(std::mem::discriminant(a), std::mem::discriminant(b));
@@ -293,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn polyline_roundtrips_vertices_and_closed_flag() {
+    fn polyline_roundtrips_vertices_and_closed_flag_and_bulge() {
         let doc = rich_doc();
         let text = DxfWriter::write_to_string(&doc).unwrap();
         let parsed = DxfReader::read_str(&text).unwrap();
@@ -302,8 +444,9 @@ mod tests {
         };
         assert_eq!(p.vertices.len(), 4);
         assert!(p.closed);
-        assert!((p.vertices[2][0] - 4000.0).abs() < 1e-6);
-        assert!((p.vertices[2][1] - 3000.0).abs() < 1e-6);
+        assert!((p.vertices[2].x - 4000.0).abs() < 1e-6);
+        assert!((p.vertices[2].y - 3000.0).abs() < 1e-6);
+        assert!((p.vertices[1].bulge - 0.5).abs() < 1e-6);
     }
 
     #[test]
@@ -317,5 +460,54 @@ mod tests {
         assert!((a.start_angle - 0.0).abs() < 1e-6);
         assert!((a.end_angle - 90.0).abs() < 1e-6);
         assert!((a.radius - 250.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn ellipse_ratio_roundtrip() {
+        let doc = rich_doc();
+        let text = DxfWriter::write_to_string(&doc).unwrap();
+        let parsed = DxfReader::read_str(&text).unwrap();
+        let DxfEntity::Ellipse(e) = &parsed.entities[4] else {
+            panic!("expected ellipse at index 4");
+        };
+        assert!((e.ratio - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn spline_control_points_roundtrip() {
+        let doc = rich_doc();
+        let text = DxfWriter::write_to_string(&doc).unwrap();
+        let parsed = DxfReader::read_str(&text).unwrap();
+        let DxfEntity::Spline(s) = &parsed.entities[5] else {
+            panic!("expected spline at index 5");
+        };
+        assert_eq!(s.control_points.len(), 4);
+        assert_eq!(s.knots.len(), 8);
+        assert_eq!(s.degree, 3);
+    }
+
+    #[test]
+    fn hatch_loops_roundtrip() {
+        let doc = rich_doc();
+        let text = DxfWriter::write_to_string(&doc).unwrap();
+        let parsed = DxfReader::read_str(&text).unwrap();
+        let DxfEntity::Hatch(h) = &parsed.entities[6] else {
+            panic!("expected hatch at index 6");
+        };
+        assert_eq!(h.loops.len(), 1);
+        assert_eq!(h.loops[0].vertices.len(), 4);
+        assert!(h.solid);
+    }
+
+    #[test]
+    fn dimension_roundtrip() {
+        let doc = rich_doc();
+        let text = DxfWriter::write_to_string(&doc).unwrap();
+        let parsed = DxfReader::read_str(&text).unwrap();
+        let DxfEntity::Dimension(d) = &parsed.entities[9] else {
+            panic!("expected dimension at index 9");
+        };
+        assert_eq!(d.kind, DxfDimensionKind::Linear);
+        assert_eq!(d.style, "ARCH");
     }
 }
