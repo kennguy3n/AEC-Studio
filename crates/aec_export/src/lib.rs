@@ -7,6 +7,7 @@ pub mod before_after;
 pub mod bim_pack;
 pub mod boq;
 pub mod contractor_pack;
+pub mod extension_targets;
 pub mod interior_pack;
 pub mod pdf;
 pub mod pdf_sheet;
@@ -21,6 +22,10 @@ pub use bim_pack::{BimPack, BimPackError, ValidationReport, ValidationReportKind
 pub use boq::{BoqExport, BoqExportError, BoqLine, BoqSection, RegionalConfig};
 pub use contractor_pack::{
     ContractorPack, ContractorPackError, ManifestEntry, PackFile, PackManifest,
+};
+pub use extension_targets::{
+    list_extension_export_targets, resolve_export_target, ExportFormat as ExtensionExportFormat,
+    ExportTargetExtensionError, ExtensionExportTarget,
 };
 pub use interior_pack::{InteriorPack, InteriorPackError, InteriorRender};
 pub use pdf::{PdfBuilder, PdfBuilderError};

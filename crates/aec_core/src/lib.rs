@@ -20,6 +20,8 @@ pub mod config;
 pub mod crypto;
 pub mod db;
 pub mod error;
+pub mod extension_permissions;
+pub mod extensions;
 #[cfg(feature = "kchat")]
 pub mod kchat;
 #[cfg(feature = "kchat")]
@@ -35,6 +37,17 @@ pub mod version_diff;
 
 pub use config::{HardwareProfile, ProjectConfig, ProjectSettings};
 pub use error::{AecError, AecResult};
+pub use extension_permissions::{
+    validate_manifest, verify_signature_against, verify_signature_self_consistent, ManifestError,
+    Operation, PermissionCheck, PermissionEnforcer, SignatureError, TrustStore,
+};
+pub use extensions::{
+    canonical_payload_bytes, AiToolBody, AssetEntry, AssetEntryKind, AssetPackBody, ExportFormat,
+    ExportTargetBody, ExtensionId, ExtensionLoader, ExtensionManifest, ExtensionRegistry,
+    ExtensionSignature, ExtensionType, ImporterBody, LoadError, LoadOptions, LoadedExtension,
+    Permission, ScheduleBody, ScheduleColumnDef, ScheduleFormulaDef, ScheduleValueType,
+    TemplateBody,
+};
 #[cfg(feature = "kchat")]
 pub use kchat::{
     ingest_review, ingest_review_card, ApprovalStatus, ArtifactCard, AssetPackEntry,

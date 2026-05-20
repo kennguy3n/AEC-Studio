@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AecError, AecResult};
+use crate::extensions::{ExtensionRegistry, ExtensionType, LoadedExtension};
 use crate::types::{Region, Units};
 
 /// Templates use millimeters for all dimensions.
@@ -186,6 +187,70 @@ impl TemplateLoader {
             )));
         }
         Ok(tpl)
+    }
+
+    /// Load a template by key, consulting `registry` for
+    /// extension-supplied templates first and falling back to the on-disk
+    /// `templates/` tree. Extensions take precedence so users can
+    /// override shipped templates with a versioned, signed pack.
+    pub fn load_with_extensions(
+        &self,
+        registry: &ExtensionRegistry,
+        key: &str,
+    ) -> AecResult<TemplateDefinition> {
+        if let Some(ext) = registry.find_template(key) {
+            return self.load_extension_template(ext, key);
+        }
+        self.load(key)
+    }
+
+    fn load_extension_template(
+        &self,
+        ext: &LoadedExtension,
+        key: &str,
+    ) -> AecResult<TemplateDefinition> {
+        let Some(body) = ext.manifest.template.as_ref() else {
+            return Err(AecError::TemplateNotFound(key.to_string()));
+        };
+        let path = ext.root.join(&body.definition_path);
+        if !path.is_file() {
+            return Err(AecError::InvalidTemplate(format!(
+                "extension {} template file {} not found",
+                ext.manifest.id, path.display()
+            )));
+        }
+        let raw = fs::read_to_string(&path)?;
+        let mut tpl: TemplateDefinition =
+            serde_json::from_str(&raw).map_err(|e| AecError::InvalidTemplate(e.to_string()))?;
+        if tpl.template_id != key {
+            return Err(AecError::InvalidTemplate(format!(
+                "extension template {} claims template_id '{}' but manifest key is '{}'",
+                ext.manifest.id, tpl.template_id, key
+            )));
+        }
+        // Stamp the loaded template with the extension's category if the
+        // JSON doesn't already carry one, so downstream UI can group it.
+        if tpl.category.is_none() {
+            if let Some((category, _)) = key.split_once('.') {
+                tpl.category = Some(category.to_string());
+            }
+        }
+        Ok(tpl)
+    }
+
+    /// Discover keys from both on-disk templates and extension manifests.
+    /// Extension keys win on conflict.
+    pub fn discover_with_extensions(
+        &self,
+        registry: &ExtensionRegistry,
+    ) -> AecResult<Vec<String>> {
+        let mut keys: std::collections::BTreeSet<String> = self.discover()?.into_iter().collect();
+        for ext in registry.by_kind(ExtensionType::Template) {
+            if let Some(body) = ext.manifest.template.as_ref() {
+                keys.insert(body.key.clone());
+            }
+        }
+        Ok(keys.into_iter().collect())
     }
 
     /// Enumerate every category/file under `root`.
@@ -423,5 +488,81 @@ mod tests {
             .load("interior.legacy")
             .unwrap();
         assert_eq!(tpl.camera_presets[0].location_mm, [1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn extension_template_loads_via_loader_with_extensions() {
+        use crate::extensions::{
+            ExtensionId, ExtensionLoader, ExtensionManifest, ExtensionType, LoadOptions,
+            Permission, TemplateBody,
+        };
+        let td = tempfile::tempdir().unwrap();
+
+        // The on-disk template tree is empty; everything must come from
+        // the extension.
+        let templates_root = td.path().join("templates");
+        std::fs::create_dir_all(&templates_root).unwrap();
+
+        let ext_root = td.path().join("extensions");
+        let ext_dir = ext_root.join("studio.boutique");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        let tpl_relpath = std::path::PathBuf::from("templates/boutique.json");
+        std::fs::create_dir_all(ext_dir.join("templates")).unwrap();
+        let tpl_json = r#"{
+            "template_id": "interior.boutique_hotel",
+            "category": "interior",
+            "name": "Boutique Hotel",
+            "description": "Boutique room template from extension",
+            "region_defaults": {"EU": {"units": "mm", "standards": ["EN ISO 5457"]}},
+            "units": "mm",
+            "rooms": [
+                {"name": "Suite", "width_mm": 6000, "depth_mm": 4000, "height_mm": 2900}
+            ],
+            "default_walls": {"exterior_thickness_mm": 250, "interior_thickness_mm": 100},
+            "lighting_preset": "daylight",
+            "asset_shelf": [],
+            "camera_presets": []
+        }"#;
+        std::fs::write(ext_dir.join(&tpl_relpath), tpl_json).unwrap();
+
+        let manifest = ExtensionManifest {
+            id: ExtensionId("studio.boutique".into()),
+            name: "Boutique pack".into(),
+            version: "1.0.0".into(),
+            kind: ExtensionType::Template,
+            permissions: vec![Permission::FilesystemRead, Permission::GeometryRead],
+            signature: None,
+            license: "AGPL-3.0".into(),
+            description: "boutique templates".into(),
+            asset_pack: None,
+            template: Some(TemplateBody {
+                key: "interior.boutique_hotel".into(),
+                definition_path: tpl_relpath,
+            }),
+            schedule: None,
+            export_target: None,
+            ai_tool: None,
+            importer: None,
+        };
+        std::fs::write(
+            ext_dir.join("manifest.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let registry = ExtensionLoader::new(&ext_root)
+            .load(&LoadOptions::allow_unsigned())
+            .unwrap();
+        let loader = TemplateLoader::new(&templates_root);
+
+        let tpl = loader
+            .load_with_extensions(&registry, "interior.boutique_hotel")
+            .unwrap();
+        assert_eq!(tpl.template_id, "interior.boutique_hotel");
+        assert_eq!(tpl.rooms.len(), 1);
+        assert_eq!(tpl.rooms[0].name, "Suite");
+
+        let keys = loader.discover_with_extensions(&registry).unwrap();
+        assert!(keys.contains(&"interior.boutique_hotel".to_string()));
     }
 }

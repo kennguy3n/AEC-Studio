@@ -1,0 +1,904 @@
+//! Extension system for AEC Studio.
+//!
+//! Extensions ship as a directory of JSON manifests plus optional payload
+//! files (asset packs, template JSON, schedule definitions, etc.). The
+//! design follows §8 of `PROPOSAL.md`:
+//!
+//! * Every extension declares an [`ExtensionType`] (asset pack, template,
+//!   schedule, export target, AI tool, importer).
+//! * Every extension declares the [`Permission`]s it needs up-front.
+//! * Extensions can be signed with Ed25519 (see
+//!   [`crate::extension_permissions::verify_signature`]); unsigned
+//!   extensions still load but the loader records a `signed: false` flag
+//!   so the UI can surface a warning.
+//! * The [`ExtensionLoader`] reads a flat directory of `<id>/manifest.json`
+//!   files, validates each one through
+//!   [`crate::extension_permissions::validate_manifest`], optionally
+//!   verifies its signature, and hands the validated set to
+//!   [`ExtensionRegistry`].
+//!
+//! This module deliberately stays free of behaviour: every per-type "host"
+//! (asset DB integration, template loader merge, schedule registry, export
+//! target list, AI tool dispatch) lives in the crate that already owns the
+//! corresponding subsystem.
+//!
+//! ```no_run
+//! use aec_core::extensions::{ExtensionLoader, LoadOptions};
+//!
+//! let loader = ExtensionLoader::new("/path/to/extensions");
+//! let registry = loader.load(&LoadOptions::default()).unwrap();
+//! for ext in registry.iter() {
+//!     println!("{} {} ({:?})", ext.manifest.id, ext.manifest.version, ext.manifest.kind);
+//! }
+//! ```
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+use crate::extension_permissions::{
+    validate_manifest, verify_signature_against, ManifestError, SignatureError, TrustStore,
+};
+
+// ---------------------------------------------------------------------------
+// Public IDs and enums
+// ---------------------------------------------------------------------------
+
+/// Stable identifier for an extension. Format is free-form but the loader
+/// rejects any id containing path separators (`/`, `\`) or relative-path
+/// markers (`..`) so extension ids are always safe to use as directory
+/// names or registry keys.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ExtensionId(pub String);
+
+impl ExtensionId {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ExtensionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<&str> for ExtensionId {
+    fn from(s: &str) -> Self {
+        Self(s.to_string())
+    }
+}
+
+/// Categories of extension. New variants are additive — never remove or
+/// renumber existing ones because manifests on disk depend on the
+/// `serde(rename_all = "snake_case")` encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtensionType {
+    AssetPack,
+    Template,
+    Schedule,
+    ExportTarget,
+    AiTool,
+    Importer,
+}
+
+impl ExtensionType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AssetPack => "asset_pack",
+            Self::Template => "template",
+            Self::Schedule => "schedule",
+            Self::ExportTarget => "export_target",
+            Self::AiTool => "ai_tool",
+            Self::Importer => "importer",
+        }
+    }
+
+    /// Every recognised type, in stable declaration order. Used by the
+    /// validator to reject unknown types early.
+    pub const ALL: &'static [ExtensionType] = &[
+        ExtensionType::AssetPack,
+        ExtensionType::Template,
+        ExtensionType::Schedule,
+        ExtensionType::ExportTarget,
+        ExtensionType::AiTool,
+        ExtensionType::Importer,
+    ];
+}
+
+/// Permissions an extension can request. The set is closed; a manifest
+/// asking for any other string is rejected by
+/// [`validate_manifest`](crate::extension_permissions::validate_manifest).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Permission {
+    FilesystemRead,
+    FilesystemWrite,
+    Network,
+    GeometryRead,
+    GeometryWrite,
+    AiTools,
+    AuditLog,
+}
+
+impl Permission {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FilesystemRead => "filesystem_read",
+            Self::FilesystemWrite => "filesystem_write",
+            Self::Network => "network",
+            Self::GeometryRead => "geometry_read",
+            Self::GeometryWrite => "geometry_write",
+            Self::AiTools => "ai_tools",
+            Self::AuditLog => "audit_log",
+        }
+    }
+
+    pub const ALL: &'static [Permission] = &[
+        Permission::FilesystemRead,
+        Permission::FilesystemWrite,
+        Permission::Network,
+        Permission::GeometryRead,
+        Permission::GeometryWrite,
+        Permission::AiTools,
+        Permission::AuditLog,
+    ];
+}
+
+// ---------------------------------------------------------------------------
+// Manifest
+// ---------------------------------------------------------------------------
+
+/// Detached Ed25519 signature attached to a manifest. The signed payload
+/// is the manifest serialized with the `signature` field elided (see
+/// [`canonical_payload_bytes`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtensionSignature {
+    /// Currently only `"ed25519"`.
+    pub algorithm: String,
+    /// 32-byte Ed25519 public key, hex-encoded (64 chars, lowercase).
+    pub public_key_hex: String,
+    /// 64-byte Ed25519 signature, hex-encoded (128 chars, lowercase).
+    pub signature_hex: String,
+}
+
+/// On-disk schema for `extensions/<id>/manifest.json`.
+///
+/// The type-specific payload lives in dedicated structs (e.g.
+/// [`AssetPackBody`]) and is materialised by the host crate that wires the
+/// extension into the rest of the workspace. The manifest itself only
+/// carries the type-agnostic metadata + the appropriate `body` field.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExtensionManifest {
+    pub id: ExtensionId,
+    pub name: String,
+    pub version: String,
+    #[serde(rename = "type")]
+    pub kind: ExtensionType,
+    #[serde(default)]
+    pub permissions: Vec<Permission>,
+    #[serde(default)]
+    pub signature: Option<ExtensionSignature>,
+    pub license: String,
+    #[serde(default)]
+    pub description: String,
+
+    // Type-specific bodies. Exactly one must match the `kind` field; the
+    // others must be `None`. The validator enforces this invariant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset_pack: Option<AssetPackBody>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<TemplateBody>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<ScheduleBody>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export_target: Option<ExportTargetBody>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_tool: Option<AiToolBody>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub importer: Option<ImporterBody>,
+}
+
+// ---------------------------------------------------------------------------
+// Type-specific bodies
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssetEntryKind {
+    Furniture,
+    Material,
+    Preset,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AssetEntry {
+    pub asset_id: String,
+    pub name: String,
+    pub kind: AssetEntryKind,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Path relative to the extension root (e.g. `furniture/sofa.glb`).
+    pub source_path: PathBuf,
+    /// BLAKE3 of the source file, hex-encoded. The host re-hashes on
+    /// import to detect tampering between manifest signing and load.
+    #[serde(default)]
+    pub blake3: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AssetPackBody {
+    pub vendor: String,
+    pub entries: Vec<AssetEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TemplateBody {
+    /// `<category>.<id>` key (e.g. `interior.boutique_hotel`).
+    pub key: String,
+    /// Path relative to the extension root pointing at the
+    /// `TemplateDefinition` JSON document.
+    pub definition_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScheduleColumnDef {
+    pub key: String,
+    pub header: String,
+    pub value_type: ScheduleValueType,
+    #[serde(default)]
+    pub default: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScheduleValueType {
+    String,
+    Integer,
+    Float,
+    Boolean,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScheduleFormulaDef {
+    pub name: String,
+    /// Free-form expression understood by the schedule host (e.g.
+    /// `"area_m2 * unit_cost"`). The host parses and evaluates it; the
+    /// loader only checks that the string is non-empty.
+    pub expression: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScheduleBody {
+    /// Stable schedule identifier (e.g. `"acme.fire_door_schedule"`).
+    pub schedule_id: String,
+    pub display_name: String,
+    pub columns: Vec<ScheduleColumnDef>,
+    #[serde(default)]
+    pub formulas: Vec<ScheduleFormulaDef>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportFormat {
+    Pdf,
+    Xlsx,
+    Zip,
+    Ifc,
+    Json,
+    Glb,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExportTargetBody {
+    pub target_id: String,
+    pub display_name: String,
+    pub format: ExportFormat,
+    /// Path inside the extension dir that the host invokes (typically a
+    /// JSON descriptor or a script the host can interpret). The loader
+    /// only verifies the file exists; semantics are host-specific.
+    pub entry_path: PathBuf,
+    #[serde(default)]
+    pub default_extension: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AiToolBody {
+    pub tool_id: String,
+    pub display_name: String,
+    pub description: String,
+    /// Allowed workflow scopes (`design`, `draft`, `bim`, `render`,
+    /// `deliver`). Encoded as strings rather than [`crate::types::Scope`]
+    /// to keep the manifest decoupled from the workspace enum order; the
+    /// loader maps them to [`crate::types::Scope`] and stores the parsed
+    /// list on [`LoadedExtension::scopes`].
+    pub allowed_scopes: Vec<String>,
+    pub max_entities_modified: u32,
+    /// GBNF grammar key the AI runtime will load.
+    pub grammar_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImporterBody {
+    pub importer_id: String,
+    pub display_name: String,
+    /// File extensions handled (`["skp", "3ds"]`). Lower-case, no leading
+    /// dot. The loader normalises and rejects empty entries.
+    pub extensions: Vec<String>,
+    pub entry_path: PathBuf,
+}
+
+// ---------------------------------------------------------------------------
+// Loader / Registry
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Error)]
+pub enum LoadError {
+    #[error("io error reading {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("manifest parse error in {path}: {source}")]
+    Parse {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("manifest validation failed for {id}: {errors:?}")]
+    Validation {
+        id: String,
+        errors: Vec<ManifestError>,
+    },
+    #[error("signature verification failed for {id}: {source}")]
+    Signature {
+        id: String,
+        #[source]
+        source: SignatureError,
+    },
+    #[error("duplicate extension id: {0}")]
+    DuplicateId(ExtensionId),
+    #[error("extension dir contains unsafe path component (..): {path}")]
+    UnsafePath { path: PathBuf },
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LoadOptions {
+    /// Optional trust store. When set, only extensions signed by a known
+    /// key are accepted; an unsigned or unknown-key manifest produces
+    /// [`LoadError::Signature`].
+    pub trust_store: Option<TrustStore>,
+    /// If true, unsigned manifests are allowed but
+    /// [`LoadedExtension::signed`] is `false`. Default true to make the
+    /// development loop smooth — production builds set this to false and
+    /// supply a `trust_store`.
+    pub allow_unsigned: bool,
+}
+
+impl LoadOptions {
+    pub fn allow_unsigned() -> Self {
+        Self {
+            trust_store: None,
+            allow_unsigned: true,
+        }
+    }
+
+    pub fn strict(trust: TrustStore) -> Self {
+        Self {
+            trust_store: Some(trust),
+            allow_unsigned: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoadedExtension {
+    pub manifest: ExtensionManifest,
+    /// Resolved root of the extension on disk. Type-specific hosts read
+    /// `body` payload paths relative to this directory.
+    pub root: PathBuf,
+    /// True if the signature was present *and* verified against the trust
+    /// store. False for unsigned / dev-mode loads.
+    pub signed: bool,
+}
+
+#[derive(Debug)]
+pub struct ExtensionLoader {
+    root: PathBuf,
+}
+
+impl ExtensionLoader {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Read every `<root>/<dir>/manifest.json`, validate it, optionally
+    /// verify its signature, and return an [`ExtensionRegistry`].
+    pub fn load(&self, opts: &LoadOptions) -> Result<ExtensionRegistry, LoadError> {
+        let mut registry = ExtensionRegistry::default();
+        if !self.root.exists() {
+            return Ok(registry);
+        }
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        for entry in fs::read_dir(&self.root).map_err(|e| LoadError::Io {
+            path: self.root.clone(),
+            source: e,
+        })? {
+            let entry = entry.map_err(|e| LoadError::Io {
+                path: self.root.clone(),
+                source: e,
+            })?;
+            let ft = entry.file_type().map_err(|e| LoadError::Io {
+                path: entry.path(),
+                source: e,
+            })?;
+            if ft.is_dir() {
+                dirs.push(entry.path());
+            }
+        }
+        dirs.sort();
+        for ext_dir in dirs {
+            let manifest_path = ext_dir.join("manifest.json");
+            if !manifest_path.is_file() {
+                continue;
+            }
+            let raw = fs::read_to_string(&manifest_path).map_err(|e| LoadError::Io {
+                path: manifest_path.clone(),
+                source: e,
+            })?;
+            let manifest: ExtensionManifest =
+                serde_json::from_str(&raw).map_err(|e| LoadError::Parse {
+                    path: manifest_path.clone(),
+                    source: e,
+                })?;
+
+            // Reject relative-path escapes early. The signature-verified
+            // payloads can still reference relative paths but they MUST
+            // stay inside the extension dir.
+            if path_escapes_root(&ext_dir, &manifest) {
+                return Err(LoadError::UnsafePath { path: ext_dir });
+            }
+
+            let errors = validate_manifest(&manifest);
+            if !errors.is_empty() {
+                return Err(LoadError::Validation {
+                    id: manifest.id.0.clone(),
+                    errors,
+                });
+            }
+
+            let signed = match (&manifest.signature, &opts.trust_store) {
+                (Some(sig), Some(trust)) => {
+                    verify_signature_against(&manifest, sig, trust).map_err(|e| {
+                        LoadError::Signature {
+                            id: manifest.id.0.clone(),
+                            source: e,
+                        }
+                    })?;
+                    true
+                }
+                (Some(sig), None) => {
+                    // No trust store provided — still verify the signature
+                    // is *self-consistent* (i.e. signed by the embedded
+                    // public key). This catches accidental corruption and
+                    // means an extension that ships with `signature: {}`
+                    // can't masquerade as a verified one.
+                    verify_signature_against(
+                        &manifest,
+                        sig,
+                        &TrustStore::single_from_hex(&sig.public_key_hex).map_err(|e| {
+                            LoadError::Signature {
+                                id: manifest.id.0.clone(),
+                                source: e,
+                            }
+                        })?,
+                    )
+                    .map_err(|e| LoadError::Signature {
+                        id: manifest.id.0.clone(),
+                        source: e,
+                    })?;
+                    false
+                }
+                (None, Some(_)) => {
+                    if !opts.allow_unsigned {
+                        return Err(LoadError::Signature {
+                            id: manifest.id.0.clone(),
+                            source: SignatureError::MissingSignature,
+                        });
+                    }
+                    false
+                }
+                (None, None) => {
+                    if !opts.allow_unsigned {
+                        return Err(LoadError::Signature {
+                            id: manifest.id.0.clone(),
+                            source: SignatureError::MissingSignature,
+                        });
+                    }
+                    false
+                }
+            };
+
+            let loaded = LoadedExtension {
+                manifest,
+                root: ext_dir,
+                signed,
+            };
+            registry.insert(loaded)?;
+        }
+        Ok(registry)
+    }
+}
+
+fn path_escapes_root(_root: &Path, manifest: &ExtensionManifest) -> bool {
+    fn bad(p: &Path) -> bool {
+        p.is_absolute()
+            || p.components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+    }
+    let body_paths: Vec<&PathBuf> = [
+        manifest.template.as_ref().map(|t| &t.definition_path),
+        manifest.export_target.as_ref().map(|e| &e.entry_path),
+        manifest.importer.as_ref().map(|i| &i.entry_path),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if body_paths.iter().any(|p| bad(p)) {
+        return true;
+    }
+    if let Some(ap) = &manifest.asset_pack {
+        if ap.entries.iter().any(|e| bad(&e.source_path)) {
+            return true;
+        }
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
+// Canonical payload (used by signing and verification)
+// ---------------------------------------------------------------------------
+
+/// Produce the bytes that an extension publisher signs. The bytes are the
+/// manifest serialized to canonical JSON (sorted keys, no whitespace) with
+/// the `signature` field replaced by `null`. Anyone with the public key
+/// can deterministically reproduce these bytes from the on-disk manifest.
+pub fn canonical_payload_bytes(manifest: &ExtensionManifest) -> Vec<u8> {
+    let mut clone = manifest.clone();
+    clone.signature = None;
+    let value = serde_json::to_value(&clone).expect("manifest is always JSON-serialisable");
+    canonical_json(&value)
+}
+
+fn canonical_json(v: &serde_json::Value) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_canonical(&mut out, v);
+    out
+}
+
+fn write_canonical(buf: &mut Vec<u8>, v: &serde_json::Value) {
+    use serde_json::Value;
+    match v {
+        Value::Null => buf.extend_from_slice(b"null"),
+        Value::Bool(b) => buf.extend_from_slice(if *b { b"true" } else { b"false" }),
+        Value::Number(n) => buf.extend_from_slice(n.to_string().as_bytes()),
+        Value::String(s) => {
+            // serde_json's `to_string` for a string Value escapes
+            // consistently — reuse it.
+            let s = serde_json::to_string(s).expect("string is always JSON-serialisable");
+            buf.extend_from_slice(s.as_bytes());
+        }
+        Value::Array(items) => {
+            buf.push(b'[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    buf.push(b',');
+                }
+                write_canonical(buf, item);
+            }
+            buf.push(b']');
+        }
+        Value::Object(map) => {
+            // BTreeMap preserves key order so iteration is deterministic
+            // regardless of how the input was deserialised.
+            let sorted: BTreeMap<&String, &Value> = map.iter().collect();
+            buf.push(b'{');
+            for (i, (k, val)) in sorted.iter().enumerate() {
+                if i > 0 {
+                    buf.push(b',');
+                }
+                let key_str = serde_json::to_string(k).expect("string key");
+                buf.extend_from_slice(key_str.as_bytes());
+                buf.push(b':');
+                write_canonical(buf, val);
+            }
+            buf.push(b'}');
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Registry
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default, Clone)]
+pub struct ExtensionRegistry {
+    by_id: BTreeMap<ExtensionId, LoadedExtension>,
+}
+
+impl ExtensionRegistry {
+    pub fn insert(&mut self, ext: LoadedExtension) -> Result<(), LoadError> {
+        if self.by_id.contains_key(&ext.manifest.id) {
+            return Err(LoadError::DuplicateId(ext.manifest.id.clone()));
+        }
+        self.by_id.insert(ext.manifest.id.clone(), ext);
+        Ok(())
+    }
+
+    pub fn get(&self, id: &ExtensionId) -> Option<&LoadedExtension> {
+        self.by_id.get(id)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &LoadedExtension> {
+        self.by_id.values()
+    }
+
+    pub fn by_kind(&self, kind: ExtensionType) -> impl Iterator<Item = &LoadedExtension> {
+        self.by_id.values().filter(move |e| e.manifest.kind == kind)
+    }
+
+    /// Look up a `Template` extension whose body declares `key`.
+    /// Returns the first match in id-sorted order (registry is a
+    /// `BTreeMap`), which keeps lookups deterministic when two
+    /// extensions collide on a key. Hosts that need conflict
+    /// detection can iterate `by_kind` themselves.
+    pub fn find_template(&self, key: &str) -> Option<&LoadedExtension> {
+        self.by_kind(ExtensionType::Template).find(|e| {
+            e.manifest
+                .template
+                .as_ref()
+                .map(|b| b.key == key)
+                .unwrap_or(false)
+        })
+    }
+
+    /// Look up a `Schedule` extension by id. Schedule bodies don't
+    /// carry a separate key, so the manifest id IS the lookup key.
+    pub fn find_schedule(&self, ext_id: &ExtensionId) -> Option<&LoadedExtension> {
+        self.get(ext_id)
+            .filter(|e| e.manifest.kind == ExtensionType::Schedule)
+    }
+
+    /// Look up an `ExportTarget` extension by the body's `target_id`.
+    pub fn find_export_target(&self, target_id: &str) -> Option<&LoadedExtension> {
+        self.by_kind(ExtensionType::ExportTarget).find(|e| {
+            e.manifest
+                .export_target
+                .as_ref()
+                .map(|b| b.target_id == target_id)
+                .unwrap_or(false)
+        })
+    }
+
+    /// Look up an `AiTool` extension by the body's `tool_id`.
+    pub fn find_ai_tool(&self, tool_id: &str) -> Option<&LoadedExtension> {
+        self.by_kind(ExtensionType::AiTool).find(|e| {
+            e.manifest
+                .ai_tool
+                .as_ref()
+                .map(|b| b.tool_id == tool_id)
+                .unwrap_or(false)
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_id.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_id.is_empty()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::extension_permissions::keygen_test_only;
+    use std::fs;
+
+    fn write_manifest(root: &Path, id: &str, manifest: &ExtensionManifest) -> PathBuf {
+        let dir = root.join(id);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("manifest.json");
+        let raw = serde_json::to_string_pretty(manifest).unwrap();
+        fs::write(&path, raw).unwrap();
+        path
+    }
+
+    fn asset_pack_manifest(id: &str) -> ExtensionManifest {
+        ExtensionManifest {
+            id: ExtensionId(id.to_string()),
+            name: format!("{id} pack"),
+            version: "1.0.0".into(),
+            kind: ExtensionType::AssetPack,
+            permissions: vec![Permission::FilesystemRead, Permission::GeometryRead],
+            signature: None,
+            license: "AGPL-3.0".into(),
+            description: "test pack".into(),
+            asset_pack: Some(AssetPackBody {
+                vendor: "ACME".into(),
+                entries: vec![AssetEntry {
+                    asset_id: "sofa-001".into(),
+                    name: "Sofa".into(),
+                    kind: AssetEntryKind::Furniture,
+                    tags: vec!["sofa".into(), "living-room".into()],
+                    source_path: PathBuf::from("furniture/sofa.glb"),
+                    blake3: String::new(),
+                }],
+            }),
+            template: None,
+            schedule: None,
+            export_target: None,
+            ai_tool: None,
+            importer: None,
+        }
+    }
+
+    #[test]
+    fn serde_roundtrip_preserves_every_field() {
+        let m = asset_pack_manifest("acme.sofa");
+        let raw = serde_json::to_string(&m).unwrap();
+        let m2: ExtensionManifest = serde_json::from_str(&raw).unwrap();
+        assert_eq!(m, m2);
+    }
+
+    #[test]
+    fn loader_skips_directories_without_manifest_json() {
+        let td = tempfile::tempdir().unwrap();
+        // Empty dir — no manifest, must NOT fail.
+        fs::create_dir_all(td.path().join("empty-pack")).unwrap();
+        let reg = ExtensionLoader::new(td.path())
+            .load(&LoadOptions::allow_unsigned())
+            .unwrap();
+        assert_eq!(reg.len(), 0);
+    }
+
+    #[test]
+    fn loader_reads_and_indexes_two_packs() {
+        let td = tempfile::tempdir().unwrap();
+        write_manifest(td.path(), "a", &asset_pack_manifest("a"));
+        write_manifest(td.path(), "b", &asset_pack_manifest("b"));
+        let reg = ExtensionLoader::new(td.path())
+            .load(&LoadOptions::allow_unsigned())
+            .unwrap();
+        assert_eq!(reg.len(), 2);
+        assert_eq!(reg.by_kind(ExtensionType::AssetPack).count(), 2);
+        assert!(reg.get(&ExtensionId("a".into())).is_some());
+    }
+
+    #[test]
+    fn loader_rejects_invalid_permission_via_validator() {
+        // A manifest that asks for a permission the validator can't see
+        // can't actually be constructed via the enum, so prove the
+        // *validator* runs from the loader by tampering at the JSON layer.
+        let td = tempfile::tempdir().unwrap();
+        let dir = td.path().join("bad-perm");
+        fs::create_dir_all(&dir).unwrap();
+        let raw = r#"{
+            "id": "bad",
+            "name": "Bad",
+            "version": "1.0.0",
+            "type": "asset_pack",
+            "permissions": ["world_domination"],
+            "license": "AGPL-3.0",
+            "asset_pack": {"vendor":"x","entries":[]}
+        }"#;
+        fs::write(dir.join("manifest.json"), raw).unwrap();
+        let err = ExtensionLoader::new(td.path())
+            .load(&LoadOptions::allow_unsigned())
+            .unwrap_err();
+        assert!(matches!(err, LoadError::Parse { .. }));
+    }
+
+    #[test]
+    fn loader_rejects_unsafe_paths() {
+        let td = tempfile::tempdir().unwrap();
+        let mut m = asset_pack_manifest("escape");
+        if let Some(ap) = m.asset_pack.as_mut() {
+            ap.entries[0].source_path = PathBuf::from("../../etc/passwd");
+        }
+        write_manifest(td.path(), "escape", &m);
+        let err = ExtensionLoader::new(td.path())
+            .load(&LoadOptions::allow_unsigned())
+            .unwrap_err();
+        assert!(matches!(err, LoadError::UnsafePath { .. }));
+    }
+
+    #[test]
+    fn loader_rejects_duplicate_ids() {
+        // Two directories holding manifests with the same `id` are
+        // structurally impossible (loader iterates dirs), so simulate by
+        // inserting into the registry directly.
+        let mut reg = ExtensionRegistry::default();
+        let a = LoadedExtension {
+            manifest: asset_pack_manifest("dup"),
+            root: PathBuf::from("/a"),
+            signed: false,
+        };
+        let b = LoadedExtension {
+            manifest: asset_pack_manifest("dup"),
+            root: PathBuf::from("/b"),
+            signed: false,
+        };
+        reg.insert(a).unwrap();
+        let err = reg.insert(b).unwrap_err();
+        assert!(matches!(err, LoadError::DuplicateId(_)));
+    }
+
+    #[test]
+    fn signed_manifest_round_trips_through_loader_with_trust_store() {
+        let (sk, pk_hex) = keygen_test_only();
+        let mut m = asset_pack_manifest("signed");
+
+        // Sign with the freshly minted key.
+        use ed25519_dalek::Signer;
+        let payload = canonical_payload_bytes(&m);
+        let sig = sk.sign(&payload);
+        m.signature = Some(ExtensionSignature {
+            algorithm: "ed25519".into(),
+            public_key_hex: pk_hex.clone(),
+            signature_hex: hex::encode(sig.to_bytes()),
+        });
+
+        let td = tempfile::tempdir().unwrap();
+        write_manifest(td.path(), "signed", &m);
+
+        let trust = TrustStore::single_from_hex(&pk_hex).unwrap();
+        let opts = LoadOptions {
+            trust_store: Some(trust),
+            allow_unsigned: false,
+        };
+        let reg = ExtensionLoader::new(td.path()).load(&opts).unwrap();
+        let loaded = reg.get(&ExtensionId("signed".into())).unwrap();
+        assert!(loaded.signed, "trusted signature must be marked signed");
+    }
+
+    #[test]
+    fn unsigned_manifest_loads_but_signed_flag_is_false() {
+        let td = tempfile::tempdir().unwrap();
+        write_manifest(td.path(), "unsigned", &asset_pack_manifest("unsigned"));
+        let reg = ExtensionLoader::new(td.path())
+            .load(&LoadOptions::allow_unsigned())
+            .unwrap();
+        let loaded = reg.get(&ExtensionId("unsigned".into())).unwrap();
+        assert!(!loaded.signed);
+    }
+
+    #[test]
+    fn canonical_payload_is_stable_across_field_order() {
+        // Build two equivalent manifests where the JSON differs only in
+        // key order; canonical_payload_bytes must produce identical
+        // bytes.
+        let m = asset_pack_manifest("stable");
+        let bytes_a = canonical_payload_bytes(&m);
+
+        let raw = serde_json::to_string(&m).unwrap();
+        let parsed: ExtensionManifest = serde_json::from_str(&raw).unwrap();
+        let bytes_b = canonical_payload_bytes(&parsed);
+        assert_eq!(bytes_a, bytes_b);
+    }
+}

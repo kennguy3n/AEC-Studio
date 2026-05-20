@@ -7,6 +7,7 @@
 
 pub mod db;
 pub mod error;
+pub mod extension_host;
 pub mod lod;
 pub mod metadata;
 pub mod pipeline;
@@ -14,6 +15,7 @@ pub mod query;
 
 pub use db::AssetDatabase;
 pub use error::{AssetError, AssetResult};
+pub use extension_host::{install_asset_packs, AssetExtensionError, InstallSummary};
 pub use lod::{LodChain, LodLevel};
 pub use metadata::{AssetMetadata, License, MeshBlob, ThumbnailKind, Vendor};
 pub use pipeline::{AssetImportPipeline, ImportRequest, ImportSummary};
