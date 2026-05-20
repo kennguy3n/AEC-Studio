@@ -174,8 +174,20 @@ impl IfcReader {
                 other => {
                     // Anything else with a 9-field shape and a
                     // `tag::eid` name is an element.
+                    //
+                    // We split on the LAST `::` (rsplit_once) rather
+                    // than the first. The writer composes
+                    // `{IfcTag}::{EntityId}` and `EntityId::Display`
+                    // is a stable UUID format that cannot contain
+                    // `::`, but `IfcClass::Other(s)` allows the
+                    // tag itself to contain arbitrary characters
+                    // including `::` (e.g. a future
+                    // `Other("Some::Custom::Type")` produced by an
+                    // extension classifier). Splitting from the
+                    // right makes that contract robust — the eid is
+                    // always the suffix after the final `::`.
                     if let Ok(name) = g.string_arg(3) {
-                        if let Some((tag, eid)) = name.split_once("::") {
+                        if let Some((tag, eid)) = name.rsplit_once("::") {
                             // Unknown tags fall back to
                             // `IfcClass::Other(raw_kind)` so values
                             // produced by the AI classifier (e.g.
@@ -752,13 +764,26 @@ fn unquote(s: &str) -> IfcReadResult<String> {
 
 /// Reverse the writer's STEP string escaping.
 ///
-/// The writer encodes single quotes as `\'` and backslashes as `\\`.
+/// The writer encodes:
+///
+///   * single quotes as `\'`
+///   * backslashes as `\\`
+///   * newlines (`U+000A`) as `\n`
+///   * carriage returns (`U+000D`) as `\r`
+///   * tabs (`U+0009`) as `\t`
+///
 /// Chained `replace` calls cannot undo this safely (a naive
 /// `.replace("\\\\", "\\").replace("\\'", "'")` would turn the
 /// encoded literal `\\\'` — meaning a literal backslash followed by
 /// a literal quote — into `\'` and then into a literal quote, losing
 /// the backslash). A single left-to-right pass that consumes
 /// `\` + next-char as one unit is the only correct decoder.
+///
+/// The `\n` / `\r` / `\t` escapes exist so the reader can safely
+/// `text.lines()` the STEP byte stream without splitting a record
+/// across lines just because a user-supplied name contained a literal
+/// newline. The decoder maps them back to the original control
+/// characters so re-export is byte-identical for any input.
 fn unescape_step_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
@@ -767,6 +792,9 @@ fn unescape_step_string(s: &str) -> String {
             match chars.next() {
                 Some('\\') => out.push('\\'),
                 Some('\'') => out.push('\''),
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('t') => out.push('\t'),
                 Some(other) => {
                     // Unknown escape — keep the backslash and the
                     // following character verbatim so we don't
@@ -1096,6 +1124,98 @@ mod tests {
                 "'c\\\\d'".to_string(),
                 "(#1,#2)".to_string(),
             ],
+        );
+    }
+
+    #[test]
+    fn roundtrips_names_containing_newlines_tabs_and_carriage_returns() {
+        // A user-supplied space name with embedded control chars is a
+        // realistic data-entry hazard (copy/paste from an external
+        // doc, Windows CRLF line endings, etc.). Pre-fix, the writer
+        // emitted a literal newline into the STEP record, which the
+        // reader's line-based tokenizer split across two lines —
+        // producing an opaque `Malformed` error. The escape/unescape
+        // pair must now preserve these bytes verbatim.
+        let mut project = Project::new("Multi\nline\tProject\rRoot");
+        let site = project
+            .add_child(&project.root.clone(), IfcClass::IfcSite, "Site\nA")
+            .unwrap();
+        let _storey = project
+            .add_child(&site, IfcClass::IfcBuildingStorey, "Floor\tOne\rGround")
+            .unwrap();
+
+        let classification = ClassificationStore::new();
+        let props = PropertyStore::new();
+        let s = crate::ifc::IfcWriter::to_string(&project, &classification, &props);
+
+        // Re-parse and confirm the original control characters
+        // survived the round-trip on every spatial node we authored.
+        let snap = IfcReader::from_string(&s).expect("control-char names round-trip");
+        let names: Vec<&str> = snap
+            .project
+            .nodes
+            .values()
+            .map(|n| n.name.as_str())
+            .collect();
+        assert!(
+            names.contains(&"Multi\nline\tProject\rRoot"),
+            "project name lost control chars: {names:?}",
+        );
+        assert!(
+            names.contains(&"Site\nA"),
+            "site name lost newline: {names:?}",
+        );
+        assert!(
+            names.contains(&"Floor\tOne\rGround"),
+            "storey name lost tab/CR: {names:?}",
+        );
+    }
+
+    #[test]
+    fn ifc_class_other_with_double_colons_in_tag_roundtrips() {
+        // `IfcClass::Other(s)` allows the tag to contain arbitrary
+        // characters — an extension classifier could produce
+        // e.g. `Other("Some::Custom::Type")`. The writer composes the
+        // element's Name field as `{tag}::{entity_id}`, so the reader
+        // must split from the RIGHT to recover the eid as the suffix
+        // after the final `::`. Splitting from the left (the
+        // pre-fix behavior) would mis-identify the tag as just
+        // `"Some"` and break the EntityId parse.
+        let mut project = Project::new("OtherRT");
+        let site = project
+            .add_child(&project.root.clone(), IfcClass::IfcSite, "S")
+            .unwrap();
+        let bldg = project
+            .add_child(&site, IfcClass::IfcBuilding, "B")
+            .unwrap();
+        let storey = project
+            .add_child(&bldg, IfcClass::IfcBuildingStorey, "L01")
+            .unwrap();
+
+        let mut classification = ClassificationStore::new();
+        let props = PropertyStore::new();
+        let el = EntityId::new();
+        project.attach_element(&storey, el.clone());
+        classification.assign_manual(el.clone(), IfcClass::Other("Some::Custom::Type".into()));
+
+        let s = crate::ifc::IfcWriter::to_string(&project, &classification, &props);
+        let snap = IfcReader::from_string(&s).expect("Other(...) with '::' in tag must round-trip");
+        let class = snap
+            .classification
+            .accepted_for(&el)
+            .expect("element classified");
+        assert_eq!(
+            class,
+            &IfcClass::Other("Some::Custom::Type".into()),
+            "the full tag including embedded '::' must be preserved",
+        );
+        // The element's GUID must also have been recovered under the
+        // same EntityId — proving the rsplit_once split chose the
+        // correct boundary.
+        assert!(
+            snap.guid_by_entity.contains_key(&el),
+            "EntityId must survive the rsplit_once boundary: {:?}",
+            snap.guid_by_entity.keys().collect::<Vec<_>>(),
         );
     }
 

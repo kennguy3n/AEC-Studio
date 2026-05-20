@@ -350,13 +350,26 @@ DATA;\n";
 ///
 ///   * `\` is escaped as `\\`
 ///   * `'` is escaped as `\'`
+///   * `\n` (U+000A) is escaped as `\n` (backslash + ASCII 'n')
+///   * `\r` (U+000D) is escaped as `\r` (backslash + ASCII 'r')
+///   * `\t` (U+0009) is escaped as `\t` (backslash + ASCII 't')
 ///
-/// Order matters: backslashes must be doubled BEFORE single quotes are
-/// rewritten to `\'`, otherwise the `\` introduced for the quote would
-/// itself be doubled and corrupt the encoding.
+/// The newline / carriage-return / tab escapes are critical for
+/// correctness: the reader tokenises the STEP byte stream with
+/// [`str::lines`] under the assumption that one `#N = TYPE(...);`
+/// record fits on a single line. A literal newline in a user-supplied
+/// name (e.g. a multi-line space description copy-pasted by an
+/// operator) would otherwise split the record across two lines and
+/// surface as an opaque `IfcReadError::Malformed` on re-import.
+///
+/// Order matters: backslashes must be doubled BEFORE the other
+/// substitutions, otherwise the `\` introduced for an escaped quote
+/// or newline would itself be doubled and corrupt the encoding. The
+/// `match` arm on `'\\'` runs first by construction.
 ///
 /// This is not ISO 10303-21 canonical (canonical STEP doubles single
-/// quotes as `''`), but matches the reader's single-pass unescape in
+/// quotes as `''` and uses `\X\` / `\X2\` / `\X4\` for control
+/// characters), but matches the reader's single-pass unescape in
 /// [`unescape_step_string`]. The module docs explicitly state this
 /// reader/writer pair is for AEC Studio's in-process IFC pipeline and
 /// not intended for interop with third-party IFC tooling.
@@ -366,6 +379,9 @@ fn escape_step_string(s: &str) -> String {
         match c {
             '\\' => out.push_str("\\\\"),
             '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
             _ => out.push(c),
         }
     }
