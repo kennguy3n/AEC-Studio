@@ -58,6 +58,17 @@ jobs:
   gate:
     name: Gate (compute OS matrix)
     runs-on: ubuntu-latest
+    # Skip the entire workflow when the trigger is a `labeled` /
+    # `unlabeled` event on a label that doesn't change CI scope.
+    # `test-all-platforms` flips the matrix; any other label
+    # (e.g. `needs-review`, `priority-high`) must not burn runner
+    # minutes or cancel an in-progress legitimate run. The first
+    # half of the predicate keeps the default `opened`,
+    # `synchronize`, `reopened`, and all `push` events flowing.
+    if: >-
+      github.event.action != 'labeled' &&
+      github.event.action != 'unlabeled' ||
+      github.event.label.name == 'test-all-platforms'
     outputs:
       os_matrix: ${{ steps.matrix.outputs.os_matrix }}
     steps:
@@ -165,6 +176,11 @@ jobs:
   python-workers:
     name: Python workers (ubuntu-latest)
     runs-on: ubuntu-latest
+    # `needs: gate` is structural — the gate guards the whole
+    # workflow against unrelated label-change re-fires (see the
+    # `if:` on `gate`). Without this dependency, label triage on an
+    # unrelated label would still spin up the Python worker matrix.
+    needs: gate
     steps:
       - uses: actions/checkout@v4
 
@@ -202,6 +218,17 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-3-0 libnss3 libxss1 libasound2 libnotify4
+
+      # `npm run build` invokes the napi-rs build for the
+      # `aec_bridge` native addon, which needs a Rust toolchain on
+      # the packaging runner itself (the `rust` job runs on a
+      # different machine, its toolchain is not shared). Without
+      # this step the Linux installer would either fail at
+      # `npm run build` or link in a stale prebuilt addon.
+      # Matches the equivalent step in `package-macos` and
+      # `package-windows`.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Install Node.js
         uses: actions/setup-node@v4
