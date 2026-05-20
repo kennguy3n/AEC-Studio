@@ -474,9 +474,9 @@ mod tests {
 
         // Admit two; complete one, leave the other half-running; the third remains queued.
         let first = q.admit().unwrap();
-        let _second = q.admit().unwrap();
+        let second = q.admit().unwrap();
         q.complete(&first.id, "out_a.png").unwrap();
-        q.update_progress(&_second.id, 0.5).unwrap();
+        q.update_progress(&second.id, 0.5).unwrap();
 
         let p = q.batch_progress(&sub.batch_id).unwrap();
         assert_eq!(p.total, 3);

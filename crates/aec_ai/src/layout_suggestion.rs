@@ -124,7 +124,7 @@ fn parse_proposal(v: &serde_json::Value) -> Option<LayoutProposal> {
     }
     let rotation_deg = v
         .get("rotation_deg")
-        .and_then(|x| x.as_f64())
+        .and_then(serde_json::Value::as_f64)
         .unwrap_or(0.0);
     let asset_id = v.get("asset_id").and_then(|x| x.as_str()).map(String::from);
     let target_entity = v

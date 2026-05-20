@@ -72,7 +72,10 @@ impl VersionDiff {
 
     /// Total number of changed entities across every category.
     pub fn total_changes(&self) -> usize {
-        self.by_category.values().map(|c| c.total_changes()).sum()
+        self.by_category
+            .values()
+            .map(DiffCounts::total_changes)
+            .sum()
     }
 
     /// Returns the changes for one category, filtered by change kind.

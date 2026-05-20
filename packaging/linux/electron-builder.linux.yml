@@ -1,0 +1,76 @@
+# electron-builder config for Linux targets.
+# Build the renderer + electron main bundle first (`npm run build` in
+# apps/desktop/), then point electron-builder at this file:
+#
+#   npx electron-builder --linux \
+#     --config packaging/linux/electron-builder.linux.yml \
+#     --projectDir apps/desktop
+#
+# Targets:
+# * AppImage — portable single-file binary, primary distribution form.
+# * deb       — Debian / Ubuntu native package; pulls libgtk-3-0, libnss3.
+# * snap      — confined Snap Store package (optional, behind --snap).
+#
+# Native dependencies the AppImage / deb runtime requires on Ubuntu 22.04+:
+#   libgtk-3-0, libnss3, libxss1, libasound2, libnotify4
+
+appId: ai.aec.studio
+productName: AEC Studio
+copyright: "© 2026 AEC Studio Authors"
+
+directories:
+  buildResources: packaging/linux/resources
+  output: dist/installers/linux
+
+files:
+  - dist-electron/**
+  - dist/**
+  - package.json
+  - node_modules/**
+
+linux:
+  category: Graphics
+  vendor: AEC Studio
+  synopsis: Local-first AEC desktop suite
+  description: |
+    AEC Studio is a local-first computer-aided design suite for
+    architects and engineers, combining CAD drafting, photoreal
+    rendering, BIM-lite exports, and on-device AI assistance.
+  desktop:
+    StartupNotify: "true"
+    StartupWMClass: "AEC Studio"
+    MimeType: "x-scheme-handler/aec;application/x-aec"
+  target:
+    - AppImage
+    - deb
+    - snap
+  icon: packaging/linux/resources/icons
+
+appImage:
+  license: LICENSE
+  artifactName: "${productName}-${version}-${arch}.AppImage"
+
+deb:
+  depends:
+    - libgtk-3-0
+    - libnss3
+    - libxss1
+    - libasound2
+    - libnotify4
+  recommends:
+    - blender
+  artifactName: "${productName}_${version}_${arch}.deb"
+
+snap:
+  grade: stable
+  confinement: strict
+  base: core22
+  summary: Local-first AEC desktop suite
+  plugs:
+    - default
+    - removable-media
+    - audio-playback
+    - opengl
+  artifactName: "${productName}_${version}_${arch}.snap"
+
+publish: null

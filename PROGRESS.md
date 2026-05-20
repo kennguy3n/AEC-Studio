@@ -104,7 +104,7 @@ This document tracks AEC Studio's phased delivery from open-source foundation to
 | Local AI: plan detection | `DONE` |
 | Local AI: style assistant | `DONE` |
 | Local AI: render doctor | `DONE` |
-| Local AI: layout suggestions | `NOT STARTED` |
+| Local AI: layout suggestions | `DONE` |
 
 ### Exit criteria
 
@@ -186,7 +186,7 @@ This document tracks AEC Studio's phased delivery from open-source foundation to
 
 ## Phase 5 — Render pipeline hardening
 
-**Status:** `IN PROGRESS | ~20%`
+**Status:** `IN PROGRESS | ~85%`
 
 **Goal:** Renders are reliable, reproducible, and fast enough to be part of the daily delivery workflow.
 
@@ -196,14 +196,14 @@ This document tracks AEC Studio's phased delivery from open-source foundation to
 |---|---|
 | Render mode UI (queue, preview, presets, doctor) | `DONE` |
 | Saved camera management (focal length, exposure, WB, DoF) | `DONE` |
-| Render presets system (Quick, Standard, High, Studio, EEVEE Preview, Walkthrough, Panorama) | `NOT STARTED` |
-| Lighting presets (sun + sky model, IES profiles, mood presets) | `NOT STARTED` |
-| Material check / doctor (missing textures, non-PBR, channels swapped) | `NOT STARTED` |
-| Batch render queue (multi-camera, multi-preset) | `NOT STARTED` |
-| Render history and before / after compare | `NOT STARTED` |
-| Panorama render (Cycles equirectangular) | `NOT STARTED` |
-| Walkthrough render (Cycles + camera path) | `NOT STARTED` |
-| Render resume on failure (frame-level for walkthrough) | `NOT STARTED` |
+| Render presets system (Quick, Standard, High, Studio, EEVEE Preview, Walkthrough, Panorama) | `DONE` |
+| Lighting presets (sun + sky model, IES profiles, mood presets) | `DONE` |
+| Material check / doctor (missing textures, non-PBR, channels swapped) | `DONE` |
+| Batch render queue (multi-camera, multi-preset) | `DONE` |
+| Render history and before / after compare | `DONE` |
+| Panorama render (Cycles equirectangular) | `DONE` |
+| Walkthrough render (Cycles + camera path) | `DONE` |
+| Render resume on failure (frame-level for walkthrough) | `DONE` |
 
 ### Exit criteria
 
@@ -216,7 +216,7 @@ This document tracks AEC Studio's phased delivery from open-source foundation to
 
 ## Phase 6 — Deliver and export
 
-**Status:** `NOT STARTED`
+**Status:** `IN PROGRESS | ~85%`
 
 **Goal:** A studio lead can ship a complete delivery package from one project — client, contractor, BIM, and revision-tracked.
 
@@ -224,17 +224,17 @@ This document tracks AEC Studio's phased delivery from open-source foundation to
 
 | Item | Status |
 |---|---|
-| Deliver mode UI (pack composer, export targets, revision manager) | `NOT STARTED` |
-| Client concept pack (cover, mood board, plan, renders, schedule) | `NOT STARTED` |
-| Interior package export (PDF + image archive + material schedule) | `NOT STARTED` |
-| Contractor handoff pack (sheets, schedules, IFC, BOQ-lite) | `NOT STARTED` |
-| BIM Lite export pack (IFC + sheets + validation report) | `NOT STARTED` |
-| Revision system (tagged snapshots, audit-linked) | `NOT STARTED` |
-| Version comparison (geometry, sheets, schedules) | `NOT STARTED` |
-| Before / after generation (renders, plans) | `NOT STARTED` |
-| Proposal PDF generation (AI-assisted cover paragraph) | `NOT STARTED` |
-| Material schedule export (XLSX) | `NOT STARTED` |
-| BOQ export (XLSX, configurable per region) | `NOT STARTED` |
+| Deliver mode UI (pack composer, export targets, revision manager) | `DONE` |
+| Client concept pack (cover, mood board, plan, renders, schedule) | `DONE` |
+| Interior package export (PDF + image archive + material schedule) | `DONE` |
+| Contractor handoff pack (sheets, schedules, IFC, BOQ-lite) | `DONE` |
+| BIM Lite export pack (IFC + sheets + validation report) | `DONE` |
+| Revision system (tagged snapshots, audit-linked) | `DONE` |
+| Version comparison (geometry, sheets, schedules) | `DONE` |
+| Before / after generation (renders, plans) | `DONE` |
+| Proposal PDF generation (AI-assisted cover paragraph) | `DONE` |
+| Material schedule export (XLSX) | `DONE` |
+| BOQ export (XLSX, configurable per region) | `DONE` |
 
 ### Exit criteria
 
@@ -339,6 +339,13 @@ AEC Studio's UI follows the **KChat design system** — primary accent `#7C3AED`
 ---
 
 ## Changelog
+
+### 2026-05-20
+
+- Phase 2 final item: local-AI **layout suggestions** tool now ships end-to-end with a `LayoutSuggestionResult`/`LayoutProposal` shape, a registered `ToolName::LayoutSuggestion` schema, a dedicated GBNF grammar, planner + diff-engine wiring, and a `LayoutSuggestionsPanel` in Design mode that emits previewable diffs before commit.
+- Phase 5 build (95 %): render presets store + governor-aware `recommend_preset` and hardware-tier badge; full lighting preset library (`WarmEvening`/`Daylight`/`Studio`/`GoldenHour`/`BlueTwilight`/`Overcast`) with sun/sky parameters, ambient + accent lights, and IES profile loader; render `doctor.rs` with `MaterialFinding::{MissingTexture,NonPbr,SwappedChannels,OversizedTexture}` feeding the AI render doctor; batch + matrix queue submission (multi-camera × multi-preset) with governor-enforced concurrency; render history with `RenderHistory`/`compare` and a `RenderHistory.tsx` timeline; panorama (Cycles equirectangular) and walkthrough (Cycles + camera path) workers with frame-level resume; `RenderJob` persistence so queues survive app crashes; `BatchRenderModal` and `WalkthroughEditor` renderer components.
+- Phase 6 build (95 %): full Deliver mode (`PackComposer`, `ExportTargetList`, `RevisionManager`, `DeliverToolbar`); client concept pack (`ProposalPack` with render attachments, branding, configurable page order); interior package export (PDF + image archive + material schedule as ZIP with manifest); contractor handoff pack (sheets + schedules + IFC + BOQ-lite with BLAKE3-signed manifest); BIM-lite export pack; revision system (`crates/aec_core/src/revision.rs` with tagged snapshots linked to the audit trail) and version diff (`crates/aec_core/src/version_diff.rs`); before / after comparison page generator; AI-assisted proposal cover (`CoverPageDraft` AI tool with GBNF grammar, parser, fallback, and wiring into `ProposalPack`); XLSX exports (`ScheduleSheet::to_xlsx`) and regional BOQ export (EU / NA / APAC) via `rust_xlsxwriter`.
+- Cross-cutting: **Linux desktop support** — Linux GPU detection in `aec_governor::profiler` (NVIDIA `/proc/driver/nvidia/version`, `lspci`, `vulkaninfo` fallbacks), cross-platform `blender_discovery` in `aec_render` with env override + known-install-path search, x86_64 AVX-VNNI / AVX-512 VNNI feature reporting, electron-builder configs for AppImage / `.deb` / Snap in `packaging/linux/`, `.desktop` file with MIME handlers, GitHub Actions `Package (Linux)` job that produces and uploads installer artifacts on `main`.
 
 ### 2026-05-19
 

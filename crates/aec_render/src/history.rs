@@ -209,7 +209,7 @@ impl RenderHistory {
     /// Return entries sorted by completion time, newest first.
     pub fn by_recency(&self) -> Vec<&RenderHistoryEntry> {
         let mut out: Vec<&RenderHistoryEntry> = self.entries.iter().collect();
-        out.sort_by(|a, b| b.completed_at.cmp(&a.completed_at));
+        out.sort_by_key(|e| std::cmp::Reverse(e.completed_at));
         out
     }
 }
@@ -256,13 +256,11 @@ pub fn compare(a: &RenderHistoryEntry, b: &RenderHistoryEntry) -> CompareResult 
             from: a
                 .camera
                 .as_ref()
-                .map(|c| c.name.clone())
-                .unwrap_or_else(|| "(none)".to_string()),
+                .map_or_else(|| "(none)".to_string(), |c| c.name.clone()),
             to: b
                 .camera
                 .as_ref()
-                .map(|c| c.name.clone())
-                .unwrap_or_else(|| "(none)".to_string()),
+                .map_or_else(|| "(none)".to_string(), |c| c.name.clone()),
         });
     }
     let image_hash_changed = a.image_hash != b.image_hash;

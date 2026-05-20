@@ -146,7 +146,7 @@ fn build_layout_suggestion(response: &PlanResponse) -> Vec<DiffOperation> {
         .parsed
         .get("room_anchor")
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+        .map(std::string::ToString::to_string);
     let Some(arr) = response.parsed.get("proposals").and_then(|v| v.as_array()) else {
         return out;
     };

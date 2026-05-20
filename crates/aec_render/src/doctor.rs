@@ -391,7 +391,7 @@ mod tests {
         let scene = scene_with(&["mat:oak"]);
         let mats = vec![mat("mat:oak")];
         let known = std::collections::BTreeSet::new();
-        let result = check_materials(&scene, &mats, &known, &Default::default());
+        let result = check_materials(&scene, &mats, &known, &CheckMaterialsOptions::default());
         assert!(result.is_clean());
     }
 
@@ -407,7 +407,7 @@ mod tests {
         let scene = scene_with(&["mat:oak"]);
         let mats = vec![m];
         let known = std::collections::BTreeSet::new();
-        let result = check_materials(&scene, &mats, &known, &Default::default());
+        let result = check_materials(&scene, &mats, &known, &CheckMaterialsOptions::default());
         assert_eq!(result.findings.len(), 1);
         assert!(matches!(
             result.findings[0],
@@ -421,7 +421,7 @@ mod tests {
         let mut m = mat("mat:oak");
         m.metallic = 1.4;
         let scene = scene_with(&["mat:oak"]);
-        let result = check_materials(&scene, &[m], &Default::default(), &Default::default());
+        let result = check_materials(&scene, &[m], &std::collections::BTreeSet::new(), &CheckMaterialsOptions::default());
         assert!(result
             .findings
             .iter()
@@ -440,7 +440,7 @@ mod tests {
         });
         let scene = scene_with(&["mat:oak"]);
         let known: std::collections::BTreeSet<String> = ["h1".to_string()].into_iter().collect();
-        let result = check_materials(&scene, &[m], &known, &Default::default());
+        let result = check_materials(&scene, &[m], &known, &CheckMaterialsOptions::default());
         let has_swap = result
             .findings
             .iter()
@@ -463,7 +463,7 @@ mod tests {
         });
         let scene = scene_with(&["mat:oak"]);
         let known: std::collections::BTreeSet<String> = ["h1".to_string()].into_iter().collect();
-        let result = check_materials(&scene, &[m], &known, &Default::default());
+        let result = check_materials(&scene, &[m], &known, &CheckMaterialsOptions::default());
         assert!(result
             .findings
             .iter()
@@ -473,7 +473,7 @@ mod tests {
     #[test]
     fn material_referenced_but_missing_from_library_is_flagged() {
         let scene = scene_with(&["mat:ghost"]);
-        let result = check_materials(&scene, &[], &Default::default(), &Default::default());
+        let result = check_materials(&scene, &[], &std::collections::BTreeSet::new(), &CheckMaterialsOptions::default());
         assert_eq!(result.findings.len(), 1);
         assert_eq!(result.findings[0].material_id(), "mat:ghost");
         assert!(matches!(
@@ -492,8 +492,8 @@ mod tests {
         let result = check_materials(
             &scene,
             &[bad, mat("mat:used")],
-            &Default::default(),
-            &Default::default(),
+            &std::collections::BTreeSet::new(),
+            &CheckMaterialsOptions::default(),
         );
         assert!(result.is_clean());
     }

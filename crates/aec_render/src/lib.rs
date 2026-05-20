@@ -4,6 +4,7 @@
 //! The Blender process itself lives in `workers/blender/`; this crate only
 //! speaks to it over a JSON-line stdio protocol.
 
+pub mod blender_discovery;
 pub mod cameras;
 pub mod cycles;
 pub mod doctor;
@@ -16,6 +17,9 @@ pub mod queue;
 pub mod scene;
 pub mod worker;
 
+pub use blender_discovery::{
+    discover_blender, discover_blender_with, BlenderDiscovery, DiscoverySource,
+};
 pub use cameras::{
     render_thumbnail_rgba8, CameraJournal, CameraJournalEntry, CameraPresetKind, CameraSnapshot,
     CameraStore, CameraValidationError,

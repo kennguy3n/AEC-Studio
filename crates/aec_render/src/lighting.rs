@@ -618,7 +618,7 @@ impl IesProfile {
         self.candela
             .iter()
             .copied()
-            .fold(0.0_f32, |acc, c| acc.max(c))
+            .fold(0.0_f32, f32::max)
             * self.candela_multiplier
     }
 }

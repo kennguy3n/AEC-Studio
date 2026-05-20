@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=AEC Studio
+GenericName=Architecture, Engineering, Construction Studio
+Comment=Local-first AEC desktop suite
+Exec=aec-studio %U
+Terminal=false
+Icon=aec-studio
+StartupNotify=true
+StartupWMClass=AEC Studio
+Categories=Graphics;Engineering;3DGraphics;
+MimeType=application/x-aec;x-scheme-handler/aec;
+Keywords=AEC;CAD;BIM;Render;Architecture;

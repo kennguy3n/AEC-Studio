@@ -43,6 +43,7 @@
 |---|---|
 | macOS (Intel & Apple Silicon) | Planned |
 | Windows (x64) | Planned |
+| Linux (x64) | Planned |
 
 Desktop only. Supports **CPU-only** and **CPU+GPU** configurations.
 
@@ -53,6 +54,8 @@ Desktop only. Supports **CPU-only** and **CPU+GPU** configurations.
 | Apple Silicon (macOS) | **MLX** for inference, Metal for viewport and Cycles GPU |
 | Windows CPU | **llama.cpp** (PrismML fork) with **AVX2 / AVX-VNNI / AVX-512 VNNI** |
 | Windows GPU | **Vulkan / CUDA** for inference and Cycles GPU |
+| Linux CPU | **llama.cpp** (PrismML fork) with **AVX2 / AVX-VNNI / AVX-512 VNNI** |
+| Linux GPU | **Vulkan** for inference and Cycles GPU (CUDA optional on NVIDIA) |
 | Viewport / CAD canvas (all platforms) | **wgpu** with Vulkan, Metal, D3D12, or OpenGL backend |
 
 ---
@@ -131,6 +134,23 @@ AEC Studio learns from — and selectively interoperates with — battle-tested 
 - **CMake** for native dependencies (wgpu native, SQLCipher, OpenSSL)
 - **Python** 3.10+ for Blender worker scripts (only required when running renders)
 
+#### Linux prerequisites
+
+On Ubuntu / Debian, install the Electron runtime libraries before launching the desktop shell:
+
+```bash
+sudo apt-get install -y libgtk-3-0 libnss3 libxss1 libasound2 libnotify4 \
+  build-essential cmake pkg-config libssl-dev libudev-dev
+```
+
+Optional (used at runtime if present):
+
+```bash
+sudo apt-get install -y blender pciutils vulkan-tools
+```
+
+The Rust workspace probes `/proc/driver/nvidia/version`, `lspci`, and `vulkaninfo` for GPU detection; missing tools just fall back to a software profile.
+
 ### Setup
 
 ```bash
@@ -203,6 +223,7 @@ aec-studio/
 │   ├── materials/
 │   └── presets/
 ├── packaging/                  # electron-builder configs
+│   ├── linux/                  # AppImage, .deb, .snap + .desktop file
 │   ├── macos/
 │   └── windows/
 ├── docs/                       # Additional documentation

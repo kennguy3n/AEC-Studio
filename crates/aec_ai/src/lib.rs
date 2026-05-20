@@ -9,6 +9,7 @@
 pub mod audit;
 pub mod bim_classification;
 pub mod cad_cleanup;
+pub mod cover_draft;
 pub mod diff_engine;
 pub mod grammars;
 pub mod layout_suggestion;
@@ -27,6 +28,7 @@ pub use bim_classification::{
     classify as bim_classify, ClassificationConfig, ClassificationProposal, ClassificationResult,
     GeometryFeatures,
 };
+pub use cover_draft::{CoverDraftError, CoverDraftTone, CoverPageDraft};
 pub use cad_cleanup::{
     build_cleanup_proposal, close_gaps, dedupe_entities, merge_collinear, normalize_layers,
     CleanupConfig, CleanupProposal, CollinearMerge, DuplicateGroup, GapClosure, LayerPolicyRule,

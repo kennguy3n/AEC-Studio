@@ -152,6 +152,7 @@ ws        ::= [ \t\n]*
 "#;
 
 const LAYOUT_SUGGESTION_GBNF: &str = include_str!("grammars/layout_suggestion.gbnf");
+const COVER_PAGE_DRAFT_GBNF: &str = include_str!("grammars/cover_page_draft.gbnf");
 
 const RENDER_DOCTOR_GBNF: &str = r#"
 root      ::= "{" ws "\"findings\"" ws ":" ws findlist ws "}"
@@ -243,11 +244,15 @@ impl GrammarRegistry {
             example: r#"{"psets":[{"entity":"ent_001","pset":"Pset_WallCommon","properties":[{"key":"FireRating","value":"EI60"}],"confidence":0.91}]}"#
                 .into(),
         });
+        r.insert(Grammar {
+            key: "cover_page_draft".into(),
+            gbnf: COVER_PAGE_DRAFT_GBNF.into(),
+            example: r#"{"title":"Loft 12B","subtitle":"A warm home for a family of three","paragraph":"A sun-drenched apartment that pairs open-plan living with intimate corners for slow weekends.","tone":"warm"}"#.into(),
+        });
         for key in [
             "cad_cleanup",
             "schedule_fill",
             "validation_help",
-            "cover_page_draft",
         ] {
             r.insert(Grammar {
                 key: key.into(),
