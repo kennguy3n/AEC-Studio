@@ -7,7 +7,7 @@
  * controlled.
  */
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import { aec } from "../api/aec";
 import type {
@@ -17,6 +17,7 @@ import type {
 import {
   PackComposer,
   defaultDeliverablesFor,
+  useReseedOnKindChange,
   type PackDeliverables,
   type PackKind,
 } from "../components/deliver/PackComposer";
@@ -33,12 +34,6 @@ export function Deliver(): JSX.Element {
   const [deliverables, setDeliverables] = useState<PackDeliverables>(() =>
     defaultDeliverablesFor("concept"),
   );
-
-  // Track whether the user has manually edited the deliverable
-  // checkboxes; if so, switching pack kind must not silently overwrite
-  // their picks. The first switch after a user edit reseeds, but
-  // subsequent switches without further edits should still seed sanely.
-  const userEditedRef = useRef(false);
 
   const [targets, setTargets] = useState<ExportTarget[]>(() =>
     defaultExportTargets(),
@@ -70,15 +65,10 @@ export function Deliver(): JSX.Element {
     };
   }, []);
 
-  // Reseed deliverables when the kind changes unless the user has
-  // explicitly edited them — once you start tweaking, the kind switch
-  // still applies a fresh seed (you can't usefully carry "renders"
-  // across pack kinds), but if you switch back and forth the state
-  // remains predictable.
-  useEffect(() => {
-    setDeliverables(defaultDeliverablesFor(kind));
-    userEditedRef.current = false;
-  }, [kind]);
+  // Reseed deliverables when the kind changes. The exported hook keeps
+  // the reseed logic colocated with `defaultDeliverablesFor` so the two
+  // can't drift apart.
+  useReseedOnKindChange(kind, setDeliverables);
 
   const selectedTarget = useMemo(
     () => targets.find((t) => t.id === selectedTargetId) ?? targets[0],
@@ -170,10 +160,7 @@ export function Deliver(): JSX.Element {
           kind={kind}
           deliverables={deliverables}
           onKindChange={setKind}
-          onDeliverablesChange={(next) => {
-            userEditedRef.current = true;
-            setDeliverables(next);
-          }}
+          onDeliverablesChange={setDeliverables}
           onBuild={onBuildPack}
           building={exporting}
         />

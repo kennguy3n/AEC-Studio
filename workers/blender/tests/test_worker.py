@@ -289,6 +289,73 @@ class BlenderWorkerTests(unittest.TestCase):
                 frame_end=1,
             )
 
+    def test_walkthrough_rejects_extreme_aspect_ratio(self):
+        from walkthrough import render_walkthrough  # type: ignore
+
+        with self.assertRaises(ValueError):
+            render_walkthrough(
+                "/tmp",
+                keyframes=[
+                    {"frame": 1, "position": [0, 0, 0], "target": [1, 0, 0]},
+                ],
+                frame_start=1,
+                frame_end=1,
+                resolution_x=100,
+                resolution_y=10000,
+            )
+
+    def test_walkthrough_activates_scene_camera(self):
+        # Regression: walkthrough must set scene.camera = cam_object so
+        # bpy.ops.render.render() actually uses the walkthrough camera.
+        import tempfile
+
+        from walkthrough import render_walkthrough  # type: ignore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            render_walkthrough(
+                tmp,
+                keyframes=[
+                    {"frame": 1, "position": [0, -5000, 1500], "target": [0, 0, 1500]},
+                    {"frame": 5, "position": [3000, -5000, 1500], "target": [0, 0, 1500]},
+                ],
+                samples=4,
+                resolution_x=320,
+                resolution_y=180,
+                frame_start=1,
+                frame_end=2,
+                camera_name="WalkthroughCamera",
+            )
+
+            import bpy  # type: ignore
+
+            cam = bpy.context.scene.camera
+            self.assertIsNotNone(cam)
+            cam_name = (
+                cam.get("name") if isinstance(cam, dict) else getattr(cam, "name", None)
+            )
+            self.assertEqual(cam_name, "WalkthroughCamera")
+
+    def test_walkthrough_look_at_returns_identity_when_target_is_minus_z(self):
+        # A Blender camera at identity (Euler 0,0,0) looks down -Z. So a
+        # camera at the origin targeting (0,0,-1) should need a zero
+        # rotation. The previous implementation returned (pi/2, 0, 0) here,
+        # which would point the camera at +Y.
+        import math
+
+        from walkthrough import _look_at  # type: ignore
+
+        rot = _look_at([0.0, 0.0, 0.0], [0.0, 0.0, -1.0])
+        self.assertAlmostEqual(rot[0], 0.0, places=6)
+        self.assertAlmostEqual(rot[1], 0.0, places=6)
+        self.assertAlmostEqual(rot[2], 0.0, places=6)
+
+        # Targeting (0,1,0) from the origin requires pitching the camera
+        # 90° forward so its -Z axis points at +Y.
+        rot = _look_at([0.0, 0.0, 0.0], [0.0, 1.0, 0.0])
+        self.assertAlmostEqual(rot[0], math.pi / 2.0, places=6)
+        self.assertAlmostEqual(rot[1], 0.0, places=6)
+        self.assertAlmostEqual(rot[2], 0.0, places=6)
+
     # ----- dispatcher / serve -----
 
     def test_dispatch_ping_returns_pong(self):

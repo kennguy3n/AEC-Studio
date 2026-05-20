@@ -498,6 +498,11 @@ export function inProcessBackend(): BridgeBackend {
 
   const assets: AssetSummary[] = seedAssets();
   const jobs: RenderJob[] = [];
+  // Revisions are scoped per backend instance, matching `recents`, `jobs`
+  // and `assets` above. Tests that instantiate fresh backends (or hit
+  // `adaptNative`, which builds its own `base = inProcessBackend()`)
+  // get isolated revision lists.
+  const revisions: RevisionSummary[] = [];
 
   return {
     async projectCreateFromTemplate(templateKey, projectName) {
@@ -753,7 +758,7 @@ export function inProcessBackend(): BridgeBackend {
       if (!tag) {
         throw new Error("revision tag must not be empty");
       }
-      if (inProcessRevisions.some((r) => r.tag === tag)) {
+      if (revisions.some((r) => r.tag === tag)) {
         throw new Error(`revision tag already exists: ${tag}`);
       }
       const rev: RevisionSummary = {
@@ -771,17 +776,17 @@ export function inProcessBackend(): BridgeBackend {
           label: e.label ?? null,
         })),
       };
-      inProcessRevisions.push(rev);
+      revisions.push(rev);
       return rev;
     },
     async deliverListRevisions() {
-      return inProcessRevisions
+      return revisions
         .slice()
         .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
     },
     async deliverCompareRevisions({ baseId, headId }) {
-      const base = inProcessRevisions.find((r) => r.revisionId === baseId);
-      const head = inProcessRevisions.find((r) => r.revisionId === headId);
+      const base = revisions.find((r) => r.revisionId === baseId);
+      const head = revisions.find((r) => r.revisionId === headId);
       if (!base) throw new Error(`unknown base revision: ${baseId}`);
       if (!head) throw new Error(`unknown head revision: ${headId}`);
       return diffRevisionsInProcess(base, head);
@@ -806,13 +811,6 @@ export function inProcessBackend(): BridgeBackend {
 
 const AUDIT_HEAD_PLACEHOLDER =
   "0000000000000000000000000000000000000000000000000000000000000000";
-
-/**
- * In-process scratch store of revisions for the dev backend. Kept
- * module-local so `inProcessBackend()` can be invoked multiple times
- * (e.g. by `adaptNative`) without losing state across calls.
- */
-const inProcessRevisions: RevisionSummary[] = [];
 
 /**
  * JS port of `crates/aec_core/src/version_diff.rs::compare_revisions`.

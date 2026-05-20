@@ -53,6 +53,19 @@ def render_walkthrough(
         raise ValueError(
             f"frame_end ({frame_end}) must be >= frame_start ({frame_start})"
         )
+    if resolution_x <= 0 or resolution_y <= 0:
+        raise ValueError(
+            f"resolution must be positive (got {resolution_x}x{resolution_y})"
+        )
+    # Sanity-check aspect ratio. Walkthroughs don't have the panorama's
+    # strict 2:1 constraint, but extreme ratios (>16:1 or <1:16) almost
+    # always indicate a caller bug — guard so we don't silently waste a
+    # multi-hour render.
+    aspect = float(resolution_x) / float(resolution_y)
+    if aspect > 16.0 or aspect < 1.0 / 16.0:
+        raise ValueError(
+            f"walkthrough aspect ratio out of range (got {resolution_x}:{resolution_y})"
+        )
     _validate_keyframes(keyframes)
 
     out_path = Path(out_dir)
@@ -73,6 +86,10 @@ def render_walkthrough(
 
     cam_data = _ensure_camera_data(bpy, camera_name)
     cam_object = _ensure_camera_object(bpy, cam_data, camera_name)
+    # Activate the walkthrough camera so `bpy.ops.render.render` actually
+    # uses it (otherwise Blender renders whatever camera was previously
+    # active, or fails if none was set).
+    scene.camera = cam_object
 
     # Sort keyframes by frame so interpolation is monotonic.
     sorted_kf = sorted(keyframes, key=lambda k: int(k["frame"]))
@@ -225,9 +242,16 @@ def _set_vec3(obj: Any, attr: str, vec: list[float]) -> None:
 def _look_at(position: list[float], target: list[float]) -> list[float]:
     """Euler XYZ that orients a camera at `position` to look at `target`.
 
-    This is the standard Blender camera convention: looking down -Z
-    locally, with +Y up. The math here is straightforward — derive
-    the forward vector, then convert to yaw (Z) and pitch (X).
+    Blender's camera convention is: at identity (Euler 0,0,0) the camera
+    looks down -Z in local space, with +Y up. For Euler XYZ intrinsic
+    (Blender default), the camera direction in world space is:
+
+        d = (-sin(yaw) * sin(pitch),
+              cos(yaw) * sin(pitch),
+             -cos(pitch))
+
+    Inverting that decomposition gives the formulas below. We pin roll
+    (Y) to zero so the +Y world axis stays up.
     """
 
     fx, fy, fz = (
@@ -238,9 +262,8 @@ def _look_at(position: list[float], target: list[float]) -> list[float]:
     length = math.sqrt(fx * fx + fy * fy + fz * fz)
     if length == 0:
         return [0.0, 0.0, 0.0]
-    # Blender default camera looks down -Z. Compute Euler XYZ.
-    pitch = math.atan2(-fz, math.sqrt(fx * fx + fy * fy))
-    yaw = math.atan2(fx, fy)
+    pitch = math.atan2(math.sqrt(fx * fx + fy * fy), -fz)
+    yaw = math.atan2(-fx, fy)
     return [pitch, 0.0, yaw]
 
 
