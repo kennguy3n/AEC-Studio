@@ -206,12 +206,7 @@ fn drafter_journey_end_to_end() {
         angle: 45.0,
         elevation: 0.0,
         loops: vec![DxfHatchLoop {
-            vertices: vec![
-                [0.0, 0.0],
-                [5000.0, 0.0],
-                [5000.0, 3000.0],
-                [0.0, 3000.0],
-            ],
+            vertices: vec![[0.0, 0.0], [5000.0, 0.0], [5000.0, 3000.0], [0.0, 3000.0]],
         }],
     }));
     doc.push(DxfEntity::Text(DxfText {
@@ -303,7 +298,11 @@ fn drafter_journey_end_to_end() {
             .get(&original.name)
             .unwrap_or_else(|| panic!("layer {} survives roundtrip", original.name));
         assert_eq!(round.color, original.color, "{} colour", original.name);
-        assert_eq!(round.linetype, original.linetype, "{} linetype", original.name);
+        assert_eq!(
+            round.linetype, original.linetype,
+            "{} linetype",
+            original.name
+        );
         assert_eq!(
             round.lineweight, original.lineweight,
             "{} lineweight",
@@ -312,11 +311,8 @@ fn drafter_journey_end_to_end() {
     }
 
     // Block records.
-    let block_names: std::collections::BTreeSet<_> = doc
-        .block_records
-        .iter()
-        .map(|b| b.name.as_str())
-        .collect();
+    let block_names: std::collections::BTreeSet<_> =
+        doc.block_records.iter().map(|b| b.name.as_str()).collect();
     let round_block_names: std::collections::BTreeSet<_> = reloaded
         .block_records
         .iter()

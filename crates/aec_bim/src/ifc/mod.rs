@@ -30,7 +30,7 @@
 pub mod reader;
 pub mod writer;
 
-pub use reader::{IfcReadError, IfcReader, IfcReadResult, IfcReadStats};
+pub use reader::{IfcReadError, IfcReadResult, IfcReadStats, IfcReader};
 pub use writer::{IfcWriteError, IfcWriter};
 
 /// Deterministically map an `EntityId` to a 22-char compressed IFC
@@ -49,8 +49,7 @@ pub fn compress_entity_id_to_guid(id: &aec_core::types::EntityId) -> String {
 pub fn derive_guid_from_str(seed: &str) -> String {
     // 22-char IFC GUIDs use a 64-character alphabet:
     //   0-9, A-Z, a-z, '_', '$'
-    const ALPHABET: &[u8] =
-        b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_$";
+    const ALPHABET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_$";
 
     // Use BLAKE3 to project the seed into 16 bytes, then base64-ish
     // encode into 22 chars over the IFC alphabet. 16 bytes encodes into

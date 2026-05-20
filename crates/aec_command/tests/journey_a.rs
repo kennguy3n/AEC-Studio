@@ -444,7 +444,10 @@ fn interior_designer_journey_end_to_end() {
         .entries
         .iter()
         .any(|e| e.name.starts_with("schedules/"));
-    assert!(has_material_schedule, "material schedule is bundled in the pack");
+    assert!(
+        has_material_schedule,
+        "material schedule is bundled in the pack"
+    );
 
     // ---------------------------------------------------------------
     // 9. Save/load roundtrip on the project package.
@@ -454,5 +457,8 @@ fn interior_designer_journey_end_to_end() {
     drop(pkg);
     let reopened = ProjectPackage::open(&pkg_dir).expect("project package should re-open");
     assert_eq!(reopened.manifest().project_id, project_id);
-    assert_eq!(reopened.manifest().template_id.as_deref(), Some("interior.apartment"));
+    assert_eq!(
+        reopened.manifest().template_id.as_deref(),
+        Some("interior.apartment")
+    );
 }

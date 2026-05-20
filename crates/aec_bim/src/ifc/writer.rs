@@ -205,20 +205,15 @@ DATA;\n";
                         // the composed name through `escape_step_string`
                         // so adding any future user-supplied component
                         // can't break STEP tokenization.
-                        name = escape_step_string(&format!(
-                            "{tag}::{}",
-                            el.to_string()
-                        )),
+                        name = escape_step_string(&format!("{tag}::{}", el.to_string())),
                     ),
                 );
                 contained_refs.push(format!("#{step_id}"));
             }
             if !contained_refs.is_empty() {
                 let rel = buf.alloc();
-                let rel_guid = derive_guid_from_str(&format!(
-                    "rel-contained::{}",
-                    storey_id.to_string()
-                ));
+                let rel_guid =
+                    derive_guid_from_str(&format!("rel-contained::{}", storey_id.to_string()));
                 buf.write_line(
                     rel,
                     format!(
@@ -256,11 +251,8 @@ DATA;\n";
                     })
                     .collect();
                 let pset_step = buf.alloc();
-                let pset_guid = derive_guid_from_str(&format!(
-                    "pset::{}::{}",
-                    el.to_string(),
-                    name
-                ));
+                let pset_guid =
+                    derive_guid_from_str(&format!("pset::{}::{}", el.to_string(), name));
                 buf.write_line(
                     pset_step,
                     format!(
@@ -275,11 +267,8 @@ DATA;\n";
                     ),
                 );
                 let rel = buf.alloc();
-                let rel_guid = derive_guid_from_str(&format!(
-                    "rel-pset::{}::{}",
-                    el.to_string(),
-                    name
-                ));
+                let rel_guid =
+                    derive_guid_from_str(&format!("rel-pset::{}::{}", el.to_string(), name));
                 buf.write_line(
                     rel,
                     format!(
@@ -309,11 +298,8 @@ DATA;\n";
                     })
                     .collect();
                 let qset_step = buf.alloc();
-                let qset_guid = derive_guid_from_str(&format!(
-                    "qset::{}::{}",
-                    el.to_string(),
-                    name
-                ));
+                let qset_guid =
+                    derive_guid_from_str(&format!("qset::{}::{}", el.to_string(), name));
                 buf.write_line(
                     qset_step,
                     format!(
@@ -328,11 +314,8 @@ DATA;\n";
                     ),
                 );
                 let rel = buf.alloc();
-                let rel_guid = derive_guid_from_str(&format!(
-                    "rel-qset::{}::{}",
-                    el.to_string(),
-                    name
-                ));
+                let rel_guid =
+                    derive_guid_from_str(&format!("rel-qset::{}::{}", el.to_string(), name));
                 buf.write_line(
                     rel,
                     format!(
@@ -345,8 +328,7 @@ DATA;\n";
             }
         }
 
-        buf.inner
-            .extend_from_slice(b"ENDSEC;\nEND-ISO-10303-21;\n");
+        buf.inner.extend_from_slice(b"ENDSEC;\nEND-ISO-10303-21;\n");
         String::from_utf8(buf.inner).expect("IFC writer emits ASCII only")
     }
 
@@ -400,10 +382,7 @@ fn serialize_property_value(v: &PropertyValue) -> (String, &'static str) {
         PropertyValue::Volume(x) => (format_real(*x), "IFCVOLUMEMEASURE"),
         PropertyValue::Ratio(x) => (format_real(*x), "IFCPOSITIVERATIOMEASURE"),
         PropertyValue::Integer(i) => (i.to_string(), "IFCINTEGER"),
-        PropertyValue::Boolean(b) => (
-            if *b { ".T." } else { ".F." }.to_string(),
-            "IFCBOOLEAN",
-        ),
+        PropertyValue::Boolean(b) => (if *b { ".T." } else { ".F." }.to_string(), "IFCBOOLEAN"),
     }
 }
 
@@ -425,7 +404,13 @@ fn serialize_quantity_value(v: &PropertyValue) -> (String, &'static str) {
                  representation; move it to a PropertySet where \
                  IFCPOSITIVERATIOMEASURE preserves type fidelity"
             );
-            (format_real(match v { PropertyValue::Ratio(x) => *x, _ => 0.0 }), "IFCQUANTITYWEIGHT")
+            (
+                format_real(match v {
+                    PropertyValue::Ratio(x) => *x,
+                    _ => 0.0,
+                }),
+                "IFCQUANTITYWEIGHT",
+            )
         }
         // Boolean / text quantities aren't standard IFC; fall through
         // as IfcQuantityCount(0) so the file still parses.

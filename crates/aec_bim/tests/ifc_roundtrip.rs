@@ -119,7 +119,10 @@ fn furniture(i: usize, storey: usize) -> ElementSpec {
         pset_name: "Pset_FurnitureCommon",
         pset: vec![
             ("Reference", PropertyValue::Label(format!("F-{:03}", i))),
-            ("Manufacturer", PropertyValue::Text("Aspen Furniture".into())),
+            (
+                "Manufacturer",
+                PropertyValue::Text("Aspen Furniture".into()),
+            ),
         ],
         qset_name: "Qto_FurnitureBaseQuantities",
         qset: vec![("NetVolume", PropertyValue::Volume(0.25))],
@@ -219,8 +222,7 @@ fn build_50_element_project() -> (
 
 #[test]
 fn ifc_roundtrip_preserves_guids_psets_and_spatial_graph() {
-    let (project, classification, props, element_ids, spatial_nodes) =
-        build_50_element_project();
+    let (project, classification, props, element_ids, spatial_nodes) = build_50_element_project();
     let s = IfcWriter::to_string(&project, &classification, &props);
 
     // Sanity: byte-level envelope.
@@ -242,7 +244,10 @@ fn ifc_roundtrip_preserves_guids_psets_and_spatial_graph() {
     // Aggregations: root→site, site→bldg, bldg→storeyA, bldg→storeyB,
     // storeyA→3 spaces (as one IFCRELAGGREGATES list), storeyB→2 spaces.
     assert_eq!(stats.aggregations, 9, "expected aggregation edges");
-    assert_eq!(stats.containments, 50, "every element contained in a storey");
+    assert_eq!(
+        stats.containments, 50,
+        "every element contained in a storey"
+    );
 
     // (1) Every element GUID matches what compress() would derive
     // from the original EntityId.
@@ -371,9 +376,7 @@ fn ifc_modifying_five_elements_preserves_unmodified_guids_and_surfaces_new_props
     {
         let id = &element_ids[14];
         let mut q = QuantitySet::new("Qto_WallBaseQuantities");
-        for (k, v) in
-            &props.get(id).unwrap().qsets["Qto_WallBaseQuantities"].quantities
-        {
+        for (k, v) in &props.get(id).unwrap().qsets["Qto_WallBaseQuantities"].quantities {
             q.quantities.insert(k.clone(), v.clone());
         }
         q.quantities
@@ -396,9 +399,7 @@ fn ifc_modifying_five_elements_preserves_unmodified_guids_and_surfaces_new_props
         p.set("SmokeStop", PropertyValue::Boolean(true));
         props.entry(id.clone()).upsert_pset(p);
         let mut q = QuantitySet::new("Qto_DoorBaseQuantities");
-        for (k, v) in
-            &props.get(id).unwrap().qsets["Qto_DoorBaseQuantities"].quantities
-        {
+        for (k, v) in &props.get(id).unwrap().qsets["Qto_DoorBaseQuantities"].quantities {
             q.quantities.insert(k.clone(), v.clone());
         }
         q.quantities

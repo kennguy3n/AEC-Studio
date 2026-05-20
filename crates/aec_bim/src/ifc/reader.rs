@@ -96,8 +96,7 @@ impl IfcReader {
         let groups = parse_step_groups(text)?;
 
         // ---- Index by STEP id ----
-        let by_id: HashMap<u32, &StepRecord> =
-            groups.iter().map(|g| (g.step_id, g)).collect();
+        let by_id: HashMap<u32, &StepRecord> = groups.iter().map(|g| (g.step_id, g)).collect();
 
         // First pass: figure out which records are spatial nodes vs
         // elements vs psets vs qsets, and recover the originating
@@ -113,8 +112,7 @@ impl IfcReader {
         for g in &groups {
             match g.kind.as_str() {
                 "IFCOWNERHISTORY" => {}
-                "IFCPROJECT" | "IFCSITE" | "IFCBUILDING" | "IFCBUILDINGSTOREY"
-                | "IFCSPACE" => {
+                "IFCPROJECT" | "IFCSITE" | "IFCBUILDING" | "IFCBUILDINGSTOREY" | "IFCSPACE" => {
                     let class = ifc_class_from_tag(&g.kind, &g.raw_kind)?;
                     let name = g.string_arg(3)?;
                     // Spatial nodes are authored by the writer with the
@@ -168,7 +166,8 @@ impl IfcReader {
                     let refs = g.ref_list_arg(5)?;
                     qsets.insert(g.step_id, QsetRow { name, refs });
                 }
-                "IFCRELAGGREGATES" | "IFCRELCONTAINEDINSPATIALSTRUCTURE"
+                "IFCRELAGGREGATES"
+                | "IFCRELCONTAINEDINSPATIALSTRUCTURE"
                 | "IFCRELDEFINESBYPROPERTIES" => {
                     // Handled in the second pass.
                 }
@@ -278,9 +277,7 @@ impl IfcReader {
                 })?;
             let node = project.nodes.get_mut(&parent_entity).unwrap();
             for child_step in child_steps {
-                if let Some(child_entity) =
-                    spatial.get(child_step).map(|r| r.entity.clone())
-                {
+                if let Some(child_entity) = spatial.get(child_step).map(|r| r.entity.clone()) {
                     node.children.push(child_entity);
                     aggregations += 1;
                 }
@@ -324,11 +321,9 @@ impl IfcReader {
         // `ClassificationSource::Imported`, which is what an external
         // IFC file would naturally produce. Surface it as the canonical
         // source for round-tripped data.
-        debug_assert!(
-            classification
-                .iter()
-                .all(|(_, asg)| matches!(asg.source, ClassificationSource::Imported))
-        );
+        debug_assert!(classification
+            .iter()
+            .all(|(_, asg)| matches!(asg.source, ClassificationSource::Imported)));
 
         // ---- Rebuild PropertyStore ----
         let mut props = PropertyStore::new();
@@ -570,10 +565,9 @@ fn split_step_args(s: &str) -> Vec<String> {
 
 impl StepRecord {
     fn string_arg(&self, idx: usize) -> IfcReadResult<String> {
-        let raw = self
-            .args
-            .get(idx)
-            .ok_or_else(|| IfcReadError::Malformed(format!("missing arg {idx} on {}", self.kind)))?;
+        let raw = self.args.get(idx).ok_or_else(|| {
+            IfcReadError::Malformed(format!("missing arg {idx} on {}", self.kind))
+        })?;
         let s = raw.trim();
         if !(s.starts_with('\'') && s.ends_with('\'')) {
             return Err(IfcReadError::Malformed(format!(
@@ -585,10 +579,9 @@ impl StepRecord {
     }
 
     fn ref_arg(&self, idx: usize) -> IfcReadResult<u32> {
-        let raw = self
-            .args
-            .get(idx)
-            .ok_or_else(|| IfcReadError::Malformed(format!("missing arg {idx} on {}", self.kind)))?;
+        let raw = self.args.get(idx).ok_or_else(|| {
+            IfcReadError::Malformed(format!("missing arg {idx} on {}", self.kind))
+        })?;
         let s = raw.trim();
         if !s.starts_with('#') {
             return Err(IfcReadError::Malformed(format!(
@@ -602,10 +595,9 @@ impl StepRecord {
     }
 
     fn ref_list_arg(&self, idx: usize) -> IfcReadResult<Vec<u32>> {
-        let raw = self
-            .args
-            .get(idx)
-            .ok_or_else(|| IfcReadError::Malformed(format!("missing arg {idx} on {}", self.kind)))?;
+        let raw = self.args.get(idx).ok_or_else(|| {
+            IfcReadError::Malformed(format!("missing arg {idx} on {}", self.kind))
+        })?;
         let s = raw.trim();
         if !(s.starts_with('(') && s.ends_with(')')) {
             return Err(IfcReadError::Malformed(format!(
@@ -786,12 +778,7 @@ mod tests {
     use crate::properties::{PropertySet, PropertyStore, PropertyValue, QuantitySet};
     use crate::spatial::Project;
 
-    fn build_tiny_project() -> (
-        Project,
-        ClassificationStore,
-        PropertyStore,
-        Vec<EntityId>,
-    ) {
+    fn build_tiny_project() -> (Project, ClassificationStore, PropertyStore, Vec<EntityId>) {
         let mut project = Project::new("Test");
         let site = project
             .add_child(&project.root.clone(), IfcClass::IfcSite, "Site")
@@ -810,10 +797,7 @@ mod tests {
             project.attach_element(&storey, id.clone());
             classification.assign_manual(id.clone(), IfcClass::IfcWall);
             let mut pc = PropertySet::new("Pset_WallCommon");
-            pc.set(
-                "Reference",
-                PropertyValue::Label(format!("W-{:02}", i)),
-            );
+            pc.set("Reference", PropertyValue::Label(format!("W-{:02}", i)));
             pc.set("LoadBearing", PropertyValue::Boolean(false));
             props.entry(id.clone()).upsert_pset(pc);
             let mut q = QuantitySet::new("Qto_WallBaseQuantities");
@@ -918,11 +902,7 @@ mod tests {
             .add_child(&site, IfcClass::IfcBuilding, r"ends-in-backslash\")
             .unwrap();
         let storey = project
-            .add_child(
-                &bldg,
-                IfcClass::IfcBuildingStorey,
-                r"mixed\'special\chars'",
-            )
+            .add_child(&bldg, IfcClass::IfcBuildingStorey, r"mixed\'special\chars'")
             .unwrap();
 
         let mut classification = ClassificationStore::new();
@@ -935,10 +915,7 @@ mod tests {
             "Reference",
             PropertyValue::Text(r"C:\Users\O'Brien\plan.dwg".into()),
         );
-        pc.set(
-            "Tag",
-            PropertyValue::Label(r"raw\\double".into()),
-        );
+        pc.set("Tag", PropertyValue::Label(r"raw\\double".into()));
         props.entry(el.clone()).upsert_pset(pc);
 
         let s = crate::ifc::IfcWriter::to_string(&project, &classification, &props);
@@ -985,9 +962,9 @@ mod tests {
             r"with \ backslash",
             r"ends in \\",
             r"both \ and ' mixed",
-            r"\\'",          // backslash then escaped quote
-            r"\\\\",         // four backslashes
-            r"don't \stop",  // common natural text
+            r"\\'",         // backslash then escaped quote
+            r"\\\\",        // four backslashes
+            r"don't \stop", // common natural text
         ];
         for input in cases {
             // Encode the same way the writer does, char-by-char.

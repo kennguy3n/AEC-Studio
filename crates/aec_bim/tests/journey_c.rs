@@ -304,7 +304,10 @@ fn construction_pm_journey_end_to_end() {
         "IFC import must complete < 15 s (was {:?})",
         import_elapsed
     );
-    assert_eq!(walls.len() + slabs.len() + doors.len() + windows.len() + unknowns.len(), 50);
+    assert_eq!(
+        walls.len() + slabs.len() + doors.len() + windows.len() + unknowns.len(),
+        50
+    );
 
     // ---------------------------------------------------------------
     // 2. Validator. We expect "missing classification" findings for
@@ -332,10 +335,15 @@ fn construction_pm_journey_end_to_end() {
     for id in &unknowns {
         classification.assign_ai(id.clone(), IfcClass::IfcCovering, 0.92);
     }
-    assert!(unknowns.iter().all(|id| classification
-        .get(id)
-        .map_or(false, |a| a.confidence >= 0.85
-            && matches!(a.source, aec_bim::classification::ClassificationSource::Ai))));
+    assert!(unknowns
+        .iter()
+        .all(|id| classification
+            .get(id)
+            .map_or(false, |a| a.confidence >= 0.85
+                && matches!(
+                    a.source,
+                    aec_bim::classification::ClassificationSource::Ai
+                ))));
 
     let post_report = validate_project(&project, &classification, &props, &relations);
     let still_missing = post_report
@@ -394,7 +402,9 @@ fn construction_pm_journey_end_to_end() {
                 .find(|id| id.to_string() == prop.entity)
                 .expect("proposal references a known door");
             let mut pset = PropertySet::new("Pset_DoorCommon");
-            if let Some(existing) = props.get(target).and_then(|e| e.psets.get("Pset_DoorCommon"))
+            if let Some(existing) = props
+                .get(target)
+                .and_then(|e| e.psets.get("Pset_DoorCommon"))
             {
                 for (k, v) in &existing.properties {
                     pset.set(k.clone(), v.clone());

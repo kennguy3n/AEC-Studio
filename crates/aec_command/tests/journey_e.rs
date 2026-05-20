@@ -315,9 +315,7 @@ fn studio_lead_journey_end_to_end() {
         ),
         |d, e| d.add_entity(e),
     );
-    let baseline = rev_store
-        .create(baseline_draft)
-        .expect("baseline revision");
+    let baseline = rev_store.create(baseline_draft).expect("baseline revision");
 
     // Mutate: remove last wall, modify wall[0] material, add a brand
     // new wall.
@@ -362,7 +360,8 @@ fn studio_lead_journey_end_to_end() {
         "1 wall removed"
     );
     assert_eq!(
-        diff.changes_in("geometry", EntityChangeKind::Modified).len(),
+        diff.changes_in("geometry", EntityChangeKind::Modified)
+            .len(),
         1,
         "1 wall modified"
     );
@@ -393,9 +392,7 @@ fn studio_lead_journey_end_to_end() {
     let mut proposal = ProposalPack::new("Villa Solaris", "Studio Solaris");
     proposal.designer_name = "AEC Studio".into();
     let proposal_pdf = tmp.path().join("proposal.pdf");
-    proposal
-        .to_pdf(&proposal_pdf)
-        .expect("proposal pdf writes");
+    proposal.to_pdf(&proposal_pdf).expect("proposal pdf writes");
 
     let interior_pack = InteriorPack {
         project_name: "Villa Solaris".into(),

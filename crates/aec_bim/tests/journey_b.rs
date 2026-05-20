@@ -43,10 +43,7 @@ use aec_core::types::EntityId;
 use aec_export::contractor_pack::{ContractorPack, PackFile};
 use aec_export::pdf::{PageSize, PdfBuilder};
 use aec_render::{
-    cameras::CameraSnapshot,
-    job::RenderJobStatus,
-    preset::RenderPreset,
-    queue::RenderQueue,
+    cameras::CameraSnapshot, job::RenderJobStatus, preset::RenderPreset, queue::RenderQueue,
     scene::RenderScene,
 };
 
@@ -274,10 +271,7 @@ fn architecture_studio_journey_end_to_end() {
         common.set("Reference", PropertyValue::Label("CTR-01".into()));
         props.entry(id.clone()).upsert_pset(common);
         let mut mat = PropertySet::new("Pset_ElementMaterial");
-        mat.set(
-            "Material",
-            PropertyValue::Text("stainless_steel".into()),
-        );
+        mat.set("Material", PropertyValue::Text("stainless_steel".into()));
         props.entry(id.clone()).upsert_pset(mat);
         let mut q = QuantitySet::new("Qto_CoveringBaseQuantities");
         q.quantities
@@ -316,14 +310,7 @@ fn architecture_studio_journey_end_to_end() {
         project.attach_element(&storey, id.clone());
         classification.assign_ai(id.clone(), IfcClass::IfcDoor, 0.96);
         let fire = if i < 2 { Some("FD30") } else { None };
-        attach_door_pset(
-            &mut props,
-            &id,
-            &format!("D-{:02}", i + 1),
-            fire,
-            0.9,
-            2.1,
-        );
+        attach_door_pset(&mut props, &id, &format!("D-{:02}", i + 1), fire, 0.9, 2.1);
     }
     // 6 windows.
     for i in 0..6 {
@@ -349,16 +336,7 @@ fn architecture_studio_journey_end_to_end() {
     // has real fields to surface (Reference / Category / Area /
     // Perimeter / Height), not just row count.
     // ---------------------------------------------------------------
-    let space_meta: &[(
-        &str,
-        &str,
-        &str,
-        &str,
-        &str,
-        f64,
-        f64,
-        f64,
-    )] = &[
+    let space_meta: &[(&str, &str, &str, &str, &str, f64, f64, f64)] = &[
         // (number, category, floor, wall, ceiling, area_m2, perim_m, height_m)
         (
             "R-01",
@@ -472,7 +450,9 @@ fn architecture_studio_journey_end_to_end() {
                 .expect("proposal references a known door");
             let mut pset = PropertySet::new("Pset_DoorCommon");
             // Preserve other keys on the existing pset.
-            if let Some(existing) = props.get(target).and_then(|e| e.psets.get("Pset_DoorCommon"))
+            if let Some(existing) = props
+                .get(target)
+                .and_then(|e| e.psets.get("Pset_DoorCommon"))
             {
                 for (k, v) in &existing.properties {
                     pset.set(k.clone(), v.clone());
@@ -520,7 +500,11 @@ fn architecture_studio_journey_end_to_end() {
         assert_eq!(entry.category, category, "room category");
         assert_eq!(entry.floor_finish, floor, "room {} floor finish", number);
         assert_eq!(entry.wall_finish, wall, "room {} wall finish", number);
-        assert_eq!(entry.ceiling_finish, ceiling, "room {} ceiling finish", number);
+        assert_eq!(
+            entry.ceiling_finish, ceiling,
+            "room {} ceiling finish",
+            number
+        );
         assert_eq!(
             entry.area_m2,
             Some(area),
@@ -599,12 +583,12 @@ fn architecture_studio_journey_end_to_end() {
     let mut q = RenderQueue::new();
     let scene = RenderScene::new();
     let cams = [
+        camera("Entry hero", [-2500.0, 0.0, 1700.0], [6000.0, 0.0, 1500.0]),
         camera(
-            "Entry hero",
-            [-2500.0, 0.0, 1700.0],
-            [6000.0, 0.0, 1500.0],
+            "Counter",
+            [3000.0, 4500.0, 1700.0],
+            [6000.0, 1200.0, 1500.0],
         ),
-        camera("Counter", [3000.0, 4500.0, 1700.0], [6000.0, 1200.0, 1500.0]),
     ];
     let submission = q.submit_batch(&cams, RenderPreset::high(), &scene);
     assert_eq!(submission.job_ids.len(), 2);
@@ -683,9 +667,6 @@ fn architecture_studio_journey_end_to_end() {
         .filter(|e| e.name.starts_with("schedules/"))
         .count();
     assert_eq!(schedule_entries, 3, "doors + rooms + boq are bundled");
-    let has_ifc = manifest
-        .entries
-        .iter()
-        .any(|e| e.name.ends_with(".ifc"));
+    let has_ifc = manifest.entries.iter().any(|e| e.name.ends_with(".ifc"));
     assert!(has_ifc, "IFC is bundled in the contractor pack");
 }
