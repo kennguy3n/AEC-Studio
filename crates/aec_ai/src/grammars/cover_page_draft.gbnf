@@ -1,0 +1,10 @@
+# GBNF for the cover-page-draft AI tool.
+#
+# The model is asked to produce a JSON object with a title, subtitle,
+# concept paragraph, and an optional tone tag. We keep paragraph
+# content as a free-form string but cap titles/subtitles at one line.
+root        ::= "{" ws "\"title\"" ws ":" ws short_str ws "," ws "\"subtitle\"" ws ":" ws short_str ws "," ws "\"paragraph\"" ws ":" ws long_str ws ("," ws "\"tone\"" ws ":" ws tone_str ws)? "}"
+short_str   ::= "\"" [^"\n]+ "\""
+long_str    ::= "\"" [^"]+ "\""
+tone_str    ::= "\"" ("warm" | "minimal" | "industrial" | "playful" | "classical") "\""
+ws          ::= [ \t\n]*

@@ -22,12 +22,18 @@ pub mod db;
 pub mod error;
 pub mod manifest;
 pub mod package;
+pub mod revision;
 pub mod templates;
 pub mod types;
+pub mod version_diff;
 
 pub use config::{HardwareProfile, ProjectConfig, ProjectSettings};
 pub use error::{AecError, AecResult};
 pub use manifest::{ProjectManifest, SCHEMA_VERSION};
 pub use package::{ProjectPackage, ProjectSummary, RecentEntry, RecentsStore};
+pub use revision::{Revision, RevisionDraft, RevisionEntity, RevisionStore};
 pub use templates::{TemplateDefinition, TemplateLoader};
 pub use types::{Actor, ActorKind, CommandId, DiffId, EntityId, ProjectId, Region, Scope, Units};
+pub use version_diff::{
+    compare_revisions, DiffCounts, EntityChange, EntityChangeKind, VersionDiff,
+};

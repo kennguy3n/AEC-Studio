@@ -10,6 +10,8 @@ description = "Render core: Blender worker driver, render queue, EEVEE/Cycles pi
 [dependencies]
 aec_core = { path = "../aec_core" }
 aec_audit = { path = "../aec_audit" }
+aec_governor = { path = "../aec_governor" }
+aec_materials = { path = "../aec_materials" }
 chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

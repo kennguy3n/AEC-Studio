@@ -6,7 +6,13 @@
 
 import type { AecApi } from "../../../electron/preload";
 import { AI_TOOLS } from "../../../electron/ai-tools";
-import { classifyTier } from "../../../electron/bridge";
+import {
+  classifyTier,
+  diffRevisionsInProcess,
+  inProcessParsedForTool,
+  type RevisionSummary,
+  type VersionDiffSummary,
+} from "../../../electron/bridge";
 
 interface Recent {
   projectId: string;
@@ -144,12 +150,41 @@ export function rendererInProcessBackend(): AecApi {
       cancelJob: async () => ({ cancelled: true }),
       applyPreset: async () => ({ ok: true }),
       diagnose: async (jobId) => ({ jobId, suggestions: [] }),
+      enqueueBatch: async (params) => {
+        const presets =
+          (params.presetIds && params.presetIds.length > 0
+            ? params.presetIds
+            : params.presetId
+              ? [params.presetId]
+              : ["standard"]);
+        const batchId = newId("batch");
+        const jobIds: string[] = [];
+        for (let i = 0; i < params.cameraIds.length * presets.length; i++) {
+          jobIds.push(newId("job"));
+        }
+        return { batchId, jobIds };
+      },
+      batchProgress: async (batchId) => ({
+        batchId,
+        total: 0,
+        queued: 0,
+        running: 0,
+        completed: 0,
+        failed: 0,
+        cancelled: 0,
+        averageProgress: 0,
+      }),
+      checkMaterials: async () => ({ findings: [] }),
     },
     ai: {
       // Return a defensive copy so callers (and Vitest harnesses) can't
       // mutate the shared catalogue.
       listTools: async () => AI_TOOLS.map((t) => ({ ...t })),
-      plan: async () => ({ diffId: newId("diff") }),
+      plan: async (params: Record<string, unknown>) => {
+        const tool = typeof params.tool === "string" ? params.tool : null;
+        const parsed = inProcessParsedForTool(tool, params);
+        return { diffId: newId("diff"), parsed };
+      },
       acceptDiff: async () => ({ accepted: true }),
       rejectDiff: async () => ({ rejected: true }),
       cancelJob: async () => ({ cancelled: true }),
@@ -162,6 +197,7 @@ export function rendererInProcessBackend(): AecApi {
       exportGltf: async () => ({ outPath: "/exports/out.gltf" }),
       buildProposalPack: async () => ({ outPath: "/exports/proposal.pdf" }),
     },
+    deliver: deliverMock(newId),
     runtime: {
       // Derive the tier from the same `classifyTier` the production
       // backend uses so the test fixture cannot drift away from real
@@ -179,6 +215,104 @@ export function rendererInProcessBackend(): AecApi {
         gpu: { vendor: "test-gpu", model: "test-mid", vramMb: 4096 },
         os: "test",
       }),
+    },
+  };
+}
+
+/**
+ * Renderer-side fixture for the `deliver` IPC namespace. Mirrors the
+ * shape of `apps/desktop/electron/preload.ts` `deliver` so vitest tests
+ * can exercise revision + pack composer flows without spinning up the
+ * Electron host. The diff helper reuses `diffRevisionsInProcess` from
+ * the bridge module so the fixture cannot drift away from production
+ * comparison semantics.
+ */
+function deliverMock(newId: (prefix: string) => string) {
+  const revisions: RevisionSummary[] = [];
+
+  return {
+    async createRevision(params: {
+      tag: string;
+      description: string;
+      entities?: Array<{
+        category: string;
+        id: string;
+        payloadHash: string;
+        label?: string | null;
+      }>;
+    }): Promise<RevisionSummary> {
+      const tag = params.tag.trim();
+      if (!tag) throw new Error("revision tag must not be empty");
+      if (revisions.some((r) => r.tag === tag)) {
+        throw new Error(`revision tag already exists: ${tag}`);
+      }
+      const rev: RevisionSummary = {
+        revisionId: newId("rev"),
+        tag,
+        description: params.description,
+        createdAt: new Date().toISOString(),
+        auditChainHead:
+          "0000000000000000000000000000000000000000000000000000000000000000",
+        manifestName: "Apartment 12B",
+        manifestAppVersion: "0.1.0",
+        trackedEntities: (params.entities ?? []).map((e) => ({
+          category: e.category,
+          id: e.id,
+          payloadHash: e.payloadHash,
+          label: e.label ?? null,
+        })),
+      };
+      revisions.push(rev);
+      return rev;
+    },
+    async listRevisions(): Promise<RevisionSummary[]> {
+      return revisions
+        .slice()
+        .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    },
+    async compareRevisions(params: {
+      baseId: string;
+      headId: string;
+    }): Promise<VersionDiffSummary> {
+      const base = revisions.find((r) => r.revisionId === params.baseId);
+      const head = revisions.find((r) => r.revisionId === params.headId);
+      if (!base) throw new Error(`unknown base revision: ${params.baseId}`);
+      if (!head) throw new Error(`unknown head revision: ${params.headId}`);
+      return diffRevisionsInProcess(base, head);
+    },
+    async buildPack(params: {
+      kind: "concept" | "interior" | "contractor" | "bim";
+      outPath: string;
+      includeRenders?: boolean;
+      includeSheets?: boolean;
+      includeIfc?: boolean;
+      includeBoq?: boolean;
+      includeProposal?: boolean;
+      region?: "eu" | "na" | "apac";
+    }): Promise<{ outPath: string; contents: string[]; totalBytes: number }> {
+      const contents: string[] = [];
+      if (params.kind === "concept") {
+        contents.push("concept_pack.pdf", "manifest.json");
+      } else if (params.kind === "interior") {
+        contents.push(
+          "interior_summary.pdf",
+          "schedules/materials.xlsx",
+          "manifest.json",
+        );
+      } else if (params.kind === "contractor") {
+        contents.push("sheets/A100.pdf", "schedules/boq.xlsx", "manifest.json");
+      } else {
+        contents.push(
+          "model/project.ifc",
+          "validation_report.pdf",
+          "manifest.json",
+        );
+      }
+      return {
+        outPath: params.outPath,
+        contents,
+        totalBytes: contents.length * 4096,
+      };
     },
   };
 }

@@ -26,7 +26,7 @@ def render_eevee_preview(out_path: str, *, resolution_x: int = 1280, resolution_
     scene.render.resolution_y = int(resolution_y)
     scene.render.resolution_percentage = 100
     scene.render.filepath = str(out_path)
-    scene.render.image_settings_file_format = "PNG"
+    scene.render.image_settings.file_format = "PNG"
     bpy.ops.render.render(write_still=True)
     return {
         "engine": "eevee",

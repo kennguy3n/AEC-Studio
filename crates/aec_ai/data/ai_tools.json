@@ -32,7 +32,7 @@
       "description": "Suggest a furniture layout for a room shape.",
       "allowed_scopes": ["design"],
       "max_entities_modified": 16,
-      "grammar_key": "style_assistant"
+      "grammar_key": "layout_suggestion"
     },
     {
       "id": "render_doctor",

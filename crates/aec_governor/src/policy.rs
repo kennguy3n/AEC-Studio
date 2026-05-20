@@ -4,6 +4,40 @@ use serde::{Deserialize, Serialize};
 
 use crate::tier::HardwareTier;
 
+/// Canonical id for one of the bundled render presets. Mirrors the TS
+/// `RenderPresetKey` union and the Rust `RenderPreset::id` field on the
+/// `aec_render` side. Lives on the governor crate so policy structs can
+/// reference presets without taking a runtime dependency on
+/// `aec_render`, and so the type derives `Copy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PresetKey {
+    EeveePreview,
+    Quick,
+    Standard,
+    High,
+    Studio,
+    Walkthrough,
+    Panorama,
+}
+
+impl PresetKey {
+    /// The canonical short id used as the on-wire JSON value. Matches
+    /// the strings used by the TS `RenderPresetKey` union and the
+    /// `RenderPreset::id` field in `aec_render::preset`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::EeveePreview => "eevee_preview",
+            Self::Quick => "quick",
+            Self::Standard => "standard",
+            Self::High => "high",
+            Self::Studio => "studio",
+            Self::Walkthrough => "walkthrough",
+            Self::Panorama => "panorama",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct RenderPolicy {
     pub default_samples: u32,
@@ -13,6 +47,23 @@ pub struct RenderPolicy {
     pub eevee_resolution_scale: f32,
     pub viewport_framebuffer_scale: f32,
     pub allow_background_ai_during_render: bool,
+    /// Bundled preset the UI should preselect for this tier. Mirrors
+    /// `aec_render::recommend_preset` (same short-id used by the TS
+    /// `RenderPresetKey` union) but lives on the policy so the UI layer
+    /// can show the recommendation without taking a runtime dependency
+    /// on `aec_render`.
+    pub recommended_preset_id: PresetKey,
+}
+
+impl RenderPolicy {
+    /// Bundled preset id matching the tier — exposed so callers that
+    /// already hold a `RenderPolicy` (e.g. the bridge IPC layer) don't
+    /// have to reach back into `aec_render` to discover the
+    /// recommendation. Returns the canonical short id string (e.g.
+    /// `"quick"`, `"standard"`).
+    pub fn recommended_preset_id(&self) -> &'static str {
+        self.recommended_preset_id.as_str()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -61,6 +112,7 @@ impl GovernorPolicy {
                     eevee_resolution_scale: 0.5,
                     viewport_framebuffer_scale: 0.75,
                     allow_background_ai_during_render: false,
+                    recommended_preset_id: PresetKey::Quick,
                 },
                 ai: AiPolicy {
                     model_tier: AiModelTier::Small,
@@ -79,6 +131,7 @@ impl GovernorPolicy {
                     eevee_resolution_scale: 0.75,
                     viewport_framebuffer_scale: 1.0,
                     allow_background_ai_during_render: false,
+                    recommended_preset_id: PresetKey::Standard,
                 },
                 ai: AiPolicy {
                     model_tier: AiModelTier::Small,
@@ -97,6 +150,7 @@ impl GovernorPolicy {
                     eevee_resolution_scale: 1.0,
                     viewport_framebuffer_scale: 1.0,
                     allow_background_ai_during_render: true,
+                    recommended_preset_id: PresetKey::High,
                 },
                 ai: AiPolicy {
                     model_tier: AiModelTier::Medium,
@@ -115,6 +169,7 @@ impl GovernorPolicy {
                     eevee_resolution_scale: 1.0,
                     viewport_framebuffer_scale: 1.0,
                     allow_background_ai_during_render: true,
+                    recommended_preset_id: PresetKey::Studio,
                 },
                 ai: AiPolicy {
                     model_tier: AiModelTier::Large,
@@ -144,5 +199,27 @@ mod tests {
     fn low_tier_disallows_background_ai() {
         let low = GovernorPolicy::for_tier(HardwareTier::Low);
         assert!(!low.render.allow_background_ai_during_render);
+    }
+
+    #[test]
+    fn each_tier_advertises_its_recommended_preset() {
+        // Pinned by ARCHITECTURE.md §10.2 — same mapping as
+        // `aec_render::recommend_preset`. Cross-tested against the
+        // render crate's `RenderPreset::from_quality` so the strings
+        // and the enum stay in lockstep.
+        let cases = [
+            (HardwareTier::Low, "quick"),
+            (HardwareTier::Medium, "standard"),
+            (HardwareTier::High, "high"),
+            (HardwareTier::Pro, "studio"),
+        ];
+        for (tier, expected) in cases {
+            let policy = GovernorPolicy::for_tier(tier);
+            assert_eq!(
+                policy.render.recommended_preset_id(),
+                expected,
+                "tier {tier:?} should recommend `{expected}`"
+            );
+        }
     }
 }

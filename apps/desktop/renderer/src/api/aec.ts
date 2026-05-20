@@ -63,4 +63,25 @@ export type RenderJob = {
   status: "queued" | "running" | "completed" | "failed" | "cancelled";
   preset: string;
   progress: number;
+  cameraId?: string | null;
+  batchId?: string | null;
+};
+
+export type BatchProgress = {
+  batchId: string;
+  total: number;
+  queued: number;
+  running: number;
+  completed: number;
+  failed: number;
+  cancelled: number;
+  averageProgress: number;
+};
+
+export type MaterialFinding = {
+  code: string;
+  severity: "info" | "warning" | "error";
+  materialId: string | null;
+  message: string;
+  fix: string | null;
 };

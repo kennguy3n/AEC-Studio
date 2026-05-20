@@ -218,7 +218,7 @@ mod tests {
                 ToolName::LayoutSuggestion,
                 &[Scope::Design],
                 16,
-                "style_assistant",
+                "layout_suggestion",
             ),
             (ToolName::RenderDoctor, &[Scope::Render], 8, "render_doctor"),
             (ToolName::CadCleanup, &[Scope::Draft], 256, "cad_cleanup"),

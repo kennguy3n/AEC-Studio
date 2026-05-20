@@ -1,20 +1,29 @@
-import { useEffect, useState } from "react";
-import { aec, RenderJob } from "../api/aec";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { aec, RenderJob, RuntimeStatus } from "../api/aec";
 import { RenderQueue } from "../components/render/RenderQueue";
 import {
   PresetSelector,
   RenderPresetKey,
+  recommendedPresetFor,
 } from "../components/render/PresetSelector";
 import {
   CameraSelector,
   CameraTile,
 } from "../components/render/CameraSelector";
 import {
+  LightingPresetSelector,
+  LightingPresetId,
+} from "../components/render/LightingPresetSelector";
+import {
   RenderDoctor,
   DoctorSuggestion,
 } from "../components/render/RenderDoctor";
 import { RenderPreview } from "../components/render/RenderPreview";
 import { BeforeAfterCompare } from "../components/render/BeforeAfterCompare";
+
+function recommendedFor(tier: RuntimeStatus["tier"]): RenderPresetKey {
+  return recommendedPresetFor(tier);
+}
 
 const DEMO_CAMERAS: CameraTile[] = [
   {
@@ -34,6 +43,14 @@ const DEMO_CAMERAS: CameraTile[] = [
 export function Render() {
   const [jobs, setJobs] = useState<RenderJob[]>([]);
   const [preset, setPreset] = useState<RenderPresetKey>("standard");
+  const [lighting, setLighting] = useState<LightingPresetId>("daylight");
+  const [tier, setTier] = useState<RuntimeStatus["tier"] | null>(null);
+  // Has the user made an explicit preset choice yet? If so, we never
+  // override their selection from the tier default — even if the
+  // component remounts because the user navigated away and back. Using
+  // a ref instead of state keeps the value stable across renders
+  // without re-triggering the runtime-status effect.
+  const userChosePresetRef = useRef(false);
   const [selectedCameras, setSelectedCameras] = useState<Set<string>>(
     new Set(),
   );
@@ -48,9 +65,32 @@ export function Render() {
     void aec.render.listJobs().then((rows) => {
       if (alive) setJobs(rows as RenderJob[]);
     });
+    void aec.runtime.status().then((status) => {
+      if (!alive) return;
+      const rs = status as RuntimeStatus;
+      setTier(rs.tier);
+      // Pre-select the recommended preset for the detected tier on the
+      // first mount only. Once the user has picked a preset (tracked
+      // via `userChosePresetRef`), we never overwrite their choice
+      // when the runtime status reloads or the page remounts. The
+      // tier badge in `PresetSelector` continues to advertise the
+      // recommended preset so the user can switch back manually.
+      if (userChosePresetRef.current) return;
+      const recommended = recommendedFor(rs.tier);
+      if (recommended) setPreset(recommended);
+    });
     return () => {
       alive = false;
     };
+  }, []);
+
+  const changePreset = useCallback((next: RenderPresetKey) => {
+    setPreset(next);
+    userChosePresetRef.current = true;
+    // Persist the choice on the backend so other surfaces (queue UI,
+    // diagnostics) see the active preset. The bridge stub returns
+    // `{ ok: true }` in dev; the real backend persists.
+    void aec.render.applyPreset({ preset: next });
   }, []);
 
   const toggleCamera = (id: string) => {
@@ -110,7 +150,12 @@ export function Render() {
       </header>
       <div className="render-grid">
         <aside className="render-sidebar">
-          <PresetSelector active={preset} onChange={setPreset} />
+          <PresetSelector
+            active={preset}
+            onChange={changePreset}
+            tier={tier ?? undefined}
+          />
+          <LightingPresetSelector active={lighting} onChange={setLighting} />
           <CameraSelector
             cameras={DEMO_CAMERAS}
             selected={selectedCameras}

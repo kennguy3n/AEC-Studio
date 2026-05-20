@@ -68,6 +68,14 @@ const api = {
     applyPreset: (params: Record<string, unknown>) =>
       ipcRenderer.invoke("render:applyPreset", params),
     diagnose: (jobId: string) => ipcRenderer.invoke("render:diagnose", { jobId }),
+    enqueueBatch: (params: {
+      cameraIds: string[];
+      presetIds?: string[];
+      presetId?: string;
+    }) => ipcRenderer.invoke("render:enqueueBatch", params),
+    batchProgress: (batchId: string) =>
+      ipcRenderer.invoke("render:batchProgress", { batchId }),
+    checkMaterials: () => ipcRenderer.invoke("render:checkMaterials"),
   },
 
   // ----- AI -----
@@ -92,6 +100,33 @@ const api = {
       ipcRenderer.invoke("export:exportGltf", params),
     buildProposalPack: (params: Record<string, unknown>) =>
       ipcRenderer.invoke("export:buildProposalPack", params),
+  },
+
+  // ----- Deliver -----
+  deliver: {
+    createRevision: (params: {
+      tag: string;
+      description: string;
+      entities?: Array<{
+        category: string;
+        id: string;
+        payloadHash: string;
+        label?: string | null;
+      }>;
+    }) => ipcRenderer.invoke("deliver:createRevision", params),
+    listRevisions: () => ipcRenderer.invoke("deliver:listRevisions"),
+    compareRevisions: (params: { baseId: string; headId: string }) =>
+      ipcRenderer.invoke("deliver:compareRevisions", params),
+    buildPack: (params: {
+      kind: "concept" | "interior" | "contractor" | "bim";
+      outPath: string;
+      includeRenders?: boolean;
+      includeSheets?: boolean;
+      includeIfc?: boolean;
+      includeBoq?: boolean;
+      includeProposal?: boolean;
+      region?: "eu" | "na" | "apac";
+    }) => ipcRenderer.invoke("deliver:buildPack", params),
   },
 
   // ----- Runtime -----

@@ -54,6 +54,21 @@ pub enum BlenderRequest {
         preset: Box<RenderPreset>,
         output_path: String,
     },
+    /// Cycles equirectangular 360° panorama render.
+    PanoramaRender {
+        scene: Box<RenderScene>,
+        preset: Box<RenderPreset>,
+        output_path: String,
+    },
+    /// Cycles walkthrough render (image sequence) with a camera path.
+    WalkthroughRender {
+        scene: Box<RenderScene>,
+        preset: Box<RenderPreset>,
+        camera_path: crate::cameras::CameraPath,
+        output_dir: String,
+        frame_start: u32,
+        frame_end: u32,
+    },
     /// Graceful shutdown.
     Shutdown,
 }

@@ -11,12 +11,55 @@
  * native artefact.
  */
 
+import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
 
 import { AI_TOOLS, type AiTool } from "./ai-tools";
 
-export { AI_TOOLS, type AiTool };
+/**
+ * 16-hex random id helper used by the in-process backend for ids that
+ * the renderer treats as opaque (revision ids, draft ids, …). Uses
+ * Node's crypto so id collisions are vanishingly unlikely even when
+ * many revisions are created in rapid succession during tests.
+ */
+function randomId(): string {
+  return crypto.randomBytes(8).toString("hex");
+}
+
+/**
+ * Response shape for the AI plan request. The `parsed` field is
+ * tool-specific structured data, used by panels that need to display
+ * proposals before the user accepts or rejects the diff. It is always
+ * a JSON-safe object so it can cross the IPC boundary; consumers cast
+ * to a narrower tool-specific type (e.g. `LayoutSuggestionParsed`).
+ */
+export interface AiPlanResponse {
+  diffId: string;
+  /** Tool-specific parsed payload. `null` when no parse was produced. */
+  parsed?: AiPlanParsed | null;
+}
+
+/** Parsed payloads for individual AI tools, tagged by `tool`. */
+export type AiPlanParsed =
+  | LayoutSuggestionParsed
+  | { tool: string; [key: string]: unknown };
+
+/**
+ * Mirrors Rust `LayoutSuggestionResult` in
+ * `crates/aec_ai/src/layout_suggestion.rs`. Field names use snake_case
+ * to match the on-wire JSON the Rust side produces.
+ */
+export interface LayoutSuggestionParsed {
+  tool: "layout_suggestion";
+  room_anchor: string;
+  proposals: Array<{
+    asset_id?: string | null;
+    target_entity?: string | null;
+    position_mm: [number, number, number];
+    rotation_deg: number;
+  }>;
+}
 
 export interface BridgeBackend {
   projectCreateFromTemplate(templateKey: string, projectName: string): Promise<ProjectSummary>;
@@ -52,13 +95,45 @@ export interface BridgeBackend {
   bimDiff(params: Record<string, unknown>): Promise<{ diffId: string }>;
 
   renderEnqueue(params: Record<string, unknown>): Promise<{ jobId: string }>;
+  renderEnqueueBatch(params: {
+    cameraIds: string[];
+    presetIds?: string[];
+    presetId?: string;
+  }): Promise<{ batchId: string; jobIds: string[] }>;
+  renderBatchProgress(batchId: string): Promise<{
+    batchId: string;
+    total: number;
+    queued: number;
+    running: number;
+    completed: number;
+    failed: number;
+    cancelled: number;
+    averageProgress: number;
+  } | null>;
   renderListJobs(): Promise<RenderJob[]>;
   renderCancelJob(jobId: string): Promise<{ cancelled: true }>;
   renderApplyPreset(params: Record<string, unknown>): Promise<{ ok: true }>;
   renderDiagnose(jobId: string): Promise<{ jobId: string; suggestions: string[] }>;
+  renderCheckMaterials(): Promise<{
+    findings: Array<{
+      code: string;
+      severity: "info" | "warning" | "error";
+      materialId: string | null;
+      message: string;
+      fix: string | null;
+    }>;
+  }>;
 
   aiListTools(): Promise<AiTool[]>;
-  aiPlan(params: Record<string, unknown>): Promise<{ diffId: string }>;
+  /**
+   * Submit an AI tool request and receive both a diff id (for accept /
+   * reject) and an optional `parsed` payload — the structured
+   * tool-specific response that the renderer needs to display
+   * proposals before the user accepts. The shape of `parsed` is
+   * tool-dependent and mirrors the corresponding Rust result type
+   * (e.g. `LayoutSuggestionResult` for `tool = "layout_suggestion"`).
+   */
+  aiPlan(params: Record<string, unknown>): Promise<AiPlanResponse>;
   aiAcceptDiff(diffId: string): Promise<{ accepted: true }>;
   aiRejectDiff(diffId: string): Promise<{ rejected: true }>;
   aiCancelJob(jobId: string): Promise<{ cancelled: true }>;
@@ -70,7 +145,91 @@ export interface BridgeBackend {
   exportGltf(params: Record<string, unknown>): Promise<{ outPath: string }>;
   exportBuildProposalPack(params: Record<string, unknown>): Promise<{ outPath: string }>;
 
+  // ----- Deliver mode -----
+
+  deliverCreateRevision(params: {
+    tag: string;
+    description: string;
+    entities?: Array<{
+      category: string;
+      id: string;
+      payloadHash: string;
+      label?: string | null;
+    }>;
+  }): Promise<RevisionSummary>;
+  deliverListRevisions(): Promise<RevisionSummary[]>;
+  deliverCompareRevisions(params: {
+    baseId: string;
+    headId: string;
+  }): Promise<VersionDiffSummary>;
+  deliverBuildPack(params: {
+    kind: "concept" | "interior" | "contractor" | "bim";
+    outPath: string;
+    includeRenders?: boolean;
+    includeSheets?: boolean;
+    includeIfc?: boolean;
+    includeBoq?: boolean;
+    includeProposal?: boolean;
+    region?: "eu" | "na" | "apac";
+  }): Promise<DeliverPackResult>;
+
   runtimeStatus(): Promise<RuntimeStatus>;
+}
+
+/**
+ * Renderer-facing projection of a Rust `Revision` (see
+ * `crates/aec_core/src/revision.rs`). Field names use camelCase per
+ * the rest of the bridge surface; the Rust side serialises in
+ * snake_case but the adaptor in `inProcessBackend` converts.
+ */
+export interface RevisionSummary {
+  revisionId: string;
+  tag: string;
+  description: string;
+  createdAt: string;
+  auditChainHead: string;
+  manifestName: string;
+  manifestAppVersion: string;
+  trackedEntities: Array<{
+    category: string;
+    id: string;
+    payloadHash: string;
+    label: string | null;
+  }>;
+}
+
+/** Renderer-facing projection of a Rust `VersionDiff`. */
+export interface VersionDiffSummary {
+  baseRevisionId: string;
+  headRevisionId: string;
+  changes: Array<{
+    category: string;
+    id: string;
+    kind: "added" | "removed" | "modified" | "unchanged";
+    beforeHash: string | null;
+    afterHash: string | null;
+    label: string | null;
+  }>;
+  /** Per-category counts. */
+  byCategory: Record<
+    string,
+    {
+      added: number;
+      removed: number;
+      modified: number;
+      unchanged: number;
+    }
+  >;
+}
+
+/** Result returned by `deliver:buildPack`. */
+export interface DeliverPackResult {
+  /** Path on disk where the pack ZIP / PDF was written. */
+  outPath: string;
+  /** Files included in the pack. */
+  contents: string[];
+  /** Total bytes of all files in the pack. */
+  totalBytes: number;
 }
 
 export interface ProjectSummary {
@@ -95,6 +254,10 @@ export interface RenderJob {
   status: "queued" | "running" | "completed" | "failed" | "cancelled";
   preset: string;
   progress: number;
+  /** Camera entity id this job is rendering (batch / matrix submissions). */
+  cameraId?: string | null;
+  /** Batch id when this job was submitted as part of a batch. */
+  batchId?: string | null;
 }
 
 export interface RuntimeStatus {
@@ -227,10 +390,13 @@ export const NATIVE_FALLBACK_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   "bimValidate",
   "bimDiff",
   "renderEnqueue",
+  "renderEnqueueBatch",
+  "renderBatchProgress",
   "renderListJobs",
   "renderCancelJob",
   "renderApplyPreset",
   "renderDiagnose",
+  "renderCheckMaterials",
   "aiListTools",
   "aiPlan",
   "aiAcceptDiff",
@@ -242,6 +408,10 @@ export const NATIVE_FALLBACK_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   "exportIfc",
   "exportGltf",
   "exportBuildProposalPack",
+  "deliverCreateRevision",
+  "deliverListRevisions",
+  "deliverCompareRevisions",
+  "deliverBuildPack",
 ];
 
 /**
@@ -328,6 +498,11 @@ export function inProcessBackend(): BridgeBackend {
 
   const assets: AssetSummary[] = seedAssets();
   const jobs: RenderJob[] = [];
+  // Revisions are scoped per backend instance, matching `recents`, `jobs`
+  // and `assets` above. Tests that instantiate fresh backends (or hit
+  // `adaptNative`, which builds its own `base = inProcessBackend()`)
+  // get isolated revision lists.
+  const revisions: RevisionSummary[] = [];
 
   return {
     async projectCreateFromTemplate(templateKey, projectName) {
@@ -441,6 +616,75 @@ export function inProcessBackend(): BridgeBackend {
       jobs.unshift(job);
       return { jobId: job.jobId };
     },
+    async renderEnqueueBatch(params) {
+      // Mirror the Rust aec_render::queue::RenderQueue::submit_batch /
+      // submit_matrix: one job per (camera × preset) pair, all sharing
+      // one batch id.
+      const presets: string[] =
+        params.presetIds && params.presetIds.length > 0
+          ? params.presetIds
+          : params.presetId
+          ? [params.presetId]
+          : ["standard"];
+      const batchId = id("batch");
+      const created: string[] = [];
+      for (const cameraId of params.cameraIds) {
+        for (const preset of presets) {
+          const job: RenderJob = {
+            jobId: id("job"),
+            status: "queued",
+            preset,
+            progress: 0,
+            cameraId,
+            batchId,
+          };
+          jobs.unshift(job);
+          created.push(job.jobId);
+        }
+      }
+      return { batchId, jobIds: created };
+    },
+    async renderBatchProgress(batchId) {
+      const inBatch = jobs.filter((j) => j.batchId === batchId);
+      if (inBatch.length === 0) return null;
+      let queued = 0;
+      let running = 0;
+      let completed = 0;
+      let failed = 0;
+      let cancelled = 0;
+      let progressSum = 0;
+      for (const j of inBatch) {
+        switch (j.status) {
+          case "queued":
+            queued += 1;
+            break;
+          case "running":
+            running += 1;
+            progressSum += j.progress;
+            break;
+          case "completed":
+            completed += 1;
+            progressSum += 1;
+            break;
+          case "failed":
+            failed += 1;
+            break;
+          case "cancelled":
+            cancelled += 1;
+            break;
+        }
+      }
+      return {
+        batchId,
+        total: inBatch.length,
+        queued,
+        running,
+        completed,
+        failed,
+        cancelled,
+        averageProgress: progressSum / inBatch.length,
+      };
+    },
     async renderListJobs() {
       return [...jobs];
     },
@@ -455,6 +699,12 @@ export function inProcessBackend(): BridgeBackend {
     async renderDiagnose(jobId) {
       return { jobId, suggestions: [] };
     },
+    async renderCheckMaterials() {
+      // The native bridge will run check_materials() against the live
+      // RenderScene + material library; the in-process backend has no
+      // scene state, so it returns an empty findings array.
+      return { findings: [] };
+    },
 
     async aiListTools() {
       // Return a defensive copy of the catalogue so that callers can't
@@ -462,8 +712,17 @@ export function inProcessBackend(): BridgeBackend {
       // backend (see `rendererInProcessBackend.ai.listTools`).
       return AI_TOOLS.map((t) => ({ ...t }));
     },
-    async aiPlan(_p) {
-      return { diffId: id("diff") };
+    async aiPlan(params) {
+      // Pick a realistic parsed payload based on the requested tool so
+      // the renderer's AI panels can display proposals end-to-end
+      // before the native sidecar lands. The shapes intentionally
+      // match the Rust result types in `crates/aec_ai/src/` so the
+      // renderer never has to branch on "native vs in-process".
+      const parsed = inProcessParsedForTool(
+        typeof params.tool === "string" ? params.tool : null,
+        params,
+      );
+      return { diffId: id("diff"), parsed };
     },
     async aiAcceptDiff(_d) {
       return { accepted: true };
@@ -494,10 +753,234 @@ export function inProcessBackend(): BridgeBackend {
       return { outPath: "/exports/proposal.pdf" };
     },
 
+    async deliverCreateRevision(params) {
+      const tag = params.tag.trim();
+      if (!tag) {
+        throw new Error("revision tag must not be empty");
+      }
+      if (revisions.some((r) => r.tag === tag)) {
+        throw new Error(`revision tag already exists: ${tag}`);
+      }
+      const rev: RevisionSummary = {
+        revisionId: `rev_${randomId()}`,
+        tag,
+        description: params.description,
+        createdAt: new Date().toISOString(),
+        auditChainHead: AUDIT_HEAD_PLACEHOLDER,
+        manifestName: "Apartment 12B",
+        manifestAppVersion: "0.1.0",
+        trackedEntities: (params.entities ?? []).map((e) => ({
+          category: e.category,
+          id: e.id,
+          payloadHash: e.payloadHash,
+          label: e.label ?? null,
+        })),
+      };
+      revisions.push(rev);
+      return rev;
+    },
+    async deliverListRevisions() {
+      return revisions
+        .slice()
+        .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    },
+    async deliverCompareRevisions({ baseId, headId }) {
+      const base = revisions.find((r) => r.revisionId === baseId);
+      const head = revisions.find((r) => r.revisionId === headId);
+      if (!base) throw new Error(`unknown base revision: ${baseId}`);
+      if (!head) throw new Error(`unknown head revision: ${headId}`);
+      return diffRevisionsInProcess(base, head);
+    },
+    async deliverBuildPack(params) {
+      // The native side writes the actual ZIP/PDF. For the in-process
+      // backend we synthesise the file list a Rust pack would produce
+      // so the renderer can show a realistic preview.
+      const contents = packContents(params);
+      const totalBytes = contents.reduce(
+        (acc, _name, i) => acc + 1024 + i * 256,
+        0,
+      );
+      return { outPath: params.outPath, contents, totalBytes };
+    },
+
     async runtimeStatus() {
       return inProcessRuntimeStatus();
     },
   };
+}
+
+const AUDIT_HEAD_PLACEHOLDER =
+  "0000000000000000000000000000000000000000000000000000000000000000";
+
+/**
+ * JS port of `crates/aec_core/src/version_diff.rs::compare_revisions`.
+ * The shapes are identical so the renderer code path is bridge-agnostic.
+ */
+export function diffRevisionsInProcess(
+  base: RevisionSummary,
+  head: RevisionSummary,
+): VersionDiffSummary {
+  type Key = string;
+  const keyOf = (category: string, id: string): Key => `${category}\u0000${id}`;
+  const baseMap = new Map<Key, RevisionSummary["trackedEntities"][number]>();
+  const headMap = new Map<Key, RevisionSummary["trackedEntities"][number]>();
+  for (const e of base.trackedEntities) baseMap.set(keyOf(e.category, e.id), e);
+  for (const e of head.trackedEntities) headMap.set(keyOf(e.category, e.id), e);
+
+  const byCategory: VersionDiffSummary["byCategory"] = {};
+  const bucket = (cat: string) =>
+    (byCategory[cat] ??= { added: 0, removed: 0, modified: 0, unchanged: 0 });
+
+  const allKeys = new Set<Key>([...baseMap.keys(), ...headMap.keys()]);
+  const changes: VersionDiffSummary["changes"] = [];
+
+  for (const key of [...allKeys].sort()) {
+    const b = baseMap.get(key);
+    const h = headMap.get(key);
+    if (b && h) {
+      const counts = bucket(b.category);
+      if (b.payloadHash === h.payloadHash) {
+        counts.unchanged += 1;
+        changes.push({
+          category: b.category,
+          id: b.id,
+          kind: "unchanged",
+          beforeHash: b.payloadHash,
+          afterHash: h.payloadHash,
+          label: h.label ?? b.label,
+        });
+      } else {
+        counts.modified += 1;
+        changes.push({
+          category: b.category,
+          id: b.id,
+          kind: "modified",
+          beforeHash: b.payloadHash,
+          afterHash: h.payloadHash,
+          label: h.label ?? b.label,
+        });
+      }
+    } else if (h) {
+      bucket(h.category).added += 1;
+      changes.push({
+        category: h.category,
+        id: h.id,
+        kind: "added",
+        beforeHash: null,
+        afterHash: h.payloadHash,
+        label: h.label,
+      });
+    } else if (b) {
+      bucket(b.category).removed += 1;
+      changes.push({
+        category: b.category,
+        id: b.id,
+        kind: "removed",
+        beforeHash: b.payloadHash,
+        afterHash: null,
+        label: b.label,
+      });
+    }
+  }
+
+  return {
+    baseRevisionId: base.revisionId,
+    headRevisionId: head.revisionId,
+    changes,
+    byCategory,
+  };
+}
+
+function packContents(params: {
+  kind: "concept" | "interior" | "contractor" | "bim";
+  includeRenders?: boolean;
+  includeSheets?: boolean;
+  includeIfc?: boolean;
+  includeBoq?: boolean;
+  includeProposal?: boolean;
+}): string[] {
+  const base: string[] = [];
+  if (params.kind === "concept") {
+    base.push("concept_pack.pdf");
+    if (params.includeRenders ?? true) base.push("renders/01_cover.png");
+    if (params.includeSheets ?? true) base.push("sheets/A100.pdf");
+    base.push("manifest.json");
+    return base;
+  }
+  if (params.kind === "interior") {
+    base.push("interior_summary.pdf");
+    if (params.includeRenders ?? true) {
+      base.push("renders/01_living.png", "renders/02_kitchen.png");
+    }
+    base.push("schedules/materials.xlsx", "manifest.json");
+    return base;
+  }
+  if (params.kind === "contractor") {
+    if (params.includeSheets ?? true)
+      base.push("sheets/A100.pdf", "sheets/A101.pdf");
+    if (params.includeBoq ?? true) base.push("schedules/boq.xlsx");
+    base.push("schedules/materials.xlsx");
+    if (params.includeIfc ?? true) base.push("model/project.ifc");
+    if (params.includeProposal ?? true) base.push("proposal.pdf");
+    base.push("manifest.json");
+    return base;
+  }
+  // bim
+  if (params.includeIfc ?? true) base.push("model/project.ifc");
+  if (params.includeSheets ?? true)
+    base.push("sheets/A100.pdf", "sheets/A101.pdf");
+  base.push("validation_report.pdf", "manifest.json");
+  return base;
+}
+
+/**
+ * Pick a realistic structured `parsed` payload for an AI plan request,
+ * matching the shape of the Rust result types. The native bridge will
+ * eventually return the real sidecar output here; until then this
+ * fixture lets the renderer exercise the full Propose → Review → Apply
+ * flow end-to-end in dev / vitest without a sidecar.
+ *
+ * Returns `null` when the tool has no client-visible parsed payload
+ * (everything goes through diff acceptance instead).
+ */
+export function inProcessParsedForTool(
+  tool: string | null,
+  params: Record<string, unknown>,
+): AiPlanParsed | null {
+  if (tool === "layout_suggestion") {
+    const ctx = (params.context ?? {}) as Record<string, unknown>;
+    const roomAnchor =
+      typeof ctx.room_anchor === "string" ? ctx.room_anchor : "room.unknown";
+    // A small but realistic 3-proposal layout: a sofa, a side chair
+    // facing it, and a coffee table between them. Coordinates are in
+    // millimetres relative to the room anchor's origin, matching the
+    // Rust `LayoutProposal::position_mm` contract.
+    return {
+      tool: "layout_suggestion",
+      room_anchor: roomAnchor,
+      proposals: [
+        {
+          asset_id: "ikea.sofa_kivik_3s",
+          target_entity: null,
+          position_mm: [1200, 0, 600],
+          rotation_deg: 0,
+        },
+        {
+          asset_id: "muuto.armchair_outline",
+          target_entity: null,
+          position_mm: [-1100, 0, 800],
+          rotation_deg: 90,
+        },
+        {
+          asset_id: "vendor.coffee_table_round",
+          target_entity: null,
+          position_mm: [0, 0, 700],
+          rotation_deg: 0,
+        },
+      ],
+    };
+  }
+  return null;
 }
 
 function inProcessRuntimeStatus(): RuntimeStatus {

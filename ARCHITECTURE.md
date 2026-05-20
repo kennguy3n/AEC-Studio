@@ -385,11 +385,18 @@ The BIM cache lets large IFC models open in seconds on re-open and lets export s
 
 ```
 crates/aec_render/
+├── blender_discovery.rs        # Cross-platform Blender binary discovery (env → known paths → PATH)
 ├── cameras.rs                  # CameraSnapshot, CameraStore, CameraJournal, preset thumbnails
-├── queue/                      # Render job queue, status (queued/rendering/done/failed/cancelled), ETA
-├── presets/                    # Quick / Standard / High / Studio / EEVEE Preview / Walkthrough / Panorama
-├── doctor/                     # AI render diagnostics (noise, lighting, materials)
-└── ipc/                        # Bridge to the Blender worker over JSON-lines
+├── cycles.rs                   # Cycles final-render pipeline
+├── doctor.rs                   # Material check / diagnostics (missing texture, non-PBR, swapped channels)
+├── eevee.rs                    # EEVEE preview pipeline
+├── history.rs                  # RenderHistory + compare(a, b) → CompareResult
+├── job.rs                      # RenderJob, RenderJobStatus, walkthrough frame tracking, resume state
+├── lighting.rs                 # Lighting presets (WarmEvening/Daylight/Studio/...), IES profiles
+├── preset.rs                   # Quick / Standard / High / Studio / EEVEE Preview / Walkthrough / Panorama + recommend_preset(tier)
+├── queue.rs                    # Render queue (single, batch, matrix); resume on failure; governor-bounded concurrency
+├── scene.rs                    # RenderScene, RenderCamera, RenderLight serialization
+└── worker.rs                   # JSON-line IPC to the Blender worker
 ```
 
 ### Camera and render state
@@ -723,6 +730,21 @@ Encryption uses SQLCipher with **AES-256 page-level** and per-project keys. Cont
 | Packaging | electron-builder, `.exe` (NSIS) and `.msi` |
 | Code signing | EV code-signing cert via Authenticode |
 
+### Linux
+
+| Component | Detail |
+|---|---|
+| Shell | Electron + React |
+| Native addon | N-API addon (x86_64) |
+| AI runtime | LlamaCppAdapter |
+| CPU-only | AVX2 minimum, AVX-VNNI / AVX-512 VNNI when available (surfaced by `aec_governor::profiler`) |
+| CPU+GPU | Vulkan for inference; Cycles GPU via Vulkan or CUDA on NVIDIA |
+| Render GPU | wgpu Vulkan backend |
+| GPU detection | `/proc/driver/nvidia/version` → `lspci -mm` → `vulkaninfo --summary` (best-effort cascade) |
+| Blender discovery | `AEC_BLENDER_BIN` / `BLENDER_BIN` → known install paths (`/usr/bin`, `/usr/local/bin`, `/snap/bin`, Flatpak, `~/.local/bin`) → `PATH` |
+| Packaging | electron-builder, AppImage + `.deb`, optional Snap (`packaging/linux/`) |
+| Desktop integration | `.desktop` file with `application/x-aec` MIME and `x-scheme-handler/aec` deep-link handler |
+
 ### Device tiering
 
 | Tier | Available RAM | Capability |
@@ -789,6 +811,7 @@ aec-studio/
 │   ├── materials/
 │   └── presets/
 ├── packaging/                  # electron-builder configs
+│   ├── linux/                  # AppImage, .deb, .snap + .desktop
 │   ├── macos/
 │   └── windows/
 ├── docs/                       # Additional documentation

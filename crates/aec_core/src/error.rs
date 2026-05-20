@@ -44,4 +44,11 @@ pub enum AecError {
 
     #[error("OS random source unavailable: {0}")]
     Random(#[from] getrandom::Error),
+
+    /// Catch-all for module-specific validation errors (e.g. empty
+    /// revision tag, malformed comparison input). Prefer adding a
+    /// typed variant when a downstream caller needs to branch on the
+    /// specific error; use this for one-off string contexts.
+    #[error("{0}")]
+    Other(String),
 }
