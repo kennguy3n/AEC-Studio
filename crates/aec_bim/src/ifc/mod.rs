@@ -58,15 +58,28 @@ pub fn derive_guid_from_str(seed: &str) -> String {
     let raw = &hash.as_bytes()[..16];
 
     let mut out = String::with_capacity(22);
-    // Sliding 6-bit window over the 16 input bytes. `acc` is intentionally
-    // `u32` (not `u64`) — the left-shift by 8 below relies on Rust's
-    // defined wrap-on-overflow for `<<` so the top bits drop off
-    // cleanly after each byte is fully consumed. The invariant we
-    // maintain is `bits <= 14` at the top of the loop (it cycles
-    // 0→8→2→10→4→12→6→0 across bytes), so the `acc >> bits` extraction
-    // never reads beyond the live window: the bits we'd "lose" to
-    // wrap-around have already been emitted into `out` on a prior
-    // iteration. `& 0x3F` masks the 6 target bits regardless.
+    // Sliding 6-bit window over the 16 input bytes. `acc` is `u32` and
+    // never holds more than 12 *significant* bits at a time, so the
+    // accumulator comfortably fits and `acc << 8` never discards any
+    // meaningful state.
+    //
+    // The invariant: at the top of the outer loop `bits ∈ {0, 2, 4}`
+    // (the leftover from the inner extraction); after `acc << 8 | b`
+    // the live window grows to at most 12 bits; the inner `while`
+    // emits 6-bit chunks until `bits < 6` again. The exact cycle is
+    // `bits: 0 → 8 → 2 → 10 → 4 → 12 → 6 → 0 → …` (entries are the
+    // values BEFORE each emission), and the corresponding number of
+    // chars pushed per outer iteration is 1, 1, 2 — totalling 22 over
+    // 16 input bytes (matching `ceil(16 * 8 / 6) = 22`, the IFC GUID
+    // length).
+    //
+    // Note: Rust's `<<` simply discards bits shifted out of the high
+    // end (no wrap-on-overflow / no debug-mode panic for `<<` with
+    // shift count < 32). Because the invariant above keeps the
+    // accumulator below 13 significant bits, no information is ever
+    // lost from `acc` — the bits we appear to "shift out" were
+    // already zero. `& 0x3F` masks the 6 target bits in each
+    // extraction.
     let mut acc: u32 = 0;
     let mut bits: u32 = 0;
     for &b in raw {
