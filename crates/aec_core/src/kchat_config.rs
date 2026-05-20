@@ -299,8 +299,14 @@ mod tests {
         assert_eq!(history.len(), 1);
         let (card, result) = &history[0];
         assert_eq!(card.artifact, KChatArtifact::AssetPack);
-        assert_eq!(card.metadata.get("pack_id").map(String::as_str), Some("pack"));
-        assert_eq!(card.metadata.get("version").map(String::as_str), Some("0.1.0"));
+        assert_eq!(
+            card.metadata.get("pack_id").map(String::as_str),
+            Some("pack")
+        );
+        assert_eq!(
+            card.metadata.get("version").map(String::as_str),
+            Some("0.1.0")
+        );
         assert_eq!(
             card.metadata.get("manifest_blake3").map(String::as_str),
             Some(outcome.reference.manifest_blake3.as_str())

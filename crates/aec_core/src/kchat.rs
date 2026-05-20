@@ -395,10 +395,7 @@ impl AssetPackManifest {
     /// `KChatIntegration::publish_asset_pack` actually route an
     /// asset-pack announcement *through* the configured transport
     /// instead of just building a metadata struct.
-    pub fn artifact_card(
-        &self,
-        reference: &AssetPackReference,
-    ) -> ArtifactCard {
+    pub fn artifact_card(&self, reference: &AssetPackReference) -> ArtifactCard {
         let mut metadata = HashMap::new();
         metadata.insert("pack_id".to_string(), reference.pack_id.clone());
         metadata.insert("version".to_string(), reference.version.clone());
@@ -406,23 +403,14 @@ impl AssetPackManifest {
             "manifest_blake3".to_string(),
             reference.manifest_blake3.clone(),
         );
-        metadata.insert(
-            "entry_count".to_string(),
-            self.entries.len().to_string(),
-        );
+        metadata.insert("entry_count".to_string(), self.entries.len().to_string());
         let total_bytes: u64 = self.entries.iter().map(|e| e.size_bytes).sum();
         metadata.insert("total_bytes".to_string(), total_bytes.to_string());
 
         ArtifactCard {
             artifact: KChatArtifact::AssetPack,
-            caption: format!(
-                "Asset pack “{}” v{}",
-                self.display_name, self.version
-            ),
-            project_link: format!(
-                "aecstudio://asset-pack/{}/{}",
-                self.pack_id, self.version
-            ),
+            caption: format!("Asset pack “{}” v{}", self.display_name, self.version),
+            project_link: format!("aecstudio://asset-pack/{}/{}", self.pack_id, self.version),
             thumbnail_blake3: None,
             metadata,
         }
