@@ -3,8 +3,10 @@
 //! Three distinct CRC variants appear in real DWG files:
 //!
 //! 1. **CRC-8** — the file-header checksum on the leading 16 bytes
-//!    (R13+).  Polynomial `0x07` (x^8 + x^2 + x + 1), reflected,
-//!    initial value `0xc0`.
+//!    (R13+).  Polynomial `0x07` (x^8 + x^2 + x + 1), MSB-first
+//!    (non-reflected), initial value `0xc0`. The reduction loop in
+//!    [`crc_8`] tests the high bit and shifts left, matching what
+//!    AutoCAD emits and what LibreDWG validates against.
 //! 2. **CRC-32** — section page checksums (R2004+). Standard
 //!    `Castagnoli` (CRC-32C) polynomial `0x1edc6f41`, reflected,
 //!    initial value `0xffffffff`, post-complement.

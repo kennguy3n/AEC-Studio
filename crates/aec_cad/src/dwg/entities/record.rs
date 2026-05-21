@@ -234,6 +234,28 @@ impl ObjectRecord {
         ))
     }
 
+    /// Peek at the structural header of a record without consuming
+    /// the per-type payload or handle stream.
+    ///
+    /// This is the API the file walker uses for R2000-R2007 where the
+    /// payload-to-handle-stream boundary requires per-type knowledge:
+    /// the walker stores the record's raw wire bytes and the structural
+    /// summary, and a later pass (with a per-type decoder) recovers
+    /// the entity via [`Self::decode_with`].
+    ///
+    /// Returns:
+    /// - `object_type`: the entity class
+    /// - `handle`: the record's own handle (from H after BS type)
+    /// - `common`: the decoded common entity header data
+    /// - `total`: total bytes consumed by the record (MS size + body + CRC)
+    pub fn peek_header(
+        version: Version,
+        bytes: &[u8],
+    ) -> DwgResult<(ObjectType, HandleRef, CommonHeaderData, usize)> {
+        let (header, _body_r, _hint, total) = Self::decode_header_only(version, bytes)?;
+        Ok((header.object_type, header.handle, header.common, total))
+    }
+
     /// Decode just the header (BS object_type, [RL bitsize], H handle,
     /// EED terminator, common header) and return the body bit reader
     /// positioned at the start of the payload, along with the handle

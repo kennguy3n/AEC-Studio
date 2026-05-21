@@ -1,0 +1,373 @@
+//! Bridge between [`DxfDocument`] and the on-disk R14/R2000 layout.
+//!
+//! The native DWG codec is structured around two layers:
+//!
+//! 1. **Wire layer** (everything under `dwg::file`, `dwg::bits`,
+//!    `dwg::entities`) — turns bytes into typed records.
+//! 2. **Document layer** (this module) — turns those typed records
+//!    into the canonical [`DxfDocument`] in-memory shape so callers
+//!    don't need to know anything about handles or section locators.
+//!
+//! Per-version support:
+//! - R14 and R2000 → handled here (sections are not paginated)
+//! - R2004+ → handled in `dwg::pages`-aware sibling modules
+//! - R12 → handled separately under `dwg::r12`
+//!
+//! Today we round-trip the entity kinds whose bit-level codec already
+//! exists (LINE, ARC, CIRCLE, ELLIPSE, INSERT, LWPOLYLINE, TEXT).
+//! Unsupported entity kinds surface a structured
+//! [`DwgError::UnsupportedInVersion`] rather than silently dropping
+//! data.
+
+use crate::dwg::bits::reader::HandleRef;
+use crate::dwg::bits::{BitReader, BitWriter};
+use crate::dwg::entities::header_codec::CommonHeaderData;
+use crate::dwg::entities::record::{BitBuf, ObjectHandles};
+use crate::dwg::entities::{
+    arc::ArcEntity, circle::CircleEntity, ellipse::EllipseEntity, insert::InsertEntity,
+    line::LineEntity, lwpolyline::LwPolylineEntity, text::TextEntity, ObjectRecord, ObjectType,
+};
+use crate::dwg::error::{DwgError, DwgResult};
+use crate::dwg::file::classes::ClassesSection;
+use crate::dwg::file::header_vars::HeaderVarsSection;
+use crate::dwg::file::r2000_layout::{assemble_r2000, parse_r2000, R2000FileParts, R2000Object};
+use crate::dwg::version::Version;
+use crate::dxf::{DxfDocument, DxfEntity};
+
+/// First object handle we hand out. Real DWG files reserve the low
+/// handles for the well-known table records (BLOCK_RECORD, LAYER,
+/// STYLE, LTYPE, …). 0x10 is conventional enough that LibreDWG
+/// fixtures match this; once we encode real table records the
+/// assignment will be threaded through the symbol-table builder.
+const FIRST_ENTITY_HANDLE: u64 = 0x10;
+
+/// Convenience handle used for unresolved "layer 0" references in
+/// the handle stream. Real R2000 round-trip needs a LAYER record at
+/// this handle; that wiring lands in the symbol-tables commit.
+const LAYER_ZERO_HANDLE: u64 = 0x14;
+
+/// Convenience handle used for the model-space BLOCK_HEADER (owner
+/// of every entity in model space). Same caveat as above.
+const MODEL_SPACE_HANDLE: u64 = 0x1f;
+
+/// Write a [`DxfDocument`] to R14/R2000 wire bytes.
+pub fn write_modern(doc: &DxfDocument, version: Version) -> DwgResult<Vec<u8>> {
+    if !matches!(version, Version::R14 | Version::R2000) {
+        return Err(DwgError::UnsupportedInVersion {
+            version,
+            what: format!("modern::write_modern only handles R14/R2000; got {version:?}"),
+        });
+    }
+
+    let mut records = Vec::with_capacity(doc.entities.len());
+    for (idx, entity) in doc.entities.iter().enumerate() {
+        let handle = FIRST_ENTITY_HANDLE + idx as u64;
+        let record = entity_to_record(entity, version, handle)?;
+        records.push(record);
+    }
+
+    let parts = R2000FileParts {
+        version,
+        header_vars: HeaderVarsSection::minimal(version),
+        classes: ClassesSection::empty(version),
+        objects: records,
+    };
+    assemble_r2000(parts)
+}
+
+/// Read a [`DxfDocument`] from R14/R2000 wire bytes.
+pub fn read_modern(bytes: &[u8]) -> DwgResult<DxfDocument> {
+    let file = parse_r2000(bytes)?;
+    let mut doc = DxfDocument::new();
+    for object in &file.objects {
+        // parse_r2000 only peeks the structural header on R14/R2000 —
+        // for the per-type payload we re-decode via decode_with on
+        // the stored raw bytes. The per-type decoder consumes exactly
+        // the payload bits and leaves the cursor at the handle stream,
+        // so the framing inside decode_with stays consistent.
+        let entity = record_to_entity(file.version, object)?;
+        if let Some(e) = entity {
+            doc.entities.push(e);
+        }
+    }
+    Ok(doc)
+}
+
+/// Build the wire object record for one entity. The common header is
+/// fixed to "model-space BLOCK_HEADER" owner mode and a single layer
+/// handle, matching what a tiny single-LINE drawing looks like in
+/// LibreDWG's example fixtures.
+fn entity_to_record(entity: &DxfEntity, version: Version, handle: u64) -> DwgResult<ObjectRecord> {
+    let mut payload = BitWriter::new();
+    let object_type = match entity {
+        DxfEntity::Line(line) => {
+            LineEntity::from_dxf(line).encode_payload(&mut payload)?;
+            ObjectType::Line
+        }
+        DxfEntity::Arc(arc) => {
+            ArcEntity::from_dxf(arc).encode_payload(&mut payload)?;
+            ObjectType::Arc
+        }
+        DxfEntity::Circle(c) => {
+            CircleEntity::from_dxf(c).encode_payload(&mut payload)?;
+            ObjectType::Circle
+        }
+        DxfEntity::Ellipse(e) => {
+            EllipseEntity::from_dxf(e).encode_payload(&mut payload)?;
+            ObjectType::Ellipse
+        }
+        DxfEntity::Polyline(p) => {
+            LwPolylineEntity::from_dxf(p).encode_payload(&mut payload)?;
+            ObjectType::LwPolyline
+        }
+        DxfEntity::Insert(ins) => {
+            InsertEntity::from_dxf(ins).encode_payload(&mut payload, version)?;
+            ObjectType::Insert
+        }
+        DxfEntity::Text(t) => {
+            TextEntity::from_dxf(t).encode_payload(&mut payload, version)?;
+            ObjectType::Text
+        }
+        DxfEntity::Spline(_) | DxfEntity::Hatch(_) | DxfEntity::Dimension(_) => {
+            return Err(DwgError::UnsupportedInVersion {
+                version,
+                what: format!(
+                    "{:?} bit-level encoding not yet wired in modern::write_modern; \
+                     the per-type codec lands in subsequent commits",
+                    entity_kind(entity)
+                ),
+            });
+        }
+    };
+    Ok(ObjectRecord {
+        object_type,
+        handle: HandleRef {
+            code: 0,
+            value: handle,
+        },
+        common: CommonHeaderData::default(),
+        payload_bits: BitBuf::from_writer(payload),
+        handles: ObjectHandles {
+            owner: Some(HandleRef {
+                code: 5,
+                value: MODEL_SPACE_HANDLE,
+            }),
+            reactors: Vec::new(),
+            x_dictionary: None,
+            layer: HandleRef {
+                code: 5,
+                value: LAYER_ZERO_HANDLE,
+            },
+            linetype: None,
+            plot_style: None,
+            material: None,
+        },
+    })
+}
+
+/// Convert one parsed `R2000Object` back into a `DxfEntity`. We
+/// run the record's raw wire bytes through `decode_with` so the
+/// per-type decoder consumes exactly the payload bits and the
+/// handle stream is recovered consistently afterwards. Returns
+/// `None` for entity kinds we don't yet bridge — the caller is
+/// free to skip them.
+fn record_to_entity(version: Version, object: &R2000Object) -> DwgResult<Option<DxfEntity>> {
+    let layer = record_layer_name(object);
+    let (_record, entity, _consumed) =
+        ObjectRecord::decode_with(version, &object.raw_bytes, |obj_type, _common, r| {
+            payload_to_entity(obj_type, r, version, layer.clone())
+        })?;
+    Ok(Some(entity))
+}
+
+/// Decode the per-type payload from `r` into a `DxfEntity`.
+fn payload_to_entity(
+    obj_type: ObjectType,
+    r: &mut BitReader<'_>,
+    version: Version,
+    layer: String,
+) -> DwgResult<DxfEntity> {
+    match obj_type {
+        ObjectType::Line => Ok(DxfEntity::Line(
+            LineEntity::decode_payload(r, layer)?.into_dxf(),
+        )),
+        ObjectType::Arc => Ok(DxfEntity::Arc(
+            ArcEntity::decode_payload(r, layer)?.into_dxf(),
+        )),
+        ObjectType::Circle => Ok(DxfEntity::Circle(
+            CircleEntity::decode_payload(r, layer)?.into_dxf(),
+        )),
+        ObjectType::Ellipse => Ok(DxfEntity::Ellipse(
+            EllipseEntity::decode_payload(r, layer)?.into_dxf(),
+        )),
+        ObjectType::LwPolyline => Ok(DxfEntity::Polyline(
+            LwPolylineEntity::decode_payload(r, layer)?.into_dxf(),
+        )),
+        ObjectType::Insert => Ok(DxfEntity::Insert(
+            InsertEntity::decode_payload(r, layer, version)?.into_dxf(),
+        )),
+        ObjectType::Text => Ok(DxfEntity::Text(
+            TextEntity::decode_payload(r, layer, version)?.into_dxf(),
+        )),
+        other => Err(DwgError::UnsupportedInVersion {
+            version,
+            what: format!("{other:?} decoding not yet bridged to DxfEntity"),
+        }),
+    }
+}
+
+/// The layer name the entity claims to live on. The decoded
+/// `R2000Object` doesn't yet resolve its layer handle to a string
+/// (that needs the LAYER symbol table); we default to "0" until that
+/// wiring lands.
+fn record_layer_name(_object: &R2000Object) -> String {
+    "0".into()
+}
+
+fn entity_kind(e: &DxfEntity) -> &'static str {
+    match e {
+        DxfEntity::Line(_) => "Line",
+        DxfEntity::Polyline(_) => "Polyline",
+        DxfEntity::Arc(_) => "Arc",
+        DxfEntity::Circle(_) => "Circle",
+        DxfEntity::Ellipse(_) => "Ellipse",
+        DxfEntity::Spline(_) => "Spline",
+        DxfEntity::Hatch(_) => "Hatch",
+        DxfEntity::Text(_) => "Text",
+        DxfEntity::Insert(_) => "Insert",
+        DxfEntity::Dimension(_) => "Dimension",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dxf::{DxfArc, DxfCircle, DxfEllipse, DxfLine};
+
+    #[test]
+    fn empty_document_round_trips_r2000() {
+        let doc = DxfDocument::new();
+        let bytes = write_modern(&doc, Version::R2000).unwrap();
+        let back = read_modern(&bytes).unwrap();
+        assert_eq!(back.entities.len(), 0);
+    }
+
+    #[test]
+    fn single_line_round_trips_r2000() {
+        let mut doc = DxfDocument::new();
+        doc.push(DxfEntity::Line(DxfLine {
+            layer: "0".into(),
+            start: [0.0, 0.0, 0.0],
+            end: [100.0, 50.0, 0.0],
+        }));
+        let bytes = write_modern(&doc, Version::R2000).unwrap();
+        let back = read_modern(&bytes).unwrap();
+        assert_eq!(back.entities.len(), 1);
+        match &back.entities[0] {
+            DxfEntity::Line(l) => {
+                assert_eq!(l.start, [0.0, 0.0, 0.0]);
+                assert_eq!(l.end, [100.0, 50.0, 0.0]);
+            }
+            other => panic!("expected Line, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn single_line_round_trips_r14() {
+        let mut doc = DxfDocument::new();
+        doc.push(DxfEntity::Line(DxfLine {
+            layer: "0".into(),
+            start: [1.0, 2.0, 3.0],
+            end: [4.0, 5.0, 6.0],
+        }));
+        let bytes = write_modern(&doc, Version::R14).unwrap();
+        let back = read_modern(&bytes).unwrap();
+        assert_eq!(back.entities.len(), 1);
+        match &back.entities[0] {
+            DxfEntity::Line(l) => {
+                assert_eq!(l.start, [1.0, 2.0, 3.0]);
+                assert_eq!(l.end, [4.0, 5.0, 6.0]);
+            }
+            other => panic!("expected Line, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multiple_lines_round_trip_in_order() {
+        let mut doc = DxfDocument::new();
+        for i in 0..5 {
+            let f = i as f64;
+            doc.push(DxfEntity::Line(DxfLine {
+                layer: "0".into(),
+                start: [f, 0.0, 0.0],
+                end: [f + 1.0, 0.0, 0.0],
+            }));
+        }
+        let bytes = write_modern(&doc, Version::R2000).unwrap();
+        let back = read_modern(&bytes).unwrap();
+        assert_eq!(back.entities.len(), 5);
+        for (i, entity) in back.entities.iter().enumerate() {
+            match entity {
+                DxfEntity::Line(l) => assert_eq!(l.start[0], i as f64),
+                other => panic!("expected Line at {i}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn arc_round_trips_r2000() {
+        let mut doc = DxfDocument::new();
+        doc.push(DxfEntity::Arc(DxfArc {
+            layer: "0".into(),
+            center: [5.0, 5.0, 0.0],
+            radius: 3.0,
+            start_angle: 0.0,
+            end_angle: std::f64::consts::FRAC_PI_2,
+        }));
+        let bytes = write_modern(&doc, Version::R2000).unwrap();
+        let back = read_modern(&bytes).unwrap();
+        match &back.entities[0] {
+            DxfEntity::Arc(a) => {
+                assert_eq!(a.center, [5.0, 5.0, 0.0]);
+                assert_eq!(a.radius, 3.0);
+            }
+            other => panic!("expected Arc, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn circle_and_ellipse_round_trip_r2000() {
+        let mut doc = DxfDocument::new();
+        doc.push(DxfEntity::Circle(DxfCircle {
+            layer: "0".into(),
+            center: [1.0, 2.0, 0.0],
+            radius: 4.0,
+        }));
+        doc.push(DxfEntity::Ellipse(DxfEllipse {
+            layer: "0".into(),
+            center: [10.0, 20.0, 0.0],
+            major_axis: [5.0, 0.0, 0.0],
+            ratio: 0.5,
+            start_param: 0.0,
+            end_param: std::f64::consts::TAU,
+        }));
+        let bytes = write_modern(&doc, Version::R2000).unwrap();
+        let back = read_modern(&bytes).unwrap();
+        assert_eq!(back.entities.len(), 2);
+        match &back.entities[0] {
+            DxfEntity::Circle(c) => {
+                assert_eq!(c.center, [1.0, 2.0, 0.0]);
+                assert_eq!(c.radius, 4.0);
+            }
+            other => panic!("expected Circle, got {other:?}"),
+        }
+        match &back.entities[1] {
+            DxfEntity::Ellipse(e) => {
+                assert_eq!(e.center, [10.0, 20.0, 0.0]);
+                assert_eq!(e.major_axis, [5.0, 0.0, 0.0]);
+                assert_eq!(e.ratio, 0.5);
+            }
+            other => panic!("expected Ellipse, got {other:?}"),
+        }
+    }
+}

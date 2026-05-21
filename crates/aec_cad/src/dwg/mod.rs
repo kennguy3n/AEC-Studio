@@ -22,6 +22,7 @@ pub mod bits;
 pub mod entities;
 pub mod error;
 pub mod file;
+pub mod modern;
 pub mod r12;
 pub mod reader;
 pub mod tables;
