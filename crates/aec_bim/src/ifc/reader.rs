@@ -473,10 +473,25 @@ impl IfcReader {
                 }
                 qset_count += 1;
             } else {
-                return Err(IfcReadError::Malformed(format!(
-                    "IFCRELDEFINESBYPROPERTIES references unknown set #{}",
-                    pset_or_qset_step
-                )));
+                // The module contract (see crate-level doc and
+                // `IfcReader::from_string`) is that unmodeled / unknown
+                // entities — including pset / qset target rows that
+                // the modeled-entity filter skipped — are tolerated.
+                // An IFCRELDEFINESBYPROPERTIES whose RelatingPropertyDefinition
+                // points at one of those skipped rows is therefore an
+                // expected condition when reading an external file
+                // produced by Revit / ArchiCAD / IfcOpenShell, not a
+                // file corruption. Skip silently; the `records_seen`
+                // counter already accounts for the source record so
+                // downstream sanity checks remain meaningful.
+                //
+                // Hard-failing here was previously inconsistent with
+                // the module-level "tolerate and skip unknowns"
+                // promise and caused external-file ingestion to
+                // refuse otherwise-valid inputs that contained
+                // unmodeled IfcPropertySet subclasses (e.g.
+                // `IfcPreDefinedPropertySet`).
+                continue;
             }
         }
 
@@ -714,81 +729,170 @@ fn detect_schema(text: &str) -> IfcReadResult<IfcSchema> {
 ///     contains a literal semicolon that is *not* a record
 ///     terminator.
 fn iter_logical_records(text: &str) -> IfcReadResult<Vec<String>> {
+    let mut splitter = StepRecordSplitter::new(text);
     let mut out: Vec<String> = Vec::new();
-    let mut buf = String::new();
-    let mut depth: i32 = 0;
-    let mut in_str = false;
-    let mut in_comment = false;
-    // Walk by characters so multi-byte UTF-8 (e.g. é, Ö, £) is not
-    // mis-split. The peek-ahead for `/*` and `*/` looks at the next
-    // *byte* via slice indexing on the original text, which is safe
-    // because `/` and `*` are ASCII (single-byte) and the byte
-    // offset of `ch` is always at a char boundary.
-    let mut chars = text.char_indices().peekable();
-    while let Some((off, c)) = chars.next() {
-        // Comment open: `/*` outside strings.
-        if !in_str && !in_comment && c == '/' {
-            if let Some(&(_, '*')) = chars.peek() {
-                in_comment = true;
-                chars.next(); // consume `*`
+    for item in splitter.by_ref() {
+        let (record, _consumed) = item?;
+        if !record.is_empty() {
+            out.push(record);
+        }
+    }
+    splitter.validate_at_eof()?;
+    Ok(out)
+}
+
+/// Shared STEP record-splitting state machine. The same character-
+/// level rules apply to three callers:
+///
+///   1. [`iter_logical_records`] (full-text → `Vec<String>`)
+///   2. [`split_first_logical_record`] (streaming prefix → first
+///      record + consumed bytes)
+///   3. [`validate_trailing_buffer`] (post-stream EOF check)
+///
+/// Keeping the rules in a single struct ensures the three sites can
+/// not diverge — earlier versions of this module had three
+/// independent copies that all needed to be updated in lockstep (for
+/// `/* … */` comments, multi-byte UTF-8, escaped quotes, ISO
+/// `''` doubled-quote escapes, etc.). Adding a new STEP token rule
+/// now requires editing exactly one place.
+///
+/// **String quoting** accepts both AEC Studio's writer convention
+/// (`\'` for an embedded single-quote, `\\` for a backslash) AND
+/// the ISO 10303-21 canonical convention (`''` doubled quote for an
+/// embedded single-quote). The writer emits the ISO `''` form so
+/// AEC Studio output is interoperable with Revit / ArchiCAD / other
+/// third-party IFC tooling, but the reader keeps accepting `\'` for
+/// backwards compatibility with files written by earlier AEC builds.
+///
+/// Both escaped forms are preserved *verbatim* in the record buffer
+/// returned by the iterator; [`unescape_step_string`] does the final
+/// collapse from `\'` / `''` to a single `'`.
+struct StepRecordSplitter<'a> {
+    chars: std::iter::Peekable<std::str::CharIndices<'a>>,
+    buf: String,
+    depth: i32,
+    in_str: bool,
+    in_comment: bool,
+}
+
+impl<'a> StepRecordSplitter<'a> {
+    fn new(text: &'a str) -> Self {
+        // Walk by characters so multi-byte UTF-8 (e.g. é, Ö, £) is not
+        // mis-split. The peek-ahead for `/*` and `*/` looks at the next
+        // *byte* via slice indexing on the original text, which is safe
+        // because `/` and `*` are ASCII (single-byte) and the byte
+        // offset of each char is always at a char boundary.
+        Self {
+            chars: text.char_indices().peekable(),
+            buf: String::new(),
+            depth: 0,
+            in_str: false,
+            in_comment: false,
+        }
+    }
+
+    /// After [`Iterator::next`] returns `None`, call this to surface
+    /// dangling-state errors (unterminated string literal, unbalanced
+    /// parens). Returns `Ok(())` when the splitter is in a clean
+    /// resting state — i.e. not in the middle of a string and depth
+    /// is back to zero. Callers that operate on a streaming prefix
+    /// (where partial state at end-of-buffer is expected) skip this
+    /// check; callers that operate on a full STEP file or at
+    /// end-of-stream invoke it.
+    fn validate_at_eof(&self) -> IfcReadResult<()> {
+        if self.in_str {
+            return Err(IfcReadError::Malformed(
+                "unterminated string literal at end of STEP file".into(),
+            ));
+        }
+        if self.depth != 0 {
+            return Err(IfcReadError::Malformed(format!(
+                "STEP file ends with unbalanced parens (depth={})",
+                self.depth
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Iterator for StepRecordSplitter<'_> {
+    /// `(record_text_without_trailing_semicolon, bytes_consumed_in_input)`.
+    ///
+    /// `bytes_consumed_in_input` is the byte offset (into the slice
+    /// passed to [`StepRecordSplitter::new`]) of the first byte *past*
+    /// the terminating `;` — the value [`split_first_logical_record`]
+    /// returns so the streaming caller can drain that prefix.
+    type Item = IfcReadResult<(String, usize)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some((off, c)) = self.chars.next() {
+            // Comment open: `/*` outside strings.
+            if !self.in_str && !self.in_comment && c == '/' {
+                if let Some(&(_, '*')) = self.chars.peek() {
+                    self.in_comment = true;
+                    self.chars.next(); // consume `*`
+                    continue;
+                }
+            }
+            // Comment close: `*/`.
+            if self.in_comment {
+                if c == '*' {
+                    if let Some(&(_, '/')) = self.chars.peek() {
+                        self.in_comment = false;
+                        self.chars.next(); // consume `/`
+                    }
+                }
                 continue;
             }
+            match c {
+                '\\' if self.in_str => {
+                    // Preserve `\\` and `\'` so split_step_args sees them.
+                    self.buf.push(c);
+                    if let Some((_, next)) = self.chars.next() {
+                        self.buf.push(next);
+                    }
+                }
+                '\'' => {
+                    // ISO 10303-21 §6.4.1: `''` inside a string
+                    // literal is an escaped single quote (the string
+                    // does NOT terminate). Detect the doubled-quote
+                    // by peeking the next char; if matched, push
+                    // both into the buffer and stay `in_str`.
+                    if self.in_str {
+                        if let Some(&(_, '\'')) = self.chars.peek() {
+                            self.buf.push(c);
+                            if let Some((_, c2)) = self.chars.next() {
+                                self.buf.push(c2);
+                            }
+                            continue;
+                        }
+                    }
+                    self.in_str = !self.in_str;
+                    self.buf.push(c);
+                }
+                '(' if !self.in_str => {
+                    self.depth += 1;
+                    self.buf.push(c);
+                }
+                ')' if !self.in_str => {
+                    self.depth -= 1;
+                    if self.depth < 0 {
+                        return Some(Err(IfcReadError::Malformed(format!(
+                            "STEP file has ')' without matching '(' near offset {off}"
+                        ))));
+                    }
+                    self.buf.push(c);
+                }
+                ';' if !self.in_str && self.depth == 0 => {
+                    let record = std::mem::take(&mut self.buf).trim().to_string();
+                    let consumed = off + c.len_utf8();
+                    return Some(Ok((record, consumed)));
+                }
+                _ => self.buf.push(c),
+            }
         }
-        // Comment close: `*/`.
-        if in_comment {
-            if c == '*' {
-                if let Some(&(_, '/')) = chars.peek() {
-                    in_comment = false;
-                    chars.next(); // consume `/`
-                }
-            }
-            continue;
-        }
-        match c {
-            '\\' if in_str => {
-                // Preserve `\\` and `\'` so split_step_args sees them.
-                buf.push(c);
-                if let Some((_, next)) = chars.next() {
-                    buf.push(next);
-                }
-            }
-            '\'' => {
-                in_str = !in_str;
-                buf.push(c);
-            }
-            '(' if !in_str => {
-                depth += 1;
-                buf.push(c);
-            }
-            ')' if !in_str => {
-                depth -= 1;
-                if depth < 0 {
-                    return Err(IfcReadError::Malformed(format!(
-                        "STEP file has ')' without matching '(' near offset {off}"
-                    )));
-                }
-                buf.push(c);
-            }
-            ';' if !in_str && depth == 0 => {
-                if !buf.trim().is_empty() {
-                    out.push(buf.trim().to_string());
-                }
-                buf.clear();
-            }
-            _ => buf.push(c),
-        }
+        None
     }
-    if in_str {
-        return Err(IfcReadError::Malformed(
-            "unterminated string literal at end of STEP file".into(),
-        ));
-    }
-    if depth != 0 {
-        return Err(IfcReadError::Malformed(format!(
-            "STEP file ends with unbalanced parens (depth={depth})"
-        )));
-    }
-    Ok(out)
 }
 
 /// Parse a logical record's text (without trailing `;`) into a
@@ -933,57 +1037,17 @@ impl<R: BufRead> Iterator for StepIter<R> {
 /// `... ;` record (those are tolerated — the file may legitimately
 /// end with trailing whitespace after the final `ENDSEC;`).
 fn validate_trailing_buffer(text: &str) -> IfcReadResult<()> {
-    let mut depth: i32 = 0;
-    let mut in_str = false;
-    let mut in_comment = false;
-    let mut chars = text.char_indices().peekable();
-    while let Some((off, c)) = chars.next() {
-        if !in_str && !in_comment && c == '/' {
-            if let Some(&(_, '*')) = chars.peek() {
-                in_comment = true;
-                chars.next();
-                continue;
-            }
-        }
-        if in_comment {
-            if c == '*' {
-                if let Some(&(_, '/')) = chars.peek() {
-                    in_comment = false;
-                    chars.next();
-                }
-            }
-            continue;
-        }
-        match c {
-            '\\' if in_str => {
-                // Consume the escape pair so a `\'` doesn't toggle
-                // `in_str` and a `\\` doesn't leave a dangling escape.
-                chars.next();
-            }
-            '\'' => in_str = !in_str,
-            '(' if !in_str => depth += 1,
-            ')' if !in_str => {
-                depth -= 1;
-                if depth < 0 {
-                    return Err(IfcReadError::Malformed(format!(
-                        "STEP stream has ')' without matching '(' near offset {off}"
-                    )));
-                }
-            }
-            _ => {}
-        }
+    // Reuse the shared splitter: drain any complete records that
+    // happen to fit in the trailing buffer (surfacing any structural
+    // error), then assert clean EOF state. The splitter's character-
+    // level rules are identical to the streaming reader's so this
+    // check can never disagree with the prior `split_first_logical_record`
+    // calls about whether the file was well-formed.
+    let mut splitter = StepRecordSplitter::new(text);
+    for item in splitter.by_ref() {
+        item?;
     }
-    if in_str {
-        return Err(IfcReadError::Malformed(
-            "unterminated string literal at end of STEP stream".into(),
-        ));
-    }
-    if depth != 0 {
-        return Err(IfcReadError::Malformed(format!(
-            "STEP stream ends with unbalanced parens (depth={depth})"
-        )));
-    }
-    Ok(())
+    splitter.validate_at_eof()
 }
 
 /// Find the first complete logical STEP record in `text`. Returns
@@ -993,60 +1057,14 @@ fn validate_trailing_buffer(text: &str) -> IfcReadResult<()> {
 /// Returns `Ok(None)` if `text` does not yet contain a complete
 /// record (caller should buffer more input).
 fn split_first_logical_record(text: &str) -> IfcReadResult<Option<(String, usize)>> {
-    let mut buf = String::new();
-    let mut depth: i32 = 0;
-    let mut in_str = false;
-    let mut in_comment = false;
-    let mut chars = text.char_indices().peekable();
-    while let Some((off, c)) = chars.next() {
-        if !in_str && !in_comment && c == '/' {
-            if let Some(&(_, '*')) = chars.peek() {
-                in_comment = true;
-                chars.next(); // consume `*`
-                continue;
-            }
-        }
-        if in_comment {
-            if c == '*' {
-                if let Some(&(_, '/')) = chars.peek() {
-                    in_comment = false;
-                    chars.next(); // consume `/`
-                }
-            }
-            continue;
-        }
-        match c {
-            '\\' if in_str => {
-                buf.push(c);
-                if let Some((_, next)) = chars.next() {
-                    buf.push(next);
-                }
-            }
-            '\'' => {
-                in_str = !in_str;
-                buf.push(c);
-            }
-            '(' if !in_str => {
-                depth += 1;
-                buf.push(c);
-            }
-            ')' if !in_str => {
-                depth -= 1;
-                if depth < 0 {
-                    return Err(IfcReadError::Malformed(format!(
-                        "STEP stream has ')' without matching '(' near offset {off}"
-                    )));
-                }
-                buf.push(c);
-            }
-            ';' if !in_str && depth == 0 => {
-                // Consumed byte length = current char's offset + its UTF-8 width.
-                return Ok(Some((buf.trim().to_string(), off + c.len_utf8())));
-            }
-            _ => buf.push(c),
-        }
+    // Pull a single record from the shared splitter; the streaming
+    // caller drives subsequent reads from a fresh splitter over the
+    // post-drain buffer.
+    match StepRecordSplitter::new(text).next() {
+        Some(Ok((record, consumed))) => Ok(Some((record, consumed))),
+        Some(Err(e)) => Err(e),
+        None => Ok(None),
     }
-    Ok(None)
 }
 
 /// Split the argument list of a STEP record, respecting nested
@@ -1071,9 +1089,9 @@ fn split_step_args(s: &str) -> IfcReadResult<Vec<String>> {
     while let Some(c) = chars.next() {
         match c {
             '\\' if in_str => {
-                // The writer's escape_step_string emits \' for embedded
-                // single-quotes and \\ for embedded backslashes. Consume
-                // the backslash + the following character so we don't
+                // Legacy AEC writer convention: `\'` for an embedded
+                // single-quote and `\\` for a backslash. Consume the
+                // backslash + following character verbatim so we don't
                 // mis-toggle `in_str` on an escaped `'`.
                 buf.push(c);
                 if let Some(next) = chars.next() {
@@ -1081,6 +1099,19 @@ fn split_step_args(s: &str) -> IfcReadResult<Vec<String>> {
                 }
             }
             '\'' => {
+                // ISO 10303-21 §6.4.1: `''` inside a string literal is
+                // an embedded single-quote (the string does NOT
+                // terminate). Match the same rule used by
+                // `StepRecordSplitter` so external IFC files round-trip
+                // even though the arg-level splitter does not run
+                // through the record splitter twice.
+                if in_str && matches!(chars.peek(), Some('\'')) {
+                    buf.push(c);
+                    if let Some(c2) = chars.next() {
+                        buf.push(c2);
+                    }
+                    continue;
+                }
                 in_str = !in_str;
                 buf.push(c);
             }
@@ -1304,11 +1335,22 @@ fn unquote(s: &str) -> IfcReadResult<String> {
 ///
 /// The writer encodes:
 ///
-///   * single quotes as `\'`
+///   * single quotes as `''` (ISO 10303-21 §6.4.1 canonical doubled
+///     quote — interoperable with Revit / ArchiCAD / IfcOpenShell)
 ///   * backslashes as `\\`
 ///   * newlines (`U+000A`) as `\n`
 ///   * carriage returns (`U+000D`) as `\r`
 ///   * tabs (`U+0009`) as `\t`
+///
+/// The decoder *also* accepts the legacy AEC writer convention of
+/// `\'` for an embedded single-quote so files written by pre-Phase-9
+/// AEC builds continue to round-trip cleanly. A single left-to-right
+/// pass handles both forms: `\` always consumes the next char, and a
+/// `'` inside the string slice is treated as a doubled-quote escape
+/// when followed by another `'` (the record splitter already
+/// preserved the pair verbatim) or as a stray quote otherwise
+/// (defensive — the splitter would have flagged an unterminated
+/// string before we got here).
 ///
 /// Chained `replace` calls cannot undo this safely (a naive
 /// `.replace("\\\\", "\\").replace("\\'", "'")` would turn the
@@ -1324,7 +1366,7 @@ fn unquote(s: &str) -> IfcReadResult<String> {
 /// characters so re-export is byte-identical for any input.
 fn unescape_step_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
+    let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\\' {
             match chars.next() {
@@ -1342,6 +1384,14 @@ fn unescape_step_string(s: &str) -> String {
                 }
                 None => out.push('\\'),
             }
+        } else if c == '\'' {
+            // ISO 10303-21 doubled-quote escape (`''` → `'`). The
+            // record splitter preserved both characters verbatim in
+            // the slice we received, so we collapse them here.
+            if matches!(chars.peek(), Some('\'')) {
+                chars.next();
+            }
+            out.push('\'');
         } else {
             out.push(c);
         }
@@ -1547,6 +1597,13 @@ mod tests {
         // The encoder is `escape_step_string` in the writer; this is
         // the decoder. They must be exact inverses for any input,
         // including pathological combinations of `\` and `'`.
+        //
+        // Two encoder conventions are exercised:
+        //   1. ISO 10303-21 canonical (`''` for embedded single-quote),
+        //      which is what the current writer emits.
+        //   2. Legacy AEC writer (`\'` for embedded single-quote),
+        //      which the reader must continue to accept so files
+        //      written by pre-Phase-9 builds keep round-tripping.
         let cases = [
             "",
             "plain text",
@@ -1559,18 +1616,122 @@ mod tests {
             r"don't \stop", // common natural text
         ];
         for input in cases {
-            // Encode the same way the writer does, char-by-char.
-            let mut encoded = String::new();
+            // (1) ISO-canonical `''` encoding (current writer).
+            let mut encoded_iso = String::new();
             for c in input.chars() {
                 match c {
-                    '\\' => encoded.push_str("\\\\"),
-                    '\'' => encoded.push_str("\\'"),
-                    _ => encoded.push(c),
+                    '\\' => encoded_iso.push_str("\\\\"),
+                    '\'' => encoded_iso.push_str("''"),
+                    _ => encoded_iso.push(c),
                 }
             }
-            let decoded = unescape_step_string(&encoded);
-            assert_eq!(decoded, input, "round-trip failed for {input:?}");
+            let decoded_iso = unescape_step_string(&encoded_iso);
+            assert_eq!(
+                decoded_iso, input,
+                "ISO `''` round-trip failed for {input:?}"
+            );
+
+            // (2) Legacy `\'` encoding (pre-Phase-9 writer).
+            let mut encoded_legacy = String::new();
+            for c in input.chars() {
+                match c {
+                    '\\' => encoded_legacy.push_str("\\\\"),
+                    '\'' => encoded_legacy.push_str("\\'"),
+                    _ => encoded_legacy.push(c),
+                }
+            }
+            let decoded_legacy = unescape_step_string(&encoded_legacy);
+            assert_eq!(
+                decoded_legacy, input,
+                "legacy `\\'` round-trip failed for {input:?}"
+            );
         }
+    }
+
+    #[test]
+    fn reader_accepts_iso_canonical_doubled_quote_strings() {
+        // A STEP file produced by Revit / ArchiCAD / IfcOpenShell
+        // encodes an embedded single-quote as `''` (ISO 10303-21
+        // §6.4.1 canonical) rather than the legacy AEC `\'` form.
+        // Build a hand-written IFC4 STEP file using `''` and verify
+        // the reader extracts the original text losslessly.
+        let step = "\
+ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('externally-authored apostrophes'),'2;1');
+FILE_NAME('iso.ifc','2025-01-01T00:00:00',('Author'),('Org'),'AEC','AEC','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1 = IFCPROJECT('00000000000000000000a1',$,$,'O''Brien''s Project',$,$,$,$,$);
+#2 = IFCSITE('00000000000000000000a2',$,$,'St. Mary''s',$,$,$,$);
+#3 = IFCRELAGGREGATES('00000000000000000000a3',$,$,$,#1,(#2));
+ENDSEC;
+END-ISO-10303-21;
+";
+        let snap = IfcReader::from_string(step).expect("reader must accept ISO `''` quoting");
+        let root = snap.project.nodes.get(&snap.project.root).unwrap();
+        assert_eq!(
+            root.name, "O'Brien's Project",
+            "ISO doubled-quote in IfcProject.Name must collapse to a single `'`"
+        );
+        // Walk one level down: the IfcSite child.
+        let site_step = root.children.first().expect("project has one child");
+        let site = snap.project.nodes.get(site_step).unwrap();
+        assert_eq!(
+            site.name, "St. Mary's",
+            "ISO doubled-quote in IfcSite.Name must collapse to a single `'`"
+        );
+    }
+
+    #[test]
+    fn reader_skips_unmodeled_pset_targets_instead_of_failing() {
+        // Per the module contract, an IFCRELDEFINESBYPROPERTIES that
+        // references an unmodeled / unknown property-definition row
+        // (e.g. `IFCPREDEFINEDPROPERTYSET` produced by Revit's
+        // IfcDoorPanelProperties shadow type) must be tolerated and
+        // skipped, NOT raised as a hard `Malformed` error. Build a
+        // minimal STEP file that exercises this path.
+        let step = "\
+ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('skip-unknown-pset target'),'2;1');
+FILE_NAME('skip.ifc','2025-01-01T00:00:00',('A'),('O'),'AEC','AEC','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1 = IFCPROJECT('00000000000000000000a1',$,$,'P',$,$,$,$,$);
+#2 = IFCSITE('00000000000000000000a2',$,$,'S',$,$,$,$);
+#3 = IFCBUILDING('00000000000000000000a3',$,$,'B',$,$,$,$);
+#4 = IFCBUILDINGSTOREY('00000000000000000000a4',$,$,'L1',$,$,$,$);
+#5 = IFCWALL('00000000000000000000a5',$,$,'W1',$,$,$,$);
+#6 = IFCRELAGGREGATES('00000000000000000000a6',$,$,$,#1,(#2));
+#7 = IFCRELAGGREGATES('00000000000000000000a7',$,$,$,#2,(#3));
+#8 = IFCRELAGGREGATES('00000000000000000000a8',$,$,$,#3,(#4));
+#9 = IFCRELCONTAINEDINSPATIALSTRUCTURE('00000000000000000000a9',$,$,$,(#5),#4);
+/* #10 is an UNMODELED IfcPropertySet subclass that the reader filter skips. */
+#10 = IFCPREDEFINEDPROPERTYSET('00000000000000000000aa',$,'UnknownSet',$);
+/* #11 points #5 at the unmodeled #10 -- must be skipped, not rejected. */
+#11 = IFCRELDEFINESBYPROPERTIES('00000000000000000000bb',$,$,$,(#5),#10);
+ENDSEC;
+END-ISO-10303-21;
+";
+        // The contract under test: the reader must NOT raise a hard
+        // `Malformed` error just because an IFCRELDEFINESBYPROPERTIES
+        // points at an unmodeled `IfcPropertySet` subclass. Earlier
+        // versions of this module returned `Err(Malformed(...))` from
+        // the second-pass loop, which broke ingestion of any external
+        // file containing `IfcPreDefinedPropertySet` / `IfcDoorPanelProperties`
+        // / etc.
+        let snap = IfcReader::from_string(step)
+            .expect("reader must tolerate unmodeled IFCRELDEFINESBYPROPERTIES target");
+        // The spatial structure still loads — IfcProject, IfcSite,
+        // IfcBuilding, IfcBuildingStorey are all retained.
+        assert_eq!(
+            snap.stats.spatial_nodes, 4,
+            "all four spatial nodes must round-trip even though one IFCRELDEFINESBYPROPERTIES \
+             pointed at an unmodeled set"
+        );
     }
 
     #[test]

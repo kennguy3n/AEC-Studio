@@ -468,45 +468,51 @@ pub(crate) fn is_spatial_ifc_class(class: &IfcClass) -> bool {
 
 /// Escape `s` for embedding inside a STEP single-quoted string.
 ///
-/// The on-wire format used by the writer/reader pair is:
+/// The on-wire format produced by the writer is:
 ///
 ///   * `\` is escaped as `\\`
-///   * `'` is escaped as `\'`
+///   * `'` is escaped as `''` (ISO 10303-21 §6.4.1 canonical doubled
+///     single-quote — interoperable with Revit, ArchiCAD, IfcOpenShell,
+///     and any conforming STEP toolchain)
 ///   * `\n` (U+000A) is escaped as `\n` (backslash + ASCII 'n')
 ///   * `\r` (U+000D) is escaped as `\r` (backslash + ASCII 'r')
 ///   * `\t` (U+0009) is escaped as `\t` (backslash + ASCII 't')
+///
+/// The reader ([`super::reader::unescape_step_string`]) accepts BOTH
+/// the canonical `''` form emitted here AND the legacy `\'` form
+/// emitted by pre-Phase-9 AEC builds, so files already on disk
+/// continue to round-trip cleanly after this writer change. The
+/// shared [`super::reader::StepRecordSplitter`] state machine
+/// likewise treats both `''` and `\'` as non-terminating inside a
+/// string literal.
 ///
 /// The newline / carriage-return / tab escapes are an
 /// interop-friendly invariant: the writer emits exactly one
 /// `#N = TYPE(...);` record per physical line so the output is
 /// readable by tools that line-tokenise STEP (older IfcOpenShell
-/// versions, naive grep / awk pipelines, and our own pre-Phase-9
-/// reader which did the same). The current reader is the
-/// character-level `iter_logical_records` state machine in
-/// `super::reader`, which respects multi-line records, comments,
-/// and embedded `;` in strings — so on the AEC Studio side a
-/// literal newline inside a quoted string would in fact round-trip
-/// — but other STEP tools would split such a record, so we keep
-/// the escape on the write side to maintain one-record-per-line
-/// for downstream consumers.
+/// versions, naive grep / awk pipelines). Strictly speaking the
+/// reader's character-level state machine would handle embedded
+/// newlines correctly, but downstream consumers might not, so we
+/// keep them escaped at the write side.
 ///
 /// Order matters: backslashes must be doubled BEFORE the other
-/// substitutions, otherwise the `\` introduced for an escaped quote
-/// or newline would itself be doubled and corrupt the encoding. The
-/// `match` arm on `'\\'` runs first by construction.
+/// substitutions, otherwise the `\` introduced for an escaped
+/// newline would itself be doubled and corrupt the encoding. The
+/// `match` arm on `'\\'` runs first by construction. The doubled-
+/// quote substitution does not introduce any `\` so it can run in
+/// any position relative to the backslash arm.
 ///
-/// This is not ISO 10303-21 canonical (canonical STEP doubles single
-/// quotes as `''` and uses `\X\` / `\X2\` / `\X4\` for control
-/// characters), but matches the reader's single-pass unescape in
-/// [`unescape_step_string`]. The module docs explicitly state this
-/// reader/writer pair is for AEC Studio's in-process IFC pipeline and
-/// not intended for interop with third-party IFC tooling.
+/// Control characters outside the small ASCII subset above
+/// (`\X\` / `\X2\` / `\X4\` Page-1 / Page-2 / Page-4 encodings)
+/// are not produced by the writer — input strings come from
+/// IfcLabel / IfcText fields which the rest of the engine treats as
+/// UTF-8 and which the reader passes through verbatim.
 fn escape_step_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
             '\\' => out.push_str("\\\\"),
-            '\'' => out.push_str("\\'"),
+            '\'' => out.push_str("''"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),

@@ -9,7 +9,14 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RenderQuality {
-    Eevee,
+    /// Rasterized realtime preview produced by the native PBR forward
+    /// pipeline in `aec_viewport`. The variant retains its `"eevee"`
+    /// on-wire token so project files written by earlier builds
+    /// (which still referred to the EEVEE-via-Blender preview) keep
+    /// deserializing cleanly. This mirrors the `RealtimePreview`
+    /// rename already applied to `aec_governor::PresetKey`.
+    #[serde(alias = "eevee", rename = "eevee")]
+    RealtimePreview,
     Quick,
     Standard,
     High,
@@ -41,7 +48,7 @@ pub struct RenderPreset {
 }
 
 impl RenderPreset {
-    pub fn eevee_preview() -> Self {
+    pub fn realtime_preview() -> Self {
         // The id stays `eevee_preview` for backwards compatibility with
         // project files written by older builds; the user-facing label
         // tracks the new native rasterized preview.
@@ -49,7 +56,7 @@ impl RenderPreset {
             id: "eevee_preview".into(),
             display_name: "Realtime preview".into(),
             config: RenderPresetConfig {
-                quality: RenderQuality::Eevee,
+                quality: RenderQuality::RealtimePreview,
                 samples: 64,
                 denoise: false,
                 tile_size_px: 256,
@@ -166,7 +173,7 @@ impl RenderPreset {
     /// All bundled presets.
     pub fn defaults() -> Vec<Self> {
         vec![
-            Self::eevee_preview(),
+            Self::realtime_preview(),
             Self::quick(),
             Self::standard(),
             Self::high(),
@@ -179,7 +186,7 @@ impl RenderPreset {
     /// Bundled preset for a given quality enum.
     pub fn from_quality(q: RenderQuality) -> Self {
         match q {
-            RenderQuality::Eevee => Self::eevee_preview(),
+            RenderQuality::RealtimePreview => Self::realtime_preview(),
             RenderQuality::Quick => Self::quick(),
             RenderQuality::Standard => Self::standard(),
             RenderQuality::High => Self::high(),
@@ -520,5 +527,26 @@ mod tests {
         let store = RenderPresetStore::default();
         let preset = store.get("cycles_studio").expect("legacy id resolves");
         assert_eq!(preset.id, "studio");
+    }
+
+    #[test]
+    fn render_quality_realtime_preview_wire_format_stays_eevee() {
+        // The variant was renamed in Phase 9 from `Eevee` to
+        // `RealtimePreview` to match the matching rename in
+        // `aec_governor::PresetKey`, but the on-wire token must
+        // remain `"eevee"` so render-presets written by older builds
+        // continue to deserialize.
+        let q: RenderQuality = RenderQuality::RealtimePreview;
+        let json = serde_json::to_string(&q).unwrap();
+        assert_eq!(
+            json, "\"eevee\"",
+            "RenderQuality::RealtimePreview must serialize as \"eevee\" for wire-format stability"
+        );
+        let back: RenderQuality = serde_json::from_str("\"eevee\"").unwrap();
+        assert_eq!(back, RenderQuality::RealtimePreview);
+        // Round-trip: encode then decode produces the same variant.
+        let encoded = serde_json::to_string(&RenderQuality::RealtimePreview).unwrap();
+        let decoded: RenderQuality = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, RenderQuality::RealtimePreview);
     }
 }
