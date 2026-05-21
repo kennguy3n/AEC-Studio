@@ -257,8 +257,13 @@ fn sample_cosine_weighted(n: Vec3, t: Vec3, b: Vec3, u1: f32, u2: f32) -> Vec3 {
 
 /// Build an orthonormal tangent basis from a unit normal `n`. Uses the
 /// branchless Duff et al. (2017) construction (also used by Cycles).
+///
+/// `sign` is computed as a strict `±1.0` (never `0.0`) because Rust's
+/// `f32::signum(0.0) == 0.0`, which would propagate `-inf` / `NaN` through
+/// the Duff construction for normals with exactly `n.z == 0.0` (i.e. walls
+/// in the `XY` plane, which are extremely common in architectural scenes).
 pub fn tangent_basis(n: Vec3) -> (Vec3, Vec3) {
-    let sign = n.z.signum();
+    let sign: f32 = if n.z >= 0.0 { 1.0 } else { -1.0 };
     let a = -1.0 / (sign + n.z);
     let b = n.x * n.y * a;
     let t = Vec3::new(1.0 + sign * n.x * n.x * a, sign * b, -sign * n.x);

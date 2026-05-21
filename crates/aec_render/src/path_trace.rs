@@ -327,7 +327,7 @@ pub fn render(
     accum
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Tile {
     pub x_start: u32,
     pub y_start: u32,
@@ -335,7 +335,97 @@ pub struct Tile {
     pub y_end: u32,
 }
 
-fn generate_tiles(width: u32, height: u32, tile_size: u32) -> Vec<Tile> {
+impl Tile {
+    /// Number of pixels in this tile.
+    pub fn pixel_count(&self) -> usize {
+        ((self.x_end - self.x_start) as usize) * ((self.y_end - self.y_start) as usize)
+    }
+
+    pub fn width(&self) -> u32 {
+        self.x_end - self.x_start
+    }
+
+    pub fn height(&self) -> u32 {
+        self.y_end - self.y_start
+    }
+}
+
+/// Result of a single rendering pass over a tile, with per-pixel
+/// sums *and* Welford sum-of-squared-deviations for variance tracking.
+#[derive(Debug, Clone)]
+pub struct TilePassResult {
+    pub tile: Tile,
+    /// One [r_sum, g_sum, b_sum, sample_count] per pixel, ordered row-major.
+    pub sums: Vec<[f32; 4]>,
+    /// Per-pixel sum of squared deviations from the running mean (Welford
+    /// M2) for each RGB channel, used by the scheduler to estimate noise.
+    pub sums_sq: Vec<[f32; 3]>,
+}
+
+/// Render `samples_this_pass` more samples into a tile, returning sums +
+/// Welford-style sum-of-squared-deviations. Stateless — the caller is
+/// responsible for accumulating into a buffer. Used by
+/// [`crate::scheduler::TileScheduler`].
+pub fn render_tile_pass(
+    scene: &PathTraceScene,
+    camera: &RenderCamera,
+    config: &PathTraceConfig,
+    tile: Tile,
+    samples_this_pass: u32,
+    rng_seed: u64,
+) -> TilePassResult {
+    let tw = tile.width() as usize;
+    let th = tile.height() as usize;
+    let pixel_count = tw * th;
+    let mut sums = vec![[0.0_f32; 4]; pixel_count];
+    let mut sums_sq = vec![[0.0_f32; 3]; pixel_count];
+    let mut rng = fastrand::Rng::with_seed(rng_seed);
+
+    let view = build_view(camera);
+    let aspect = config.width as f32 / config.height.max(1) as f32;
+    let half_h = focal_to_half_height(camera.focal_length_mm).max(1e-4);
+    let half_w = half_h * aspect;
+
+    for ly in 0..th {
+        for lx in 0..tw {
+            let li = ly * tw + lx;
+            let mut mean = [0.0_f32; 3];
+            let mut m2 = [0.0_f32; 3];
+            for s in 0..samples_this_pass {
+                let px = tile.x_start + lx as u32;
+                let py = tile.y_start + ly as u32;
+                let nx = (px as f32 + rng.f32()) / config.width as f32 * 2.0 - 1.0;
+                let ny = 1.0 - (py as f32 + rng.f32()) / config.height as f32 * 2.0;
+                let dir_view = Vec3::new(nx * half_w, ny * half_h, -1.0).normalize();
+                let dir_world = view.basis * dir_view;
+                let ray = Ray::new(view.origin, dir_world);
+                let r = trace_path(scene, ray, config, &mut rng);
+                let rgb = [r.x, r.y, r.z];
+                let n = (s + 1) as f32;
+                for c in 0..3 {
+                    let delta = rgb[c] - mean[c];
+                    mean[c] += delta / n;
+                    let delta2 = rgb[c] - mean[c];
+                    m2[c] += delta * delta2;
+                }
+            }
+            // Convert means back to sums for the caller's accumulator,
+            // and forward the M2 as-is. The accumulator can either store
+            // sums (legacy path) or run a higher-level Welford merge
+            // (scheduler path).
+            let n = samples_this_pass as f32;
+            sums[li] = [mean[0] * n, mean[1] * n, mean[2] * n, n];
+            sums_sq[li] = m2;
+        }
+    }
+    TilePassResult {
+        tile,
+        sums,
+        sums_sq,
+    }
+}
+
+pub(crate) fn generate_tiles(width: u32, height: u32, tile_size: u32) -> Vec<Tile> {
     let ts = tile_size.max(1);
     let mut out = Vec::new();
     let mut y = 0u32;
@@ -390,9 +480,15 @@ fn render_tile(
                 let radiance = trace_path(scene, ray, config, &mut rng);
                 accum += radiance;
             }
-            let avg = accum / config.samples_per_pixel as f32;
+            // Store `[r_sum, g_sum, b_sum, sample_count]` so the output
+            // matches the documented `AccumulationBuffer` "sums + count"
+            // convention. Pre-averaging (`avg, 1.0`) would silently produce
+            // wrong sample counts if a caller ever additively merges tiles
+            // (e.g. for progressive refinement); keep the invariant uniform
+            // with `render_tile_pass` so the buffer is composable.
+            let n = config.samples_per_pixel.max(1) as f32;
             let li = ly * tw + lx;
-            buf[li] = [avg.x, avg.y, avg.z, 1.0];
+            buf[li] = [accum.x, accum.y, accum.z, n];
         }
     }
     buf

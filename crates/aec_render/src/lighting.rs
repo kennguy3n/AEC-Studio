@@ -82,6 +82,19 @@ pub struct SkyParams {
     pub turbidity: f32,
 }
 
+impl Default for SkyParams {
+    /// Neutral overcast sky — strength 1.0, mid-grey tint, light haze.
+    /// Used as a fallback world setup when no lighting preset has been
+    /// applied. Picked so the scene is not pitch-black with no lights.
+    fn default() -> Self {
+        Self {
+            strength: 1.0,
+            color: [0.5, 0.5, 0.5],
+            turbidity: 2.0,
+        }
+    }
+}
+
 /// A complete lighting setup. Fully self-describing: it carries every
 /// light the worker should create plus the world tint and ambient
 /// strength multiplier. The Blender worker reads `lights` directly
