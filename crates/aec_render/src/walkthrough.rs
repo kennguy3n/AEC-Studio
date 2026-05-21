@@ -30,7 +30,9 @@ use image::{ImageBuffer, Rgb};
 use serde::{Deserialize, Serialize};
 
 use crate::cameras::CameraPath;
-use crate::final_render::{build_path_trace_scene, path_trace_config_from_preset, scene_sky};
+use crate::final_render::{
+    build_path_trace_scene, encode_srgb8, path_trace_config_from_preset, scene_sky,
+};
 use crate::gpu_trace::render_or_fallback;
 use crate::path_trace::{CameraProjection, CancelToken};
 use crate::preset::RenderPreset;
@@ -209,7 +211,15 @@ impl WalkthroughPipeline {
 
             let width = buffer.width;
             let height = buffer.height;
-            let srgb = buffer.into_srgb8();
+            // Honour `preset.config.denoise`: the default walkthrough
+            // preset ships with `denoise: true`, so calling
+            // `buffer.into_srgb8()` directly would silently produce
+            // noisier frames than the preset promises (and — worse —
+            // each frame would receive an independent noise pattern,
+            // making the resulting video flicker). Route through the
+            // shared `encode_srgb8` so still, panorama, and
+            // walkthrough renders all use one tone-map / denoise path.
+            let srgb = encode_srgb8(&buffer, preset.config.denoise);
             let img = ImageBuffer::<Rgb<u8>, _>::from_raw(width, height, srgb)
                 .expect("buffer size matches width * height * 3");
             let path = output_dir.join(format!("frame_{frame:05}.png"));

@@ -227,10 +227,17 @@ pub(crate) fn path_trace_config_from_preset(
     }
 }
 
-/// Tone-map a radiance buffer to sRGB-8 bytes. When `denoise` is true the
-/// per-channel mean is bilaterally filtered before tone-mapping; this is
-/// equivalent to the legacy Blender denoiser's post-process pass.
-fn encode_srgb8(buffer: &AccumulationBuffer, denoise: bool) -> Vec<u8> {
+/// Tone-map a radiance buffer to sRGB-8 bytes. When `denoise` is true
+/// the per-channel mean is bilaterally filtered before tone-mapping;
+/// this is equivalent to the legacy Blender denoiser's post-process
+/// pass.
+///
+/// Exposed `pub(crate)` so [`crate::panorama::PanoramaPipeline`] and
+/// [`crate::walkthrough::WalkthroughPipeline`] can honour their preset's
+/// `denoise` flag without duplicating the tone-mapping math. Keeping a
+/// single tone-map implementation also ensures still / panorama /
+/// walkthrough output matches pixel-for-pixel given the same buffer.
+pub(crate) fn encode_srgb8(buffer: &AccumulationBuffer, denoise: bool) -> Vec<u8> {
     if !denoise {
         // Borrowing path — no full-buffer clone for the common case.
         return buffer.as_srgb8();

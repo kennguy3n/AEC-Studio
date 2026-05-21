@@ -18,7 +18,9 @@ use std::time::{Duration, Instant};
 use aec_materials::MaterialLibrary;
 use image::{ImageBuffer, Rgb};
 
-use crate::final_render::{build_path_trace_scene, path_trace_config_from_preset, scene_sky};
+use crate::final_render::{
+    build_path_trace_scene, encode_srgb8, path_trace_config_from_preset, scene_sky,
+};
 use crate::gpu_trace::render_or_fallback;
 use crate::path_trace::{CameraProjection, CancelToken};
 use crate::preset::RenderPreset;
@@ -45,6 +47,9 @@ pub struct PanoramaOutput {
     pub height: u32,
     pub samples_per_pixel: u32,
     pub elapsed: Duration,
+    /// Whether the bilateral denoiser ran on the radiance buffer.
+    /// Mirrors [`crate::final_render::FinalRenderOutput::denoised`].
+    pub denoised: bool,
 }
 
 /// Native equirectangular panorama pipeline.
@@ -125,7 +130,14 @@ impl PanoramaPipeline {
 
         let buf_width = buffer.width;
         let buf_height = buffer.height;
-        let srgb = buffer.into_srgb8();
+        // Honour `preset.config.denoise`: panorama presets ship with
+        // `denoise: true` by default, so calling `buffer.into_srgb8()`
+        // directly would silently produce noisier output than the
+        // preset promises. Route through `encode_srgb8` so still,
+        // panorama, and walkthrough renders all share one tone-map
+        // path and one denoise gate.
+        let denoised = preset.config.denoise;
+        let srgb = encode_srgb8(&buffer, denoised);
         let img = ImageBuffer::<Rgb<u8>, _>::from_raw(buf_width, buf_height, srgb)
             .expect("buffer size matches width * height * 3");
         img.save(&output_path)?;
@@ -136,6 +148,7 @@ impl PanoramaPipeline {
             height: buf_height,
             samples_per_pixel: preset.config.samples,
             elapsed,
+            denoised,
         })
     }
 }
