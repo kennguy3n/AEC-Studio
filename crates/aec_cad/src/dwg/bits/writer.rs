@@ -212,6 +212,22 @@ impl BitWriter {
         Ok(())
     }
 
+    /// Write a Raw Long (RL): unsigned 32-bit little-endian, bit-aligned.
+    pub fn write_rl(&mut self, value: u32) -> DwgResult<()> {
+        for b in value.to_le_bytes() {
+            self.write_bits_u32(8, u32::from(b))?;
+        }
+        Ok(())
+    }
+
+    /// Write a Raw Short (RS): unsigned 16-bit little-endian, bit-aligned.
+    pub fn write_rs(&mut self, value: u16) -> DwgResult<()> {
+        for b in value.to_le_bytes() {
+            self.write_bits_u32(8, u32::from(b))?;
+        }
+        Ok(())
+    }
+
     pub fn write_3bd(&mut self, value: [f64; 3]) -> DwgResult<()> {
         self.write_bd(value[0])?;
         self.write_bd(value[1])?;

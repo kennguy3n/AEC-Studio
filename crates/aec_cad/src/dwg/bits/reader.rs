@@ -53,6 +53,25 @@ impl<'a> BitReader<'a> {
         self.byte >= self.data.len()
     }
 
+    /// Number of bits not yet consumed (`(data.len()*8) - bit_position`).
+    pub fn remaining_bits(&self) -> u64 {
+        let total = (self.data.len() as u64).saturating_mul(8);
+        total.saturating_sub(self.bit_position())
+    }
+
+    /// Restore the cursor to an absolute bit position previously
+    /// returned by [`Self::bit_position`].
+    pub fn set_bit_position(&mut self, bit_pos: u64) -> DwgResult<()> {
+        let byte = (bit_pos / 8) as usize;
+        let bit = (bit_pos % 8) as u8;
+        if byte > self.data.len() {
+            return Err(DwgError::UnexpectedEof { byte, bit });
+        }
+        self.byte = byte;
+        self.bit = bit;
+        Ok(())
+    }
+
     /// Move the cursor to absolute byte/bit position.
     pub fn seek(&mut self, byte: usize, bit: u8) -> DwgResult<()> {
         if bit >= 8 {
@@ -255,6 +274,22 @@ impl<'a> BitReader<'a> {
             *byte = self.read_bits_u32(8)? as u8;
         }
         Ok(f64::from_le_bytes(bytes))
+    }
+
+    /// Read a Raw Long (RL): unsigned 32-bit little-endian, bit-aligned.
+    pub fn read_rl(&mut self) -> DwgResult<u32> {
+        let mut bytes = [0u8; 4];
+        for byte in bytes.iter_mut() {
+            *byte = self.read_bits_u32(8)? as u8;
+        }
+        Ok(u32::from_le_bytes(bytes))
+    }
+
+    /// Read a Raw Short (RS): unsigned 16-bit little-endian, bit-aligned.
+    pub fn read_rs(&mut self) -> DwgResult<u16> {
+        let lo = self.read_bits_u32(8)? as u8;
+        let hi = self.read_bits_u32(8)? as u8;
+        Ok(u16::from_le_bytes([lo, hi]))
     }
 
     /// 3 × BD point.

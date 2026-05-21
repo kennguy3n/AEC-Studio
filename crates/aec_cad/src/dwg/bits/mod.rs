@@ -30,5 +30,6 @@ pub mod crc;
 pub mod reader;
 pub mod writer;
 
+pub use crc::{crc_32c, crc_8, crc_x25};
 pub use reader::BitReader;
 pub use writer::BitWriter;

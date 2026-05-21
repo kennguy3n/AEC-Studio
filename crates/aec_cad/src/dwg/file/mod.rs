@@ -25,9 +25,13 @@
 //! └──────────────────────────────────────────────┘
 //! ```
 
+pub mod classes;
 pub mod header;
+pub mod header_vars;
+pub mod object_map;
 pub mod pages;
 pub mod sections;
+pub mod sentinels;
 pub mod system_section;
 
 pub use header::FileHeader;
