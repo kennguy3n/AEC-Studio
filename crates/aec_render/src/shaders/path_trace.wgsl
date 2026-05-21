@@ -296,6 +296,66 @@ fn cosine_weighted_sample(n: vec3<f32>, r0: f32, r1: f32) -> vec3<f32> {
     return normalize(t * local.x + b * local.y + n * local.z);
 }
 
+// Analytic emission seen by a ray that misses all geometry — mirrors
+// `crate::path_trace::direct_visible_lights`. Without this branch a
+// primary ray pointed at the sun (or a panorama row covering the sun
+// disc) would only pick up the diffuse sky background, while the CPU
+// kernel would correctly accumulate the analytic light's radiance.
+//
+// Point / IES lights are intentionally excluded: they are delta
+// emitters with zero solid angle, so a ray can never "hit" one — their
+// illumination flows entirely through NEE.
+//
+// Caller must gate this to the GPU's analog of CPU's
+// `last_was_specular` (currently `bounce == 0u`) so that emission
+// already accounted for by NEE during the bouncing loop is not
+// double-counted.
+fn direct_visible_lights(ray_o: vec3<f32>, ray_d: vec3<f32>) -> vec3<f32> {
+    var total = vec3<f32>(0.0);
+    for (var li: u32 = 0u; li < params.light_count; li = li + 1u) {
+        let light = lights[li];
+        if (light.kind == 0u) {
+            // Sun: `light.position` is the (normalized) direction the
+            // photons travel toward the scene, so the apparent
+            // direction of the sun disc is `-light.position`. The ray
+            // "hits" the sun if its direction falls inside the disc's
+            // angular cone.
+            let to_sun = -light.position;
+            let cos_cone = cos(light.params.x);
+            let cos_angle = dot(normalize(ray_d), normalize(to_sun));
+            if (cos_angle >= cos_cone) {
+                total = total + light.emission;
+            }
+        } else if (light.kind == 2u) {
+            // Area: ray-plane intersection, then a (u, v) rectangle
+            // test in the light's local frame. The area light is
+            // two-sided, matching the CPU implementation.
+            let u_axis = light.params.xyz;
+            let v_axis = light.extra.xyz;
+            let n_area = normalize(cross(u_axis, v_axis));
+            let denom = dot(n_area, ray_d);
+            if (abs(denom) >= 1.0e-6) {
+                let t = dot(light.position - ray_o, n_area) / denom;
+                // Primary-ray bounds: `t_min = 1e-4` (consistent with
+                // the CPU `Ray::new` default and the GPU
+                // ray-triangle epsilon).
+                if (t > 1.0e-4) {
+                    let hit_pt = ray_o + ray_d * t;
+                    let local = hit_pt - light.position;
+                    let u = dot(local, u_axis);
+                    let v = dot(local, v_axis);
+                    if (abs(u) <= light.size.x * 0.5 && abs(v) <= light.size.y * 0.5) {
+                        total = total + light.emission;
+                    }
+                }
+            }
+        }
+        // kind == 1u (point / IES): skip; delta emitters are not
+        // hit-visible.
+    }
+    return total;
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= params.width || gid.y >= params.height) {
@@ -346,6 +406,19 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let hit = traverse(ray_o, ray_d, 1.0e8);
             if (hit.valid == 0u) {
                 radiance = radiance + throughput * params.sky_color * params.sky_strength;
+                // Cycles parity: a ray that escapes the scene also
+                // sees any analytic light whose support contains the
+                // ray direction. Gated to `bounce == 0u` — the GPU
+                // megakernel uses cosine-weighted diffuse bounces for
+                // every non-primary segment, which is the analog of
+                // the CPU kernel's `last_was_specular = false` after
+                // a non-specular sample. Direct NEE inside the loop
+                // already accounts for analytic lights on every hit,
+                // so adding the analytic miss contribution after a
+                // diffuse bounce would double-count.
+                if (bounce == 0u) {
+                    radiance = radiance + throughput * direct_visible_lights(ray_o, ray_d);
+                }
                 break;
             }
             let mat = material_for(hit.prim_id);

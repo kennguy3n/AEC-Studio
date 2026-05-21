@@ -434,7 +434,29 @@ impl GpuPathTracer {
 
         let buffers = GpuSceneBuffers::build(scene);
         let bvh_buf = self.create_storage("bvh_nodes", bytemuck::cast_slice(&buffers.bvh_nodes));
-        let tri_buf = self.create_storage("triangles", bytemuck::cast_slice(&buffers.triangles));
+        // Empty triangle buffer is bound with 16 bytes of wgpu padding
+        // but the shader's storage array expects `stride_of<TriangleGpu>`
+        // = 48 bytes per element, so binding the zero-length buffer
+        // triggers a validation error on dispatch. Stub a single
+        // zeroed placeholder when there are no triangles — the shader
+        // already guards traversal with `params.bvh_count == 0u`, so
+        // the stub is never read. Mirrors the same pattern already
+        // used for `materials` and `lights` below.
+        let tri_buf = if buffers.triangles.is_empty() {
+            self.create_storage(
+                "triangles",
+                bytemuck::cast_slice(&[TriangleGpu {
+                    v0: [0.0; 3],
+                    _pad0: 0.0,
+                    v1: [0.0; 3],
+                    _pad1: 0.0,
+                    v2: [0.0; 3],
+                    material_id: -1,
+                }]),
+            )
+        } else {
+            self.create_storage("triangles", bytemuck::cast_slice(&buffers.triangles))
+        };
         let mat_buf = if buffers.materials.is_empty() {
             self.create_storage(
                 "materials",
@@ -941,6 +963,90 @@ mod tests {
         assert!(
             mse < 0.5,
             "GPU equirectangular output diverges from CPU reference: mse={mse}"
+        );
+    }
+
+    #[test]
+    fn gpu_primary_ray_sees_sun_disc_on_miss() {
+        // Regression for the post-fix Devin Review finding flagging
+        // that the GPU shader's miss branch only added
+        // `sky_color * sky_strength` and never the analytic
+        // `direct_visible_lights` contribution (sun disc + area-light
+        // visibility through escaped rays). With the fix, a primary
+        // ray pointed inside the sun's angular cone must accumulate
+        // the sun's radiance on miss, producing pixels that are much
+        // brighter than the sky-only baseline.
+        //
+        // Strategy: an empty-geometry scene (every primary ray
+        // escapes) with a sun pointing straight at `-Z` (toward the
+        // camera-forward) and a very small angular radius. The
+        // bottom-row centre pixels (which subtend the smallest
+        // angles around the forward direction) must see the sun;
+        // far-off pixels see only the sky. We don't compare to CPU
+        // (the CPU path is already covered by
+        // `crate::path_trace::tests::*` for this branch) — instead
+        // we assert the structural invariant that a bright spot
+        // appears in the forward cone.
+        let Ok(tracer) = GpuPathTracer::try_new() else {
+            return;
+        };
+
+        // Empty scene with a single sun light. Build via
+        // `from_render_scene` for the sky params and then push the
+        // analytic sun directly so we control its direction and
+        // angular radius exactly.
+        let scene_in = RenderScene::default();
+        let mut scene = PathTraceScene::from_render_scene(
+            &scene_in,
+            vec![],
+            |_| None,
+            SkyParams {
+                strength: 0.0, // suppress sky so the sun is the only contributor
+                color: [0.0, 0.0, 0.0],
+                ..SkyParams::default()
+            },
+        );
+        scene.lights.push(crate::light_sampling::NativeLight::Sun {
+            direction: glam::Vec3::new(0.0, 0.0, 1.0), // photons travel +Z; sun disc lives at -Z
+            radiance: glam::Vec3::splat(100.0),
+            angular_radius_rad: 0.10, // ~5.7° half-angle — covers the centre pixels at 16×16
+        });
+
+        let camera = RenderCamera {
+            id: "cam".into(),
+            position_mm: [0.0, 0.0, 0.0],
+            // target_mm: camera looks toward -Z, which is exactly
+            // where the sun disc sits (since photons travel +Z).
+            target_mm: [0.0, 0.0, -1000.0],
+            focal_length_mm: 35.0,
+            exposure_ev: 0.0,
+            white_balance_k: 5500.0,
+            aperture_f: 5.6,
+        };
+        let cfg = PathTraceConfig {
+            width: 16,
+            height: 16,
+            samples_per_pixel: 1,
+            max_bounces: 1,
+            tile_size: 8,
+            russian_roulette_min_bounces: 1,
+            adaptive_threshold: 0.0,
+            projection: crate::path_trace::CameraProjection::Perspective,
+        };
+        let buf = tracer.render(&scene, &camera, &cfg, None, None);
+        let avg = buf.average_rgb();
+
+        let max_lum = avg
+            .iter()
+            .map(|p| p[0].max(p[1]).max(p[2]))
+            .fold(0.0_f32, f32::max);
+        // Without the fix the maximum pixel luminance was the sky
+        // baseline (here zero by construction). With the fix at
+        // least one primary ray in the forward cone hits the sun and
+        // accumulates its 100-unit radiance.
+        assert!(
+            max_lum > 10.0,
+            "GPU primary rays did not pick up the sun disc on miss; max luminance was {max_lum}"
         );
     }
 
