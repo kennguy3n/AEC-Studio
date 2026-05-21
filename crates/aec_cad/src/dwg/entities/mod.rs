@@ -13,10 +13,12 @@ pub mod insert;
 pub mod line;
 pub mod lwpolyline;
 pub mod mtext;
+pub mod record;
 pub mod text;
 
 pub use common::CommonEntityHeader;
 pub use header_codec::{CommonHeaderData, EntityMode, LinetypeFlag};
+pub use record::{BitBuf, ObjectHandles, ObjectRecord};
 
 /// Numeric object type tag stored inside every entity's bit stream.
 /// These IDs are AutoCAD's `OBJECT_TYPE` enum (see OpenDesign spec

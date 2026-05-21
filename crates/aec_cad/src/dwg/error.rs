@@ -93,4 +93,10 @@ pub enum DwgError {
 
     #[error("internal codec invariant violated: {0} (this is a bug — please report)")]
     InternalInvariant(String),
+
+    #[error("unknown object type {value:#06x}: this entity class is not in our table")]
+    UnknownObjectType { value: u16 },
+
+    #[error("feature not yet supported by the native DWG codec: {0}")]
+    Unsupported(String),
 }

@@ -458,7 +458,7 @@ impl<'a> BitReader<'a> {
 
 /// Parsed handle reference. The semantics of `code` depend on the
 /// surrounding object kind — see OpenDesign spec § "Handle codes".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct HandleRef {
     pub code: u8,
     pub value: u64,

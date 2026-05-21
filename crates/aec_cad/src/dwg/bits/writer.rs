@@ -56,6 +56,37 @@ impl BitWriter {
         (bytes as u64) * 8 + u64::from(self.bit)
     }
 
+    /// Overwrite 32 little-endian bits at `bit_pos` with `value`. The
+    /// position must already have been written through (i.e.
+    /// `bit_pos + 32 <= bit_position()`). Used by the object-record
+    /// encoder to back-patch the R2010+ data-bitsize field once the
+    /// data stream length is known.
+    pub fn patch_rl_at(&mut self, bit_pos: u64, value: u32) -> DwgResult<()> {
+        let cur = self.bit_position();
+        if bit_pos + 32 > cur {
+            return Err(DwgError::InternalInvariant(format!(
+                "patch_rl_at({bit_pos}) would overrun buffer of {cur} bits"
+            )));
+        }
+        let bytes = value.to_le_bytes();
+        for (byte_idx, src) in bytes.iter().enumerate() {
+            let base_bit = bit_pos + (byte_idx as u64) * 8;
+            for i in 0..8u8 {
+                let abs_bit = base_bit + u64::from(i);
+                let byte_in_buf = (abs_bit / 8) as usize;
+                let bit_in_byte = (abs_bit % 8) as u8;
+                let mask = 1u8 << (7 - bit_in_byte);
+                let new_bit = (*src >> (7 - i)) & 1;
+                if new_bit == 1 {
+                    self.data[byte_in_buf] |= mask;
+                } else {
+                    self.data[byte_in_buf] &= !mask;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Pad the current byte to the next byte boundary with zero bits.
     pub fn align_to_byte(&mut self) {
         if self.bit != 0 {
