@@ -12,6 +12,7 @@ aec_core = { path = "../aec_core" }
 aec_audit = { path = "../aec_audit" }
 aec_governor = { path = "../aec_governor" }
 aec_materials = { path = "../aec_materials" }
+aec_viewport = { path = "../aec_viewport" }
 chrono = { workspace = true }
 glam = { workspace = true }
 fastrand = { workspace = true }

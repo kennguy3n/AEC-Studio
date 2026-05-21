@@ -49,6 +49,7 @@ pub use gpu_trace::{
     render_or_fallback as gpu_render_or_fallback, validate_shader as gpu_validate_shader,
     GpuPathTracer, GpuSceneBuffers, GpuTraceError, SHADER_SOURCE as GPU_SHADER_SOURCE,
 };
+pub mod preview;
 pub use history::{
     compare as compare_history, CompareResult, FieldDiff, HistoryError, RenderHistory,
     RenderHistoryEntry,
@@ -74,6 +75,10 @@ pub use path_trace::{
 pub use preset::{
     migrate_legacy_preset_id, recommend_preset, PresetError, RenderPreset, RenderPresetConfig,
     RenderPresetStore, RenderQuality,
+};
+pub use preview::{
+    pick_sky_state, scene_world_sphere, tier_resolution_scale, tier_tile_size, PreviewBuildError,
+    PreviewFrameOutput, PreviewMaterial, PreviewPipeline, PreviewTile, SharedPreviewPipeline,
 };
 pub use queue::{QueueError, RenderQueue};
 pub use scene::{RenderCamera, RenderLight, RenderScene, SerializedMesh};
