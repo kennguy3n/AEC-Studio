@@ -1263,27 +1263,36 @@ mod tests {
     /// vertex pairs that straddled an integer grid boundary even when
     /// they were within `epsilon` L∞ of each other. The 3x3x3
     /// neighbourhood search added alongside this test correctly
-    /// collapses (0.4*eps, 0, 0) and (0.6*eps, 0, 0) which hash to
-    /// keys 0 and 1 respectively — their L∞ distance is 0.2*eps, well
-    /// within the welding tolerance.
+    /// collapses points that hash to adjacent cells. With
+    /// `epsilon = 1.0` and `floor()`-based bucketing, a pair like
+    /// `(0.9*eps, 0, 0)` and `(1.1*eps, 0, 0)` lands in cells `0`
+    /// and `1` respectively — their L∞ distance is `0.2*eps`, well
+    /// within the welding tolerance, and the cross-cell lookup must
+    /// find them.
     #[test]
     fn welded_mesh_collapses_vertices_across_grid_cell_boundary() {
         let epsilon = 1.0; // 1 mm tolerance
         let mesh = Mesh {
             positions: vec![
-                [0.4, 0.0, 0.0], // rounds to grid key (0, 0, 0)
-                [0.6, 0.0, 0.0], // rounds to grid key (1, 0, 0)
-                [10.0, 0.0, 0.0],
-                [10.4, 0.0, 0.0], // rounds to (10, 0, 0)
-                [10.6, 0.0, 0.0], // rounds to (11, 0, 0)
+                // Cluster A: cross-cell pair under floor() bucketing.
+                [0.9, 0.0, 0.0], // floor(0.9) = 0, cell (0, 0, 0)
+                [1.1, 0.0, 0.0], // floor(1.1) = 1, cell (1, 0, 0)
+                // Cluster B: a cross-cell pair followed by a same-cell
+                // straggler, exercising both the 3x3x3 lookup AND the
+                // single-cell fast path off the same representative.
+                [9.9, 0.0, 0.0],  // floor(9.9)  = 9,  cell (9,  0, 0)
+                [10.1, 0.0, 0.0], // floor(10.1) = 10, cell (10, 0, 0)
+                [10.4, 0.0, 0.0], // floor(10.4) = 10, cell (10, 0, 0)
             ],
             // Synthetic indices just to exercise the remap.
             indices: vec![[0, 1, 2], [2, 3, 4]],
         };
         let welded = mesh.welded(epsilon);
         // Original: 5 positions. After welding within eps=1.0:
-        //   [0.4, 0.6] -> one cluster (L∞ = 0.2 < 1.0)
-        //   [10.0, 10.4, 10.6] -> one cluster (max pair L∞ = 0.6 < 1.0)
+        //   [0.9, 1.1] -> one cluster (L∞ = 0.2 < 1.0, crosses cell 0|1)
+        //   [9.9, 10.1, 10.4] -> one cluster
+        //       9.9 and 10.1 cross cell 9|10 (L∞ = 0.2 < 1.0);
+        //       10.4 stays in cell 10 alongside 10.1 (single-cell merge).
         // Expected: 2 unique positions.
         assert_eq!(
             welded.positions.len(),

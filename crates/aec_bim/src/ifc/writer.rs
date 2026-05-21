@@ -551,6 +551,23 @@ fn serialize_property_value(v: &PropertyValue) -> (String, String) {
     }
 }
 
+/// Serialise a `PropertyValue` as an `IfcQuantity*` STEP literal for
+/// inclusion in an `IfcElementQuantity` set.
+///
+/// **Contract for `PropertyValue::Other`**: when an `Other` variant is
+/// placed in a `QuantitySet`, its `measure` field MUST already be an
+/// `IFCQUANTITY*` entity type (e.g. `"IFCQUANTITYTIME"` for the
+/// IFC4x3 time quantity, or any future schema-level quantity). The
+/// reader enforces this by routing only entities matching the
+/// `IFCQUANTITY*` prefix through `parse_quantity_typed` → the
+/// catch-all `Other` arm (see `crates/aec_bim/src/ifc/reader.rs` ::
+/// `parse_quantity_typed`). Programmatic callers stuffing an `Other`
+/// variant with a non-quantity measure (e.g. `IFCMASSDENSITYMEASURE`)
+/// into a QuantitySet would produce malformed STEP — the
+/// `debug_assert!` below catches that contract violation in tests and
+/// debug builds while staying free in release. The check is a
+/// fail-fast on programmer error, not a runtime tax on well-formed
+/// input.
 fn serialize_quantity_value(v: &PropertyValue) -> (String, String) {
     match v {
         PropertyValue::Length(x) => (format_real(*x), "IFCQUANTITYLENGTH".to_string()),
@@ -558,7 +575,21 @@ fn serialize_quantity_value(v: &PropertyValue) -> (String, String) {
         PropertyValue::Volume(x) => (format_real(*x), "IFCQUANTITYVOLUME".to_string()),
         PropertyValue::Integer(i) => (i.to_string(), "IFCQUANTITYCOUNT".to_string()),
         PropertyValue::Real(x) => (format_real(*x), "IFCQUANTITYWEIGHT".to_string()),
-        PropertyValue::Other { measure, raw } => (raw.clone(), measure.to_ascii_uppercase()),
+        PropertyValue::Other { measure, raw } => {
+            let entity = measure.to_ascii_uppercase();
+            debug_assert!(
+                entity.starts_with("IFCQUANTITY"),
+                "PropertyValue::Other in a QuantitySet must carry an IFCQUANTITY* \
+                 measure (e.g. IFCQUANTITYTIME for IFC4x3); got {entity:?}. \
+                 The reader only routes IFCQUANTITY* prefixed entities into the \
+                 Other arm of parse_quantity_typed, so this assertion firing means \
+                 a programmatic caller bypassed the reader and stuffed a non-\
+                 quantity measure into a QuantitySet — it would produce \
+                 malformed STEP. Move the value into a PropertySet instead, \
+                 where any IfcMeasure can be serialised."
+            );
+            (raw.clone(), entity)
+        }
         PropertyValue::Ratio(_) => {
             // IFC4 has no IfcQuantityRatio — Ratio values belong in
             // Psets (IFCPOSITIVERATIOMEASURE) not Qsets. Emit as
