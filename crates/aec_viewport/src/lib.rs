@@ -50,5 +50,7 @@ pub use scene::{SceneGraph, SceneMesh, SceneNode, SceneNodeKind};
 pub use selection::{Selection, SelectionMode};
 pub use snap_overlay::{SnapHit, SnapKind, SnapOverlay};
 pub use viewport_pipeline::{
-    ViewportDescriptor, ViewportError, ViewportFrame, ViewportPipeline, ViewportStats,
+    validate_shaders as validate_viewport_shaders, ViewportDescriptor, ViewportError,
+    ViewportFrame, ViewportPipeline, ViewportStats, HIZ_SHADER_SOURCE, OUTLINE_SHADER_SOURCE,
+    PBR_CSM_SHADER_SOURCE, PICKING_SHADER_SOURCE, SHADOW_CSM_SHADER_SOURCE,
 };

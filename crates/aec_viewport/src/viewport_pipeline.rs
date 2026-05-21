@@ -32,6 +32,47 @@ use crate::culling::{cull_visible, Aabb, Frustum};
 use crate::outline::{jump_flood_sdf, outline_thickness_mask, OutlineSdf, OutlineStyle};
 use crate::picking::{PickRegistry, PickedHit, PickingId, PickingTarget};
 
+/// WGSL source for the CSM variant of the PBR forward shader. Bundled
+/// at compile time so the pipeline can stamp it into a wgpu device on
+/// any platform without separate asset loading.
+pub const PBR_CSM_SHADER_SOURCE: &str = include_str!("shaders/pbr_csm.wgsl");
+
+/// WGSL source for the hardware picking pass — instance id written
+/// into an R32Uint colour target.
+pub const PICKING_SHADER_SOURCE: &str = include_str!("shaders/picking.wgsl");
+
+/// WGSL source for the JFA outline composite (consumes the CPU-built
+/// squared-distance field).
+pub const OUTLINE_SHADER_SOURCE: &str = include_str!("shaders/outline.wgsl");
+
+/// WGSL source for the per-cascade depth-only shadow pass.
+pub const SHADOW_CSM_SHADER_SOURCE: &str = include_str!("shaders/shadow_csm.wgsl");
+
+/// WGSL source for the Hi-Z depth pyramid builder + occlusion test.
+pub const HIZ_SHADER_SOURCE: &str = include_str!("shaders/hiz.wgsl");
+
+/// Validate every WGSL shader bundled with the viewport pipeline.
+/// Returns the first naga parse error encountered, prefixed with the
+/// shader name. Headless CI calls this to catch shader regressions
+/// without needing a GPU adapter.
+///
+/// # Errors
+///
+/// Returns the first shader's error message (prefixed with the
+/// shader name) if any of the bundled WGSL sources fail to parse.
+pub fn validate_shaders() -> Result<(), String> {
+    naga::front::wgsl::parse_str(PBR_CSM_SHADER_SOURCE)
+        .map_err(|e| format!("pbr_csm.wgsl: {e}"))?;
+    naga::front::wgsl::parse_str(PICKING_SHADER_SOURCE)
+        .map_err(|e| format!("picking.wgsl: {e}"))?;
+    naga::front::wgsl::parse_str(OUTLINE_SHADER_SOURCE)
+        .map_err(|e| format!("outline.wgsl: {e}"))?;
+    naga::front::wgsl::parse_str(SHADOW_CSM_SHADER_SOURCE)
+        .map_err(|e| format!("shadow_csm.wgsl: {e}"))?;
+    naga::front::wgsl::parse_str(HIZ_SHADER_SOURCE).map_err(|e| format!("hiz.wgsl: {e}"))?;
+    Ok(())
+}
+
 /// User-facing configuration for the navigable viewport.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ViewportDescriptor {
@@ -277,6 +318,40 @@ mod tests {
             height: 72,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn pbr_csm_shader_compiles_via_naga() {
+        // Catches shader regressions in headless CI where no GPU
+        // adapter is available — naga is a CPU-side WGSL parser.
+        naga::front::wgsl::parse_str(PBR_CSM_SHADER_SOURCE).expect("pbr_csm.wgsl must parse");
+    }
+
+    #[test]
+    fn picking_shader_compiles_via_naga() {
+        naga::front::wgsl::parse_str(PICKING_SHADER_SOURCE).expect("picking.wgsl must parse");
+    }
+
+    #[test]
+    fn outline_shader_compiles_via_naga() {
+        naga::front::wgsl::parse_str(OUTLINE_SHADER_SOURCE).expect("outline.wgsl must parse");
+    }
+
+    #[test]
+    fn shadow_csm_shader_compiles_via_naga() {
+        naga::front::wgsl::parse_str(SHADOW_CSM_SHADER_SOURCE).expect("shadow_csm.wgsl must parse");
+    }
+
+    #[test]
+    fn hiz_shader_compiles_via_naga() {
+        naga::front::wgsl::parse_str(HIZ_SHADER_SOURCE).expect("hiz.wgsl must parse");
+    }
+
+    #[test]
+    fn validate_shaders_succeeds_for_bundled_set() {
+        // Single entry point the embedding crate calls during boot
+        // to fail-fast on any WGSL regression.
+        validate_shaders().expect("all bundled shaders must parse");
     }
 
     #[test]
