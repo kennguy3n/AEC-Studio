@@ -842,11 +842,7 @@ mod tests {
         let mut pts = Vec::with_capacity(n_points);
         for i in 0..n_points {
             let theta = (i as f64) / (n_points as f64) * std::f64::consts::TAU;
-            let r = if i.is_multiple_of(2) {
-                outer_r
-            } else {
-                inner_r
-            };
+            let r = if i % 2 == 0 { outer_r } else { inner_r };
             pts.push([r * theta.cos(), r * theta.sin()]);
         }
         let prof = ArbitraryClosedProfile { points: pts }.evaluate();
