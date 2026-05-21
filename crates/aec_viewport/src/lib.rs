@@ -12,10 +12,12 @@ pub mod gizmo;
 pub mod grid;
 pub mod instancing;
 pub mod material_preview;
+pub mod pbr_preview;
 pub mod reference_image;
 pub mod renderer;
 pub mod scene;
 pub mod selection;
+pub mod sky;
 pub mod snap_overlay;
 
 pub use cad_canvas::{

@@ -17,6 +17,8 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 bytemuck = { version = "1", features = ["derive"] }
 wgpu = "0.20"
+naga = { version = "0.20", features = ["wgsl-in"] }
+pollster = "0.3"
 
 [lints]
 workspace = true
