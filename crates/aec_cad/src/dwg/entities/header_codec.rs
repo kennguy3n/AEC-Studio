@@ -96,6 +96,12 @@ pub struct CommonHeaderData {
     pub linetype_scale: f64,
     pub linetype_flag: LinetypeFlag,
     pub plot_style_flag: u8, // BB
+    /// R2004+ extension-dictionary-missing flag. When `true` the
+    /// handle stream does NOT carry an xdict handle; when `false` the
+    /// handle stream carries one extra `H` for the extension
+    /// dictionary owner. The bit is written only for R2004+; for older
+    /// versions xdict is always implicitly missing.
+    pub xdict_missing: bool,
     /// Invisibility bitfield (R14+; bit 0 = "entity is invisible").
     pub invisibility: i32,
     /// LineWeight (RC). Values 0-211 are millimetres × 0.05. 0x1d ("by
@@ -114,6 +120,7 @@ impl Default for CommonHeaderData {
             linetype_scale: 1.0,
             linetype_flag: LinetypeFlag::ByLayer,
             plot_style_flag: 0,
+            xdict_missing: true,
             invisibility: 0,
             lineweight: 0x1d, // BYLAYER
         }
@@ -129,12 +136,11 @@ impl CommonHeaderData {
         w.write_bb(self.entity_mode.to_bb())?;
         // BL reactor count
         w.write_bl(i64::from(self.reactor_count))?;
-        // R2004+: B xdict-missing-flag. R2013+ also adds the "has
-        // binary data" bit. We don't emit either in this minimal
-        // shape — default is "xdict missing = true (no extension
-        // dictionary)" which the writer represents implicitly.
+        // R2004+: B xdict-missing-flag. The handle stream emits an
+        // extra `H` for the extension dictionary owner iff this flag
+        // is `false`. R2013+ also adds the "has binary data" bit.
         if version >= Version::R2004 {
-            w.write_b(true)?; // xdict missing
+            w.write_b(self.xdict_missing)?;
         }
         if version >= Version::R2013 {
             w.write_b(false)?; // has binary data
@@ -183,9 +189,13 @@ impl CommonHeaderData {
     pub fn decode_for_version(version: Version, r: &mut BitReader<'_>) -> DwgResult<Self> {
         let entity_mode = EntityMode::from_bb(r.read_bb()?);
         let reactor_count = r.read_bl()? as u32;
-        if version >= Version::R2004 {
-            let _xdict_missing = r.read_b()?;
-        }
+        let xdict_missing = if version >= Version::R2004 {
+            r.read_b()?
+        } else {
+            // R14/R2000 never emit the flag; xdict is implicitly
+            // "missing" so the handle stream skips the extra `H`.
+            true
+        };
         if version >= Version::R2013 {
             let _has_binary_data = r.read_b()?;
         }
@@ -226,6 +236,7 @@ impl CommonHeaderData {
             linetype_scale,
             linetype_flag,
             plot_style_flag,
+            xdict_missing,
             invisibility,
             lineweight,
         })

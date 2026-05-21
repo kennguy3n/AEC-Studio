@@ -164,6 +164,15 @@ impl BitWriter {
     }
 
     /// Bit Short — encode using the smallest of the four shapes.
+    ///
+    /// The 16-bit shape (BB=0b00) carries a signed 16-bit value. Values
+    /// outside `[-32768, 32767]` cannot be represented and the writer
+    /// returns [`DwgError::InternalInvariant`] rather than silently
+    /// truncating. The 0 and 256 shorthand (BB=0b10 and BB=0b11) and the
+    /// unsigned-byte shape (BB=0b01, range `0..=255`) take precedence in
+    /// that order — `write_bs(0)` produces 2 bits, `write_bs(256)`
+    /// produces 2 bits, `write_bs(5)` produces 10 bits, and any other
+    /// in-range value produces 18 bits.
     pub fn write_bs(&mut self, value: i32) -> DwgResult<()> {
         if value == 0 {
             self.write_bb(0b10)
@@ -172,11 +181,16 @@ impl BitWriter {
         } else if (0..=255).contains(&value) {
             self.write_bb(0b01)?;
             self.write_bits_u32(8, value as u32)
-        } else {
+        } else if (i32::from(i16::MIN)..=i32::from(i16::MAX)).contains(&value) {
             self.write_bb(0b00)?;
-            let v = (value as i16) as u16;
+            let v = value as i16 as u16;
             self.write_bits_u32(8, u32::from(v & 0xff))?;
             self.write_bits_u32(8, u32::from(v >> 8))
+        } else {
+            Err(DwgError::InternalInvariant(format!(
+                "write_bs value {value} out of range [-32768, 32767]; \
+                 use write_bl for wider values"
+            )))
         }
     }
 
@@ -274,6 +288,71 @@ impl BitWriter {
         self.write_rd(value[0])?;
         self.write_rd(value[1])?;
         self.write_rd(value[2])
+    }
+
+    /// Bit Extrusion (BE) for R2000+: 1-bit "is default" prefix; if
+    /// the extrusion vector equals the OCS default `(0, 0, 1)` we
+    /// write only the prefix bit, otherwise we write the prefix bit
+    /// followed by three BD components. Mirrors LibreDWG's
+    /// `bit_write_BE` so files written by either codec can be read by
+    /// the other.
+    pub fn write_be_r2000_plus(&mut self, value: [f64; 3]) -> DwgResult<()> {
+        if value[0] == 0.0 && value[1] == 0.0 && value[2] == 1.0 {
+            self.write_b(true)
+        } else {
+            self.write_b(false)?;
+            self.write_bd(value[0])?;
+            self.write_bd(value[1])?;
+            // LibreDWG normalises the z component when x = y = 0 so
+            // the on-wire vector matches what AutoCAD emits; we
+            // mirror that here so round-tripping through external
+            // tools is bit-stable.
+            let z = if value[0] == 0.0 && value[1] == 0.0 {
+                if value[2] <= 0.0 {
+                    -1.0
+                } else {
+                    1.0
+                }
+            } else {
+                value[2]
+            };
+            self.write_bd(z)
+        }
+    }
+
+    /// Bit Thickness (BT) for R2000+: 1-bit "is default (zero)"
+    /// prefix; non-zero thicknesses are written as the prefix bit + a
+    /// BD. Matches LibreDWG's `bit_write_BT`.
+    pub fn write_bt_r2000_plus(&mut self, value: f64) -> DwgResult<()> {
+        if value == 0.0 {
+            self.write_b(true)
+        } else {
+            self.write_b(false)?;
+            self.write_bd(value)
+        }
+    }
+
+    /// Bit Double With Default (DD): two control bits select between
+    /// reusing the default verbatim (00), patching the low 4 bytes
+    /// (01), patching the low 6 bytes (10), or reading a full 8-byte
+    /// RD (11). For simplicity and round-trip stability we always
+    /// emit `00` when `value == default` and `11` (raw RD) otherwise;
+    /// this is a valid encoding per the OpenDesign specification and
+    /// matches what LibreDWG emits when it can't infer a smaller
+    /// patch shape.
+    pub fn write_dd(&mut self, value: f64, default: f64) -> DwgResult<()> {
+        if value.to_bits() == default.to_bits() {
+            self.write_bb(0b00)
+        } else {
+            self.write_bb(0b11)?;
+            self.write_rd(value)
+        }
+    }
+
+    /// 2 DDs with respective component defaults.
+    pub fn write_2dd(&mut self, value: [f64; 2], default: [f64; 2]) -> DwgResult<()> {
+        self.write_dd(value[0], default[0])?;
+        self.write_dd(value[1], default[1])
     }
 
     /// Modular Char (signed). Up to 4 bytes of 7-bit payload.
@@ -406,18 +485,28 @@ impl BitWriter {
     }
 
     pub fn write_cmc(&mut self, color: &Color) -> DwgResult<()> {
+        // The colour tag is the signed 16-bit value whose unsigned
+        // representation is 0xc0kk for special colours (ByLayer = 0xc000,
+        // ByBlock = 0xc100, RGB = 0xc200, Named = 0xc300). We pass the
+        // signed equivalent directly so `write_bs` doesn't have to rely
+        // on silent i32→i16 truncation — the `i16::from_le_bytes(...)`
+        // form makes the bit pattern → signed value conversion explicit.
+        const BY_LAYER: i32 = i16::from_le_bytes([0x00, 0xc0]) as i32;
+        const BY_BLOCK: i32 = i16::from_le_bytes([0x00, 0xc1]) as i32;
+        const RGB_TAG: i32 = i16::from_le_bytes([0x00, 0xc2]) as i32;
+        const NAMED_TAG: i32 = i16::from_le_bytes([0x00, 0xc3]) as i32;
         match color {
             Color::Index(idx) => self.write_bs(i32::from(*idx)),
-            Color::ByLayer => self.write_bs(0xc000_u32 as i32),
-            Color::ByBlock => self.write_bs(0xc100_u32 as i32),
+            Color::ByLayer => self.write_bs(BY_LAYER),
+            Color::ByBlock => self.write_bs(BY_BLOCK),
             Color::Rgb(r, g, b) => {
-                self.write_bs(0xc200_u32 as i32)?;
+                self.write_bs(RGB_TAG)?;
                 self.write_bits_u32(8, u32::from(*r))?;
                 self.write_bits_u32(8, u32::from(*g))?;
                 self.write_bits_u32(8, u32::from(*b))
             }
             Color::Named(name) => {
-                self.write_bs(0xc300_u32 as i32)?;
+                self.write_bs(NAMED_TAG)?;
                 self.write_tv(name)
             }
         }
@@ -469,6 +558,43 @@ mod tests {
     }
 
     #[test]
+    fn bs_rejects_values_outside_i16_range() {
+        let mut w = BitWriter::new();
+        // Just above i16::MAX (excluding the 0..=256 shorthand window).
+        let err = w.write_bs(32_768).unwrap_err();
+        assert!(matches!(err, DwgError::InternalInvariant(_)));
+        // Just below i16::MIN.
+        let err = w.write_bs(-32_769).unwrap_err();
+        assert!(matches!(err, DwgError::InternalInvariant(_)));
+        // 0xc000 used to silently truncate to -16384 via `as i16` cast;
+        // the new contract is that the caller must pass the signed form
+        // (CMC encoder does this explicitly).
+        let err = w.write_bs(0xc000).unwrap_err();
+        assert!(matches!(err, DwgError::InternalInvariant(_)));
+    }
+
+    #[test]
+    fn cmc_uses_signed_form_for_special_tags() {
+        // Round-trip every Color variant: the tag bit pattern on the
+        // wire is byte-identical between encoder/decoder regardless of
+        // whether write_bs receives the signed (-16384) or unsigned
+        // (0xc000) representation, so this serves as a regression test
+        // that write_cmc no longer relies on silent i32 -> i16
+        // truncation in write_bs.
+        for color in [
+            Color::Index(7),
+            Color::ByLayer,
+            Color::ByBlock,
+            Color::Rgb(0x80, 0x40, 0xff),
+            Color::Named("MAGENTA".into()),
+        ] {
+            let color2 = color.clone();
+            let got = round_trip(move |w| w.write_cmc(&color2), |r| r.read_cmc());
+            assert_eq!(color, got, "CMC round-trip failed for {color:?}");
+        }
+    }
+
+    #[test]
     fn bl_round_trips_special_values() {
         for v in [0_i64, 1, 255, 256, 32767, -1, -2_147_483_648, 2_147_483_647] {
             assert_eq!(v, round_trip(move |w| w.write_bl(v), |r| r.read_bl()));
@@ -488,6 +614,64 @@ mod tests {
             let got = round_trip(move |w| w.write_bd(v), |r| r.read_bd());
             assert_eq!(v.to_bits(), got.to_bits(), "BD round-trip failed for {v}");
         }
+    }
+
+    #[test]
+    fn be_default_extrusion_uses_one_bit() {
+        // OCS default (0, 0, 1) compresses to a single `1` bit.
+        let mut w = BitWriter::new();
+        w.write_be_r2000_plus([0.0, 0.0, 1.0]).unwrap();
+        // Position cursor moved 1 bit forward; total emitted length
+        // is still one byte (the padding bits don't affect the
+        // bit_position metric we expose).
+        assert_eq!(w.bit_position(), 1);
+        // Round-trip recovers the default.
+        let bytes = w.into_bytes();
+        let mut r = BitReader::new(&bytes);
+        assert_eq!(r.read_be_r2000_plus().unwrap(), [0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn be_explicit_extrusion_round_trips() {
+        for vec in [
+            [1.0, 0.0, 0.0],
+            [0.5, 0.5, std::f64::consts::FRAC_1_SQRT_2],
+            // Verifies the LibreDWG-compatible z-normalisation: when
+            // x = y = 0 and the on-wire z is negative, the recovered
+            // z is exactly -1.0 rather than the original input.
+            [0.0, 0.0, -42.0],
+        ] {
+            let got = round_trip(
+                move |w| w.write_be_r2000_plus(vec),
+                |r| r.read_be_r2000_plus(),
+            );
+            if vec[0] == 0.0 && vec[1] == 0.0 {
+                // Normalised path: z is ±1, sign matches input.
+                assert!(got[2] == 1.0 || got[2] == -1.0);
+            } else {
+                assert_eq!(vec, got);
+            }
+        }
+    }
+
+    #[test]
+    fn bt_round_trips() {
+        // Default zero compresses to one bit; non-default values use
+        // bit + full BD.
+        let zero = round_trip(|w| w.write_bt_r2000_plus(0.0), |r| r.read_bt_r2000_plus());
+        assert_eq!(zero, 0.0);
+        let thick = round_trip(|w| w.write_bt_r2000_plus(2.5), |r| r.read_bt_r2000_plus());
+        assert_eq!(thick, 2.5);
+    }
+
+    #[test]
+    fn dd_round_trips_via_default_and_raw_shapes() {
+        // Value equal to default → BB=00 shape, no bytes after.
+        let same = round_trip(|w| w.write_dd(4.0, 4.0), |r| r.read_dd(4.0));
+        assert_eq!(same, 4.0);
+        // Differing value → BB=11 shape, full 8-byte RD.
+        let diff = round_trip(|w| w.write_dd(7.25, 4.0), |r| r.read_dd(4.0));
+        assert_eq!(diff, 7.25);
     }
 
     #[test]

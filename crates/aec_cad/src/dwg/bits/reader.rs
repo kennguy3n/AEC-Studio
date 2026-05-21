@@ -307,6 +307,80 @@ impl<'a> BitReader<'a> {
         Ok([self.read_rd()?, self.read_rd()?, self.read_rd()?])
     }
 
+    /// Bit Extrusion (BE) for R2000+: see [`BitWriter::write_be_r2000_plus`].
+    /// When the prefix bit is `1`, the extrusion is the OCS default
+    /// `(0, 0, 1)`; otherwise it's three full BD values.
+    ///
+    /// [`BitWriter::write_be_r2000_plus`]: super::writer::BitWriter::write_be_r2000_plus
+    pub fn read_be_r2000_plus(&mut self) -> DwgResult<[f64; 3]> {
+        if self.read_b()? {
+            Ok([0.0, 0.0, 1.0])
+        } else {
+            let x = self.read_bd()?;
+            let y = self.read_bd()?;
+            let mut z = self.read_bd()?;
+            if x == 0.0 && y == 0.0 {
+                z = if z <= 0.0 { -1.0 } else { 1.0 };
+            }
+            Ok([x, y, z])
+        }
+    }
+
+    /// Bit Thickness (BT) for R2000+: see [`BitWriter::write_bt_r2000_plus`].
+    ///
+    /// [`BitWriter::write_bt_r2000_plus`]: super::writer::BitWriter::write_bt_r2000_plus
+    pub fn read_bt_r2000_plus(&mut self) -> DwgResult<f64> {
+        if self.read_b()? {
+            Ok(0.0)
+        } else {
+            self.read_bd()
+        }
+    }
+
+    /// Bit Double With Default (DD). The writer in this crate always
+    /// emits `00` (use default) or `11` (full RD); for full
+    /// AutoCAD-emitted file compatibility we also handle the `01`
+    /// (4-byte patch) and `10` (6-byte patch) shapes by patching the
+    /// low bytes of the default's little-endian representation.
+    pub fn read_dd(&mut self, default: f64) -> DwgResult<f64> {
+        match self.read_bb()? {
+            0b00 => Ok(default),
+            0b01 => {
+                // Patch the low 4 bytes; keep the upper 4 bytes of the
+                // default. Per the OpenDesign spec, the patch is
+                // little-endian regardless of host endianness.
+                let mut bytes = default.to_le_bytes();
+                for byte in &mut bytes[0..4] {
+                    *byte = self.read_bits_u32(8)? as u8;
+                }
+                Ok(f64::from_le_bytes(bytes))
+            }
+            0b10 => {
+                // Patch the low 6 bytes (with a documented quirk: the
+                // first two on-wire bytes go into byte positions 4-5,
+                // and the remaining four go into byte positions 0-3,
+                // matching LibreDWG's `bit_read_DD` implementation).
+                let mut bytes = default.to_le_bytes();
+                bytes[4] = self.read_bits_u32(8)? as u8;
+                bytes[5] = self.read_bits_u32(8)? as u8;
+                for byte in &mut bytes[0..4] {
+                    *byte = self.read_bits_u32(8)? as u8;
+                }
+                Ok(f64::from_le_bytes(bytes))
+            }
+            0b11 => self.read_rd(),
+            other => Err(DwgError::InvalidBitPattern {
+                type_name: "DD",
+                bits: other,
+            }),
+        }
+    }
+
+    /// 2 DDs with respective component defaults.
+    pub fn read_2dd(&mut self, default: [f64; 2]) -> DwgResult<[f64; 2]> {
+        Ok([self.read_dd(default[0])?, self.read_dd(default[1])?])
+    }
+
     /// Modular Char (MC, signed). Variable-length: up to 4 bytes,
     /// 7 data bits per byte, MSB is the continuation flag. The sign
     /// bit is the next-to-MSB of the *last* byte.

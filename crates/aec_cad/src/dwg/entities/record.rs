@@ -438,11 +438,23 @@ fn encode_handle_stream(
             .unwrap_or(HandleRef { code: 4, value: 0 });
         w.write_h(r)?;
     }
-    // Xdict handle: present only when xdict-missing flag was false.
-    // We always set xdict-missing = true on write, so skip emission
-    // here — when we add structured xdict support it will gate this.
-    if let Some(xd) = handles.x_dictionary {
+    // Xdict handle: present only when the xdict-missing flag in the
+    // common header is false. We assert the encoder is internally
+    // consistent — if the caller has an xdict handle to emit, the
+    // common header must say so; if not, we must NOT write any extra
+    // bytes here (writing them would desynchronise the handle stream
+    // from the bit cursor and corrupt every following handle).
+    if !common.xdict_missing {
+        let xd = handles
+            .x_dictionary
+            .unwrap_or(HandleRef { code: 3, value: 0 });
         w.write_h(xd)?;
+    } else if handles.x_dictionary.is_some() {
+        return Err(DwgError::InternalInvariant(
+            "ObjectHandles::x_dictionary is Some but CommonHeaderData::xdict_missing \
+             is true; set xdict_missing = false to emit the handle."
+                .into(),
+        ));
     }
     // Layer is mandatory.
     w.write_h(handles.layer)?;
@@ -483,8 +495,11 @@ fn decode_handle_stream(
     for _ in 0..common.reactor_count {
         reactors.push(r.read_h()?);
     }
-    // No xdict (encoder always sets missing=true today).
-    let x_dictionary = None;
+    let x_dictionary = if common.xdict_missing {
+        None
+    } else {
+        Some(r.read_h()?)
+    };
     let layer = r.read_h()?;
     let linetype = if common.linetype_flag == LinetypeFlag::Handle {
         Some(r.read_h()?)
@@ -599,6 +614,76 @@ mod tests {
         let (decoded, _) = ObjectRecord::decode(Version::R2018, &bytes).unwrap();
         assert_eq!(decoded.object_type, ObjectType::Line);
         assert_eq!(decoded.payload_bits.bit_len, record.payload_bits.bit_len);
+    }
+
+    #[test]
+    fn record_round_trips_xdict_handle_on_r2010() {
+        // Build a record whose common header declares xdict-present
+        // (xdict_missing = false) AND supplies the matching handle in
+        // the handle stream. The encoder must emit the extra `H` in
+        // the handle stream and the decoder must consume it, leaving
+        // the layer handle aligned. If the symmetry were broken the
+        // decoder would interpret the xdict handle bytes as the layer
+        // handle and the assertion below would fail.
+        let xdict = HandleRef {
+            code: 3,
+            value: 0x77,
+        };
+        let layer = HandleRef {
+            code: 5,
+            value: 0x20,
+        };
+        let common = CommonHeaderData {
+            xdict_missing: false,
+            ..CommonHeaderData::default()
+        };
+        let handles = ObjectHandles {
+            owner: Some(HandleRef {
+                code: 5,
+                value: 0x10,
+            }),
+            reactors: Vec::new(),
+            x_dictionary: Some(xdict),
+            layer,
+            linetype: None,
+            plot_style: None,
+            material: None,
+        };
+        let record = ObjectRecord {
+            object_type: ObjectType::Line,
+            handle: HandleRef { code: 0, value: 1 },
+            common,
+            payload_bits: BitBuf::new(),
+            handles,
+        };
+        let bytes = record.encode(Version::R2010).unwrap();
+        let (decoded, _) = ObjectRecord::decode(Version::R2010, &bytes).unwrap();
+        assert_eq!(decoded.handles.x_dictionary, Some(xdict));
+        assert_eq!(decoded.handles.layer, layer);
+        assert!(!decoded.common.xdict_missing);
+    }
+
+    #[test]
+    fn record_rejects_xdict_handle_when_header_says_missing() {
+        // If the caller passes an x_dictionary handle but leaves
+        // common.xdict_missing = true, the encoder must surface the
+        // inconsistency rather than silently writing bytes the decoder
+        // will never read. (Silently writing them would corrupt the
+        // handle stream alignment.)
+        let mut handles = build_handles();
+        handles.x_dictionary = Some(HandleRef {
+            code: 3,
+            value: 0x77,
+        });
+        let record = ObjectRecord {
+            object_type: ObjectType::Line,
+            handle: HandleRef { code: 0, value: 1 },
+            common: CommonHeaderData::default(), // xdict_missing = true
+            payload_bits: BitBuf::new(),
+            handles,
+        };
+        let err = record.encode(Version::R2010).unwrap_err();
+        assert!(matches!(err, DwgError::InternalInvariant(_)));
     }
 
     #[test]
