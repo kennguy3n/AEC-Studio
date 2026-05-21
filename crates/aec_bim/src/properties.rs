@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use aec_core::types::EntityId;
 
 use crate::classification::IfcClass;
-use crate::ifc::reader::unescape_step_string;
+use crate::ifc::reader::{parse_step_real, unescape_step_string};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
@@ -109,7 +109,7 @@ impl PropertyValue {
             // FORTRAN-derived IFC exporters (canonical ISO 10303-21
             // only allows `e`/`E`, but the wider IFC ecosystem still
             // ships archives that use `D`).
-            Self::Other { raw, .. } => crate::ifc::reader::parse_step_real(raw),
+            Self::Other { raw, .. } => parse_step_real(raw),
             // Non-numeric typed variants: Text, Boolean, Label.
             Self::Text(_) | Self::Boolean(_) | Self::Label(_) => None,
         }
@@ -455,6 +455,23 @@ mod tests {
             raw: "2D5".into(),
         };
         assert_eq!(d_integer_mantissa.as_real(), Some(2e5));
+
+        // Non-finite tokens (NaN, inf) are not valid ISO 10303-21
+        // REAL literals. Rust's f64::from_str accepts them, but
+        // accepting them here would let a malformed STEP poison
+        // downstream BOQ / signed_volume arithmetic via
+        // NaN-propagation. `as_real` must return None just like for
+        // any other non-numeric raw.
+        let nan = PropertyValue::Other {
+            measure: "IFCMASSDENSITYMEASURE".into(),
+            raw: "NaN".into(),
+        };
+        assert_eq!(nan.as_real(), None);
+        let infinity = PropertyValue::Other {
+            measure: "IFCMASSDENSITYMEASURE".into(),
+            raw: "infinity".into(),
+        };
+        assert_eq!(infinity.as_real(), None);
 
         let descriptive = PropertyValue::Other {
             measure: "IFCDESCRIPTIVEMEASURE".into(),

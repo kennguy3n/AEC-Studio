@@ -1426,10 +1426,18 @@ fn parse_real(s: &str) -> IfcReadResult<f64> {
 /// Returns `None` only if the literal is not a valid REAL in either
 /// form (e.g. quoted strings or `.T.` booleans, which `PropertyValue::Other`
 /// can legitimately store).
+///
+/// Non-finite results (`NaN`, `±∞`) are also rejected. Rust's
+/// `f64::from_str` accepts the textual tokens `NaN`, `inf`, `infinity`,
+/// `-inf`, etc., but none of those are valid ISO 10303-21 REAL literals
+/// — and silently admitting them would let a malformed STEP file poison
+/// downstream BIM quantity arithmetic (a wall with `IFCLENGTHMEASURE(NaN)`
+/// would propagate `NaN` through every BOQ sum, `signed_volume`, and
+/// schedule it touched). Defense in depth: reject at the parse boundary.
 pub(crate) fn parse_step_real(s: &str) -> Option<f64> {
     let trimmed = s.trim();
     if let Ok(v) = trimmed.parse::<f64>() {
-        return Some(v);
+        return v.is_finite().then_some(v);
     }
     // Slow path: only allocate / scan when there's a D-exponent to
     // rewrite. `D` and `d` cannot occur outside the exponent
@@ -1448,7 +1456,7 @@ pub(crate) fn parse_step_real(s: &str) -> Option<f64> {
             other => other,
         })
         .collect();
-    rewritten.parse::<f64>().ok()
+    rewritten.parse::<f64>().ok().filter(|v| v.is_finite())
 }
 
 fn parse_int(s: &str) -> IfcReadResult<i64> {
@@ -2907,6 +2915,28 @@ END-ISO-10303-21;\n";
         // would already fail canonical parse; rewriting to `E` still
         // fails. Don't accidentally rescue malformed literals.
         assert!(parse_step_real("D5").is_none()); // bare exponent, no mantissa
+
+        // Defense in depth: Rust's f64::from_str accepts NaN/inf
+        // textual tokens, but ISO 10303-21 REAL grammar does not.
+        // Silently admitting these would let a malformed STEP file
+        // poison downstream BOQ / signed_volume arithmetic with
+        // NaN-propagation. parse_step_real must reject them at the
+        // parse boundary.
+        assert!(
+            parse_step_real("NaN").is_none(),
+            "NaN must not parse as REAL"
+        );
+        assert!(parse_step_real("nan").is_none());
+        assert!(
+            parse_step_real("inf").is_none(),
+            "inf must not parse as REAL"
+        );
+        assert!(parse_step_real("infinity").is_none());
+        assert!(parse_step_real("-inf").is_none());
+        assert!(parse_step_real("+inf").is_none());
+        // The legacy-D slow path is gated by the same finiteness
+        // check — a contrived `InfD0` literal must also be rejected.
+        assert!(parse_step_real("InfD0").is_none());
     }
 
     /// End-to-end: a STEP file whose REAL literals use legacy `D`
@@ -2970,6 +3000,53 @@ END-ISO-10303-21;\n";
             (length - 1500.0).abs() < 1e-9,
             "D-exponent legacy literal 1.5D+3 must parse as 1500.0; got {length}",
         );
+    }
+
+    /// End-to-end defense in depth: a STEP file that smuggles `NaN`
+    /// into a typed measure must fail to parse, not silently produce a
+    /// wall with a NaN-valued Length quantity. Rust's `f64::from_str`
+    /// accepts `NaN`/`inf`, but ISO 10303-21's REAL grammar does not;
+    /// `parse_step_real` rejects them, and the reader surfaces that
+    /// rejection as `IfcReadError::Malformed`.
+    #[test]
+    fn reader_rejects_nan_in_typed_measure() {
+        let mut project = Project::new("NaNMeasure");
+        let site = project
+            .add_child(&project.root.clone(), IfcClass::IfcSite, "Site")
+            .unwrap();
+        let bldg = project
+            .add_child(&site, IfcClass::IfcBuilding, "B")
+            .unwrap();
+        let storey = project
+            .add_child(&bldg, IfcClass::IfcBuildingStorey, "L01")
+            .unwrap();
+        let wall_id = EntityId::new();
+        project.attach_element(&storey, wall_id.clone());
+        let mut classification = ClassificationStore::new();
+        classification.assign_manual(wall_id.clone(), IfcClass::IfcWall);
+        let mut properties = PropertyStore::new();
+        let mut pset = PropertySet::new("Pset_WallCommon");
+        pset.set("Length", PropertyValue::Length(1500.0));
+        properties.entry(wall_id.clone()).upsert_pset(pset);
+
+        let canonical = crate::ifc::IfcWriter::to_string(&project, &classification, &properties);
+        let poisoned = canonical.replace("IFCLENGTHMEASURE(1500.0)", "IFCLENGTHMEASURE(NaN)");
+        assert_ne!(
+            canonical, poisoned,
+            "the substitution must have actually rewritten the literal",
+        );
+
+        let err = IfcReader::from_string(&poisoned)
+            .expect_err("reader must reject NaN-valued IfcLengthMeasure literals");
+        match err {
+            IfcReadError::Malformed(msg) => {
+                assert!(
+                    msg.contains("real parse"),
+                    "expected real-parse rejection for NaN literal; got: {msg}",
+                );
+            }
+            other => panic!("expected Malformed error for NaN literal; got {other:?}"),
+        }
     }
 
     /// Conversely, a HEADER section that legitimately declares
