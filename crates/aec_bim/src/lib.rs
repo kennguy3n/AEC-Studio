@@ -2,8 +2,9 @@
 //! schedules, validation, diff, drawing generation.
 //!
 //! The Rust side owns the *graph* (project → site → building → level → space
-//! → elements). The IFC byte-level read/write happens out-of-process in the
-//! IfcOpenShell worker (see `workers/ifc/`).
+//! → elements). IFC byte-level read/write and geometry tessellation are
+//! handled in-process by [`ifc::IfcReader`] / [`ifc::IfcWriter`] /
+//! [`tessellator`] — there is no external worker.
 
 pub mod boq;
 pub mod cache;

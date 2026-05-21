@@ -96,9 +96,10 @@ fn write_minimal_ifc(dir: &Path, project_name: &str) -> PathBuf {
 }
 
 /// Strict-mode validator: every IFC export must contain a valid
-/// header section, declare the IFC4 schema, and end with the STEP
-/// `END-ISO-10303-21;` marker. This mirrors the worker-side
-/// validator in `workers/ifc/validator.py`.
+/// header section, declare an IFC4-family schema, and end with the
+/// STEP `END-ISO-10303-21;` marker. Companion to the in-process
+/// `IfcReader` envelope check, used as an extra defense-in-depth
+/// assertion at the journey level.
 fn validate_ifc_strict(path: &Path) -> Result<(), String> {
     let s = fs::read_to_string(path).map_err(|e| e.to_string())?;
     let has_header = s.contains("HEADER;") && s.contains("ENDSEC;");

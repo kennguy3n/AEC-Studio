@@ -77,10 +77,10 @@ jobs:
   # reasons unrelated to the PR's diff (npm registry / electron CDN
   # 404s, runner image regressions, etc.). For PRs that don't touch
   # platform-specific code (Rust-only, docs-only, etc.) we run a
-  # fast and stable baseline — Ubuntu Rust + Ubuntu TypeScript +
-  # Python workers — and gate the full cross-platform sweep on the
-  # merge to main, where any real platform regression is caught
-  # before it can affect a release.
+  # fast and stable baseline — Ubuntu Rust + Ubuntu TypeScript —
+  # and gate the full cross-platform sweep on the merge to main,
+  # where any real platform regression is caught before it can
+  # affect a release.
   #
   # To opt a PR into the full matrix (e.g. when you intentionally
   # touch Electron / packaging / OS-specific Rust code), add the
@@ -208,33 +208,14 @@ jobs:
       - name: Test
         run: npm run test:ui
 
-  python-workers:
-    name: Python workers (ubuntu-latest)
-    runs-on: ubuntu-latest
-    # `needs: gate` is structural — the gate guards the whole
-    # workflow against unrelated label-change re-fires (see the
-    # `if:` on `gate`). Without this dependency, label triage on an
-    # unrelated label would still spin up the Python worker matrix.
-    #
-    # NOTE — Phase 9: the Blender worker has been removed (Phase 9
-    # PR4, Task 13). Rendering is now native Rust (see
-    # `crates/aec_render/src/{final_render,walkthrough,panorama}.rs`)
-    # and there are no Blender Python tests to run. The IFC worker
-    # is still Python until Phase 9 PR5 deletes it; this job's sole
-    # remaining responsibility is to keep `workers/ifc/` green
-    # until then.
-    needs: gate
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: IFC worker tests
-        working-directory: workers/ifc
-        run: python -m unittest discover -s tests -p 'test_*.py' -v
+  # Phase 9 (PR4 + PR5) removed the `python-workers` job entirely
+  # — both the Blender worker and the IFC worker (the only two
+  # Python worker trees this repo ever shipped) have been replaced
+  # with native Rust implementations. Rendering goes through
+  # `crates/aec_render/src/{final_render,walkthrough,panorama}.rs`
+  # and IFC I/O / tessellation through `crates/aec_bim/src/ifc/`
+  # + `crates/aec_bim/src/tessellator.rs`. Adding a Python step
+  # back here would defeat the point of the rewrite.
 
   # ---------------------------------------------------------------
   # package-*: produce installable artefacts.
