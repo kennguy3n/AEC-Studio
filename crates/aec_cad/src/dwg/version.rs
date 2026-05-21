@@ -11,7 +11,7 @@ use super::error::{DwgError, DwgResult};
 ///
 /// The numeric ordering is *chronological*, not lexicographic: R12
 /// (1992) < R14 (1997) < R2000 (1999) < … < R2018 (2017).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Version {
     /// AC1009. AutoCAD R11/R12 (1990-1992). Fixed-record entity
     /// format; no class section; no bit-encoded objects.
