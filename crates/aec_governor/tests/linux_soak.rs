@@ -4,8 +4,7 @@
 //! This complements the unit tests in `profiler.rs` and `tier.rs` by
 //! validating that the integration shape of "profile a real Linux box
 //! → classify a tier → derive a policy" holds together. We never call
-//! external binaries (Blender, FFmpeg) — the test must pass on any
-//! Linux CI runner.
+//! external binaries — the test must pass on any Linux CI runner.
 
 #![cfg(target_os = "linux")]
 
@@ -120,17 +119,8 @@ fn scheduler_admits_and_rejects_jobs_with_linux_profile() {
     assert!(!sched.admit_ai().admitted);
 }
 
-#[test]
-fn linux_blender_discovery_path_set_is_non_empty() {
-    use std::path::PathBuf;
-
-    // Sanity-check that on Linux the well-known Blender install paths
-    // include at least one of the canonical locations.
-    let candidates: Vec<PathBuf> = vec![
-        PathBuf::from("/usr/bin/blender"),
-        PathBuf::from("/usr/local/bin/blender"),
-        PathBuf::from("/snap/bin/blender"),
-        PathBuf::from("/var/lib/flatpak/exports/bin/org.blender.Blender"),
-    ];
-    assert!(!candidates.is_empty());
-}
+// Phase 9 PR4 removed the Blender worker entirely; the previous
+// `linux_blender_discovery_path_set_is_non_empty` smoke test no longer
+// has a target binary to probe for. The native render pipeline carries
+// its own coverage in `aec_render` (path tracer, scheduler, etc.) and
+// does not need a Linux-specific discovery probe.

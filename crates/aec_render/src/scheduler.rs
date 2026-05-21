@@ -433,6 +433,7 @@ mod tests {
             tile_size: 8,
             russian_roulette_min_bounces: 1,
             adaptive_threshold: 0.0,
+            projection: crate::path_trace::CameraProjection::Perspective,
         }
     }
 

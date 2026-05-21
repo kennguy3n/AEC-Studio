@@ -810,6 +810,7 @@ mod tests {
             tile_size: 8,
             russian_roulette_min_bounces: 1,
             adaptive_threshold: 0.0,
+            projection: crate::path_trace::CameraProjection::Perspective,
         };
         let buf = render_or_fallback(&scene, &camera, &cfg, None, None);
         assert_eq!(buf.width, 16);
@@ -840,6 +841,7 @@ mod tests {
             tile_size: 8,
             russian_roulette_min_bounces: 1,
             adaptive_threshold: 0.0,
+            projection: crate::path_trace::CameraProjection::Perspective,
         };
         let token = CancelToken::new();
         token.cancel();
@@ -877,6 +879,7 @@ mod tests {
                     tile_size: 4,
                     russian_roulette_min_bounces: 1,
                     adaptive_threshold: 0.0,
+                    projection: crate::path_trace::CameraProjection::Perspective,
                 };
                 let buf = render_or_fallback(&scene, &camera, &cfg, None, None);
                 assert_eq!(buf.pixels.len(), 48);

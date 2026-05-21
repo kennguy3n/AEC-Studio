@@ -8,7 +8,8 @@
 //! IES profiles are loaded from disk via [`IesProfile::load_ies`] —
 //! the parser accepts IES LM-63 family files (1986/1991/1995/2002) and
 //! exposes the candela distribution plus normalisation metadata that
-//! the Blender worker translates into light data nodes.
+//! the native renderer maps onto [`crate::light_sampling::NativeLight::Ies`]
+//! at scene-build time.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -70,8 +71,10 @@ impl LightingPresetKind {
     }
 }
 
-/// Sky/world parameters baked into a preset. The Blender worker
-/// translates these into a `World` shader graph.
+/// Sky/world parameters baked into a preset. The native renderer
+/// translates these into the Preetham sky kernel (see
+/// [`crate::light_sampling::environment_radiance`] and the
+/// `aec_viewport::sky` shader).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SkyParams {
     /// Overall world strength multiplier.
@@ -96,9 +99,9 @@ impl Default for SkyParams {
 }
 
 /// A complete lighting setup. Fully self-describing: it carries every
-/// light the worker should create plus the world tint and ambient
-/// strength multiplier. The Blender worker reads `lights` directly
-/// (the JSON form is `LightingPayload` below).
+/// light the renderer should create plus the world tint and ambient
+/// strength multiplier. Callers feed `lights` directly to the native
+/// path tracer (see [`crate::light_sampling::NativeLight::from_render_light`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LightingPreset {
     pub id: String,
@@ -108,7 +111,8 @@ pub struct LightingPreset {
     pub sun_azimuth_deg: f32,
     /// Sun elevation above horizon [-90, 90].
     pub sun_elevation_deg: f32,
-    /// Sun intensity (W/m² roughly — Blender uses physical units).
+    /// Sun intensity (W/m² roughly — same physical-units convention
+    /// the native path tracer uses for direct sun radiance).
     pub sun_intensity: f32,
     /// Sun color temperature in Kelvin (e.g. 6500 = noon, 3200 = tungsten).
     pub sun_color_temperature_k: f32,
@@ -333,96 +337,14 @@ impl LightingPreset {
             .map(|k| Self::from_kind(*k))
             .collect()
     }
-
-    /// JSON payload for the Blender worker. Matches the shape the
-    /// existing `workers/blender/lighting.py::apply_lighting` accepts
-    /// (top-level `name`, `lights`, `world`).
-    pub fn worker_payload(&self) -> LightingPayload {
-        let lights = self
-            .build_lights()
-            .iter()
-            .enumerate()
-            .map(|(idx, l)| WorkerLight::from_render_light(idx, l))
-            .collect();
-        LightingPayload {
-            name: self.id.clone(),
-            lights,
-            world: WorkerWorld {
-                strength: self.sky.strength,
-                color: self.sky.color,
-                turbidity: self.sky.turbidity,
-            },
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LightingPayload {
-    pub name: String,
-    pub lights: Vec<WorkerLight>,
-    pub world: WorkerWorld,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkerWorld {
-    pub strength: f32,
-    pub color: [f32; 3],
-    pub turbidity: f32,
-}
-
-/// The flat light spec used in the JSON-over-stdio worker protocol.
-/// Mirrors the `lighting.py` accepted shape (`type`, `energy`, `color`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkerLight {
-    pub name: String,
-    #[serde(rename = "type")]
-    pub light_type: String,
-    pub energy: f32,
-    pub color: [f32; 3],
-}
-
-impl WorkerLight {
-    pub fn from_render_light(idx: usize, light: &RenderLight) -> Self {
-        match light {
-            RenderLight::SunSky {
-                intensity,
-                color_temperature_k,
-                ..
-            } => Self {
-                name: format!("Sun_{idx}"),
-                light_type: "SUN".into(),
-                energy: *intensity,
-                color: kelvin_to_rgb(*color_temperature_k),
-            },
-            RenderLight::Area {
-                intensity,
-                color_temperature_k,
-                ..
-            } => Self {
-                name: format!("Area_{idx}"),
-                light_type: "AREA".into(),
-                energy: *intensity,
-                color: kelvin_to_rgb(*color_temperature_k),
-            },
-            RenderLight::Point {
-                intensity,
-                color_temperature_k,
-                ..
-            } => Self {
-                name: format!("Point_{idx}"),
-                light_type: "POINT".into(),
-                energy: *intensity,
-                color: kelvin_to_rgb(*color_temperature_k),
-            },
-        }
-    }
 }
 
 /// Convert a Kelvin color temperature to linear RGB using the
 /// Tanner Helland approximation
 /// (<https://tannerhelland.com/2012/09/18/convert-temperature-rgb-algorithm-code.html>).
 /// Output is clamped to [0, 1] linear floats so it can be passed
-/// straight to Blender's light `color` attribute.
+/// directly into [`crate::light_sampling::NativeLight`] colour fields
+/// and into the preview rasteriser's per-light colour uniform.
 pub fn kelvin_to_rgb(kelvin_k: f32) -> [f32; 3] {
     // Tanner Helland's piecewise polynomial. The constants are baked
     // and have been used in countless renderers for decades; the
@@ -847,11 +769,16 @@ mod tests {
     }
 
     #[test]
-    fn worker_payload_includes_sun_first() {
-        let payload = LightingPreset::studio().worker_payload();
-        assert!(payload.lights[0].light_type == "SUN");
+    fn studio_preset_emits_sun_first_in_native_light_list() {
+        // The native path tracer ingests `RenderLight`s directly via
+        // `NativeLight::from_render_light`. The studio preset must keep
+        // the sun as the first light so MIS-importance-sampling order is
+        // deterministic across renders.
+        let preset = LightingPreset::studio();
+        let lights = preset.build_lights();
+        assert!(matches!(lights[0], RenderLight::SunSky { .. }));
         // Studio has 3 accents + 1 sun.
-        assert_eq!(payload.lights.len(), 4);
+        assert_eq!(lights.len(), 4);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! Material check / render doctor — diagnoses material issues before
-//! sending a scene to the Blender worker.
+//! kicking off a native render (preview, final, walkthrough, or
+//! panorama).
 //!
 //! Catches the four failure modes that bite real renders:
 //!
