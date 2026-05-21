@@ -89,13 +89,53 @@ impl PropertyValue {
                 Some(*v)
             }
             Self::Integer(v) => Some(*v as f64),
-            _ => None,
+            // For an opaque IFC measure the reader didn't model
+            // natively (e.g. `IfcMassDensityMeasure(2400.0)`,
+            // `IfcFrequencyMeasure(50.0)`, `IfcCountMeasure(12)`),
+            // try to recover a numeric value from the raw STEP
+            // literal so BOQ / schedules can still see it instead of
+            // silently dropping the property. We deliberately do NOT
+            // recurse through STEP escape parsing here — the only
+            // case where this returns `Some` is when the raw literal
+            // is a plain numeric token (the other lexical shapes for
+            // an IFC measure value are quoted strings `'...'` or
+            // booleans `.T.`/`.F.`, neither of which is meaningful
+            // as a real). `f64::from_str` handles ints (`12`),
+            // signed floats (`-3.5`), scientific notation
+            // (`1.5e-3`), and IFC's `D` exponent variant in the few
+            // legacy producers that emit it (`1.5D-3` is normalised
+            // by the reader before storage, so by the time it
+            // reaches `raw` it's already in `E` form).
+            Self::Other { raw, .. } => raw.trim().parse::<f64>().ok(),
+            // Non-numeric typed variants: Text, Boolean, Label.
+            Self::Text(_) | Self::Boolean(_) | Self::Label(_) => None,
         }
     }
 
     pub fn as_text(&self) -> Option<&str> {
         match self {
             Self::Text(s) | Self::Label(s) => Some(s.as_str()),
+            // Opaque IFC measures whose raw literal is a quoted STEP
+            // string can still be surfaced to schedules. We return
+            // a borrowed slice into the stored `raw` rather than
+            // allocating an unescaped copy here — callers that need
+            // the decoded form should re-route through the reader's
+            // `unescape_step_string` helper. Most string-valued
+            // measures in practice (`IfcDescriptiveMeasure`,
+            // `IfcGloballyUniqueId`, custom strings) do not contain
+            // escape sequences, so the borrowed view is the right
+            // tradeoff. Boolean / numeric raws return `None`,
+            // matching the contract that as_text only exposes
+            // text-typed values.
+            Self::Other { raw, .. } => {
+                let trimmed = raw.trim();
+                let bytes = trimmed.as_bytes();
+                if bytes.len() >= 2 && bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'' {
+                    Some(&trimmed[1..trimmed.len() - 1])
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
     }
@@ -321,6 +361,57 @@ mod tests {
         assert!(PropertyValue::Boolean(true).as_real().is_none());
         assert_eq!(PropertyValue::Text("hi".into()).as_text(), Some("hi"));
         assert_eq!(PropertyValue::Label("hi".into()).as_text(), Some("hi"));
+    }
+
+    /// `PropertyValue::Other` is the catch-all for opaque IFC measure
+    /// types AEC Studio doesn't model natively. `as_real` must surface
+    /// numeric raws so they reach BOQ / schedule consumers; `as_text`
+    /// must surface quoted-string raws likewise. Booleans (`.T.`/`.F.`)
+    /// and any other lexical shapes return `None` to match the typed
+    /// variants' contract.
+    #[test]
+    fn other_variant_surfaces_numeric_and_string_raws_to_consumers() {
+        let density = PropertyValue::Other {
+            measure: "IFCMASSDENSITYMEASURE".into(),
+            raw: "2400.0".into(),
+        };
+        assert_eq!(density.as_real(), Some(2400.0));
+        assert_eq!(density.as_text(), None);
+
+        let count = PropertyValue::Other {
+            measure: "IFCCOUNTMEASURE".into(),
+            raw: "12".into(),
+        };
+        assert_eq!(count.as_real(), Some(12.0));
+
+        let scientific = PropertyValue::Other {
+            measure: "IFCFREQUENCYMEASURE".into(),
+            raw: "1.5e-3".into(),
+        };
+        assert_eq!(scientific.as_real(), Some(1.5e-3));
+
+        let descriptive = PropertyValue::Other {
+            measure: "IFCDESCRIPTIVEMEASURE".into(),
+            raw: "'kg/m3'".into(),
+        };
+        assert_eq!(descriptive.as_text(), Some("kg/m3"));
+        assert_eq!(descriptive.as_real(), None);
+
+        let boolean = PropertyValue::Other {
+            measure: "IFCBOOLEAN".into(),
+            raw: ".T.".into(),
+        };
+        assert_eq!(boolean.as_real(), None);
+        assert_eq!(boolean.as_text(), None);
+
+        // Whitespace tolerance: the writer never adds leading/trailing
+        // whitespace, but a defensive caller hand-constructing the
+        // variant might. Trim and still parse.
+        let padded = PropertyValue::Other {
+            measure: "IFCMASSDENSITYMEASURE".into(),
+            raw: "  2400.0  ".into(),
+        };
+        assert_eq!(padded.as_real(), Some(2400.0));
     }
 
     #[test]

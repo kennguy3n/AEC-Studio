@@ -156,6 +156,29 @@ impl Mesh {
     ///
     /// `epsilon` is the L∞ (Chebyshev) tolerance per axis. A
     /// typical IFC tolerance is 0.1–1.0 mm.
+    ///
+    /// **Semantics (greedy, non-transitive)**: the welder walks the
+    /// vertex list in input order. Each candidate is collapsed into
+    /// the FIRST already-emitted vertex within `epsilon` it can find
+    /// (3×3×3 neighbourhood lookup); once collapsed, the candidate's
+    /// own position is no longer searchable, so a third vertex C that
+    /// is within `epsilon` of B but NOT within `epsilon` of A (B's
+    /// cluster representative) will start a fresh cluster instead of
+    /// joining `{A, B}`. The guarantee is therefore the weaker
+    /// **"every output vertex is within `epsilon` of its cluster
+    /// representative"** — NOT the stronger transitive-closure
+    /// guarantee "all pairwise-within-`epsilon` inputs share a
+    /// cluster". For the use case this welder is designed for — IFC
+    /// `FacetedBrep` quantity take-off, where adjacent faces share
+    /// **exact** vertex positions (per-face tessellation of a closed
+    /// solid) — greedy and union-find produce identical results, and
+    /// greedy is `O(n)` while a true union-find merge would be
+    /// `O(n α(n))` with materially higher constants. Callers using
+    /// `welded()` for fuzzy deduplication with a tolerance larger
+    /// than the gap between distinct features (e.g. `epsilon` >> the
+    /// minimum inter-vertex distance you want to keep separate)
+    /// should be aware of this — bump `epsilon` only as far as the
+    /// numerical precision of the producer demands.
     pub fn welded(&self, epsilon: f64) -> Mesh {
         if self.positions.is_empty() {
             return self.clone();
