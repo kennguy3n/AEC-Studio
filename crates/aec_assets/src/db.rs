@@ -59,14 +59,39 @@ impl AssetDatabase {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
-        conn.execute_batch(SCHEMA)?;
+        Self::init_schema(&conn)?;
         Ok(Self { conn })
     }
 
     pub fn open_in_memory() -> AssetResult<Self> {
         let conn = Connection::open_in_memory()?;
-        conn.execute_batch(SCHEMA)?;
+        Self::init_schema(&conn)?;
         Ok(Self { conn })
+    }
+
+    /// Initialise the base schema, the FTS5 mirror, and rebuild the FTS
+    /// index only if it's out of sync. Idempotent and O(1) on the common
+    /// path where triggers already keep the index current.
+    fn init_schema(conn: &Connection) -> AssetResult<()> {
+        conn.execute_batch(SCHEMA)?;
+        // FTS5 is part of the bundled SQLite shipped via
+        // `rusqlite/bundled-sqlcipher-vendored-openssl`. The triggers
+        // keep the FTS table in sync for every future write; the
+        // `rebuild_index_if_needed` call covers pre-existing rows from
+        // a database that was upgraded from a pre-FTS schema without
+        // paying O(n) on every open.
+        conn.execute_batch(crate::search::FTS_SCHEMA)?;
+        crate::search::rebuild_index_if_needed(conn)?;
+        Ok(())
+    }
+
+    /// Run an FTS5 full-text search against the asset library. See
+    /// [`crate::search`] for query syntax.
+    pub fn search(
+        &self,
+        opts: &crate::search::SearchOptions,
+    ) -> AssetResult<Vec<crate::search::SearchHit>> {
+        crate::search::search(&self.conn, opts)
     }
 
     /// Insert a content-addressed mesh blob. Idempotent (BLAKE3 keys dedupe).
@@ -271,7 +296,7 @@ fn escape_like(input: &str) -> String {
     out
 }
 
-fn row_to_metadata(row: &Row<'_>) -> rusqlite::Result<AssetMetadata> {
+pub(crate) fn row_to_metadata(row: &Row<'_>) -> rusqlite::Result<AssetMetadata> {
     use rusqlite::types::Type;
     use rusqlite::Error::FromSqlConversionFailure;
     let parse_json = |idx: usize| -> rusqlite::Result<serde_json::Value> {
@@ -441,5 +466,149 @@ mod tests {
         assert!(db.blob_exists("blake3:1").unwrap());
         let got = db.get_blob("blake3:1").unwrap().unwrap();
         assert_eq!(got, payload);
+    }
+
+    #[test]
+    fn fts_search_finds_asset_by_name_token() {
+        use crate::search::SearchOptions;
+        let mut db = AssetDatabase::open_in_memory().unwrap();
+        let chain = LodChain::from_ratios(1000, &[]);
+        let mut chair = sample("chair-1");
+        chair.name = "Oak Lounge Chair".into();
+        chair.tags = vec!["seating".into()];
+        let mut table = sample("table-1");
+        table.name = "Walnut Coffee Table".into();
+        table.tags = vec!["surface".into()];
+        db.upsert_metadata(&chair, &chain).unwrap();
+        db.upsert_metadata(&table, &chain).unwrap();
+
+        let hits = db
+            .search(&SearchOptions {
+                query: "chair".into(),
+                ..SearchOptions::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].metadata.asset_id, "chair-1");
+    }
+
+    #[test]
+    fn fts_search_ranks_name_above_tag() {
+        use crate::search::SearchOptions;
+        let mut db = AssetDatabase::open_in_memory().unwrap();
+        let chain = LodChain::from_ratios(1000, &[]);
+        // BM25 IDF requires more than 2 documents to differentiate
+        // between term-frequency-weighted columns — with N=2 docs, IDF
+        // collapses to log(1) = 0 and the BM25 contribution drops to 0
+        // regardless of weight. Seed several decoy documents so the
+        // weight ordering is observable.
+        for i in 0..6 {
+            let mut decoy = sample(&format!("decoy-{i}"));
+            decoy.name = format!("Decoy Item {i}");
+            decoy.tags = vec!["misc".into()];
+            db.upsert_metadata(&decoy, &chain).unwrap();
+        }
+        let mut tagged = sample("with-tag");
+        tagged.name = "Side Table".into();
+        tagged.tags = vec!["oak".into()];
+        let mut named = sample("with-name");
+        named.name = "Oak Bookshelf".into();
+        named.tags = vec!["furniture".into()];
+        db.upsert_metadata(&tagged, &chain).unwrap();
+        db.upsert_metadata(&named, &chain).unwrap();
+
+        let hits = db
+            .search(&SearchOptions {
+                query: "oak".into(),
+                ..SearchOptions::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        // bm25 weights `name` 3x vs `tags` 2x; lower (more negative) is
+        // better, so the name-hit asset should rank first.
+        assert_eq!(hits[0].metadata.asset_id, "with-name");
+        assert_eq!(hits[1].metadata.asset_id, "with-tag");
+        assert!(hits[0].bm25 < hits[1].bm25, "name should outscore tag");
+    }
+
+    #[test]
+    fn fts_search_multi_token_is_anded() {
+        use crate::search::SearchOptions;
+        let mut db = AssetDatabase::open_in_memory().unwrap();
+        let chain = LodChain::from_ratios(1000, &[]);
+        let mut chair = sample("c");
+        chair.name = "Oak Lounge Chair".into();
+        let mut shelf = sample("s");
+        shelf.name = "Oak Bookshelf".into();
+        db.upsert_metadata(&chair, &chain).unwrap();
+        db.upsert_metadata(&shelf, &chain).unwrap();
+
+        let hits = db
+            .search(&SearchOptions {
+                query: "oak chair".into(),
+                ..SearchOptions::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].metadata.asset_id, "c");
+    }
+
+    #[test]
+    fn fts_search_diacritics_normalised() {
+        use crate::search::SearchOptions;
+        let mut db = AssetDatabase::open_in_memory().unwrap();
+        let chain = LodChain::from_ratios(1000, &[]);
+        let mut a = sample("cafe");
+        a.name = "Café Table".into();
+        db.upsert_metadata(&a, &chain).unwrap();
+
+        // `remove_diacritics 2` -> ASCII "cafe" matches "café".
+        let hits = db
+            .search(&SearchOptions {
+                query: "cafe".into(),
+                ..SearchOptions::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn fts_search_empty_query_returns_recent_assets() {
+        use crate::search::SearchOptions;
+        let mut db = AssetDatabase::open_in_memory().unwrap();
+        let chain = LodChain::from_ratios(1000, &[]);
+        for i in 0..3 {
+            let m = sample(&format!("a{i}"));
+            db.upsert_metadata(&m, &chain).unwrap();
+        }
+        let hits = db.search(&SearchOptions::default()).unwrap();
+        assert_eq!(hits.len(), 3);
+    }
+
+    #[test]
+    fn fts_search_delete_removes_from_index() {
+        use crate::search::SearchOptions;
+        let mut db = AssetDatabase::open_in_memory().unwrap();
+        let chain = LodChain::from_ratios(1000, &[]);
+        let mut m = sample("c");
+        m.name = "Oak Chair".into();
+        db.upsert_metadata(&m, &chain).unwrap();
+        assert_eq!(
+            db.search(&SearchOptions {
+                query: "oak".into(),
+                ..SearchOptions::default()
+            })
+            .unwrap()
+            .len(),
+            1
+        );
+        db.delete(&m.asset_id).unwrap();
+        assert!(db
+            .search(&SearchOptions {
+                query: "oak".into(),
+                ..SearchOptions::default()
+            })
+            .unwrap()
+            .is_empty());
     }
 }
