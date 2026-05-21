@@ -85,6 +85,11 @@ pub struct ReferenceImage {
     /// When `true` the inspector hides the position/scale controls and
     /// the viewport refuses pointer interaction with the overlay.
     pub locked: bool,
+    /// 0-based page index. Only meaningful when [`Self::kind`] is
+    /// [`ReferenceImageKind::Pdf`]; ignored for JPG/PNG (which are
+    /// single-page). Defaults to `0` (cover page).
+    #[serde(default)]
+    pub page_index: u32,
 }
 
 impl ReferenceImage {
@@ -100,7 +105,17 @@ impl ReferenceImage {
             position_mm: [0.0, 0.0],
             scale: 1.0,
             locked: false,
+            page_index: 0,
         })
+    }
+
+    /// Set the active page (PDFs only). Returns `self` for chaining
+    /// in the typical builder pattern. Pages beyond the source's
+    /// page count are clamped at decode time, not here, because the
+    /// page count isn't known until the file is read.
+    pub fn with_page(mut self, page_index: u32) -> Self {
+        self.page_index = page_index;
+        self
     }
 
     /// Clamp opacity into [0.0, 1.0].
@@ -116,6 +131,16 @@ impl ReferenceImage {
         }
         self
     }
+}
+
+/// Per-page metadata returned by [`enumerate_pages`]. For non-PDF
+/// inputs the returned vector contains exactly one entry with
+/// `page_index = 0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReferenceImagePage {
+    pub page_index: u32,
+    pub width: u32,
+    pub height: u32,
 }
 
 /// Bitmap form decoded from the source file.
@@ -198,11 +223,13 @@ impl ReferenceImageOverlay {
     /// `overlay_set_image_keeps_bitmap_when_path_unchanged` pins this
     /// contract.
     pub fn set_image(&mut self, image: ReferenceImage) {
-        let same_path = self
-            .image
-            .as_ref()
-            .is_some_and(|i| i.source_path == image.source_path);
-        if !same_path {
+        let same_source = self.image.as_ref().is_some_and(|i| {
+            // Invalidate when either the file changes or the page
+            // index changes — a new page is a new bitmap even though
+            // the underlying file is the same.
+            i.source_path == image.source_path && i.page_index == image.page_index
+        });
+        if !same_source {
             self.bitmap = None;
         }
         self.image = Some(image);
@@ -238,21 +265,54 @@ pub fn decode(image: &ReferenceImage) -> Result<ReferenceImageBitmap, ReferenceI
     if bytes.is_empty() {
         return Err(ReferenceImageError::Malformed("empty file".into()));
     }
-    let (width, height) = match image.kind {
-        ReferenceImageKind::Pdf => pdf_first_page_dimensions(&bytes).unwrap_or((1600, 1131)),
-        ReferenceImageKind::Jpg => jpeg_dimensions(&bytes)
-            .ok_or_else(|| ReferenceImageError::Malformed("not a valid JPEG".into()))?,
-        ReferenceImageKind::Png => png_dimensions(&bytes)
-            .ok_or_else(|| ReferenceImageError::Malformed("not a valid PNG".into()))?,
+    let (width, height, resolved_page) = match image.kind {
+        ReferenceImageKind::Pdf => {
+            let pages = pdf_pages(&bytes);
+            let n = pages.len() as u32;
+            // Fall back to page 0 (the cover) on out-of-range. We
+            // *don't* error because a project file surviving a PDF
+            // being replaced with a shorter one should still open;
+            // and falling back to page 0 is the least surprising
+            // recovery — the host UI's page picker will then re-sync
+            // to the available range. (We deliberately don't saturate
+            // to the last page: a project pinned to page 7 should not
+            // silently start showing the cover of a now-3-page PDF
+            // and only if it has fewer than 8 pages.)
+            let resolved = if n == 0 || image.page_index >= n {
+                0
+            } else {
+                image.page_index
+            };
+            let (w, h) = pages
+                .get(resolved as usize)
+                .copied()
+                .unwrap_or((1600, 1131));
+            (w, h, resolved)
+        }
+        ReferenceImageKind::Jpg => {
+            let (w, h) = jpeg_dimensions(&bytes)
+                .ok_or_else(|| ReferenceImageError::Malformed("not a valid JPEG".into()))?;
+            (w, h, 0)
+        }
+        ReferenceImageKind::Png => {
+            let (w, h) = png_dimensions(&bytes)
+                .ok_or_else(|| ReferenceImageError::Malformed("not a valid PNG".into()))?;
+            (w, h, 0)
+        }
     };
     let (width, height) = clamp_to_max(width, height);
 
-    // Synthetic bitmap derived from the file hash. We don't decode
-    // the actual pixels — see the implementation note above. The
-    // important invariants for the renderer are: dimensions match the
-    // source, length matches `width*height*4`, and the bitmap is
-    // deterministic for a given file.
-    let hash = blake3::hash(&bytes);
+    // Synthetic bitmap derived from the file hash + page index. We
+    // don't decode the actual pixels — see the implementation note
+    // above. The important invariants for the renderer are:
+    // dimensions match the source, length matches `width*height*4`,
+    // bitmap is deterministic for a given (file, page) pair, and
+    // different pages produce different patterns so the host UI can
+    // visually confirm page switching is working.
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&bytes);
+    hasher.update(&resolved_page.to_le_bytes());
+    let hash = hasher.finalize();
     let pattern = hash.as_bytes();
     let mut rgba = vec![0u8; (width as usize) * (height as usize) * 4];
     for (i, chunk) in rgba.chunks_mut(4).enumerate() {
@@ -263,6 +323,62 @@ pub fn decode(image: &ReferenceImage) -> Result<ReferenceImageBitmap, ReferenceI
         chunk[3] = 255;
     }
     ReferenceImageBitmap::from_rgba(width, height, rgba)
+}
+
+/// Enumerate pages in a reference image. For PDFs returns one entry
+/// per page (in document order); for JPG/PNG returns a single entry
+/// with `page_index = 0`. Returns the source's first-page dimensions
+/// for any PDF page whose MediaBox can't be parsed, so the host UI
+/// always gets a usable size.
+pub fn enumerate_pages(
+    image: &ReferenceImage,
+) -> Result<Vec<ReferenceImagePage>, ReferenceImageError> {
+    let bytes = fs::read(&image.source_path)?;
+    if bytes.is_empty() {
+        return Err(ReferenceImageError::Malformed("empty file".into()));
+    }
+    match image.kind {
+        ReferenceImageKind::Pdf => {
+            let pages = pdf_pages(&bytes);
+            if pages.is_empty() {
+                return Err(ReferenceImageError::Malformed(
+                    "PDF contains no parseable pages".into(),
+                ));
+            }
+            Ok(pages
+                .into_iter()
+                .enumerate()
+                .map(|(i, (w, h))| {
+                    let (w, h) = clamp_to_max(w, h);
+                    ReferenceImagePage {
+                        page_index: i as u32,
+                        width: w,
+                        height: h,
+                    }
+                })
+                .collect())
+        }
+        ReferenceImageKind::Jpg => {
+            let (w, h) = jpeg_dimensions(&bytes)
+                .ok_or_else(|| ReferenceImageError::Malformed("not a valid JPEG".into()))?;
+            let (w, h) = clamp_to_max(w, h);
+            Ok(vec![ReferenceImagePage {
+                page_index: 0,
+                width: w,
+                height: h,
+            }])
+        }
+        ReferenceImageKind::Png => {
+            let (w, h) = png_dimensions(&bytes)
+                .ok_or_else(|| ReferenceImageError::Malformed("not a valid PNG".into()))?;
+            let (w, h) = clamp_to_max(w, h);
+            Ok(vec![ReferenceImagePage {
+                page_index: 0,
+                width: w,
+                height: h,
+            }])
+        }
+    }
 }
 
 fn clamp_to_max(width: u32, height: u32) -> (u32, u32) {
@@ -345,16 +461,73 @@ fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     None
 }
 
-/// PDF dimension probe — extracts the first `/MediaBox` entry and
-/// converts the PDF points to a raster size at 200 DPI. PDF parsing
-/// is intentionally minimal: if anything looks off we return `None`
-/// and the caller falls back to a default A3 raster.
-fn pdf_first_page_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+/// Multi-page PDF dimension probe. Scans the document for page
+/// objects (`/Type /Page` not `/Type /Pages`) and returns one
+/// `(width, height)` pair per page in document order.
+///
+/// PDF parsing is intentionally minimal: we look for `/Type /Page`
+/// markers and pair each one with the nearest following `/MediaBox`.
+/// Pages that inherit their MediaBox from a `/Pages` parent (less
+/// common but valid) fall back to the document's first parseable
+/// MediaBox. Pages with neither get the A3 default. This handles the
+/// 99% case (every page declares its own MediaBox) without pulling in
+/// a full PDF parser.
+fn pdf_pages(bytes: &[u8]) -> Vec<(u32, u32)> {
+    // First scan: collect every MediaBox in document order.
+    let media_boxes = find_all_media_boxes(bytes);
+    let inherited: (u32, u32) = media_boxes
+        .first()
+        .map_or((1600, 1131), |(w, h, _)| (*w, *h));
+
+    // Second scan: find every page object, in order, and assign the
+    // first MediaBox at or after the page's start. This is the same
+    // rule PDF readers apply for the common case where each page
+    // object precedes its MediaBox in the byte stream.
+    let page_positions = find_page_positions(bytes);
+
+    if page_positions.is_empty() {
+        // Fall back: at least one page if we found a MediaBox.
+        return if media_boxes.is_empty() {
+            Vec::new()
+        } else {
+            vec![inherited]
+        };
+    }
+
+    let mut out = Vec::with_capacity(page_positions.len());
+    for (i, &page_pos) in page_positions.iter().enumerate() {
+        // The MediaBox for this page is the first one whose byte
+        // position is greater than this page's start *and* less than
+        // the next page's start. This rejects MediaBoxes that belong
+        // to a later page.
+        let next_page_pos = page_positions.get(i + 1).copied().unwrap_or(usize::MAX);
+        let mb: (u32, u32) = media_boxes
+            .iter()
+            .find(|(_, _, pos)| *pos > page_pos && *pos < next_page_pos)
+            .map_or(inherited, |(w, h, _)| (*w, *h));
+        out.push(mb);
+    }
+    out
+}
+
+fn find_all_media_boxes(bytes: &[u8]) -> Vec<(u32, u32, usize)> {
     let needle = b"/MediaBox";
-    let pos = find_subseq(bytes, needle)?;
-    // PDF MediaBox is `[ llx lly urx ury ]` — lower-left and
-    // upper-right corners in PDF user units. The page dimensions are
-    // the *delta* between the two corners, not the absolute coords.
+    let mut out = Vec::new();
+    let mut cursor = 0;
+    while cursor + needle.len() <= bytes.len() {
+        let Some(rel) = find_subseq(&bytes[cursor..], needle) else {
+            break;
+        };
+        let abs = cursor + rel;
+        if let Some(dims) = parse_media_box_at(bytes, abs) {
+            out.push((dims.0, dims.1, abs));
+        }
+        cursor = abs + needle.len();
+    }
+    out
+}
+
+fn parse_media_box_at(bytes: &[u8], pos: usize) -> Option<(u32, u32)> {
     let slice_end = (pos + 256).min(bytes.len());
     let slice = &bytes[pos..slice_end];
     let text = std::str::from_utf8(slice).ok()?;
@@ -371,12 +544,48 @@ fn pdf_first_page_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     if w_pts <= 0.0 || h_pts <= 0.0 {
         return None;
     }
-    // 200 DPI / 72 PDF user units per inch → 200/72 px/unit.
     let dpi = 200.0_f32;
     let px_per_unit = dpi / 72.0;
     let w = (w_pts * px_per_unit) as u32;
     let h = (h_pts * px_per_unit) as u32;
     Some((w.max(1), h.max(1)))
+}
+
+/// Locate every page-object position in the PDF. A page object is
+/// marked by the byte pattern `/Type /Page` followed by a non-`s`
+/// non-alphanumeric byte (so we exclude `/Type /Pages` which is the
+/// page-tree parent). Real PDFs always emit `/Type /Page` followed by
+/// whitespace, `/`, or end-of-line, but we accept any non-letter for
+/// robustness against unusual whitespace.
+fn find_page_positions(bytes: &[u8]) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut cursor = 0;
+    let needle = b"/Type";
+    while cursor + needle.len() <= bytes.len() {
+        let Some(rel) = find_subseq(&bytes[cursor..], needle) else {
+            break;
+        };
+        let abs = cursor + rel;
+        // Skip past `/Type` and any whitespace, then check for `/Page` and
+        // ensure the byte after `e` is not a letter (would be `s` for `/Pages`).
+        let mut p = abs + needle.len();
+        while p < bytes.len()
+            && (bytes[p] == b' ' || bytes[p] == b'\t' || bytes[p] == b'\n' || bytes[p] == b'\r')
+        {
+            p += 1;
+        }
+        let page = b"/Page";
+        if p + page.len() < bytes.len() && &bytes[p..p + page.len()] == page {
+            let after = bytes[p + page.len()];
+            // Reject `/Pages` (and any other identifier-extending byte).
+            let is_identifier_continuation = after.is_ascii_alphanumeric() || after == b'_';
+            if !is_identifier_continuation {
+                out.push(abs);
+            }
+        }
+        cursor = abs + needle.len();
+    }
+    out
 }
 
 fn find_subseq(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -570,12 +779,16 @@ mod tests {
         assert_eq!(b1, b2);
     }
 
+    fn first_page(bytes: &[u8]) -> Option<(u32, u32)> {
+        pdf_pages(bytes).into_iter().next()
+    }
+
     #[test]
     fn pdf_mediabox_uses_corner_delta_not_absolute() {
         // Origin at (50, 50), upper-right at (595, 841): real page is
         // 545 × 791 PDF units, not 595 × 841.
         let pdf = b"%PDF-1.4\n1 0 obj\n<< /Type /Page /MediaBox [50 50 595 841] >>\nendobj\n";
-        let (w_px, h_px) = pdf_first_page_dimensions(pdf).expect("parses");
+        let (w_px, h_px) = first_page(pdf).expect("parses");
         let dpi = 200.0_f32 / 72.0;
         let expect_w = ((595.0 - 50.0) * dpi) as u32;
         let expect_h = ((841.0 - 50.0) * dpi) as u32;
@@ -585,15 +798,141 @@ mod tests {
     #[test]
     fn pdf_mediabox_zero_origin_unchanged() {
         let pdf = b"%PDF-1.4\n1 0 obj\n<< /Type /Page /MediaBox [0 0 595 842] >>\nendobj\n";
-        let (w_px, h_px) = pdf_first_page_dimensions(pdf).expect("parses");
+        let (w_px, h_px) = first_page(pdf).expect("parses");
         let dpi = 200.0_f32 / 72.0;
         assert_eq!((w_px, h_px), ((595.0 * dpi) as u32, (842.0 * dpi) as u32));
     }
 
     #[test]
     fn pdf_mediabox_rejects_inverted_box() {
+        // The bare `/MediaBox` (no `/Type /Page` before it) is still
+        // scanned and the inverted corners are rejected, so this PDF
+        // has zero parseable pages.
         let pdf = b"%PDF-1.4\n1 0 obj\n<< /MediaBox [200 200 100 100] >>\nendobj\n";
-        assert!(pdf_first_page_dimensions(pdf).is_none());
+        assert!(first_page(pdf).is_none());
+    }
+
+    fn make_multipage_pdf(media_boxes: &[(u32, u32)]) -> Vec<u8> {
+        use std::fmt::Write;
+        let mut out = String::from("%PDF-1.4\n");
+        for (i, (w, h)) in media_boxes.iter().enumerate() {
+            let idx = i + 1;
+            // Writing to a `String` is infallible; discard the Result.
+            let _ = write!(
+                out,
+                "{idx} 0 obj\n<< /Type /Page /MediaBox [0 0 {w} {h}] >>\nendobj\n",
+            );
+        }
+        out.into_bytes()
+    }
+
+    #[test]
+    fn pdf_pages_enumerates_every_page_in_order() {
+        let pdf = make_multipage_pdf(&[(595, 842), (842, 595), (1190, 842)]);
+        let pages = pdf_pages(&pdf);
+        assert_eq!(pages.len(), 3);
+        let dpi = 200.0_f32 / 72.0;
+        assert_eq!(pages[0], ((595.0 * dpi) as u32, (842.0 * dpi) as u32));
+        assert_eq!(pages[1], ((842.0 * dpi) as u32, (595.0 * dpi) as u32));
+        assert_eq!(pages[2], ((1190.0 * dpi) as u32, (842.0 * dpi) as u32));
+    }
+
+    #[test]
+    fn pdf_pages_ignores_pages_tree_root_node() {
+        // The page-tree parent uses `/Type /Pages`. It also carries
+        // its own `/MediaBox` (inherited by children). Our scanner
+        // must skip the parent node and only return real pages.
+        let pdf = b"%PDF-1.4\n\
+1 0 obj\n<< /Type /Pages /MediaBox [0 0 100 100] /Kids [2 0 R] >>\nendobj\n\
+2 0 obj\n<< /Type /Page /MediaBox [0 0 595 842] >>\nendobj\n";
+        let pages = pdf_pages(pdf);
+        assert_eq!(pages.len(), 1);
+        let dpi = 200.0_f32 / 72.0;
+        assert_eq!(pages[0], ((595.0 * dpi) as u32, (842.0 * dpi) as u32));
+    }
+
+    fn write_pdf(path: &Path, pages: &[(u32, u32)]) {
+        let bytes = make_multipage_pdf(pages);
+        fs::write(path, &bytes).unwrap();
+    }
+
+    #[test]
+    fn enumerate_pages_returns_one_entry_per_pdf_page() {
+        let dir = tempdir();
+        let path = dir.join("multi.pdf");
+        write_pdf(&path, &[(595, 842), (842, 595)]);
+        let r = ReferenceImage::new(&path).unwrap();
+        let pages = enumerate_pages(&r).unwrap();
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].page_index, 0);
+        assert_eq!(pages[1].page_index, 1);
+        // Second page is landscape — width should be larger than
+        // height after rasterising the swapped MediaBox.
+        assert!(pages[1].width > pages[1].height);
+    }
+
+    #[test]
+    fn enumerate_pages_returns_single_entry_for_png() {
+        let dir = tempdir();
+        let path = dir.join("single.png");
+        write_png(&path, 800, 600);
+        let r = ReferenceImage::new(&path).unwrap();
+        let pages = enumerate_pages(&r).unwrap();
+        assert_eq!(pages.len(), 1);
+        assert_eq!(
+            pages[0],
+            ReferenceImagePage {
+                page_index: 0,
+                width: 800,
+                height: 600
+            }
+        );
+    }
+
+    #[test]
+    fn decode_pdf_honors_page_index() {
+        let dir = tempdir();
+        let path = dir.join("multi.pdf");
+        // Two pages with clearly different dimensions so we can
+        // distinguish which one was decoded.
+        write_pdf(&path, &[(595, 842), (1700, 1200)]);
+        let r0 = ReferenceImage::new(&path).unwrap();
+        let r1 = ReferenceImage::new(&path).unwrap().with_page(1);
+        let b0 = decode(&r0).unwrap();
+        let b1 = decode(&r1).unwrap();
+        // Page 1 has the larger MediaBox — its raster must be wider.
+        assert!(b1.width > b0.width);
+        // And the bitmaps must differ because we hash in page_index.
+        assert_ne!(b0.blake3, b1.blake3);
+    }
+
+    #[test]
+    fn decode_pdf_clamps_out_of_range_page_index_instead_of_erroring() {
+        let dir = tempdir();
+        let path = dir.join("multi.pdf");
+        write_pdf(&path, &[(595, 842), (842, 595)]);
+        let r = ReferenceImage::new(&path).unwrap().with_page(99);
+        // Out-of-range page falls back to page 0 silently — the
+        // host UI shouldn't ever fail to open a project because the
+        // PDF lost a page.
+        let bm = decode(&r).unwrap();
+        let r0 = ReferenceImage::new(&path).unwrap();
+        let bm0 = decode(&r0).unwrap();
+        assert_eq!(bm.blake3, bm0.blake3);
+    }
+
+    #[test]
+    fn overlay_set_image_clears_bitmap_when_page_index_changes() {
+        let mut o = ReferenceImageOverlay::default();
+        let dir = tempdir();
+        let path = dir.join("a.pdf");
+        write_pdf(&path, &[(595, 842), (842, 595)]);
+        o.set_image(ReferenceImage::new(&path).unwrap());
+        o.bitmap = Some(ReferenceImageBitmap::from_rgba(1, 1, vec![0; 4]).unwrap());
+        // Same path, different page — bitmap must be dropped so the
+        // renderer re-decodes the new page.
+        o.set_image(ReferenceImage::new(&path).unwrap().with_page(1));
+        assert!(o.bitmap.is_none());
     }
 
     #[test]
