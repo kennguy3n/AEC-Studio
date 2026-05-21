@@ -311,10 +311,19 @@ fn count_frames_matching(dir: &Path, pattern: &str) -> u32 {
         let Some(name) = name.to_str() else {
             continue;
         };
-        if name.starts_with(prefix) && name.ends_with(suffix) {
+        // Defend against patterns where prefix and suffix overlap in
+        // short filenames (e.g. pattern "f%df" matches a file named "f"
+        // — both `starts_with("f")` and `ends_with("f")` are true, but
+        // the slice `&name[1..0]` would panic). Require the filename to
+        // be long enough to contain a non-empty body between the
+        // affixes before slicing.
+        if name.starts_with(prefix)
+            && name.ends_with(suffix)
+            && name.len() > prefix.len() + suffix.len()
+        {
             // Body between prefix and suffix must be all digits.
             let body = &name[prefix.len()..name.len() - suffix.len()];
-            if !body.is_empty() && body.chars().all(|c| c.is_ascii_digit()) {
+            if body.chars().all(|c| c.is_ascii_digit()) {
                 count += 1;
             }
         }
@@ -618,6 +627,24 @@ mod tests {
             super::count_frames_matching(tmp.path(), "frame_%05d.png"),
             3
         );
+    }
+
+    #[test]
+    fn count_frames_matching_does_not_panic_on_overlapping_prefix_suffix() {
+        // Regression: pattern "f%df" → prefix "f", suffix "f". A file
+        // literally named "f" matches both `starts_with` and
+        // `ends_with` but the affixes overlap; the slice
+        // `&name[1..0]` would panic without the length guard.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("f"), b"x").unwrap();
+        std::fs::write(tmp.path().join("ff"), b"x").unwrap();
+        std::fs::write(tmp.path().join("f123f"), b"x").unwrap();
+        std::fs::write(tmp.path().join("fXf"), b"x").unwrap();
+        // "f"  → prefix+suffix overlap, skipped (no body)
+        // "ff" → length == prefix+suffix, skipped (empty body)
+        // "f123f" → counts (digits between)
+        // "fXf"   → does not count (non-digit body)
+        assert_eq!(super::count_frames_matching(tmp.path(), "f%df"), 1);
     }
 
     #[test]
