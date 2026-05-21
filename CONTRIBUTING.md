@@ -13,7 +13,8 @@ Thank you for your interest in contributing to AEC Studio! This guide covers eve
 | **npm** | 10+ | Package management |
 | **C toolchain** | GCC / Clang / MSVC | Build bundled SQLCipher + OpenSSL |
 | **CMake** | 3.22+ | Native dependencies (wgpu native, SQLCipher) |
-| **Python** | 3.10+ | Blender worker scripts (only needed when running renders) |
+| **Python** | 3.10+ | `node-gyp` build dependency for the N-API native addon (not used at runtime) |
+
 
 ### Platform-specific setup
 
@@ -203,7 +204,7 @@ docs(readme): clarify wgpu backend requirements
 test(cad): add fixtures for DXF block roundtrip
 chore(ci): add macOS runner to CI matrix
 refactor(governor): split scheduler from policy
-perf(render): cache Blender scene per project
+perf(render): cache BVH per scene
 style(rust): apply rustfmt to aec_command
 ```
 
@@ -251,18 +252,16 @@ aec-studio/
 │   ├── aec_geometry/           # Geometry index, spatial queries, mesh cache
 │   ├── aec_viewport/           # wgpu viewport, 2D CAD canvas, selection overlays
 │   ├── aec_cad/                # 2D CAD: primitives, layers, blocks, snaps, dims
-│   ├── aec_bim/                # BIM/IFC: IfcOpenShell adapter, spatial hierarchy
-│   ├── aec_render/             # Render queue, Blender/Cycles worker orchestration
+│   ├── aec_bim/                # Native BIM/IFC: STEP reader/writer, tessellator, spatial hierarchy
+│   ├── aec_render/             # Native path tracer + PBR preview + walkthrough/panorama
 │   ├── aec_assets/             # Asset database, import pipeline, LOD, thumbnails
 │   ├── aec_materials/          # PBR material library, texture management
 │   ├── aec_ai/                 # AI command planner, tool schema, safety validator
 │   ├── aec_governor/           # Resource governor, hardware profiler, scheduling
 │   ├── aec_export/             # PDF, DXF, IFC, glTF, proposal pack export
 │   └── aec_audit/              # Audit trail, project history
-├── workers/                    # Native worker processes
-│   ├── blender/                # Blender worker scripts (Python)
-│   ├── ifc/                    # IfcOpenShell worker
-│   └── ai/                     # llama-server sidecar config
+├── workers/                    # Sidecar processes
+│   └── ai/                     # llama-server sidecar config (only remaining external sidecar)
 ├── templates/                  # Project, room, drawing, render, BIM templates
 ├── assets/                     # Bundled asset packs (furniture, materials, presets)
 ├── packaging/                  # electron-builder configs (macos, windows)

@@ -21,7 +21,9 @@ pub enum RenderQuality {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RenderPresetConfig {
     pub quality: RenderQuality,
-    /// Sample count for Cycles; for EEVEE this is the temporal sample count.
+    /// Path-tracer sample count per pixel for path-traced presets; for
+    /// the realtime/rasterized preview this is the temporal sample count
+    /// used by the PBR forward pipeline for temporal anti-aliasing.
     pub samples: u32,
     pub denoise: bool,
     pub tile_size_px: u32,
@@ -40,9 +42,12 @@ pub struct RenderPreset {
 
 impl RenderPreset {
     pub fn eevee_preview() -> Self {
+        // The id stays `eevee_preview` for backwards compatibility with
+        // project files written by older builds; the user-facing label
+        // tracks the new native rasterized preview.
         Self {
             id: "eevee_preview".into(),
-            display_name: "EEVEE preview".into(),
+            display_name: "Realtime preview".into(),
             config: RenderPresetConfig {
                 quality: RenderQuality::Eevee,
                 samples: 64,
@@ -203,7 +208,7 @@ pub fn recommend_preset(tier: HardwareTier) -> RenderQuality {
 /// Pre-2026-05 project packages serialised preset ids with the
 /// `cycles_` prefix (e.g. `cycles_standard`). The new canonical
 /// form drops the prefix to align with the TypeScript `RenderPresetKey`
-/// union and the Blender worker names. Anywhere we look up a preset id
+/// union and the renderer preset names. Anywhere we look up a preset id
 /// — in [`RenderPresetStore::get`] and inside the custom Deserialize
 /// hook on [`RenderPresetStore::selected`] — we route through this
 /// function so on-disk project files written by older builds keep

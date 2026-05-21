@@ -210,7 +210,7 @@ This document tracks AEC Studio's phased delivery from open-source foundation to
 - [x] A user can queue 8 renders overnight on a mid-tier PC and resume any that crashed. *(Validated by `phase5_e2e.rs::queue_eight_renders_fail_two_and_resume_them`.)*
 - [x] Render history surfaces a before / after compare across revisions. *(Validated by `phase5_e2e.rs::render_history_surfaces_before_after_compare`.)*
 - [x] Walkthrough renders resume from the last completed frame. *(Validated by `phase5_e2e.rs::walkthrough_resumes_from_last_completed_frame`.)*
-- [x] EEVEE preview latency stays under 250 ms on a mid-tier laptop with a typical interior scene. *(Rust-side IPC overhead is benched in `crates/aec_render/benches/eevee_latency.rs`; the full render-engine round-trip requires a Blender install and is measured manually per release.)*
+- [x] Preview latency stays under 250 ms on a mid-tier laptop with a typical interior scene. *(Measured end-to-end against the native PBR rasterizer + path tracer via `crates/aec_render/benches/native_render.rs`; the in-process pipeline has no IPC or external-binary cold-start overhead to amortise.)*
 
 ---
 
@@ -245,6 +245,39 @@ This document tracks AEC Studio's phased delivery from open-source foundation to
 
 ---
 
+## Phase 9 — Native render & BIM engine
+
+**Status:** `IN PROGRESS` (PR1–PR4 merged; PR5 in review)
+
+**Goal:** Eliminate every external runtime dependency for rendering and IFC handling. Replace the Blender worker (EEVEE/Cycles via subprocess) and IfcOpenShell worker (Python subprocess) with native Rust implementations in-process, while preserving every user-facing capability (PBR preview, path-traced final, walkthrough, panorama, IFC2x3 / IFC4 / IFC4x3 import/export with GUID + Pset round-trip).
+
+### Build
+
+| Item | Status |
+|---|---|
+| **PR1**: BVH (SAH), ray-tri intersection, CPU path tracer, principled BSDF, light sampling + MIS | `DONE` (#9 merged) |
+| **PR2**: wgpu compute path tracer, bilateral denoiser, tile scheduler | `DONE` (#10 merged) |
+| **PR3**: PBR rasterization preview, Hosek-Wilkie sky shader, preview integration | `DONE` (#11 merged) |
+| **PR4**: Remove `BlenderWorker`, `blender_discovery`, `cycles.rs`, `eevee.rs`, `workers/blender/`; native `final_render`, `walkthrough`, `panorama` (equirectangular camera in path tracer) | `DONE` (#12 merged) |
+| **PR5 — Task 15**: Native IFC STEP parser with schema detection (IFC2x3 / IFC4 / IFC4x3), streaming iterator, multi-line records & comments, UTF-8 preservation | `DONE` |
+| **PR5 — Task 16**: Native IFC STEP writer with GUID preservation, deterministic numbering, verbatim unknown-Pset round-trip via `PropertyValue::Other` | `DONE` |
+| **PR5 — Task 17**: Native IFC geometry tessellator (IfcExtrudedAreaSolid, IfcFacetedBrep, RectangleProfile / CircleProfile / ArbitraryClosedProfile, IfcBooleanClippingResult) | `DONE` |
+| **PR5 — Task 18**: Delete `workers/ifc/`, remove `python-workers` CI job, audit and update all stale Blender/IfcOpenShell doc references | `DONE` |
+| Phase 6–9 documentation refresh (ARCHITECTURE.md, PROPOSAL.md, README.md, PHASES.md, this file) | `DONE` |
+
+### Exit criteria
+
+- [x] `cargo test --workspace` passes with no Python dependency anywhere in the tree.
+- [x] No `workers/blender/` directory.
+- [x] No `workers/ifc/` directory.
+- [x] No `BlenderWorker`, `BlenderRequest`, `BlenderResponse`, `blender_discovery`, `cycles.rs`, `eevee.rs` references in code.
+- [x] CPU + GPU path tracer produce visually equivalent output on a fixed test scene.
+- [x] Native STEP parser/writer round-trips GUIDs and all Psets (including unmodeled measure types via `PropertyValue::Other`).
+- [x] Documentation (ARCHITECTURE.md, PROPOSAL.md, README.md, PROGRESS.md, PHASES.md) reflects the in-process Rust engine throughout.
+- [x] CI workflow no longer installs Blender or IfcOpenShell (the `python-workers` job is gone).
+
+---
+
 ## Phase 7 — Optional KChat integration
 
 **Status:** `DONE`
@@ -276,7 +309,7 @@ This document tracks AEC Studio's phased delivery from open-source foundation to
 | **Platforms** | macOS (Intel + Apple Silicon), Windows x64, Linux x64 (AppImage / deb / snap) |
 | **Modes** | Home, Design, Draft, BIM, Render, Deliver |
 | **Templates** | Apartment, café, office, villa, retail, kitchen, bathroom, renovation |
-| **Render engines** | EEVEE preview, Cycles final, Cycles batch / walkthrough / panorama |
+| **Render engines** | Native PBR rasterizer preview, native Rust path tracer (wgpu compute, CPU fallback), native batch / walkthrough / panorama |
 | **CAD** | Native 2D, DXF roundtrip, DWG converter adapter (opt-in), PDF / SVG export |
 | **BIM** | IFC2x3 / IFC4 / IFC4x3 import + export with GUID preservation, BOQ-lite |
 | **AI** | Plan detection, style assistant, layout suggestions, CAD cleanup, classification, property fill, render doctor — all local |
@@ -292,9 +325,9 @@ This document tracks AEC Studio's phased delivery from open-source foundation to
 | App cold start | < 2.5 s to Home screen | Medium-tier laptop |
 | Project open (apartment template) | < 1.0 s | Medium-tier laptop |
 | Project open (40 MB IFC) | < 15 s | Medium-tier laptop |
-| EEVEE preview latency | < 250 ms per refresh | Medium-tier laptop, typical interior scene |
-| Cycles "Standard" render (1080p interior) | < 90 s | RTX 3060 / Apple GPU 10-core |
-| Cycles "High" render (4K interior) | < 6 min | RTX 4070 / Apple GPU 30-core |
+| PBR rasterized preview latency | < 250 ms per refresh | Medium-tier laptop, typical interior scene |
+| Path-traced "Standard" render (1080p interior) | < 90 s | RTX 3060 / Apple GPU 10-core |
+| Path-traced "High" render (4K interior) | < 6 min | RTX 4070 / Apple GPU 30-core |
 | DXF import (10 k entities) | < 1.5 s | Medium-tier laptop |
 | IFC export (40 MB model, no changes) | < 4 s | Medium-tier laptop |
 | AI tool-call response (Bonsai 1.7B) | < 1.5 s | Medium-tier laptop, CPU only |
@@ -334,12 +367,23 @@ AEC Studio's UI follows the **KChat design system** — primary accent `#7C3AED`
 - [CONTRIBUTING.md](CONTRIBUTING.md) — contribution guide
 - [SECURITY.md](SECURITY.md) — security policy
 - [kennguy3n/llama.cpp@prism](https://github.com/kennguy3n/llama.cpp) — local AI inference
-- [kennguy3n/IfcOpenShell](https://github.com/kennguy3n/IfcOpenShell) — BIM/IFC engine
+- [kennguy3n/IfcOpenShell](https://github.com/kennguy3n/IfcOpenShell) — reference implementation studied for the native Rust STEP parser (not a runtime dependency)
 - [kennguy3n/cycles](https://github.com/kennguy3n/cycles) — path-traced renderer
 
 ---
 
 ## Changelog
+
+### 2026-05-20 (Phase 9 — native render & BIM engine, PRs #9–#13)
+
+- **Removed all external runtime dependencies for rendering and BIM.** The Blender worker (Python scripts driving Blender for EEVEE/Cycles, JSON-line IPC over stdin/stdout, `workers/blender/`) and the IfcOpenShell worker (Python scripts wrapping IfcOpenShell, `workers/ifc/`) are gone. Rendering and IFC handling are now fully in-process Rust.
+- **PR1 #9 — CPU path tracer core.** SAH BVH2 builder with two-level instancing (`crates/aec_render/src/bvh.rs`), Möller–Trumbore ray-tri intersection + stack-based traversal (`intersect.rs`), CPU path tracer with Russian roulette and next-event estimation (`path_trace.rs`), principled BSDF with GGX + Schlick (`material.rs`), and MIS light sampling for sun / area / point / sky + IES profiles (`light_sampling.rs`).
+- **PR2 #10 — GPU compute path tracer + denoiser + scheduler.** WGSL compute kernel (`shaders/path_trace.wgsl`) mirroring the CPU path: BVH traversal, principled BSDF, light sampling, MIS. Edge-aware bilateral denoiser (`denoise.rs`). Tile scheduler with progressive sampling, adaptive convergence, and cancellation (`scheduler.rs`).
+- **PR3 #11 — Native PBR preview + sky.** wgpu PBR rasterization pipeline (`crates/aec_viewport/src/pbr_preview.rs` + `shaders/pbr.wgsl`) with cascaded shadow maps and SSAO; Hosek-Wilkie procedural sky (`sky.rs` + `shaders/sky.wgsl`); `PreviewPipeline` (replacing `EeveePipeline`) drives the same pipeline for the editor preview.
+- **PR4 #12 — Removed Blender, native walkthrough + panorama.** Deleted `crates/aec_render/src/worker.rs` (BlenderWorker), `blender_discovery.rs`, `cycles.rs`, `eevee.rs`, and the entire `workers/blender/` tree. New `final_render.rs` drives the path tracer end-to-end; `walkthrough.rs` renders camera-path frame sequences with frame-level resume and optional ffmpeg stitch; `panorama.rs` adds an equirectangular camera projection to the path tracer for 360° room panoramas.
+- **PR5 #13 — Native IFC engine.** New `crates/aec_bim/src/ifc/reader.rs` (STEP parser with `FILE_SCHEMA(('IFC2X3'|'IFC4'|'IFC4X3'))` detection, streaming `StepIter`, multi-line records, ISO 10303-21 comments, UTF-8-safe quoted-string parsing); `writer.rs` (deterministic GUID-preserving STEP emitter, verbatim unknown-Pset round-trip via `PropertyValue::Other`); `tessellator.rs` (IfcExtrudedAreaSolid, IfcFacetedBrep, RectangleProfile / CircleProfile / ArbitraryClosedProfile, IfcBooleanClippingResult). Deleted `workers/ifc/` and the `python-workers` CI job.
+- **Documentation refresh.** ARCHITECTURE.md, PROPOSAL.md, README.md, PROGRESS.md, and PHASES.md updated to reflect that rendering and BIM are in-process Rust. `docs/LICENSE_ARCHITECTURE.md` notes the GPL (Blender) and LGPL (IfcOpenShell) boundaries are no longer relevant — only the AGPL (project source) and MIT (llama.cpp) boundaries remain.
+- **Tests.** `cargo test --workspace` stays green throughout the migration; `cargo clippy --all-targets --all-features -- -D warnings` clean.
 
 ### 2026-05-20 (CI gating — Ubuntu-only PR baseline, full matrix on `main`)
 
@@ -355,7 +399,7 @@ AEC Studio's UI follows the **KChat design system** — primary accent `#7C3AED`
 
 ### 2026-05-20 (Phase 7 + validation batch)
 
-- **Phase 2/5/6 exit criteria validated.** Added `crates/aec_export/tests/phase6_e2e.rs` (single project → concept, interior, contractor, BIM packs), `crates/aec_export/tests/determinism.rs` (PDF content stripped of XMP / dates / xref is byte-identical across runs; XLSX entry inventory + BLAKE3 hashes match), and `crates/aec_export/tests/contractor_perf.rs` (realistic 12-sheet + 3-XLSX + 1 MB IFC pack zips well under the 60 s budget). All four Phase 2 exit criteria, three of four Phase 5 criteria, and three of four Phase 6 criteria now flip from `[ ]` to `[x]`; the EEVEE latency criterion is backed by the new `crates/aec_render/benches/eevee_latency.rs` criterion benchmark for the Rust-side IPC overhead, with a documented manual measurement for the full Blender round-trip.
+- **Phase 2/5/6 exit criteria validated.** Added `crates/aec_export/tests/phase6_e2e.rs` (single project → concept, interior, contractor, BIM packs), `crates/aec_export/tests/determinism.rs` (PDF content stripped of XMP / dates / xref is byte-identical across runs; XLSX entry inventory + BLAKE3 hashes match), and `crates/aec_export/tests/contractor_perf.rs` (realistic 12-sheet + 3-XLSX + 1 MB IFC pack zips well under the 60 s budget). All four Phase 2 exit criteria, three of four Phase 5 criteria, and three of four Phase 6 criteria now flip from `[ ]` to `[x]`; the preview-latency criterion was originally backed by a Blender-IPC microbenchmark at the time of writing, and has since been superseded by the in-process `crates/aec_render/benches/native_render.rs` Criterion benchmark introduced in Phase 9 PR4 (which exercises the full native CPU/GPU path tracer + PBR rasterizer end to end).
 - **Phase 7 KChat integration end-to-end.** New `crates/aec_core/src/kchat.rs` (artifact cards, `KChatPublisher` trait, `InMemoryPublisher` for tests, `ReviewComment` / `ApprovalStatus` / `ReviewCard`, `ingest_review` → `AuditEntry` with `ActorKind::KChat`, asset-pack publish / subscribe), `kchat_sync.rs` (one-way comment sync with dedup), and `kchat_config.rs` (local-first config — disabled by default rejects every operation). The `apps/desktop/renderer/src/components/kchat/` folder ships `PublishCardModal` and `ArtifactCardPreview`; KChat UI hides itself when the config is disabled.
 - **Walkthrough MP4 encoding.** `workers/blender/walkthrough.py` grows a `stitch_frames(out_dir, output_path, fps, frame_pattern, ffmpeg_path)` helper that invokes FFmpeg when available and gracefully falls back to leaving the image sequence in place, validating fps / frame count / directory existence with explicit `ValueError`s. The Rust side gets `BlenderRequest::StitchWalkthrough`, a `WalkthroughOutput { Video | ImageSequence }` discriminated union, and a `BlenderResponse::WalkthroughStitched` event.
 - **New AI tools.** `lighting_balance.rs`, `schedule_fill.rs`, `validation_help.rs` in `aec_ai` register `ToolName::{LightingBalance, ScheduleFill, ValidationHelp}` with GBNF grammars, planner wiring, and diff-engine integration (lighting balance produces `Insert` operations on `RenderLight`).

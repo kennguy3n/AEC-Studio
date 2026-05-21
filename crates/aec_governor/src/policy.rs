@@ -9,10 +9,19 @@ use crate::tier::HardwareTier;
 /// `aec_render` side. Lives on the governor crate so policy structs can
 /// reference presets without taking a runtime dependency on
 /// `aec_render`, and so the type derives `Copy`.
+///
+/// The realtime-preview variant retains its `"eevee_preview"` on-wire id
+/// for project-file compatibility — Phase 9 swapped the underlying
+/// implementation (EEVEE-via-Blender → native PBR rasterizer) but kept
+/// the string id stable so existing `.aecstudio` packages still load.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PresetKey {
-    EeveePreview,
+    /// Native PBR rasterizer realtime preview (replaces the pre-Phase-9
+    /// EEVEE-via-Blender preview). On-wire id stays `"eevee_preview"`
+    /// for backward compatibility.
+    #[serde(alias = "eevee_preview", rename = "eevee_preview")]
+    RealtimePreview,
     Quick,
     Standard,
     High,
@@ -27,7 +36,7 @@ impl PresetKey {
     /// `RenderPreset::id` field in `aec_render::preset`.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::EeveePreview => "eevee_preview",
+            Self::RealtimePreview => "eevee_preview",
             Self::Quick => "quick",
             Self::Standard => "standard",
             Self::High => "high",
@@ -44,7 +53,14 @@ pub struct RenderPolicy {
     pub default_tile_size_px: u32,
     pub max_concurrent_jobs: u32,
     pub max_concurrent_tiles: u32,
-    pub eevee_resolution_scale: f32,
+    /// Resolution multiplier the realtime PBR-rasterizer preview applies
+    /// to its offscreen render target before upscaling to the viewport.
+    /// Lower values trade fidelity for latency on tighter hardware.
+    ///
+    /// Serializes as `eevee_resolution_scale` and accepts that alias on
+    /// deserialize so existing `.aecstudio` projects continue to load.
+    #[serde(alias = "eevee_resolution_scale", rename = "eevee_resolution_scale")]
+    pub preview_resolution_scale: f32,
     pub viewport_framebuffer_scale: f32,
     pub allow_background_ai_during_render: bool,
     /// Bundled preset the UI should preselect for this tier. Mirrors
@@ -109,7 +125,7 @@ impl GovernorPolicy {
                     default_tile_size_px: 128,
                     max_concurrent_jobs: 1,
                     max_concurrent_tiles: 1,
-                    eevee_resolution_scale: 0.5,
+                    preview_resolution_scale: 0.5,
                     viewport_framebuffer_scale: 0.75,
                     allow_background_ai_during_render: false,
                     recommended_preset_id: PresetKey::Quick,
@@ -128,7 +144,7 @@ impl GovernorPolicy {
                     default_tile_size_px: 192,
                     max_concurrent_jobs: 1,
                     max_concurrent_tiles: 2,
-                    eevee_resolution_scale: 0.75,
+                    preview_resolution_scale: 0.75,
                     viewport_framebuffer_scale: 1.0,
                     allow_background_ai_during_render: false,
                     recommended_preset_id: PresetKey::Standard,
@@ -147,7 +163,7 @@ impl GovernorPolicy {
                     default_tile_size_px: 256,
                     max_concurrent_jobs: 2,
                     max_concurrent_tiles: 4,
-                    eevee_resolution_scale: 1.0,
+                    preview_resolution_scale: 1.0,
                     viewport_framebuffer_scale: 1.0,
                     allow_background_ai_during_render: true,
                     recommended_preset_id: PresetKey::High,
@@ -166,7 +182,7 @@ impl GovernorPolicy {
                     default_tile_size_px: 256,
                     max_concurrent_jobs: 3,
                     max_concurrent_tiles: 6,
-                    eevee_resolution_scale: 1.0,
+                    preview_resolution_scale: 1.0,
                     viewport_framebuffer_scale: 1.0,
                     allow_background_ai_during_render: true,
                     recommended_preset_id: PresetKey::Studio,

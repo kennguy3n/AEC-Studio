@@ -11,7 +11,7 @@
 > AEC Studio is the local-first studio for small architecture and interior design teams that need to model, draft, and render real projects end to end.
 
 **Developer-facing:**
-> AEC Studio is an open-source Electron + Rust desktop suite combining a wgpu viewport, a 2D CAD module, BIM Lite via IfcOpenShell, Cycles/EEVEE rendering through a Blender worker, and a local AI assistant served by a llama.cpp / PrismML sidecar.
+> AEC Studio is an open-source Electron + Rust desktop suite combining a wgpu viewport, a 2D CAD module, BIM Lite via a native Rust IFC engine (STEP reader/writer + tessellator), a native Rust path tracer + PBR preview renderer (wgpu compute, CPU fallback), and a local AI assistant served by a llama.cpp / PrismML sidecar.
 
 ---
 
@@ -24,7 +24,7 @@
 - Place furniture, finishes, and lighting from the bundled asset library or imported asset packs.
 - Produce real construction drawings — plans, sections, elevations, details, and printable sheets — in the Draft mode.
 - Import, view, classify, lightly edit, and re-export IFC building models in the BIM mode.
-- Render previews via EEVEE and final stills/walkthroughs/panoramas via Cycles through a Blender worker.
+- Render previews via the native PBR rasterizer and final stills/walkthroughs/panoramas via the in-process Rust path tracer.
 - Run local AI assistants (plan detection, style ideas, render doctor, CAD cleanup, BIM classification) entirely on-device.
 - Bundle the same project into client proposals, contractor packs, and BIM exports without duplicating data.
 
@@ -33,7 +33,7 @@
 - **Not a clone of AutoCAD, Revit, or SketchUp** — focused on the production loop of small studios, not a general-purpose CAD/BIM platform.
 - **Not a cloud-dependent SaaS** — every project, render, and inference runs on the user's machine. No cloud backend, no telemetry, no remote rendering.
 - **Not a general chatbot** — AI is scoped to design, drafting, and BIM tools through a strict tool schema and a safety validator.
-- **Not a real-time game engine** — the viewport prioritizes accuracy and snapping; final rendering uses Cycles/EEVEE.
+- **Not a real-time game engine** — the viewport prioritizes accuracy and snapping; final rendering uses the in-process Rust path tracer.
 
 ### Core promise
 
@@ -49,7 +49,7 @@
 | **Design** | 3D space modeling, furniture, materials, lighting, cameras, design AI |
 | **Draft** | 2D CAD canvas, layers, blocks, dims, sheets, title blocks, drafting AI |
 | **BIM** | IFC import/export, spatial hierarchy, properties, schedules, takeoff, BIM AI |
-| **Render** | EEVEE preview, Cycles final, batch queue, presets, walkthrough, panorama, render doctor |
+| **Render** | PBR rasterized preview, path-traced final, batch queue, presets, walkthrough, panorama, render doctor — all native Rust |
 | **Deliver** | Proposal pack, contractor handoff, BOQ-lite, IFC pack, PDF/DXF, revisions |
 
 There is **no primary chat surface**. AEC Studio is a mode-based workflow application.
@@ -83,11 +83,11 @@ Plan → Model → Furnish → Render → Draft → Quantify → Export → Revi
 | # | Principle | Why |
 |---|---|---|
 | 1 | **Rust core, Electron shell, wgpu viewport** | Memory safety + fast indexing in Rust; mature UI in Electron/React; cross-platform GPU through wgpu. |
-| 2 | **Worker-isolated heavy lifting** | Blender, IFC, AI, and CAD heavy ops run in separate worker processes for safety, crash isolation, and parallelism. |
+| 2 | **Worker-isolated heavy lifting** | Rendering, IFC parsing, and CAD ops run in-process in Rust; only AI inference runs as a separate sidecar process (llama.cpp / PrismML) for safety and parallelism. |
 | 3 | **Typed IPC, no direct renderer access** | Renderer never touches files, tokens, or model binaries. All native capabilities flow through a typed N-API boundary. |
 | 4 | **Command engine with undo/redo journal** | Every state mutation is a command, replayable and auditable. AI actions reuse the same engine. |
 | 5 | **Resource governor with hardware tiers** | The governor reads a hardware profile, picks model sizes and render presets, and throttles workers under load. |
-| 6 | **Open foundations** | Cycles, EEVEE (via Blender), IfcOpenShell, llama.cpp/PrismML, and wgpu — all open-source, locally executable, license-compatible with AGPL-3.0. |
+| 6 | **Open foundations** | Native Rust path tracer + IFC engine, llama.cpp/PrismML, and wgpu — all open-source, locally executable, license-compatible with AGPL-3.0. Reference implementations (kennguy3n/cycles, kennguy3n/IfcOpenShell) inform the design but are not runtime dependencies. |
 
 ---
 
@@ -175,7 +175,7 @@ Project
 2. **Design → Plan detection AI.** Drops the client's PDF onto the AI panel. The plan-detection model returns a previewed wall outline; she accepts the diff which becomes a parametric wall set.
 3. **Design → Furnish.** Drags sofa, dining table, bed, lamps, and rugs from the bundled assets. Uses the material panel to swap finishes and recolor walls.
 4. **Design → Lighting.** Picks "warm evening" lighting preset; AI suggests two extra accent lights, both shown as a preview before commit.
-5. **Render → 4 cameras.** Saves 4 cameras (living, dining, bedroom, kitchen). Picks "Interior High" preset. Render queue runs Cycles in the background; EEVEE thumbnails are ready in <30 s each.
+5. **Render → 4 cameras.** Saves 4 cameras (living, dining, bedroom, kitchen). Picks "Interior High" preset. Render queue runs the native path tracer in the background; PBR rasterized thumbnails are ready in <30 s each.
 6. **Deliver → Client concept pack.** Generates a PDF with cover, mood board, floor plan, 4 renders, material schedule, and a "next steps" page. Saves a revision snapshot.
 
 **UX details:**
@@ -203,7 +203,7 @@ Project
 3. **Draft → Sheets.** Drafter creates plan, section, and elevation sheets from the live model. Title block is the studio's saved template.
 4. **BIM → Classification.** AI proposes IFC classes (IfcWall, IfcDoor, IfcFurniture). Drafter accepts via diff preview.
 5. **BIM → Schedules.** Door schedule and room schedule generate from the spatial tree. AI fills missing fire ratings using the studio's project standards file.
-6. **Render → 2 hero shots.** Cycles GPU on RTX 4070; ~6 minutes per hero render at 4K with denoise.
+6. **Render → 2 hero shots.** Native path tracer on wgpu compute, RTX 4070; ~6 minutes per hero render at 4K with denoise.
 7. **Deliver → Contractor handoff pack.** Bundles sheets, schedules, IFC, BOQ-lite into a single zipped pack with a manifest.
 
 **UX details:**
@@ -215,7 +215,7 @@ Project
 **Acceptance criteria:**
 
 - [ ] Construction sheets stay in sync with the 3D model; no manual re-tracing.
-- [ ] IFC export validates against IfcOpenShell strict mode and re-imports with full GUID match.
+- [ ] IFC export validates against the native strict-mode parser and re-imports with full GUID match.
 - [ ] Contractor pack export takes < 60 s on a mid-range PC.
 
 ### C. Construction PM — "Site renovation with BIM Lite and BOQ"
@@ -226,7 +226,7 @@ Project
 
 **Flow:**
 
-1. **Home → Open project → Import IFC.** Drops a 40 MB IFC. IfcOpenShell worker imports in a few seconds; spatial tree appears in the BIM mode.
+1. **Home → Open project → Import IFC.** Drops a 40 MB IFC. The native STEP parser imports in a few seconds; spatial tree appears in the BIM mode.
 2. **BIM → Validate.** Runs the AEC Studio validator: surfaces dangling references, missing IFC classes, and unclosed spaces.
 3. **BIM → AI classification.** AI proposes IFC classes for unclassified meshes; PM accepts only the high-confidence ones (≥ 0.85) and reviews the rest manually.
 4. **BIM → Property fill.** AI suggests property sets for walls and floors (material, fire rating, thickness) from project standards. Diff preview, accept or edit.
@@ -332,11 +332,11 @@ Project
 
 | Mode | Engine | Use case |
 |---|---|---|
-| **Preview** | EEVEE via Blender worker | Real-time-ish preview at viewport refresh rates |
-| **Final** | Cycles via Blender worker | Photoreal stills with denoise |
-| **Batch** | Cycles queue | Multi-camera, multi-preset batches |
-| **Walkthrough** | Cycles + camera path | Short walkthrough animations |
-| **Panorama** | Cycles equirectangular | 360° room panoramas for VR previews |
+| **Preview** | Native PBR rasterizer (wgpu) | Real-time-ish preview at viewport refresh rates |
+| **Final** | Native path tracer (wgpu compute, CPU fallback) | Photoreal stills with denoise |
+| **Batch** | Native render queue | Multi-camera, multi-preset batches |
+| **Walkthrough** | Native path tracer + camera path | Short walkthrough animations |
+| **Panorama** | Native equirectangular path tracer | 360° room panoramas for VR previews |
 
 ### 5.2 2D CAD Drafting
 
@@ -374,7 +374,7 @@ Project
 
 | Feature | Detail |
 |---|---|
-| IFC import | IfcOpenShell-based, IFC2x3 + IFC4 + IFC4x3 |
+| IFC import | Native Rust STEP parser, IFC2x3 + IFC4 + IFC4x3 |
 | IFC export | Round-trippable with GUID preservation |
 | Spatial hierarchy | Project / Site / Building / Storey / Space tree |
 | Classification | IfcWall, IfcSlab, IfcDoor, IfcWindow, IfcFurniture, IfcRoof, etc. |
@@ -591,9 +591,9 @@ Publishing is one-way (AEC Studio → KChat). Comments and approvals can sync ba
 ### License constraints
 
 - **AEC Studio** itself is **AGPL-3.0**.
-- **Cycles** ([kennguy3n/cycles](https://github.com/kennguy3n/cycles)) is Apache-2.0; bundling and modifying it is compatible.
-- **IfcOpenShell** ([kennguy3n/IfcOpenShell](https://github.com/kennguy3n/IfcOpenShell)) is LGPL-3.0; we link/use it through an out-of-process worker which keeps the integration clean.
-- **Blender** is GPL-3.0; we drive Blender as an external worker process, never link it into AEC Studio's address space.
+- **Cycles** ([kennguy3n/cycles](https://github.com/kennguy3n/cycles)) is Apache-2.0; AEC Studio studied its kernel for the native path tracer but does NOT link or invoke it at runtime.
+- **IfcOpenShell** ([kennguy3n/IfcOpenShell](https://github.com/kennguy3n/IfcOpenShell)) is LGPL-3.0; AEC Studio studied its STEP parser as a reference but the native Rust parser in `aec_bim::ifc` is a clean implementation that does NOT link or invoke IfcOpenShell at runtime.
+- **Blender** is GPL-3.0; AEC Studio does NOT bundle, link, or invoke Blender. All rendering is in-process Rust.
 - **llama.cpp / PrismML** ([kennguy3n/llama.cpp](https://github.com/kennguy3n/llama.cpp)) is MIT; bundling and modifying is compatible.
 - **wgpu**, **napi-rs**, **SQLite/SQLCipher**, and **Electron** licenses are reviewed and compatible.
 - Bundled asset packs declare individual licenses; we accept only license-clean assets (CC0, CC-BY with attribution, or studio-original).
@@ -603,8 +603,8 @@ Publishing is one-way (AEC Studio → KChat). Comments and approvals can sync ba
 | Concern | Posture |
 |---|---|
 | AGPL network-use obligation | Make the source available for any user who interacts with the application — README + LICENSE + a "Corresponding Source" link |
-| GPL/AGPL contamination via Blender | Out-of-process worker only; Blender is invoked, not linked |
-| LGPL contamination via IfcOpenShell | Out-of-process worker; users can swap our binary for a custom IfcOpenShell build |
+| GPL/AGPL contamination via Blender | Eliminated — Blender is no longer a runtime dependency |
+| LGPL contamination via IfcOpenShell | Eliminated — IfcOpenShell is no longer a runtime dependency |
 | Asset licensing | Per-asset `LICENSE` and attribution stored in the pack manifest; "Attributions" pane in Settings |
 | Cryptographic export | SQLCipher is permitted; we publish the crypto algorithms used (XChaCha20-Poly1305 + AES-256 page-level) |
 | Privacy | No telemetry, no network without explicit user action; documented in [SECURITY.md](SECURITY.md) |
@@ -615,11 +615,11 @@ Publishing is one-way (AEC Studio → KChat). Comments and approvals can sync ba
 
 | Risk | Mitigation |
 |---|---|
-| Render queue stalls on low-end hardware | Resource governor with auto-tuned preset, EEVEE-only fallback, render resume on failure |
+| Render queue stalls on low-end hardware | Resource governor with auto-tuned preset, PBR-rasterizer-only fallback for low-tier, render resume on failure |
 | AI hallucinates a destructive mutation | Strict tool schema, grammar-constrained decoding, safety validator, preview diffs, audit log |
-| IFC roundtrip loses GUIDs or Psets | Use IfcOpenShell strict mode; round-trip tests in CI; preserve unknown Psets verbatim |
+| IFC roundtrip loses GUIDs or Psets | Native parser preserves GUIDs by construction; round-trip tests in CI; unknown property types preserved verbatim via `PropertyValue::Other` |
 | DWG legal/license issues | DXF is canonical; DWG is opt-in through a separate converter adapter, never bundled by default |
-| Blender worker version drift | Pin the Blender minor version per release; ship a manifest with the supported range |
+| Native render engine regressions | Comprehensive workspace test suite covers BVH, BSDF, MIS, denoiser, scheduler, and PBR preview; benchmarks track regressions across releases |
 | wgpu backend gaps on older GPUs | Detect at startup and fall back to a software OpenGL path with clear messaging |
 | AGPL chilling effect on commercial adopters | Clear `Corresponding Source` link, separate commercial license SKU document if/when needed |
 | Project file format churn | Versioned JSON schema, migrations crate, deterministic upgrades, snapshot before migrate |
@@ -659,7 +659,7 @@ AEC Studio's UI follows the **KChat design system** (same tokens as [kennguy3n/T
 - [CONTRIBUTING.md](CONTRIBUTING.md) — contribution guide
 - [SECURITY.md](SECURITY.md) — security policy
 - [kennguy3n/llama.cpp@prism](https://github.com/kennguy3n/llama.cpp) — local AI inference
-- [kennguy3n/IfcOpenShell](https://github.com/kennguy3n/IfcOpenShell) — BIM/IFC engine
+- [kennguy3n/IfcOpenShell](https://github.com/kennguy3n/IfcOpenShell) — reference implementation for the native Rust STEP parser (not a runtime dependency)
 - [kennguy3n/cycles](https://github.com/kennguy3n/cycles) — path-traced renderer
 - [kennguy3n/knowledge](https://github.com/kennguy3n/knowledge) — local knowledge substrate
 - [kennguy3n/Tessera](https://github.com/kennguy3n/Tessera) — reference desktop architecture

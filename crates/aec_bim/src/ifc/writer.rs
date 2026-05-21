@@ -510,27 +510,43 @@ fn escape_step_string(s: &str) -> String {
     out
 }
 
-fn serialize_property_value(v: &PropertyValue) -> (String, &'static str) {
+/// Returns the (literal, measure-wrapper) pair for a single property
+/// value. The measure-wrapper is the IFC tag uppercased to STEP
+/// canonical form (e.g. `"IFCMASSDENSITYMEASURE"`). For unmodeled
+/// `PropertyValue::Other` variants the raw STEP literal is emitted
+/// verbatim, restoring the bytes the reader captured.
+fn serialize_property_value(v: &PropertyValue) -> (String, String) {
     match v {
-        PropertyValue::Text(s) => (format!("'{}'", escape_step_string(s)), "IFCTEXT"),
-        PropertyValue::Label(s) => (format!("'{}'", escape_step_string(s)), "IFCLABEL"),
-        PropertyValue::Real(x) => (format_real(*x), "IFCREAL"),
-        PropertyValue::Length(x) => (format_real(*x), "IFCLENGTHMEASURE"),
-        PropertyValue::Area(x) => (format_real(*x), "IFCAREAMEASURE"),
-        PropertyValue::Volume(x) => (format_real(*x), "IFCVOLUMEMEASURE"),
-        PropertyValue::Ratio(x) => (format_real(*x), "IFCPOSITIVERATIOMEASURE"),
-        PropertyValue::Integer(i) => (i.to_string(), "IFCINTEGER"),
-        PropertyValue::Boolean(b) => (if *b { ".T." } else { ".F." }.to_string(), "IFCBOOLEAN"),
+        PropertyValue::Text(s) => (
+            format!("'{}'", escape_step_string(s)),
+            "IFCTEXT".to_string(),
+        ),
+        PropertyValue::Label(s) => (
+            format!("'{}'", escape_step_string(s)),
+            "IFCLABEL".to_string(),
+        ),
+        PropertyValue::Real(x) => (format_real(*x), "IFCREAL".to_string()),
+        PropertyValue::Length(x) => (format_real(*x), "IFCLENGTHMEASURE".to_string()),
+        PropertyValue::Area(x) => (format_real(*x), "IFCAREAMEASURE".to_string()),
+        PropertyValue::Volume(x) => (format_real(*x), "IFCVOLUMEMEASURE".to_string()),
+        PropertyValue::Ratio(x) => (format_real(*x), "IFCPOSITIVERATIOMEASURE".to_string()),
+        PropertyValue::Integer(i) => (i.to_string(), "IFCINTEGER".to_string()),
+        PropertyValue::Boolean(b) => (
+            if *b { ".T." } else { ".F." }.to_string(),
+            "IFCBOOLEAN".to_string(),
+        ),
+        PropertyValue::Other { measure, raw } => (raw.clone(), measure.to_ascii_uppercase()),
     }
 }
 
-fn serialize_quantity_value(v: &PropertyValue) -> (String, &'static str) {
+fn serialize_quantity_value(v: &PropertyValue) -> (String, String) {
     match v {
-        PropertyValue::Length(x) => (format_real(*x), "IFCQUANTITYLENGTH"),
-        PropertyValue::Area(x) => (format_real(*x), "IFCQUANTITYAREA"),
-        PropertyValue::Volume(x) => (format_real(*x), "IFCQUANTITYVOLUME"),
-        PropertyValue::Integer(i) => (i.to_string(), "IFCQUANTITYCOUNT"),
-        PropertyValue::Real(x) => (format_real(*x), "IFCQUANTITYWEIGHT"),
+        PropertyValue::Length(x) => (format_real(*x), "IFCQUANTITYLENGTH".to_string()),
+        PropertyValue::Area(x) => (format_real(*x), "IFCQUANTITYAREA".to_string()),
+        PropertyValue::Volume(x) => (format_real(*x), "IFCQUANTITYVOLUME".to_string()),
+        PropertyValue::Integer(i) => (i.to_string(), "IFCQUANTITYCOUNT".to_string()),
+        PropertyValue::Real(x) => (format_real(*x), "IFCQUANTITYWEIGHT".to_string()),
+        PropertyValue::Other { measure, raw } => (raw.clone(), measure.to_ascii_uppercase()),
         PropertyValue::Ratio(_) => {
             // IFC4 has no IfcQuantityRatio — Ratio values belong in
             // Psets (IFCPOSITIVERATIOMEASURE) not Qsets. Emit as
@@ -547,12 +563,12 @@ fn serialize_quantity_value(v: &PropertyValue) -> (String, &'static str) {
                     PropertyValue::Ratio(x) => *x,
                     _ => 0.0,
                 }),
-                "IFCQUANTITYWEIGHT",
+                "IFCQUANTITYWEIGHT".to_string(),
             )
         }
         // Boolean / text quantities aren't standard IFC; fall through
         // as IfcQuantityCount(0) so the file still parses.
-        _ => ("0".into(), "IFCQUANTITYCOUNT"),
+        _ => ("0".into(), "IFCQUANTITYCOUNT".to_string()),
     }
 }
 

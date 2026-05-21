@@ -1130,7 +1130,18 @@ fn parse_typed_measure(raw: &str) -> IfcReadResult<PropertyValue> {
         "IFCPOSITIVERATIOMEASURE" => Ok(PropertyValue::Ratio(parse_real(inner)?)),
         "IFCINTEGER" => Ok(PropertyValue::Integer(parse_int(inner)?)),
         "IFCBOOLEAN" => Ok(PropertyValue::Boolean(matches!(inner, ".T."))),
-        other => Err(IfcReadError::UnknownType(other.to_string())),
+        other => {
+            // Preserve unknown IFC measure types verbatim for
+            // lossless round-trip. The writer's emit path detects
+            // `PropertyValue::Other` and re-wraps the raw literal
+            // in the original IFC measure tag. We store the STEP
+            // form (uppercase) since recovering the IFC4 canonical
+            // camelCase spelling without a dictionary is lossy.
+            Ok(PropertyValue::Other {
+                measure: other.to_string(),
+                raw: inner.to_string(),
+            })
+        }
     }
 }
 
@@ -1142,7 +1153,11 @@ fn parse_quantity_typed(tag: &str, raw: &str) -> IfcReadResult<PropertyValue> {
         "IFCQUANTITYVOLUME" => Ok(PropertyValue::Volume(parse_real(v)?)),
         "IFCQUANTITYCOUNT" => Ok(PropertyValue::Integer(parse_int(v)?)),
         "IFCQUANTITYWEIGHT" => Ok(PropertyValue::Real(parse_real(v)?)),
-        other => Err(IfcReadError::UnknownType(other.to_string())),
+        // IFC4x3 added IFCQUANTITYTIME and others; preserve verbatim.
+        other => Ok(PropertyValue::Other {
+            measure: other.to_string(),
+            raw: v.to_string(),
+        }),
     }
 }
 
@@ -2033,6 +2048,87 @@ ENDSEC;\n\
 END-ISO-10303-21;\n";
         let err = IfcReader::from_string(bad).expect_err("malformed arg list must error");
         assert!(matches!(err, IfcReadError::Malformed(_)), "{err:?}");
+    }
+
+    /// Unknown IFC measure types (e.g. `IfcMassDensityMeasure`,
+    /// `IfcFrequencyMeasure`) inside a Pset round-trip through
+    /// `PropertyValue::Other`. The reader preserves the raw STEP
+    /// literal and the measure tag verbatim, and the writer emits
+    /// them back inside an `IFCXXX(raw)` wrapper. The next reader
+    /// pass must see the same value.
+    #[test]
+    fn unknown_pset_measure_types_round_trip() {
+        // Build an in-memory file that mixes a modeled property
+        // (Length) and an unmodeled one (MassDensity) inside the
+        // same Pset, attached to a tiny IfcWall element. Read it
+        // → write it → read it again and assert the unmodeled
+        // value survives bit-identical.
+        let mut project = Project::new("P");
+        let site = project
+            .add_child(&project.root.clone(), IfcClass::IfcSite, "Site")
+            .unwrap();
+        let bldg = project
+            .add_child(&site, IfcClass::IfcBuilding, "B")
+            .unwrap();
+        let storey = project
+            .add_child(&bldg, IfcClass::IfcBuildingStorey, "L01")
+            .unwrap();
+        let wall = EntityId::new();
+        project.attach_element(&storey, wall.clone());
+        let mut classification = ClassificationStore::new();
+        classification.assign_manual(wall.clone(), IfcClass::IfcWall);
+        let mut props = PropertyStore::new();
+        let mut p = PropertySet::new("Pset_WallCommon");
+        p.set("Length", PropertyValue::Length(3.5));
+        p.set(
+            "Density",
+            PropertyValue::Other {
+                measure: "IfcMassDensityMeasure".to_string(),
+                raw: "2400.0".to_string(),
+            },
+        );
+        props.entry(wall.clone()).upsert_pset(p);
+
+        let body = crate::ifc::IfcWriter::to_string(&project, &classification, &props);
+        // Round-trip 1
+        let snap1 = IfcReader::from_string(&body).expect("first parse");
+        let stored = snap1
+            .properties
+            .get(&wall)
+            .and_then(|p| p.psets.get("Pset_WallCommon"))
+            .and_then(|ps| ps.properties.get("Density"))
+            .cloned();
+        match stored {
+            Some(PropertyValue::Other {
+                ref measure,
+                ref raw,
+            }) => {
+                assert_eq!(measure.to_ascii_uppercase(), "IFCMASSDENSITYMEASURE");
+                assert_eq!(raw, "2400.0");
+            }
+            ref other => panic!("expected PropertyValue::Other, got {other:?}"),
+        }
+        // The body must literally contain the measure wrapper.
+        assert!(
+            body.contains("IFCMASSDENSITYMEASURE(2400.0)"),
+            "writer must re-emit the raw measure wrapper, got body:\n{body}"
+        );
+
+        // Round-trip 2: re-write the snapshot's reconstructed pset
+        // and ensure the second parse yields an identical value.
+        let mut props2 = PropertyStore::new();
+        for (el, p) in snap1.properties.iter() {
+            for ps in p.psets.values() {
+                props2.entry(el.clone()).upsert_pset(ps.clone());
+            }
+        }
+        let body2 = crate::ifc::IfcWriter::to_string(&project, &classification, &props2);
+        let snap2 = IfcReader::from_string(&body2).expect("second parse");
+        assert_eq!(
+            snap1.properties.get(&wall),
+            snap2.properties.get(&wall),
+            "two reader passes converge on the same PropertyValue tree"
+        );
     }
 
     /// `FILE_SCHEMA(('IFC4'))` -> `IfcSchema::Ifc4`, and the snapshot

@@ -16,6 +16,7 @@ pub mod properties;
 pub mod relations;
 pub mod schedules;
 pub mod spatial;
+pub mod tessellator;
 pub mod validation;
 
 pub use boq::{boq_for_project, BoqLine, BoqRegion, BoqReport};

@@ -1,7 +1,7 @@
 //! Hardware tier classification.
 //!
 //! The tier drives all per-session policy defaults: render preset, sample
-//! counts, AI model size, viewport framebuffer scale, EEVEE resolution, mesh
+//! counts, AI model size, viewport framebuffer scale, preview resolution, mesh
 //! cache size, max simultaneous render jobs.
 
 use serde::{Deserialize, Serialize};

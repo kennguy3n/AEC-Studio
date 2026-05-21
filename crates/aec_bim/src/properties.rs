@@ -24,12 +24,27 @@ pub enum PropertyValue {
     Ratio(f64),
     /// IfcLabel — short, controlled string (≤ 255 chars).
     Label(String),
+    /// Opaque IFC measure type AEC Studio doesn't model natively
+    /// (e.g. `IfcMassDensityMeasure`, `IfcFrequencyMeasure`,
+    /// `IfcCountMeasure`). The reader stores the original measure
+    /// tag (without the `IFC` prefix and case-normalised, e.g.
+    /// `"MassDensityMeasure"`) and the raw STEP value literal so
+    /// the writer can round-trip the property losslessly without
+    /// having to enumerate every IFC measure type in this enum.
+    Other {
+        /// IFC measure-type name (e.g. `"IfcMassDensityMeasure"`).
+        measure: String,
+        /// Raw STEP literal as parsed (e.g. `"2400.0"`, `"'kg/m3'"`,
+        /// `".T."`). The writer emits this back verbatim inside the
+        /// `IFCXXX(...)` wrapper.
+        raw: String,
+    },
 }
 
 impl PropertyValue {
     /// IFC measure type for an instance — used when serialising back to
     /// an IFC `IfcPropertySingleValue.NominalValue` wrapper.
-    pub fn ifc_measure_type(&self) -> &'static str {
+    pub fn ifc_measure_type(&self) -> &str {
         match self {
             Self::Text(_) => "IfcText",
             Self::Real(_) => "IfcReal",
@@ -40,6 +55,21 @@ impl PropertyValue {
             Self::Volume(_) => "IfcVolumeMeasure",
             Self::Ratio(_) => "IfcPositiveRatioMeasure",
             Self::Label(_) => "IfcLabel",
+            Self::Other { measure, .. } => measure.as_str(),
+        }
+    }
+
+    /// Raw STEP literal for the inner value, as it should appear
+    /// inside the `IFCXXX(...)` measure wrapper. Returns `None` for
+    /// variants whose serialisation requires the writer's escape
+    /// logic (those go through the writer's normal formatters);
+    /// returns `Some(raw)` only for [`PropertyValue::Other`], where
+    /// the reader preserved the original bytes for verbatim
+    /// round-trip.
+    pub fn other_raw_literal(&self) -> Option<&str> {
+        match self {
+            Self::Other { raw, .. } => Some(raw.as_str()),
+            _ => None,
         }
     }
 

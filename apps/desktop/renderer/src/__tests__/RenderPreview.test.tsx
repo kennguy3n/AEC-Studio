@@ -12,7 +12,7 @@ describe("RenderPreview", () => {
     render(
       <RenderPreview
         imageDataUri="data:image/png;base64,AAAA"
-        caption="EEVEE preview"
+        caption="Realtime preview"
       />,
     );
     const img = screen.getByTestId("render-preview-image") as HTMLImageElement;

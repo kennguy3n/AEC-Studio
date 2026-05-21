@@ -81,7 +81,7 @@ The Electron renderer (React UI) operates in a sandboxed context with:
 - **`nodeIntegration: false`** — no `require()` or `process` in the renderer.
 - **Typed IPC only** — all communication between renderer and main process goes through a typed, validated IPC bridge exposed via `contextBridge`.
 - **No direct file access** — the renderer cannot read files, launch processes, or interact with the encrypted DB directly.
-- **No direct worker access** — the renderer cannot launch or message the Blender, IFC, or AI workers; only the main process can.
+- **No direct worker access** — the renderer cannot launch or message the AI sidecar; only the main process can. (Rendering and IFC parsing are in-process Rust and have no separate worker boundary to cross.)
 - **Content Security Policy** — strict CSP headers prevent inline scripts, `eval`, and unauthorized resource loading.
 
 ### Strict process separation
@@ -89,15 +89,15 @@ The Electron renderer (React UI) operates in a sandboxed context with:
 | Process | Access |
 |---|---|
 | Renderer (React) | UI only — no file system, no tokens, no database, no workers |
-| Main (Electron) | IPC routing, window management, OS file picker, worker supervision |
-| Rust core (N-API) | Project graph, geometry, asset DB, render queue, export, audit |
-| Blender worker | Rendering only, runs as a separate Blender process with stdin/stdout JSON IPC |
-| IFC worker | BIM/IFC parsing only, runs as a separate process wrapping IfcOpenShell |
+| Main (Electron) | IPC routing, window management, OS file picker, AI sidecar supervision |
+| Rust core (N-API) | Project graph, geometry, asset DB, **native path tracer**, **native IFC engine**, render queue, export, audit — all in-process |
 | AI sidecar (llama-server) | Model inference, bound to localhost loopback only |
 
 ### Worker process isolation
 
-Blender, IFC, and AI workers run as **separate processes**. They communicate with the Rust core via either local pipes (stdin/stdout JSON-line IPC) or a loopback HTTP socket (for the AI sidecar). They never share address space with AEC Studio's main binary. A crash in a worker never crashes the main app — the supervisor restarts the worker and surfaces the failure in the UI.
+The **AI sidecar (`llama-server`)** is the only remaining external worker process. It communicates with the Rust core via a loopback HTTP socket and never shares address space with AEC Studio's main binary. A crash in the AI sidecar never crashes the main app — the supervisor restarts it and surfaces the failure in the UI.
+
+Rendering and IFC parsing are now fully in-process Rust (`crates/aec_render/` and `crates/aec_bim/`). Faults in those subsystems are isolated by panic boundaries at the N-API bridge layer rather than process boundaries; the trade-off is intentional, since Rust's memory safety guarantees remove the original justification for an out-of-process Blender / IfcOpenShell worker.
 
 ### AI safety
 
@@ -135,7 +135,7 @@ The audit log is hash-chained per entry and can be exported alongside a project.
 - Encrypted storage bypass (reading SQLCipher data without the key).
 - Arbitrary code execution through crafted files (e.g., malicious DXF, IFC, PDF, glTF, FBX, asset pack).
 - AI sidecar escaping loopback (accepting connections from outside localhost) or exfiltrating data.
-- Worker process escapes (Blender, IFC, AI) that affect AEC Studio's security boundary.
+- AI sidecar escapes (process boundary, loopback binding) that affect AEC Studio's security boundary.
 - Audit log tampering (breaking the hash chain without detection).
 - Extension permissions bypass (extension performing operations outside its declared permissions).
 
@@ -145,7 +145,7 @@ The audit log is hash-chained per entry and can be exported alongside a project.
 - Issues requiring physical access to an unlocked machine (this is a desktop app; physical access implies full access).
 - Social engineering attacks.
 - Denial of service against the local application (crashing your own app is not a security issue).
-- Issues in [llama.cpp](https://github.com/kennguy3n/llama.cpp), [Blender](https://www.blender.org/), or [IfcOpenShell](https://github.com/kennguy3n/IfcOpenShell) that do not affect AEC Studio's security boundary — please report those upstream.
+- Issues in [llama.cpp](https://github.com/kennguy3n/llama.cpp) that do not affect AEC Studio's security boundary — please report those upstream.
 
 ---
 
@@ -161,7 +161,6 @@ AEC Studio uses well-maintained dependencies with known security properties:
 | napi-rs | Rust ↔ Node.js bridge | Type-safe, no serialization vulnerabilities |
 | wgpu | Cross-platform GPU | Safe Rust API over Vulkan / Metal / D3D12 / OpenGL |
 | llama.cpp / PrismML | Local AI inference | Runs as a sidecar bound to loopback |
-| IfcOpenShell | BIM/IFC parsing | Runs as an isolated worker process |
-| Blender | Rendering | Runs as an isolated worker process; never linked |
+
 
 We monitor dependencies for known vulnerabilities and update promptly. Dependabot or an equivalent watcher runs on the repo.
