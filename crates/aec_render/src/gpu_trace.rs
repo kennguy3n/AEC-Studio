@@ -148,7 +148,16 @@ impl GpuSceneBuffers {
     /// permutation is applied here so the shader can index triangles
     /// directly by `prim_indices[start + i]`.
     pub fn build(scene: &PathTraceScene) -> Self {
-        let mut bvh_nodes: Vec<BvhNodeGpu> = scene
+        // Note: when `scene.bvh.nodes` is empty we deliberately keep
+        // `bvh_nodes` empty. The wgpu buffer-not-empty constraint is
+        // satisfied at bind time by stubbing a placeholder node
+        // (see `GpuPathTracer::dispatch`) so that `params.bvh_count`
+        // here continues to reflect the *logical* node count. The
+        // WGSL traversal guards on `params.bvh_count == 0u` and
+        // returns the miss-hit immediately, so the placeholder node
+        // is never read. Mirrors the triangle/material/light stub
+        // pattern below.
+        let bvh_nodes: Vec<BvhNodeGpu> = scene
             .bvh
             .nodes
             .iter()
@@ -159,15 +168,6 @@ impl GpuSceneBuffers {
                 prim_count: n.prim_count,
             })
             .collect();
-        if bvh_nodes.is_empty() {
-            // Single empty leaf so the shader's loop terminates.
-            bvh_nodes.push(BvhNodeGpu {
-                min: [0.0; 3],
-                left_or_start: 0,
-                max: [0.0; 3],
-                prim_count: 0,
-            });
-        }
 
         // Reorder triangles per the BVH's prim_indices so the shader
         // can do contiguous leaf scans without an indirection.
@@ -433,7 +433,31 @@ impl GpuPathTracer {
         }
 
         let buffers = GpuSceneBuffers::build(scene);
-        let bvh_buf = self.create_storage("bvh_nodes", bytemuck::cast_slice(&buffers.bvh_nodes));
+        // Same stride/zero-length validation issue as `triangles`
+        // below: an empty `bvh_nodes` buffer is bound with 16 bytes
+        // of wgpu padding but the shader's storage array expects
+        // `stride_of<BvhNodeGpu>` = 32 bytes per element, which trips
+        // the dispatch-time validator. Stub a single zeroed
+        // placeholder when the scene has no BVH; the shader guards
+        // traversal with `params.bvh_count == 0u`, so the placeholder
+        // is never read. Crucially, `params.bvh_count` is computed
+        // from `buffers.bvh_nodes.len()` further down, so it remains
+        // `0` for empty scenes and the WGSL early-return fires
+        // structurally rather than relying on the placeholder's
+        // degenerate AABB to miss every ray.
+        let bvh_buf = if buffers.bvh_nodes.is_empty() {
+            self.create_storage(
+                "bvh_nodes",
+                bytemuck::cast_slice(&[BvhNodeGpu {
+                    min: [0.0; 3],
+                    left_or_start: 0,
+                    max: [0.0; 3],
+                    prim_count: 0,
+                }]),
+            )
+        } else {
+            self.create_storage("bvh_nodes", bytemuck::cast_slice(&buffers.bvh_nodes))
+        };
         // Empty triangle buffer is bound with 16 bytes of wgpu padding
         // but the shader's storage array expects `stride_of<TriangleGpu>`
         // = 48 bytes per element, so binding the zero-length buffer
@@ -1048,6 +1072,90 @@ mod tests {
             max_lum > 10.0,
             "GPU primary rays did not pick up the sun disc on miss; max luminance was {max_lum}"
         );
+    }
+
+    #[test]
+    fn gpu_empty_bvh_with_camera_at_origin_terminates_cleanly() {
+        // Regression for the Devin Review finding on 9b76ffe flagging
+        // that the GPU dispatch path stored an empty-scene "stub" BVH
+        // node inside `GpuSceneBuffers::bvh_nodes`, which made
+        // `params.bvh_count == 1` (not 0) and bypassed the WGSL
+        // `params.bvh_count == 0u` early-return. With the stub's
+        // degenerate AABB at the world origin, a camera positioned at
+        // the origin emits rays that pass *through* the AABB, treat
+        // the stub as an internal node (`prim_count == 0`), and push
+        // out-of-bounds child indices onto the traversal stack. WGSL
+        // clamps the OOB reads, but the loop can spin until the
+        // 64-deep stack overflows.
+        //
+        // The structural fix moves the empty-BVH stub from
+        // `GpuSceneBuffers::build` to the bind step (mirroring the
+        // triangle / material / light pattern), so `params.bvh_count`
+        // remains 0 for empty scenes and the WGSL early-return fires
+        // before any node is read. This test exercises exactly the
+        // pathological case — camera at origin, ray through (0,0,0).
+        let Ok(tracer) = GpuPathTracer::try_new() else {
+            return;
+        };
+
+        let scene_in = RenderScene::default();
+        let scene = PathTraceScene::from_render_scene(
+            &scene_in,
+            vec![],
+            |_| None,
+            SkyParams {
+                strength: 1.0,
+                color: [1.0, 1.0, 1.0],
+                ..SkyParams::default()
+            },
+        );
+        // BVH must actually be empty for this regression.
+        assert!(
+            scene.bvh.nodes.is_empty(),
+            "test relies on an empty BVH to exercise the stub-node path"
+        );
+
+        let camera = RenderCamera {
+            id: "cam".into(),
+            // Camera at world origin — rays will pass through the
+            // pre-fix stub AABB (which was [0,0,0] / [0,0,0]).
+            position_mm: [0.0, 0.0, 0.0],
+            target_mm: [0.0, 0.0, -1000.0],
+            focal_length_mm: 35.0,
+            exposure_ev: 0.0,
+            white_balance_k: 5500.0,
+            aperture_f: 5.6,
+        };
+        let cfg = PathTraceConfig {
+            width: 8,
+            height: 6,
+            samples_per_pixel: 1,
+            max_bounces: 1,
+            tile_size: 4,
+            russian_roulette_min_bounces: 1,
+            adaptive_threshold: 0.0,
+            projection: crate::path_trace::CameraProjection::Perspective,
+        };
+        let buf = tracer.render(&scene, &camera, &cfg, None, None);
+
+        // Every primary ray misses (no geometry) and hits the
+        // constant-white sky, so every pixel should accumulate
+        // `sky_color * sky_strength == (1,1,1)`. If the OOB stack
+        // overflow had been triggered, the kernel would either
+        // produce zeros (early-out without sky) or NaNs.
+        let avg = buf.average_rgb();
+        for (i, p) in avg.iter().enumerate() {
+            assert!(
+                p[0].is_finite() && p[1].is_finite() && p[2].is_finite(),
+                "pixel {i} produced non-finite radiance {p:?} — empty-BVH traversal corrupted the kernel"
+            );
+            assert!(
+                (p[0] - 1.0).abs() < 1.0e-3
+                    && (p[1] - 1.0).abs() < 1.0e-3
+                    && (p[2] - 1.0).abs() < 1.0e-3,
+                "pixel {i} = {p:?}: empty-BVH miss should hit the white sky exactly, but the stub-node bug would either zero this out or push garbage from the OOB stack push."
+            );
+        }
     }
 
     #[test]
