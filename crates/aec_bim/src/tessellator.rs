@@ -222,13 +222,22 @@ fn triangulate_polygon_2d(points: &[[f64; 2]]) -> Vec<[u32; 3]> {
             if cross <= 0.0 {
                 continue;
             }
-            // No other polygon vertex may lie inside the triangle (a,b,c).
+            // No other ACTIVE polygon vertex may lie inside the
+            // triangle (a, b, c). Iterating over the original `points`
+            // would also test vertices that have already been clipped
+            // off in earlier iterations — once a previously-clipped
+            // ear's tip lies inside the current candidate, the
+            // candidate would be falsely rejected and the algorithm
+            // could fail to find any valid ear, producing a partial
+            // triangulation for legitimate concave inputs (very common
+            // for IfcArbitraryClosedProfileDef cross-sections).
+            // Iterate only over vertices still part of `idx`.
             let mut clean = true;
-            for (j, p) in points.iter().enumerate() {
+            for &j in &idx {
                 if j == i_prev || j == i_curr || j == i_next {
                     continue;
                 }
-                if point_in_triangle(*p, a, b, c) {
+                if point_in_triangle(points[j], a, b, c) {
                     clean = false;
                     break;
                 }
@@ -655,6 +664,55 @@ mod tests {
                 0.5 * ((pb[0] - pa[0]) * (pc[1] - pa[1]) - (pb[1] - pa[1]) * (pc[0] - pa[0])).abs();
         }
         assert!((sum - 3.0).abs() < 1e-12);
+    }
+
+    /// Star-shaped (highly concave) polygon — the classic worst case
+    /// for ear clipping. Without the "iterate only over active
+    /// vertices" fix, previously-clipped tips would falsely reject
+    /// otherwise-valid ears and produce a partial triangulation.
+    #[test]
+    fn highly_concave_star_polygon_triangulates_completely() {
+        // 5-pointed star: alternating outer (r=1) and inner (r=0.4)
+        // vertices around the unit circle. 10 vertices total, so the
+        // correct triangulation has n-2 = 8 triangles.
+        let n_points = 10;
+        let outer_r = 1.0;
+        let inner_r = 0.4;
+        let mut pts = Vec::with_capacity(n_points);
+        for i in 0..n_points {
+            let theta = (i as f64) / (n_points as f64) * std::f64::consts::TAU;
+            let r = if i.is_multiple_of(2) {
+                outer_r
+            } else {
+                inner_r
+            };
+            pts.push([r * theta.cos(), r * theta.sin()]);
+        }
+        let prof = ArbitraryClosedProfile { points: pts }.evaluate();
+        let polygon_area = prof.signed_area();
+        let tris = triangulate_polygon_2d(&prof.points);
+        // Must produce exactly n-2 triangles (no partial output).
+        assert_eq!(
+            tris.len(),
+            n_points - 2,
+            "concave star triangulated incompletely: got {} tris (expected {})",
+            tris.len(),
+            n_points - 2
+        );
+        // Sum of triangle areas must equal the polygon area exactly
+        // (modulo float epsilon) — proves we didn't bail out early.
+        let mut sum = 0.0;
+        for [a, b, c] in tris {
+            let pa = prof.points[a as usize];
+            let pb = prof.points[b as usize];
+            let pc = prof.points[c as usize];
+            sum +=
+                0.5 * ((pb[0] - pa[0]) * (pc[1] - pa[1]) - (pb[1] - pa[1]) * (pc[0] - pa[0])).abs();
+        }
+        assert!(
+            (sum - polygon_area.abs()).abs() < 1e-12,
+            "triangulated area {sum} != polygon area {polygon_area}"
+        );
     }
 
     /// A 200×100×3000 mm rectangular wall (extruded along +Z by 3 m)

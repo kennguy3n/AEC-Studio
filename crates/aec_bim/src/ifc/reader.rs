@@ -26,7 +26,7 @@
 //! IFC4 implementation.
 
 use std::collections::HashMap;
-use std::io::BufRead;
+use std::io::{BufRead, Read};
 
 use thiserror::Error;
 
@@ -498,25 +498,26 @@ impl IfcReader {
         })
     }
 
-    /// Streaming variant of [`IfcReader::from_string`].
+    /// Convenience wrapper around [`IfcReader::from_string`] that
+    /// accepts any `BufRead`.
     ///
-    /// Reads logical STEP records line-by-line from `reader` so
-    /// even multi-gigabyte external IFC files can be ingested
-    /// without `read_to_string`-ing the whole file. Internally
-    /// this still indexes the records (the IFC cross-reference
-    /// graph requires it), so peak RAM is bounded by the parsed
-    /// record set rather than the on-disk byte count.
+    /// **Memory profile**: this method is API-streaming but NOT
+    /// memory-streaming — it buffers the entire input into a
+    /// `String` before parsing because [`IfcReader::from_string`]
+    /// needs random access to resolve forward references in the
+    /// STEP cross-reference graph (e.g. `#42` referring to an
+    /// entity defined later in the file). Peak RAM is therefore
+    /// roughly `file_size + indexed_record_set`, the same as
+    /// reading the whole file into a `String` yourself.
     ///
-    /// For genuinely streaming record-by-record consumption,
-    /// use [`IfcReader::iter`] which yields one [`StepRecord`]
-    /// at a time without building the cross-reference indexes.
-    pub fn from_reader<R: BufRead>(reader: R) -> IfcReadResult<IfcSnapshot> {
+    /// For genuinely memory-streaming consumption that yields one
+    /// [`StepRecord`] at a time without building cross-reference
+    /// indexes (suitable for multi-gigabyte IFC ingest where you
+    /// only need per-record processing), use [`IfcReader::iter`]
+    /// instead.
+    pub fn from_reader<R: Read>(mut reader: R) -> IfcReadResult<IfcSnapshot> {
         let mut buf = String::new();
-        for line in reader.lines() {
-            let line = line?;
-            buf.push_str(&line);
-            buf.push('\n');
-        }
+        reader.read_to_string(&mut buf)?;
         Self::from_string(&buf)
     }
 

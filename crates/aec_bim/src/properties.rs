@@ -26,13 +26,23 @@ pub enum PropertyValue {
     Label(String),
     /// Opaque IFC measure type AEC Studio doesn't model natively
     /// (e.g. `IfcMassDensityMeasure`, `IfcFrequencyMeasure`,
-    /// `IfcCountMeasure`). The reader stores the original measure
-    /// tag (without the `IFC` prefix and case-normalised, e.g.
-    /// `"MassDensityMeasure"`) and the raw STEP value literal so
-    /// the writer can round-trip the property losslessly without
-    /// having to enumerate every IFC measure type in this enum.
+    /// `IfcCountMeasure`). The reader stores the measure tag in the
+    /// uppercase STEP form (verbatim from the file, e.g.
+    /// `"IFCMASSDENSITYMEASURE"`) together with the raw STEP value
+    /// literal so the writer can round-trip the property losslessly
+    /// without having to enumerate every IFC measure type in this
+    /// enum. Recovering the IFC4 canonical camelCase spelling (e.g.
+    /// `"IfcMassDensityMeasure"`) from the uppercase STEP form would
+    /// require a dictionary; the writer normalises with
+    /// `to_ascii_uppercase` either way, so round-tripping is exact
+    /// regardless of which case the caller stored.
     Other {
-        /// IFC measure-type name (e.g. `"IfcMassDensityMeasure"`).
+        /// IFC measure-type tag as it appears in the STEP file —
+        /// uppercased including the `IFC` prefix (e.g.
+        /// `"IFCMASSDENSITYMEASURE"`). Programmatic constructors may
+        /// also use the canonical camelCase spelling (e.g.
+        /// `"IfcMassDensityMeasure"`); the writer uppercases before
+        /// emitting either way.
         measure: String,
         /// Raw STEP literal as parsed (e.g. `"2400.0"`, `"'kg/m3'"`,
         /// `".T."`). The writer emits this back verbatim inside the

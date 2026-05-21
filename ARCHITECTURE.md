@@ -526,7 +526,7 @@ crates/aec_governor/
 | **Low** | Dual-core / 4-thread x86 or older M1 | 4–6 GB | None / integrated | Bonsai 1.7B Q4_K_M | PBR preview only, path tracer "Quick" (CPU fallback) |
 | **Medium** | Modern 6-core x86 or M2 | 8–12 GB | Integrated or low-end discrete | Bonsai 1.7B / 4B | Path tracer "Standard" |
 | **High** | 8+ cores or M2 Pro / M3 | 16–32 GB | RTX 3060 / Apple GPU 10-core+ | Bonsai 4B | Path tracer "High" |
-| **Pro** | 12+ cores / Threadripper / M3 Max | 32+ GB | RTX 4070+ or Apple GPU 30-core+ | Bonsai 8B | Cycles "Studio" |
+| **Pro** | 12+ cores / Threadripper / M3 Max | 32+ GB | RTX 4070+ or Apple GPU 30-core+ | Bonsai 8B | Path tracer "Studio" |
 
 The profile is detected at first run and re-evaluated when the user changes the runtime configuration. Users can override the recommended tier but the governor logs and surfaces the override.
 
@@ -593,8 +593,8 @@ User clicks "Render"
 
 | Preset | Engine | Samples | Denoise | Resolution scale | Notes |
 |---|---|---|---|---|---|
-| Quick | Cycles | 32 | OIDN | 0.75× | Fast looks |
-| Standard | Cycles | 128 | OIDN | 1.0× | Daily delivery |
+| Quick | Path tracer | 32 | Bilateral / NLM | 0.75× | Fast looks |
+| Standard | Path tracer | 128 | Bilateral / NLM | 1.0× | Daily delivery |
 | High | Path tracer | 256 | Bilateral / NLM | 1.0× | Client hero |
 | Studio | Path tracer | 1024 | Bilateral / NLM | 1.0× | Print-quality |
 | Realtime Preview | PBR rasterizer | n/a | — | 0.5–1.0× | Real-time-ish viewport |
@@ -807,7 +807,7 @@ Encryption uses SQLCipher with **AES-256 page-level** and per-project keys. Cont
 | Native addon | C++ N-API addon |
 | AI runtime | LlamaCppAdapter |
 | CPU-only | AVX2 minimum, AVX-VNNI / AVX-512 VNNI when available |
-| CPU+GPU | Vulkan / CUDA backend for inference; Cycles GPU CUDA/OptiX |
+| CPU+GPU | Vulkan / CUDA backend for inference; native wgpu path tracer on Vulkan / DX12 / Metal |
 | Render GPU | wgpu D3D12 (default) or Vulkan |
 | Packaging | electron-builder, `.exe` (NSIS) and `.msi` |
 | Code signing | EV code-signing cert via Authenticode |
@@ -820,7 +820,7 @@ Encryption uses SQLCipher with **AES-256 page-level** and per-project keys. Cont
 | Native addon | N-API addon (x86_64) |
 | AI runtime | LlamaCppAdapter |
 | CPU-only | AVX2 minimum, AVX-VNNI / AVX-512 VNNI when available (surfaced by `aec_governor::profiler`) |
-| CPU+GPU | Vulkan for inference; Cycles GPU via Vulkan or CUDA on NVIDIA |
+| CPU+GPU | Vulkan for inference; native wgpu path tracer on Vulkan / DX12 / Metal |
 | Render GPU | wgpu Vulkan backend |
 | GPU detection | `/proc/driver/nvidia/version` → `lspci -mm` → `vulkaninfo --summary` (best-effort cascade) |
 | Packaging | electron-builder, AppImage + `.deb`, optional Snap (`packaging/linux/`) |
@@ -833,7 +833,7 @@ Encryption uses SQLCipher with **AES-256 page-level** and per-project keys. Cont
 | **Low** | 4–6 GB | Bonsai 1.7B Q4_K_M only, PBR preview, single render job |
 | **Medium** | 8–12 GB | Bonsai 1.7B / 4B, path tracer "Standard" |
 | **High** | 16–32 GB | Bonsai 4B always-on, path tracer "High" with GPU denoise |
-| **Pro** | 32+ GB | Bonsai 8B always-on, Cycles "Studio", multi-job render queue |
+| **Pro** | 32+ GB | Bonsai 8B always-on, path tracer "Studio", multi-job render queue |
 
 ---
 
