@@ -743,9 +743,22 @@ impl HalfSpace {
 }
 
 /// `IfcBooleanClippingResult`: subtract a half-space from a solid.
-/// Applied per-triangle by clipping each triangle against the
-/// half-space plane (Sutherland-Hodgman polygon clipping
-/// specialised for triangles).
+/// Applied per-triangle by Sutherland-Hodgman polygon clipping for
+/// the body geometry, **plus** a second pass that closes the newly
+/// exposed cut face with a cap polygon so the output remains
+/// watertight — a precondition for [`Mesh::signed_volume`] to match
+/// the actual remaining solid's volume, which BIM quantity take-off
+/// (`IfcQuantityVolume` on a clipped wall) relies on.
+///
+/// Per-triangle clipping alone is open at the cut, which is fine for
+/// visual rendering but produces undefined `signed_volume()` results.
+/// The cap pass collects the in→out / out→in intersection segment
+/// from every partially-clipped triangle, chains the segments into
+/// closed loops by directed-graph walk (the intersection of a plane
+/// with a closed manifold is one or more closed curves), projects
+/// each loop onto a 2D basis on the clip plane, and ear-clip
+/// triangulates it with winding consistent with `+clip.normal` as
+/// the outward normal of the cap face.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BooleanClipping {
     pub operand: Mesh,
@@ -753,7 +766,14 @@ pub struct BooleanClipping {
 }
 
 impl BooleanClipping {
-    pub fn tessellate(&self) -> Mesh {
+    /// Tessellate the boolean subtraction. See the struct-level doc
+    /// for the algorithm. Returns
+    /// [`TessellatorError::PartialTriangulation`] only if a cap loop
+    /// fails to triangulate (self-intersecting after projection —
+    /// indicates malformed input). Open chains (operand not a closed
+    /// manifold) emit body geometry without a cap rather than
+    /// erroring, matching the pre-existing best-effort semantics.
+    pub fn tessellate(&self) -> TessellatorResult<Mesh> {
         let mut out = Mesh::default();
         // Cache: for each vertex of the input mesh, where does it
         // end up in `out.positions`? Borderline triangles produce
@@ -770,6 +790,11 @@ impl BooleanClipping {
                 remap[idx as usize] = Some(new_idx);
                 new_idx
             };
+        // Cap-side edges collected from partial clips. Each pair is
+        // `(in→out intersection, out→in intersection)` in the original
+        // triangle's CCW order; chaining these in `close_cap` recovers
+        // the cap polygon(s) on the clip plane.
+        let mut cap_edges: Vec<([f64; 3], [f64; 3])> = Vec::new();
         for [a, b, c] in &self.operand.indices {
             let pa = self.operand.positions[*a as usize];
             let pb = self.operand.positions[*b as usize];
@@ -797,6 +822,8 @@ impl BooleanClipping {
                         (*c, pc, inside[2]),
                     ];
                     let mut clipped: Vec<[f64; 3]> = Vec::with_capacity(4);
+                    let mut in_to_out: Option<[f64; 3]> = None;
+                    let mut out_to_in: Option<[f64; 3]> = None;
                     for k in 0..3 {
                         let (_, p_curr, in_curr) = verts[k];
                         let (_, p_next, in_next) = verts[(k + 1) % 3];
@@ -805,7 +832,13 @@ impl BooleanClipping {
                         }
                         if in_curr != in_next {
                             // Edge crosses the plane.
-                            clipped.push(self.clip.intersect(p_curr, p_next));
+                            let ip = self.clip.intersect(p_curr, p_next);
+                            clipped.push(ip);
+                            if in_curr && !in_next {
+                                in_to_out = Some(ip);
+                            } else {
+                                out_to_in = Some(ip);
+                            }
                         }
                     }
                     // Triangulate the resulting polygon as a fan.
@@ -819,11 +852,211 @@ impl BooleanClipping {
                     for k in 1..(clipped.len() - 1) {
                         out.push_tri(base, base + k as u32, base + (k + 1) as u32);
                     }
+                    if let (Some(from), Some(to)) = (in_to_out, out_to_in) {
+                        cap_edges.push((from, to));
+                    }
                 }
             }
         }
-        out
+        if !cap_edges.is_empty() {
+            self.close_cap(&mut out, &cap_edges)?;
+        }
+        Ok(out)
     }
+
+    /// Close the cut face by triangulating closed loops formed by the
+    /// directed `cap_edges`. Open chains (which mean the operand was
+    /// not a closed solid) are silently dropped — visible body
+    /// geometry is still correct, just without the cap closure that
+    /// watertightness would require.
+    fn close_cap(
+        &self,
+        out: &mut Mesh,
+        cap_edges: &[([f64; 3], [f64; 3])],
+    ) -> TessellatorResult<()> {
+        // 1. Intern cap-edge endpoints into a deduplicated position
+        //    list via an `EPS`-bucketed lookup. Two endpoints that
+        //    coincide within `EPS` mm collapse to one logical vertex.
+        //    The 3×3×3-neighbourhood scan handles the cell-boundary
+        //    case (same rationale as `Mesh::welded`).
+        const EPS: f64 = 1.0e-6;
+        let inv_eps = 1.0 / EPS;
+        let key = |p: [f64; 3]| -> (i64, i64, i64) {
+            (
+                (p[0] * inv_eps).floor() as i64,
+                (p[1] * inv_eps).floor() as i64,
+                (p[2] * inv_eps).floor() as i64,
+            )
+        };
+        use std::collections::HashMap;
+        let mut bucket: HashMap<(i64, i64, i64), Vec<u32>> = HashMap::new();
+        let mut positions: Vec<[f64; 3]> = Vec::new();
+        let intern = |p: [f64; 3],
+                      positions: &mut Vec<[f64; 3]>,
+                      bucket: &mut HashMap<(i64, i64, i64), Vec<u32>>|
+         -> u32 {
+            let k = key(p);
+            for dx in -1..=1i64 {
+                for dy in -1..=1i64 {
+                    for dz in -1..=1i64 {
+                        let nk = (k.0 + dx, k.1 + dy, k.2 + dz);
+                        if let Some(indices) = bucket.get(&nk) {
+                            for &i in indices {
+                                let q = positions[i as usize];
+                                if (p[0] - q[0]).abs() <= EPS
+                                    && (p[1] - q[1]).abs() <= EPS
+                                    && (p[2] - q[2]).abs() <= EPS
+                                {
+                                    return i;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let i = positions.len() as u32;
+            positions.push(p);
+            bucket.entry(k).or_default().push(i);
+            i
+        };
+        let mut indexed_edges: Vec<(u32, u32)> = Vec::with_capacity(cap_edges.len());
+        for &(from, to) in cap_edges {
+            let i = intern(from, &mut positions, &mut bucket);
+            let j = intern(to, &mut positions, &mut bucket);
+            if i != j {
+                indexed_edges.push((i, j));
+            }
+        }
+        if indexed_edges.is_empty() {
+            return Ok(());
+        }
+        // 2. Walk closed loops over the directed edges.
+        let mut by_start: HashMap<u32, Vec<usize>> = HashMap::new();
+        for (idx, &(i, _)) in indexed_edges.iter().enumerate() {
+            by_start.entry(i).or_default().push(idx);
+        }
+        let mut visited = vec![false; indexed_edges.len()];
+        let mut loops: Vec<Vec<u32>> = Vec::new();
+        for start_edge in 0..indexed_edges.len() {
+            if visited[start_edge] {
+                continue;
+            }
+            let start_vertex = indexed_edges[start_edge].0;
+            let mut cur = start_edge;
+            let mut loop_verts: Vec<u32> = Vec::new();
+            loop {
+                if visited[cur] {
+                    // Re-entered a previously-walked edge before
+                    // closing — this segment forms an open chain;
+                    // discard it.
+                    break;
+                }
+                visited[cur] = true;
+                loop_verts.push(indexed_edges[cur].0);
+                let next_vertex = indexed_edges[cur].1;
+                if next_vertex == start_vertex {
+                    loops.push(loop_verts);
+                    break;
+                }
+                let next = by_start
+                    .get(&next_vertex)
+                    .and_then(|edges| edges.iter().copied().find(|&e| !visited[e]));
+                match next {
+                    Some(n) => cur = n,
+                    None => break, // open chain — operand not closed
+                }
+            }
+        }
+        if loops.is_empty() {
+            return Ok(());
+        }
+        // 3. Triangulate each loop on the clip plane. Cap face outward
+        //    normal = `+clip.normal`; loops are reoriented to CCW
+        //    when viewed from `+clip.normal`.
+        let n = cap_normalize(self.clip.normal);
+        let (u_axis, v_axis) = plane_basis(n);
+        for loop_verts in &loops {
+            if loop_verts.len() < 3 {
+                continue;
+            }
+            let pts2d: Vec<[f64; 2]> = loop_verts
+                .iter()
+                .map(|&i| {
+                    let p = positions[i as usize];
+                    [
+                        p[0] * u_axis[0] + p[1] * u_axis[1] + p[2] * u_axis[2],
+                        p[0] * v_axis[0] + p[1] * v_axis[1] + p[2] * v_axis[2],
+                    ]
+                })
+                .collect();
+            let area_2d: f64 = {
+                let mut s = 0.0;
+                let m = pts2d.len();
+                for i in 0..m {
+                    let j = (i + 1) % m;
+                    s += pts2d[i][0] * pts2d[j][1] - pts2d[j][0] * pts2d[i][1];
+                }
+                s * 0.5
+            };
+            let (loop_verts_oriented, pts2d_oriented): (Vec<u32>, Vec<[f64; 2]>) = if area_2d < 0.0
+            {
+                let mut lv = loop_verts.clone();
+                lv.reverse();
+                let mut pp = pts2d;
+                pp.reverse();
+                (lv, pp)
+            } else {
+                (loop_verts.clone(), pts2d)
+            };
+            let tris = triangulate_polygon_2d(&pts2d_oriented)?;
+            let base = out.positions.len() as u32;
+            for &v in &loop_verts_oriented {
+                out.positions.push(positions[v as usize]);
+            }
+            for [a, b, c] in tris {
+                out.push_tri(base + a, base + b, base + c);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Normalise a 3-vector for use as a plane normal. Falls back to
+/// `+Z` for the degenerate (near-zero) case so cap closure on a
+/// malformed `HalfSpace` still produces *some* basis rather than
+/// emitting NaN positions.
+fn cap_normalize(v: [f64; 3]) -> [f64; 3] {
+    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    if len > 1e-12 {
+        [v[0] / len, v[1] / len, v[2] / len]
+    } else {
+        [0.0, 0.0, 1.0]
+    }
+}
+
+/// Build an orthonormal `(u, v)` basis on the plane perpendicular to
+/// `n`. `n` is assumed unit-length. Used for projecting cap-loop 3D
+/// points down to a 2D ear-clip input. Matches the convention used
+/// by [`face_basis`] for `FacetedBrep` faces.
+fn plane_basis(n: [f64; 3]) -> ([f64; 3], [f64; 3]) {
+    let ref_axis = if n[0].abs() < 0.9 {
+        [1.0, 0.0, 0.0]
+    } else {
+        [0.0, 1.0, 0.0]
+    };
+    let mut u = [
+        ref_axis[1] * n[2] - ref_axis[2] * n[1],
+        ref_axis[2] * n[0] - ref_axis[0] * n[2],
+        ref_axis[0] * n[1] - ref_axis[1] * n[0],
+    ];
+    let ul = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt().max(1e-12);
+    u = [u[0] / ul, u[1] / ul, u[2] / ul];
+    let v = [
+        n[1] * u[2] - n[2] * u[1],
+        n[2] * u[0] - n[0] * u[2],
+        n[0] * u[1] - n[1] * u[0],
+    ];
+    (u, v)
 }
 
 // ---------------------------------------------------------------------
@@ -1040,10 +1273,16 @@ mod tests {
     }
 
     /// Clipping a 2×2×2 cube with a horizontal half-space at
-    /// z = 1 (clip everything above the plane) produces a closed
-    /// mesh whose triangle vertices all satisfy z ≤ 1.
+    /// z = 0 (clip everything above the plane) produces a closed,
+    /// watertight mesh of the bottom half — every output vertex
+    /// satisfies `z ≤ 0`, and (per the cap-closure pass) the mesh's
+    /// signed volume matches the bottom half's actual volume
+    /// (`2 × 2 × 1 = 4`). The pre-PR5-wave-7 implementation only
+    /// performed per-triangle clipping and produced an open mesh; the
+    /// volume invariant locked in here is the regression guard for
+    /// the cap closure described in [`BooleanClipping`].
     #[test]
-    fn boolean_clipping_subtracts_half_space() {
+    fn boolean_clipping_produces_watertight_solid_with_correct_volume() {
         // Cube spanning [-1,1]³.
         let v = [
             [-1.0, -1.0, -1.0],
@@ -1087,7 +1326,8 @@ mod tests {
             operand: cube,
             clip,
         }
-        .tessellate();
+        .tessellate()
+        .expect("clipped cube tessellates");
         // Every output vertex must lie at or below z = 0.
         for p in &clipped.positions {
             assert!(
@@ -1097,8 +1337,18 @@ mod tests {
                 p
             );
         }
-        // The clipped mesh should still have triangles.
+        // Body geometry survives clipping.
         assert!(!clipped.indices.is_empty());
+        // Cap closure: the resulting solid must be watertight. A
+        // 2×2×2 cube clipped at z = 0 keeps the bottom half whose
+        // volume is 4 (2 × 2 × 1). The divergence-theorem
+        // `signed_volume` is positive for CCW-from-outside winding
+        // (and would be near zero / wrong for an open mesh).
+        let vol = clipped.signed_volume();
+        assert!(
+            (vol.abs() - 4.0).abs() < 1e-6,
+            "watertight half-cube must have |volume| = 4, got {vol}"
+        );
     }
 
     /// Boolean clip that removes everything (plane far below the
@@ -1132,8 +1382,50 @@ mod tests {
             operand: cube,
             clip,
         }
-        .tessellate();
+        .tessellate()
+        .expect("empty boolean tessellates without error");
         assert!(out.indices.is_empty());
+    }
+
+    /// `BooleanClipping` must work on solids produced by
+    /// `ExtrudedAreaSolid` too (shared vertex indices on edges).
+    /// A 1×1×2 box extruded along +Z and clipped at z = 1 should
+    /// retain a 1×1×1 cube of volume 1.
+    #[test]
+    fn boolean_clipping_on_extrusion_preserves_volume() {
+        let solid = ExtrudedAreaSolid {
+            profile: RectangleProfile {
+                x_dim: 1.0,
+                y_dim: 1.0,
+            }
+            .evaluate(),
+            direction: [0.0, 0.0, 1.0],
+            depth: 2.0,
+        };
+        let mesh = solid.tessellate().expect("extrusion tessellates");
+        // Pre-clip volume = 1 × 1 × 2 = 2.
+        assert!((mesh.signed_volume().abs() - 2.0).abs() < 1e-9);
+        let clip = HalfSpace {
+            point: [0.0, 0.0, 1.0],
+            normal: [0.0, 0.0, 1.0],
+        };
+        let clipped = BooleanClipping {
+            operand: mesh,
+            clip,
+        }
+        .tessellate()
+        .expect("clipped extrusion tessellates");
+        // Post-clip volume = 1 × 1 × 1 = 1 (kept the z ∈ [0, 1]
+        // bottom half of the 2-tall box).
+        let vol = clipped.signed_volume();
+        assert!(
+            (vol.abs() - 1.0).abs() < 1e-6,
+            "clipped extrusion volume must be 1, got {vol}"
+        );
+        // No vertex above the clip plane.
+        for p in &clipped.positions {
+            assert!(p[2] <= 1.0 + 1e-9);
+        }
     }
 
     /// A degenerate polygon where every triangle is collinear

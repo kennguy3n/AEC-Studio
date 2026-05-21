@@ -19,8 +19,9 @@ use crate::tier::HardwareTier;
 pub enum PresetKey {
     /// Native PBR rasterizer realtime preview (replaces the pre-Phase-9
     /// EEVEE-via-Blender preview). On-wire id stays `"eevee_preview"`
-    /// for backward compatibility.
-    #[serde(alias = "eevee_preview", rename = "eevee_preview")]
+    /// for backward compatibility — `rename` covers both directions of
+    /// (de)serialization, so no `alias` is needed.
+    #[serde(rename = "eevee_preview")]
     RealtimePreview,
     Quick,
     Standard,
@@ -57,9 +58,10 @@ pub struct RenderPolicy {
     /// to its offscreen render target before upscaling to the viewport.
     /// Lower values trade fidelity for latency on tighter hardware.
     ///
-    /// Serializes as `eevee_resolution_scale` and accepts that alias on
+    /// Serializes as `eevee_resolution_scale` and accepts that key on
     /// deserialize so existing `.aecstudio` projects continue to load.
-    #[serde(alias = "eevee_resolution_scale", rename = "eevee_resolution_scale")]
+    /// `rename` covers both directions, so no separate `alias` is needed.
+    #[serde(rename = "eevee_resolution_scale")]
     pub preview_resolution_scale: f32,
     pub viewport_framebuffer_scale: f32,
     pub allow_background_ai_during_render: bool,
