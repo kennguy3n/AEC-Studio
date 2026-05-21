@@ -480,9 +480,15 @@ fn render_tile(
                 let radiance = trace_path(scene, ray, config, &mut rng);
                 accum += radiance;
             }
-            let avg = accum / config.samples_per_pixel as f32;
+            // Store `[r_sum, g_sum, b_sum, sample_count]` so the output
+            // matches the documented `AccumulationBuffer` "sums + count"
+            // convention. Pre-averaging (`avg, 1.0`) would silently produce
+            // wrong sample counts if a caller ever additively merges tiles
+            // (e.g. for progressive refinement); keep the invariant uniform
+            // with `render_tile_pass` so the buffer is composable.
+            let n = config.samples_per_pixel.max(1) as f32;
             let li = ly * tw + lx;
-            buf[li] = [avg.x, avg.y, avg.z, 1.0];
+            buf[li] = [accum.x, accum.y, accum.z, n];
         }
     }
     buf

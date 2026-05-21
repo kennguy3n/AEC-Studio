@@ -150,10 +150,20 @@ fn traverse(ray_origin: vec3<f32>, ray_dir: vec3<f32>, t_max_in: f32) -> Hit {
     if (params.bvh_count == 0u) {
         return best;
     }
+    // Sign-preserving safe inverse, matching the CPU `safe_inverse` in
+    // `intersect.rs`. A finite, signed magnitude is used in place of +/-inf
+    // so that the subsequent multiplication `(lo - origin) * inv_dir` never
+    // produces NaN when the origin lies exactly on a slab face. Preserving
+    // the sign keeps the slab test correct regardless of `t_max` magnitude.
+    let safe_x = select(1.0 / ray_dir.x, sign(ray_dir.x) * 1.0e30, abs(ray_dir.x) < 1.0e-12);
+    let safe_y = select(1.0 / ray_dir.y, sign(ray_dir.y) * 1.0e30, abs(ray_dir.y) < 1.0e-12);
+    let safe_z = select(1.0 / ray_dir.z, sign(ray_dir.z) * 1.0e30, abs(ray_dir.z) < 1.0e-12);
+    // `sign(0)` is 0 in WGSL — guard so an exactly-zero component still
+    // produces a finite positive magnitude rather than 0.
     let inv_dir = vec3<f32>(
-        select(1.0 / ray_dir.x, 1.0e30, abs(ray_dir.x) < 1.0e-12),
-        select(1.0 / ray_dir.y, 1.0e30, abs(ray_dir.y) < 1.0e-12),
-        select(1.0 / ray_dir.z, 1.0e30, abs(ray_dir.z) < 1.0e-12),
+        select(safe_x, 1.0e30, safe_x == 0.0),
+        select(safe_y, 1.0e30, safe_y == 0.0),
+        select(safe_z, 1.0e30, safe_z == 0.0),
     );
     var stack: array<u32, 64>;
     var sp: i32 = 0;
