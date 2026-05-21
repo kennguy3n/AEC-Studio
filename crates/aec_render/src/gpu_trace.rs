@@ -119,8 +119,15 @@ struct ParamsGpu {
     seed: u32,
     sky_color: [f32; 3],
     sky_strength: f32,
+    /// Camera projection enum encoded for the WGSL shader:
+    /// 0 = perspective, 1 = equirectangular. Must match
+    /// [`crate::path_trace::CameraProjection`].
+    projection: u32,
+    /// Padding so the struct ends on a 16-byte (`vec4`) boundary, as
+    /// required by WGSL uniform layout rules.
+    _pad_projection: [u32; 3],
 }
-const _: () = assert!(std::mem::size_of::<ParamsGpu>() == 112);
+const _: () = assert!(std::mem::size_of::<ParamsGpu>() == 128);
 
 // ---- Scene -> GPU buffers ---------------------------------------------
 
@@ -464,6 +471,10 @@ impl GpuPathTracer {
         };
 
         let camera_frame = build_camera_frame(camera);
+        let projection = match config.projection {
+            crate::path_trace::CameraProjection::Perspective => 0u32,
+            crate::path_trace::CameraProjection::Equirectangular => 1u32,
+        };
         let params = ParamsGpu {
             width: config.width,
             height: config.height,
@@ -483,6 +494,8 @@ impl GpuPathTracer {
             seed: 0xC0FFEE,
             sky_color: buffers.sky_color,
             sky_strength: buffers.sky_strength,
+            projection,
+            _pad_projection: [0; 3],
         };
         let params_buf = self
             .device
@@ -750,7 +763,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<TriangleGpu>(), 48);
         assert_eq!(std::mem::size_of::<MaterialGpu>(), 48);
         assert_eq!(std::mem::size_of::<LightGpu>(), 96);
-        assert_eq!(std::mem::size_of::<ParamsGpu>(), 112);
+        assert_eq!(std::mem::size_of::<ParamsGpu>(), 128);
     }
 
     #[test]
@@ -850,6 +863,85 @@ mod tests {
         // dimensions.
         assert_eq!(buf.width, 16);
         assert_eq!(buf.height, 12);
+    }
+
+    #[test]
+    fn gpu_equirectangular_render_matches_cpu_when_gpu_available() {
+        // Regression for PR #12 Devin Review finding BUG_0001: the GPU
+        // shader used to ignore the camera projection and always
+        // generate perspective rays, so a panorama dispatched through
+        // `render_or_fallback` silently produced perspective output on
+        // GPU-equipped machines. With the projection field plumbed
+        // through `ParamsGpu` + WGSL, the GPU equirectangular path must
+        // produce output that matches the CPU reference within a tight
+        // PSNR-like tolerance.
+        //
+        // Headless CI without a GPU adapter simply exits early — the
+        // CPU path is already covered by
+        // `crate::path_trace::tests::equirectangular_camera_covers_full_sphere`.
+        let Ok(tracer) = GpuPathTracer::try_new() else {
+            return;
+        };
+        let scene = quad_scene();
+        let camera = RenderCamera {
+            id: "pano".into(),
+            position_mm: [0.0, 1500.0, 0.0],
+            target_mm: [0.0, 1500.0, -1000.0],
+            focal_length_mm: 35.0,
+            exposure_ev: 0.0,
+            white_balance_k: 5500.0,
+            aperture_f: 5.6,
+        };
+        // Tiny 8x4 panorama — keeps the test fast but still covers the
+        // full sphere, so any divergence between CPU and GPU primary
+        // rays manifests as a per-pixel radiance difference.
+        let cfg = PathTraceConfig {
+            width: 8,
+            height: 4,
+            samples_per_pixel: 1,
+            max_bounces: 1,
+            tile_size: 8,
+            russian_roulette_min_bounces: 1,
+            adaptive_threshold: 0.0,
+            projection: crate::path_trace::CameraProjection::Equirectangular,
+        };
+        let gpu = tracer.render(&scene, &camera, &cfg, None, None);
+        let cpu = crate::path_trace::render(&scene, &camera, &cfg, None, None);
+
+        // Sanity: dimensions agree.
+        assert_eq!(gpu.width, cpu.width);
+        assert_eq!(gpu.height, cpu.height);
+
+        // Compare averaged radiance per pixel. GPU and CPU use
+        // different RNG sequences (host-PCG vs CPU rayon), so direct
+        // equality won't hold — instead we require the per-channel
+        // mean-squared error to stay below a generous threshold. The
+        // important invariant is that the bug fix produces a panorama
+        // (escaped rays sample the sky / sun in the same hemisphere
+        // pattern), not perspective output (which would hit only the
+        // forward cone).
+        let gpu_avg = gpu.average_rgb();
+        let cpu_avg = cpu.average_rgb();
+        let mut sse = 0.0_f64;
+        for (g, c) in gpu_avg.iter().zip(cpu_avg.iter()) {
+            for ch in 0..3 {
+                let d = (g[ch] - c[ch]) as f64;
+                sse += d * d;
+            }
+        }
+        let mse = sse / (gpu_avg.len() as f64 * 3.0);
+        // Generous threshold: equirectangular rays from CPU vs GPU
+        // sample slightly different jitter, but the radiance
+        // distribution should agree to within 0.5 in linear radiance
+        // for this synthetic scene. A perspective-projecting GPU
+        // shader (the bug) would produce MSE well above 1.0 because
+        // most pixels would never escape the camera cone and would
+        // therefore see a different mix of floor + sky than the CPU's
+        // full-sphere equirectangular sample.
+        assert!(
+            mse < 0.5,
+            "GPU equirectangular output diverges from CPU reference: mse={mse}"
+        );
     }
 
     #[test]

@@ -17,7 +17,7 @@
 //!    CPU `rayon`-tiled path tracer otherwise.
 //! 4. If `preset.config.denoise` is true, run the bilateral denoiser
 //!    over the averaged RGB buffer.
-//! 5. Tone-map (Reinhard + gamma 2.2 via [`AccumulationBuffer::into_srgb8`])
+//! 5. Tone-map (Reinhard + gamma 2.2 via [`AccumulationBuffer::as_srgb8`])
 //!    and write the result as an sRGB-8 PNG.
 //!
 //! ## Cancellation
@@ -232,7 +232,8 @@ pub(crate) fn path_trace_config_from_preset(
 /// equivalent to the legacy Blender denoiser's post-process pass.
 fn encode_srgb8(buffer: &AccumulationBuffer, denoise: bool) -> Vec<u8> {
     if !denoise {
-        return buffer.clone().into_srgb8();
+        // Borrowing path — no full-buffer clone for the common case.
+        return buffer.as_srgb8();
     }
     let avg = buffer.average_rgb();
     let denoised = crate::denoise::bilateral_denoise(
@@ -248,7 +249,7 @@ fn encode_srgb8(buffer: &AccumulationBuffer, denoise: bool) -> Vec<u8> {
 
     let mut out = Vec::with_capacity(denoised.pixels.len() * 3);
     for p in &denoised.pixels {
-        // Match `AccumulationBuffer::into_srgb8`: Reinhard + gamma 2.2.
+        // Match `AccumulationBuffer::as_srgb8`: Reinhard + gamma 2.2.
         let r = (p[0].max(0.0) / (1.0 + p[0].max(0.0))).powf(1.0 / 2.2);
         let g = (p[1].max(0.0) / (1.0 + p[1].max(0.0))).powf(1.0 / 2.2);
         let b = (p[2].max(0.0) / (1.0 + p[2].max(0.0))).powf(1.0 / 2.2);

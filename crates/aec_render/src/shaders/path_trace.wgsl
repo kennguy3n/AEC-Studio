@@ -75,6 +75,12 @@ struct Params {
     seed: u32,
     sky_color: vec3<f32>,
     sky_strength: f32,
+    // Camera projection: 0 = perspective, 1 = equirectangular.
+    // Must mirror `crate::path_trace::CameraProjection` discriminants.
+    // WGSL auto-pads the struct end to the max-field alignment (16
+    // bytes here, set by `vec3<f32>`), so the on-device size is 128
+    // bytes — matches `ParamsGpu` in `gpu_trace.rs` (also 128).
+    projection: u32,
 }
 
 @group(0) @binding(0) var<storage, read> bvh_nodes: array<BvhNodeGpu>;
@@ -300,11 +306,34 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     var accum_rgb = vec3<f32>(0.0);
     for (var s: u32 = 0u; s < params.samples_per_pixel; s = s + 1u) {
-        let nx = (f32(gid.x) + rand_f32(&rng_state)) / f32(params.width) * 2.0 - 1.0;
-        let ny = 1.0 - (f32(gid.y) + rand_f32(&rng_state)) / f32(params.height) * 2.0;
-        let dir_view = normalize(vec3<f32>(nx * params.focal_half_h * params.aspect,
+        let jx = rand_f32(&rng_state);
+        let jy = rand_f32(&rng_state);
+        var dir_view: vec3<f32>;
+        if (params.projection == 1u) {
+            // Equirectangular: u maps to longitude [0, 2pi], v maps to
+            // latitude [0, pi]. Must match
+            // `crate::path_trace::equirectangular_dir` so CPU and GPU
+            // produce identical panoramas.
+            let u = (f32(gid.x) + jx) / max(f32(params.width), 1.0);
+            let v = (f32(gid.y) + jy) / max(f32(params.height), 1.0);
+            let phi = u * 6.28318530717958647692;   // TAU
+            let theta = v * 3.14159265358979323846; // PI
+            let sin_theta = sin(theta);
+            // Local frame: +Y up, +X right, -Z forward (camera looks
+            // toward -Z in view space, so longitude pi must hit -Z to
+            // keep the panorama centred on the camera forward).
+            dir_view = vec3<f32>(sin_theta * sin(phi),
+                                  cos(theta),
+                                  -sin_theta * cos(phi));
+        } else {
+            // Perspective: pinhole projection through the camera
+            // focal length / aspect ratio.
+            let nx = (f32(gid.x) + jx) / f32(params.width) * 2.0 - 1.0;
+            let ny = 1.0 - (f32(gid.y) + jy) / f32(params.height) * 2.0;
+            dir_view = normalize(vec3<f32>(nx * params.focal_half_h * params.aspect,
                                             ny * params.focal_half_h,
                                             -1.0));
+        }
         let dir_world = normalize(params.camera_right * dir_view.x
                                 + params.camera_up * dir_view.y
                                 - params.camera_forward * dir_view.z);

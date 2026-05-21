@@ -344,6 +344,12 @@ fn split_printf_pattern(pattern: &str) -> Option<(&str, &str)> {
 /// otherwise `None`. We do not shell out — this is a pure directory
 /// probe so it's safe to call inside async runtimes and from test
 /// contexts where mutating `$PATH` is forbidden by lint rules.
+///
+/// A "candidate" is a regular file (not a directory) that is
+/// executable on Unix (any of the user/group/other `x` bits set). On
+/// Windows the candidate must exist and have one of the standard
+/// `.exe`/`.bat`/`.cmd` extensions; the Unix executable-bit check
+/// does not apply.
 fn find_ffmpeg() -> Option<std::path::PathBuf> {
     let path = std::env::var_os("PATH")?;
     let sep = if cfg!(windows) { ';' } else { ':' };
@@ -353,19 +359,42 @@ fn find_ffmpeg() -> Option<std::path::PathBuf> {
             continue;
         }
         let base = std::path::Path::new(dir).join("ffmpeg");
-        if base.exists() {
+        if is_executable_file(&base) {
             return Some(base);
         }
         if cfg!(windows) {
             for ext in ["exe", "bat", "cmd"] {
                 let with = base.with_extension(ext);
-                if with.exists() {
+                if is_executable_file(&with) {
                     return Some(with);
                 }
             }
         }
     }
     None
+}
+
+/// Return true iff `path` exists, is a regular file, and (on Unix)
+/// has at least one of the executable bits set. On Windows we trust
+/// the `.exe`/`.bat`/`.cmd` extension that `find_ffmpeg` already
+/// gated on, so `is_file()` is sufficient.
+fn is_executable_file(path: &std::path::Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Any of user/group/other execute bits set is sufficient.
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -654,6 +683,38 @@ mod tests {
             Some(("frame_", ".png"))
         );
         assert_eq!(super::split_printf_pattern("nopattern.png"), None);
+    }
+
+    #[test]
+    fn find_ffmpeg_rejects_directory_named_ffmpeg() {
+        // Regression: an entry named `ffmpeg` that is a directory (not
+        // a binary) used to satisfy `Path::exists()` and would be
+        // returned by `find_ffmpeg`, leading to a spurious
+        // `Command::new` failure. The hardened lookup must require
+        // (a) regular file + (b) on Unix, executable bit set.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("ffmpeg")).unwrap();
+        assert!(
+            !super::is_executable_file(&tmp.path().join("ffmpeg")),
+            "directory must not be considered an ffmpeg executable"
+        );
+
+        // Plain non-executable file: also rejected on Unix.
+        let non_exec = tmp.path().join("not_ffmpeg");
+        std::fs::write(&non_exec, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&non_exec, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(
+                !super::is_executable_file(&non_exec),
+                "non-executable file must be rejected on Unix"
+            );
+
+            // Same file, executable bit on → accepted.
+            std::fs::set_permissions(&non_exec, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(super::is_executable_file(&non_exec));
+        }
     }
 
     #[test]

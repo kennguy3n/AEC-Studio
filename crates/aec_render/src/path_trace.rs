@@ -270,7 +270,14 @@ impl AccumulationBuffer {
             .collect()
     }
 
-    pub fn into_srgb8(self) -> Vec<u8> {
+    /// Tone-map this buffer to an sRGB-8 byte triplet array without
+    /// taking ownership. For large final renders (e.g. 1920×1080)
+    /// this avoids the ~8 MB allocation that
+    /// [`AccumulationBuffer::into_srgb8`] would force by consuming
+    /// `self`. The tone-mapping pipeline (Reinhard + gamma 2.2) is
+    /// kept identical so the two helpers are byte-for-byte
+    /// equivalent.
+    pub fn as_srgb8(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.pixels.len() * 3);
         for p in &self.pixels {
             let n = p[3].max(1.0);
@@ -286,6 +293,13 @@ impl AccumulationBuffer {
             out.push((b * 255.0).round().clamp(0.0, 255.0) as u8);
         }
         out
+    }
+
+    /// Owning variant of [`AccumulationBuffer::as_srgb8`]. Kept for
+    /// callers that already consume the buffer at the encode site —
+    /// internally it just forwards to `as_srgb8`.
+    pub fn into_srgb8(self) -> Vec<u8> {
+        self.as_srgb8()
     }
 }
 
