@@ -111,11 +111,20 @@ impl PanoramaPipeline {
         let pt_scene = build_path_trace_scene(scene, &self.materials, sky);
 
         // Force 2:1 aspect ratio so each pixel covers equal solid angle.
+        // Equirectangular panoramas REQUIRE width = 2 * height exactly,
+        // otherwise the bottom row covers a slightly different solid
+        // angle than the rest, breaking VR / 360° viewer conventions.
+        // Integer division on odd widths (e.g. 65) silently produces an
+        // off-by-one height (32, giving 65:32 = 2.03:1) so clamp width
+        // down to the nearest even value before deriving height. Stock
+        // presets ship even widths (1024, 2048, 4096), but a caller
+        // wiring a custom resolution_x should not be able to break the
+        // invariant.
         let mut config =
             path_trace_config_from_preset(&preset.config, CameraProjection::Equirectangular);
-        let width = config.width.max(2);
-        // height must be exactly width / 2 for equirectangular.
-        let height = (width / 2).max(1);
+        let width = (config.width.max(2)) & !1u32;
+        // height = width / 2 is now exact (no truncation).
+        let height = width / 2;
         config.width = width;
         config.height = height;
 
@@ -367,6 +376,26 @@ mod tests {
             .unwrap();
         assert_eq!(out.width, 128);
         assert_eq!(out.height, 64);
+    }
+
+    #[test]
+    fn render_clamps_odd_width_to_even_to_preserve_two_to_one_aspect() {
+        // Odd preset width must be clamped down to the nearest even
+        // value so the equirectangular `width = 2 * height` invariant
+        // holds exactly. Without the clamp, 65 px width would produce
+        // 65 x 32 = 2.03:1 aspect, breaking the constant solid-angle
+        // assumption made by every downstream 360° viewer.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut preset = fast_preset();
+        preset.config.resolution_x = 65;
+        preset.config.resolution_y = 65;
+        let pipeline = PanoramaPipeline::new();
+        let out = pipeline
+            .render(&tiny_scene(), &preset, tmp.path().join("p_odd.png"))
+            .unwrap();
+        assert_eq!(out.width, 64);
+        assert_eq!(out.height, 32);
+        assert_eq!(out.width, 2 * out.height);
     }
 
     #[test]
