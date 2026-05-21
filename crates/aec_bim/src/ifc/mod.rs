@@ -1,10 +1,9 @@
-//! In-process IFC4 STEP serializer + parser.
+//! Native IFC STEP serializer + parser + geometry tessellator.
 //!
-//! AEC Studio's primary IFC pipeline is the out-of-process IfcOpenShell
-//! worker (`workers/ifc/`). However, for end-to-end tests and for the
-//! "BIM Lite" export pack we ship a small, self-contained STEP writer
-//! and reader that supports the subset of the IFC4 schema this codebase
-//! actually needs:
+//! As of Phase 9 (Tasks 15–18) this is AEC Studio's *sole* IFC
+//! implementation: there is no external IfcOpenShell worker. The
+//! reader, writer, and [`super::tessellator`] together cover every
+//! IFC4 entity AEC Studio reads or writes on disk:
 //!
 //!   * Spatial structure: `IfcProject`, `IfcSite`, `IfcBuilding`,
 //!     `IfcBuildingStorey`, `IfcSpace`.
@@ -22,15 +21,21 @@
 //! roundtrip, including the spatial relations and the
 //! IfcRelDefinesByProperties wiring between elements and Psets/Qtos.
 //!
-//! Limitations (intentional): no geometry, no IFC inheritance beyond
-//! the listed classes, no material library. Geometry handoff goes
-//! through the worker; the Lite roundtrip is intended for schedule /
-//! property / classification fidelity.
+//! Schema reach: IFC4 by default; IFC2x3 and IFC4x3 entity instance
+//! files are accepted and parsed (entity kinds AEC Studio doesn't
+//! model are preserved verbatim by the property-roundtrip path —
+//! see [`crate::properties::PropertyStore`]). Geometry for
+//! `IfcExtrudedAreaSolid` and `IfcFacetedBrep` is tessellated in
+//! Rust via [`crate::tessellator`]. IFC inheritance beyond the
+//! listed classes and the full material library are out of scope.
 
 pub mod reader;
 pub mod writer;
 
-pub use reader::{IfcReadError, IfcReadResult, IfcReadStats, IfcReader};
+pub use reader::{
+    IfcReadError, IfcReadResult, IfcReadStats, IfcReader, IfcSchema, IfcSnapshot, StepIter,
+    StepRecord,
+};
 pub use writer::{IfcWriteError, IfcWriter};
 
 /// Deterministically map an `EntityId` to a 22-char compressed IFC

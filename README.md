@@ -10,7 +10,7 @@
 - **2D CAD Drafting** — produce real construction documentation: floor plans, sections, elevations, details, schedules, title blocks, and printable sheets.
 - **BIM Lite / IFC** — import, view, classify, and lightly edit IFC building models; produce room and door/window schedules; do quantity takeoff for small projects.
 - **Asset Library** — bundled and importable furniture, materials, and presets organized by project type (apartment, café, office, villa, retail, kitchen, bathroom, renovation).
-- **Local Render** — EEVEE-class previews and Cycles final renders driven by a Blender worker, with batch queues, presets, and walkthrough/panorama support.
+- **Local Render** — PBR-class previews and photorealistic final renders driven by a native Rust path tracer (CPU + wgpu compute), with batch queues, presets, and walkthrough/panorama support. No external runtime needed.
 - **Local AI** — on-device AI assistants for plan detection, style suggestions, render-doctor diagnostics, CAD cleanup, and BIM classification — all running through a local llama.cpp / PrismML sidecar with explicit, previewable actions.
 - **Deliver** — proposal packs, contractor handoff bundles, BOQ-lite quantity exports, IFC packs, and PDF/DXF exports tailored to the project type.
 - **One project, many outputs** — a single `.aecstudio` package emits client decks, drawings, BIM exports, and contractor packages without duplicating data.
@@ -20,7 +20,7 @@
 - **Not a clone of AutoCAD, Revit, or SketchUp** — it is a focused, opinionated suite for the production loop of small studios and freelancers, not a general-purpose CAD/BIM platform.
 - **Not a cloud-dependent SaaS** — every project, every asset, every render, and every AI inference runs on your machine by default. There is no cloud backend, no telemetry, and no remote rendering required.
 - **Not a general chatbot** — AI is scoped to design, drafting, and BIM tools with a strict tool schema and a safety validator. There is no free-form chat surface, no internet retrieval, and no silent geometry mutation.
-- **Not a real-time game engine** — the viewport prioritizes accuracy, snapping, and predictable performance over framerate. Final rendering uses Cycles/EEVEE through a worker.
+- **Not a real-time game engine** — the viewport prioritizes accuracy, snapping, and predictable performance over framerate. Final rendering uses the in-process Rust path tracer (wgpu compute + CPU fallback).
 - **Not a clipper for stock-photo VizPacks** — bundled assets are deliberate, tagged, and license-clean. Users curate their own asset library on top.
 
 ---
@@ -51,11 +51,11 @@ Desktop only. Supports **CPU-only** and **CPU+GPU** configurations.
 
 | Target | Acceleration |
 |---|---|
-| Apple Silicon (macOS) | **MLX** for inference, Metal for viewport and Cycles GPU |
+| Apple Silicon (macOS) | **MLX** for inference, Metal for viewport and the native wgpu path tracer |
 | Windows CPU | **llama.cpp** (PrismML fork) with **AVX2 / AVX-VNNI / AVX-512 VNNI** |
-| Windows GPU | **Vulkan / CUDA** for inference and Cycles GPU |
+| Windows GPU | **Vulkan / CUDA** for inference, DX12 / Vulkan for the native wgpu path tracer |
 | Linux CPU | **llama.cpp** (PrismML fork) with **AVX2 / AVX-VNNI / AVX-512 VNNI** |
-| Linux GPU | **Vulkan** for inference and Cycles GPU (CUDA optional on NVIDIA) |
+| Linux GPU | **Vulkan** for inference and the native wgpu path tracer (CUDA optional on NVIDIA for inference only) |
 | Viewport / CAD canvas (all platforms) | **wgpu** with Vulkan, Metal, D3D12, or OpenGL backend |
 
 ---
@@ -71,8 +71,8 @@ Desktop only. Supports **CPU-only** and **CPU+GPU** configurations.
 | Local storage | SQLite / SQLCipher |
 | Model runtime | llama.cpp / PrismML sidecar |
 | Apple Silicon acceleration | MLX |
-| BIM / IFC | [kennguy3n/IfcOpenShell](https://github.com/kennguy3n/IfcOpenShell) (v0.8.0) |
-| Render engine | [kennguy3n/cycles](https://github.com/kennguy3n/cycles) + EEVEE via Blender worker |
+| BIM / IFC | Native Rust STEP parser + writer + tessellator (`aec_bim::ifc`) — IFC4 with IFC2x3 / IFC4x3 input compatibility |
+| Render engine | Native Rust path tracer + PBR rasterizer (wgpu compute, CPU fallback) |
 | Electron ↔ Rust bridge | N-API (napi-rs) |
 | Packaging | electron-builder |
 
@@ -94,9 +94,9 @@ For the full technical architecture, see [ARCHITECTURE.md](ARCHITECTURE.md).
 | **Design** | 3D space modeling, furniture placement, materials, lighting, cameras | Interior designers, architects |
 | **Draft** | 2D CAD drawings, sheets, dimensions, schedules, title blocks | Drafters, architects |
 | **BIM** | IFC import/export, classification, property editing, schedules, takeoff | BIM coordinators, small firms |
-| **Render** | EEVEE previews, Cycles final renders, batch queues, walkthroughs, panoramas | Visualizers |
+| **Render** | Native PBR rasterized previews, path-traced final renders, batch queues, walkthroughs, panoramas — all in-process Rust | Visualizers |
 | **Deliver** | Proposal packs, contractor handoff, BOQ exports, IFC packs, PDF/DXF | Project leads |
-| **Settings** | Hardware profile, AI model tier override, render defaults, units, KChat integration toggle, Blender path | Everyone |
+| **Settings** | Hardware profile, AI model tier override, render defaults, units, KChat integration toggle | Everyone |
 
 A Ctrl/Cmd+K **command palette** opens from any mode, fuzzy-searching every registered command and shortcut. Navigation shortcuts: `Ctrl/Cmd+1..6` for Home / Design / Draft / BIM / Render / Deliver, `Ctrl/Cmd+,` for Settings.
 
@@ -120,10 +120,9 @@ AEC Studio learns from — and selectively interoperates with — battle-tested 
 
 | Project | What AEC Studio uses it for |
 |---|---|
-| **Blender** | Rendering and modeling worker (EEVEE preview, Cycles final, mesh ops) |
+| **kennguy3n/cycles** | Reference implementation studied for the native path tracer (BVH traversal, principled BSDF, sampler) — not a runtime dependency |
 | **QCAD / LibreCAD** | 2D CAD UX patterns (snaps, command line, layers, dim styles) |
-| **IfcOpenShell / Bonsai / FreeCAD** | BIM/IFC parsing, geometry, property editing patterns |
-| **Cycles** | Physically-based path-traced final renderer |
+| **IfcOpenShell / Bonsai / FreeCAD** | Reference implementations studied for IFC parsing, geometry, property editing patterns — not runtime dependencies |
 
 ---
 
@@ -132,8 +131,8 @@ AEC Studio learns from — and selectively interoperates with — battle-tested 
 | Repo | Role |
 |---|---|
 | [kennguy3n/llama.cpp@prism](https://github.com/kennguy3n/llama.cpp) | Local AI inference (PrismML fork — Q1_0_g128 ternary repack, CUDA, Metal, Vulkan, AVX-512 VNNI, AVX-VNNI, AVX2, ARM NEON) |
-| [kennguy3n/IfcOpenShell](https://github.com/kennguy3n/IfcOpenShell) | BIM/IFC parsing, geometry, conversion (v0.8.0) |
-| [kennguy3n/cycles](https://github.com/kennguy3n/cycles) | Path-traced final renderer |
+| [kennguy3n/IfcOpenShell](https://github.com/kennguy3n/IfcOpenShell) | Reference implementation studied for the native Rust STEP parser (not a runtime dependency) |
+| [kennguy3n/cycles](https://github.com/kennguy3n/cycles) | Reference implementation studied for the native Rust path tracer (not a runtime dependency) |
 | [kennguy3n/knowledge](https://github.com/kennguy3n/knowledge) | Local knowledge substrate patterns (SQLCipher, scopes, audit) |
 | [kennguy3n/Tessera](https://github.com/kennguy3n/Tessera) | Reference Electron + Rust desktop app structure |
 
@@ -147,7 +146,7 @@ AEC Studio learns from — and selectively interoperates with — battle-tested 
 - **Node.js** 20+ and **npm** 10+
 - **C toolchain** for native dependency compilation (gcc/clang on Linux/macOS, MSVC on Windows)
 - **CMake** for native dependencies (wgpu native, SQLCipher, OpenSSL)
-- **Python** 3.10+ for Blender worker scripts (only required when running renders)
+
 
 #### Linux prerequisites
 
@@ -158,13 +157,13 @@ sudo apt-get install -y libgtk-3-0 libnss3 libxss1 libasound2 libnotify4 \
   build-essential cmake pkg-config libssl-dev libudev-dev
 ```
 
-Optional (used at runtime if present):
+Optional (used at runtime if present, for GPU detection only):
 
 ```bash
-sudo apt-get install -y blender pciutils vulkan-tools
+sudo apt-get install -y pciutils vulkan-tools
 ```
 
-The Rust workspace probes `/proc/driver/nvidia/version`, `lspci`, and `vulkaninfo` for GPU detection; missing tools just fall back to a software profile.
+The Rust workspace probes `/proc/driver/nvidia/version`, `lspci`, and `vulkaninfo` for GPU detection; missing tools just fall back to a software profile. Rendering and BIM parsing are fully native Rust — no Blender or IfcOpenShell installation is required at runtime.
 
 ### Setup
 
@@ -217,17 +216,15 @@ aec-studio/
 │   ├── aec_geometry/           # Geometry index, spatial queries, mesh cache
 │   ├── aec_viewport/           # wgpu viewport, 2D CAD canvas, selection overlays
 │   ├── aec_cad/                # 2D CAD: primitives, layers, blocks, snaps, dims
-│   ├── aec_bim/                # BIM/IFC: IfcOpenShell adapter, spatial hierarchy
-│   ├── aec_render/             # Render queue, Blender/Cycles worker orchestration
+│   ├── aec_bim/                # Native BIM/IFC: STEP reader/writer, tessellator, spatial hierarchy
+│   ├── aec_render/             # Native path tracer + PBR preview + walkthrough/panorama
 │   ├── aec_assets/             # Asset database, import pipeline, LOD, thumbnails
 │   ├── aec_materials/          # PBR material library, texture management
 │   ├── aec_ai/                 # AI command planner, tool schema, safety validator
 │   ├── aec_governor/           # Resource governor, hardware profiler, scheduling
 │   ├── aec_export/             # PDF, DXF, IFC, glTF, proposal pack export
 │   └── aec_audit/              # Audit trail, project history
-├── workers/                    # Native worker processes
-│   ├── blender/                # Blender worker scripts (Python)
-│   ├── ifc/                    # IfcOpenShell worker
+├── workers/                    # Sidecar processes
 │   └── ai/                     # llama-server sidecar config
 ├── templates/                  # Project, room, drawing, render, BIM templates
 │   ├── interior/
@@ -290,9 +287,9 @@ AGPL-3.0 — see [LICENSE](LICENSE).
 - [EXTENSIONS.md](EXTENSIONS.md) — extension system: manifest schema, permissions, signatures
 - [CONTRIBUTING.md](CONTRIBUTING.md) — contribution guide
 - [SECURITY.md](SECURITY.md) — security policy
-- [docs/LICENSE_ARCHITECTURE.md](docs/LICENSE_ARCHITECTURE.md) — AGPL boundary analysis (Blender / IfcOpenShell / Cycles / llama.cpp)
+- [docs/LICENSE_ARCHITECTURE.md](docs/LICENSE_ARCHITECTURE.md) — AGPL boundary analysis (llama.cpp; rendering and BIM are now in-process Rust)
 - [kennguy3n/llama.cpp@prism](https://github.com/kennguy3n/llama.cpp) — local AI inference
-- [kennguy3n/IfcOpenShell](https://github.com/kennguy3n/IfcOpenShell) — BIM/IFC engine
-- [kennguy3n/cycles](https://github.com/kennguy3n/cycles) — path-traced renderer
+- [kennguy3n/IfcOpenShell](https://github.com/kennguy3n/IfcOpenShell) — reference implementation studied for the native Rust STEP parser (not a runtime dependency)
+- [kennguy3n/cycles](https://github.com/kennguy3n/cycles) — reference implementation studied for the native Rust path tracer (not a runtime dependency)
 - [kennguy3n/knowledge](https://github.com/kennguy3n/knowledge) — local knowledge substrate
 - [kennguy3n/Tessera](https://github.com/kennguy3n/Tessera) — reference desktop architecture

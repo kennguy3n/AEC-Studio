@@ -18,7 +18,7 @@ export function RenderPreview({ imageDataUri, caption }: Props) {
         />
       ) : (
         <div className="render-preview__empty" data-testid="render-preview-empty">
-          <p>No preview yet. Queue a render or load an EEVEE preview.</p>
+          <p>No preview yet. Queue a render or load a realtime preview.</p>
         </div>
       )}
       {caption && <figcaption>{caption}</figcaption>}

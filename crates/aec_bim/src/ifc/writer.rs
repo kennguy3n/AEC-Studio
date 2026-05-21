@@ -468,39 +468,51 @@ pub(crate) fn is_spatial_ifc_class(class: &IfcClass) -> bool {
 
 /// Escape `s` for embedding inside a STEP single-quoted string.
 ///
-/// The on-wire format used by the writer/reader pair is:
+/// The on-wire format produced by the writer is:
 ///
 ///   * `\` is escaped as `\\`
-///   * `'` is escaped as `\'`
+///   * `'` is escaped as `''` (ISO 10303-21 §6.4.1 canonical doubled
+///     single-quote — interoperable with Revit, ArchiCAD, IfcOpenShell,
+///     and any conforming STEP toolchain)
 ///   * `\n` (U+000A) is escaped as `\n` (backslash + ASCII 'n')
 ///   * `\r` (U+000D) is escaped as `\r` (backslash + ASCII 'r')
 ///   * `\t` (U+0009) is escaped as `\t` (backslash + ASCII 't')
 ///
-/// The newline / carriage-return / tab escapes are critical for
-/// correctness: the reader tokenises the STEP byte stream with
-/// [`str::lines`] under the assumption that one `#N = TYPE(...);`
-/// record fits on a single line. A literal newline in a user-supplied
-/// name (e.g. a multi-line space description copy-pasted by an
-/// operator) would otherwise split the record across two lines and
-/// surface as an opaque `IfcReadError::Malformed` on re-import.
+/// The reader ([`super::reader::unescape_step_string`]) accepts BOTH
+/// the canonical `''` form emitted here AND the legacy `\'` form
+/// emitted by pre-Phase-9 AEC builds, so files already on disk
+/// continue to round-trip cleanly after this writer change. The
+/// shared [`super::reader::StepRecordSplitter`] state machine
+/// likewise treats both `''` and `\'` as non-terminating inside a
+/// string literal.
+///
+/// The newline / carriage-return / tab escapes are an
+/// interop-friendly invariant: the writer emits exactly one
+/// `#N = TYPE(...);` record per physical line so the output is
+/// readable by tools that line-tokenise STEP (older IfcOpenShell
+/// versions, naive grep / awk pipelines). Strictly speaking the
+/// reader's character-level state machine would handle embedded
+/// newlines correctly, but downstream consumers might not, so we
+/// keep them escaped at the write side.
 ///
 /// Order matters: backslashes must be doubled BEFORE the other
-/// substitutions, otherwise the `\` introduced for an escaped quote
-/// or newline would itself be doubled and corrupt the encoding. The
-/// `match` arm on `'\\'` runs first by construction.
+/// substitutions, otherwise the `\` introduced for an escaped
+/// newline would itself be doubled and corrupt the encoding. The
+/// `match` arm on `'\\'` runs first by construction. The doubled-
+/// quote substitution does not introduce any `\` so it can run in
+/// any position relative to the backslash arm.
 ///
-/// This is not ISO 10303-21 canonical (canonical STEP doubles single
-/// quotes as `''` and uses `\X\` / `\X2\` / `\X4\` for control
-/// characters), but matches the reader's single-pass unescape in
-/// [`unescape_step_string`]. The module docs explicitly state this
-/// reader/writer pair is for AEC Studio's in-process IFC pipeline and
-/// not intended for interop with third-party IFC tooling.
+/// Control characters outside the small ASCII subset above
+/// (`\X\` / `\X2\` / `\X4\` Page-1 / Page-2 / Page-4 encodings)
+/// are not produced by the writer — input strings come from
+/// IfcLabel / IfcText fields which the rest of the engine treats as
+/// UTF-8 and which the reader passes through verbatim.
 fn escape_step_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
             '\\' => out.push_str("\\\\"),
-            '\'' => out.push_str("\\'"),
+            '\'' => out.push_str("''"),
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
@@ -510,27 +522,74 @@ fn escape_step_string(s: &str) -> String {
     out
 }
 
-fn serialize_property_value(v: &PropertyValue) -> (String, &'static str) {
+/// Returns the (literal, measure-wrapper) pair for a single property
+/// value. The measure-wrapper is the IFC tag uppercased to STEP
+/// canonical form (e.g. `"IFCMASSDENSITYMEASURE"`). For unmodeled
+/// `PropertyValue::Other` variants the raw STEP literal is emitted
+/// verbatim, restoring the bytes the reader captured.
+fn serialize_property_value(v: &PropertyValue) -> (String, String) {
     match v {
-        PropertyValue::Text(s) => (format!("'{}'", escape_step_string(s)), "IFCTEXT"),
-        PropertyValue::Label(s) => (format!("'{}'", escape_step_string(s)), "IFCLABEL"),
-        PropertyValue::Real(x) => (format_real(*x), "IFCREAL"),
-        PropertyValue::Length(x) => (format_real(*x), "IFCLENGTHMEASURE"),
-        PropertyValue::Area(x) => (format_real(*x), "IFCAREAMEASURE"),
-        PropertyValue::Volume(x) => (format_real(*x), "IFCVOLUMEMEASURE"),
-        PropertyValue::Ratio(x) => (format_real(*x), "IFCPOSITIVERATIOMEASURE"),
-        PropertyValue::Integer(i) => (i.to_string(), "IFCINTEGER"),
-        PropertyValue::Boolean(b) => (if *b { ".T." } else { ".F." }.to_string(), "IFCBOOLEAN"),
+        PropertyValue::Text(s) => (
+            format!("'{}'", escape_step_string(s)),
+            "IFCTEXT".to_string(),
+        ),
+        PropertyValue::Label(s) => (
+            format!("'{}'", escape_step_string(s)),
+            "IFCLABEL".to_string(),
+        ),
+        PropertyValue::Real(x) => (format_real(*x), "IFCREAL".to_string()),
+        PropertyValue::Length(x) => (format_real(*x), "IFCLENGTHMEASURE".to_string()),
+        PropertyValue::Area(x) => (format_real(*x), "IFCAREAMEASURE".to_string()),
+        PropertyValue::Volume(x) => (format_real(*x), "IFCVOLUMEMEASURE".to_string()),
+        PropertyValue::Ratio(x) => (format_real(*x), "IFCPOSITIVERATIOMEASURE".to_string()),
+        PropertyValue::Integer(i) => (i.to_string(), "IFCINTEGER".to_string()),
+        PropertyValue::Boolean(b) => (
+            if *b { ".T." } else { ".F." }.to_string(),
+            "IFCBOOLEAN".to_string(),
+        ),
+        PropertyValue::Other { measure, raw } => (raw.clone(), measure.to_ascii_uppercase()),
     }
 }
 
-fn serialize_quantity_value(v: &PropertyValue) -> (String, &'static str) {
+/// Serialise a `PropertyValue` as an `IfcQuantity*` STEP literal for
+/// inclusion in an `IfcElementQuantity` set.
+///
+/// **Contract for `PropertyValue::Other`**: when an `Other` variant is
+/// placed in a `QuantitySet`, its `measure` field MUST already be an
+/// `IFCQUANTITY*` entity type (e.g. `"IFCQUANTITYTIME"` for the
+/// IFC4x3 time quantity, or any future schema-level quantity). The
+/// reader enforces this by routing only entities matching the
+/// `IFCQUANTITY*` prefix through `parse_quantity_typed` → the
+/// catch-all `Other` arm (see `crates/aec_bim/src/ifc/reader.rs` ::
+/// `parse_quantity_typed`). Programmatic callers stuffing an `Other`
+/// variant with a non-quantity measure (e.g. `IFCMASSDENSITYMEASURE`)
+/// into a QuantitySet would produce malformed STEP — the
+/// `debug_assert!` below catches that contract violation in tests and
+/// debug builds while staying free in release. The check is a
+/// fail-fast on programmer error, not a runtime tax on well-formed
+/// input.
+fn serialize_quantity_value(v: &PropertyValue) -> (String, String) {
     match v {
-        PropertyValue::Length(x) => (format_real(*x), "IFCQUANTITYLENGTH"),
-        PropertyValue::Area(x) => (format_real(*x), "IFCQUANTITYAREA"),
-        PropertyValue::Volume(x) => (format_real(*x), "IFCQUANTITYVOLUME"),
-        PropertyValue::Integer(i) => (i.to_string(), "IFCQUANTITYCOUNT"),
-        PropertyValue::Real(x) => (format_real(*x), "IFCQUANTITYWEIGHT"),
+        PropertyValue::Length(x) => (format_real(*x), "IFCQUANTITYLENGTH".to_string()),
+        PropertyValue::Area(x) => (format_real(*x), "IFCQUANTITYAREA".to_string()),
+        PropertyValue::Volume(x) => (format_real(*x), "IFCQUANTITYVOLUME".to_string()),
+        PropertyValue::Integer(i) => (i.to_string(), "IFCQUANTITYCOUNT".to_string()),
+        PropertyValue::Real(x) => (format_real(*x), "IFCQUANTITYWEIGHT".to_string()),
+        PropertyValue::Other { measure, raw } => {
+            let entity = measure.to_ascii_uppercase();
+            debug_assert!(
+                entity.starts_with("IFCQUANTITY"),
+                "PropertyValue::Other in a QuantitySet must carry an IFCQUANTITY* \
+                 measure (e.g. IFCQUANTITYTIME for IFC4x3); got {entity:?}. \
+                 The reader only routes IFCQUANTITY* prefixed entities into the \
+                 Other arm of parse_quantity_typed, so this assertion firing means \
+                 a programmatic caller bypassed the reader and stuffed a non-\
+                 quantity measure into a QuantitySet — it would produce \
+                 malformed STEP. Move the value into a PropertySet instead, \
+                 where any IfcMeasure can be serialised."
+            );
+            (raw.clone(), entity)
+        }
         PropertyValue::Ratio(_) => {
             // IFC4 has no IfcQuantityRatio — Ratio values belong in
             // Psets (IFCPOSITIVERATIOMEASURE) not Qsets. Emit as
@@ -547,12 +606,12 @@ fn serialize_quantity_value(v: &PropertyValue) -> (String, &'static str) {
                     PropertyValue::Ratio(x) => *x,
                     _ => 0.0,
                 }),
-                "IFCQUANTITYWEIGHT",
+                "IFCQUANTITYWEIGHT".to_string(),
             )
         }
         // Boolean / text quantities aren't standard IFC; fall through
         // as IfcQuantityCount(0) so the file still parses.
-        _ => ("0".into(), "IFCQUANTITYCOUNT"),
+        _ => ("0".into(), "IFCQUANTITYCOUNT".to_string()),
     }
 }
 

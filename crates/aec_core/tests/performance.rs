@@ -11,8 +11,9 @@
 //! Some Phase-level targets (render benchmarks, DXF 10K-entity import)
 //! live in their own crates (`aec_cad`, `aec_render`) so they can
 //! depend on the relevant adapters; we re-link them in the
-//! Phase 6 e2e suite. Render-engine end-to-end benchmarks require
-//! Blender and run manually.
+//! Phase 6 e2e suite. Render-engine end-to-end benchmarks live in
+//! `crates/aec_render/benches/native_render.rs` and run in-process
+//! against the native path tracer.
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -95,8 +96,8 @@ fn blake3_hash_of_10mb_blob_under_250ms() {
 fn benchmark_pointers_documented() {
     let benches = [
         (
-            "EEVEE preview latency (<250ms)",
-            "cargo bench -p aec_render --bench eevee_latency",
+            "Path-tracer single-tile latency (<250ms)",
+            "cargo bench -p aec_render --bench native_render",
         ),
         (
             "Contractor pack export (<60s)",

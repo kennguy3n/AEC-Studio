@@ -36,11 +36,10 @@ flowchart TB
         NAPI["N-API bridge"]
     end
 
-    subgraph "3D Worker (Blender)"
-        BlenderProc["Blender process"]
-        EEVEE["EEVEE preview"]
-        Cycles["Cycles final"]
-        BlenderScripts["Blender Python scripts"]
+    subgraph "Native Render Engine (Rust/wgpu)"
+        NativePreview["PBR preview (wgpu)"]
+        NativePathTrace["Path tracer (wgpu compute + CPU)"]
+        NativeWalkthrough["Walkthrough / panorama"]
     end
 
     subgraph "CAD Worker (Rust)"
@@ -49,9 +48,10 @@ flowchart TB
         DWG["DWG adapter (opt-in)"]
     end
 
-    subgraph "BIM Worker (IfcOpenShell)"
-        IfcProc["IfcOpenShell process"]
-        IFCIo["IFC read / write"]
+    subgraph "Native BIM Engine (Rust)"
+        IfcReader["Native STEP parser (aec_bim::ifc)"]
+        IfcWriter["Native STEP writer"]
+        Tessellator["Geometry tessellator"]
         BIMCache["BIM cache"]
     end
 
@@ -73,9 +73,10 @@ flowchart TB
     WinMgr --> NAPI
     FilePicker --> NAPI
     NativeLoad --> NAPI
-    WorkerSup --> BlenderProc
+    WorkerSup --> NativePreview
+    WorkerSup --> NativePathTrace
     WorkerSup --> CADcanvas
-    WorkerSup --> IfcProc
+    WorkerSup --> IfcReader
     WorkerSup --> LlamaSidecar
 
     NAPI --> ProjectGraph
@@ -91,17 +92,17 @@ flowchart TB
     CmdEngine --> UndoJournal
     CmdEngine --> ProjectGraph
     CmdEngine --> GeoIndex
-    RenderQueue --> BlenderProc
+    RenderQueue --> NativePathTrace
+    RenderQueue --> NativeWalkthrough
     GeoIndex --> CADcanvas
-    GeoIndex --> IfcProc
+    GeoIndex --> IfcReader
     ToolPlanner --> CmdEngine
 
-    BlenderProc --> EEVEE
-    BlenderProc --> Cycles
-    BlenderProc --> BlenderScripts
+    NativePathTrace --> NativePreview
 
-    IfcProc --> IFCIo
-    IfcProc --> BIMCache
+    IfcReader --> IfcWriter
+    IfcReader --> Tessellator
+    IfcReader --> BIMCache
 
     LlamaSidecar --> VisionModel
     LlamaSidecar --> Embeddings
@@ -122,8 +123,8 @@ flowchart TB
 | Search / hybrid retrieval | SQLite FTS5 + embeddings | Asset search, BIM property search without external services |
 | Model runtime | llama.cpp / PrismML sidecar | Local GGUF inference with broad acceleration coverage |
 | Apple Silicon | MLX | macOS ARM inference acceleration |
-| Render engine | Cycles + EEVEE via Blender worker | Photoreal final + fast preview, sandboxed worker |
-| BIM / IFC | IfcOpenShell | Mature open-source IFC parsing, geometry, and conversion |
+| Render engine | Native Rust path tracer (wgpu compute) + PBR rasterizer | Photoreal final + fast preview, in-process with no external runtime |
+| BIM / IFC | Native Rust STEP parser + writer + tessellator (`aec_bim::ifc`) | In-process IFC4 (and IFC2x3 / IFC4x3 on input) with verbatim Pset round-trip; no external dependency |
 | Electron bridge | N-API (napi-rs) | Low-overhead Rust ↔ Node.js calls |
 | Packaging | electron-builder | Platform installers for macOS and Windows |
 
@@ -136,7 +137,7 @@ Rust is the primary systems language for AEC Studio's core engine. It handles:
 - The project graph (spatial hierarchy, geometry, materials, schedules)
 - The command engine with an undo/redo journal
 - Geometry indexing (BVH, spatial queries, mesh cache)
-- The render queue and Blender worker orchestration
+- The render queue and native path tracer orchestration
 - The asset database with content hashing (BLAKE3) and dedup
 - Encrypted local storage (SQLite + SQLCipher)
 - The resource governor and hardware profiler
@@ -165,7 +166,7 @@ The viewport, 2D CAD canvas, and selection/overlay layers all run on **wgpu**:
 | 2D CAD canvas | Orthographic projection, batched line/polyline/hatch | Pixel-perfect snapping, infinite zoom |
 | Selection overlay | Stencil + outline pass | Shared across 3D and 2D |
 | Hover / measure tools | Lightweight overlay pass | Read-only of the geometry index |
-| Final render preview | Texture display | Just shows the Cycles/EEVEE output |
+| Final render preview | Texture display | Just shows the native path-tracer / PBR-rasterizer output |
 
 ---
 
@@ -174,7 +175,7 @@ The viewport, 2D CAD canvas, and selection/overlay layers all run on **wgpu**:
 AEC Studio enforces a **strict security boundary** between the renderer and native capabilities.
 
 ```
-React renderer → typed IPC → Electron main → N-API → Rust core → workers (Blender, IFC, AI, CAD)
+React renderer → typed IPC → Electron main → N-API → Rust core → in-process engines (path tracer, IFC, CAD) + AI sidecar
 ```
 
 ### Anti-patterns to avoid
@@ -298,32 +299,46 @@ Every state mutation in AEC Studio is a **command**: a typed, serializable recor
 
 ---
 
-## 9.2 Blender worker
+## 9.2 Native render engine
 
 ```
-workers/blender/
-├── aec_blender_worker.py       # Entrypoint, IPC over stdin/stdout JSON-lines
-├── scene_loader.py             # Loads AEC project graph into a Blender scene
-├── materials.py                # Translates PBR materials into Blender shaders
-├── lighting.py                 # Sun/sky, area lights, IES profiles
-├── eevee_preview.py            # EEVEE preview pipeline
-├── cycles_final.py             # Cycles final render with denoise
-├── walkthrough.py              # Camera path animation + stitch_frames() FFmpeg MP4 encode (graceful fallback to image sequence)
-├── panorama.py                 # Equirectangular panorama renders
-└── manifest.json               # Pinned Blender version range
+crates/aec_render/
+├── bvh.rs                      # SAH BVH2 builder, two-level instancing
+├── intersect.rs                # Möller–Trumbore + stack-based BVH traversal
+├── path_trace.rs               # CPU megakernel path tracer
+├── gpu_trace.rs                # wgpu compute path tracer (fallback to CPU)
+├── shaders/path_trace.wgsl     # WGSL compute kernel
+├── material.rs                 # Principled BSDF (Lambert + GGX, Schlick Fresnel, Smith)
+├── light_sampling.rs           # Sun / area / point / sky / IES with MIS
+├── denoise.rs                  # Edge-aware bilateral / NLM denoiser
+├── scheduler.rs                # Tile scheduler, adaptive sampling, cancellation
+├── preview.rs                  # Native PBR rasterized preview pipeline
+├── final_render.rs             # Final-render pipeline (PNG / EXR output)
+├── walkthrough.rs              # Camera-path animation + optional ffmpeg MP4 stitch
+├── panorama.rs                 # Equirectangular 360° panorama pipeline
+├── scene.rs                    # RenderScene / RenderCamera / RenderLight
+├── preset.rs                  # Quick / Standard / High / Studio / Preview / Walkthrough / Panorama
+├── queue.rs                    # Render queue (single, batch, matrix), resume on failure
+└── doctor.rs                   # Render diagnostics
+
+crates/aec_viewport/
+├── pbr_preview.rs              # PBR forward rasterizer (wgpu) used by preview.rs
+├── shaders/pbr.wgsl            # PBR fragment shader (metallic/roughness + IBL)
+├── shaders/sky.wgsl            # Hosek–Wilkie procedural sky
+└── sky.rs                      # Sky parameters → GPU uniform binding
 ```
 
-### Worker types
+### Pipelines
 
-| Worker | Trigger | Engine | Out |
+| Pipeline | Trigger | Engine | Output |
 |---|---|---|---|
-| Preview | Viewport refresh / camera change | EEVEE | RGB texture |
-| Final | User-initiated render | Cycles | PNG / EXR + denoise |
-| Batch | Render queue | Cycles | Multi-image pack |
-| Walkthrough | User-initiated | Cycles | MP4 / image sequence |
-| Panorama | User-initiated | Cycles equirectangular | EXR / JPG |
+| Preview | Viewport refresh / camera change | PBR rasterizer (wgpu) | RGB texture |
+| Final | User-initiated render | Path tracer (wgpu compute, CPU fallback) | PNG / EXR + denoise |
+| Batch | Render queue | Path tracer | Multi-image pack |
+| Walkthrough | User-initiated | Path tracer + camera path | MP4 / image sequence |
+| Panorama | User-initiated | Path tracer (equirectangular camera) | EXR / JPG |
 
-**Key decision:** Blender is **never linked** into AEC Studio's process. It is invoked as an external worker process and communicates over JSON-line IPC. This keeps AEC Studio's GPL exposure scoped to the AGPL-3.0 license already declared, and lets users swap Blender versions without rebuilding the core.
+**Key decision:** Rendering is **fully in-process**. There is no Blender (or any other external renderer) involvement at runtime — not as a linked library, not as a subprocess, not as an embedded interpreter. Phase 9 PRs #9–#12 implemented a complete native CPU + GPU path tracer (informed by reading [kennguy3n/cycles](https://github.com/kennguy3n/cycles) as a reference) and a native PBR rasterizer for preview. Eliminating the external worker simplifies packaging (no Blender install required), removes the GPL boundary, improves crash isolation (Rust memory safety vs. Python subprocess), and removes IPC latency from the preview hot path.
 
 ---
 
@@ -353,25 +368,24 @@ crates/aec_cad/
 
 ---
 
-## 9.4 BIM / IFC worker
+## 9.4 Native BIM engine
 
 ```
-workers/ifc/
-├── aec_ifc_worker.py           # Entrypoint; wraps IfcOpenShell Python API
-├── import_pipeline.py          # IFC → AEC project graph (parametric where possible)
-├── export_pipeline.py          # AEC project graph → IFC with GUID preservation
-├── classifier.py               # AI-assisted classification adapter
-├── property_editor.py          # Pset/Qto editing
-├── schedules.py                # Room / door / window / material schedules
-├── validator.py                # Strict validation against schema and project rules
-├── diff.py                     # IFC diff at element + property level
-└── manifest.json               # Pinned IfcOpenShell version (v0.8.0)
+crates/aec_bim/src/
+├── ifc/reader.rs                # Native STEP parser: schema detection (IFC2x3 / IFC4 / IFC4x3), streaming iterator, UTF-8-safe, multi-line records & comments
+├── ifc/writer.rs                # Native STEP writer: GUID preservation, deterministic numbering, verbatim Pset round-trip (incl. PropertyValue::Other)
+├── tessellator.rs               # Geometry tessellator: IfcExtrudedAreaSolid, IfcFacetedBrep, profile types (rectangle/circle/arbitrary), IfcBooleanClippingResult
+├── classification.rs            # AI-assisted classification adapter
+├── properties.rs                # Pset/Qto editing (incl. PropertyValue::Other for verbatim round-trip)
+├── schedules/                   # Room / door / window / material schedules (mod + per-schedule files)
+├── validation.rs                # Strict validation against schema and project rules
+└── diff.rs                      # IFC diff at element + property level
 ```
 
 ### BIM cache strategy
 
 ```
-IFC file → IfcOpenShell parse → AEC project graph delta →
+IFC file → native STEP parse → AEC project graph delta →
   ├── Persist deltas as commands in the command engine
   ├── Store a per-element BIM cache (geometry hash, Pset hash, classification)
   └── Materialize fast IFC re-export from cache (skip re-tessellation when unchanged)
@@ -409,13 +423,10 @@ crates/aec_render/
 └── walkthrough.rs              # Native walkthrough pipeline + optional ffmpeg stitching + WalkthroughOutput enum
 ```
 
-> NOTE — Phase 9 in progress: the prose in §9 above still describes the
-> legacy Blender/IfcOpenShell worker architecture. The file inventory
-> here reflects the post-PR4 (Phase 9, Tasks 12-14) state where
-> `worker.rs`, `blender_discovery.rs`, `cycles.rs`, and `eevee.rs` have
-> been removed in favour of the native render engine. The narrative
-> sections (§9.2, §9.4, §9.5, §10.5, §1 stack diagram) are rewritten in
-> Phase 9 PR9 (documentation pass).
+> The file inventory above is the post-Phase-9 layout: `worker.rs`,
+> `blender_discovery.rs`, `cycles.rs`, `eevee.rs`, and the entire
+> `workers/blender/` and `workers/ifc/` trees were removed in Phase 9.
+> Rendering and IFC handling are now fully in-process Rust.
 
 ---
 
@@ -479,7 +490,7 @@ apps/desktop/renderer/src/components/kchat/
 - Thumbnails are rendered deterministically (32×32 RGBA8) from the snapshot so the camera tile
   grid is reproducible across machines.
 - Camera presets (`InteriorCloseUp`, `Wide`, `EyeLevel`, `BirdsEye`) configure focal/sensor/DoF
-  parameters; render presets configure the engine (EEVEE/Cycles), sample count, and resolution.
+  parameters; render presets configure the engine path (rasterized preview vs path-traced final), sample count, and resolution.
 
 ---
 
@@ -498,9 +509,9 @@ crates/aec_governor/
 ### What the governor controls
 
 - Render preset and sample count.
-- Number of concurrent Cycles tiles.
+- Number of concurrent path-tracer tiles.
 - AI model tier (Bonsai 1.7B / 4B / 8B).
-- Whether EEVEE preview runs at full or half resolution.
+- Whether the PBR preview runs at full or half resolution.
 - Whether the 3D viewport runs at native or downscaled framebuffer under heavy load.
 - Eviction policy for the geometry mesh cache.
 - Maximum simultaneous render jobs (1 by default on low-tier hardware).
@@ -512,10 +523,10 @@ crates/aec_governor/
 
 | Profile | CPU | RAM | GPU | Default model tier | Default render preset |
 |---|---|---|---|---|---|
-| **Low** | Dual-core / 4-thread x86 or older M1 | 4–6 GB | None / integrated | Bonsai 1.7B Q4_K_M | EEVEE preview only, Cycles "Quick" |
-| **Medium** | Modern 6-core x86 or M2 | 8–12 GB | Integrated or low-end discrete | Bonsai 1.7B / 4B | Cycles "Standard" |
-| **High** | 8+ cores or M2 Pro / M3 | 16–32 GB | RTX 3060 / Apple GPU 10-core+ | Bonsai 4B | Cycles "High" |
-| **Pro** | 12+ cores / Threadripper / M3 Max | 32+ GB | RTX 4070+ or Apple GPU 30-core+ | Bonsai 8B | Cycles "Studio" |
+| **Low** | Dual-core / 4-thread x86 or older M1 | 4–6 GB | None / integrated | Bonsai 1.7B Q4_K_M | PBR preview only, path tracer "Quick" (CPU fallback) |
+| **Medium** | Modern 6-core x86 or M2 | 8–12 GB | Integrated or low-end discrete | Bonsai 1.7B / 4B | Path tracer "Standard" |
+| **High** | 8+ cores or M2 Pro / M3 | 16–32 GB | RTX 3060 / Apple GPU 10-core+ | Bonsai 4B | Path tracer "High" |
+| **Pro** | 12+ cores / Threadripper / M3 Max | 32+ GB | RTX 4070+ or Apple GPU 30-core+ | Bonsai 8B | Path tracer "Studio" |
 
 The profile is detected at first run and re-evaluated when the user changes the runtime configuration. Users can override the recommended tier but the governor logs and surfaces the override.
 
@@ -557,8 +568,8 @@ Budgets are advisory — exceeding them triggers governor warnings and LOD swap-
 ```
 User clicks "Render"
   │
-  ├── If preview → EEVEE worker (fast, denoise-less)
-  ├── If final / batch / walkthrough → Cycles worker
+  ├── If preview → PBR rasterizer pipeline (fast, denoise-less)
+  ├── If final / batch / walkthrough → Path tracer pipeline
   │     │
   │     ├── Choose tile size from governor
   │     ├── Choose sample count from preset
@@ -571,10 +582,10 @@ User clicks "Render"
 
 | Concern | Strategy |
 |---|---|
-| Cold-start | Reuse the Blender worker across jobs (warm scene loader) |
-| Mesh re-translation | Cache Blender scene per project, invalidate by geometry hash |
+| Cold-start | Reuse the BVH across jobs; rebuild only on geometry change |
+| Mesh re-translation | Cache the path-tracer scene per project, invalidate by geometry hash |
 | Sample budget | Per-preset minimum samples, denoise pass closes the rest |
-| Multi-job throughput | Cycles concurrency capped to N tiles by the governor |
+| Multi-job throughput | Path-tracer tile concurrency capped to N tiles by the governor |
 | Crash isolation | Worker crash never crashes AEC Studio; job marked failed and resumable |
 | Walkthrough | Frame-by-frame resume from the last completed frame |
 
@@ -582,13 +593,13 @@ User clicks "Render"
 
 | Preset | Engine | Samples | Denoise | Resolution scale | Notes |
 |---|---|---|---|---|---|
-| Quick | Cycles | 32 | OIDN | 0.75× | Fast looks |
-| Standard | Cycles | 128 | OIDN | 1.0× | Daily delivery |
-| High | Cycles | 256 | OIDN | 1.0× | Client hero |
-| Studio | Cycles | 1024 | OIDN | 1.0× | Print-quality |
-| EEVEE Preview | EEVEE | n/a | — | 0.5–1.0× | Real-time-ish viewport |
-| Walkthrough | Cycles | 64 / frame | OIDN | 1.0× | Multi-frame |
-| Panorama | Cycles (equi) | 128 | OIDN | 1.0× | 360° room shots |
+| Quick | Path tracer | 32 | Bilateral / NLM | 0.75× | Fast looks |
+| Standard | Path tracer | 128 | Bilateral / NLM | 1.0× | Daily delivery |
+| High | Path tracer | 256 | Bilateral / NLM | 1.0× | Client hero |
+| Studio | Path tracer | 1024 | Bilateral / NLM | 1.0× | Print-quality |
+| Realtime Preview | PBR rasterizer | n/a | — | 0.5–1.0× | Real-time-ish viewport |
+| Walkthrough | Path tracer | 96 / frame | Bilateral / NLM | 1.0× | Multi-frame |
+| Panorama | Path tracer (equirectangular) | 512 | Bilateral / NLM | 1.0× | 360° room shots |
 
 ---
 
@@ -601,7 +612,7 @@ Asset import (glTF / FBX / OBJ)
   ├── Validate license + manifest
   ├── Normalize transform + units
   ├── Compute LOD chain (LOD0 hero, LOD1 mid, LOD2 silhouette)
-  ├── Generate thumbnail (EEVEE quick render)
+  ├── Generate thumbnail (PBR rasterized quick render)
   ├── Hash mesh + materials (BLAKE3) for dedup
   └── Persist to the asset DB (SQLite + content-addressed blob store)
 ```
@@ -652,7 +663,7 @@ Asset import (glTF / FBX / OBJ)
 
 | Concern | Strategy |
 |---|---|
-| Large IFC parse | IfcOpenShell streaming iterator; materialize geometry lazily |
+| Large IFC parse | Native `IfcReader::iter` streaming iterator over `StepRecord`s; materialize geometry lazily via the in-process tessellator |
 | Re-import speed | BIM cache keyed by element GUID + geometry hash |
 | Pset edit cost | Element-level Pset diff, write-back only on save |
 | Schedule generation | Indexed property store; schedule queries hit SQLite directly |
@@ -727,8 +738,8 @@ All tool-call outputs are constrained with **GBNF** grammars in `crates/aec_ai/g
 | Tier | Available RAM | Capability |
 |---|---|---|
 | **Low** | 4–6 GB | Bonsai 1.7B Q4_K_M only, no concurrent AI + render |
-| **Medium** | 8–12 GB | Bonsai 1.7B / 4B, AI + EEVEE preview concurrently |
-| **High** | 16–32 GB | Bonsai 4B always-on, AI + Cycles concurrent (with governor) |
+| **Medium** | 8–12 GB | Bonsai 1.7B / 4B, AI + PBR preview concurrently |
+| **High** | 16–32 GB | Bonsai 4B always-on, AI + path tracer concurrent (with governor) |
 | **Pro** | 32+ GB | Bonsai 8B always-on, multi-job AI + render |
 
 ---
@@ -783,7 +794,7 @@ Encryption uses SQLCipher with **AES-256 page-level** and per-project keys. Cont
 | Shell | Electron + React |
 | Native addon | Universal N-API addon (Intel + Apple Silicon) |
 | Preferred AI runtime | MLX (MLXAdapter) |
-| Render GPU | Metal (Cycles + EEVEE), wgpu Metal backend |
+| Render GPU | wgpu Metal backend (native path tracer + PBR rasterizer) |
 | Fallback AI runtime | LlamaCppAdapter (CPU AVX2/AVX-VNNI on Intel; CPU NEON on Apple Silicon) |
 | Packaging | electron-builder, `.dmg` and `.zip` |
 | Code signing / notarization | Apple Developer ID + notarytool |
@@ -796,7 +807,7 @@ Encryption uses SQLCipher with **AES-256 page-level** and per-project keys. Cont
 | Native addon | C++ N-API addon |
 | AI runtime | LlamaCppAdapter |
 | CPU-only | AVX2 minimum, AVX-VNNI / AVX-512 VNNI when available |
-| CPU+GPU | Vulkan / CUDA backend for inference; Cycles GPU CUDA/OptiX |
+| CPU+GPU | Vulkan / CUDA backend for inference; native wgpu path tracer on Vulkan / DX12 / Metal |
 | Render GPU | wgpu D3D12 (default) or Vulkan |
 | Packaging | electron-builder, `.exe` (NSIS) and `.msi` |
 | Code signing | EV code-signing cert via Authenticode |
@@ -809,10 +820,9 @@ Encryption uses SQLCipher with **AES-256 page-level** and per-project keys. Cont
 | Native addon | N-API addon (x86_64) |
 | AI runtime | LlamaCppAdapter |
 | CPU-only | AVX2 minimum, AVX-VNNI / AVX-512 VNNI when available (surfaced by `aec_governor::profiler`) |
-| CPU+GPU | Vulkan for inference; Cycles GPU via Vulkan or CUDA on NVIDIA |
+| CPU+GPU | Vulkan for inference; native wgpu path tracer on Vulkan / DX12 / Metal |
 | Render GPU | wgpu Vulkan backend |
 | GPU detection | `/proc/driver/nvidia/version` → `lspci -mm` → `vulkaninfo --summary` (best-effort cascade) |
-| Blender discovery | `AEC_BLENDER_BIN` / `BLENDER_BIN` → known install paths (`/usr/bin`, `/usr/local/bin`, `/snap/bin`, Flatpak, `~/.local/bin`) → `PATH` |
 | Packaging | electron-builder, AppImage + `.deb`, optional Snap (`packaging/linux/`) |
 | Desktop integration | `.desktop` file with `application/x-aec` MIME and `x-scheme-handler/aec` deep-link handler |
 
@@ -820,10 +830,10 @@ Encryption uses SQLCipher with **AES-256 page-level** and per-project keys. Cont
 
 | Tier | Available RAM | Capability |
 |---|---|---|
-| **Low** | 4–6 GB | Bonsai 1.7B Q4_K_M only, EEVEE preview, single render job |
-| **Medium** | 8–12 GB | Bonsai 1.7B / 4B, Cycles "Standard" |
-| **High** | 16–32 GB | Bonsai 4B always-on, Cycles "High" with GPU denoise |
-| **Pro** | 32+ GB | Bonsai 8B always-on, Cycles "Studio", multi-job render queue |
+| **Low** | 4–6 GB | Bonsai 1.7B Q4_K_M only, PBR preview, single render job |
+| **Medium** | 8–12 GB | Bonsai 1.7B / 4B, path tracer "Standard" |
+| **High** | 16–32 GB | Bonsai 4B always-on, path tracer "High" with GPU denoise |
+| **Pro** | 32+ GB | Bonsai 8B always-on, path tracer "Studio", multi-job render queue |
 
 ---
 
@@ -837,7 +847,7 @@ Encryption uses SQLCipher with **AES-256 page-level** and per-project keys. Cont
 | BLAKE3 content hashing | Used across geometry blobs, assets, audit log, command journal |
 | Safe renderer | No direct file, worker, or model access from the renderer |
 | Secure IPC | Typed and validated messages between renderer, main, and Rust core |
-| Process separation | Renderer / main / Rust core / Blender / IFC / AI sidecar are separate processes |
+| Process separation | Renderer / main / Rust core are separate processes; AI sidecar is the only external worker. Rendering and IFC parsing are in-process Rust. |
 | Worker sandboxing | Workers run with reduced privileges and explicit project-scoped file access |
 | AI safety | Strict tool schema, grammar-constrained decoding, safety validator, preview diffs |
 | Audit log | All commands, AI actions, exports, and connector events are logged |
@@ -862,9 +872,8 @@ aec-studio/
 │   ├── aec_geometry/           # Geometry index, spatial queries, mesh cache
 │   ├── aec_viewport/           # wgpu viewport, 2D CAD canvas, selection overlays, reference_image.rs
 │   ├── aec_cad/                # 2D CAD: primitives, layers, blocks, snaps, dims
-│   ├── aec_bim/                # BIM/IFC: IfcOpenShell adapter, spatial hierarchy
-│   ├── aec_render/             # Render queue, Blender/Cycles worker orchestration,
-│   │                             EEVEE latency benchmark (benches/eevee_latency.rs)
+│   ├── aec_bim/                # Native BIM: STEP reader/writer, tessellator, spatial hierarchy
+│   ├── aec_render/             # Native path tracer + PBR preview + walkthrough/panorama,
 │   ├── aec_assets/             # Asset database, import pipeline, LOD, thumbnails
 │   ├── aec_materials/          # PBR material library, texture management, mood_board.rs
 │   ├── aec_ai/                 # AI command planner, tool schema, safety validator,
@@ -876,10 +885,8 @@ aec-studio/
 │   │                             boq.rs, interior_pack.rs, contractor_pack.rs, bim_pack.rs,
 │   │                             before_after.rs, xlsx.rs; determinism + contractor_perf + phase6_e2e tests
 │   └── aec_audit/              # Audit trail, project history (ActorKind::KChat for review comments)
-├── workers/                    # Native worker processes
-│   ├── blender/                # Blender worker scripts (Python)
-│   ├── ifc/                    # IfcOpenShell worker
-│   └── ai/                     # llama-server sidecar config
+├── workers/                    # Sidecar processes
+│   └── ai/                     # llama-server sidecar config (the only remaining external sidecar)
 ├── templates/                  # Project, room, drawing, render, BIM templates
 │   ├── interior/
 │   ├── architecture/
@@ -936,7 +943,7 @@ AEC Studio's UI follows the **KChat design system** (same tokens as [kennguy3n/T
 - [CONTRIBUTING.md](CONTRIBUTING.md) — contribution guide
 - [SECURITY.md](SECURITY.md) — security policy
 - [kennguy3n/llama.cpp@prism](https://github.com/kennguy3n/llama.cpp) — local AI inference
-- [kennguy3n/IfcOpenShell](https://github.com/kennguy3n/IfcOpenShell) — BIM/IFC engine
+- [kennguy3n/IfcOpenShell](https://github.com/kennguy3n/IfcOpenShell) — reference implementation studied for the native Rust STEP parser (not a runtime dependency)
 - [kennguy3n/cycles](https://github.com/kennguy3n/cycles) — path-traced renderer
 - [kennguy3n/knowledge](https://github.com/kennguy3n/knowledge) — local knowledge substrate
 - [kennguy3n/Tessera](https://github.com/kennguy3n/Tessera) — reference desktop architecture

@@ -17,7 +17,6 @@ describe("Settings page", () => {
     expect(screen.getByTestId("settings-section-render")).toBeInTheDocument();
     expect(screen.getByTestId("settings-section-region")).toBeInTheDocument();
     expect(screen.getByTestId("settings-section-kchat")).toBeInTheDocument();
-    expect(screen.getByTestId("settings-section-blender")).toBeInTheDocument();
 
     // Hardware tier resolves from the in-process runtime status backend.
     await waitFor(() => {

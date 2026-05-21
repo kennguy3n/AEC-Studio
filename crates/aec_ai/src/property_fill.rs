@@ -155,6 +155,14 @@ fn property_value_to_json(v: &PropertyValue) -> serde_json::Value {
         | PropertyValue::Volume(f)
         | PropertyValue::Ratio(f) => serde_json::Number::from_f64(*f)
             .map_or(serde_json::Value::Null, serde_json::Value::Number),
+        // Round-trip-only carrier for unmodeled IFC measure types
+        // (e.g. `IfcMassDensityMeasure`). The diff payload exposes
+        // both the raw STEP literal and the canonical measure tag
+        // so reviewers can see what's being proposed.
+        PropertyValue::Other { measure, raw } => serde_json::json!({
+            "measure": measure,
+            "raw": raw,
+        }),
     }
 }
 

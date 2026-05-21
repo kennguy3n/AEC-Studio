@@ -106,12 +106,12 @@ pub fn boq_for_project(
         let mat = props
             .get(id)
             .and_then(|ep| ep.get("Pset_MaterialLayerSet", "Material"))
-            .and_then(|v| v.as_text().map(str::to_string))
+            .and_then(|v| v.as_text().map(std::borrow::Cow::into_owned))
             .or_else(|| {
                 props
                     .get(id)
                     .and_then(|ep| ep.get("Pset_ElementMaterial", "Material"))
-                    .and_then(|v| v.as_text().map(str::to_string))
+                    .and_then(|v| v.as_text().map(std::borrow::Cow::into_owned))
             })
             .unwrap_or_else(|| "Unspecified".to_string());
         let area = quantity(props, id, &asg.class, QuantityKind::Area);

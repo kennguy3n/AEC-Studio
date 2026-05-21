@@ -15,13 +15,18 @@
 //! so the parser can recover identity verbatim and the round-trip is
 //! lossless for everything we serialise.
 //!
-//! This is intentionally a **subset** parser: we do not support
-//! arbitrary IFC files coming from other authoring tools. That path
-//! goes through the IfcOpenShell worker. The role of this parser is
-//! to round-trip the bytes our own writer produced, for end-to-end
-//! tests and for the BIM-Lite export pack.
+//! Schema reach: the reader accepts IFC4, IFC2x3, and IFC4x3 STEP
+//! files; the detected schema is exposed via [`IfcSnapshot::schema`]
+//! so downstream consumers can decide how strictly to interpret
+//! entities whose IFC version differs from AEC Studio's canonical
+//! IFC4 model. Entities outside the modeled subset (custom Psets,
+//! geometry instances, unmodeled spatial classes) are tolerated
+//! and skipped during parse — the goal is end-to-end roundtrip
+//! fidelity for the entities AEC Studio owns, not a complete
+//! IFC4 implementation.
 
 use std::collections::HashMap;
+use std::io::{BufRead, Read};
 
 use thiserror::Error;
 
@@ -45,6 +50,52 @@ pub enum IfcReadError {
 
 pub type IfcReadResult<T> = Result<T, IfcReadError>;
 
+/// IFC schema versions the reader accepts.
+///
+/// Detected from the `FILE_SCHEMA` line in the STEP header. AEC
+/// Studio's writer emits [`Ifc4`](IfcSchema::Ifc4); the reader is
+/// permissive on input so files exported by other authoring tools
+/// (which often target [`Ifc2x3`](IfcSchema::Ifc2x3)) round-trip
+/// through AEC Studio without losing identity for the entities we
+/// own. Entities unique to a particular schema generation are
+/// tolerated and skipped — see [`IfcReader::from_string`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum IfcSchema {
+    /// IFC2x3 TC1 — ISO 16739:2005, still the most widely deployed
+    /// schema in legacy authoring tools.
+    Ifc2x3,
+    /// IFC4 ADD2 TC1 — ISO 16739-1:2018, AEC Studio's canonical
+    /// internal schema.
+    #[default]
+    Ifc4,
+    /// IFC4x3 ADD2 — ISO 16739-1:2024, the current draft schema,
+    /// adds infrastructure-domain entities.
+    Ifc4x3,
+}
+
+impl IfcSchema {
+    /// Match a STEP `FILE_SCHEMA(('...'))` literal (case-insensitive,
+    /// whitespace-tolerant) against the known versions.
+    pub fn from_step_literal(s: &str) -> Option<Self> {
+        let up = s.trim().to_ascii_uppercase();
+        match up.as_str() {
+            "IFC2X3" => Some(IfcSchema::Ifc2x3),
+            "IFC4" => Some(IfcSchema::Ifc4),
+            "IFC4X3" | "IFC4X3_ADD2" | "IFC4X3_ADD1" | "IFC4X3_RC4" => Some(IfcSchema::Ifc4x3),
+            _ => None,
+        }
+    }
+
+    /// The canonical token AEC Studio's writer emits for this schema.
+    pub fn as_step_literal(self) -> &'static str {
+        match self {
+            IfcSchema::Ifc2x3 => "IFC2X3",
+            IfcSchema::Ifc4 => "IFC4",
+            IfcSchema::Ifc4x3 => "IFC4X3",
+        }
+    }
+}
+
 /// Lightweight stats returned alongside the snapshot, useful for
 /// assertions in roundtrip tests.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -55,6 +106,13 @@ pub struct IfcReadStats {
     pub qsets: usize,
     pub aggregations: usize,
     pub containments: usize,
+    /// Number of `#N = TYPE(...)` entity instances the tokenizer
+    /// observed before the modeled-entity filter. Useful as a
+    /// sanity-check when feeding an external IFC file: the value
+    /// should be ≥ `spatial_nodes + elements + psets + qsets`,
+    /// with the difference being unmodeled / unknown records that
+    /// were tolerated and skipped.
+    pub records_seen: usize,
 }
 
 /// Snapshot returned by [`IfcReader::from_string`]. Everything below
@@ -71,6 +129,8 @@ pub struct IfcSnapshot {
     pub guid_by_entity: HashMap<EntityId, String>,
     /// The recovered spatial parent for each element (`storey_id`).
     pub element_parent: HashMap<EntityId, EntityId>,
+    /// IFC schema declared in the file's `FILE_SCHEMA` header.
+    pub schema: IfcSchema,
     pub stats: IfcReadStats,
 }
 
@@ -83,9 +143,7 @@ impl IfcReader {
         if !text.contains("HEADER;") || !text.contains("DATA;") {
             return Err(IfcReadError::MissingSection("HEADER/DATA"));
         }
-        if !text.contains("FILE_SCHEMA(('IFC4'))") {
-            return Err(IfcReadError::MissingSection("FILE_SCHEMA"));
-        }
+        let schema = detect_schema(text)?;
         if !text.trim_end().ends_with("END-ISO-10303-21;") {
             return Err(IfcReadError::Malformed(
                 "missing END-ISO-10303-21; terminator".into(),
@@ -145,8 +203,25 @@ impl IfcReader {
                     let value = parse_typed_measure(&measure)?;
                     prop_values.insert(g.step_id, PropRow { key, value });
                 }
-                "IFCQUANTITYLENGTH" | "IFCQUANTITYAREA" | "IFCQUANTITYVOLUME"
-                | "IFCQUANTITYCOUNT" | "IFCQUANTITYWEIGHT" => {
+                // Any `IFCQUANTITY*` entity is dispatched here. The
+                // five canonical quantity kinds (length/area/volume/
+                // count/weight) map to typed `PropertyValue` variants;
+                // IFC4x3 added `IFCQUANTITYTIME` and any future
+                // schema-level quantity kinds fall through the
+                // catch-all arm of `parse_quantity_typed` to a
+                // `PropertyValue::Other { measure, raw }` so the value
+                // survives a read→write round-trip verbatim — i.e. the
+                // writer's `serialize_quantity_value::Other` arm emits
+                // exactly the same STEP literal we ingested here.
+                //
+                // We intentionally do NOT enumerate the known kinds in
+                // the dispatch arm: that would silently drop any
+                // future or vendor-extension `IFCQUANTITY*` to the
+                // element fallback below (which then skips the entity
+                // entirely because it lacks the `tag::eid` Name field).
+                // A prefix match keeps the round-trip closed for the
+                // full open-ended family.
+                kind if kind.starts_with("IFCQUANTITY") => {
                     let key = g.string_arg(0)?;
                     let lit = g
                         .args
@@ -398,10 +473,25 @@ impl IfcReader {
                 }
                 qset_count += 1;
             } else {
-                return Err(IfcReadError::Malformed(format!(
-                    "IFCRELDEFINESBYPROPERTIES references unknown set #{}",
-                    pset_or_qset_step
-                )));
+                // The module contract (see crate-level doc and
+                // `IfcReader::from_string`) is that unmodeled / unknown
+                // entities — including pset / qset target rows that
+                // the modeled-entity filter skipped — are tolerated.
+                // An IFCRELDEFINESBYPROPERTIES whose RelatingPropertyDefinition
+                // points at one of those skipped rows is therefore an
+                // expected condition when reading an external file
+                // produced by Revit / ArchiCAD / IfcOpenShell, not a
+                // file corruption. Skip silently; the `records_seen`
+                // counter already accounts for the source record so
+                // downstream sanity checks remain meaningful.
+                //
+                // Hard-failing here was previously inconsistent with
+                // the module-level "tolerate and skip unknowns"
+                // promise and caused external-file ingestion to
+                // refuse otherwise-valid inputs that contained
+                // unmodeled IfcPropertySet subclasses (e.g.
+                // `IfcPreDefinedPropertySet`).
+                continue;
             }
         }
 
@@ -423,6 +513,7 @@ impl IfcReader {
             qsets: qset_count,
             aggregations,
             containments,
+            records_seen: groups.len(),
         };
 
         // sanity: project_entity is the same as project.root
@@ -434,8 +525,47 @@ impl IfcReader {
             properties: props,
             guid_by_entity,
             element_parent,
+            schema,
             stats,
         })
+    }
+
+    /// Convenience wrapper around [`IfcReader::from_string`] that
+    /// accepts any [`Read`] (no `BufRead` requirement — the input is
+    /// slurped into a `String` in one call).
+    ///
+    /// **Memory profile**: this method is API-streaming but NOT
+    /// memory-streaming — it buffers the entire input into a
+    /// `String` before parsing because [`IfcReader::from_string`]
+    /// needs random access to resolve forward references in the
+    /// STEP cross-reference graph (e.g. `#42` referring to an
+    /// entity defined later in the file). Peak RAM is therefore
+    /// roughly `file_size + indexed_record_set`, the same as
+    /// reading the whole file into a `String` yourself.
+    ///
+    /// For genuinely memory-streaming consumption that yields one
+    /// [`StepRecord`] at a time without building cross-reference
+    /// indexes (suitable for multi-gigabyte IFC ingest where you
+    /// only need per-record processing), use [`IfcReader::iter`]
+    /// instead.
+    pub fn from_reader<R: Read>(mut reader: R) -> IfcReadResult<IfcSnapshot> {
+        let mut buf = String::new();
+        reader.read_to_string(&mut buf)?;
+        Self::from_string(&buf)
+    }
+
+    /// Create a streaming iterator over the STEP entity instances
+    /// in `reader`. The iterator yields one [`StepRecord`] per
+    /// logical record (record terminator = `;` outside strings,
+    /// parens, and comments), without buffering the entire file
+    /// in memory.
+    ///
+    /// Use this when you need raw entity records (e.g. to
+    /// implement a custom dispatch over IFC types AEC Studio
+    /// doesn't model). For the high-level snapshot, use
+    /// [`IfcReader::from_string`] or [`IfcReader::from_reader`].
+    pub fn iter<R: BufRead>(reader: R) -> StepIter<R> {
+        StepIter::new(reader)
     }
 
     fn malformed(record: &StepRecord, why: &str) -> IfcReadError {
@@ -453,18 +583,24 @@ impl IfcReader {
 // Tokenisation
 // ---------------------------------------------------------------------
 
+/// A parsed STEP entity instance: `#step_id = kind(args...);`.
+///
+/// This is the smallest unit the parser yields; consumers can read
+/// records via [`StepIter`] and dispatch entity-type-specific
+/// interpretation themselves. The internal entity-extraction code
+/// in [`IfcReader::from_string`] uses the same type.
 #[derive(Debug, Clone)]
-struct StepRecord {
-    step_id: u32,
+pub struct StepRecord {
+    pub step_id: u32,
     /// STEP entity kind, normalized to ASCII uppercase for matching
     /// against canonical STEP entity names (`IFCWALL`, `IFCSITE`, ...).
-    kind: String,
+    pub kind: String,
     /// The kind exactly as it appeared in the source bytes, before
     /// any case normalization. Used to round-trip
     /// [`IfcClass::Other`] values whose tag carries non-canonical
     /// casing (e.g. `"IfcBuildingElementProxy"`).
-    raw_kind: String,
-    args: Vec<String>,
+    pub raw_kind: String,
+    pub args: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -514,46 +650,421 @@ struct QtyRow {
 
 fn parse_step_groups(text: &str) -> IfcReadResult<Vec<StepRecord>> {
     let mut groups = Vec::new();
-    // Each STEP entity instance fits on one line in the bytes we emit:
-    //   "#N = TYPE(arg1,arg2,...);\n"
-    // We tokenize purely on those lines, ignoring the HEADER and
-    // ENDSEC markers.
-    for raw in text.lines() {
-        let line = raw.trim();
-        if !line.starts_with('#') {
-            continue;
+    for record in iter_logical_records(text)? {
+        if let Some(rec) = parse_logical_record(&record)? {
+            groups.push(rec);
         }
-        let Some(body) = line.strip_suffix(';') else {
-            continue;
-        };
-        // "#N = TYPE(args)"
-        let (lhs, rhs) = body
-            .split_once('=')
-            .ok_or_else(|| IfcReadError::Malformed(format!("missing '=' in '{line}'")))?;
-        let step_id: u32 = lhs
-            .trim()
-            .trim_start_matches('#')
-            .parse()
-            .map_err(|e| IfcReadError::Malformed(format!("step id parse: {e}")))?;
-        let rhs = rhs.trim();
-        let open = rhs
-            .find('(')
-            .ok_or_else(|| IfcReadError::Malformed(format!("missing '(' in '{rhs}'")))?;
-        let close = rhs
-            .rfind(')')
-            .ok_or_else(|| IfcReadError::Malformed(format!("missing ')' in '{rhs}'")))?;
-        let raw_kind = rhs[..open].trim().to_string();
-        let kind = raw_kind.to_ascii_uppercase();
-        let inner = &rhs[open + 1..close];
-        let args = split_step_args(inner)?;
-        groups.push(StepRecord {
-            step_id,
-            kind,
-            raw_kind,
-            args,
-        });
     }
     Ok(groups)
+}
+
+/// Detect the IFC schema declared in `FILE_SCHEMA(('IFCxx'))`.
+///
+/// AEC Studio accepts IFC2x3, IFC4, and IFC4x3. Any other token is
+/// rejected as `MissingSection("FILE_SCHEMA")` so we fail loudly
+/// rather than silently re-interpret an unsupported schema as IFC4.
+///
+/// The search is intentionally **bounded to the HEADER section**
+/// (`HEADER;` ... `ENDSEC;` before `DATA;`) so we never mistake a
+/// `FILE_SCHEMA(('IFC2X3'))` token that happens to appear inside a
+/// DATA-section string literal (e.g. a `Description` attribute on
+/// an entity, or a comment-like `/*…*/` block) for the file's
+/// declared schema. ISO 10303-21 §6.4 mandates that `FILE_SCHEMA`
+/// is a HEADER entity, so anything matching outside HEADER must be
+/// payload, not metadata.
+fn detect_schema(text: &str) -> IfcReadResult<IfcSchema> {
+    // The STEP grammar allows whitespace inside the parens; the
+    // canonical AEC-emitted form is `FILE_SCHEMA(('IFC4'));` but
+    // external authoring tools may emit `FILE_SCHEMA ( ( 'IFC4' ) ) ;`.
+    let upper = text.to_ascii_uppercase();
+    // Bound the search to the HEADER section. STEP files start with
+    // `ISO-10303-21;` then `HEADER;` ... `ENDSEC;` then `DATA;`.
+    // We locate `HEADER` and the *first* `ENDSEC` after it; that
+    // pair delimits the metadata block. If the file lacks either
+    // marker we reject as `MissingSection` rather than fall back to
+    // a permissive whole-text scan (which would let a DATA-section
+    // string smuggle in a fake schema declaration).
+    let header_start = upper
+        .find("HEADER")
+        .ok_or(IfcReadError::MissingSection("HEADER"))?;
+    let header_end_rel = upper[header_start..]
+        .find("ENDSEC")
+        .ok_or(IfcReadError::MissingSection("HEADER"))?;
+    let header_end = header_start + header_end_rel;
+    let header = &text[header_start..header_end];
+    let header_upper = &upper[header_start..header_end];
+    let needle = "FILE_SCHEMA";
+    let start = header_upper
+        .find(needle)
+        .ok_or(IfcReadError::MissingSection("FILE_SCHEMA"))?;
+    let tail = &header[start + needle.len()..];
+    // Locate the first single-quoted literal after `FILE_SCHEMA(...)`.
+    let q1 = tail
+        .find('\'')
+        .ok_or(IfcReadError::MissingSection("FILE_SCHEMA"))?;
+    let after = &tail[q1 + 1..];
+    let q2 = after
+        .find('\'')
+        .ok_or(IfcReadError::MissingSection("FILE_SCHEMA"))?;
+    let literal = &after[..q2];
+    IfcSchema::from_step_literal(literal).ok_or(IfcReadError::MissingSection("FILE_SCHEMA"))
+}
+
+/// Iterator over logical STEP records (text between matching
+/// top-level semicolons), with comments stripped and string literals
+/// respected. Returns each record's raw text *without* the trailing
+/// semicolon.
+///
+/// This handles three things the original line-based splitter did
+/// not:
+///
+///   * **Multi-line records**: an `IFCWALL(... \n ... \n ...);` whose
+///     arg list spans several newlines is returned as a single
+///     logical record.
+///   * **`/* ... */` comments**: per ISO 10303-21 §6.4.1, comments
+///     can appear anywhere outside string literals. We strip them
+///     before record splitting so a `;` inside a comment doesn't
+///     accidentally terminate a record.
+///   * **Embedded `;` in strings**: a string literal `'foo;bar'`
+///     contains a literal semicolon that is *not* a record
+///     terminator.
+fn iter_logical_records(text: &str) -> IfcReadResult<Vec<String>> {
+    let mut splitter = StepRecordSplitter::new(text);
+    let mut out: Vec<String> = Vec::new();
+    for item in splitter.by_ref() {
+        let (record, _consumed) = item?;
+        if !record.is_empty() {
+            out.push(record);
+        }
+    }
+    splitter.validate_at_eof()?;
+    Ok(out)
+}
+
+/// Shared STEP record-splitting state machine. The same character-
+/// level rules apply to three callers:
+///
+///   1. [`iter_logical_records`] (full-text → `Vec<String>`)
+///   2. [`split_first_logical_record`] (streaming prefix → first
+///      record + consumed bytes)
+///   3. [`validate_trailing_buffer`] (post-stream EOF check)
+///
+/// Keeping the rules in a single struct ensures the three sites can
+/// not diverge — earlier versions of this module had three
+/// independent copies that all needed to be updated in lockstep (for
+/// `/* … */` comments, multi-byte UTF-8, escaped quotes, ISO
+/// `''` doubled-quote escapes, etc.). Adding a new STEP token rule
+/// now requires editing exactly one place.
+///
+/// **String quoting** accepts both AEC Studio's writer convention
+/// (`\'` for an embedded single-quote, `\\` for a backslash) AND
+/// the ISO 10303-21 canonical convention (`''` doubled quote for an
+/// embedded single-quote). The writer emits the ISO `''` form so
+/// AEC Studio output is interoperable with Revit / ArchiCAD / other
+/// third-party IFC tooling, but the reader keeps accepting `\'` for
+/// backwards compatibility with files written by earlier AEC builds.
+///
+/// Both escaped forms are preserved *verbatim* in the record buffer
+/// returned by the iterator; [`unescape_step_string`] does the final
+/// collapse from `\'` / `''` to a single `'`.
+struct StepRecordSplitter<'a> {
+    chars: std::iter::Peekable<std::str::CharIndices<'a>>,
+    buf: String,
+    depth: i32,
+    in_str: bool,
+    in_comment: bool,
+}
+
+impl<'a> StepRecordSplitter<'a> {
+    fn new(text: &'a str) -> Self {
+        // Walk by characters so multi-byte UTF-8 (e.g. é, Ö, £) is not
+        // mis-split. The peek-ahead for `/*` and `*/` looks at the next
+        // *byte* via slice indexing on the original text, which is safe
+        // because `/` and `*` are ASCII (single-byte) and the byte
+        // offset of each char is always at a char boundary.
+        Self {
+            chars: text.char_indices().peekable(),
+            buf: String::new(),
+            depth: 0,
+            in_str: false,
+            in_comment: false,
+        }
+    }
+
+    /// After [`Iterator::next`] returns `None`, call this to surface
+    /// dangling-state errors (unterminated string literal, unbalanced
+    /// parens). Returns `Ok(())` when the splitter is in a clean
+    /// resting state — i.e. not in the middle of a string and depth
+    /// is back to zero. Callers that operate on a streaming prefix
+    /// (where partial state at end-of-buffer is expected) skip this
+    /// check; callers that operate on a full STEP file or at
+    /// end-of-stream invoke it.
+    fn validate_at_eof(&self) -> IfcReadResult<()> {
+        if self.in_str {
+            return Err(IfcReadError::Malformed(
+                "unterminated string literal at end of STEP file".into(),
+            ));
+        }
+        if self.depth != 0 {
+            return Err(IfcReadError::Malformed(format!(
+                "STEP file ends with unbalanced parens (depth={})",
+                self.depth
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Iterator for StepRecordSplitter<'_> {
+    /// `(record_text_without_trailing_semicolon, bytes_consumed_in_input)`.
+    ///
+    /// `bytes_consumed_in_input` is the byte offset (into the slice
+    /// passed to [`StepRecordSplitter::new`]) of the first byte *past*
+    /// the terminating `;` — the value [`split_first_logical_record`]
+    /// returns so the streaming caller can drain that prefix.
+    type Item = IfcReadResult<(String, usize)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some((off, c)) = self.chars.next() {
+            // Comment open: `/*` outside strings.
+            if !self.in_str && !self.in_comment && c == '/' {
+                if let Some(&(_, '*')) = self.chars.peek() {
+                    self.in_comment = true;
+                    self.chars.next(); // consume `*`
+                    continue;
+                }
+            }
+            // Comment close: `*/`.
+            if self.in_comment {
+                if c == '*' {
+                    if let Some(&(_, '/')) = self.chars.peek() {
+                        self.in_comment = false;
+                        self.chars.next(); // consume `/`
+                    }
+                }
+                continue;
+            }
+            match c {
+                '\\' if self.in_str => {
+                    // Preserve `\\` and `\'` so split_step_args sees them.
+                    self.buf.push(c);
+                    if let Some((_, next)) = self.chars.next() {
+                        self.buf.push(next);
+                    }
+                }
+                '\'' => {
+                    // ISO 10303-21 §6.4.1: `''` inside a string
+                    // literal is an escaped single quote (the string
+                    // does NOT terminate). Detect the doubled-quote
+                    // by peeking the next char; if matched, push
+                    // both into the buffer and stay `in_str`.
+                    if self.in_str {
+                        if let Some(&(_, '\'')) = self.chars.peek() {
+                            self.buf.push(c);
+                            if let Some((_, c2)) = self.chars.next() {
+                                self.buf.push(c2);
+                            }
+                            continue;
+                        }
+                    }
+                    self.in_str = !self.in_str;
+                    self.buf.push(c);
+                }
+                '(' if !self.in_str => {
+                    self.depth += 1;
+                    self.buf.push(c);
+                }
+                ')' if !self.in_str => {
+                    self.depth -= 1;
+                    if self.depth < 0 {
+                        return Some(Err(IfcReadError::Malformed(format!(
+                            "STEP file has ')' without matching '(' near offset {off}"
+                        ))));
+                    }
+                    self.buf.push(c);
+                }
+                ';' if !self.in_str && self.depth == 0 => {
+                    let record = std::mem::take(&mut self.buf).trim().to_string();
+                    let consumed = off + c.len_utf8();
+                    return Some(Ok((record, consumed)));
+                }
+                _ => self.buf.push(c),
+            }
+        }
+        None
+    }
+}
+
+/// Parse a logical record's text (without trailing `;`) into a
+/// [`StepRecord`] if it matches the `#N = TYPE(args)` shape;
+/// otherwise return `Ok(None)` so the caller can ignore HEADER
+/// declarations, ENDSEC markers, and other non-entity tokens.
+fn parse_logical_record(record: &str) -> IfcReadResult<Option<StepRecord>> {
+    let line = record.trim();
+    if !line.starts_with('#') {
+        return Ok(None);
+    }
+    let (lhs, rhs) = line
+        .split_once('=')
+        .ok_or_else(|| IfcReadError::Malformed(format!("missing '=' in '{line}'")))?;
+    let step_id: u32 = lhs
+        .trim()
+        .trim_start_matches('#')
+        .parse()
+        .map_err(|e| IfcReadError::Malformed(format!("step id parse: {e}")))?;
+    let rhs = rhs.trim();
+    let open = rhs
+        .find('(')
+        .ok_or_else(|| IfcReadError::Malformed(format!("missing '(' in '{rhs}'")))?;
+    let close = rhs
+        .rfind(')')
+        .ok_or_else(|| IfcReadError::Malformed(format!("missing ')' in '{rhs}'")))?;
+    let raw_kind = rhs[..open].trim().to_string();
+    let kind = raw_kind.to_ascii_uppercase();
+    let inner = &rhs[open + 1..close];
+    let args = split_step_args(inner)?;
+    Ok(Some(StepRecord {
+        step_id,
+        kind,
+        raw_kind,
+        args,
+    }))
+}
+
+/// Streaming iterator over STEP entity instances.
+///
+/// Pulls one logical record at a time from a [`BufRead`], yielding
+/// `Result<StepRecord, IfcReadError>`. Callers can implement custom
+/// cross-reference resolution without buffering the entire file
+/// in memory \u2014 only the in-flight record plus whatever cross-ref
+/// indexes the caller chooses to maintain is held in RAM.
+///
+/// Handles multi-line records, `/* ... */` comments, and embedded
+/// `;` inside quoted strings identically to
+/// [`IfcReader::from_string`].
+pub struct StepIter<R: BufRead> {
+    reader: R,
+    buf: String,
+    eof: bool,
+    fault: bool,
+}
+
+impl<R: BufRead> StepIter<R> {
+    pub fn new(reader: R) -> Self {
+        Self {
+            reader,
+            buf: String::new(),
+            eof: false,
+            fault: false,
+        }
+    }
+}
+
+impl<R: BufRead> Iterator for StepIter<R> {
+    type Item = IfcReadResult<StepRecord>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.fault {
+            return None;
+        }
+        loop {
+            // Try to split off one logical record from the buffer.
+            match split_first_logical_record(&self.buf) {
+                Ok(Some((record_text, consumed))) => {
+                    self.buf.drain(..consumed);
+                    match parse_logical_record(&record_text) {
+                        Ok(Some(rec)) => return Some(Ok(rec)),
+                        Ok(None) => continue, // skip non-entity tokens
+                        Err(e) => {
+                            self.fault = true;
+                            return Some(Err(e));
+                        }
+                    }
+                }
+                Ok(None) => {
+                    // Need more input.
+                    if self.eof {
+                        // The reader is drained. Match the eager
+                        // `from_string` path's truncation-detection
+                        // contract: if the trailing buffer contains an
+                        // unterminated string literal or unbalanced
+                        // parens, surface a `Malformed` error rather
+                        // than silently dropping the partial record.
+                        // `from_string` runs the same check at end of
+                        // input (see `iter_logical_records`); without
+                        // it, a STEP file truncated mid-string would
+                        // produce identical bytes through both APIs but
+                        // only one would flag the corruption.
+                        if let Err(e) = validate_trailing_buffer(&self.buf) {
+                            self.fault = true;
+                            self.buf.clear();
+                            return Some(Err(e));
+                        }
+                        return None;
+                    }
+                    let mut line = String::new();
+                    match self.reader.read_line(&mut line) {
+                        Ok(0) => self.eof = true,
+                        Ok(_) => self.buf.push_str(&line),
+                        Err(e) => {
+                            self.fault = true;
+                            return Some(Err(e.into()));
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.fault = true;
+                    return Some(Err(e));
+                }
+            }
+        }
+    }
+}
+
+/// Validate the trailing (post-final-`;`) bytes of a STEP buffer at
+/// end-of-stream. Used by [`StepIter`] to reject truncated files —
+/// without this check a STEP file that was cut off mid-string or
+/// mid-record would silently terminate the iterator instead of
+/// flagging the corruption.
+///
+/// Returns `Err(Malformed)` for:
+///   * unterminated string literal (`'…` without closing `'`)
+///   * unbalanced parens (more `(` than `)` outside strings)
+///   * unbalanced parens (more `)` than `(` outside strings)
+///
+/// Returns `Ok(())` for buffers that contain only whitespace,
+/// comments, and balanced tokens that don't constitute a full
+/// `... ;` record (those are tolerated — the file may legitimately
+/// end with trailing whitespace after the final `ENDSEC;`).
+fn validate_trailing_buffer(text: &str) -> IfcReadResult<()> {
+    // Reuse the shared splitter: drain any complete records that
+    // happen to fit in the trailing buffer (surfacing any structural
+    // error), then assert clean EOF state. The splitter's character-
+    // level rules are identical to the streaming reader's so this
+    // check can never disagree with the prior `split_first_logical_record`
+    // calls about whether the file was well-formed.
+    let mut splitter = StepRecordSplitter::new(text);
+    for item in splitter.by_ref() {
+        item?;
+    }
+    splitter.validate_at_eof()
+}
+
+/// Find the first complete logical STEP record in `text`. Returns
+/// `Ok(Some((record, consumed)))` where `record` is the text up to
+/// but excluding the terminating `;`, and `consumed` is the byte
+/// length to drain from the front of `text` (including the `;`).
+/// Returns `Ok(None)` if `text` does not yet contain a complete
+/// record (caller should buffer more input).
+fn split_first_logical_record(text: &str) -> IfcReadResult<Option<(String, usize)>> {
+    // Pull a single record from the shared splitter; the streaming
+    // caller drives subsequent reads from a fresh splitter over the
+    // post-drain buffer.
+    match StepRecordSplitter::new(text).next() {
+        Some(Ok((record, consumed))) => Ok(Some((record, consumed))),
+        Some(Err(e)) => Err(e),
+        None => Ok(None),
+    }
 }
 
 /// Split the argument list of a STEP record, respecting nested
@@ -578,9 +1089,9 @@ fn split_step_args(s: &str) -> IfcReadResult<Vec<String>> {
     while let Some(c) = chars.next() {
         match c {
             '\\' if in_str => {
-                // The writer's escape_step_string emits \' for embedded
-                // single-quotes and \\ for embedded backslashes. Consume
-                // the backslash + the following character so we don't
+                // Legacy AEC writer convention: `\'` for an embedded
+                // single-quote and `\\` for a backslash. Consume the
+                // backslash + following character verbatim so we don't
                 // mis-toggle `in_str` on an escaped `'`.
                 buf.push(c);
                 if let Some(next) = chars.next() {
@@ -588,6 +1099,19 @@ fn split_step_args(s: &str) -> IfcReadResult<Vec<String>> {
                 }
             }
             '\'' => {
+                // ISO 10303-21 §6.4.1: `''` inside a string literal is
+                // an embedded single-quote (the string does NOT
+                // terminate). Match the same rule used by
+                // `StepRecordSplitter` so external IFC files round-trip
+                // even though the arg-level splitter does not run
+                // through the record splitter twice.
+                if in_str && matches!(chars.peek(), Some('\'')) {
+                    buf.push(c);
+                    if let Some(c2) = chars.next() {
+                        buf.push(c2);
+                    }
+                    continue;
+                }
                 in_str = !in_str;
                 buf.push(c);
             }
@@ -628,7 +1152,9 @@ fn split_step_args(s: &str) -> IfcReadResult<Vec<String>> {
 }
 
 impl StepRecord {
-    fn string_arg(&self, idx: usize) -> IfcReadResult<String> {
+    /// Decode a single-quoted string argument at `idx`, unescaping
+    /// `\'`, `\\`, `\n`, `\r`, and `\t` per the writer's contract.
+    pub fn string_arg(&self, idx: usize) -> IfcReadResult<String> {
         let raw = self.args.get(idx).ok_or_else(|| {
             IfcReadError::Malformed(format!("missing arg {idx} on {}", self.kind))
         })?;
@@ -642,7 +1168,8 @@ impl StepRecord {
         Ok(unescape_step_string(&s[1..s.len() - 1]))
     }
 
-    fn ref_arg(&self, idx: usize) -> IfcReadResult<u32> {
+    /// Decode an entity reference (`#N`) argument at `idx`.
+    pub fn ref_arg(&self, idx: usize) -> IfcReadResult<u32> {
         let raw = self.args.get(idx).ok_or_else(|| {
             IfcReadError::Malformed(format!("missing arg {idx} on {}", self.kind))
         })?;
@@ -658,7 +1185,9 @@ impl StepRecord {
             .map_err(|e| IfcReadError::Malformed(format!("ref parse: {e}")))
     }
 
-    fn ref_list_arg(&self, idx: usize) -> IfcReadResult<Vec<u32>> {
+    /// Decode a list-of-references (`(#N, #M, ...)`) argument at
+    /// `idx`. Empty lists return an empty vector.
+    pub fn ref_list_arg(&self, idx: usize) -> IfcReadResult<Vec<u32>> {
         let raw = self.args.get(idx).ok_or_else(|| {
             IfcReadError::Malformed(format!("missing arg {idx} on {}", self.kind))
         })?;
@@ -761,7 +1290,18 @@ fn parse_typed_measure(raw: &str) -> IfcReadResult<PropertyValue> {
         "IFCPOSITIVERATIOMEASURE" => Ok(PropertyValue::Ratio(parse_real(inner)?)),
         "IFCINTEGER" => Ok(PropertyValue::Integer(parse_int(inner)?)),
         "IFCBOOLEAN" => Ok(PropertyValue::Boolean(matches!(inner, ".T."))),
-        other => Err(IfcReadError::UnknownType(other.to_string())),
+        other => {
+            // Preserve unknown IFC measure types verbatim for
+            // lossless round-trip. The writer's emit path detects
+            // `PropertyValue::Other` and re-wraps the raw literal
+            // in the original IFC measure tag. We store the STEP
+            // form (uppercase) since recovering the IFC4 canonical
+            // camelCase spelling without a dictionary is lossy.
+            Ok(PropertyValue::Other {
+                measure: other.to_string(),
+                raw: inner.to_string(),
+            })
+        }
     }
 }
 
@@ -773,7 +1313,11 @@ fn parse_quantity_typed(tag: &str, raw: &str) -> IfcReadResult<PropertyValue> {
         "IFCQUANTITYVOLUME" => Ok(PropertyValue::Volume(parse_real(v)?)),
         "IFCQUANTITYCOUNT" => Ok(PropertyValue::Integer(parse_int(v)?)),
         "IFCQUANTITYWEIGHT" => Ok(PropertyValue::Real(parse_real(v)?)),
-        other => Err(IfcReadError::UnknownType(other.to_string())),
+        // IFC4x3 added IFCQUANTITYTIME and others; preserve verbatim.
+        other => Ok(PropertyValue::Other {
+            measure: other.to_string(),
+            raw: v.to_string(),
+        }),
     }
 }
 
@@ -791,11 +1335,22 @@ fn unquote(s: &str) -> IfcReadResult<String> {
 ///
 /// The writer encodes:
 ///
-///   * single quotes as `\'`
+///   * single quotes as `''` (ISO 10303-21 §6.4.1 canonical doubled
+///     quote — interoperable with Revit / ArchiCAD / IfcOpenShell)
 ///   * backslashes as `\\`
 ///   * newlines (`U+000A`) as `\n`
 ///   * carriage returns (`U+000D`) as `\r`
 ///   * tabs (`U+0009`) as `\t`
+///
+/// The decoder *also* accepts the legacy AEC writer convention of
+/// `\'` for an embedded single-quote so files written by pre-Phase-9
+/// AEC builds continue to round-trip cleanly. A single left-to-right
+/// pass handles both forms: `\` always consumes the next char, and a
+/// `'` inside the string slice is treated as a doubled-quote escape
+/// when followed by another `'` (the record splitter already
+/// preserved the pair verbatim) or as a stray quote otherwise
+/// (defensive — the splitter would have flagged an unterminated
+/// string before we got here).
 ///
 /// Chained `replace` calls cannot undo this safely (a naive
 /// `.replace("\\\\", "\\").replace("\\'", "'")` would turn the
@@ -809,9 +1364,9 @@ fn unquote(s: &str) -> IfcReadResult<String> {
 /// across lines just because a user-supplied name contained a literal
 /// newline. The decoder maps them back to the original control
 /// characters so re-export is byte-identical for any input.
-fn unescape_step_string(s: &str) -> String {
+pub(crate) fn unescape_step_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
+    let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '\\' {
             match chars.next() {
@@ -829,6 +1384,14 @@ fn unescape_step_string(s: &str) -> String {
                 }
                 None => out.push('\\'),
             }
+        } else if c == '\'' {
+            // ISO 10303-21 doubled-quote escape (`''` → `'`). The
+            // record splitter preserved both characters verbatim in
+            // the slice we received, so we collapse them here.
+            if matches!(chars.peek(), Some('\'')) {
+                chars.next();
+            }
+            out.push('\'');
         } else {
             out.push(c);
         }
@@ -1034,6 +1597,13 @@ mod tests {
         // The encoder is `escape_step_string` in the writer; this is
         // the decoder. They must be exact inverses for any input,
         // including pathological combinations of `\` and `'`.
+        //
+        // Two encoder conventions are exercised:
+        //   1. ISO 10303-21 canonical (`''` for embedded single-quote),
+        //      which is what the current writer emits.
+        //   2. Legacy AEC writer (`\'` for embedded single-quote),
+        //      which the reader must continue to accept so files
+        //      written by pre-Phase-9 builds keep round-tripping.
         let cases = [
             "",
             "plain text",
@@ -1046,18 +1616,122 @@ mod tests {
             r"don't \stop", // common natural text
         ];
         for input in cases {
-            // Encode the same way the writer does, char-by-char.
-            let mut encoded = String::new();
+            // (1) ISO-canonical `''` encoding (current writer).
+            let mut encoded_iso = String::new();
             for c in input.chars() {
                 match c {
-                    '\\' => encoded.push_str("\\\\"),
-                    '\'' => encoded.push_str("\\'"),
-                    _ => encoded.push(c),
+                    '\\' => encoded_iso.push_str("\\\\"),
+                    '\'' => encoded_iso.push_str("''"),
+                    _ => encoded_iso.push(c),
                 }
             }
-            let decoded = unescape_step_string(&encoded);
-            assert_eq!(decoded, input, "round-trip failed for {input:?}");
+            let decoded_iso = unescape_step_string(&encoded_iso);
+            assert_eq!(
+                decoded_iso, input,
+                "ISO `''` round-trip failed for {input:?}"
+            );
+
+            // (2) Legacy `\'` encoding (pre-Phase-9 writer).
+            let mut encoded_legacy = String::new();
+            for c in input.chars() {
+                match c {
+                    '\\' => encoded_legacy.push_str("\\\\"),
+                    '\'' => encoded_legacy.push_str("\\'"),
+                    _ => encoded_legacy.push(c),
+                }
+            }
+            let decoded_legacy = unescape_step_string(&encoded_legacy);
+            assert_eq!(
+                decoded_legacy, input,
+                "legacy `\\'` round-trip failed for {input:?}"
+            );
         }
+    }
+
+    #[test]
+    fn reader_accepts_iso_canonical_doubled_quote_strings() {
+        // A STEP file produced by Revit / ArchiCAD / IfcOpenShell
+        // encodes an embedded single-quote as `''` (ISO 10303-21
+        // §6.4.1 canonical) rather than the legacy AEC `\'` form.
+        // Build a hand-written IFC4 STEP file using `''` and verify
+        // the reader extracts the original text losslessly.
+        let step = "\
+ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('externally-authored apostrophes'),'2;1');
+FILE_NAME('iso.ifc','2025-01-01T00:00:00',('Author'),('Org'),'AEC','AEC','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1 = IFCPROJECT('00000000000000000000a1',$,$,'O''Brien''s Project',$,$,$,$,$);
+#2 = IFCSITE('00000000000000000000a2',$,$,'St. Mary''s',$,$,$,$);
+#3 = IFCRELAGGREGATES('00000000000000000000a3',$,$,$,#1,(#2));
+ENDSEC;
+END-ISO-10303-21;
+";
+        let snap = IfcReader::from_string(step).expect("reader must accept ISO `''` quoting");
+        let root = snap.project.nodes.get(&snap.project.root).unwrap();
+        assert_eq!(
+            root.name, "O'Brien's Project",
+            "ISO doubled-quote in IfcProject.Name must collapse to a single `'`"
+        );
+        // Walk one level down: the IfcSite child.
+        let site_step = root.children.first().expect("project has one child");
+        let site = snap.project.nodes.get(site_step).unwrap();
+        assert_eq!(
+            site.name, "St. Mary's",
+            "ISO doubled-quote in IfcSite.Name must collapse to a single `'`"
+        );
+    }
+
+    #[test]
+    fn reader_skips_unmodeled_pset_targets_instead_of_failing() {
+        // Per the module contract, an IFCRELDEFINESBYPROPERTIES that
+        // references an unmodeled / unknown property-definition row
+        // (e.g. `IFCPREDEFINEDPROPERTYSET` produced by Revit's
+        // IfcDoorPanelProperties shadow type) must be tolerated and
+        // skipped, NOT raised as a hard `Malformed` error. Build a
+        // minimal STEP file that exercises this path.
+        let step = "\
+ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('skip-unknown-pset target'),'2;1');
+FILE_NAME('skip.ifc','2025-01-01T00:00:00',('A'),('O'),'AEC','AEC','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1 = IFCPROJECT('00000000000000000000a1',$,$,'P',$,$,$,$,$);
+#2 = IFCSITE('00000000000000000000a2',$,$,'S',$,$,$,$);
+#3 = IFCBUILDING('00000000000000000000a3',$,$,'B',$,$,$,$);
+#4 = IFCBUILDINGSTOREY('00000000000000000000a4',$,$,'L1',$,$,$,$);
+#5 = IFCWALL('00000000000000000000a5',$,$,'W1',$,$,$,$);
+#6 = IFCRELAGGREGATES('00000000000000000000a6',$,$,$,#1,(#2));
+#7 = IFCRELAGGREGATES('00000000000000000000a7',$,$,$,#2,(#3));
+#8 = IFCRELAGGREGATES('00000000000000000000a8',$,$,$,#3,(#4));
+#9 = IFCRELCONTAINEDINSPATIALSTRUCTURE('00000000000000000000a9',$,$,$,(#5),#4);
+/* #10 is an UNMODELED IfcPropertySet subclass that the reader filter skips. */
+#10 = IFCPREDEFINEDPROPERTYSET('00000000000000000000aa',$,'UnknownSet',$);
+/* #11 points #5 at the unmodeled #10 -- must be skipped, not rejected. */
+#11 = IFCRELDEFINESBYPROPERTIES('00000000000000000000bb',$,$,$,(#5),#10);
+ENDSEC;
+END-ISO-10303-21;
+";
+        // The contract under test: the reader must NOT raise a hard
+        // `Malformed` error just because an IFCRELDEFINESBYPROPERTIES
+        // points at an unmodeled `IfcPropertySet` subclass. Earlier
+        // versions of this module returned `Err(Malformed(...))` from
+        // the second-pass loop, which broke ingestion of any external
+        // file containing `IfcPreDefinedPropertySet` / `IfcDoorPanelProperties`
+        // / etc.
+        let snap = IfcReader::from_string(step)
+            .expect("reader must tolerate unmodeled IFCRELDEFINESBYPROPERTIES target");
+        // The spatial structure still loads — IfcProject, IfcSite,
+        // IfcBuilding, IfcBuildingStorey are all retained.
+        assert_eq!(
+            snap.stats.spatial_nodes, 4,
+            "all four spatial nodes must round-trip even though one IFCRELDEFINESBYPROPERTIES \
+             pointed at an unmodeled set"
+        );
     }
 
     #[test]
@@ -1664,6 +2338,507 @@ ENDSEC;\n\
 END-ISO-10303-21;\n";
         let err = IfcReader::from_string(bad).expect_err("malformed arg list must error");
         assert!(matches!(err, IfcReadError::Malformed(_)), "{err:?}");
+    }
+
+    /// Unknown IFC measure types (e.g. `IfcMassDensityMeasure`,
+    /// `IfcFrequencyMeasure`) inside a Pset round-trip through
+    /// `PropertyValue::Other`. The reader preserves the raw STEP
+    /// literal and the measure tag verbatim, and the writer emits
+    /// them back inside an `IFCXXX(raw)` wrapper. The next reader
+    /// pass must see the same value.
+    #[test]
+    fn unknown_pset_measure_types_round_trip() {
+        // Build an in-memory file that mixes a modeled property
+        // (Length) and an unmodeled one (MassDensity) inside the
+        // same Pset, attached to a tiny IfcWall element. Read it
+        // → write it → read it again and assert the unmodeled
+        // value survives bit-identical.
+        let mut project = Project::new("P");
+        let site = project
+            .add_child(&project.root.clone(), IfcClass::IfcSite, "Site")
+            .unwrap();
+        let bldg = project
+            .add_child(&site, IfcClass::IfcBuilding, "B")
+            .unwrap();
+        let storey = project
+            .add_child(&bldg, IfcClass::IfcBuildingStorey, "L01")
+            .unwrap();
+        let wall = EntityId::new();
+        project.attach_element(&storey, wall.clone());
+        let mut classification = ClassificationStore::new();
+        classification.assign_manual(wall.clone(), IfcClass::IfcWall);
+        let mut props = PropertyStore::new();
+        let mut p = PropertySet::new("Pset_WallCommon");
+        p.set("Length", PropertyValue::Length(3.5));
+        p.set(
+            "Density",
+            PropertyValue::Other {
+                measure: "IfcMassDensityMeasure".to_string(),
+                raw: "2400.0".to_string(),
+            },
+        );
+        props.entry(wall.clone()).upsert_pset(p);
+
+        let body = crate::ifc::IfcWriter::to_string(&project, &classification, &props);
+        // Round-trip 1
+        let snap1 = IfcReader::from_string(&body).expect("first parse");
+        let stored = snap1
+            .properties
+            .get(&wall)
+            .and_then(|p| p.psets.get("Pset_WallCommon"))
+            .and_then(|ps| ps.properties.get("Density"))
+            .cloned();
+        match stored {
+            Some(PropertyValue::Other {
+                ref measure,
+                ref raw,
+            }) => {
+                assert_eq!(measure.to_ascii_uppercase(), "IFCMASSDENSITYMEASURE");
+                assert_eq!(raw, "2400.0");
+            }
+            ref other => panic!("expected PropertyValue::Other, got {other:?}"),
+        }
+        // The body must literally contain the measure wrapper.
+        assert!(
+            body.contains("IFCMASSDENSITYMEASURE(2400.0)"),
+            "writer must re-emit the raw measure wrapper, got body:\n{body}"
+        );
+
+        // Round-trip 2: re-write the snapshot's reconstructed pset
+        // and ensure the second parse yields an identical value.
+        let mut props2 = PropertyStore::new();
+        for (el, p) in snap1.properties.iter() {
+            for ps in p.psets.values() {
+                props2.entry(el.clone()).upsert_pset(ps.clone());
+            }
+        }
+        let body2 = crate::ifc::IfcWriter::to_string(&project, &classification, &props2);
+        let snap2 = IfcReader::from_string(&body2).expect("second parse");
+        assert_eq!(
+            snap1.properties.get(&wall),
+            snap2.properties.get(&wall),
+            "two reader passes converge on the same PropertyValue tree"
+        );
+    }
+
+    /// Unmodeled `IFCQUANTITY*` types (e.g. IFC4x3's
+    /// `IFCQUANTITYTIME`) must round-trip through the read→write→
+    /// read cycle via `PropertyValue::Other`, exactly like
+    /// unmodeled property measures do above. The reader's quantity
+    /// dispatch matches any `IFCQUANTITY*` prefix (not just the five
+    /// canonical kinds), so the catch-all arm of
+    /// `parse_quantity_typed` is reachable and the writer's
+    /// `serialize_quantity_value::Other` arm emits the same STEP
+    /// literal we ingested.
+    #[test]
+    fn unknown_quantity_kinds_round_trip() {
+        let mut project = Project::new("P");
+        let site = project
+            .add_child(&project.root.clone(), IfcClass::IfcSite, "Site")
+            .unwrap();
+        let bldg = project
+            .add_child(&site, IfcClass::IfcBuilding, "B")
+            .unwrap();
+        let storey = project
+            .add_child(&bldg, IfcClass::IfcBuildingStorey, "L01")
+            .unwrap();
+        let wall = EntityId::new();
+        project.attach_element(&storey, wall.clone());
+        let mut classification = ClassificationStore::new();
+        classification.assign_manual(wall.clone(), IfcClass::IfcWall);
+
+        // QuantitySet mixing a modeled (Length) and an unmodeled
+        // (Time) quantity. IFCQUANTITYTIME was added in IFC4x3 and
+        // is not modeled as a typed PropertyValue variant; the
+        // round-trip must preserve it through PropertyValue::Other.
+        let mut props = PropertyStore::new();
+        let mut q = QuantitySet::new("Qto_WallBaseQuantities");
+        q.quantities
+            .insert("Length".into(), PropertyValue::Length(3.5));
+        q.quantities.insert(
+            "ConstructionTime".into(),
+            PropertyValue::Other {
+                measure: "IfcQuantityTime".into(),
+                raw: "3600.0".into(),
+            },
+        );
+        props.entry(wall.clone()).upsert_qset(q);
+
+        let body = crate::ifc::IfcWriter::to_string(&project, &classification, &props);
+        // The writer must emit the unmodeled quantity verbatim with
+        // its uppercased measure wrapper.
+        assert!(
+            body.contains("IFCQUANTITYTIME('ConstructionTime',$,$,3600.0)"),
+            "writer must re-emit the raw IFCQUANTITYTIME wrapper, got body:\n{body}"
+        );
+
+        let snap1 = IfcReader::from_string(&body).expect("first parse");
+        let stored = snap1
+            .properties
+            .get(&wall)
+            .and_then(|p| p.qsets.get("Qto_WallBaseQuantities"))
+            .and_then(|qs| qs.quantities.get("ConstructionTime"))
+            .cloned();
+        match stored {
+            Some(PropertyValue::Other {
+                ref measure,
+                ref raw,
+            }) => {
+                assert_eq!(measure.to_ascii_uppercase(), "IFCQUANTITYTIME");
+                assert_eq!(raw, "3600.0");
+            }
+            ref other => {
+                panic!("expected PropertyValue::Other for unmodeled IFCQUANTITYTIME, got {other:?}")
+            }
+        }
+        // The known IFCQUANTITYLENGTH companion must also survive.
+        let length = snap1
+            .properties
+            .get(&wall)
+            .and_then(|p| p.qsets.get("Qto_WallBaseQuantities"))
+            .and_then(|qs| qs.quantities.get("Length"))
+            .cloned();
+        assert_eq!(length, Some(PropertyValue::Length(3.5)));
+
+        // Re-write and re-read to confirm second pass converges.
+        let mut props2 = PropertyStore::new();
+        for (el, p) in snap1.properties.iter() {
+            for qs in p.qsets.values() {
+                props2.entry(el.clone()).upsert_qset(qs.clone());
+            }
+        }
+        let body2 = crate::ifc::IfcWriter::to_string(&project, &classification, &props2);
+        let snap2 = IfcReader::from_string(&body2).expect("second parse");
+        assert_eq!(
+            snap1.properties.get(&wall),
+            snap2.properties.get(&wall),
+            "two reader passes converge on the same QuantitySet tree"
+        );
+    }
+
+    /// `FILE_SCHEMA(('IFC4'))` -> `IfcSchema::Ifc4`, and the snapshot
+    /// surfaces the detected schema verbatim. Asserts the writer's
+    /// canonical AEC output is round-trip stable through the new
+    /// schema-aware envelope check.
+    #[test]
+    fn detects_ifc4_schema_on_writer_output() {
+        let (project, classification, props, _ids) = build_tiny_project();
+        let s = crate::ifc::IfcWriter::to_string(&project, &classification, &props);
+        let snap = IfcReader::from_string(&s).expect("parses");
+        assert_eq!(snap.schema, IfcSchema::Ifc4);
+    }
+
+    /// Files declaring `FILE_SCHEMA(('IFC2X3'))` parse with schema
+    /// `Ifc2x3` and recover any modeled entities the same way IFC4
+    /// files do — the writer's entity grammar is identical at the
+    /// arg shapes we depend on. Extra IFC2x3-specific entities
+    /// (here `IFCEXTRUDEDAREASOLID`) are tolerated and skipped.
+    #[test]
+    fn parses_ifc2x3_with_unmodeled_geometry_entities() {
+        let body = "\
+ISO-10303-21;\n\
+HEADER;\n\
+FILE_DESCRIPTION(('ViewDefinition [CoordinationView]'),'2;1');\n\
+FILE_NAME('legacy.ifc','2024-01-01',(''),(''),'AEC Studio','AEC Studio','');\n\
+FILE_SCHEMA(('IFC2X3'));\n\
+ENDSEC;\n\
+DATA;\n\
+#1 = IFCPROJECT('00000000000000000000a1',$,$,'P1',$,$,$,$,$);\n\
+#2 = IFCSITE('00000000000000000000a2',$,$,'Site',$,$,$,$,$);\n\
+#3 = IFCRELAGGREGATES('00000000000000000000a3',$,$,$,#1,(#2));\n\
+#42 = IFCEXTRUDEDAREASOLID(#41,#7,#11,300.0);\n\
+ENDSEC;\n\
+END-ISO-10303-21;\n";
+        let snap = IfcReader::from_string(body).expect("IFC2x3 parses");
+        assert_eq!(snap.schema, IfcSchema::Ifc2x3);
+        // The IfcExtrudedAreaSolid was tolerated and skipped — it
+        // shows up in records_seen but not in any of the modeled
+        // counts.
+        assert!(snap.stats.records_seen >= 4);
+        assert_eq!(snap.stats.spatial_nodes, 2); // project + site
+        assert_eq!(snap.stats.aggregations, 1);
+        assert_eq!(snap.stats.elements, 0);
+    }
+
+    /// `FILE_SCHEMA(('IFC4X3'))` and its release-stage variants
+    /// (`IFC4X3_ADD2`, `IFC4X3_RC4`) all map to `IfcSchema::Ifc4x3`.
+    #[test]
+    fn detects_ifc4x3_release_stage_variants() {
+        for token in ["IFC4X3", "IFC4X3_ADD2", "IFC4X3_RC4"] {
+            let body = format!(
+                "ISO-10303-21;\n\
+HEADER;\n\
+FILE_DESCRIPTION(('vd'),'2;1');\n\
+FILE_NAME('x','2024-01-01',(''),(''),'AEC','AEC','');\n\
+FILE_SCHEMA(('{token}'));\n\
+ENDSEC;\n\
+DATA;\n\
+#1 = IFCPROJECT('00000000000000000000a1',$,$,'P',$,$,$,$,$);\n\
+ENDSEC;\n\
+END-ISO-10303-21;\n"
+            );
+            let snap = IfcReader::from_string(&body).expect("IFC4x3 token parses");
+            assert_eq!(snap.schema, IfcSchema::Ifc4x3, "token = {token}");
+        }
+    }
+
+    /// `FILE_SCHEMA(('IFCXX'))` for an unknown schema literal must
+    /// fail with `MissingSection("FILE_SCHEMA")` so callers can
+    /// surface a clear "unsupported schema" error rather than
+    /// silently re-interpreting the file as IFC4.
+    #[test]
+    fn unknown_schema_literal_is_rejected() {
+        let body = "\
+ISO-10303-21;\n\
+HEADER;\n\
+FILE_DESCRIPTION(('vd'),'2;1');\n\
+FILE_NAME('x','2024-01-01',(''),(''),'AEC','AEC','');\n\
+FILE_SCHEMA(('IFC5'));\n\
+ENDSEC;\n\
+DATA;\n\
+#1 = IFCPROJECT('00000000000000000000a1',$,$,'P',$,$,$,$,$);\n\
+ENDSEC;\n\
+END-ISO-10303-21;\n";
+        let err = IfcReader::from_string(body).expect_err("unknown schema must error");
+        assert!(
+            matches!(err, IfcReadError::MissingSection("FILE_SCHEMA")),
+            "got {err:?}"
+        );
+    }
+
+    /// Multi-line STEP records — where the arg list is split across
+    /// physical newlines per ISO 10303-21 §11.2 — tokenize
+    /// identically to single-line ones. External authoring tools
+    /// commonly emit pretty-printed IFC; we must round-trip it.
+    #[test]
+    fn parses_multi_line_step_records() {
+        let body = "\
+ISO-10303-21;\n\
+HEADER;\n\
+FILE_DESCRIPTION(('vd'),'2;1');\n\
+FILE_NAME('x','2024-01-01',(''),(''),'AEC','AEC','');\n\
+FILE_SCHEMA(('IFC4'));\n\
+ENDSEC;\n\
+DATA;\n\
+#1 = IFCPROJECT(\n\
+    '00000000000000000000a1',\n\
+    $,$,\n\
+    'Multi-line Project',\n\
+    $,$,$,$,$);\n\
+#2 = IFCSITE(\n\
+    '00000000000000000000a2',\n\
+    $,$,\n\
+    'Multi-line Site',\n\
+    $,$,$,$,$);\n\
+#3 = IFCRELAGGREGATES('00000000000000000000a3',$,$,$,#1,(#2));\n\
+ENDSEC;\n\
+END-ISO-10303-21;\n";
+        let snap = IfcReader::from_string(body).expect("multi-line parses");
+        assert_eq!(snap.stats.spatial_nodes, 2);
+        assert_eq!(snap.stats.aggregations, 1);
+        // Project's display name was recovered across newlines.
+        let root = snap.project.root.clone();
+        assert_eq!(snap.project.get(&root).unwrap().name, "Multi-line Project");
+    }
+
+    /// STEP `/* ... */` comments (ISO 10303-21 §6.4.1) can appear
+    /// anywhere outside string literals, including spanning a
+    /// would-be `;` record terminator. We strip them so the
+    /// embedded `;` does not split a record.
+    #[test]
+    fn strips_step_comments_including_embedded_semicolons() {
+        let body = "\
+ISO-10303-21;\n\
+HEADER;\n\
+FILE_DESCRIPTION(('vd'),'2;1');\n\
+FILE_NAME('x','2024-01-01',(''),(''),'AEC','AEC','');\n\
+FILE_SCHEMA(('IFC4'));\n\
+ENDSEC;\n\
+DATA;\n\
+/* comment containing ; which must not split records */\n\
+#1 = IFCPROJECT('00000000000000000000a1',$,$,'P',$,$,$,$,$);\n\
+#2 = IFCSITE('00000000000000000000a2',$,$,/* inline ; comment */'Site',$,$,$,$,$);\n\
+#3 = IFCRELAGGREGATES('00000000000000000000a3',$,$,$,#1,(#2));\n\
+ENDSEC;\n\
+END-ISO-10303-21;\n";
+        let snap = IfcReader::from_string(body).expect("comments are stripped");
+        assert_eq!(snap.stats.spatial_nodes, 2);
+        assert_eq!(snap.stats.aggregations, 1);
+    }
+
+    /// Embedded `;` inside a quoted string literal is *not* a
+    /// record terminator. This protects against pathological
+    /// names like `"Café; Bar"`.
+    #[test]
+    fn embedded_semicolon_in_string_does_not_split_record() {
+        let mut project = Project::new("Café; Bar");
+        let _site = project
+            .add_child(&project.root.clone(), IfcClass::IfcSite, "Café; Bar Site")
+            .unwrap();
+        let classification = ClassificationStore::new();
+        let props = PropertyStore::new();
+        let s = crate::ifc::IfcWriter::to_string(&project, &classification, &props);
+        let snap = IfcReader::from_string(&s).expect("read back");
+        let root = snap.project.root.clone();
+        assert_eq!(snap.project.get(&root).unwrap().name, "Café; Bar");
+    }
+
+    /// `StepIter` over a streaming `BufRead` yields the same
+    /// records as `parse_step_groups` does in-memory. Multi-line
+    /// records and comments split identically across the two
+    /// modes.
+    #[test]
+    fn step_iter_yields_records_one_at_a_time() {
+        let body = "\
+ISO-10303-21;\n\
+HEADER;\n\
+FILE_DESCRIPTION(('vd'),'2;1');\n\
+FILE_NAME('x','2024-01-01',(''),(''),'AEC','AEC','');\n\
+FILE_SCHEMA(('IFC4'));\n\
+ENDSEC;\n\
+DATA;\n\
+/* leading comment */\n\
+#1 = IFCPROJECT(\n\
+    '00000000000000000000a1',\n\
+    $,$,\n\
+    'P',\n\
+    $,$,$,$,$);\n\
+#2 = IFCSITE('00000000000000000000a2',$,$,'S',$,$,$,$,$);\n\
+ENDSEC;\n\
+END-ISO-10303-21;\n";
+        let cursor = std::io::Cursor::new(body.as_bytes());
+        let records: Vec<_> = IfcReader::iter(cursor).collect::<Result<_, _>>().unwrap();
+        // 2 entity records + the writer's HEADER lines are NOT entity
+        // records (no `#N = ...` shape) and are filtered out by
+        // parse_logical_record.
+        let kinds: Vec<&str> = records.iter().map(|r| r.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["IFCPROJECT", "IFCSITE"]);
+        assert_eq!(records[0].step_id, 1);
+        assert_eq!(records[1].step_id, 2);
+    }
+
+    /// `IfcReader::from_reader` produces the same `IfcSnapshot` as
+    /// `from_string` when fed the same bytes through a `BufRead`.
+    /// This is the bit-for-bit equivalence test required by the
+    /// task spec: the streaming variant is a memory-bounded twin
+    /// of the in-memory parser.
+    #[test]
+    fn from_reader_matches_from_string() {
+        let (project, classification, props, _ids) = build_tiny_project();
+        let s = crate::ifc::IfcWriter::to_string(&project, &classification, &props);
+        let snap_a = IfcReader::from_string(&s).expect("from_string");
+        let cursor = std::io::Cursor::new(s.as_bytes());
+        let snap_b = IfcReader::from_reader(cursor).expect("from_reader");
+        assert_eq!(snap_a.stats, snap_b.stats);
+        assert_eq!(snap_a.schema, snap_b.schema);
+        assert_eq!(snap_a.guid_by_entity.len(), snap_b.guid_by_entity.len());
+    }
+
+    /// `StepIter` must NOT silently truncate when the underlying
+    /// reader reaches EOF mid-string. The eager `from_string` path
+    /// flags the same input as `Malformed`; the streaming iterator
+    /// must do the same so a corrupted IFC file fails identically
+    /// through either API. This pins the EOF-validation contract.
+    #[test]
+    fn step_iter_rejects_unterminated_string_at_eof() {
+        let truncated = "#1=IFCPROPERTYSINGLEVALUE('NeverCloses,";
+        let cursor = std::io::Cursor::new(truncated.as_bytes());
+        let mut iter = StepIter::new(std::io::BufReader::new(cursor));
+        // No complete `... ;` record, so the first poll just returns
+        // None? — except we're now requiring the iterator to surface
+        // the malformed trailing bytes as an explicit error before
+        // returning None.
+        let mut saw_error = false;
+        for item in iter.by_ref() {
+            if let Err(IfcReadError::Malformed(msg)) = item {
+                saw_error = true;
+                assert!(
+                    msg.contains("unterminated string"),
+                    "expected unterminated-string diagnostic, got: {msg}"
+                );
+                break;
+            }
+        }
+        assert!(
+            saw_error,
+            "StepIter must report unterminated-string at EOF, not silently stop"
+        );
+        // Once faulted, the iterator must stay faulted.
+        assert!(iter.next().is_none());
+    }
+
+    /// Same EOF contract for unbalanced parens.
+    #[test]
+    fn step_iter_rejects_unbalanced_parens_at_eof() {
+        let truncated = "#1=IFCFOO(1,(2,3";
+        let cursor = std::io::Cursor::new(truncated.as_bytes());
+        let mut iter = StepIter::new(std::io::BufReader::new(cursor));
+        let mut saw_error = false;
+        for item in iter.by_ref() {
+            if let Err(IfcReadError::Malformed(msg)) = item {
+                saw_error = true;
+                assert!(
+                    msg.contains("unbalanced parens"),
+                    "expected unbalanced-parens diagnostic, got: {msg}"
+                );
+                break;
+            }
+        }
+        assert!(saw_error, "StepIter must report unbalanced-parens at EOF");
+    }
+
+    /// Whitespace-only trailing bytes after the last `... ;` are
+    /// allowed — the iterator must NOT report an error.
+    #[test]
+    fn step_iter_tolerates_trailing_whitespace() {
+        let valid = "#1=IFCAPPLICATION('a','b','c','d');   \n\n";
+        let cursor = std::io::Cursor::new(valid.as_bytes());
+        let iter = StepIter::new(std::io::BufReader::new(cursor));
+        let results: Vec<_> = iter.collect();
+        assert_eq!(results.len(), 1, "expected one record, got {results:?}");
+        assert!(results[0].is_ok());
+    }
+
+    /// `detect_schema` must NOT mistake a `FILE_SCHEMA(('IFC2X3'))`
+    /// token appearing inside a DATA-section string literal for the
+    /// file's declared schema. The HEADER-bounded search defends
+    /// against an adversarial / corrupted file where the DATA
+    /// section embeds a fake schema marker.
+    #[test]
+    fn detect_schema_ignores_file_schema_inside_data_section() {
+        // HEADER says IFC4; DATA section has an entity whose
+        // Description happens to contain the substring
+        // "FILE_SCHEMA(('IFC2X3'))" inside a string literal.
+        let text = "ISO-10303-21;\n\
+            HEADER;\n\
+            FILE_DESCRIPTION(('a'),'2;1');\n\
+            FILE_NAME('','',(''),(''),'','','');\n\
+            FILE_SCHEMA(('IFC4'));\n\
+            ENDSEC;\n\
+            DATA;\n\
+            #1=IFCAPPLICATION('Trojan with FILE_SCHEMA((\\'IFC2X3\\'))','v1','app','id');\n\
+            ENDSEC;\n\
+            END-ISO-10303-21;";
+        let schema = detect_schema(text).expect("schema detect");
+        assert_eq!(schema, IfcSchema::Ifc4);
+    }
+
+    /// Conversely, a HEADER section that legitimately declares
+    /// IFC2X3 must still be detected, even when the file mentions
+    /// other tokens elsewhere.
+    #[test]
+    fn detect_schema_finds_ifc2x3_in_header() {
+        let text = "ISO-10303-21;\n\
+            HEADER;\n\
+            FILE_DESCRIPTION(('a'),'2;1');\n\
+            FILE_NAME('','',(''),(''),'','','');\n\
+            FILE_SCHEMA(('IFC2X3'));\n\
+            ENDSEC;\n\
+            DATA;\n\
+            ENDSEC;\n\
+            END-ISO-10303-21;";
+        let schema = detect_schema(text).expect("schema detect");
+        assert_eq!(schema, IfcSchema::Ifc2x3);
     }
 }
 

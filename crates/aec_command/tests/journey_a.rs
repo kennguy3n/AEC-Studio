@@ -15,8 +15,8 @@
 //!    path the command engine uses (via a thin local "place_object"
 //!    helper that goes through `engine.execute`).
 //! 4. Save 4 cameras through `CommandKind::SaveCamera`.
-//! 5. Queue 4 Cycles renders through `RenderQueue::submit_batch` and
-//!    drive them through admit → complete (no real Blender). This is
+//! 5. Queue 4 path-traced renders through `RenderQueue::submit_batch` and
+//!    drive them through admit → complete. This is
 //!    exactly how the desktop UI exercises the queue.
 //! 6. Build the deliverable: an interior pack (ZIP) that bundles the
 //!    proposal PDF + the 4 render PNGs + a material schedule.
@@ -356,10 +356,10 @@ fn interior_designer_journey_end_to_end() {
     let _ = ActorKind::Ai;
 
     // ---------------------------------------------------------------
-    // 7. Render queue: submit 4 Cycles standard renders and drive
+    // 7. Render queue: submit 4 path-traced standard renders and drive
     //    them to completion (admit → complete). This is exactly the
-    //    same admit/complete loop the UI uses; no Blender process is
-    //    started.
+    //    same admit/complete loop the UI uses; the native path tracer
+    //    runs in-process.
     // ---------------------------------------------------------------
     let mut q = RenderQueue::new();
     let scene = RenderScene::new();

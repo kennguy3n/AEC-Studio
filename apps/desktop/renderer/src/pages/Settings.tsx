@@ -4,8 +4,8 @@
  * Surfaces runtime configuration that's reasonable for users to
  * inspect and override. The page deliberately separates *read-only*
  * surfaces (hardware profile — the machine is what it is) from
- * *override* surfaces (AI model tier, render defaults, Blender path,
- * KChat integration).
+ * *override* surfaces (AI model tier, render defaults, KChat
+ * integration).
  *
  * Persistence is **in-memory only** in this build: the page holds the
  * user's choices for the duration of the session and surfaces a
@@ -29,7 +29,6 @@ interface SettingsState {
   defaultRenderPreset: RenderPresetKey;
   region: Region;
   kchatEnabled: boolean;
-  blenderPathOverride: string;
 }
 
 const DEFAULT_SETTINGS: SettingsState = {
@@ -37,7 +36,6 @@ const DEFAULT_SETTINGS: SettingsState = {
   defaultRenderPreset: "standard",
   region: "metric",
   kchatEnabled: false,
-  blenderPathOverride: "",
 };
 
 export function Settings() {
@@ -229,29 +227,6 @@ export function Settings() {
           />
           Enable KChat integration
         </label>
-      </section>
-
-      <section
-        className="settings-section"
-        data-testid="settings-section-blender"
-        aria-label="Blender path"
-      >
-        <h2>Blender path override</h2>
-        <p>
-          Auto-discovered from <code>AEC_BLENDER_BIN</code>, the
-          platform's known install paths, or <code>PATH</code>. Set
-          this only if you need to pin a specific Blender install.
-        </p>
-        <input
-          type="text"
-          data-testid="settings-blender-path"
-          aria-label="Blender path"
-          placeholder="/usr/bin/blender (auto-discovered)"
-          value={settings.blenderPathOverride}
-          onChange={(e) =>
-            updateSetting("blenderPathOverride", e.target.value)
-          }
-        />
       </section>
 
       <footer className="settings-page__footer">

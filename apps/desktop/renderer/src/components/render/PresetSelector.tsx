@@ -38,13 +38,17 @@ interface PresetDetail {
 export const PRESETS: PresetDetail[] = [
   {
     id: "eevee_preview",
-    label: "EEVEE Preview",
+    label: "Realtime Preview",
     shortDescription: "Fast realtime preview",
     samples: 64,
-    // Matches `RenderPreset::eevee_preview()` in
-    // crates/aec_render/src/preset.rs (1280×720). The governor's
-    // `eevee_resolution_scale` is applied at draw time — the preset
-    // itself stores the unscaled resolution.
+    // Matches `RenderPreset::realtime_preview()` in
+    // crates/aec_render/src/preset.rs (1280×720) — the on-wire id
+    // stays `eevee_preview` for backward compatibility with existing
+    // `.aecstudio` project files, but the underlying implementation is
+    // now the native PBR rasterizer (see preview.rs / pbr_preview.rs).
+    // The governor's `preview_resolution_scale` (still serialized as
+    // `eevee_resolution_scale` on the wire for compat) is applied at
+    // draw time — the preset itself stores the unscaled resolution.
     resolution: [1280, 720],
   },
   {

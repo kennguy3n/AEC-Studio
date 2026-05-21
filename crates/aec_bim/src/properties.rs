@@ -3,6 +3,7 @@
 //! Property values are typed; the BIM cache fingerprints them with BLAKE3 so
 //! we can detect changes when re-importing an IFC.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -10,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use aec_core::types::EntityId;
 
 use crate::classification::IfcClass;
+use crate::ifc::reader::unescape_step_string;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
@@ -24,12 +26,37 @@ pub enum PropertyValue {
     Ratio(f64),
     /// IfcLabel — short, controlled string (≤ 255 chars).
     Label(String),
+    /// Opaque IFC measure type AEC Studio doesn't model natively
+    /// (e.g. `IfcMassDensityMeasure`, `IfcFrequencyMeasure`,
+    /// `IfcCountMeasure`). The reader stores the measure tag in the
+    /// uppercase STEP form (verbatim from the file, e.g.
+    /// `"IFCMASSDENSITYMEASURE"`) together with the raw STEP value
+    /// literal so the writer can round-trip the property losslessly
+    /// without having to enumerate every IFC measure type in this
+    /// enum. Recovering the IFC4 canonical camelCase spelling (e.g.
+    /// `"IfcMassDensityMeasure"`) from the uppercase STEP form would
+    /// require a dictionary; the writer normalises with
+    /// `to_ascii_uppercase` either way, so round-tripping is exact
+    /// regardless of which case the caller stored.
+    Other {
+        /// IFC measure-type tag as it appears in the STEP file —
+        /// uppercased including the `IFC` prefix (e.g.
+        /// `"IFCMASSDENSITYMEASURE"`). Programmatic constructors may
+        /// also use the canonical camelCase spelling (e.g.
+        /// `"IfcMassDensityMeasure"`); the writer uppercases before
+        /// emitting either way.
+        measure: String,
+        /// Raw STEP literal as parsed (e.g. `"2400.0"`, `"'kg/m3'"`,
+        /// `".T."`). The writer emits this back verbatim inside the
+        /// `IFCXXX(...)` wrapper.
+        raw: String,
+    },
 }
 
 impl PropertyValue {
     /// IFC measure type for an instance — used when serialising back to
     /// an IFC `IfcPropertySingleValue.NominalValue` wrapper.
-    pub fn ifc_measure_type(&self) -> &'static str {
+    pub fn ifc_measure_type(&self) -> &str {
         match self {
             Self::Text(_) => "IfcText",
             Self::Real(_) => "IfcReal",
@@ -40,6 +67,21 @@ impl PropertyValue {
             Self::Volume(_) => "IfcVolumeMeasure",
             Self::Ratio(_) => "IfcPositiveRatioMeasure",
             Self::Label(_) => "IfcLabel",
+            Self::Other { measure, .. } => measure.as_str(),
+        }
+    }
+
+    /// Raw STEP literal for the inner value, as it should appear
+    /// inside the `IFCXXX(...)` measure wrapper. Returns `None` for
+    /// variants whose serialisation requires the writer's escape
+    /// logic (those go through the writer's normal formatters);
+    /// returns `Some(raw)` only for [`PropertyValue::Other`], where
+    /// the reader preserved the original bytes for verbatim
+    /// round-trip.
+    pub fn other_raw_literal(&self) -> Option<&str> {
+        match self {
+            Self::Other { raw, .. } => Some(raw.as_str()),
+            _ => None,
         }
     }
 
@@ -49,16 +91,91 @@ impl PropertyValue {
                 Some(*v)
             }
             Self::Integer(v) => Some(*v as f64),
-            _ => None,
+            // For an opaque IFC measure the reader didn't model
+            // natively (e.g. `IfcMassDensityMeasure(2400.0)`,
+            // `IfcFrequencyMeasure(50.0)`, `IfcCountMeasure(12)`),
+            // try to recover a numeric value from the raw STEP
+            // literal so BOQ / schedules can still see it instead of
+            // silently dropping the property. We deliberately do NOT
+            // recurse through STEP escape parsing here — the only
+            // case where this returns `Some` is when the raw literal
+            // is a plain numeric token (the other lexical shapes for
+            // an IFC measure value are quoted strings `'...'` or
+            // booleans `.T.`/`.F.`, neither of which is meaningful
+            // as a real). `f64::from_str` handles ints (`12`),
+            // signed floats (`-3.5`), scientific notation
+            // (`1.5e-3`), and IFC's `D` exponent variant in the few
+            // legacy producers that emit it (`1.5D-3` is normalised
+            // by the reader before storage, so by the time it
+            // reaches `raw` it's already in `E` form).
+            Self::Other { raw, .. } => raw.trim().parse::<f64>().ok(),
+            // Non-numeric typed variants: Text, Boolean, Label.
+            Self::Text(_) | Self::Boolean(_) | Self::Label(_) => None,
         }
     }
 
-    pub fn as_text(&self) -> Option<&str> {
+    /// Decoded text view of a string-typed property. Returns a
+    /// `Cow<str>` so the common (no-escape) case avoids allocation
+    /// while still emitting a properly unescaped string when the raw
+    /// literal carries ISO 10303-21 escapes.
+    ///
+    /// Semantics:
+    /// * `Text` / `Label` — `Some(Cow::Borrowed(s))`. Already decoded
+    ///   strings; zero alloc.
+    /// * `Other { raw, .. }` where `raw` is a quoted STEP literal
+    ///   (`'...'`):
+    ///     * If the quoted contents are escape-free, returns
+    ///       `Some(Cow::Borrowed(inner))` — a slice into the stored
+    ///       `raw`, zero alloc. This is the common case in practice
+    ///       (`IfcDescriptiveMeasure`, `IfcGloballyUniqueId`, custom
+    ///       strings rarely embed quotes or control characters).
+    ///     * If the inner bytes contain `\` or `'` (the only two byte
+    ///       markers that can trigger an ISO 10303-21 escape
+    ///       sequence — `\\`, `\'`, `\n`, `\r`, `\t`, or the
+    ///       doubled-quote `''`), returns
+    ///       `Some(Cow::Owned(unescape_step_string(inner)))`. The
+    ///       returned string is then byte-identical to what
+    ///       `Text(...).as_text()` would return for the equivalent
+    ///       decoded value (e.g. `Other` with raw `'O''Brien'` and
+    ///       `Text("O'Brien")` both yield `"O'Brien"`). This
+    ///       consistency matters for schedule / BOQ consumers that
+    ///       merge string values across `Text`, `Label`, and `Other`
+    ///       variants — without it, a property migrated from a
+    ///       modelled `Text` to an opaque `Other` would suddenly
+    ///       compare unequal to its original.
+    /// * All other variants (numeric measures, booleans) return
+    ///   `None`.
+    pub fn as_text(&self) -> Option<Cow<'_, str>> {
         match self {
-            Self::Text(s) | Self::Label(s) => Some(s.as_str()),
+            Self::Text(s) | Self::Label(s) => Some(Cow::Borrowed(s.as_str())),
+            Self::Other { raw, .. } => {
+                let trimmed = raw.trim();
+                let bytes = trimmed.as_bytes();
+                if bytes.len() >= 2 && bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'' {
+                    let inner = &trimmed[1..trimmed.len() - 1];
+                    if has_step_escape(inner) {
+                        Some(Cow::Owned(unescape_step_string(inner)))
+                    } else {
+                        Some(Cow::Borrowed(inner))
+                    }
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
     }
+}
+
+/// Fast probe for byte markers that can trigger ISO 10303-21 string
+/// escape decoding. Returns `true` iff the slice contains a `\` (which
+/// could introduce `\\`, `\'`, `\n`, `\r`, or `\t`) or a `'` (which
+/// could be the leading half of a doubled-quote `''`). Plain text
+/// strings — overwhelmingly the common case for IFC measure values —
+/// trip neither marker, so the caller can hand out a borrowed slice
+/// directly.
+fn has_step_escape(s: &str) -> bool {
+    s.bytes().any(|b| b == b'\\' || b == b'\'')
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -279,8 +396,93 @@ mod tests {
         assert_eq!(PropertyValue::Real(3.5).as_real(), Some(3.5));
         assert_eq!(PropertyValue::Integer(7).as_real(), Some(7.0));
         assert!(PropertyValue::Boolean(true).as_real().is_none());
-        assert_eq!(PropertyValue::Text("hi".into()).as_text(), Some("hi"));
-        assert_eq!(PropertyValue::Label("hi".into()).as_text(), Some("hi"));
+        assert_eq!(
+            PropertyValue::Text("hi".into()).as_text().as_deref(),
+            Some("hi")
+        );
+        assert_eq!(
+            PropertyValue::Label("hi".into()).as_text().as_deref(),
+            Some("hi")
+        );
+    }
+
+    /// `PropertyValue::Other` is the catch-all for opaque IFC measure
+    /// types AEC Studio doesn't model natively. `as_real` must surface
+    /// numeric raws so they reach BOQ / schedule consumers; `as_text`
+    /// must surface quoted-string raws likewise. Booleans (`.T.`/`.F.`)
+    /// and any other lexical shapes return `None` to match the typed
+    /// variants' contract.
+    #[test]
+    fn other_variant_surfaces_numeric_and_string_raws_to_consumers() {
+        let density = PropertyValue::Other {
+            measure: "IFCMASSDENSITYMEASURE".into(),
+            raw: "2400.0".into(),
+        };
+        assert_eq!(density.as_real(), Some(2400.0));
+        assert!(density.as_text().is_none());
+
+        let count = PropertyValue::Other {
+            measure: "IFCCOUNTMEASURE".into(),
+            raw: "12".into(),
+        };
+        assert_eq!(count.as_real(), Some(12.0));
+
+        let scientific = PropertyValue::Other {
+            measure: "IFCFREQUENCYMEASURE".into(),
+            raw: "1.5e-3".into(),
+        };
+        assert_eq!(scientific.as_real(), Some(1.5e-3));
+
+        let descriptive = PropertyValue::Other {
+            measure: "IFCDESCRIPTIVEMEASURE".into(),
+            raw: "'kg/m3'".into(),
+        };
+        assert_eq!(descriptive.as_text().as_deref(), Some("kg/m3"));
+        // The escape-free common case must return Cow::Borrowed so we
+        // pay nothing extra for typical IFC measure strings.
+        assert!(matches!(descriptive.as_text(), Some(Cow::Borrowed(_))));
+        assert_eq!(descriptive.as_real(), None);
+
+        // STEP escape decoding: a string carrying ISO 10303-21 escapes
+        // must come back fully decoded so consumers comparing across
+        // `Text` and `Other` variants see byte-identical results.
+        // Single-quote via the doubled-quote escape `''`.
+        let with_apostrophe = PropertyValue::Other {
+            measure: "IFCDESCRIPTIVEMEASURE".into(),
+            raw: "'O''Brien'".into(),
+        };
+        assert_eq!(with_apostrophe.as_text().as_deref(), Some("O'Brien"));
+        assert!(matches!(with_apostrophe.as_text(), Some(Cow::Owned(_))));
+        assert_eq!(
+            with_apostrophe.as_text().as_deref(),
+            PropertyValue::Text("O'Brien".into()).as_text().as_deref(),
+            "escape-decoded Other must compare equal to the modelled Text variant"
+        );
+
+        // Backslash escapes (`\\` for `\`, `\n` for newline) must
+        // also decode.
+        let with_control = PropertyValue::Other {
+            measure: "IFCDESCRIPTIVEMEASURE".into(),
+            raw: r"'a\\b\nc'".into(),
+        };
+        assert_eq!(with_control.as_text().as_deref(), Some("a\\b\nc"));
+        assert!(matches!(with_control.as_text(), Some(Cow::Owned(_))));
+
+        let boolean = PropertyValue::Other {
+            measure: "IFCBOOLEAN".into(),
+            raw: ".T.".into(),
+        };
+        assert_eq!(boolean.as_real(), None);
+        assert!(boolean.as_text().is_none());
+
+        // Whitespace tolerance: the writer never adds leading/trailing
+        // whitespace, but a defensive caller hand-constructing the
+        // variant might. Trim and still parse.
+        let padded = PropertyValue::Other {
+            measure: "IFCMASSDENSITYMEASURE".into(),
+            raw: "  2400.0  ".into(),
+        };
+        assert_eq!(padded.as_real(), Some(2400.0));
     }
 
     #[test]
@@ -307,7 +509,7 @@ mod tests {
             .unwrap()
             .get("Pset_WallCommon", "FireRating")
             .unwrap();
-        assert_eq!(got.as_text(), Some("EI60"));
+        assert_eq!(got.as_text().as_deref(), Some("EI60"));
     }
 
     #[test]

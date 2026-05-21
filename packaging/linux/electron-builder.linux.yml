@@ -71,8 +71,8 @@ deb:
     - libxss1
     - libasound2
     - libnotify4
-  recommends:
-    - blender
+  # Phase 9 made rendering fully in-process Rust (wgpu compute path
+  # tracer + PBR rasterizer); the deb no longer recommends Blender.
   artifactName: "${productName}_${version}_${arch}.deb"
 
 snap:

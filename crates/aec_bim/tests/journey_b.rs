@@ -96,9 +96,10 @@ fn write_minimal_ifc(dir: &Path, project_name: &str) -> PathBuf {
 }
 
 /// Strict-mode validator: every IFC export must contain a valid
-/// header section, declare the IFC4 schema, and end with the STEP
-/// `END-ISO-10303-21;` marker. This mirrors the worker-side
-/// validator in `workers/ifc/validator.py`.
+/// header section, declare an IFC4-family schema, and end with the
+/// STEP `END-ISO-10303-21;` marker. Companion to the in-process
+/// `IfcReader` envelope check, used as an extra defense-in-depth
+/// assertion at the journey level.
 fn validate_ifc_strict(path: &Path) -> Result<(), String> {
     let s = fs::read_to_string(path).map_err(|e| e.to_string())?;
     let has_header = s.contains("HEADER;") && s.contains("ENDSEC;");
@@ -471,8 +472,7 @@ fn architecture_studio_journey_end_to_end() {
         let fr = props
             .get(id)
             .and_then(|e| e.get("Pset_DoorCommon", "FireRating"))
-            .and_then(PropertyValue::as_text)
-            .map(str::to_string);
+            .and_then(|v| v.as_text().map(std::borrow::Cow::into_owned));
         assert!(fr.is_some(), "every door has a FireRating after AI fill");
     }
 

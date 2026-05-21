@@ -13,7 +13,8 @@ Thank you for your interest in contributing to AEC Studio! This guide covers eve
 | **npm** | 10+ | Package management |
 | **C toolchain** | GCC / Clang / MSVC | Build bundled SQLCipher + OpenSSL |
 | **CMake** | 3.22+ | Native dependencies (wgpu native, SQLCipher) |
-| **Python** | 3.10+ | Blender worker scripts (only needed when running renders) |
+| **Python** | 3.10+ | `node-gyp` build dependency for the N-API native addon (not used at runtime) |
+
 
 ### Platform-specific setup
 
@@ -187,7 +188,7 @@ use_try_shorthand = true
    - `npm run type-check`
    - `npm test`
 
-   CI runs a **stable Ubuntu-only baseline** on every PR (Rust + TypeScript + Python workers). The full cross-platform matrix (macOS + Windows) runs automatically on every push to `main` and gates the next release. If your PR touches Electron, packaging configs, or OS-specific Rust code and you want the full matrix to run on the PR itself, add the `test-all-platforms` label — the workflow re-fires immediately on `labeled` (you do not need to push another commit), so the next CI run sweeps all three OSes. Removing the label snaps the *next* run back to the Ubuntu-only baseline. This keeps PR turnaround fast and avoids surfacing flakes from platform-specific runners (e.g. Electron CDN 404s on macOS-arm64) on diffs that can't have caused them.
+   CI runs a **stable Ubuntu-only baseline** on every PR (Rust + TypeScript). The full cross-platform matrix (macOS + Windows) runs automatically on every push to `main` and gates the next release. If your PR touches Electron, packaging configs, or OS-specific Rust code and you want the full matrix to run on the PR itself, add the `test-all-platforms` label — the workflow re-fires immediately on `labeled` (you do not need to push another commit), so the next CI run sweeps all three OSes. Removing the label snaps the *next* run back to the Ubuntu-only baseline. This keeps PR turnaround fast and avoids surfacing flakes from platform-specific runners (e.g. Electron CDN 404s on macOS-arm64) on diffs that can't have caused them.
 5. **Write a clear PR description** — explain what changed, why, and how to test it.
 
 ### Commit message conventions
@@ -203,7 +204,7 @@ docs(readme): clarify wgpu backend requirements
 test(cad): add fixtures for DXF block roundtrip
 chore(ci): add macOS runner to CI matrix
 refactor(governor): split scheduler from policy
-perf(render): cache Blender scene per project
+perf(render): cache BVH per scene
 style(rust): apply rustfmt to aec_command
 ```
 
@@ -251,18 +252,16 @@ aec-studio/
 │   ├── aec_geometry/           # Geometry index, spatial queries, mesh cache
 │   ├── aec_viewport/           # wgpu viewport, 2D CAD canvas, selection overlays
 │   ├── aec_cad/                # 2D CAD: primitives, layers, blocks, snaps, dims
-│   ├── aec_bim/                # BIM/IFC: IfcOpenShell adapter, spatial hierarchy
-│   ├── aec_render/             # Render queue, Blender/Cycles worker orchestration
+│   ├── aec_bim/                # Native BIM/IFC: STEP reader/writer, tessellator, spatial hierarchy
+│   ├── aec_render/             # Native path tracer + PBR preview + walkthrough/panorama
 │   ├── aec_assets/             # Asset database, import pipeline, LOD, thumbnails
 │   ├── aec_materials/          # PBR material library, texture management
 │   ├── aec_ai/                 # AI command planner, tool schema, safety validator
 │   ├── aec_governor/           # Resource governor, hardware profiler, scheduling
 │   ├── aec_export/             # PDF, DXF, IFC, glTF, proposal pack export
 │   └── aec_audit/              # Audit trail, project history
-├── workers/                    # Native worker processes
-│   ├── blender/                # Blender worker scripts (Python)
-│   ├── ifc/                    # IfcOpenShell worker
-│   └── ai/                     # llama-server sidecar config
+├── workers/                    # Sidecar processes
+│   └── ai/                     # llama-server sidecar config (only remaining external sidecar)
 ├── templates/                  # Project, room, drawing, render, BIM templates
 ├── assets/                     # Bundled asset packs (furniture, materials, presets)
 ├── packaging/                  # electron-builder configs (macos, windows)
