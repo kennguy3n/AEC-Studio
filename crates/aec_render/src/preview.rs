@@ -26,6 +26,7 @@ use aec_viewport::sky::SkyState;
 use glam::{Mat4, Vec3};
 use thiserror::Error;
 
+use crate::lighting::kelvin_to_rgb;
 use crate::scene::{RenderCamera, RenderLight, RenderScene, SerializedMesh};
 
 /// One CPU-visible RGBA tile produced by [`PreviewPipeline::render`].
@@ -95,32 +96,6 @@ fn vec3_from_unit(v: [f32; 3]) -> Vec3 {
     Vec3::new(v[0], v[1], v[2])
 }
 
-/// Convert a Kelvin colour temperature into a normalised RGB triplet.
-/// Reasonable for 1000–20 000 K (covers AEC sun + interior bulbs).
-fn kelvin_to_rgb(k: f32) -> Vec3 {
-    let temperature = k.clamp(1000.0, 20000.0) / 100.0;
-    let r = if temperature <= 66.0 {
-        1.0
-    } else {
-        let t = temperature - 60.0;
-        (329.698_7 * t.powf(-0.133_205)).clamp(0.0, 255.0) / 255.0
-    };
-    let g = if temperature <= 66.0 {
-        (99.470_8 * temperature.ln() - 161.119_6).clamp(0.0, 255.0) / 255.0
-    } else {
-        let t = temperature - 60.0;
-        (288.122_2 * t.powf(-0.075_515)).clamp(0.0, 255.0) / 255.0
-    };
-    let b = if temperature >= 66.0 {
-        1.0
-    } else if temperature <= 19.0 {
-        0.0
-    } else {
-        (138.517_7 * (temperature - 10.0).ln() - 305.044_8).clamp(0.0, 255.0) / 255.0
-    };
-    Vec3::new(r, g, b)
-}
-
 /// Decode a row-major 4x4 transform (mm) into a [`Mat4`] in metres.
 fn transform_to_mat4(t: [[f32; 4]; 4]) -> Mat4 {
     let mut cols = [[0.0f32; 4]; 4];
@@ -171,7 +146,7 @@ pub fn pick_sky_state(scene: &RenderScene) -> SkyState {
                 sun_elevation_deg: *elevation_deg,
                 turbidity: 2.5,
                 strength: *intensity,
-                tint: [tint.x, tint.y, tint.z],
+                tint,
             };
         }
     }
@@ -188,10 +163,15 @@ fn camera_from_render(cam: &RenderCamera, aspect: f32) -> PreviewCamera {
     // Sensor width is fixed at 36 mm (full-frame); fov_y from focal_length.
     let sensor_height_mm = 24.0;
     let fov_y_rad = 2.0 * (sensor_height_mm / (2.0 * cam.focal_length_mm.max(0.1))).atan();
+    // World convention: +Y is up. This matches the Preetham sky shader
+    // (`sky.wgsl::evaluate_sky` reads `dir.y` for elevation) and
+    // `SkyState::sun_direction` (elevation maps to Y). Using +Z here
+    // would leave upward-facing geometry unlit because `dot(normal, sun)`
+    // would be ~0 at noon.
     PreviewCamera::perspective(
         vec3_from_mm(cam.position_mm),
         vec3_from_mm(cam.target_mm),
-        Vec3::Z, // AEC convention: +Z is up
+        Vec3::Y,
         fov_y_rad.to_degrees(),
         aspect.max(0.1),
         0.05,
@@ -298,12 +278,19 @@ impl PreviewPipeline {
     pub fn logical_dimensions(&self) -> (u32, u32) {
         (self.logical_width, self.logical_height)
     }
+    /// Pixel dimensions of the actual offscreen render target. When a
+    /// GPU is available, returns the wgpu texture size. When running
+    /// headless (no adapter), returns the scaled dimensions that *would*
+    /// have been allocated — derived deterministically from the tier so
+    /// callers (tile schedulers, UI layout) can plan even without a GPU.
     pub fn render_dimensions(&self) -> (u32, u32) {
-        self.inner
-            .as_ref()
-            .map_or((self.logical_width, self.logical_height), |p| {
-                (p.width(), p.height())
-            })
+        if let Some(p) = self.inner.as_ref() {
+            return (p.width(), p.height());
+        }
+        let scale = tier_resolution_scale(self.tier);
+        let w = ((self.logical_width as f32) * scale).round().max(1.0) as u32;
+        let h = ((self.logical_height as f32) * scale).round().max(1.0) as u32;
+        (w, h)
     }
     pub fn resolution_scale(&self) -> f32 {
         tier_resolution_scale(self.tier)
@@ -496,8 +483,8 @@ mod tests {
     fn kelvin_to_rgb_warm_is_red_dominant() {
         let warm = kelvin_to_rgb(2700.0);
         let cool = kelvin_to_rgb(10000.0);
-        assert!(warm.x > warm.z, "warm: {:?}", warm);
-        assert!(cool.z > cool.x, "cool: {:?}", cool);
+        assert!(warm[0] > warm[2], "warm: {:?}", warm);
+        assert!(cool[2] > cool[0], "cool: {:?}", cool);
     }
 
     #[test]
@@ -587,13 +574,13 @@ mod tests {
         let (w0, h0) = p.render_dimensions();
         p.resize(1280, 720);
         let (w1, h1) = p.render_dimensions();
-        if p.is_gpu_available() {
-            assert!(w1 > w0, "{} > {}", w1, w0);
-            assert!(h1 > h0, "{} > {}", h1, h0);
-            // Low-tier scale is 0.5
-            assert_eq!(w1, 640);
-            assert_eq!(h1, 360);
-        }
+        // render_dimensions is deterministic from tier + logical size
+        // even without a GPU — grew on both paths.
+        assert!(w1 > w0, "{} > {}", w1, w0);
+        assert!(h1 > h0, "{} > {}", h1, h0);
+        // Low-tier scale is 0.5, so 1280x720 logical -> 640x360 render.
+        assert_eq!(w1, 640);
+        assert_eq!(h1, 360);
     }
 
     #[test]

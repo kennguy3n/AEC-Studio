@@ -97,9 +97,16 @@ struct SunUniform {
     direction: [f32; 4],
     colour: [f32; 4],
     light_view_proj: [[f32; 4]; 4],
+    /// `[texel_size, resolution_pixels, reserved, reserved]`.
+    ///
+    /// `texel_size = 1.0 / resolution_pixels`. The PBR fragment shader
+    /// reads `sun.shadow_params.x` to compute its 3×3 PCF jitter,
+    /// which keeps the shader independent of [`DEFAULT_SHADOW_RES`] and
+    /// allows the pipeline to resize the shadow texture at runtime.
+    shadow_params: [f32; 4],
 }
 
-const _SUN_UNIFORM_SIZE: () = assert!(std::mem::size_of::<SunUniform>() == 96);
+const _SUN_UNIFORM_SIZE: () = assert!(std::mem::size_of::<SunUniform>() == 112);
 
 /// Direct sun light. Direction points **from ground to sun**.
 #[derive(Debug, Clone, Copy)]
@@ -110,12 +117,27 @@ pub struct SunLight {
     pub intensity: f32,
 }
 
+/// Physical baseline sun illuminance multiplier in the same arbitrary
+/// units the PBR pipeline expects (matches the SkyState `strength = 1.0`
+/// noon reference).
+const BASELINE_SUN_INTENSITY: f32 = 3.0;
+
+/// Warm-white sun colour at noon (CIE D65-ish). Modulated by the sky
+/// tint so a tinted SkyState (e.g. warm sunset) also tints the sun.
+const BASELINE_SUN_COLOUR: Vec3 = Vec3::new(1.0, 0.97, 0.92);
+
 impl SunLight {
+    /// Derive a [`SunLight`] from a sky state. The direction is the
+    /// SkyState's sun vector; the colour is the baseline warm-white
+    /// modulated by [`SkyState::tint`]; the intensity scales with
+    /// [`SkyState::strength`] so dimming the sky also dims the sun and
+    /// the two stay energetically consistent.
     pub fn from_sky_state(sky: &SkyState) -> Self {
+        let tint = Vec3::new(sky.tint[0], sky.tint[1], sky.tint[2]);
         Self {
             direction: sky.sun_direction(),
-            colour: Vec3::new(1.0, 0.97, 0.92),
-            intensity: 3.0,
+            colour: BASELINE_SUN_COLOUR * tint,
+            intensity: BASELINE_SUN_INTENSITY * sky.strength.max(0.0),
         }
     }
 
@@ -714,6 +736,7 @@ impl PbrPreviewPipeline {
         let sun_vp = frame
             .sun
             .light_view_proj(frame.world_center, frame.world_radius);
+        let shadow_res_f = self.shadow_res.max(1) as f32;
         let sun = SunUniform {
             direction: [
                 frame.sun.direction.x,
@@ -728,6 +751,7 @@ impl PbrPreviewPipeline {
                 1.0,
             ],
             light_view_proj: sun_vp.to_cols_array_2d(),
+            shadow_params: [1.0 / shadow_res_f, shadow_res_f, 0.0, 0.0],
         };
         let sky = build_sky_uniform(&frame.sky_state);
 
@@ -1035,8 +1059,9 @@ mod tests {
     }
 
     #[test]
-    fn sun_uniform_size_is_96_bytes() {
-        assert_eq!(std::mem::size_of::<SunUniform>(), 96);
+    fn sun_uniform_size_is_112_bytes() {
+        // direction(16) + colour(16) + light_view_proj(64) + shadow_params(16) = 112
+        assert_eq!(std::mem::size_of::<SunUniform>(), 112);
     }
 
     #[test]

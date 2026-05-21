@@ -42,14 +42,18 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VertexOutput {
     return out;
 }
 
-// Inverse view-projection matrix uniform — needed to convert NDC into a
-// world-space ray direction. Provided by the renderer through binding 1.
-struct InvViewProj {
+// Camera uniform — must mirror the Rust `CameraUniform` layout in
+// `pbr_preview.rs` exactly (view_proj at offset 0, inv_view_proj at
+// offset 64, camera_pos at offset 128). The sky pass binds the same
+// `camera_buf` as the main PBR pass, so the struct layout below MUST
+// match `CameraUniform` byte-for-byte.
+struct CameraUniform {
+    view_proj: mat4x4<f32>,
     inv_view_proj: mat4x4<f32>,
     camera_pos: vec4<f32>,
 };
 
-@group(0) @binding(1) var<uniform> ivp: InvViewProj;
+@group(0) @binding(1) var<uniform> camera: CameraUniform;
 
 fn preetham_f(coeff: vec4<f32>, e: f32, cos_theta: f32, cos_gamma: f32) -> f32 {
     let a = coeff.x;
@@ -127,9 +131,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // NDC → world-space ray direction. clip = (ndc.x, ndc.y, 1, 1),
     // world = inv_view_proj * clip; ray = normalize(world.xyz - camera).
     let clip = vec4<f32>(in.ndc, 1.0, 1.0);
-    let world_h = ivp.inv_view_proj * clip;
+    let world_h = camera.inv_view_proj * clip;
     let world = world_h.xyz / world_h.w;
-    let dir = normalize(world - ivp.camera_pos.xyz);
+    let dir = normalize(world - camera.camera_pos.xyz);
     let rgb = evaluate_sky(dir);
     return vec4<f32>(rgb, 1.0);
 }

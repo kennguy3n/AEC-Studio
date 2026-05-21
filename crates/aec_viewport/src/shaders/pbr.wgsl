@@ -20,6 +20,11 @@ struct SunLight {
     direction: vec4<f32>,
     colour: vec4<f32>,
     light_view_proj: mat4x4<f32>,
+    // [shadow_texel_size, shadow_resolution_px, reserved, reserved]
+    // The Rust pipeline writes 1.0 / shadow_res into .x; the fragment
+    // PCF kernel reads it instead of hard-coding a value, so changing
+    // shadow resolution doesn't require a shader edit.
+    shadow_params: vec4<f32>,
 };
 
 struct PbrSky {
@@ -182,8 +187,10 @@ fn shadow_attenuation(shadow_clip: vec4<f32>, ndl: f32) -> f32 {
     // Receiver bias scaled by slope (helps prevent self-shadowing).
     let bias = max(0.003 * (1.0 - ndl), 0.0005);
     let depth = ndc.z - bias;
-    // 3x3 PCF — 9 hardware-compared samples.
-    let texel = 1.0 / 1024.0;
+    // 3x3 PCF — 9 hardware-compared samples. Texel size is supplied by
+    // the host so the kernel matches whatever shadow resolution the
+    // pipeline was built with.
+    let texel = sun.shadow_params.x;
     var sum: f32 = 0.0;
     for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
         for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
