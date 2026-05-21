@@ -1,5 +1,5 @@
-//! Lighting presets shared between the viewport (preview), Blender worker
-//! (final render), and the AI assistants.
+//! Lighting presets shared between the viewport (preview), the native
+//! CPU/GPU path tracer (final render), and the AI assistants.
 
 use serde::{Deserialize, Serialize};
 

@@ -385,20 +385,37 @@ The BIM cache lets large IFC models open in seconds on re-open and lets export s
 
 ```
 crates/aec_render/
-├── benches/eevee_latency.rs    # Criterion benchmark for Rust-side IPC overhead (250ms budget)
-├── blender_discovery.rs        # Cross-platform Blender binary discovery (env → known paths → PATH)
+├── benches/native_render.rs    # Criterion benchmark for the native CPU/GPU path tracer end-to-end
+├── bvh.rs                      # SAH BVH2 builder + node layout (Tasks 1-2, Phase 9 PR1)
 ├── cameras.rs                  # CameraSnapshot, CameraStore, CameraJournal, preset thumbnails
-├── cycles.rs                   # Cycles final-render pipeline
+├── denoise.rs                  # Edge-aware bilateral / NLM denoiser (Phase 9 PR2)
 ├── doctor.rs                   # Material check / diagnostics (missing texture, non-PBR, swapped channels)
-├── eevee.rs                    # EEVEE preview pipeline
+├── final_render.rs             # Native final-render pipeline — CPU/GPU path tracer → tone-map → PNG
+├── gpu_trace.rs                # wgpu compute path tracer + fallback to CPU rayon path tracer
 ├── history.rs                  # RenderHistory + compare(a, b) → CompareResult
+├── intersect.rs                # Möller-Trumbore + stack-based BVH traversal (Phase 9 PR1)
 ├── job.rs                      # RenderJob, RenderJobStatus, walkthrough frame tracking, resume state
+├── light_sampling.rs           # Sun / area / point / IES sampling with MIS (Phase 9 PR1)
 ├── lighting.rs                 # Lighting presets (WarmEvening/Daylight/Studio/...), IES profiles
-├── preset.rs                   # Quick / Standard / High / Studio / EEVEE Preview / Walkthrough / Panorama + recommend_preset(tier)
+├── material.rs                 # Principled BSDF (diffuse + GGX, Schlick Fresnel, Smith shadowing)
+├── panorama.rs                 # Native 360° equirectangular panorama pipeline
+├── path_trace.rs               # CPU megakernel path tracer + CameraProjection + AccumulationBuffer
+├── preset.rs                   # Quick / Standard / High / Studio / Preview / Walkthrough / Panorama + recommend_preset(tier)
+├── preview.rs                  # Native PBR raster preview pipeline (replaces eevee.rs)
 ├── queue.rs                    # Render queue (single, batch, matrix); resume on failure; governor-bounded concurrency
 ├── scene.rs                    # RenderScene, RenderCamera, RenderLight serialization
-└── worker.rs                   # JSON-line IPC to the Blender worker; StitchWalkthrough request + WalkthroughOutput enum
+├── scheduler.rs                # Tile / adaptive scheduler with cancellation (Phase 9 PR2)
+├── shaders/path_trace.wgsl     # WGSL compute kernel used by gpu_trace.rs
+└── walkthrough.rs              # Native walkthrough pipeline + optional ffmpeg stitching + WalkthroughOutput enum
 ```
+
+> NOTE — Phase 9 in progress: the prose in §9 above still describes the
+> legacy Blender/IfcOpenShell worker architecture. The file inventory
+> here reflects the post-PR4 (Phase 9, Tasks 12-14) state where
+> `worker.rs`, `blender_discovery.rs`, `cycles.rs`, and `eevee.rs` have
+> been removed in favour of the native render engine. The narrative
+> sections (§9.2, §9.4, §9.5, §10.5, §1 stack diagram) are rewritten in
+> Phase 9 PR9 (documentation pass).
 
 ---
 

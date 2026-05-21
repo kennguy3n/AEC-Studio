@@ -168,6 +168,17 @@ impl PathTraceScene {
     }
 }
 
+/// Camera projection used by the path tracer when generating primary
+/// rays. `Perspective` is the default; `Equirectangular` is used by the
+/// panorama renderer to produce 360°×180° output where horizontal pixels
+/// span longitude `[0, 2π]` and vertical pixels span latitude `[0, π]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CameraProjection {
+    #[default]
+    Perspective,
+    Equirectangular,
+}
+
 /// Path-tracer configuration. Most fields map 1:1 to
 /// [`crate::preset::RenderPresetConfig`].
 #[derive(Debug, Clone, Copy)]
@@ -181,6 +192,8 @@ pub struct PathTraceConfig {
     /// Threshold below which a tile is considered converged and stops
     /// sampling. Set to 0 to disable adaptive sampling.
     pub adaptive_threshold: f32,
+    /// Camera projection model used when generating primary rays.
+    pub projection: CameraProjection,
 }
 
 impl PathTraceConfig {
@@ -193,6 +206,7 @@ impl PathTraceConfig {
             tile_size: 64,
             russian_roulette_min_bounces: 3,
             adaptive_threshold: 0.0,
+            projection: CameraProjection::Perspective,
         }
     }
 
@@ -205,6 +219,24 @@ impl PathTraceConfig {
             tile_size: 64,
             russian_roulette_min_bounces: 3,
             adaptive_threshold: 0.01,
+            projection: CameraProjection::Perspective,
+        }
+    }
+
+    /// Default panorama configuration: 4096 × 2048 equirectangular at
+    /// 512 samples per pixel. Aspect ratio is forced to 2:1 so the
+    /// `[0, 2π]` longitude maps to one full screen-space rotation per
+    /// row.
+    pub fn panorama() -> Self {
+        Self {
+            width: 4096,
+            height: 2048,
+            samples_per_pixel: 512,
+            max_bounces: 8,
+            tile_size: 128,
+            russian_roulette_min_bounces: 3,
+            adaptive_threshold: 0.01,
+            projection: CameraProjection::Equirectangular,
         }
     }
 }
@@ -238,7 +270,14 @@ impl AccumulationBuffer {
             .collect()
     }
 
-    pub fn into_srgb8(self) -> Vec<u8> {
+    /// Tone-map this buffer to an sRGB-8 byte triplet array without
+    /// taking ownership. For large final renders (e.g. 1920×1080)
+    /// this avoids the ~8 MB allocation that
+    /// [`AccumulationBuffer::into_srgb8`] would force by consuming
+    /// `self`. The tone-mapping pipeline (Reinhard + gamma 2.2) is
+    /// kept identical so the two helpers are byte-for-byte
+    /// equivalent.
+    pub fn as_srgb8(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.pixels.len() * 3);
         for p in &self.pixels {
             let n = p[3].max(1.0);
@@ -254,6 +293,13 @@ impl AccumulationBuffer {
             out.push((b * 255.0).round().clamp(0.0, 255.0) as u8);
         }
         out
+    }
+
+    /// Owning variant of [`AccumulationBuffer::as_srgb8`]. Kept for
+    /// callers that already consume the buffer at the encode site —
+    /// internally it just forwards to `as_srgb8`.
+    pub fn into_srgb8(self) -> Vec<u8> {
+        self.as_srgb8()
     }
 }
 
@@ -394,10 +440,23 @@ pub fn render_tile_pass(
             for s in 0..samples_this_pass {
                 let px = tile.x_start + lx as u32;
                 let py = tile.y_start + ly as u32;
-                let nx = (px as f32 + rng.f32()) / config.width as f32 * 2.0 - 1.0;
-                let ny = 1.0 - (py as f32 + rng.f32()) / config.height as f32 * 2.0;
-                let dir_view = Vec3::new(nx * half_w, ny * half_h, -1.0).normalize();
-                let dir_world = view.basis * dir_view;
+                let jx = rng.f32();
+                let jy = rng.f32();
+                let dir_world = match config.projection {
+                    CameraProjection::Perspective => {
+                        let nx = (px as f32 + jx) / config.width as f32 * 2.0 - 1.0;
+                        let ny = 1.0 - (py as f32 + jy) / config.height as f32 * 2.0;
+                        let dir_view = Vec3::new(nx * half_w, ny * half_h, -1.0).normalize();
+                        view.basis * dir_view
+                    }
+                    CameraProjection::Equirectangular => equirectangular_dir(
+                        px as f32 + jx,
+                        py as f32 + jy,
+                        config.width,
+                        config.height,
+                        &view,
+                    ),
+                };
                 let ray = Ray::new(view.origin, dir_world);
                 let r = trace_path(scene, ray, config, &mut rng);
                 let rgb = [r.x, r.y, r.z];
@@ -472,10 +531,23 @@ fn render_tile(
             for _ in 0..config.samples_per_pixel {
                 let px = tile.x_start + lx as u32;
                 let py = tile.y_start + ly as u32;
-                let nx = (px as f32 + rng.f32()) / config.width as f32 * 2.0 - 1.0;
-                let ny = 1.0 - (py as f32 + rng.f32()) / config.height as f32 * 2.0;
-                let dir_view = Vec3::new(nx * half_w, ny * half_h, -1.0).normalize();
-                let dir_world = view.basis * dir_view;
+                let jx = rng.f32();
+                let jy = rng.f32();
+                let dir_world = match config.projection {
+                    CameraProjection::Perspective => {
+                        let nx = (px as f32 + jx) / config.width as f32 * 2.0 - 1.0;
+                        let ny = 1.0 - (py as f32 + jy) / config.height as f32 * 2.0;
+                        let dir_view = Vec3::new(nx * half_w, ny * half_h, -1.0).normalize();
+                        view.basis * dir_view
+                    }
+                    CameraProjection::Equirectangular => equirectangular_dir(
+                        px as f32 + jx,
+                        py as f32 + jy,
+                        config.width,
+                        config.height,
+                        &view,
+                    ),
+                };
                 let ray = Ray::new(view.origin, dir_world);
                 let radiance = trace_path(scene, ray, config, &mut rng);
                 accum += radiance;
@@ -528,6 +600,112 @@ fn focal_to_half_height(focal_mm: f32) -> f32 {
     (sensor_h_mm * 0.5) / f
 }
 
+/// Generate a world-space direction for an equirectangular pixel.
+///
+/// The horizontal axis maps to longitude and the vertical axis maps to
+/// latitude `[0, π]` (north pole at `y=0`, south pole at `y=height`).
+/// We shift longitude by `-π` (`phi = (u - 0.5) * TAU`) so the panorama
+/// centre column (`u = 0.5`) points along the camera-view `-Z`
+/// (i.e. the camera forward), matching the standard 360°/VR convention
+/// used by Insta360, Google PhotoSphere, FB 360, and every consumer VR
+/// runtime. After the shift the four cardinal columns in view space
+/// are:
+///
+/// | `u`     | `phi`   | view-space direction at the equator |
+/// |---------|---------|-------------------------------------|
+/// | `0.0`   | `-π`    | `+Z` (camera-backward)              |
+/// | `0.25`  | `-π/2`  | `-X` (camera-left)                  |
+/// | `0.5`   | `0`     | `-Z` (camera-forward)               |
+/// | `0.75`  | `+π/2`  | `+X` (camera-right)                 |
+/// | `1.0`   | `+π`    | `+Z` (camera-backward, wraps to 0)  |
+///
+/// The view-space direction is then multiplied by the camera basis so
+/// the panorama is aimed via the camera's `target_mm`. The basis is
+/// orthonormal, so `dir_view` is unit-length by construction
+/// (`sin²θ (sin²φ + cos²φ) + cos²θ = 1`); we still call
+/// `normalize_or_zero` on the result to absorb floating-point drift
+/// from the basis multiplication and to give a deterministic value on
+/// the degenerate `basis * dir_view == 0` case.
+fn equirectangular_dir(px: f32, py: f32, width: u32, height: u32, view: &ViewFrame) -> Vec3 {
+    let u = px / width.max(1) as f32;
+    let v = py / height.max(1) as f32;
+    // Centre-forward convention — see the table in the doc comment.
+    let phi = (u - 0.5) * std::f32::consts::TAU;
+    let theta = v * std::f32::consts::PI;
+    let sin_theta = theta.sin();
+    let dir_view = Vec3::new(sin_theta * phi.sin(), theta.cos(), -sin_theta * phi.cos());
+    (view.basis * dir_view).normalize_or_zero()
+}
+
+/// Sum the radiance from analytic lights (sun, area) whose support
+/// contains `ray.dir`. Used by `trace_path` to add direct visibility of
+/// these lights for rays that escape the scene without hitting any
+/// triangle — without this, looking straight at a sun would render
+/// only the sky background.
+///
+/// Point/IES lights are intentionally excluded: they are point delta
+/// emitters with zero solid angle, so a ray can never "hit" one.
+fn direct_visible_lights(lights: &[NativeLight], ray: &Ray) -> Vec3 {
+    let mut total = Vec3::ZERO;
+    for light in lights {
+        match light {
+            NativeLight::Sun {
+                direction,
+                radiance,
+                angular_radius_rad,
+            } => {
+                // The sun's apparent direction is `-direction` (the
+                // direction light *comes from*). A primary ray points
+                // away from the camera; it "hits" the sun if its
+                // direction lies inside the sun's angular cone.
+                let to_sun = -*direction;
+                let cos_cone = angular_radius_rad.cos();
+                let cos_angle = ray.dir.normalize_or_zero().dot(to_sun.normalize_or_zero());
+                if cos_angle >= cos_cone {
+                    total += *radiance;
+                }
+            }
+            NativeLight::Area {
+                position,
+                normal,
+                u_axis,
+                v_axis,
+                width,
+                height,
+                radiance,
+            } => {
+                // Ray-plane intersection: solve t such that the ray
+                // crosses the plane defined by `position`/`normal`,
+                // then check the (u, v) hit point is inside the
+                // rectangle. The area light is two-sided so the dot
+                // product sign is irrelevant.
+                let denom = normal.dot(ray.dir);
+                if denom.abs() < 1e-6 {
+                    continue;
+                }
+                let t = (*position - ray.origin).dot(*normal) / denom;
+                if t < ray.t_min || t > ray.t_max {
+                    continue;
+                }
+                let hit_pt = ray.origin + ray.dir * t;
+                let local = hit_pt - *position;
+                let u = local.dot(*u_axis);
+                let v = local.dot(*v_axis);
+                if u.abs() <= *width * 0.5 && v.abs() <= *height * 0.5 {
+                    total += *radiance;
+                }
+            }
+            NativeLight::Point { .. } | NativeLight::Ies { .. } => {
+                // Delta luminaires have zero solid angle; a ray cannot
+                // intersect them in the geometric sense, so they
+                // contribute nothing to direct-miss visibility. Their
+                // illumination flows entirely through NEE.
+            }
+        }
+    }
+    total
+}
+
 fn trace_path(
     scene: &PathTraceScene,
     ray_in: Ray,
@@ -545,6 +723,20 @@ fn trace_path(
         let Some(hit) = hit else {
             let env = environment_radiance(&scene.sky, ray.dir);
             radiance += throughput * env;
+            // Cycles parity: a ray that escapes the scene also sees any
+            // analytic light whose support contains `ray.dir`. Without
+            // this branch a panorama or a "shoot ray at the sky"
+            // primary ray would never observe the sun disk, only the
+            // diffuse sky background. Sun lights are evaluated as a
+            // delta-cone test; area lights as a ray-rectangle test.
+            // Direct-lighting NEE already accounts for these analytic
+            // lights inside the bouncing loop, so we skip the analytic
+            // contribution on rays that came from a BSDF sample to
+            // avoid double-counting (`last_was_specular` is true for
+            // the primary ray and for rays after specular bounces).
+            if last_was_specular {
+                radiance += throughput * direct_visible_lights(&scene.lights, &ray);
+            }
             break;
         };
         let tri = &scene.triangles[hit.prim_id as usize];
@@ -780,6 +972,7 @@ mod tests {
             tile_size: 8,
             russian_roulette_min_bounces: 3,
             adaptive_threshold: 0.0,
+            projection: crate::path_trace::CameraProjection::Perspective,
         };
         let buf = render(&pt, &camera, &cfg, None, None);
         // Every pixel should equal the environment radiance (0.5, 0.5, 0.5).
@@ -823,6 +1016,7 @@ mod tests {
             tile_size: 16,
             russian_roulette_min_bounces: 3,
             adaptive_threshold: 0.0,
+            projection: crate::path_trace::CameraProjection::Perspective,
         };
         let buf = render(&pt, &camera, &cfg, None, None);
         let avg = buf.average_rgb();
@@ -869,6 +1063,7 @@ mod tests {
             tile_size: 8,
             russian_roulette_min_bounces: 3,
             adaptive_threshold: 0.0,
+            projection: crate::path_trace::CameraProjection::Perspective,
         };
         render(&pt, &camera, &cfg, Some(progress), None);
         assert_eq!(counter.load(Ordering::Relaxed), 4); // 2x2 tiles
@@ -906,6 +1101,7 @@ mod tests {
             tile_size: 8,
             russian_roulette_min_bounces: 3,
             adaptive_threshold: 0.0,
+            projection: crate::path_trace::CameraProjection::Perspective,
         };
         let buf = render(&pt, &camera, &cfg, None, Some(token));
         // Cancelled before any tile was rendered → all pixels untouched.

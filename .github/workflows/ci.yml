@@ -215,6 +215,14 @@ jobs:
     # workflow against unrelated label-change re-fires (see the
     # `if:` on `gate`). Without this dependency, label triage on an
     # unrelated label would still spin up the Python worker matrix.
+    #
+    # NOTE — Phase 9: the Blender worker has been removed (Phase 9
+    # PR4, Task 13). Rendering is now native Rust (see
+    # `crates/aec_render/src/{final_render,walkthrough,panorama}.rs`)
+    # and there are no Blender Python tests to run. The IFC worker
+    # is still Python until Phase 9 PR5 deletes it; this job's sole
+    # remaining responsibility is to keep `workers/ifc/` green
+    # until then.
     needs: gate
     steps:
       - uses: actions/checkout@v4
@@ -223,10 +231,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Blender worker tests
-        working-directory: workers/blender
-        run: python -m unittest discover -s tests -p 'test_*.py' -v
 
       - name: IFC worker tests
         working-directory: workers/ifc

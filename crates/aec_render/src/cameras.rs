@@ -3,7 +3,7 @@
 //! camera browser tile.
 //!
 //! `RenderCamera` (in `scene.rs`) is the minimal projection-only camera the
-//! Blender worker consumes. `CameraSnapshot` here adds everything an artist
+//! native render pipeline consumes. `CameraSnapshot` here adds everything an artist
 //! tweaks (focal length, sensor, exposure, DoF, white balance, aspect ratio,
 //! optional preset key) and serialises out via serde so projects can store
 //! it on disk. CRUD goes through the command engine so undo/redo applies.
@@ -115,9 +115,9 @@ impl CameraSnapshot {
     }
 
     /// Project the snapshot down to the minimal `RenderCamera` the
-    /// Blender worker consumes. This is what gets stamped onto each
-    /// queued render so the camera roundtrips even after subsequent
-    /// edits to the snapshot.
+    /// native render pipeline consumes. This is what gets stamped onto
+    /// each queued render so the camera roundtrips even after
+    /// subsequent edits to the snapshot.
     pub fn to_render_camera(&self) -> RenderCamera {
         RenderCamera {
             id: self.id.to_string(),
@@ -310,9 +310,9 @@ impl CameraStore {
 ///
 /// The gradient is not photorealistic; it's a visual fingerprint. The
 /// production renderer ships a real preview render of the scene from
-/// the camera, but that requires the Blender worker to be live. The
-/// fingerprint is used when the worker is offline / cold and when
-/// rendering thumbnails in batch.
+/// the camera via [`crate::preview::PreviewPipeline`]; the fingerprint
+/// is used when the GPU is unavailable or when rendering thumbnails in
+/// batch where launching a full preview per camera would be wasteful.
 pub fn render_thumbnail_rgba8(snapshot: &CameraSnapshot) -> Vec<u8> {
     const SIZE: usize = 32;
     let mut out = vec![0u8; SIZE * SIZE * 4];
@@ -572,7 +572,7 @@ mod tests {
     }
 
     #[test]
-    fn to_render_camera_strips_to_worker_payload() {
+    fn to_render_camera_preserves_lens_and_exposure_for_native_renderer() {
         let cam = sample_camera("cam_x");
         let rc = cam.to_render_camera();
         assert_eq!(rc.id, "ent_cam_x");

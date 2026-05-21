@@ -1,6 +1,6 @@
-//! Tiny indexed mesh format used by the viewport (wgpu) and the Blender
-//! worker. Vertices are positions in millimeters, normals are unit vectors,
-//! UVs are in `[0,1]`.
+//! Tiny indexed mesh format used by the viewport (wgpu rasteriser) and
+//! the native CPU/GPU path tracer. Vertices are positions in
+//! millimeters, normals are unit vectors, UVs are in `[0,1]`.
 
 use serde::{Deserialize, Serialize};
 

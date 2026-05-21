@@ -119,8 +119,15 @@ struct ParamsGpu {
     seed: u32,
     sky_color: [f32; 3],
     sky_strength: f32,
+    /// Camera projection enum encoded for the WGSL shader:
+    /// 0 = perspective, 1 = equirectangular. Must match
+    /// [`crate::path_trace::CameraProjection`].
+    projection: u32,
+    /// Padding so the struct ends on a 16-byte (`vec4`) boundary, as
+    /// required by WGSL uniform layout rules.
+    _pad_projection: [u32; 3],
 }
-const _: () = assert!(std::mem::size_of::<ParamsGpu>() == 112);
+const _: () = assert!(std::mem::size_of::<ParamsGpu>() == 128);
 
 // ---- Scene -> GPU buffers ---------------------------------------------
 
@@ -141,7 +148,16 @@ impl GpuSceneBuffers {
     /// permutation is applied here so the shader can index triangles
     /// directly by `prim_indices[start + i]`.
     pub fn build(scene: &PathTraceScene) -> Self {
-        let mut bvh_nodes: Vec<BvhNodeGpu> = scene
+        // Note: when `scene.bvh.nodes` is empty we deliberately keep
+        // `bvh_nodes` empty. The wgpu buffer-not-empty constraint is
+        // satisfied at bind time by stubbing a placeholder node
+        // (see `GpuPathTracer::dispatch`) so that `params.bvh_count`
+        // here continues to reflect the *logical* node count. The
+        // WGSL traversal guards on `params.bvh_count == 0u` and
+        // returns the miss-hit immediately, so the placeholder node
+        // is never read. Mirrors the triangle/material/light stub
+        // pattern below.
+        let bvh_nodes: Vec<BvhNodeGpu> = scene
             .bvh
             .nodes
             .iter()
@@ -152,15 +168,6 @@ impl GpuSceneBuffers {
                 prim_count: n.prim_count,
             })
             .collect();
-        if bvh_nodes.is_empty() {
-            // Single empty leaf so the shader's loop terminates.
-            bvh_nodes.push(BvhNodeGpu {
-                min: [0.0; 3],
-                left_or_start: 0,
-                max: [0.0; 3],
-                prim_count: 0,
-            });
-        }
 
         // Reorder triangles per the BVH's prim_indices so the shader
         // can do contiguous leaf scans without an indirection.
@@ -426,8 +433,54 @@ impl GpuPathTracer {
         }
 
         let buffers = GpuSceneBuffers::build(scene);
-        let bvh_buf = self.create_storage("bvh_nodes", bytemuck::cast_slice(&buffers.bvh_nodes));
-        let tri_buf = self.create_storage("triangles", bytemuck::cast_slice(&buffers.triangles));
+        // Same stride/zero-length validation issue as `triangles`
+        // below: an empty `bvh_nodes` buffer is bound with 16 bytes
+        // of wgpu padding but the shader's storage array expects
+        // `stride_of<BvhNodeGpu>` = 32 bytes per element, which trips
+        // the dispatch-time validator. Stub a single zeroed
+        // placeholder when the scene has no BVH; the shader guards
+        // traversal with `params.bvh_count == 0u`, so the placeholder
+        // is never read. Crucially, `params.bvh_count` is computed
+        // from `buffers.bvh_nodes.len()` further down, so it remains
+        // `0` for empty scenes and the WGSL early-return fires
+        // structurally rather than relying on the placeholder's
+        // degenerate AABB to miss every ray.
+        let bvh_buf = if buffers.bvh_nodes.is_empty() {
+            self.create_storage(
+                "bvh_nodes",
+                bytemuck::cast_slice(&[BvhNodeGpu {
+                    min: [0.0; 3],
+                    left_or_start: 0,
+                    max: [0.0; 3],
+                    prim_count: 0,
+                }]),
+            )
+        } else {
+            self.create_storage("bvh_nodes", bytemuck::cast_slice(&buffers.bvh_nodes))
+        };
+        // Empty triangle buffer is bound with 16 bytes of wgpu padding
+        // but the shader's storage array expects `stride_of<TriangleGpu>`
+        // = 48 bytes per element, so binding the zero-length buffer
+        // triggers a validation error on dispatch. Stub a single
+        // zeroed placeholder when there are no triangles — the shader
+        // already guards traversal with `params.bvh_count == 0u`, so
+        // the stub is never read. Mirrors the same pattern already
+        // used for `materials` and `lights` below.
+        let tri_buf = if buffers.triangles.is_empty() {
+            self.create_storage(
+                "triangles",
+                bytemuck::cast_slice(&[TriangleGpu {
+                    v0: [0.0; 3],
+                    _pad0: 0.0,
+                    v1: [0.0; 3],
+                    _pad1: 0.0,
+                    v2: [0.0; 3],
+                    material_id: -1,
+                }]),
+            )
+        } else {
+            self.create_storage("triangles", bytemuck::cast_slice(&buffers.triangles))
+        };
         let mat_buf = if buffers.materials.is_empty() {
             self.create_storage(
                 "materials",
@@ -464,6 +517,10 @@ impl GpuPathTracer {
         };
 
         let camera_frame = build_camera_frame(camera);
+        let projection = match config.projection {
+            crate::path_trace::CameraProjection::Perspective => 0u32,
+            crate::path_trace::CameraProjection::Equirectangular => 1u32,
+        };
         let params = ParamsGpu {
             width: config.width,
             height: config.height,
@@ -483,6 +540,8 @@ impl GpuPathTracer {
             seed: 0xC0FFEE,
             sky_color: buffers.sky_color,
             sky_strength: buffers.sky_strength,
+            projection,
+            _pad_projection: [0; 3],
         };
         let params_buf = self
             .device
@@ -750,7 +809,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<TriangleGpu>(), 48);
         assert_eq!(std::mem::size_of::<MaterialGpu>(), 48);
         assert_eq!(std::mem::size_of::<LightGpu>(), 96);
-        assert_eq!(std::mem::size_of::<ParamsGpu>(), 112);
+        assert_eq!(std::mem::size_of::<ParamsGpu>(), 128);
     }
 
     #[test]
@@ -810,6 +869,7 @@ mod tests {
             tile_size: 8,
             russian_roulette_min_bounces: 1,
             adaptive_threshold: 0.0,
+            projection: crate::path_trace::CameraProjection::Perspective,
         };
         let buf = render_or_fallback(&scene, &camera, &cfg, None, None);
         assert_eq!(buf.width, 16);
@@ -840,6 +900,7 @@ mod tests {
             tile_size: 8,
             russian_roulette_min_bounces: 1,
             adaptive_threshold: 0.0,
+            projection: crate::path_trace::CameraProjection::Perspective,
         };
         let token = CancelToken::new();
         token.cancel();
@@ -848,6 +909,253 @@ mod tests {
         // dimensions.
         assert_eq!(buf.width, 16);
         assert_eq!(buf.height, 12);
+    }
+
+    #[test]
+    fn gpu_equirectangular_render_matches_cpu_when_gpu_available() {
+        // Regression for PR #12 Devin Review finding BUG_0001: the GPU
+        // shader used to ignore the camera projection and always
+        // generate perspective rays, so a panorama dispatched through
+        // `render_or_fallback` silently produced perspective output on
+        // GPU-equipped machines. With the projection field plumbed
+        // through `ParamsGpu` + WGSL, the GPU equirectangular path must
+        // produce output that matches the CPU reference within a tight
+        // PSNR-like tolerance.
+        //
+        // Headless CI without a GPU adapter simply exits early — the
+        // CPU path is already covered by
+        // `crate::path_trace::tests::equirectangular_camera_covers_full_sphere`.
+        let Ok(tracer) = GpuPathTracer::try_new() else {
+            return;
+        };
+        let scene = quad_scene();
+        let camera = RenderCamera {
+            id: "pano".into(),
+            position_mm: [0.0, 1500.0, 0.0],
+            target_mm: [0.0, 1500.0, -1000.0],
+            focal_length_mm: 35.0,
+            exposure_ev: 0.0,
+            white_balance_k: 5500.0,
+            aperture_f: 5.6,
+        };
+        // Tiny 8x4 panorama — keeps the test fast but still covers the
+        // full sphere, so any divergence between CPU and GPU primary
+        // rays manifests as a per-pixel radiance difference.
+        let cfg = PathTraceConfig {
+            width: 8,
+            height: 4,
+            samples_per_pixel: 1,
+            max_bounces: 1,
+            tile_size: 8,
+            russian_roulette_min_bounces: 1,
+            adaptive_threshold: 0.0,
+            projection: crate::path_trace::CameraProjection::Equirectangular,
+        };
+        let gpu = tracer.render(&scene, &camera, &cfg, None, None);
+        let cpu = crate::path_trace::render(&scene, &camera, &cfg, None, None);
+
+        // Sanity: dimensions agree.
+        assert_eq!(gpu.width, cpu.width);
+        assert_eq!(gpu.height, cpu.height);
+
+        // Compare averaged radiance per pixel. GPU and CPU use
+        // different RNG sequences (host-PCG vs CPU rayon), so direct
+        // equality won't hold — instead we require the per-channel
+        // mean-squared error to stay below a generous threshold. The
+        // important invariant is that the bug fix produces a panorama
+        // (escaped rays sample the sky / sun in the same hemisphere
+        // pattern), not perspective output (which would hit only the
+        // forward cone).
+        let gpu_avg = gpu.average_rgb();
+        let cpu_avg = cpu.average_rgb();
+        let mut sse = 0.0_f64;
+        for (g, c) in gpu_avg.iter().zip(cpu_avg.iter()) {
+            for ch in 0..3 {
+                let d = (g[ch] - c[ch]) as f64;
+                sse += d * d;
+            }
+        }
+        let mse = sse / (gpu_avg.len() as f64 * 3.0);
+        // Generous threshold: equirectangular rays from CPU vs GPU
+        // sample slightly different jitter, but the radiance
+        // distribution should agree to within 0.5 in linear radiance
+        // for this synthetic scene. A perspective-projecting GPU
+        // shader (the bug) would produce MSE well above 1.0 because
+        // most pixels would never escape the camera cone and would
+        // therefore see a different mix of floor + sky than the CPU's
+        // full-sphere equirectangular sample.
+        assert!(
+            mse < 0.5,
+            "GPU equirectangular output diverges from CPU reference: mse={mse}"
+        );
+    }
+
+    #[test]
+    fn gpu_primary_ray_sees_sun_disc_on_miss() {
+        // Regression for the post-fix Devin Review finding flagging
+        // that the GPU shader's miss branch only added
+        // `sky_color * sky_strength` and never the analytic
+        // `direct_visible_lights` contribution (sun disc + area-light
+        // visibility through escaped rays). With the fix, a primary
+        // ray pointed inside the sun's angular cone must accumulate
+        // the sun's radiance on miss, producing pixels that are much
+        // brighter than the sky-only baseline.
+        //
+        // Strategy: an empty-geometry scene (every primary ray
+        // escapes) with a sun pointing straight at `-Z` (toward the
+        // camera-forward) and a very small angular radius. The
+        // bottom-row centre pixels (which subtend the smallest
+        // angles around the forward direction) must see the sun;
+        // far-off pixels see only the sky. We don't compare to CPU
+        // (the CPU path is already covered by
+        // `crate::path_trace::tests::*` for this branch) — instead
+        // we assert the structural invariant that a bright spot
+        // appears in the forward cone.
+        let Ok(tracer) = GpuPathTracer::try_new() else {
+            return;
+        };
+
+        // Empty scene with a single sun light. Build via
+        // `from_render_scene` for the sky params and then push the
+        // analytic sun directly so we control its direction and
+        // angular radius exactly.
+        let scene_in = RenderScene::default();
+        let mut scene = PathTraceScene::from_render_scene(
+            &scene_in,
+            vec![],
+            |_| None,
+            SkyParams {
+                strength: 0.0, // suppress sky so the sun is the only contributor
+                color: [0.0, 0.0, 0.0],
+                ..SkyParams::default()
+            },
+        );
+        scene.lights.push(crate::light_sampling::NativeLight::Sun {
+            direction: glam::Vec3::new(0.0, 0.0, 1.0), // photons travel +Z; sun disc lives at -Z
+            radiance: glam::Vec3::splat(100.0),
+            angular_radius_rad: 0.10, // ~5.7° half-angle — covers the centre pixels at 16×16
+        });
+
+        let camera = RenderCamera {
+            id: "cam".into(),
+            position_mm: [0.0, 0.0, 0.0],
+            // target_mm: camera looks toward -Z, which is exactly
+            // where the sun disc sits (since photons travel +Z).
+            target_mm: [0.0, 0.0, -1000.0],
+            focal_length_mm: 35.0,
+            exposure_ev: 0.0,
+            white_balance_k: 5500.0,
+            aperture_f: 5.6,
+        };
+        let cfg = PathTraceConfig {
+            width: 16,
+            height: 16,
+            samples_per_pixel: 1,
+            max_bounces: 1,
+            tile_size: 8,
+            russian_roulette_min_bounces: 1,
+            adaptive_threshold: 0.0,
+            projection: crate::path_trace::CameraProjection::Perspective,
+        };
+        let buf = tracer.render(&scene, &camera, &cfg, None, None);
+        let avg = buf.average_rgb();
+
+        let max_lum = avg
+            .iter()
+            .map(|p| p[0].max(p[1]).max(p[2]))
+            .fold(0.0_f32, f32::max);
+        // Without the fix the maximum pixel luminance was the sky
+        // baseline (here zero by construction). With the fix at
+        // least one primary ray in the forward cone hits the sun and
+        // accumulates its 100-unit radiance.
+        assert!(
+            max_lum > 10.0,
+            "GPU primary rays did not pick up the sun disc on miss; max luminance was {max_lum}"
+        );
+    }
+
+    #[test]
+    fn gpu_empty_bvh_with_camera_at_origin_terminates_cleanly() {
+        // Regression for the Devin Review finding on 9b76ffe flagging
+        // that the GPU dispatch path stored an empty-scene "stub" BVH
+        // node inside `GpuSceneBuffers::bvh_nodes`, which made
+        // `params.bvh_count == 1` (not 0) and bypassed the WGSL
+        // `params.bvh_count == 0u` early-return. With the stub's
+        // degenerate AABB at the world origin, a camera positioned at
+        // the origin emits rays that pass *through* the AABB, treat
+        // the stub as an internal node (`prim_count == 0`), and push
+        // out-of-bounds child indices onto the traversal stack. WGSL
+        // clamps the OOB reads, but the loop can spin until the
+        // 64-deep stack overflows.
+        //
+        // The structural fix moves the empty-BVH stub from
+        // `GpuSceneBuffers::build` to the bind step (mirroring the
+        // triangle / material / light pattern), so `params.bvh_count`
+        // remains 0 for empty scenes and the WGSL early-return fires
+        // before any node is read. This test exercises exactly the
+        // pathological case — camera at origin, ray through (0,0,0).
+        let Ok(tracer) = GpuPathTracer::try_new() else {
+            return;
+        };
+
+        let scene_in = RenderScene::default();
+        let scene = PathTraceScene::from_render_scene(
+            &scene_in,
+            vec![],
+            |_| None,
+            SkyParams {
+                strength: 1.0,
+                color: [1.0, 1.0, 1.0],
+                ..SkyParams::default()
+            },
+        );
+        // BVH must actually be empty for this regression.
+        assert!(
+            scene.bvh.nodes.is_empty(),
+            "test relies on an empty BVH to exercise the stub-node path"
+        );
+
+        let camera = RenderCamera {
+            id: "cam".into(),
+            // Camera at world origin — rays will pass through the
+            // pre-fix stub AABB (which was [0,0,0] / [0,0,0]).
+            position_mm: [0.0, 0.0, 0.0],
+            target_mm: [0.0, 0.0, -1000.0],
+            focal_length_mm: 35.0,
+            exposure_ev: 0.0,
+            white_balance_k: 5500.0,
+            aperture_f: 5.6,
+        };
+        let cfg = PathTraceConfig {
+            width: 8,
+            height: 6,
+            samples_per_pixel: 1,
+            max_bounces: 1,
+            tile_size: 4,
+            russian_roulette_min_bounces: 1,
+            adaptive_threshold: 0.0,
+            projection: crate::path_trace::CameraProjection::Perspective,
+        };
+        let buf = tracer.render(&scene, &camera, &cfg, None, None);
+
+        // Every primary ray misses (no geometry) and hits the
+        // constant-white sky, so every pixel should accumulate
+        // `sky_color * sky_strength == (1,1,1)`. If the OOB stack
+        // overflow had been triggered, the kernel would either
+        // produce zeros (early-out without sky) or NaNs.
+        let avg = buf.average_rgb();
+        for (i, p) in avg.iter().enumerate() {
+            assert!(
+                p[0].is_finite() && p[1].is_finite() && p[2].is_finite(),
+                "pixel {i} produced non-finite radiance {p:?} — empty-BVH traversal corrupted the kernel"
+            );
+            assert!(
+                (p[0] - 1.0).abs() < 1.0e-3
+                    && (p[1] - 1.0).abs() < 1.0e-3
+                    && (p[2] - 1.0).abs() < 1.0e-3,
+                "pixel {i} = {p:?}: empty-BVH miss should hit the white sky exactly, but the stub-node bug would either zero this out or push garbage from the OOB stack push."
+            );
+        }
     }
 
     #[test]
@@ -877,6 +1185,7 @@ mod tests {
                     tile_size: 4,
                     russian_roulette_min_bounces: 1,
                     adaptive_threshold: 0.0,
+                    projection: crate::path_trace::CameraProjection::Perspective,
                 };
                 let buf = render_or_fallback(&scene, &camera, &cfg, None, None);
                 assert_eq!(buf.pixels.len(), 48);

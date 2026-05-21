@@ -1,5 +1,6 @@
 //! PBR material struct shared between the viewport (real-time preview),
-//! Blender worker (final render), and the IPC layer.
+//! the native preview rasteriser, and the native CPU/GPU path tracer
+//! used for final, walkthrough, and panorama renders.
 
 use serde::{Deserialize, Serialize};
 

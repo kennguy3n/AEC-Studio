@@ -1,6 +1,8 @@
-//! Render scene serialization shared by EEVEE/Cycles. The structures here
-//! are intentionally Blender-agnostic — the worker translates them into
-//! `bpy` calls in `workers/blender/scene_loader.py`.
+//! Render scene serialization shared by the preview, final, walkthrough,
+//! and panorama pipelines. Phase 9 PR4 removed the Blender worker; the
+//! structures here are now consumed natively by
+//! [`crate::path_trace::PathTraceScene::from_render_scene`] (CPU/GPU
+//! path tracer) and [`crate::preview::PreviewPipeline`] (PBR raster).
 
 use serde::{Deserialize, Serialize};
 

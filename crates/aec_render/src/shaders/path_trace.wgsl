@@ -75,6 +75,12 @@ struct Params {
     seed: u32,
     sky_color: vec3<f32>,
     sky_strength: f32,
+    // Camera projection: 0 = perspective, 1 = equirectangular.
+    // Must mirror `crate::path_trace::CameraProjection` discriminants.
+    // WGSL auto-pads the struct end to the max-field alignment (16
+    // bytes here, set by `vec3<f32>`), so the on-device size is 128
+    // bytes — matches `ParamsGpu` in `gpu_trace.rs` (also 128).
+    projection: u32,
 }
 
 @group(0) @binding(0) var<storage, read> bvh_nodes: array<BvhNodeGpu>;
@@ -290,6 +296,71 @@ fn cosine_weighted_sample(n: vec3<f32>, r0: f32, r1: f32) -> vec3<f32> {
     return normalize(t * local.x + b * local.y + n * local.z);
 }
 
+// Analytic emission seen by a ray that misses all geometry — mirrors
+// `crate::path_trace::direct_visible_lights`. Without this branch a
+// primary ray pointed at the sun (or a panorama row covering the sun
+// disc) would only pick up the diffuse sky background, while the CPU
+// kernel would correctly accumulate the analytic light's radiance.
+//
+// Point / IES lights are intentionally excluded: they are delta
+// emitters with zero solid angle, so a ray can never "hit" one — their
+// illumination flows entirely through NEE.
+//
+// Caller must gate this to the GPU's analog of CPU's
+// `last_was_specular` (currently `bounce == 0u`) so that emission
+// already accounted for by NEE during the bouncing loop is not
+// double-counted.
+fn direct_visible_lights(ray_o: vec3<f32>, ray_d: vec3<f32>) -> vec3<f32> {
+    var total = vec3<f32>(0.0);
+    for (var li: u32 = 0u; li < params.light_count; li = li + 1u) {
+        let light = lights[li];
+        if (light.kind == 0u) {
+            // Sun: `light.position` is the (normalized) direction the
+            // photons travel toward the scene, so the apparent
+            // direction of the sun disc is `-light.position`. The ray
+            // "hits" the sun if its direction falls inside the disc's
+            // angular cone.
+            let to_sun = -light.position;
+            let cos_cone = cos(light.params.x);
+            let cos_angle = dot(normalize(ray_d), normalize(to_sun));
+            if (cos_angle >= cos_cone) {
+                total = total + light.emission;
+            }
+        } else if (light.kind == 2u) {
+            // Area: ray-plane intersection, then a (u, v) rectangle
+            // test in the light's local frame. The area light is
+            // two-sided, matching the CPU implementation.
+            let u_axis = light.params.xyz;
+            let v_axis = light.extra.xyz;
+            let n_area = normalize(cross(u_axis, v_axis));
+            let denom = dot(n_area, ray_d);
+            if (abs(denom) >= 1.0e-6) {
+                let t = dot(light.position - ray_o, n_area) / denom;
+                // Primary-ray bounds: `t_min = 1e-4`, `t_max = 1e8`.
+                // CPU uses `[ray.t_min, ray.t_max]` (1e-4 to
+                // `f32::INFINITY` for primary rays); the upper-bound
+                // check is a defence-in-depth no-op today but keeps
+                // CPU and GPU symbolically identical so a future
+                // change that tightens `t_max` won't silently diverge
+                // the two kernels. `1e8` matches the traversal cap
+                // already passed to `traverse(..., 1e8)`.
+                if (t > 1.0e-4 && t < 1.0e8) {
+                    let hit_pt = ray_o + ray_d * t;
+                    let local = hit_pt - light.position;
+                    let u = dot(local, u_axis);
+                    let v = dot(local, v_axis);
+                    if (abs(u) <= light.size.x * 0.5 && abs(v) <= light.size.y * 0.5) {
+                        total = total + light.emission;
+                    }
+                }
+            }
+        }
+        // kind == 1u (point / IES): skip; delta emitters are not
+        // hit-visible.
+    }
+    return total;
+}
+
 @compute @workgroup_size(8, 8, 1)
 fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (gid.x >= params.width || gid.y >= params.height) {
@@ -300,11 +371,39 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     var accum_rgb = vec3<f32>(0.0);
     for (var s: u32 = 0u; s < params.samples_per_pixel; s = s + 1u) {
-        let nx = (f32(gid.x) + rand_f32(&rng_state)) / f32(params.width) * 2.0 - 1.0;
-        let ny = 1.0 - (f32(gid.y) + rand_f32(&rng_state)) / f32(params.height) * 2.0;
-        let dir_view = normalize(vec3<f32>(nx * params.focal_half_h * params.aspect,
+        let jx = rand_f32(&rng_state);
+        let jy = rand_f32(&rng_state);
+        var dir_view: vec3<f32>;
+        if (params.projection == 1u) {
+            // Equirectangular: centre column (u=0.5) maps to view
+            // -Z (camera forward) via `phi = (u - 0.5) * TAU`,
+            // matching the standard 360°/VR convention. Must mirror
+            // `crate::path_trace::equirectangular_dir` exactly so CPU
+            // and GPU produce identical panoramas. The cardinal
+            // columns are: u=0/u=1 → +Z (back), u=0.25 → -X (left),
+            // u=0.5 → -Z (forward), u=0.75 → +X (right).
+            let u = (f32(gid.x) + jx) / max(f32(params.width), 1.0);
+            let v = (f32(gid.y) + jy) / max(f32(params.height), 1.0);
+            let phi = (u - 0.5) * 6.28318530717958647692;   // (u - 0.5) * TAU
+            let theta = v * 3.14159265358979323846;          // v * PI
+            let sin_theta = sin(theta);
+            // `dir_view` is unit-length by construction
+            // (`sin²θ (sin²φ + cos²φ) + cos²θ = 1`); the basis
+            // multiplication below applies a `normalize(...)` to
+            // absorb any floating-point drift, so we don't normalize
+            // here.
+            dir_view = vec3<f32>(sin_theta * sin(phi),
+                                  cos(theta),
+                                  -sin_theta * cos(phi));
+        } else {
+            // Perspective: pinhole projection through the camera
+            // focal length / aspect ratio.
+            let nx = (f32(gid.x) + jx) / f32(params.width) * 2.0 - 1.0;
+            let ny = 1.0 - (f32(gid.y) + jy) / f32(params.height) * 2.0;
+            dir_view = normalize(vec3<f32>(nx * params.focal_half_h * params.aspect,
                                             ny * params.focal_half_h,
                                             -1.0));
+        }
         let dir_world = normalize(params.camera_right * dir_view.x
                                 + params.camera_up * dir_view.y
                                 - params.camera_forward * dir_view.z);
@@ -317,6 +416,19 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
             let hit = traverse(ray_o, ray_d, 1.0e8);
             if (hit.valid == 0u) {
                 radiance = radiance + throughput * params.sky_color * params.sky_strength;
+                // Cycles parity: a ray that escapes the scene also
+                // sees any analytic light whose support contains the
+                // ray direction. Gated to `bounce == 0u` — the GPU
+                // megakernel uses cosine-weighted diffuse bounces for
+                // every non-primary segment, which is the analog of
+                // the CPU kernel's `last_was_specular = false` after
+                // a non-specular sample. Direct NEE inside the loop
+                // already accounts for analytic lights on every hit,
+                // so adding the analytic miss contribution after a
+                // diffuse bounce would double-count.
+                if (bounce == 0u) {
+                    radiance = radiance + throughput * direct_visible_lights(ray_o, ray_d);
+                }
                 break;
             }
             let mat = material_for(hit.prim_id);
