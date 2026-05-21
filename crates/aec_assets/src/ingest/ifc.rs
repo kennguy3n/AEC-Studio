@@ -71,7 +71,13 @@ pub fn parse_bytes(
     // Track shells consumed by an enclosing IFCFACETEDBREP so we don't
     // double-tessellate them as standalone IFCCLOSEDSHELL entities below.
     let mut consumed_shells: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    for rec in records.values() {
+    // Iterate in deterministic (step_id) order so the output mesh has
+    // reproducible face ordering — important because the downstream
+    // BLAKE3 content hash must be stable across runs.
+    let mut sorted_ids: Vec<u32> = records.keys().copied().collect();
+    sorted_ids.sort_unstable();
+    for &id in &sorted_ids {
+        let rec = &records[&id];
         if rec.kind == "IFCFACETEDBREP" {
             if let Some(shell_id) = rec.args.first().and_then(|s| parse_entity_ref(s)) {
                 consumed_shells.insert(shell_id);
@@ -86,7 +92,8 @@ pub fn parse_bytes(
     }
     // Also pick up bare IFCCLOSEDSHELL entities (some exporters omit the
     // outer `IFCFACETEDBREP` wrapper when the model is a single shell).
-    for rec in records.values() {
+    for &id in &sorted_ids {
+        let rec = &records[&id];
         if rec.kind == "IFCCLOSEDSHELL" && !consumed_shells.contains(&rec.step_id) {
             if let Some(faces) = resolve_closed_shell(rec, &records) {
                 let brep = FacetedBrep { faces };

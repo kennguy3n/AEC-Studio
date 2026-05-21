@@ -69,17 +69,19 @@ impl AssetDatabase {
         Ok(Self { conn })
     }
 
-    /// Initialise the base schema, the FTS5 mirror, and (re)build the
-    /// FTS index from the current `assets` rows. Idempotent.
+    /// Initialise the base schema, the FTS5 mirror, and rebuild the FTS
+    /// index only if it's out of sync. Idempotent and O(1) on the common
+    /// path where triggers already keep the index current.
     fn init_schema(conn: &Connection) -> AssetResult<()> {
         conn.execute_batch(SCHEMA)?;
         // FTS5 is part of the bundled SQLite shipped via
         // `rusqlite/bundled-sqlcipher-vendored-openssl`. The triggers
-        // re-populate the FTS table for every future write; the
-        // `rebuild_index` call covers the pre-existing rows from a
-        // database that was upgraded from a pre-FTS schema.
+        // keep the FTS table in sync for every future write; the
+        // `rebuild_index_if_needed` call covers pre-existing rows from
+        // a database that was upgraded from a pre-FTS schema without
+        // paying O(n) on every open.
         conn.execute_batch(crate::search::FTS_SCHEMA)?;
-        crate::search::rebuild_index(conn)?;
+        crate::search::rebuild_index_if_needed(conn)?;
         Ok(())
     }
 

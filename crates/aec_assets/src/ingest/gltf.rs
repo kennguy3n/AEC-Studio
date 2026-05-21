@@ -118,6 +118,13 @@ fn bake_primitive(
         |i| i.into_u32().collect(),
     );
 
+    // Guard against singular world matrices (e.g. a zero-scale node in
+    // the glTF scene tree). `inverse()` on a singular matrix produces
+    // inf/NaN which propagates into positions and normals. Skip the
+    // primitive entirely in that (pathological) case.
+    if world.determinant().abs() < 1e-30 {
+        return Ok(());
+    }
     let normal_xform = world.inverse().transpose();
     let base = u32::try_from(out.positions.len())
         .map_err(|_| IngestError::Parse("vertex count exceeds u32".into()))?;

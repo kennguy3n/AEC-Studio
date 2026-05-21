@@ -416,15 +416,30 @@ mod tests {
         assert_eq!(stored.lods.len(), 3);
         // Level 0 is the base mesh.
         assert_eq!(stored.lods[0].triangle_count, base_tri);
-        // Each subsequent level should be no larger than the previous;
-        // we don't require strict decrease because decimation may stop
-        // early on heavily constrained meshes.
+        // Subsequent levels must be monotonically non-increasing.
         for w in stored.lods.windows(2) {
             assert!(
                 w[1].triangle_count <= w[0].triangle_count,
                 "LOD levels should be monotonically non-increasing"
             );
         }
+        // At least one downstream level must actually be smaller than
+        // the base — otherwise QEM produced no reduction and we silently
+        // fell back to `req.mesh.clone()` in `import_mesh`, which would
+        // mask a regression in `decimate()` (as happened with the
+        // `shared_count` double-counting bug). The dense bipyramid input
+        // has 14 manifold interior edges and zero boundary edges, so
+        // any working QEM impl must reduce at least one level.
+        assert!(
+            stored.lods.iter().any(|l| l.triangle_count < base_tri),
+            "no LOD level reduced: all levels still at base {base_tri} triangles \
+             — decimate() likely failed or fell back to the base mesh: lods = {:?}",
+            stored
+                .lods
+                .iter()
+                .map(|l| l.triangle_count)
+                .collect::<Vec<_>>(),
+        );
         // Thumbnail should be a rendered PBR thumbnail.
         assert_eq!(stored.thumbnail_kind, ThumbnailKind::Rendered);
         let png = db.get_blob(&stored.thumbnail_hash).unwrap().unwrap();

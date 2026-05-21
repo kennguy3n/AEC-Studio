@@ -42,7 +42,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS assets_fts USING fts5(
     tags,
     style_tags,
     materials,
-    tokenize = "unicode61 remove_diacritics 2"
+    tokenize = "porter unicode61 remove_diacritics 2"
 );
 
 CREATE TRIGGER IF NOT EXISTS assets_fts_ai AFTER INSERT ON assets BEGIN
@@ -152,10 +152,23 @@ pub fn search(conn: &rusqlite::Connection, opts: &SearchOptions) -> AssetResult<
     Ok(hits)
 }
 
-/// Re-index every existing asset into the FTS table. Called once at
-/// database open after the trigger schema is installed so callers that
-/// upgraded from a pre-FTS schema don't have to re-import their assets.
-pub(crate) fn rebuild_index(conn: &rusqlite::Connection) -> AssetResult<()> {
+/// Re-index existing assets into the FTS table, but ONLY when the index
+/// is out of sync (e.g. first open after a schema upgrade, or the FTS
+/// table was manually cleared). On subsequent opens where the triggers
+/// have been keeping things in sync, this is a no-op. This avoids an
+/// O(n) full-table scan on every `AssetDatabase::open`.
+pub(crate) fn rebuild_index_if_needed(conn: &rusqlite::Connection) -> AssetResult<()> {
+    let assets_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM assets", [], |r| r.get(0))
+        .unwrap_or(0);
+    let fts_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM assets_fts", [], |r| r.get(0))
+        .unwrap_or(0);
+    if assets_count == fts_count {
+        return Ok(());
+    }
+    // Mismatch → full rebuild (handles upgrades, manual deletes, and
+    // tokenizer changes that invalidate existing index data).
     conn.execute("DELETE FROM assets_fts", [])?;
     conn.execute(
         "INSERT INTO assets_fts (asset_id, name, vendor, tags, style_tags, materials)

@@ -217,10 +217,25 @@ impl PartialOrd for HeapEntry {
 impl Ord for HeapEntry {
     fn cmp(&self, other: &Self) -> Ordering {
         // Lower cost should sort GREATER so the max-heap pops it first.
-        other
-            .cost
-            .partial_cmp(&self.cost)
-            .unwrap_or(Ordering::Equal)
+        // NaN handling: we never construct NaN costs in practice
+        // (`Quadric::evaluate` is a sum of squares; `optimal_position`
+        // is gated by a finite determinant check), but to keep `Ord`
+        // strictly total even if a future code path introduces one,
+        // we sort NaN as the LEAST-preferred edge (Ordering::Less in
+        // the max-heap = pops last) by treating any NaN as "greater
+        // cost than any finite cost". Using `unwrap_or(Equal)` would
+        // make the ordering non-transitive (NaN == every finite cost
+        // but two finite costs ≠ each other), which violates BinaryHeap's
+        // invariant.
+        match (self.cost.is_nan(), other.cost.is_nan()) {
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            (false, false) => other
+                .cost
+                .partial_cmp(&self.cost)
+                .unwrap_or(Ordering::Equal),
+        }
     }
 }
 
@@ -453,12 +468,22 @@ impl DecimateState {
         {
             return false;
         }
-        // Collect incident triangles touching either endpoint.
+        // Collect incident triangles touching either endpoint. A
+        // triangle containing BOTH endpoints appears in both adjacency
+        // lists, so we must deduplicate the triangle indices before
+        // counting — otherwise every shared face is counted twice and
+        // manifold interior edges (truly shared_count == 2) end up
+        // measured as 4, tripping the >2 rejection below and refusing
+        // every non-boundary collapse.
+        let mut seen: HashSet<u32> = HashSet::new();
         let mut shared_count = 0_u32;
         for &ti in self.vertex_tris[v0 as usize]
             .iter()
             .chain(self.vertex_tris[v1 as usize].iter())
         {
+            if !seen.insert(ti) {
+                continue;
+            }
             let tri = self.triangles[ti as usize];
             if tri[0] == u32::MAX {
                 continue;
@@ -533,14 +558,17 @@ impl DecimateState {
         // quadric into v0; replace v1 indices in surviving triangles.
         let qsum = self.quadrics[v0 as usize].add(&self.quadrics[v1 as usize]);
         self.quadrics[v0 as usize] = qsum;
+
+        // Compute the barycentric alpha BEFORE overwriting v0's
+        // position. Otherwise `barycentric_alpha(v_new, p1, v_new)`
+        // always returns 0, freezing v0's original normal/uv on every
+        // collapse regardless of where `v_new` actually landed.
+        let p0_old = self.positions[v0 as usize];
+        let p1_old = self.positions[v1 as usize];
         self.positions[v0 as usize] = v_new;
 
         // Reseat normal/uv barycentrically along the edge for v0.
-        let alpha = barycentric_alpha(
-            self.positions[v0 as usize],
-            self.positions[v1 as usize],
-            v_new,
-        );
+        let alpha = barycentric_alpha(p0_old, p1_old, v_new);
         let new_normal = lerp3(self.normals[v0 as usize], self.normals[v1 as usize], alpha);
         let new_uv = lerp2(self.uvs[v0 as usize], self.uvs[v1 as usize], alpha);
         self.normals[v0 as usize] = normalize_or_keep(new_normal, self.normals[v0 as usize]);
@@ -897,6 +925,7 @@ mod tests {
     #[test]
     fn cube_decimates_to_target_face_count() {
         let mesh = cube();
+        let input_tri = mesh.indices.len() / 3;
         let out = decimate(
             &mesh,
             &DecimateOptions {
@@ -906,7 +935,21 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(out.triangle_count() <= 12);
+        // Must actually reduce — historically a `<= input` assertion
+        // here hid a `shared_count` double-counting bug that caused
+        // every interior edge collapse to be rejected.
+        assert!(
+            out.triangle_count() < input_tri,
+            "decimation produced no reduction: input {input_tri}, out {}",
+            out.triangle_count()
+        );
+        // Should hit the requested budget within a small tolerance —
+        // a closed cube has 6 quad-pairs that can each collapse cleanly.
+        assert!(
+            out.triangle_count() <= 8,
+            "decimation overshot target: requested 6, got {}",
+            out.triangle_count()
+        );
     }
 
     #[test]
