@@ -19,6 +19,7 @@
 pub mod blocks;
 pub mod command_line;
 pub mod dims;
+pub mod dwg;
 pub mod dwg_adapter;
 pub mod dxf;
 pub mod editing;
