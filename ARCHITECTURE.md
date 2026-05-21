@@ -375,9 +375,9 @@ crates/aec_bim/src/
 ├── ifc/reader.rs                # Native STEP parser: schema detection (IFC2x3 / IFC4 / IFC4x3), streaming iterator, UTF-8-safe, multi-line records & comments
 ├── ifc/writer.rs                # Native STEP writer: GUID preservation, deterministic numbering, verbatim Pset round-trip (incl. PropertyValue::Other)
 ├── tessellator.rs               # Geometry tessellator: IfcExtrudedAreaSolid, IfcFacetedBrep, profile types (rectangle/circle/arbitrary), IfcBooleanClippingResult
-├── classifier.py               # AI-assisted classification adapter
-├── property_editor.py          # Pset/Qto editing
-├── schedules.py                # Room / door / window / material schedules
+├── classification.rs            # AI-assisted classification adapter
+├── properties.rs                # Pset/Qto editing (incl. PropertyValue::Other for verbatim round-trip)
+├── schedules/                   # Room / door / window / material schedules (mod + per-schedule files)
 ├── validation.rs                # Strict validation against schema and project rules
 └── diff.rs                      # IFC diff at element + property level
 ```
@@ -598,8 +598,8 @@ User clicks "Render"
 | High | Path tracer | 256 | Bilateral / NLM | 1.0× | Client hero |
 | Studio | Path tracer | 1024 | Bilateral / NLM | 1.0× | Print-quality |
 | Realtime Preview | PBR rasterizer | n/a | — | 0.5–1.0× | Real-time-ish viewport |
-| Walkthrough | Path tracer | 64 / frame | Bilateral / NLM | 1.0× | Multi-frame |
-| Panorama | Path tracer (equirectangular) | 128 | Bilateral / NLM | 1.0× | 360° room shots |
+| Walkthrough | Path tracer | 96 / frame | Bilateral / NLM | 1.0× | Multi-frame |
+| Panorama | Path tracer (equirectangular) | 512 | Bilateral / NLM | 1.0× | 360° room shots |
 
 ---
 

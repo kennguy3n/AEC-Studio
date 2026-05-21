@@ -44,6 +44,64 @@ pub struct Mesh {
     pub indices: Vec<[u32; 3]>,
 }
 
+/// Failure modes the tessellator can report to callers.
+///
+/// The tessellator never silently produces a partial mesh for a
+/// caller that expects a closed solid: any of these variants means
+/// the input is malformed (self-intersecting profile, degenerate
+/// face, ear-clipping bail-out, etc.) and downstream BIM code
+/// should either skip the element or surface a Render Doctor
+/// warning instead of emitting geometry with missing triangles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TessellatorError {
+    /// Ear clipping bailed out before consuming the input polygon
+    /// — typically because the polygon is self-intersecting or has
+    /// duplicate vertices. Carries the number of vertices that
+    /// remained un-consumed at bail-out, so the caller can decide
+    /// whether the partial result is usable.
+    PartialTriangulation {
+        /// Number of triangles successfully emitted before bail-out.
+        triangles_emitted: usize,
+        /// Number of polygon vertices still in the active ring when
+        /// the algorithm gave up.
+        vertices_remaining: usize,
+    },
+    /// A `BrepFace` had a loop with fewer than 3 vertices, which
+    /// cannot form a planar polygon. Includes the face index for
+    /// debugging large breps.
+    DegenerateFace {
+        face_index: usize,
+        vertex_count: usize,
+    },
+}
+
+impl std::fmt::Display for TessellatorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PartialTriangulation {
+                triangles_emitted,
+                vertices_remaining,
+            } => write!(
+                f,
+                "ear clipping bailed out: {triangles_emitted} triangles emitted, \
+                 {vertices_remaining} vertices remaining (input likely self-intersecting)"
+            ),
+            Self::DegenerateFace {
+                face_index,
+                vertex_count,
+            } => write!(
+                f,
+                "BrepFace #{face_index} has {vertex_count} vertices; need at least 3"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TessellatorError {}
+
+/// Result alias for tessellation operations.
+pub type TessellatorResult<T> = Result<T, TessellatorError>;
+
 impl Mesh {
     /// Total surface area of the mesh (sum of triangle areas).
     pub fn surface_area(&self) -> f64 {
@@ -84,6 +142,58 @@ impl Mesh {
     fn push_tri(&mut self, a: u32, b: u32, c: u32) {
         self.indices.push([a, b, c]);
     }
+
+    /// Produce a "welded" copy of this mesh in which positions that
+    /// coincide within `epsilon` (mm) collapse to a single vertex.
+    ///
+    /// This is the right post-process for **non-rendering**
+    /// consumers — quantity take-off, watertightness checks,
+    /// volume reductions — where vertex count matters but
+    /// shading does not. The rendering pipeline must NOT weld a
+    /// `FacetedBrep` mesh because adjacent faces typically need
+    /// split normals at sharp architectural edges; welding would
+    /// smooth-shade across those seams and round off corners.
+    ///
+    /// `epsilon` is the L∞ (Chebyshev) tolerance per axis. A
+    /// typical IFC tolerance is 0.1–1.0 mm.
+    pub fn welded(&self, epsilon: f64) -> Mesh {
+        if self.positions.is_empty() {
+            return self.clone();
+        }
+        // Bucket positions into an `epsilon`-sized grid; identical
+        // grid cells map to the same canonical vertex. This is
+        // O(n) instead of the naive O(n²) all-pairs comparison.
+        use std::collections::HashMap;
+        let inv_eps = if epsilon > 0.0 { 1.0 / epsilon } else { 1.0e9 };
+        let key = |p: [f64; 3]| -> (i64, i64, i64) {
+            (
+                (p[0] * inv_eps).round() as i64,
+                (p[1] * inv_eps).round() as i64,
+                (p[2] * inv_eps).round() as i64,
+            )
+        };
+        let mut bucket: HashMap<(i64, i64, i64), u32> = HashMap::new();
+        let mut new_positions: Vec<[f64; 3]> = Vec::new();
+        let mut remap = vec![0u32; self.positions.len()];
+        for (old_i, &p) in self.positions.iter().enumerate() {
+            let k = key(p);
+            let new_i = *bucket.entry(k).or_insert_with(|| {
+                let i = new_positions.len() as u32;
+                new_positions.push(p);
+                i
+            });
+            remap[old_i] = new_i;
+        }
+        let new_indices = self
+            .indices
+            .iter()
+            .map(|&[a, b, c]| [remap[a as usize], remap[b as usize], remap[c as usize]])
+            .collect();
+        Mesh {
+            positions: new_positions,
+            indices: new_indices,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -92,7 +202,7 @@ impl Mesh {
 
 /// A closed 2D polyline in the XY-plane. The polygon is CCW; the
 /// last vertex must NOT repeat the first.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Profile {
     pub points: Vec<[f64; 2]>,
 }
@@ -187,14 +297,27 @@ impl ArbitraryClosedProfile {
 /// polygons including non-convex ones — necessary for IFC
 /// arbitrary closed profiles. For a convex polygon ear clipping
 /// degenerates to a fan, so we don't special-case convex inputs.
+///
+/// **Error semantics**: returns
+/// [`TessellatorError::PartialTriangulation`] if the ear-search
+/// runs out of candidates before consuming the input polygon —
+/// this means the input was self-intersecting, had duplicate
+/// vertices, or otherwise violated the "simple polygon"
+/// precondition. Callers receive the partially-built triangle
+/// list inside the error so they can choose to surface a warning
+/// to the user (Render Doctor) or fall back to a draft
+/// representation, but the default expectation is that the caller
+/// propagates the error rather than emitting geometry with
+/// missing triangles — returning `Ok(tris)` always means the
+/// triangulation is complete (`tris.len() == points.len() - 2`).
 #[allow(clippy::many_single_char_names)]
-fn triangulate_polygon_2d(points: &[[f64; 2]]) -> Vec<[u32; 3]> {
+fn triangulate_polygon_2d(points: &[[f64; 2]]) -> TessellatorResult<Vec<[u32; 3]>> {
     let n_total = points.len();
     if n_total < 3 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     if n_total == 3 {
-        return vec![[0, 1, 2]];
+        return Ok(vec![[0, 1, 2]]);
     }
     let mut idx: Vec<usize> = (0..n_total).collect();
     let mut out = Vec::with_capacity(n_total - 2);
@@ -203,10 +326,15 @@ fn triangulate_polygon_2d(points: &[[f64; 2]]) -> Vec<[u32; 3]> {
         guard += 1;
         // Safety net for degenerate / self-intersecting input: at
         // most n³ ear-search iterations should suffice; if we go
-        // past that, bail out with a partial triangulation rather
-        // than spinning forever.
+        // past that, surface the partial result through
+        // `TessellatorError::PartialTriangulation` so the caller
+        // can detect the bail-out instead of silently emitting a
+        // mesh with missing triangles.
         if guard > n_total * n_total * n_total {
-            break;
+            return Err(TessellatorError::PartialTriangulation {
+                triangles_emitted: out.len(),
+                vertices_remaining: idx.len(),
+            });
         }
         let active = idx.len();
         let mut found = false;
@@ -250,14 +378,18 @@ fn triangulate_polygon_2d(points: &[[f64; 2]]) -> Vec<[u32; 3]> {
             }
         }
         if !found {
-            // No ear found — input is malformed. Emit what we have.
-            break;
+            // No ear found — input is malformed. Surface the partial
+            // triangulation so the caller can decide what to do.
+            return Err(TessellatorError::PartialTriangulation {
+                triangles_emitted: out.len(),
+                vertices_remaining: idx.len(),
+            });
         }
     }
     if idx.len() == 3 {
         out.push([idx[0] as u32, idx[1] as u32, idx[2] as u32]);
     }
-    out
+    Ok(out)
 }
 
 fn point_in_triangle(p: [f64; 2], a: [f64; 2], b: [f64; 2], c: [f64; 2]) -> bool {
@@ -296,11 +428,17 @@ impl ExtrudedAreaSolid {
     ///   * a top cap (the profile triangulated, vertices offset
     ///     by `direction * depth`)
     ///   * a side wall ribbon (two triangles per profile edge)
-    pub fn tessellate(&self) -> Mesh {
+    ///
+    /// Returns [`TessellatorError::PartialTriangulation`] if the
+    /// profile is self-intersecting or otherwise causes ear
+    /// clipping to bail out before consuming every vertex — in
+    /// that case the caller should skip the solid rather than
+    /// emit a mesh with missing cap triangles.
+    pub fn tessellate(&self) -> TessellatorResult<Mesh> {
         let mut mesh = Mesh::default();
         let n = self.profile.points.len();
         if n < 3 {
-            return mesh;
+            return Ok(mesh);
         }
 
         // Normalise the extrusion direction.
@@ -326,8 +464,10 @@ impl ExtrudedAreaSolid {
                 .push([p[0] + dz[0], p[1] + dz[1], 0.0 + dz[2]]);
         }
 
-        // Caps.
-        let tris = triangulate_polygon_2d(&self.profile.points);
+        // Caps. If the profile triangulator fails, propagate the
+        // error so the caller knows the resulting solid would be
+        // open at top + bottom.
+        let tris = triangulate_polygon_2d(&self.profile.points)?;
         for [a, b, c] in &tris {
             // Bottom: invert winding so the normal points -dir.
             mesh.push_tri(*c, *b, *a);
@@ -347,7 +487,7 @@ impl ExtrudedAreaSolid {
             mesh.push_tri(bi, bj, tj);
             mesh.push_tri(bi, tj, ti);
         }
-        mesh
+        Ok(mesh)
     }
 }
 
@@ -371,11 +511,32 @@ pub struct FacetedBrep {
 }
 
 impl FacetedBrep {
-    pub fn tessellate(&self) -> Mesh {
+    /// Tessellate every face independently and concatenate the
+    /// results into a single triangle mesh.
+    ///
+    /// **Note on vertex sharing**: adjacent faces that meet at an
+    /// edge intentionally produce *duplicate* vertices in the
+    /// output. This is the correct representation for architectural
+    /// geometry because sharp edges (a wall meeting a slab, a door
+    /// frame meeting a wall) need split normals — welding the
+    /// vertices would smooth-shade across the seam and visually
+    /// round off corners that should appear crisp. A separate
+    /// `welded()` post-process is exposed for callers (e.g. quantity
+    /// take-off) that want unique vertex counts without changing
+    /// the rendering geometry.
+    ///
+    /// Returns [`TessellatorError::DegenerateFace`] for any
+    /// `BrepFace` with fewer than 3 vertices, or
+    /// [`TessellatorError::PartialTriangulation`] if any face's
+    /// ear-clip pass bails out.
+    pub fn tessellate(&self) -> TessellatorResult<Mesh> {
         let mut mesh = Mesh::default();
-        for face in &self.faces {
+        for (face_index, face) in self.faces.iter().enumerate() {
             if face.loop_.len() < 3 {
-                continue;
+                return Err(TessellatorError::DegenerateFace {
+                    face_index,
+                    vertex_count: face.loop_.len(),
+                });
             }
             let base = mesh.positions.len() as u32;
             // Compute the face normal from the first non-degenerate
@@ -416,14 +577,14 @@ impl FacetedBrep {
             for p in &local_3d {
                 mesh.positions.push(*p);
             }
-            for tri in triangulate_polygon_2d(&pts2d) {
+            for tri in triangulate_polygon_2d(&pts2d)? {
                 mesh.push_tri(base + tri[0], base + tri[1], base + tri[2]);
             }
             // Discard the unused face normal; kept for future
             // smooth-shading work.
             let _ = n;
         }
-        mesh
+        Ok(mesh)
     }
 }
 
@@ -652,7 +813,7 @@ mod tests {
         }
         .evaluate();
         assert!((l.signed_area() - 3.0).abs() < 1e-12);
-        let tris = triangulate_polygon_2d(&l.points);
+        let tris = triangulate_polygon_2d(&l.points).expect("L profile triangulates");
         assert_eq!(tris.len(), 4, "n-2 = 4 triangles for hexagonal L");
         // Sum of triangle areas equals polygon area.
         let mut sum = 0.0;
@@ -690,7 +851,7 @@ mod tests {
         }
         let prof = ArbitraryClosedProfile { points: pts }.evaluate();
         let polygon_area = prof.signed_area();
-        let tris = triangulate_polygon_2d(&prof.points);
+        let tris = triangulate_polygon_2d(&prof.points).expect("concave star triangulates");
         // Must produce exactly n-2 triangles (no partial output).
         assert_eq!(
             tris.len(),
@@ -730,7 +891,7 @@ mod tests {
             direction: [0.0, 0.0, 1.0],
             depth: 3000.0,
         };
-        let mesh = solid.tessellate();
+        let mesh = solid.tessellate().expect("rectangle extrudes");
         let v = mesh.signed_volume();
         assert!(
             (v - 60_000_000.0).abs() < 1e-6,
@@ -760,7 +921,7 @@ mod tests {
             direction: [0.0, 0.0, 4.0], // non-unit; gets normalised
             depth: 1000.0,
         };
-        let mesh = solid.tessellate();
+        let mesh = solid.tessellate().expect("oblique extrusion succeeds");
         // V = 100 * 100 * 1000 = 10_000_000.
         assert!((mesh.signed_volume() - 10_000_000.0).abs() < 1e-6);
     }
@@ -800,7 +961,9 @@ mod tests {
                 loop_: vec![v[3], v[0], v[4], v[7]], // -X side
             },
         ];
-        let mesh = FacetedBrep { faces }.tessellate();
+        let mesh = FacetedBrep { faces }
+            .tessellate()
+            .expect("unit cube brep tessellates");
         // The cube has 6 quad faces → 12 triangles.
         assert_eq!(mesh.indices.len(), 12);
         assert!(
@@ -853,7 +1016,8 @@ mod tests {
                 },
             ],
         }
-        .tessellate();
+        .tessellate()
+        .expect("cube brep tessellates");
         let clip = HalfSpace {
             point: [0.0, 0.0, 0.0], // plane z = 0
             normal: [0.0, 0.0, 1.0],
@@ -895,7 +1059,8 @@ mod tests {
                 loop_: vec![v[0], v[1], v[2], v[3]],
             }],
         }
-        .tessellate();
+        .tessellate()
+        .expect("single-face brep tessellates");
         let clip = HalfSpace {
             point: [0.0, 0.0, 10.0], // plane z = 10
             // Inside half-space is z >= 10 (normal points -Z;
@@ -908,5 +1073,126 @@ mod tests {
         }
         .tessellate();
         assert!(out.indices.is_empty());
+    }
+
+    /// A degenerate polygon where every triangle is collinear
+    /// (zero cross product) must surface
+    /// `TessellatorError::PartialTriangulation` rather than
+    /// silently emitting a partial cap. The old `-> Vec<...>`
+    /// signature gave callers no way to distinguish a complete
+    /// triangulation from a bail-out; this test pins the new
+    /// `Result` contract.
+    #[test]
+    fn degenerate_collinear_polygon_reports_partial_triangulation() {
+        // Four collinear points along y=0. Every candidate "ear"
+        // has cross == 0 (degenerate), so the ear-search loop
+        // exhausts its options without removing any vertex and
+        // returns Err(PartialTriangulation).
+        let pts = vec![[0.0, 0.0], [1.0, 0.0], [2.0, 0.0], [3.0, 0.0]];
+        let err = triangulate_polygon_2d(&pts).expect_err("collinear must bail");
+        match err {
+            TessellatorError::PartialTriangulation {
+                triangles_emitted,
+                vertices_remaining,
+            } => {
+                assert_eq!(triangles_emitted, 0);
+                assert_eq!(vertices_remaining, 4);
+            }
+            other => panic!("unexpected tessellator error variant: {other}"),
+        }
+    }
+
+    /// Confirm that `ExtrudedAreaSolid::tessellate` propagates the
+    /// `PartialTriangulation` error from its profile rather than
+    /// silently producing an extrusion with missing caps.
+    #[test]
+    fn extruded_solid_propagates_triangulation_error() {
+        let bad = ExtrudedAreaSolid {
+            profile: Profile {
+                points: vec![[0.0, 0.0], [1.0, 0.0], [2.0, 0.0], [3.0, 0.0]],
+            },
+            direction: [0.0, 0.0, 1.0],
+            depth: 10.0,
+        };
+        let err = bad.tessellate().expect_err("bad profile must error");
+        assert!(matches!(err, TessellatorError::PartialTriangulation { .. }));
+    }
+
+    /// `BrepFace` with fewer than three vertices must surface
+    /// `TessellatorError::DegenerateFace`, not silently skip the
+    /// face. Skipping would let a malformed IFC pass validation
+    /// and produce a hole in the rendered solid.
+    #[test]
+    fn brep_with_degenerate_face_reports_error() {
+        let v = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]];
+        let brep = FacetedBrep {
+            faces: vec![BrepFace {
+                loop_: vec![v[0], v[1]], // only 2 vertices
+            }],
+        };
+        let err = brep.tessellate().expect_err("must report degenerate face");
+        assert!(matches!(
+            err,
+            TessellatorError::DegenerateFace {
+                face_index: 0,
+                vertex_count: 2,
+            }
+        ));
+    }
+
+    /// `Mesh::welded` must collapse coincident vertices into a
+    /// single canonical index while preserving the triangle list's
+    /// topology. Quantity take-off relies on this — a unit cube
+    /// emitted as six independent faces has 24 vertices, but the
+    /// welded form must have exactly 8.
+    #[test]
+    fn welded_mesh_dedupes_coincident_brep_vertices() {
+        let v = [
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0],
+            [0.0, 1.0, 1.0],
+        ];
+        let brep = FacetedBrep {
+            faces: vec![
+                BrepFace {
+                    loop_: vec![v[0], v[3], v[2], v[1]],
+                },
+                BrepFace {
+                    loop_: vec![v[4], v[5], v[6], v[7]],
+                },
+                BrepFace {
+                    loop_: vec![v[0], v[1], v[5], v[4]],
+                },
+                BrepFace {
+                    loop_: vec![v[1], v[2], v[6], v[5]],
+                },
+                BrepFace {
+                    loop_: vec![v[2], v[3], v[7], v[6]],
+                },
+                BrepFace {
+                    loop_: vec![v[3], v[0], v[4], v[7]],
+                },
+            ],
+        };
+        let mesh = brep.tessellate().expect("cube tessellates");
+        // 6 faces × 4 vertices = 24 duplicated positions.
+        assert_eq!(mesh.positions.len(), 24);
+        let welded = mesh.welded(1e-9);
+        // Cube has 8 unique vertices.
+        assert_eq!(welded.positions.len(), 8);
+        // Triangle count is preserved.
+        assert_eq!(welded.indices.len(), mesh.indices.len());
+        // Volume is preserved under welding (topology unchanged).
+        assert!(
+            (welded.signed_volume().abs() - mesh.signed_volume().abs()).abs() < 1e-9,
+            "welding changed volume: before={}, after={}",
+            mesh.signed_volume(),
+            welded.signed_volume()
+        );
     }
 }

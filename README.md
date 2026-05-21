@@ -51,11 +51,11 @@ Desktop only. Supports **CPU-only** and **CPU+GPU** configurations.
 
 | Target | Acceleration |
 |---|---|
-| Apple Silicon (macOS) | **MLX** for inference, Metal for viewport and Cycles GPU |
+| Apple Silicon (macOS) | **MLX** for inference, Metal for viewport and the native wgpu path tracer |
 | Windows CPU | **llama.cpp** (PrismML fork) with **AVX2 / AVX-VNNI / AVX-512 VNNI** |
-| Windows GPU | **Vulkan / CUDA** for inference and Cycles GPU |
+| Windows GPU | **Vulkan / CUDA** for inference, DX12 / Vulkan for the native wgpu path tracer |
 | Linux CPU | **llama.cpp** (PrismML fork) with **AVX2 / AVX-VNNI / AVX-512 VNNI** |
-| Linux GPU | **Vulkan** for inference and Cycles GPU (CUDA optional on NVIDIA) |
+| Linux GPU | **Vulkan** for inference and the native wgpu path tracer (CUDA optional on NVIDIA for inference only) |
 | Viewport / CAD canvas (all platforms) | **wgpu** with Vulkan, Metal, D3D12, or OpenGL backend |
 
 ---

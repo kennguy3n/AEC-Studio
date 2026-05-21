@@ -499,7 +499,8 @@ impl IfcReader {
     }
 
     /// Convenience wrapper around [`IfcReader::from_string`] that
-    /// accepts any `BufRead`.
+    /// accepts any [`Read`] (no `BufRead` requirement — the input is
+    /// slurped into a `String` in one call).
     ///
     /// **Memory profile**: this method is API-streaming but NOT
     /// memory-streaming — it buffers the entire input into a
@@ -630,16 +631,41 @@ fn parse_step_groups(text: &str) -> IfcReadResult<Vec<StepRecord>> {
 /// AEC Studio accepts IFC2x3, IFC4, and IFC4x3. Any other token is
 /// rejected as `MissingSection("FILE_SCHEMA")` so we fail loudly
 /// rather than silently re-interpret an unsupported schema as IFC4.
+///
+/// The search is intentionally **bounded to the HEADER section**
+/// (`HEADER;` ... `ENDSEC;` before `DATA;`) so we never mistake a
+/// `FILE_SCHEMA(('IFC2X3'))` token that happens to appear inside a
+/// DATA-section string literal (e.g. a `Description` attribute on
+/// an entity, or a comment-like `/*…*/` block) for the file's
+/// declared schema. ISO 10303-21 §6.4 mandates that `FILE_SCHEMA`
+/// is a HEADER entity, so anything matching outside HEADER must be
+/// payload, not metadata.
 fn detect_schema(text: &str) -> IfcReadResult<IfcSchema> {
     // The STEP grammar allows whitespace inside the parens; the
     // canonical AEC-emitted form is `FILE_SCHEMA(('IFC4'));` but
     // external authoring tools may emit `FILE_SCHEMA ( ( 'IFC4' ) ) ;`.
     let upper = text.to_ascii_uppercase();
+    // Bound the search to the HEADER section. STEP files start with
+    // `ISO-10303-21;` then `HEADER;` ... `ENDSEC;` then `DATA;`.
+    // We locate `HEADER` and the *first* `ENDSEC` after it; that
+    // pair delimits the metadata block. If the file lacks either
+    // marker we reject as `MissingSection` rather than fall back to
+    // a permissive whole-text scan (which would let a DATA-section
+    // string smuggle in a fake schema declaration).
+    let header_start = upper
+        .find("HEADER")
+        .ok_or(IfcReadError::MissingSection("HEADER"))?;
+    let header_end_rel = upper[header_start..]
+        .find("ENDSEC")
+        .ok_or(IfcReadError::MissingSection("HEADER"))?;
+    let header_end = header_start + header_end_rel;
+    let header = &text[header_start..header_end];
+    let header_upper = &upper[header_start..header_end];
     let needle = "FILE_SCHEMA";
-    let start = upper
+    let start = header_upper
         .find(needle)
         .ok_or(IfcReadError::MissingSection("FILE_SCHEMA"))?;
-    let tail = &text[start + needle.len()..];
+    let tail = &header[start + needle.len()..];
     // Locate the first single-quoted literal after `FILE_SCHEMA(...)`.
     let q1 = tail
         .find('\'')
@@ -837,6 +863,22 @@ impl<R: BufRead> Iterator for StepIter<R> {
                 Ok(None) => {
                     // Need more input.
                     if self.eof {
+                        // The reader is drained. Match the eager
+                        // `from_string` path's truncation-detection
+                        // contract: if the trailing buffer contains an
+                        // unterminated string literal or unbalanced
+                        // parens, surface a `Malformed` error rather
+                        // than silently dropping the partial record.
+                        // `from_string` runs the same check at end of
+                        // input (see `iter_logical_records`); without
+                        // it, a STEP file truncated mid-string would
+                        // produce identical bytes through both APIs but
+                        // only one would flag the corruption.
+                        if let Err(e) = validate_trailing_buffer(&self.buf) {
+                            self.fault = true;
+                            self.buf.clear();
+                            return Some(Err(e));
+                        }
                         return None;
                     }
                     let mut line = String::new();
@@ -856,6 +898,75 @@ impl<R: BufRead> Iterator for StepIter<R> {
             }
         }
     }
+}
+
+/// Validate the trailing (post-final-`;`) bytes of a STEP buffer at
+/// end-of-stream. Used by [`StepIter`] to reject truncated files —
+/// without this check a STEP file that was cut off mid-string or
+/// mid-record would silently terminate the iterator instead of
+/// flagging the corruption.
+///
+/// Returns `Err(Malformed)` for:
+///   * unterminated string literal (`'…` without closing `'`)
+///   * unbalanced parens (more `(` than `)` outside strings)
+///   * unbalanced parens (more `)` than `(` outside strings)
+///
+/// Returns `Ok(())` for buffers that contain only whitespace,
+/// comments, and balanced tokens that don't constitute a full
+/// `... ;` record (those are tolerated — the file may legitimately
+/// end with trailing whitespace after the final `ENDSEC;`).
+fn validate_trailing_buffer(text: &str) -> IfcReadResult<()> {
+    let mut depth: i32 = 0;
+    let mut in_str = false;
+    let mut in_comment = false;
+    let mut chars = text.char_indices().peekable();
+    while let Some((off, c)) = chars.next() {
+        if !in_str && !in_comment && c == '/' {
+            if let Some(&(_, '*')) = chars.peek() {
+                in_comment = true;
+                chars.next();
+                continue;
+            }
+        }
+        if in_comment {
+            if c == '*' {
+                if let Some(&(_, '/')) = chars.peek() {
+                    in_comment = false;
+                    chars.next();
+                }
+            }
+            continue;
+        }
+        match c {
+            '\\' if in_str => {
+                // Consume the escape pair so a `\'` doesn't toggle
+                // `in_str` and a `\\` doesn't leave a dangling escape.
+                chars.next();
+            }
+            '\'' => in_str = !in_str,
+            '(' if !in_str => depth += 1,
+            ')' if !in_str => {
+                depth -= 1;
+                if depth < 0 {
+                    return Err(IfcReadError::Malformed(format!(
+                        "STEP stream has ')' without matching '(' near offset {off}"
+                    )));
+                }
+            }
+            _ => {}
+        }
+    }
+    if in_str {
+        return Err(IfcReadError::Malformed(
+            "unterminated string literal at end of STEP stream".into(),
+        ));
+    }
+    if depth != 0 {
+        return Err(IfcReadError::Malformed(format!(
+            "STEP stream ends with unbalanced parens (depth={depth})"
+        )));
+    }
+    Ok(())
 }
 
 /// Find the first complete logical STEP record in `text`. Returns
@@ -2348,6 +2459,113 @@ END-ISO-10303-21;\n";
         assert_eq!(snap_a.stats, snap_b.stats);
         assert_eq!(snap_a.schema, snap_b.schema);
         assert_eq!(snap_a.guid_by_entity.len(), snap_b.guid_by_entity.len());
+    }
+
+    /// `StepIter` must NOT silently truncate when the underlying
+    /// reader reaches EOF mid-string. The eager `from_string` path
+    /// flags the same input as `Malformed`; the streaming iterator
+    /// must do the same so a corrupted IFC file fails identically
+    /// through either API. This pins the EOF-validation contract.
+    #[test]
+    fn step_iter_rejects_unterminated_string_at_eof() {
+        let truncated = "#1=IFCPROPERTYSINGLEVALUE('NeverCloses,";
+        let cursor = std::io::Cursor::new(truncated.as_bytes());
+        let mut iter = StepIter::new(std::io::BufReader::new(cursor));
+        // No complete `... ;` record, so the first poll just returns
+        // None? — except we're now requiring the iterator to surface
+        // the malformed trailing bytes as an explicit error before
+        // returning None.
+        let mut saw_error = false;
+        for item in iter.by_ref() {
+            if let Err(IfcReadError::Malformed(msg)) = item {
+                saw_error = true;
+                assert!(
+                    msg.contains("unterminated string"),
+                    "expected unterminated-string diagnostic, got: {msg}"
+                );
+                break;
+            }
+        }
+        assert!(
+            saw_error,
+            "StepIter must report unterminated-string at EOF, not silently stop"
+        );
+        // Once faulted, the iterator must stay faulted.
+        assert!(iter.next().is_none());
+    }
+
+    /// Same EOF contract for unbalanced parens.
+    #[test]
+    fn step_iter_rejects_unbalanced_parens_at_eof() {
+        let truncated = "#1=IFCFOO(1,(2,3";
+        let cursor = std::io::Cursor::new(truncated.as_bytes());
+        let mut iter = StepIter::new(std::io::BufReader::new(cursor));
+        let mut saw_error = false;
+        for item in iter.by_ref() {
+            if let Err(IfcReadError::Malformed(msg)) = item {
+                saw_error = true;
+                assert!(
+                    msg.contains("unbalanced parens"),
+                    "expected unbalanced-parens diagnostic, got: {msg}"
+                );
+                break;
+            }
+        }
+        assert!(saw_error, "StepIter must report unbalanced-parens at EOF");
+    }
+
+    /// Whitespace-only trailing bytes after the last `... ;` are
+    /// allowed — the iterator must NOT report an error.
+    #[test]
+    fn step_iter_tolerates_trailing_whitespace() {
+        let valid = "#1=IFCAPPLICATION('a','b','c','d');   \n\n";
+        let cursor = std::io::Cursor::new(valid.as_bytes());
+        let iter = StepIter::new(std::io::BufReader::new(cursor));
+        let results: Vec<_> = iter.collect();
+        assert_eq!(results.len(), 1, "expected one record, got {results:?}");
+        assert!(results[0].is_ok());
+    }
+
+    /// `detect_schema` must NOT mistake a `FILE_SCHEMA(('IFC2X3'))`
+    /// token appearing inside a DATA-section string literal for the
+    /// file's declared schema. The HEADER-bounded search defends
+    /// against an adversarial / corrupted file where the DATA
+    /// section embeds a fake schema marker.
+    #[test]
+    fn detect_schema_ignores_file_schema_inside_data_section() {
+        // HEADER says IFC4; DATA section has an entity whose
+        // Description happens to contain the substring
+        // "FILE_SCHEMA(('IFC2X3'))" inside a string literal.
+        let text = "ISO-10303-21;\n\
+            HEADER;\n\
+            FILE_DESCRIPTION(('a'),'2;1');\n\
+            FILE_NAME('','',(''),(''),'','','');\n\
+            FILE_SCHEMA(('IFC4'));\n\
+            ENDSEC;\n\
+            DATA;\n\
+            #1=IFCAPPLICATION('Trojan with FILE_SCHEMA((\\'IFC2X3\\'))','v1','app','id');\n\
+            ENDSEC;\n\
+            END-ISO-10303-21;";
+        let schema = detect_schema(text).expect("schema detect");
+        assert_eq!(schema, IfcSchema::Ifc4);
+    }
+
+    /// Conversely, a HEADER section that legitimately declares
+    /// IFC2X3 must still be detected, even when the file mentions
+    /// other tokens elsewhere.
+    #[test]
+    fn detect_schema_finds_ifc2x3_in_header() {
+        let text = "ISO-10303-21;\n\
+            HEADER;\n\
+            FILE_DESCRIPTION(('a'),'2;1');\n\
+            FILE_NAME('','',(''),(''),'','','');\n\
+            FILE_SCHEMA(('IFC2X3'));\n\
+            ENDSEC;\n\
+            DATA;\n\
+            ENDSEC;\n\
+            END-ISO-10303-21;";
+        let schema = detect_schema(text).expect("schema detect");
+        assert_eq!(schema, IfcSchema::Ifc2x3);
     }
 }
 
