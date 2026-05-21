@@ -476,13 +476,19 @@ pub(crate) fn is_spatial_ifc_class(class: &IfcClass) -> bool {
 ///   * `\r` (U+000D) is escaped as `\r` (backslash + ASCII 'r')
 ///   * `\t` (U+0009) is escaped as `\t` (backslash + ASCII 't')
 ///
-/// The newline / carriage-return / tab escapes are critical for
-/// correctness: the reader tokenises the STEP byte stream with
-/// [`str::lines`] under the assumption that one `#N = TYPE(...);`
-/// record fits on a single line. A literal newline in a user-supplied
-/// name (e.g. a multi-line space description copy-pasted by an
-/// operator) would otherwise split the record across two lines and
-/// surface as an opaque `IfcReadError::Malformed` on re-import.
+/// The newline / carriage-return / tab escapes are an
+/// interop-friendly invariant: the writer emits exactly one
+/// `#N = TYPE(...);` record per physical line so the output is
+/// readable by tools that line-tokenise STEP (older IfcOpenShell
+/// versions, naive grep / awk pipelines, and our own pre-Phase-9
+/// reader which did the same). The current reader is the
+/// character-level `iter_logical_records` state machine in
+/// `super::reader`, which respects multi-line records, comments,
+/// and embedded `;` in strings — so on the AEC Studio side a
+/// literal newline inside a quoted string would in fact round-trip
+/// — but other STEP tools would split such a record, so we keep
+/// the escape on the write side to maintain one-record-per-line
+/// for downstream consumers.
 ///
 /// Order matters: backslashes must be doubled BEFORE the other
 /// substitutions, otherwise the `\` introduced for an escaped quote

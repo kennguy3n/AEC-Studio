@@ -1098,7 +1098,9 @@ mod tests {
                 assert_eq!(triangles_emitted, 0);
                 assert_eq!(vertices_remaining, 4);
             }
-            other => panic!("unexpected tessellator error variant: {other}"),
+            other @ TessellatorError::DegenerateFace { .. } => {
+                panic!("unexpected tessellator error variant: {other}")
+            }
         }
     }
 

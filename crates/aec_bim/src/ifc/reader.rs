@@ -203,8 +203,25 @@ impl IfcReader {
                     let value = parse_typed_measure(&measure)?;
                     prop_values.insert(g.step_id, PropRow { key, value });
                 }
-                "IFCQUANTITYLENGTH" | "IFCQUANTITYAREA" | "IFCQUANTITYVOLUME"
-                | "IFCQUANTITYCOUNT" | "IFCQUANTITYWEIGHT" => {
+                // Any `IFCQUANTITY*` entity is dispatched here. The
+                // five canonical quantity kinds (length/area/volume/
+                // count/weight) map to typed `PropertyValue` variants;
+                // IFC4x3 added `IFCQUANTITYTIME` and any future
+                // schema-level quantity kinds fall through the
+                // catch-all arm of `parse_quantity_typed` to a
+                // `PropertyValue::Other { measure, raw }` so the value
+                // survives a read→write round-trip verbatim — i.e. the
+                // writer's `serialize_quantity_value::Other` arm emits
+                // exactly the same STEP literal we ingested here.
+                //
+                // We intentionally do NOT enumerate the known kinds in
+                // the dispatch arm: that would silently drop any
+                // future or vendor-extension `IFCQUANTITY*` to the
+                // element fallback below (which then skips the entity
+                // entirely because it lacks the `tag::eid` Name field).
+                // A prefix match keeps the round-trip closed for the
+                // full open-ended family.
+                kind if kind.starts_with("IFCQUANTITY") => {
                     let key = g.string_arg(0)?;
                     let lit = g
                         .args
@@ -2240,6 +2257,101 @@ END-ISO-10303-21;\n";
             snap1.properties.get(&wall),
             snap2.properties.get(&wall),
             "two reader passes converge on the same PropertyValue tree"
+        );
+    }
+
+    /// Unmodeled `IFCQUANTITY*` types (e.g. IFC4x3's
+    /// `IFCQUANTITYTIME`) must round-trip through the read→write→
+    /// read cycle via `PropertyValue::Other`, exactly like
+    /// unmodeled property measures do above. The reader's quantity
+    /// dispatch matches any `IFCQUANTITY*` prefix (not just the five
+    /// canonical kinds), so the catch-all arm of
+    /// `parse_quantity_typed` is reachable and the writer's
+    /// `serialize_quantity_value::Other` arm emits the same STEP
+    /// literal we ingested.
+    #[test]
+    fn unknown_quantity_kinds_round_trip() {
+        let mut project = Project::new("P");
+        let site = project
+            .add_child(&project.root.clone(), IfcClass::IfcSite, "Site")
+            .unwrap();
+        let bldg = project
+            .add_child(&site, IfcClass::IfcBuilding, "B")
+            .unwrap();
+        let storey = project
+            .add_child(&bldg, IfcClass::IfcBuildingStorey, "L01")
+            .unwrap();
+        let wall = EntityId::new();
+        project.attach_element(&storey, wall.clone());
+        let mut classification = ClassificationStore::new();
+        classification.assign_manual(wall.clone(), IfcClass::IfcWall);
+
+        // QuantitySet mixing a modeled (Length) and an unmodeled
+        // (Time) quantity. IFCQUANTITYTIME was added in IFC4x3 and
+        // is not modeled as a typed PropertyValue variant; the
+        // round-trip must preserve it through PropertyValue::Other.
+        let mut props = PropertyStore::new();
+        let mut q = QuantitySet::new("Qto_WallBaseQuantities");
+        q.quantities
+            .insert("Length".into(), PropertyValue::Length(3.5));
+        q.quantities.insert(
+            "ConstructionTime".into(),
+            PropertyValue::Other {
+                measure: "IfcQuantityTime".into(),
+                raw: "3600.0".into(),
+            },
+        );
+        props.entry(wall.clone()).upsert_qset(q);
+
+        let body = crate::ifc::IfcWriter::to_string(&project, &classification, &props);
+        // The writer must emit the unmodeled quantity verbatim with
+        // its uppercased measure wrapper.
+        assert!(
+            body.contains("IFCQUANTITYTIME('ConstructionTime',$,$,3600.0)"),
+            "writer must re-emit the raw IFCQUANTITYTIME wrapper, got body:\n{body}"
+        );
+
+        let snap1 = IfcReader::from_string(&body).expect("first parse");
+        let stored = snap1
+            .properties
+            .get(&wall)
+            .and_then(|p| p.qsets.get("Qto_WallBaseQuantities"))
+            .and_then(|qs| qs.quantities.get("ConstructionTime"))
+            .cloned();
+        match stored {
+            Some(PropertyValue::Other {
+                ref measure,
+                ref raw,
+            }) => {
+                assert_eq!(measure.to_ascii_uppercase(), "IFCQUANTITYTIME");
+                assert_eq!(raw, "3600.0");
+            }
+            ref other => {
+                panic!("expected PropertyValue::Other for unmodeled IFCQUANTITYTIME, got {other:?}")
+            }
+        }
+        // The known IFCQUANTITYLENGTH companion must also survive.
+        let length = snap1
+            .properties
+            .get(&wall)
+            .and_then(|p| p.qsets.get("Qto_WallBaseQuantities"))
+            .and_then(|qs| qs.quantities.get("Length"))
+            .cloned();
+        assert_eq!(length, Some(PropertyValue::Length(3.5)));
+
+        // Re-write and re-read to confirm second pass converges.
+        let mut props2 = PropertyStore::new();
+        for (el, p) in snap1.properties.iter() {
+            for qs in p.qsets.values() {
+                props2.entry(el.clone()).upsert_qset(qs.clone());
+            }
+        }
+        let body2 = crate::ifc::IfcWriter::to_string(&project, &classification, &props2);
+        let snap2 = IfcReader::from_string(&body2).expect("second parse");
+        assert_eq!(
+            snap1.properties.get(&wall),
+            snap2.properties.get(&wall),
+            "two reader passes converge on the same QuantitySet tree"
         );
     }
 
