@@ -602,22 +602,37 @@ fn focal_to_half_height(focal_mm: f32) -> f32 {
 
 /// Generate a world-space direction for an equirectangular pixel.
 ///
-/// The horizontal axis maps to longitude `[0, 2π]` (one full revolution
-/// per row) and the vertical axis to latitude `[0, π]` (north pole at
-/// `y=0`, south pole at `y=height`). The resulting direction is then
-/// transformed by the camera basis so panoramas can be aimed via the
-/// camera's `target_mm`. With the canonical basis (`forward=-Z`,
-/// `up=+Y`), longitude `0` looks toward `+Z` and longitude `π` looks
-/// toward `-Z` so the panorama centre column is the camera forward.
+/// The horizontal axis maps to longitude and the vertical axis maps to
+/// latitude `[0, π]` (north pole at `y=0`, south pole at `y=height`).
+/// We shift longitude by `-π` (`phi = (u - 0.5) * TAU`) so the panorama
+/// centre column (`u = 0.5`) points along the camera-view `-Z`
+/// (i.e. the camera forward), matching the standard 360°/VR convention
+/// used by Insta360, Google PhotoSphere, FB 360, and every consumer VR
+/// runtime. After the shift the four cardinal columns in view space
+/// are:
+///
+/// | `u`     | `phi`   | view-space direction at the equator |
+/// |---------|---------|-------------------------------------|
+/// | `0.0`   | `-π`    | `+Z` (camera-backward)              |
+/// | `0.25`  | `-π/2`  | `-X` (camera-left)                  |
+/// | `0.5`   | `0`     | `-Z` (camera-forward)               |
+/// | `0.75`  | `+π/2`  | `+X` (camera-right)                 |
+/// | `1.0`   | `+π`    | `+Z` (camera-backward, wraps to 0)  |
+///
+/// The view-space direction is then multiplied by the camera basis so
+/// the panorama is aimed via the camera's `target_mm`. The basis is
+/// orthonormal, so `dir_view` is unit-length by construction
+/// (`sin²θ (sin²φ + cos²φ) + cos²θ = 1`); we still call
+/// `normalize_or_zero` on the result to absorb floating-point drift
+/// from the basis multiplication and to give a deterministic value on
+/// the degenerate `basis * dir_view == 0` case.
 fn equirectangular_dir(px: f32, py: f32, width: u32, height: u32, view: &ViewFrame) -> Vec3 {
     let u = px / width.max(1) as f32;
     let v = py / height.max(1) as f32;
-    let phi = u * std::f32::consts::TAU;
+    // Centre-forward convention — see the table in the doc comment.
+    let phi = (u - 0.5) * std::f32::consts::TAU;
     let theta = v * std::f32::consts::PI;
     let sin_theta = theta.sin();
-    // Local frame: +Y up, +X right, -Z forward (camera looks toward -Z
-    // in view space, so longitude 0 must hit -Z to keep the panorama
-    // centred on the camera forward).
     let dir_view = Vec3::new(sin_theta * phi.sin(), theta.cos(), -sin_theta * phi.cos());
     (view.basis * dir_view).normalize_or_zero()
 }

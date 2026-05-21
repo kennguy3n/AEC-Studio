@@ -336,10 +336,15 @@ fn direct_visible_lights(ray_o: vec3<f32>, ray_d: vec3<f32>) -> vec3<f32> {
             let denom = dot(n_area, ray_d);
             if (abs(denom) >= 1.0e-6) {
                 let t = dot(light.position - ray_o, n_area) / denom;
-                // Primary-ray bounds: `t_min = 1e-4` (consistent with
-                // the CPU `Ray::new` default and the GPU
-                // ray-triangle epsilon).
-                if (t > 1.0e-4) {
+                // Primary-ray bounds: `t_min = 1e-4`, `t_max = 1e8`.
+                // CPU uses `[ray.t_min, ray.t_max]` (1e-4 to
+                // `f32::INFINITY` for primary rays); the upper-bound
+                // check is a defence-in-depth no-op today but keeps
+                // CPU and GPU symbolically identical so a future
+                // change that tightens `t_max` won't silently diverge
+                // the two kernels. `1e8` matches the traversal cap
+                // already passed to `traverse(..., 1e8)`.
+                if (t > 1.0e-4 && t < 1.0e8) {
                     let hit_pt = ray_o + ray_d * t;
                     let local = hit_pt - light.position;
                     let u = dot(local, u_axis);
@@ -370,18 +375,23 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let jy = rand_f32(&rng_state);
         var dir_view: vec3<f32>;
         if (params.projection == 1u) {
-            // Equirectangular: u maps to longitude [0, 2pi], v maps to
-            // latitude [0, pi]. Must match
-            // `crate::path_trace::equirectangular_dir` so CPU and GPU
-            // produce identical panoramas.
+            // Equirectangular: centre column (u=0.5) maps to view
+            // -Z (camera forward) via `phi = (u - 0.5) * TAU`,
+            // matching the standard 360°/VR convention. Must mirror
+            // `crate::path_trace::equirectangular_dir` exactly so CPU
+            // and GPU produce identical panoramas. The cardinal
+            // columns are: u=0/u=1 → +Z (back), u=0.25 → -X (left),
+            // u=0.5 → -Z (forward), u=0.75 → +X (right).
             let u = (f32(gid.x) + jx) / max(f32(params.width), 1.0);
             let v = (f32(gid.y) + jy) / max(f32(params.height), 1.0);
-            let phi = u * 6.28318530717958647692;   // TAU
-            let theta = v * 3.14159265358979323846; // PI
+            let phi = (u - 0.5) * 6.28318530717958647692;   // (u - 0.5) * TAU
+            let theta = v * 3.14159265358979323846;          // v * PI
             let sin_theta = sin(theta);
-            // Local frame: +Y up, +X right, -Z forward (camera looks
-            // toward -Z in view space, so longitude pi must hit -Z to
-            // keep the panorama centred on the camera forward).
+            // `dir_view` is unit-length by construction
+            // (`sin²θ (sin²φ + cos²φ) + cos²θ = 1`); the basis
+            // multiplication below applies a `normalize(...)` to
+            // absorb any floating-point drift, so we don't normalize
+            // here.
             dir_view = vec3<f32>(sin_theta * sin(phi),
                                   cos(theta),
                                   -sin_theta * cos(phi));
