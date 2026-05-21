@@ -456,6 +456,233 @@ fn write_u64(b: &mut [u8], at: usize, v: u64) {
     b[at..at + 8].copy_from_slice(&v.to_le_bytes());
 }
 
+/// The 20-byte preamble at the start of the section-info system page.
+/// Describes how many section descriptors follow and the global
+/// encryption / compression posture of the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SectionInfoHeader {
+    /// Number of section descriptors that follow this preamble.
+    pub num_desc: u32,
+    /// Per-spec name "compressed": always `2` (LZ77) on AutoCAD-written
+    /// files; LibreDWG keeps it verbatim for round-trip fidelity.
+    pub compressed: u32,
+    /// Maximum decompressed size of any single page in the file. Almost
+    /// always `0x7400`; legal up to `0x8000`.
+    pub max_size: u32,
+    /// `0` = unencrypted file, `1` = encrypted (rare on consumer
+    /// files), `2` = the R2018 magic-XOR handle-page encryption.
+    pub encrypted: u32,
+    /// Duplicate of `num_desc` — always equal on well-formed files.
+    pub num_desc2: u32,
+}
+
+impl SectionInfoHeader {
+    pub fn encode(&self) -> [u8; 20] {
+        let mut buf = [0u8; 20];
+        buf[0..4].copy_from_slice(&self.num_desc.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.compressed.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.max_size.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.encrypted.to_le_bytes());
+        buf[16..20].copy_from_slice(&self.num_desc2.to_le_bytes());
+        buf
+    }
+
+    pub fn parse(bytes: &[u8]) -> DwgResult<Self> {
+        if bytes.len() < 20 {
+            return Err(DwgError::UnexpectedEof {
+                byte: bytes.len(),
+                bit: 0,
+            });
+        }
+        Ok(Self {
+            num_desc: read_u32(bytes, 0),
+            compressed: read_u32(bytes, 4),
+            max_size: read_u32(bytes, 8),
+            encrypted: read_u32(bytes, 12),
+            num_desc2: read_u32(bytes, 16),
+        })
+    }
+}
+
+/// A single page entry within a [`SectionInfoDescriptor`]. The
+/// `address` is the absolute file offset of the page on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SectionInfoPage {
+    pub page_number: i32,
+    /// Compressed (on-disk) size of this page's payload.
+    pub comp_size: u32,
+    pub address: u64,
+}
+
+/// One logical section's full descriptor — the variable-sized
+/// 92 + 16 × num_pages record that follows [`SectionInfoHeader`] in
+/// the section-info system page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SectionInfoDescriptor {
+    /// Total decompressed size of this section, summed across all
+    /// pages.
+    pub size: u64,
+    /// Maximum decompressed size of any single page in this section.
+    /// Typically `0x7400`.
+    pub max_decomp_size: u32,
+    /// `1` = stored, `2` = LZ77-compressed.
+    pub compressed: u32,
+    /// Section type opaque tag (AutoCAD uses these to disambiguate
+    /// duplicate names — we preserve them verbatim).
+    pub type_tag: u32,
+    /// `0` = unencrypted, `1` = encrypted, `2` = R2018 magic-XOR.
+    pub encrypted: u32,
+    /// Verbatim 64-byte name field. ASCII bytes followed by trailing
+    /// NULs. Names like `"AcDb:Header"`, `"AcDb:Classes"`,
+    /// `"AcDb:Handles"`, `"AcDb:AcDbObjects"`.
+    pub name: [u8; 64],
+    /// Opaque `unknown` slot (reserved by the spec — preserved
+    /// verbatim for round-trip fidelity).
+    pub unknown: u32,
+    /// Pages that compose this section, in on-disk order.
+    pub pages: Vec<SectionInfoPage>,
+}
+
+impl Default for SectionInfoDescriptor {
+    fn default() -> Self {
+        Self {
+            size: 0,
+            max_decomp_size: 0x7400,
+            compressed: 2,
+            type_tag: 0,
+            encrypted: 0,
+            name: [0u8; 64],
+            unknown: 0,
+            pages: Vec::new(),
+        }
+    }
+}
+
+impl SectionInfoDescriptor {
+    /// Construct from an ASCII section name. Pads the 64-byte name
+    /// field with trailing NULs. Panics if the input is longer than
+    /// 64 bytes — the names AutoCAD uses are all <= 32 chars so this
+    /// is enforced as a programming-error contract.
+    pub fn with_name(name: &str) -> Self {
+        assert!(name.len() <= 64, "section name too long: {name:?}");
+        let mut name_buf = [0u8; 64];
+        name_buf[..name.len()].copy_from_slice(name.as_bytes());
+        Self {
+            name: name_buf,
+            ..Self::default()
+        }
+    }
+
+    /// Extract the printable ASCII portion of the name field (drops
+    /// trailing NULs and any non-ASCII bytes).
+    pub fn name_str(&self) -> &str {
+        let end = self.name.iter().position(|&b| b == 0).unwrap_or(64);
+        std::str::from_utf8(&self.name[..end]).unwrap_or("")
+    }
+
+    /// Total on-disk size of this descriptor when serialized:
+    /// 96 fixed bytes + 16 × `pages.len()` page records.
+    pub fn encoded_size(&self) -> usize {
+        96 + 16 * self.pages.len()
+    }
+}
+
+/// Serialize a header + descriptors into the on-disk system-info
+/// payload (the decompressed bytes that go into the LZ77 wrapper).
+pub fn encode_section_info(
+    header: SectionInfoHeader,
+    descriptors: &[SectionInfoDescriptor],
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(
+        20 + descriptors
+            .iter()
+            .map(SectionInfoDescriptor::encoded_size)
+            .sum::<usize>(),
+    );
+    buf.extend_from_slice(&header.encode());
+    for d in descriptors {
+        buf.extend_from_slice(&d.size.to_le_bytes());
+        buf.extend_from_slice(&(d.pages.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&d.max_decomp_size.to_le_bytes());
+        buf.extend_from_slice(&d.unknown.to_le_bytes());
+        buf.extend_from_slice(&d.compressed.to_le_bytes());
+        buf.extend_from_slice(&d.type_tag.to_le_bytes());
+        buf.extend_from_slice(&d.encrypted.to_le_bytes());
+        buf.extend_from_slice(&d.name);
+        for p in &d.pages {
+            buf.extend_from_slice(&p.page_number.to_le_bytes());
+            buf.extend_from_slice(&p.comp_size.to_le_bytes());
+            buf.extend_from_slice(&p.address.to_le_bytes());
+        }
+    }
+    buf
+}
+
+/// Inverse of [`encode_section_info`].
+pub fn decode_section_info(
+    bytes: &[u8],
+) -> DwgResult<(SectionInfoHeader, Vec<SectionInfoDescriptor>)> {
+    let header = SectionInfoHeader::parse(bytes)?;
+    let mut cursor = 20usize;
+    let mut descriptors = Vec::with_capacity(header.num_desc as usize);
+    for i in 0..header.num_desc {
+        if cursor + 96 > bytes.len() {
+            return Err(DwgError::InternalInvariant(format!(
+                "R2004 section_info: truncated at descriptor {i} (need {} got {})",
+                cursor + 96,
+                bytes.len()
+            )));
+        }
+        let size = read_u64(bytes, cursor);
+        let num_sections = read_u32(bytes, cursor + 8);
+        let max_decomp_size = read_u32(bytes, cursor + 12);
+        let unknown = read_u32(bytes, cursor + 16);
+        let compressed = read_u32(bytes, cursor + 20);
+        let type_tag = read_u32(bytes, cursor + 24);
+        let encrypted = read_u32(bytes, cursor + 28);
+        let mut name = [0u8; 64];
+        name.copy_from_slice(&bytes[cursor + 32..cursor + 96]);
+        cursor += 96;
+
+        let need = num_sections as usize * 16;
+        if cursor + need > bytes.len() {
+            return Err(DwgError::InternalInvariant(format!(
+                "R2004 section_info[{i}]: truncated page list (need {} got {})",
+                cursor + need,
+                bytes.len()
+            )));
+        }
+        let mut pages = Vec::with_capacity(num_sections as usize);
+        for _ in 0..num_sections {
+            let page_number = i32::from_le_bytes([
+                bytes[cursor],
+                bytes[cursor + 1],
+                bytes[cursor + 2],
+                bytes[cursor + 3],
+            ]);
+            let comp_size = read_u32(bytes, cursor + 4);
+            let address = read_u64(bytes, cursor + 8);
+            pages.push(SectionInfoPage {
+                page_number,
+                comp_size,
+                address,
+            });
+            cursor += 16;
+        }
+        descriptors.push(SectionInfoDescriptor {
+            size,
+            max_decomp_size,
+            compressed,
+            type_tag,
+            encrypted,
+            name,
+            unknown,
+            pages,
+        });
+    }
+    Ok((header, descriptors))
+}
+
 /// Convenience reader for legacy callers that expected the
 /// previously-stub `parse_descriptors` API. Returns the structured
 /// error from the inner system-section reader.
@@ -640,5 +867,130 @@ mod tests {
     fn parse_descriptors_returns_unsupported() {
         let err = parse_descriptors(&[]).unwrap_err();
         assert!(matches!(err, DwgError::UnsupportedInVersion { .. }));
+    }
+
+    #[test]
+    fn section_info_round_trip() {
+        let header = SectionInfoHeader {
+            num_desc: 4,
+            compressed: 2,
+            max_size: 0x7400,
+            encrypted: 0,
+            num_desc2: 4,
+        };
+        let descriptors = vec![
+            {
+                let mut d = SectionInfoDescriptor::with_name("AcDb:Header");
+                d.size = 0x1234;
+                d.type_tag = 1;
+                d.pages = vec![SectionInfoPage {
+                    page_number: 1,
+                    comp_size: 0x500,
+                    address: 0x100,
+                }];
+                d
+            },
+            {
+                let mut d = SectionInfoDescriptor::with_name("AcDb:Classes");
+                d.size = 0x2345;
+                d.type_tag = 2;
+                d.pages = vec![SectionInfoPage {
+                    page_number: 2,
+                    comp_size: 0x800,
+                    address: 0x600,
+                }];
+                d
+            },
+            {
+                let mut d = SectionInfoDescriptor::with_name("AcDb:Handles");
+                d.size = 0x3456;
+                d.type_tag = 3;
+                d.pages = vec![
+                    SectionInfoPage {
+                        page_number: 3,
+                        comp_size: 0x1000,
+                        address: 0xe00,
+                    },
+                    SectionInfoPage {
+                        page_number: 4,
+                        comp_size: 0x800,
+                        address: 0x1e00,
+                    },
+                ];
+                d
+            },
+            {
+                let mut d = SectionInfoDescriptor::with_name("AcDb:AcDbObjects");
+                d.size = 0x4567;
+                d.type_tag = 4;
+                d.pages = vec![SectionInfoPage {
+                    page_number: 5,
+                    comp_size: 0x2000,
+                    address: 0x2600,
+                }];
+                d
+            },
+        ];
+        let buf = encode_section_info(header, &descriptors);
+        // Expected size: 20 byte header + 96 base * 4 sections + 16 * (1+1+2+1)
+        // = 20 + 384 + 80 = 484 bytes.
+        assert_eq!(buf.len(), 20 + 96 * 4 + 16 * 5);
+        let (parsed_header, parsed_descriptors) = decode_section_info(&buf).unwrap();
+        assert_eq!(parsed_header, header);
+        assert_eq!(parsed_descriptors, descriptors);
+    }
+
+    #[test]
+    fn section_info_name_round_trips_through_64_byte_field() {
+        let d = SectionInfoDescriptor::with_name("AcDb:Header");
+        assert_eq!(d.name_str(), "AcDb:Header");
+        // Trailing bytes after the ASCII content must be NUL-padded.
+        assert!(d.name[11..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn section_info_descriptor_encoded_size_includes_pages() {
+        let mut d = SectionInfoDescriptor::with_name("AcDb:Test");
+        assert_eq!(d.encoded_size(), 96);
+        d.pages.push(SectionInfoPage::default());
+        assert_eq!(d.encoded_size(), 96 + 16);
+        d.pages.push(SectionInfoPage::default());
+        assert_eq!(d.encoded_size(), 96 + 32);
+    }
+
+    #[test]
+    fn section_info_rejects_truncated_descriptor() {
+        let header = SectionInfoHeader {
+            num_desc: 1,
+            compressed: 2,
+            max_size: 0x7400,
+            encrypted: 0,
+            num_desc2: 1,
+        };
+        // Truncate everything after the header — 20 bytes is < the
+        // 96-byte descriptor preamble we promised in the header.
+        let buf = header.encode();
+        let err = decode_section_info(&buf).unwrap_err();
+        assert!(matches!(err, DwgError::InternalInvariant(_)));
+    }
+
+    #[test]
+    fn section_info_rejects_truncated_page_list() {
+        // Header says 1 descriptor with 2 pages, but we only supply 1
+        // page's worth of bytes after the 96-byte preamble.
+        let header = SectionInfoHeader {
+            num_desc: 1,
+            compressed: 2,
+            max_size: 0x7400,
+            encrypted: 0,
+            num_desc2: 1,
+        };
+        let mut d = SectionInfoDescriptor::with_name("AcDb:Test");
+        d.pages = vec![SectionInfoPage::default(), SectionInfoPage::default()];
+        let mut buf = encode_section_info(header, &[d.clone()]);
+        // Drop the trailing 16 bytes (one page's worth).
+        buf.truncate(buf.len() - 16);
+        let err = decode_section_info(&buf).unwrap_err();
+        assert!(matches!(err, DwgError::InternalInvariant(_)));
     }
 }
