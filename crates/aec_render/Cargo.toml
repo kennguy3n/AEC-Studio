@@ -13,6 +13,10 @@ aec_audit = { path = "../aec_audit" }
 aec_governor = { path = "../aec_governor" }
 aec_materials = { path = "../aec_materials" }
 chrono = { workspace = true }
+glam = { workspace = true }
+fastrand = { workspace = true }
+image = { workspace = true }
+rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
