@@ -41,15 +41,15 @@ pub fn generate_material_schedule(
         let Some(ep) = props.get(id) else { continue };
         let name = ep
             .get("Pset_MaterialLayerSet", "Material")
-            .and_then(|v| v.as_text().map(str::to_string))
+            .and_then(|v| v.as_text().map(std::borrow::Cow::into_owned))
             .or_else(|| {
                 ep.get("Pset_ElementMaterial", "Material")
-                    .and_then(|v| v.as_text().map(str::to_string))
+                    .and_then(|v| v.as_text().map(std::borrow::Cow::into_owned))
             });
         let Some(name) = name else { continue };
         let supplier = ep
             .get("Pset_ElementMaterial", "Supplier")
-            .and_then(|v| v.as_text().map(str::to_string))
+            .and_then(|v| v.as_text().map(std::borrow::Cow::into_owned))
             .unwrap_or_default();
         let area = ep
             .get("Qto_WallBaseQuantities", "NetSideArea")

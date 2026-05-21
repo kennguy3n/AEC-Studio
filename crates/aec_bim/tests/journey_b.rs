@@ -472,8 +472,7 @@ fn architecture_studio_journey_end_to_end() {
         let fr = props
             .get(id)
             .and_then(|e| e.get("Pset_DoorCommon", "FireRating"))
-            .and_then(PropertyValue::as_text)
-            .map(str::to_string);
+            .and_then(|v| v.as_text().map(std::borrow::Cow::into_owned));
         assert!(fr.is_some(), "every door has a FireRating after AI fill");
     }
 

@@ -1364,7 +1364,7 @@ fn unquote(s: &str) -> IfcReadResult<String> {
 /// across lines just because a user-supplied name contained a literal
 /// newline. The decoder maps them back to the original control
 /// characters so re-export is byte-identical for any input.
-fn unescape_step_string(s: &str) -> String {
+pub(crate) fn unescape_step_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {

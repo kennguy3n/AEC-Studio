@@ -41,7 +41,7 @@ pub fn generate_room_schedule(
         let p = props.get(&space.id);
         let pget = |pset: &str, key: &str| {
             p.and_then(|e| e.get(pset, key))
-                .and_then(|v| v.as_text().map(str::to_string))
+                .and_then(|v| v.as_text().map(std::borrow::Cow::into_owned))
                 .unwrap_or_default()
         };
         let pnum = |pset: &str, key: &str| {
