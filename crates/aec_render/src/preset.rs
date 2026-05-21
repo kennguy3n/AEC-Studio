@@ -14,8 +14,10 @@ pub enum RenderQuality {
     /// on-wire token so project files written by earlier builds
     /// (which still referred to the EEVEE-via-Blender preview) keep
     /// deserializing cleanly. This mirrors the `RealtimePreview`
-    /// rename already applied to `aec_governor::PresetKey`.
-    #[serde(alias = "eevee", rename = "eevee")]
+    /// rename already applied to `aec_governor::PresetKey`. `rename`
+    /// covers both serialize AND deserialize, so no separate `alias`
+    /// is needed.
+    #[serde(rename = "eevee")]
     RealtimePreview,
     Quick,
     Standard,

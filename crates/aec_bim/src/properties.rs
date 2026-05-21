@@ -102,13 +102,14 @@ impl PropertyValue {
             // is a plain numeric token (the other lexical shapes for
             // an IFC measure value are quoted strings `'...'` or
             // booleans `.T.`/`.F.`, neither of which is meaningful
-            // as a real). `f64::from_str` handles ints (`12`),
-            // signed floats (`-3.5`), scientific notation
-            // (`1.5e-3`), and IFC's `D` exponent variant in the few
-            // legacy producers that emit it (`1.5D-3` is normalised
-            // by the reader before storage, so by the time it
-            // reaches `raw` it's already in `E` form).
-            Self::Other { raw, .. } => raw.trim().parse::<f64>().ok(),
+            // as a real). [`crate::ifc::reader::parse_step_real`]
+            // handles ints (`12`), signed floats (`-3.5`), scientific
+            // notation (`1.5e-3`), and IFC's legacy `D` / `d` exponent
+            // variant (`1.5D-3` / `1.5d-3`) used by some pre-2010
+            // FORTRAN-derived IFC exporters (canonical ISO 10303-21
+            // only allows `e`/`E`, but the wider IFC ecosystem still
+            // ships archives that use `D`).
+            Self::Other { raw, .. } => crate::ifc::reader::parse_step_real(raw),
             // Non-numeric typed variants: Text, Boolean, Label.
             Self::Text(_) | Self::Boolean(_) | Self::Label(_) => None,
         }
@@ -432,6 +433,28 @@ mod tests {
             raw: "1.5e-3".into(),
         };
         assert_eq!(scientific.as_real(), Some(1.5e-3));
+
+        // IFC's legacy FORTRAN-style `D` / `d` exponent literals
+        // (`1.5D-3`, `2d5`) must parse the same as the canonical `e`
+        // form. Pre-2010 AutoCAD-IFC / ARX exporters historically
+        // emitted this variant — accepting it on the way in is what
+        // makes the doc claim above true and keeps real-world
+        // archives readable.
+        let d_upper = PropertyValue::Other {
+            measure: "IFCMASSDENSITYMEASURE".into(),
+            raw: "1.5D-3".into(),
+        };
+        assert_eq!(d_upper.as_real(), Some(1.5e-3));
+        let d_lower = PropertyValue::Other {
+            measure: "IFCFREQUENCYMEASURE".into(),
+            raw: "1.5d-3".into(),
+        };
+        assert_eq!(d_lower.as_real(), Some(1.5e-3));
+        let d_integer_mantissa = PropertyValue::Other {
+            measure: "IFCCOUNTMEASURE".into(),
+            raw: "2D5".into(),
+        };
+        assert_eq!(d_integer_mantissa.as_real(), Some(2e5));
 
         let descriptive = PropertyValue::Other {
             measure: "IFCDESCRIPTIVEMEASURE".into(),

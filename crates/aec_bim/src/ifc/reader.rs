@@ -1400,8 +1400,55 @@ pub(crate) fn unescape_step_string(s: &str) -> String {
 }
 
 fn parse_real(s: &str) -> IfcReadResult<f64> {
-    s.parse::<f64>()
-        .map_err(|e| IfcReadError::Malformed(format!("real parse: {e}")))
+    parse_step_real(s)
+        .ok_or_else(|| IfcReadError::Malformed(format!("real parse: invalid literal {s:?}")))
+}
+
+/// Parse a STEP REAL literal into `f64`.
+///
+/// ISO 10303-21 §6.4.3.2 only allows lowercase `e` (or `E`) for the
+/// exponent of a REAL literal, but the older IFC2x3 “AutoCAD-IFC”
+/// exporter family (and a few other FORTRAN-derived ARX writers from
+/// c. 2000–2010) historically emitted the FORTRAN-style `D` /
+/// `d` exponent form (`1.5D-3`) because their host’s `printf`
+/// formatter substituted `D` for double-precision values. Real-world
+/// `.ifc` archives delivered to mid-size architecture firms
+/// occasionally still contain such literals.
+///
+/// To keep AEC Studio readable against those archives we accept
+/// either form. Fast path: try the canonical `[+-]?\d+(\.\d+)?(eE\d+)?`
+/// parse first — the overwhelming majority of literals are already
+/// in canonical form, and the fast path is zero-allocation. Only on
+/// parse failure (and only when the literal actually contains `D` or
+/// `d`) do we rewrite the exponent letter and retry; this keeps
+/// well-formed literals on the hot, allocation-free path.
+///
+/// Returns `None` only if the literal is not a valid REAL in either
+/// form (e.g. quoted strings or `.T.` booleans, which `PropertyValue::Other`
+/// can legitimately store).
+pub(crate) fn parse_step_real(s: &str) -> Option<f64> {
+    let trimmed = s.trim();
+    if let Ok(v) = trimmed.parse::<f64>() {
+        return Some(v);
+    }
+    // Slow path: only allocate / scan when there's a D-exponent to
+    // rewrite. `D` and `d` cannot occur outside the exponent
+    // position of a STEP REAL literal, so a blanket replacement is
+    // safe — any other context would already have failed the
+    // canonical-form parse above and will fail the rewritten parse
+    // too.
+    if !trimmed.bytes().any(|b| b == b'D' || b == b'd') {
+        return None;
+    }
+    let rewritten: String = trimmed
+        .chars()
+        .map(|c| match c {
+            'D' => 'E',
+            'd' => 'e',
+            other => other,
+        })
+        .collect();
+    rewritten.parse::<f64>().ok()
 }
 
 fn parse_int(s: &str) -> IfcReadResult<i64> {
@@ -2821,6 +2868,108 @@ END-ISO-10303-21;\n";
             END-ISO-10303-21;";
         let schema = detect_schema(text).expect("schema detect");
         assert_eq!(schema, IfcSchema::Ifc4);
+    }
+
+    /// ISO 10303-21 §6.4.3.2 specifies lowercase `e` for the REAL
+    /// exponent, but real-world IFC2x3 archives from pre-2010
+    /// FORTRAN-derived exporters (AutoCAD-IFC and friends) ship with
+    /// the FORTRAN `D` / `d` exponent form. `parse_step_real` must
+    /// accept both forms, preserve canonical-form parsing on the
+    /// zero-allocation fast path, and reject anything that isn't a
+    /// REAL literal (quoted strings, booleans, garbage).
+    #[test]
+    fn parse_step_real_accepts_canonical_and_legacy_d_exponent() {
+        // Canonical forms (fast path, no rewrite needed).
+        assert_eq!(parse_step_real("0"), Some(0.0));
+        assert_eq!(parse_step_real("3.5"), Some(3.5));
+        assert_eq!(parse_step_real("-3.5"), Some(-3.5));
+        assert_eq!(parse_step_real("1.5e-3"), Some(1.5e-3));
+        assert_eq!(parse_step_real("1.5E+10"), Some(1.5e10));
+        // Trim is on by default — IFC writers don't pad, but
+        // hand-constructed test fixtures do.
+        assert_eq!(parse_step_real("  -2.0 "), Some(-2.0));
+
+        // Legacy FORTRAN `D` exponent.
+        assert_eq!(parse_step_real("1.5D-3"), Some(1.5e-3));
+        assert_eq!(parse_step_real("1.5d-3"), Some(1.5e-3));
+        assert_eq!(parse_step_real("2D5"), Some(2e5));
+        assert_eq!(parse_step_real("-3.5D+2"), Some(-350.0));
+
+        // Lexical shapes that are valid in `PropertyValue::Other.raw`
+        // but are not REAL literals must return `None` (don't claim
+        // numeric recoverability for booleans / quoted strings).
+        assert!(parse_step_real("'kg/m3'").is_none());
+        assert!(parse_step_real(".T.").is_none());
+        assert!(parse_step_real(".F.").is_none());
+        assert!(parse_step_real("").is_none());
+        assert!(parse_step_real("abc").is_none());
+        // A `D` that isn't an exponent (e.g. embedded mid-mantissa)
+        // would already fail canonical parse; rewriting to `E` still
+        // fails. Don't accidentally rescue malformed literals.
+        assert!(parse_step_real("D5").is_none()); // bare exponent, no mantissa
+    }
+
+    /// End-to-end: a STEP file whose REAL literals use legacy `D`
+    /// exponent notation must still round-trip through the full
+    /// reader (typed measures like `IfcLengthMeasure` go through
+    /// `parse_real`, not just `as_real()` on the `Other` catch-all).
+    #[test]
+    fn reader_accepts_legacy_d_exponent_in_typed_measures() {
+        // Build a valid IFC via the writer (canonical `e` exponent
+        // form), then surgically rewrite the relevant
+        // `IFCLENGTHMEASURE(1500.0)` literal to use the legacy
+        // FORTRAN-style `1.5D+3` exponent. The pre-fix reader would
+        // reject that file at `parse_real`; the post-fix reader must
+        // parse it and recover the numeric value via
+        // `parse_step_real`.
+        let mut project = Project::new("LegacyDExponent");
+        let site = project
+            .add_child(&project.root.clone(), IfcClass::IfcSite, "Site")
+            .unwrap();
+        let bldg = project
+            .add_child(&site, IfcClass::IfcBuilding, "B")
+            .unwrap();
+        let storey = project
+            .add_child(&bldg, IfcClass::IfcBuildingStorey, "L01")
+            .unwrap();
+        let wall_id = EntityId::new();
+        project.attach_element(&storey, wall_id.clone());
+        let mut classification = ClassificationStore::new();
+        classification.assign_manual(wall_id.clone(), IfcClass::IfcWall);
+        let mut properties = PropertyStore::new();
+        let mut pset = PropertySet::new("Pset_WallCommon");
+        pset.set("Length", PropertyValue::Length(1500.0));
+        properties.entry(wall_id.clone()).upsert_pset(pset);
+
+        let canonical = crate::ifc::IfcWriter::to_string(&project, &classification, &properties);
+        // Find and rewrite the writer's canonical
+        // `IFCLENGTHMEASURE(1500.0)` (or its scientific form) to the
+        // legacy FORTRAN `1.5D+3` exponent variant. The writer emits
+        // `IFCLENGTHMEASURE(1500.0)` for a length of 1500 mm; map
+        // that to `1.5D+3` to exercise the D-exponent code path.
+        assert!(
+            canonical.contains("IFCLENGTHMEASURE(1500"),
+            "writer must emit IFCLENGTHMEASURE(1500…) so we can rewrite it; got:\n{canonical}",
+        );
+        let with_d_exponent =
+            canonical.replace("IFCLENGTHMEASURE(1500.0)", "IFCLENGTHMEASURE(1.5D+3)");
+        assert_ne!(
+            canonical, with_d_exponent,
+            "the substitution must have actually rewritten the literal",
+        );
+
+        let snap = IfcReader::from_string(&with_d_exponent)
+            .expect("reader must accept legacy D-exponent on typed measures");
+        let length = snap
+            .properties
+            .get(&wall_id)
+            .and_then(|e| e.get("Pset_WallCommon", "Length"))
+            .and_then(PropertyValue::as_real)
+            .expect("Pset_WallCommon.Length must be readable after D-exponent normalisation");
+        assert!(
+            (length - 1500.0).abs() < 1e-9,
+            "D-exponent legacy literal 1.5D+3 must parse as 1500.0; got {length}",
+        );
     }
 
     /// Conversely, a HEADER section that legitimately declares
