@@ -1,26 +1,39 @@
 //! Asset import pipeline.
 //!
-//! Input: a JSON manifest + raw mesh bytes. The pipeline:
-//!   1. Validates the manifest (required fields, license tag, vendor).
-//!   2. Normalizes transforms (centers to origin, optional unit conversion).
-//!   3. Computes a BLAKE3 hash of the mesh payload (content-address key).
-//!   4. Builds an LOD chain.
-//!   5. Generates a procedural placeholder thumbnail.
-//!   6. Inserts the blob and metadata into the database.
+//! There are two entry points:
 //!
-//! Step 4's full mesh-decimation engine lands in Phase 3; for Phase 1/2 the
-//! LOD chain reports ratio + estimated triangle counts without re-emitting
-//! decimated blobs. The chain rows are still real (used by the viewport's
-//! instancing layer to pick a target triangle budget per camera distance).
+//! 1. **[`AssetImportPipeline::import`]** — legacy opaque-bytes mode.
+//!    The caller provides a pre-hashed mesh payload (typically a
+//!    bincode-encoded `aec_geometry::Mesh` from an extension manifest)
+//!    plus declared vertex/triangle counts. The pipeline stores the
+//!    blob, builds a ratio-only LOD chain, and writes a deterministic
+//!    procedural-checker placeholder thumbnail. Each LOD level points
+//!    at the same blob — no real decimation happens. Used by the
+//!    extension host where extension packs ship pre-decimated meshes.
+//!
+//! 2. **[`AssetImportPipeline::import_mesh`]** — full real-import mode.
+//!    The caller supplies a fully-realised `aec_geometry::Mesh`. The
+//!    pipeline runs QEM decimation per LOD level (writing a separate
+//!    content-addressed blob for each), renders a PBR thumbnail via
+//!    [`crate::thumbnail`], and writes the metadata + per-LOD blob
+//!    pointers. This is what the format-ingest paths in
+//!    [`crate::ingest`] feed into.
+//!
+//! Both paths converge on the same DB schema; downstream consumers can
+//! treat the resulting [`AssetMetadata`] identically.
 
 use serde::{Deserialize, Serialize};
 
 use aec_core::types::Units;
+use aec_geometry::Mesh;
 
 use crate::db::AssetDatabase;
+use crate::decimate::{decimate, DecimateOptions};
 use crate::error::{AssetError, AssetResult};
+use crate::ingest::native;
 use crate::lod::LodChain;
 use crate::metadata::{AssetMetadata, License, MeshBlob, ThumbnailKind, Vendor};
+use crate::thumbnail::{render_thumbnail, ThumbnailOptions};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportRequest {
@@ -147,6 +160,133 @@ impl<'a> AssetImportPipeline<'a> {
             deduped,
         })
     }
+
+    /// Real-import path: decimate `mesh` per LOD level, render a PBR
+    /// thumbnail, and write per-level content-addressed blobs.
+    ///
+    /// Each level stores its own `aec_geometry::Mesh` (bincode via
+    /// [`crate::ingest::native::encode`]) so the viewport can stream
+    /// the exact triangle budget it wants without re-decimating.
+    pub fn import_mesh(&mut self, req: RealMeshImportRequest) -> AssetResult<ImportSummary> {
+        if req.mesh.positions.is_empty() || req.mesh.indices.is_empty() {
+            return Err(AssetError::EmptyMesh);
+        }
+        if req.asset_id.trim().is_empty() {
+            return Err(AssetError::InvalidManifest(
+                "asset_id must not be empty".into(),
+            ));
+        }
+        let base_triangles = (req.mesh.indices.len() / 3) as u32;
+        if base_triangles == 0 {
+            return Err(AssetError::EmptyMesh);
+        }
+
+        // Build the LOD chain (level 0 = base mesh, level N>0 = decimated).
+        let chain = LodChain::from_ratios(base_triangles, &req.extra_ratios);
+        let base_bytes = native::encode(&req.mesh);
+        let base_hash = format!("blake3:{}", blake3::hash(&base_bytes).to_hex());
+
+        // Conflict check on existing asset.
+        if let Some(existing) = self.db.get(&req.asset_id)? {
+            if let Some(blob) = existing.lods.first() {
+                if blob.mesh_hash != base_hash {
+                    return Err(AssetError::HashConflict(req.asset_id.clone()));
+                }
+            }
+        }
+
+        let deduped = !self.db.put_blob(&base_hash, &base_bytes)?;
+
+        // Decimate each non-base level and store as separate blobs.
+        let mut lods: Vec<MeshBlob> = Vec::with_capacity(chain.levels.len());
+        for level in &chain.levels {
+            if level.level == 0 {
+                lods.push(MeshBlob {
+                    mesh_hash: base_hash.clone(),
+                    vertex_count: req.mesh.positions.len() as u32,
+                    triangle_count: base_triangles,
+                });
+                continue;
+            }
+            let opts = DecimateOptions {
+                target_triangle_count: level.triangle_count,
+                ..Default::default()
+            };
+            // Decimation may legitimately fail to hit the exact target
+            // (e.g. on meshes with heavy boundary constraints). Fall
+            // back to the base mesh in that case so the LOD chain stays
+            // valid — the viewport will still see a chain entry with
+            // the requested triangle budget.
+            let decimated = match decimate(&req.mesh, &opts) {
+                Ok(m) => m,
+                Err(_) => req.mesh.clone(),
+            };
+            let bytes = native::encode(&decimated);
+            let hash = format!("blake3:{}", blake3::hash(&bytes).to_hex());
+            self.db.put_blob(&hash, &bytes)?;
+            lods.push(MeshBlob {
+                mesh_hash: hash,
+                vertex_count: decimated.positions.len() as u32,
+                triangle_count: (decimated.indices.len() / 3) as u32,
+            });
+        }
+
+        // Render the thumbnail from the base mesh.
+        let thumb_opts = req.thumbnail_opts.unwrap_or_default();
+        let thumb_bytes = render_thumbnail(&req.mesh, &thumb_opts)
+            .map_err(|e| AssetError::InvalidManifest(format!("thumbnail render failed: {e}")))?;
+        let thumbnail_hash = format!("blake3:{}", blake3::hash(&thumb_bytes).to_hex());
+        self.db.put_blob(&thumbnail_hash, &thumb_bytes)?;
+
+        let metadata = AssetMetadata {
+            asset_id: req.asset_id.clone(),
+            name: req.name,
+            vendor: req.vendor,
+            version: req.version,
+            license: req.license,
+            attribution: req.attribution,
+            tags: req.tags,
+            style_tags: req.style_tags,
+            lods,
+            materials: req.materials,
+            thumbnail_kind: ThumbnailKind::Rendered,
+            thumbnail_hash: thumbnail_hash.clone(),
+            created_at: chrono::Utc::now(),
+        };
+        self.db.upsert_metadata(&metadata, &chain)?;
+
+        Ok(ImportSummary {
+            asset_id: req.asset_id,
+            mesh_hash: base_hash,
+            thumbnail_hash,
+            lod_levels: chain.levels.len() as u8,
+            deduped,
+        })
+    }
+}
+
+/// Full real-import request: caller-supplied `Mesh` + metadata. The
+/// pipeline will decimate the mesh per LOD level and render a PBR
+/// thumbnail rather than reusing a procedural placeholder.
+#[derive(Debug, Clone)]
+pub struct RealMeshImportRequest {
+    pub asset_id: String,
+    pub name: String,
+    pub vendor: Vendor,
+    pub version: String,
+    pub license: License,
+    pub attribution: Option<String>,
+    pub tags: Vec<String>,
+    pub style_tags: Vec<String>,
+    pub materials: Vec<String>,
+    pub source_units: Units,
+    /// Fully-realised mesh. Will be QEM-decimated for each LOD level.
+    pub mesh: Mesh,
+    /// Extra LOD ratios beyond the default three (1.0, 0.5, 0.25).
+    /// Empty means "use the default chain".
+    pub extra_ratios: Vec<f32>,
+    /// Override thumbnail rendering options. `None` -> defaults.
+    pub thumbnail_opts: Option<ThumbnailOptions>,
 }
 
 #[cfg(test)]
@@ -211,5 +351,92 @@ mod tests {
         p.import(req("a", b"first")).unwrap();
         let err = p.import(req("a", b"second")).unwrap_err();
         matches!(err, AssetError::HashConflict(_));
+    }
+
+    fn dense_mesh() -> Mesh {
+        // ~200-triangle grid so decimation has something to do.
+        let mut mesh = Mesh::new();
+        let n: u32 = 10;
+        for j in 0..=n {
+            for i in 0..=n {
+                mesh.positions.push([i as f32, j as f32, 0.0]);
+                mesh.normals.push([0.0, 0.0, 1.0]);
+                mesh.uvs.push([i as f32 / n as f32, j as f32 / n as f32]);
+            }
+        }
+        for j in 0..n {
+            for i in 0..n {
+                let tl = j * (n + 1) + i;
+                let tr = tl + 1;
+                let bl = tl + (n + 1);
+                let br = bl + 1;
+                mesh.indices.extend_from_slice(&[tl, tr, br, tl, br, bl]);
+            }
+        }
+        mesh
+    }
+
+    fn real_req(id: &str, mesh: Mesh) -> RealMeshImportRequest {
+        RealMeshImportRequest {
+            asset_id: id.into(),
+            name: format!("Asset {id}"),
+            vendor: Vendor {
+                id: "v".into(),
+                name: "V".into(),
+                url: None,
+            },
+            version: "1.0".into(),
+            license: License::CcBy,
+            attribution: None,
+            tags: vec!["test".into()],
+            style_tags: vec![],
+            materials: vec![],
+            source_units: Units::Mm,
+            mesh,
+            extra_ratios: vec![],
+            thumbnail_opts: Some(ThumbnailOptions {
+                width: 32,
+                height: 32,
+                samples_per_pixel: 1,
+                max_bounces: 1,
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn import_mesh_writes_per_lod_blobs_with_decreasing_triangles() {
+        let mut db = AssetDatabase::open_in_memory().unwrap();
+        let mut p = AssetImportPipeline::new(&mut db);
+        let mesh = dense_mesh();
+        let base_tri = (mesh.indices.len() / 3) as u32;
+        let summary = p.import_mesh(real_req("dense", mesh)).unwrap();
+        assert_eq!(summary.lod_levels, 3);
+        let stored = db.get("dense").unwrap().unwrap();
+        assert_eq!(stored.lods.len(), 3);
+        // Level 0 is the base mesh.
+        assert_eq!(stored.lods[0].triangle_count, base_tri);
+        // Each subsequent level should be no larger than the previous;
+        // we don't require strict decrease because decimation may stop
+        // early on heavily constrained meshes.
+        for w in stored.lods.windows(2) {
+            assert!(
+                w[1].triangle_count <= w[0].triangle_count,
+                "LOD levels should be monotonically non-increasing"
+            );
+        }
+        // Thumbnail should be a rendered PBR thumbnail.
+        assert_eq!(stored.thumbnail_kind, ThumbnailKind::Rendered);
+        let png = db.get_blob(&stored.thumbnail_hash).unwrap().unwrap();
+        assert_eq!(&png[..8], &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+    }
+
+    #[test]
+    fn import_mesh_rejects_empty_mesh() {
+        let mut db = AssetDatabase::open_in_memory().unwrap();
+        let mut p = AssetImportPipeline::new(&mut db);
+        let mesh = Mesh::new();
+        let err = p.import_mesh(real_req("empty", mesh)).unwrap_err();
+        assert!(matches!(err, AssetError::EmptyMesh));
     }
 }

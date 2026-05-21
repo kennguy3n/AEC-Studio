@@ -9,6 +9,9 @@ description = "Content-addressed asset pipeline: validate, normalize, LOD, hash,
 
 [dependencies]
 aec_core = { path = "../aec_core" }
+aec_geometry = { path = "../aec_geometry" }
+aec_render = { path = "../aec_render" }
+aec_bim = { path = "../aec_bim" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -16,6 +19,11 @@ blake3 = { workspace = true }
 rusqlite = { workspace = true }
 hex = { workspace = true }
 chrono = { workspace = true }
+gltf = { workspace = true }
+tobj = { workspace = true }
+bincode = { workspace = true }
+image = { workspace = true }
+glam = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
