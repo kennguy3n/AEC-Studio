@@ -160,9 +160,15 @@ impl Mesh {
         if self.positions.is_empty() {
             return self.clone();
         }
-        // Bucket positions into an `epsilon`-sized grid; identical
-        // grid cells map to the same canonical vertex. This is
-        // O(n) instead of the naive O(n²) all-pairs comparison.
+        // Bucket positions into an `epsilon`-sized grid, then for each
+        // candidate vertex search the 3x3x3 neighbourhood of its cell
+        // for an existing welded vertex within `epsilon` (L∞). Naive
+        // single-cell lookup is broken at cell boundaries — two points
+        // at `(0.4*eps, 0, 0)` and `(0.6*eps, 0, 0)` are within `eps`
+        // L∞ but hash to keys `0` and `1` respectively. Checking the
+        // 27-cell neighbourhood guarantees that any pair within
+        // `epsilon` ends up in adjacent cells, so the lookup catches
+        // them. Remains O(n · 27) = O(n) overall.
         use std::collections::HashMap;
         let inv_eps = if epsilon > 0.0 { 1.0 / epsilon } else { 1.0e9 };
         let key = |p: [f64; 3]| -> (i64, i64, i64) {
@@ -177,11 +183,36 @@ impl Mesh {
         let mut remap = vec![0u32; self.positions.len()];
         for (old_i, &p) in self.positions.iter().enumerate() {
             let k = key(p);
-            let new_i = *bucket.entry(k).or_insert_with(|| {
+            // Search 3x3x3 neighbouring cells for an existing welded
+            // vertex within `epsilon` (L∞). First match wins, mirroring
+            // the union-find semantics: order of input vertices defines
+            // which collapsed-cluster representative survives.
+            let mut found: Option<u32> = None;
+            'search: for dx in -1..=1i64 {
+                for dy in -1..=1i64 {
+                    for dz in -1..=1i64 {
+                        let nk = (k.0 + dx, k.1 + dy, k.2 + dz);
+                        if let Some(&existing) = bucket.get(&nk) {
+                            let q = new_positions[existing as usize];
+                            if (p[0] - q[0]).abs() <= epsilon
+                                && (p[1] - q[1]).abs() <= epsilon
+                                && (p[2] - q[2]).abs() <= epsilon
+                            {
+                                found = Some(existing);
+                                break 'search;
+                            }
+                        }
+                    }
+                }
+            }
+            let new_i = if let Some(idx) = found {
+                idx
+            } else {
                 let i = new_positions.len() as u32;
                 new_positions.push(p);
+                bucket.insert(k, i);
                 i
-            });
+            };
             remap[old_i] = new_i;
         }
         let new_indices = self
@@ -1192,5 +1223,42 @@ mod tests {
             mesh.signed_volume(),
             welded.signed_volume()
         );
+    }
+
+    /// Regression: the previous single-cell-lookup welder dropped
+    /// vertex pairs that straddled an integer grid boundary even when
+    /// they were within `epsilon` L∞ of each other. The 3x3x3
+    /// neighbourhood search added alongside this test correctly
+    /// collapses (0.4*eps, 0, 0) and (0.6*eps, 0, 0) which hash to
+    /// keys 0 and 1 respectively — their L∞ distance is 0.2*eps, well
+    /// within the welding tolerance.
+    #[test]
+    fn welded_mesh_collapses_vertices_across_grid_cell_boundary() {
+        let epsilon = 1.0; // 1 mm tolerance
+        let mesh = Mesh {
+            positions: vec![
+                [0.4, 0.0, 0.0], // rounds to grid key (0, 0, 0)
+                [0.6, 0.0, 0.0], // rounds to grid key (1, 0, 0)
+                [10.0, 0.0, 0.0],
+                [10.4, 0.0, 0.0], // rounds to (10, 0, 0)
+                [10.6, 0.0, 0.0], // rounds to (11, 0, 0)
+            ],
+            // Synthetic indices just to exercise the remap.
+            indices: vec![[0, 1, 2], [2, 3, 4]],
+        };
+        let welded = mesh.welded(epsilon);
+        // Original: 5 positions. After welding within eps=1.0:
+        //   [0.4, 0.6] -> one cluster (L∞ = 0.2 < 1.0)
+        //   [10.0, 10.4, 10.6] -> one cluster (max pair L∞ = 0.6 < 1.0)
+        // Expected: 2 unique positions.
+        assert_eq!(
+            welded.positions.len(),
+            2,
+            "expected 2 welded clusters, got {} positions: {:?}",
+            welded.positions.len(),
+            welded.positions
+        );
+        // Triangle count preserved; remap collapses the 5 originals to 2.
+        assert_eq!(welded.indices.len(), 2);
     }
 }

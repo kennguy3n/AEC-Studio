@@ -41,7 +41,7 @@ export const PRESETS: PresetDetail[] = [
     label: "Realtime Preview",
     shortDescription: "Fast realtime preview",
     samples: 64,
-    // Matches `RenderPreset::eevee_preview()` in
+    // Matches `RenderPreset::realtime_preview()` in
     // crates/aec_render/src/preset.rs (1280×720) — the on-wire id
     // stays `eevee_preview` for backward compatibility with existing
     // `.aecstudio` project files, but the underlying implementation is
