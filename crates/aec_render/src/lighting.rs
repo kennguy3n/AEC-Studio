@@ -617,6 +617,76 @@ impl IesProfile {
     pub fn peak_candela(&self) -> f32 {
         self.candela.iter().copied().fold(0.0_f32, f32::max) * self.candela_multiplier
     }
+
+    /// Bilinearly-interpolated candela value at the supplied vertical /
+    /// horizontal angles, in degrees. Vertical is measured from the
+    /// luminaire's downward axis; horizontal is measured around it.
+    ///
+    /// Out-of-range angles clamp to the nearest sampled angle (so a
+    /// type-C distribution that only spans 0..=90° returns its boundary
+    /// value above 90°, rather than zero).
+    pub fn candela_at(&self, vertical_deg: f32, horizontal_deg: f32) -> f32 {
+        if self.vertical_angles.is_empty() || self.horizontal_angles.is_empty() {
+            return 0.0;
+        }
+        let (v0_idx, v_t) = bracket_angle(&self.vertical_angles, vertical_deg);
+        let (h0_idx, h_t) = bracket_angle(&self.horizontal_angles, horizontal_deg);
+        let v_len = self.vertical_angles.len();
+        let h_len = self.horizontal_angles.len();
+        let v1_idx = (v0_idx + 1).min(v_len - 1);
+        let h1_idx = (h0_idx + 1).min(h_len - 1);
+        let sample = |h: usize, v: usize| -> f32 { self.candela[h * v_len + v] };
+        let c00 = sample(h0_idx, v0_idx);
+        let c01 = sample(h0_idx, v1_idx);
+        let c10 = sample(h1_idx, v0_idx);
+        let c11 = sample(h1_idx, v1_idx);
+        let c0 = c00 + (c01 - c00) * v_t;
+        let c1 = c10 + (c11 - c10) * v_t;
+        let raw = c0 + (c1 - c0) * h_t;
+        raw * self.candela_multiplier
+    }
+
+    /// Synthetic profile used by unit tests — emits `peak_cd` candela
+    /// uniformly across the full sphere.
+    pub fn test_isotropic(peak_cd: f32) -> Self {
+        let vertical_angles: Vec<f32> = (0..=18).map(|i| i as f32 * 10.0).collect();
+        let horizontal_angles: Vec<f32> = vec![0.0];
+        let candela = vec![peak_cd; vertical_angles.len() * horizontal_angles.len()];
+        Self {
+            source: "synthetic isotropic".into(),
+            lamp_count: 1,
+            lumens_per_lamp: peak_cd * 4.0 * std::f32::consts::PI,
+            candela_multiplier: 1.0,
+            vertical_angles,
+            horizontal_angles,
+            candela,
+            photometric_type: IesPhotometricType::C,
+        }
+    }
+}
+
+/// Find `(lower_index, t)` such that `angles[lower_index] <= a <= angles[lower_index+1]`
+/// and `t in [0, 1]` is the interpolation parameter. Clamps to the
+/// boundary when `a` is outside the sampled range.
+fn bracket_angle(angles: &[f32], a: f32) -> (usize, f32) {
+    if angles.len() < 2 {
+        return (0, 0.0);
+    }
+    if a <= angles[0] {
+        return (0, 0.0);
+    }
+    if a >= angles[angles.len() - 1] {
+        return (angles.len() - 2, 1.0);
+    }
+    // Binary search for the first index whose angle exceeds `a`.
+    let upper = angles
+        .partition_point(|&v| v <= a)
+        .max(1)
+        .min(angles.len() - 1);
+    let lower = upper - 1;
+    let span = (angles[upper] - angles[lower]).max(1e-9);
+    let t = (a - angles[lower]) / span;
+    (lower, t)
 }
 
 #[derive(Debug, Clone, PartialEq, Error)]
