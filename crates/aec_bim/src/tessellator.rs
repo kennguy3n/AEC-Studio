@@ -169,13 +169,24 @@ impl Mesh {
         // 27-cell neighbourhood guarantees that any pair within
         // `epsilon` ends up in adjacent cells, so the lookup catches
         // them. Remains O(n · 27) = O(n) overall.
+        //
+        // Important: use `floor` rather than `round` for the bucket
+        // key. Rust's `f64::round` rounds half-way cases away from
+        // zero, so two points at `-0.5*eps` and `+0.5*eps` (L∞
+        // distance exactly `eps` — within the welding tolerance)
+        // would hash to keys `-1` and `+1` respectively, a gap of 2
+        // along one axis. That falls OUTSIDE the 3x3x3 neighbourhood
+        // search and the pair would be silently left un-collapsed.
+        // `floor` is monotone non-decreasing with the property
+        // `|x - y| <= eps ⇒ |floor(x/eps) - floor(y/eps)| <= 1`,
+        // which is the invariant the 27-cell lookup relies on.
         use std::collections::HashMap;
         let inv_eps = if epsilon > 0.0 { 1.0 / epsilon } else { 1.0e9 };
         let key = |p: [f64; 3]| -> (i64, i64, i64) {
             (
-                (p[0] * inv_eps).round() as i64,
-                (p[1] * inv_eps).round() as i64,
-                (p[2] * inv_eps).round() as i64,
+                (p[0] * inv_eps).floor() as i64,
+                (p[1] * inv_eps).floor() as i64,
+                (p[2] * inv_eps).floor() as i64,
             )
         };
         let mut bucket: HashMap<(i64, i64, i64), u32> = HashMap::new();
@@ -1259,6 +1270,42 @@ mod tests {
             welded.positions
         );
         // Triangle count preserved; remap collapses the 5 originals to 2.
+        assert_eq!(welded.indices.len(), 2);
+    }
+
+    /// Regression: the previous `round()`-based bucket key dropped
+    /// vertex pairs that landed on opposite sides of an integer
+    /// half-boundary even though their L∞ distance was exactly the
+    /// welding tolerance. With `epsilon = 1.0` the points
+    /// `(-0.5, 0, 0)` and `(+0.5, 0, 0)` are exactly `eps` apart and
+    /// MUST collapse, but `round(-0.5) = -1` and `round(+0.5) = +1`
+    /// hashed them to keys two apart on the X axis — outside the
+    /// 3x3x3 neighbourhood the welder searches. `floor()` guarantees
+    /// any pair within `eps` lands in adjacent cells (max key diff
+    /// of 1 along each axis), restoring the welding invariant.
+    #[test]
+    fn welded_mesh_collapses_vertices_straddling_half_integer_boundary() {
+        let epsilon = 1.0;
+        let mesh = Mesh {
+            positions: vec![
+                [-0.5, 0.0, 0.0],
+                [0.5, 0.0, 0.0],
+                // Second cluster, similarly straddling x = 9.5 — both
+                // floor and round agree this cluster is within eps,
+                // but the test still confirms the second-cluster path.
+                [9.0, 0.0, 0.0],
+                [9.5, 0.0, 0.0],
+            ],
+            indices: vec![[0, 1, 2], [1, 2, 3]],
+        };
+        let welded = mesh.welded(epsilon);
+        assert_eq!(
+            welded.positions.len(),
+            2,
+            "expected 2 welded clusters, got {} positions: {:?}",
+            welded.positions.len(),
+            welded.positions
+        );
         assert_eq!(welded.indices.len(), 2);
     }
 }
