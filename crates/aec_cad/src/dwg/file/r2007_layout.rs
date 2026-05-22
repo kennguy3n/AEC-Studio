@@ -158,13 +158,21 @@ pub(crate) fn decode_pages_map_content(payload: &[u8]) -> DwgResult<Vec<(i64, u6
 /// Per-section descriptor in an R2007 sections-map. 64 bytes of
 /// 8 × i64 LE fields, mirroring LibreDWG's `r2007_section` struct
 /// (decode_r2007.c line 891-898).
+///
+/// `name_length` (UTF-16LE byte count) is **not** stored as a
+/// separate field — it is always derived from `name` at encode
+/// time via [`Self::name_length_bytes`]. Keeping it as a stored
+/// field would create a consistency invariant between `name` and
+/// `name_length` that callers could break by mutating `name`
+/// without updating `name_length`. The on-disk format still emits
+/// the value at offset 32 of the descriptor header; we just
+/// recompute it from the single source of truth (`name`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SectionDescriptor {
     pub data_size: i64,
     pub max_size: i64,
     pub encrypted: i64,
     pub hashcode: i64,
-    pub name_length: i64,
     pub unknown: i64,
     pub encoded: i64,
     pub name: String,
@@ -208,13 +216,11 @@ impl SectionDescriptor {
     /// data buffer is zero-length, sentinel search fails, decoder
     /// gracefully skips the body).
     pub fn empty_for_name(name: &str) -> Self {
-        let name_bytes = utf16le_bytes(name);
         Self {
             data_size: 1,
             max_size: 1,
             encrypted: 0,
             hashcode: 0,
-            name_length: name_bytes.len() as i64,
             unknown: 0,
             encoded: 0,
             name: name.to_string(),
@@ -233,13 +239,11 @@ impl SectionDescriptor {
         page_size: u64,
         page_id: i64,
     ) -> Self {
-        let name_bytes = utf16le_bytes(name);
         Self {
             data_size: uncomp_size as i64,
             max_size: uncomp_size as i64,
             encrypted: 0,
             hashcode: 0,
-            name_length: name_bytes.len() as i64,
             unknown: 0,
             encoded: 0,
             name: name.to_string(),
@@ -259,20 +263,32 @@ impl SectionDescriptor {
         self.pages.len() as i64
     }
 
+    /// UTF-16LE byte count of the section name — the value LibreDWG
+    /// reads at offset 32 of each section descriptor header. Always
+    /// derived from `name`; never stored separately to avoid the
+    /// consistency-invariant footgun (changing `name` would have
+    /// required a paired change to a stored `name_length` field).
+    pub fn name_length_bytes(&self) -> i64 {
+        // ASCII-only names round-trip as 2 bytes per code unit; the
+        // `* 2` would be wrong if a name ever contained a surrogate
+        // pair, so we always go through `utf16le_bytes` for
+        // correctness.
+        utf16le_bytes(&self.name).len() as i64
+    }
+
     /// Serialize this descriptor onto the sections-map content
-    /// payload: 64 bytes of header + `name_length` bytes of
+    /// payload: 64 bytes of header + `name_length_bytes()` bytes of
     /// UTF-16LE name + 56 bytes per page entry.
     pub fn encode(&self, out: &mut Vec<u8>) {
+        let name_bytes = utf16le_bytes(&self.name);
         out.extend_from_slice(&self.data_size.to_le_bytes());
         out.extend_from_slice(&self.max_size.to_le_bytes());
         out.extend_from_slice(&self.encrypted.to_le_bytes());
         out.extend_from_slice(&self.hashcode.to_le_bytes());
-        out.extend_from_slice(&self.name_length.to_le_bytes());
+        out.extend_from_slice(&(name_bytes.len() as i64).to_le_bytes());
         out.extend_from_slice(&self.unknown.to_le_bytes());
         out.extend_from_slice(&self.encoded.to_le_bytes());
         out.extend_from_slice(&self.num_pages().to_le_bytes());
-        let name_bytes = utf16le_bytes(&self.name);
-        debug_assert_eq!(name_bytes.len() as i64, self.name_length);
         out.extend_from_slice(&name_bytes);
         for entry in &self.pages {
             out.extend_from_slice(&entry.offset.to_le_bytes());
@@ -494,12 +510,17 @@ pub(crate) fn decode_sections_map_content(
             });
             pos = page_end;
         }
+        // `name_length` was already validated against the on-disk
+        // bytes and used to slice out `name`; we deliberately do not
+        // re-store it on the descriptor — see the type doc on
+        // `SectionDescriptor` and `name_length_bytes()`. Drop the
+        // value here so it is not silently ignored.
+        let _ = name_length;
         out.push(SectionDescriptor {
             data_size,
             max_size,
             encrypted,
             hashcode,
-            name_length,
             unknown,
             encoded,
             name,
@@ -1036,9 +1057,9 @@ mod tests {
         {
             assert_eq!(&descriptor.name, expected_name);
             assert_eq!(
-                descriptor.name_length as usize,
+                descriptor.name_length_bytes() as usize,
                 expected_name.len() * 2,
-                "name_length must be the UTF-16LE byte count for {expected_name}"
+                "name_length_bytes() must equal the UTF-16LE byte count for {expected_name}"
             );
         }
         // Sentinel-bearing sections (AcDb:Header, AcDb:Classes,
@@ -1084,7 +1105,6 @@ mod tests {
                 max_size: 8192,
                 encrypted: 0,
                 hashcode: 0x1234_5678,
-                name_length: ("AcDb:AcDbObjects".len() * 2) as i64,
                 unknown: 0,
                 encoded: 0,
                 name: "AcDb:AcDbObjects".to_string(),
@@ -1262,6 +1282,39 @@ mod tests {
             expected_name.extend_from_slice(&code_unit.to_le_bytes());
         }
         assert_eq!(&bytes[64..], &expected_name[..]);
+    }
+
+    /// Regression test for the `name_length` consistency invariant
+    /// that USED to live as a stored struct field. The fix removed
+    /// the field entirely and derives the on-disk byte count from
+    /// `name` at encode time, so a caller who mutates `name` after
+    /// construction can no longer desynchronize the two.
+    ///
+    /// Before the fix, the following sequence:
+    /// ```ignore
+    /// let mut d = SectionDescriptor::empty_for_name("AcDb:Header");
+    /// d.name = "x".into();
+    /// // d.name_length still says 22, encoded bytes are now 2
+    /// ```
+    /// would emit a 22-byte name_length but only 2 name bytes,
+    /// breaking the decoder. With the field removed, the same
+    /// mutation re-encodes consistently.
+    #[test]
+    fn descriptor_name_mutation_re_encodes_consistently() {
+        let mut descriptor = SectionDescriptor::empty_for_name("AcDb:Header");
+        descriptor.name = "Z".to_string();
+        let mut bytes = Vec::new();
+        descriptor.encode(&mut bytes);
+        // name_length at offset 32 must reflect the new name
+        // (UTF-16LE byte count = 2 for one ASCII code unit).
+        assert_eq!(&bytes[32..40], &2i64.to_le_bytes());
+        // Total length is 64-byte header + 2-byte name.
+        assert_eq!(bytes.len(), 66);
+        // And the round-trip through decode preserves the new name.
+        let parsed = decode_sections_map_content(&bytes, 1).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "Z");
+        assert_eq!(parsed[0].name_length_bytes(), 2);
     }
 
     /// Regression test for the i64 → usize wrap on a malformed
