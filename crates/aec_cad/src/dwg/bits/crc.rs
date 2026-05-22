@@ -60,6 +60,14 @@ pub fn crc_8(data: &[u8]) -> u8 {
 }
 
 /// CRC-32C (Castagnoli) used on R2004+ section pages.
+///
+/// `seed` is the previous CRC return value when chaining across
+/// non-contiguous buffers, and `0` for a fresh computation
+/// (matching how LibreDWG seeds the data-page header CRC). The
+/// function applies the standard `~seed` in / `~crc` out inversion,
+/// which makes the returned value directly usable as the next seed
+/// — see `crc_32c_chains_when_previous_return_is_fed_back_as_seed`
+/// in the test module for the chaining identity.
 pub fn crc_32c(seed: u32, data: &[u8]) -> u32 {
     let mut crc = !seed;
     let table = CRC32C_TABLE;
@@ -212,18 +220,32 @@ mod tests {
     }
 
     #[test]
-    fn crc_32c_is_incremental() {
-        // Two-step seeding must equal one-step.
+    fn crc_32c_chains_when_previous_return_is_fed_back_as_seed() {
+        // The `!seed` / `!crc` inversion is balanced: if the caller
+        // wants to feed two buffers through CRC-32C piecewise, the
+        // correct continuation is to pass the previous *returned*
+        // value back in as the next seed. Internally that becomes
+        // `!!prev = prev_state`, which is exactly the state the
+        // algorithm needs to resume from.
+        //
+        // This is the standard CRC-32 chaining identity — it works
+        // for both Castagnoli (CRC-32C, this function) and IEEE
+        // (`crc_32_ieee`). The mirror test for IEEE is below.
         let full = crc_32c(0, b"hello world");
         let part = crc_32c(0, b"hello ");
-        // Step continuation requires the running CRC fed back as seed.
-        // The seed parameter is XORed with !crc internally, so to
-        // continue: pass `!part` as new seed and complement after.
-        // (Most callers don't actually do incremental updates because
-        // section pages are self-contained — this test just locks
-        // the algorithm's behavior in place.)
-        let _ = part;
-        assert_eq!(full, crc_32c(0, b"hello world"));
+        let chained = crc_32c(part, b"world");
+        assert_eq!(full, chained);
+    }
+
+    #[test]
+    fn crc_32c_three_way_chain_matches_single_call() {
+        // Three-buffer chain. Locks in that the chaining identity
+        // composes — not just "works once".
+        let full = crc_32c(0, b"the quick brown fox");
+        let a = crc_32c(0, b"the qu");
+        let b = crc_32c(a, b"ick br");
+        let c = crc_32c(b, b"own fox");
+        assert_eq!(full, c);
     }
 
     #[test]
@@ -241,6 +263,18 @@ mod tests {
         // The seed is inverted on entry and exit (`!seed` in / `!crc`
         // out), so seed=0, no input → !!0 = 0.
         assert_eq!(crc_32_ieee(0, &[]), 0);
+    }
+
+    #[test]
+    fn crc_32_ieee_chains_when_previous_return_is_fed_back_as_seed() {
+        // Mirror of `crc_32c_chains_when_previous_return_is_fed_back_as_seed`
+        // — same chaining identity, different polynomial. Locks in
+        // that the public API contract ("return value is a valid
+        // seed for continuation") holds for both variants.
+        let full = crc_32_ieee(0, b"hello world");
+        let part = crc_32_ieee(0, b"hello ");
+        let chained = crc_32_ieee(part, b"world");
+        assert_eq!(full, chained);
     }
 
     #[test]

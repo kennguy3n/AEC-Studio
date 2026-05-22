@@ -360,13 +360,20 @@ mod tests {
 
     #[test]
     fn arc_round_trips_r2000() {
+        // `DxfArc::{start_angle,end_angle}` are degrees (matching how
+        // DXF group codes 50/51 are spelled on disk). The DWG wire
+        // codec stores them as radians; `ArcEntity::{from_dxf,into_dxf}`
+        // perform the deg<->rad conversion. Using realistic degree
+        // values here — not radians masquerading as degrees — also
+        // catches any future regression where the conversion is
+        // accidentally skipped or doubled.
         let mut doc = DxfDocument::new();
         doc.push(DxfEntity::Arc(DxfArc {
             layer: "0".into(),
             center: [5.0, 5.0, 0.0],
             radius: 3.0,
-            start_angle: 0.0,
-            end_angle: std::f64::consts::FRAC_PI_2,
+            start_angle: 30.0,
+            end_angle: 90.0,
         }));
         let bytes = write_modern(&doc, Version::R2000).unwrap();
         let back = read_modern(&bytes).unwrap();
@@ -374,6 +381,8 @@ mod tests {
             DxfEntity::Arc(a) => {
                 assert_eq!(a.center, [5.0, 5.0, 0.0]);
                 assert_eq!(a.radius, 3.0);
+                assert!((a.start_angle - 30.0).abs() < 1e-9);
+                assert!((a.end_angle - 90.0).abs() < 1e-9);
             }
             other => panic!("expected Arc, got {other:?}"),
         }
