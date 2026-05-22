@@ -22,6 +22,17 @@
 /// 16-byte byte pattern delimiting a section in the R13-R2000 format.
 pub type Sentinel = [u8; 16];
 
+/// 16-byte sentinel written immediately after the locator-block CRC
+/// and before the first section payload. LibreDWG's
+/// `decode_R13_R2000` does a forward search for this pattern; it
+/// confirms successful parse of the header + locator block.
+///
+/// Bytes taken from LibreDWG `common.c::dwg_sentinel`
+/// (`DWG_SENTINEL_HEADER_END = 0`).
+pub const HEADER_END: Sentinel = [
+    0x95, 0xa0, 0x4e, 0x28, 0x99, 0x82, 0x1a, 0xe5, 0x5e, 0x41, 0xe0, 0x5f, 0x9d, 0x3a, 0x4d, 0x00,
+];
+
 /// Start sentinel for the *header variables* section.
 pub const HEADER_VARS_BEGIN: Sentinel = [
     0xcf, 0x7b, 0x1f, 0x23, 0xfd, 0xde, 0x38, 0xa9, 0x5f, 0x7c, 0x68, 0xb8, 0x4e, 0x6d, 0x33, 0x5f,

@@ -423,8 +423,10 @@ pub fn assemble_r2004(parts: R2004FileParts) -> DwgResult<Vec<u8>> {
         section_locator_count: 0,
     };
     let mut legacy = file_header.encode();
-    // The legacy header is 0x20 bytes; R2004+ pads to 0x80 before the
-    // encrypted R2004 file header. The intervening bytes are zero.
+    // `FileHeader::encode` returns 0x19 bytes (FIXED_HEADER_LEN). R2004+
+    // pads the legacy header region out to 0x80 bytes before the
+    // encrypted R2004 file header begins. The intervening bytes are
+    // zero.
     legacy.resize(R2004_HEADER_OFFSET, 0);
 
     // 8. Encode the encrypted R2004 file header (120 bytes).
