@@ -116,7 +116,7 @@ pub(crate) fn encode_pages_map_content(pages: &[(i64, u64)]) -> Vec<u8> {
     let mut out = Vec::with_capacity(pages.len() * 16);
     for &(id, size) in pages {
         out.extend_from_slice(&size.to_le_bytes());
-        out.extend_from_slice(&(id as u64).to_le_bytes());
+        out.extend_from_slice(&id.to_le_bytes());
     }
     out
 }
@@ -652,7 +652,7 @@ pub fn parse_r2007(bytes: &[u8], version: Version) -> DwgResult<R2007File> {
     let pages_map_on_disk_len = system_page_on_disk_size(
         header.pages_map_size_uncomp as usize,
         header.pages_map_correction,
-    );
+    )?;
     let pages_map_end = pages_map_off
         .checked_add(pages_map_on_disk_len)
         .ok_or_else(|| {

@@ -31,6 +31,17 @@ const fn round_up_8(n: usize) -> usize {
     (n + 7) & !7
 }
 
+/// Overflow-safe variant of [`round_up_8`] — returns `None` if
+/// `n + 7` would wrap. Used on the hot path where `n` may come from
+/// an untrusted file-header field that has already been validated as
+/// non-negative but is otherwise unbounded.
+const fn round_up_8_checked(n: usize) -> Option<usize> {
+    match n.checked_add(7) {
+        Some(v) => Some(v & !7),
+        None => None,
+    }
+}
+
 /// Wire-format report from [`encode_system_page`].
 ///
 /// `on_disk` is the byte stream that goes directly to the file at
@@ -116,6 +127,19 @@ pub fn decode_system_page(
             "decode_system_page: invalid repeat_count {repeat_count}"
         )));
     }
+    // Defense in depth: the public signature accepts `i64` because
+    // those fields come straight from the wire format. A negative
+    // value cast-to-usize wraps to a huge positive number that
+    // would slip past the `src.len() < page_size` check below. The
+    // existing production caller (`parse_r2007`) already validates
+    // these are non-negative, but the function's own contract must
+    // hold for any future caller — guard here so a third caller
+    // can't accidentally bypass it.
+    if size_comp < 0 || size_uncomp < 0 {
+        return Err(DwgError::InternalInvariant(format!(
+            "decode_system_page: negative sizes (comp={size_comp}, uncomp={size_uncomp})"
+        )));
+    }
     if size_comp != size_uncomp {
         return Err(DwgError::InternalInvariant(
             "decode_system_page: compressed mode not supported (size_comp != size_uncomp)".into(),
@@ -123,9 +147,8 @@ pub fn decode_system_page(
     }
     let size_comp = size_comp as usize;
     let size_uncomp = size_uncomp as usize;
-    let pesize_unrounded = round_up_8(size_comp) * repeat_count as usize;
-    let block_count = pesize_unrounded.div_ceil(RS_DATA_SIZE).max(1);
-    let page_size = round_up_8(block_count * RS_BLOCK_SIZE);
+    let page_size = compute_page_size(size_comp, repeat_count)?;
+    let block_count = page_size_to_block_count(page_size);
     if src.len() < page_size {
         return Err(DwgError::InternalInvariant(format!(
             "decode_system_page: src too short (need {page_size}, got {})",
@@ -153,15 +176,61 @@ pub fn decode_system_page(
 /// `header.pages_map_correction` in the R2007 file header context;
 /// AutoCAD-emitted files always use 1, and so does our encoder.
 ///
-/// Panics if `repeat_count < 1`.
-pub fn system_page_on_disk_size(payload_len: usize, repeat_count: i64) -> usize {
-    assert!(
-        repeat_count >= 1,
-        "system_page_on_disk_size: repeat_count must be >= 1 (got {repeat_count})"
-    );
-    let pesize_unrounded = round_up_8(payload_len) * repeat_count as usize;
+/// Returns an error if `repeat_count < 1` or if any of the internal
+/// arithmetic would overflow `usize` (e.g. an adversarial file with
+/// `payload_len` near `usize::MAX / 2` and `repeat_count > 1`).
+/// Returning a typed error rather than panicking lets the caller
+/// propagate the rejection up to its parse-error path without
+/// breaking the host process.
+pub fn system_page_on_disk_size(payload_len: usize, repeat_count: i64) -> DwgResult<usize> {
+    if repeat_count < 1 {
+        return Err(DwgError::InternalInvariant(format!(
+            "system_page_on_disk_size: repeat_count must be >= 1 (got {repeat_count})"
+        )));
+    }
+    compute_page_size(payload_len, repeat_count)
+}
+
+/// Shared `compute pesize → block_count → page_size` pipeline used
+/// by both [`system_page_on_disk_size`] and [`decode_system_page`].
+/// Centralizing the math here guarantees the encoder and decoder
+/// can never disagree on the on-disk size for a given
+/// `(payload_len, repeat_count)` pair — that consistency is what
+/// `parse_r2007`'s bounds check relies on.
+fn compute_page_size(payload_len: usize, repeat_count: i64) -> DwgResult<usize> {
+    // repeat_count is validated by the callers (>= 1) before we get
+    // here, so the `as usize` cast is numerically safe. We still
+    // checked_mul through every step to defeat adversarial
+    // `payload_len` near `usize::MAX / 2`.
+    let repeat = repeat_count as usize;
+    let pesize_rounded = round_up_8_checked(payload_len).ok_or_else(|| {
+        DwgError::InternalInvariant(format!(
+            "system_page math: round_up_8({payload_len}) overflowed usize"
+        ))
+    })?;
+    let pesize_unrounded = pesize_rounded.checked_mul(repeat).ok_or_else(|| {
+        DwgError::InternalInvariant(format!(
+            "system_page math: pesize * repeat_count overflowed usize ({pesize_rounded} * {repeat})"
+        ))
+    })?;
     let block_count = pesize_unrounded.div_ceil(RS_DATA_SIZE).max(1);
-    round_up_8(block_count * RS_BLOCK_SIZE)
+    let codeword_bytes = block_count.checked_mul(RS_BLOCK_SIZE).ok_or_else(|| {
+        DwgError::InternalInvariant(format!(
+            "system_page math: block_count * RS_BLOCK_SIZE overflowed usize ({block_count} * {RS_BLOCK_SIZE})"
+        ))
+    })?;
+    round_up_8_checked(codeword_bytes).ok_or_else(|| {
+        DwgError::InternalInvariant(format!(
+            "system_page math: round_up_8({codeword_bytes}) overflowed usize"
+        ))
+    })
+}
+
+/// Inverse of [`compute_page_size`] on the codeword side — given the
+/// final 8-byte-aligned page size, return how many 255-byte RS
+/// codewords it contains.
+fn page_size_to_block_count(page_size: usize) -> usize {
+    page_size / RS_BLOCK_SIZE
 }
 
 #[cfg(test)]
@@ -190,7 +259,7 @@ mod tests {
         assert_eq!(result.size_uncomp, payload.len() as i64);
         assert_eq!(
             result.on_disk.len(),
-            system_page_on_disk_size(payload.len(), 1)
+            system_page_on_disk_size(payload.len(), 1).unwrap()
         );
         // Round-trip the payload.
         let recovered = decode_system_page(
@@ -281,9 +350,47 @@ mod tests {
             let result = encode_system_page(&vec![0u8; n]);
             assert_eq!(
                 result.on_disk.len(),
-                system_page_on_disk_size(n, 1),
+                system_page_on_disk_size(n, 1).unwrap(),
                 "n={n}"
             );
         }
+    }
+
+    #[test]
+    fn on_disk_size_rejects_zero_repeat_count() {
+        let err = system_page_on_disk_size(100, 0);
+        assert!(err.is_err(), "repeat_count = 0 must be rejected");
+    }
+
+    #[test]
+    fn on_disk_size_rejects_negative_repeat_count() {
+        let err = system_page_on_disk_size(100, -1);
+        assert!(err.is_err(), "negative repeat_count must be rejected");
+    }
+
+    #[test]
+    fn on_disk_size_rejects_overflow_inputs() {
+        // Adversarial: payload_len near usize::MAX would overflow on
+        // `round_up_8(payload_len)`. Result must be a clean Err,
+        // never a panic or wrap.
+        let err = system_page_on_disk_size(usize::MAX, 1);
+        assert!(err.is_err());
+        // Same shape via the repeat_count * pesize path. pick a
+        // pesize that fits and a repeat_count that would overflow on
+        // the multiplication.
+        let err = system_page_on_disk_size(usize::MAX / 4, i64::MAX);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn decode_system_page_rejects_negative_sizes() {
+        let result = encode_system_page(&[0u8; 100]);
+        let err = decode_system_page(&result.on_disk, -1, -1, 1);
+        assert!(err.is_err(), "negative sizes must be rejected");
+        // Also the mismatched-sign case.
+        let err = decode_system_page(&result.on_disk, -100, 100, 1);
+        assert!(err.is_err(), "negative size_comp must be rejected");
+        let err = decode_system_page(&result.on_disk, 100, -100, 1);
+        assert!(err.is_err(), "negative size_uncomp must be rejected");
     }
 }
