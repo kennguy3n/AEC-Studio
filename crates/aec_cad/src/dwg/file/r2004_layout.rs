@@ -32,11 +32,14 @@
 //!       └────────────────────────────────────────┘
 //! ```
 //!
-//! Every page (data or system) uses the same 20-byte system-page
-//! envelope: `(page_type, decompressed_size, compressed_size,
-//! compression_type, checksum)` + LZ77-wrapped payload + CRC-32C
-//! trailer. This matches LibreDWG's `read_R2004_section` framing —
-//! AutoCAD's reference reader accepts files written this way.
+//! Every system page uses the 20-byte system-page envelope:
+//! `(page_type, decompressed_size, compressed_size,
+//! compression_type, checksum)` + (optionally LZ77-wrapped) payload.
+//! Every data page (R2004+ AcDb:Header, AcDb:Classes, etc.) uses a
+//! 32-byte XOR-encrypted page header instead. Both envelopes use
+//! LibreDWG's `dwg_section_page_checksum` (Adler-32-style with
+//! `mod 0xFFF1`, NOT CRC-32C) for the trailing checksum — this
+//! matches AutoCAD-emitted files and LibreDWG's reference reader.
 //!
 //! Reference: OpenDesign Specification § "R2004 file format" and the
 //! LibreDWG `decode_r2004.c` walker.
