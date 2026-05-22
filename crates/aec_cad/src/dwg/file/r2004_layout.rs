@@ -74,8 +74,8 @@ use crate::dwg::file::r2000_layout::R2000Object;
 use crate::dwg::file::system_section::{
     decode_section_info, encode_page_map, encode_section_info, read_data_page, read_system_page,
     write_data_page, write_system_page, CompressionType, PageDescriptor, R2004FileHeader,
-    SectionInfoDescriptor, SectionInfoHeader, SectionInfoPage, R2004_HEADER_OFFSET,
-    SYSTEM_PAGE_HEADER_SIZE,
+    SectionInfoDescriptor, SectionInfoHeader, SectionInfoPage, DATA_PAGE_HEADER_SIZE,
+    R2004_HEADER_OFFSET, SYSTEM_PAGE_HEADER_SIZE,
 };
 use crate::dwg::version::Version;
 
@@ -361,7 +361,23 @@ pub fn assemble_r2004(parts: R2004FileParts) -> DwgResult<Vec<u8>> {
         desc.unknown = 0;
         desc.pages.push(SectionInfoPage {
             page_number: descriptor.page_id,
-            comp_size: wire.len() as u32,
+            // `comp_size` is the COMPRESSED PAYLOAD size of this page,
+            // excluding the 32-byte encrypted data-page header. LibreDWG
+            // logs it as `compressed` (decode.c:1880 / 1895) and the
+            // `SectionInfoPage.comp_size` doc comment in
+            // `system_section.rs` says "compressed (on-disk) size of
+            // this page's payload" — the previous `wire.len()` was off
+            // by `DATA_PAGE_HEADER_SIZE` (= 32). LibreDWG never uses the
+            // value for slicing (only `LOG_TRACE`), so the bug was
+            // benign at the LibreDWG cross-check, but AutoCAD-emitted
+            // files write the payload-only size here and external tools
+            // (e.g. ODA Drawings SDK) would mis-report page sizes if we
+            // continued to overstate it.
+            //
+            // For our R2004+ output `compressed = 1` (stored), so this
+            // equals the section's decompressed size; once we add real
+            // LZ77 the value becomes whatever `compress()` returned.
+            comp_size: (wire.len() - DATA_PAGE_HEADER_SIZE) as u32,
             address: descriptor.file_offset,
         });
         section_descriptors.push(desc);

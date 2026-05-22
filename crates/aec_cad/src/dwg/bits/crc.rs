@@ -352,16 +352,47 @@ mod tests {
     }
 
     #[test]
-    fn dwg_section_page_checksum_chains_via_returned_seed() {
+    fn dwg_section_page_checksum_chains_at_arbitrary_split() {
         // The chaining identity AutoCAD relies on for the two-pass
         // header-then-payload composition: feeding the previous
         // return value back as the seed reconstructs the full-buffer
-        // computation. Locks in that callers can split the input on
-        // any boundary without changing the answer.
-        let full = dwg_section_page_checksum(0, b"abcdefghijklmnop");
-        let part = dwg_section_page_checksum(0, b"abcdefgh");
-        let chained = dwg_section_page_checksum(part, b"ijklmnop");
-        assert_eq!(full, chained);
+        // computation.
+        //
+        // The previous version of this test claimed "any boundary"
+        // and only proved it on 16 bytes of ASCII, which can't
+        // distinguish mod-induced divergence from trivial equality.
+        // This rewrite exercises ~22 KB of pseudo-random bytes that
+        // cross the 0x15B0 chunk boundary twice and verifies the
+        // identity at three split points: (a) interior to the first
+        // chunk, (b) exactly on the chunk boundary, (c) interior to
+        // the second chunk.
+        //
+        // Why arbitrary splits work in practice: each chunk
+        // accumulates at most ~2.3 GB into u32, well under 2^32 even
+        // when sum1/sum2 are seeded at 0xFFFF, so the mod reduction
+        // happens before any value would overflow. As long as the
+        // implementation maintains that invariant (chunksize ≤ 0x15B0
+        // and accumulators are u32), chaining preserves identity at
+        // any split point. Crossing that invariant — e.g., raising
+        // chunksize past ~0x6F00 with high-valued bytes — would
+        // re-introduce true split-point sensitivity, so future
+        // maintainers should NOT relax the 0x15B0 chunk constant.
+        let mut data = vec![0u8; 0x15B0 * 2 + 100];
+        let mut state: u32 = 0xdead_beef;
+        for b in &mut data {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            *b = (state >> 16) as u8;
+        }
+        let full = dwg_section_page_checksum(0, &data);
+
+        for split in [100, 0x15B0, 0x15B0 + 1, 0x15B0 * 2 - 1] {
+            let part = dwg_section_page_checksum(0, &data[..split]);
+            let chained = dwg_section_page_checksum(part, &data[split..]);
+            assert_eq!(
+                full, chained,
+                "chaining mismatch at split = {split} (full = {full:#x}, chained = {chained:#x})"
+            );
+        }
     }
 
     #[test]
