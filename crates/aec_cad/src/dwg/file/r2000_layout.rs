@@ -547,4 +547,71 @@ mod tests {
             "locator[2].id must be HANDLES"
         );
     }
+
+    #[test]
+    fn r2000_file_rejects_header_crc_corruption() {
+        let parts = R2000FileParts {
+            version: Version::R2000,
+            header_vars: HeaderVarsSection::minimal(Version::R2000),
+            classes: ClassesSection::empty(Version::R2000),
+            objects: Vec::new(),
+        };
+        let mut bytes = assemble_r2000(parts).unwrap();
+        // Flip a byte inside the locator block (which is covered by
+        // the CRC). The new locator block starts at FIXED_HEADER_LEN.
+        bytes[FIXED_HEADER_LEN] ^= 0xff;
+        assert!(matches!(
+            parse_r2000(&bytes),
+            Err(DwgError::HeaderCrcMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn r2000_file_rejects_missing_header_end_sentinel() {
+        let parts = R2000FileParts {
+            version: Version::R2000,
+            header_vars: HeaderVarsSection::minimal(Version::R2000),
+            classes: ClassesSection::empty(Version::R2000),
+            objects: Vec::new(),
+        };
+        let mut bytes = assemble_r2000(parts).unwrap();
+        // Corrupt the HEADER_END sentinel that lives immediately after
+        // the locator CRC. Parsing must refuse the file rather than
+        // silently treating the next bytes as section data.
+        let sentinel_offset = FIXED_HEADER_LEN + LOCATOR_COUNT * 9 + 2;
+        bytes[sentinel_offset] ^= 0xff;
+        let err = parse_r2000(&bytes).unwrap_err();
+        assert!(
+            matches!(err, DwgError::MalformedObject { .. }),
+            "expected MalformedObject for corrupt HEADER_END, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn r2000_assemble_rejects_paged_versions() {
+        // R2004+ uses the paged system-section layout; assemble_r2000
+        // must surface that with a structured error rather than emit
+        // a malformed file. This is the single guard that keeps a
+        // caller from accidentally producing an R2010 file with an
+        // R2000 wire shape.
+        for version in [
+            Version::R2004,
+            Version::R2007,
+            Version::R2010,
+            Version::R2013,
+            Version::R2018,
+        ] {
+            let parts = R2000FileParts {
+                version,
+                header_vars: HeaderVarsSection::minimal(version),
+                classes: ClassesSection::empty(version),
+                objects: Vec::new(),
+            };
+            let err = assemble_r2000(parts).unwrap_err();
+            assert!(
+                matches!(err, DwgError::UnsupportedInVersion { .. }),
+                "expected UnsupportedInVersion for {version:?}, got {err:?}"
+            );
+        }
+    }
 }
