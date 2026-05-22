@@ -429,11 +429,7 @@ mod tests {
         // R2013 / R2018 still go through assemble_r2004 and round-
         // trip cleanly. Re-enabling R2007 here is pinned by the
         // entity-content commit later in this same PR.
-        for v in [
-            Version::R2010,
-            Version::R2013,
-            Version::R2018,
-        ] {
+        for v in [Version::R2010, Version::R2013, Version::R2018] {
             let mut doc = DxfDocument::new();
             doc.push(DxfEntity::Text(DxfText {
                 layer: "0".into(),

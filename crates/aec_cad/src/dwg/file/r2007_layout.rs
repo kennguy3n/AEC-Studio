@@ -53,7 +53,30 @@ use crate::dwg::file::r2007_header::{
 use crate::dwg::file::r2007_system_page::{
     decode_system_page, encode_system_page, system_page_on_disk_size,
 };
+use crate::dwg::file::sentinels::{CLASSES_BEGIN, HEADER_VARS_BEGIN};
 use crate::dwg::version::Version;
+
+/// Number of data bytes per Reed–Solomon block in an R2007 data
+/// page. Equals `0xFB` in LibreDWG `decode_rs (… data_size=0xFB …)`
+/// at decode_r2007.c:718. Distinct from the 239-byte data block
+/// used by system pages.
+const RS_DATA_PAGE_DATA_SIZE: usize = 0xFB;
+
+/// On-disk block size in an R2007 data page (data + parity).
+/// Always 255 in LibreDWG. Parity = `255 - RS_DATA_PAGE_DATA_SIZE`
+/// = 4 bytes per block.
+const RS_DATA_PAGE_BLOCK_SIZE: usize = 255;
+
+/// Bytes per per-page entry in a sections-map section descriptor.
+/// See decode_r2007.c:1006-1022 — seven `bit_read_RLL` calls
+/// (offset, size, id, uncomp_size, comp_size, checksum, crc).
+const SECTION_PAGE_ENTRY_SIZE: usize = 7 * 8;
+
+/// Round `n` up to the next multiple of 8 — every R2007 page
+/// boundary is 8-byte-aligned per LibreDWG `(size + 7) & ~7`.
+const fn round_up_8(n: usize) -> usize {
+    (n + 7) & !7
+}
 
 /// File offset where R2007 page data begins. Computed as
 /// `R2007_HEADER_OFFSET + R2007_FILE_HEADER_ON_DISK_SIZE + R2007_CHECK_DATA_LEN`
@@ -132,8 +155,36 @@ pub(crate) struct SectionDescriptor {
     pub name_length: i64,
     pub unknown: i64,
     pub encoded: i64,
-    pub num_pages: i64,
     pub name: String,
+    /// One entry per data page that backs this section. Each is
+    /// emitted on disk as 56 bytes immediately after the section
+    /// header and name; LibreDWG reads them at line 1016-1022.
+    /// Empty if no data pages back this section yet — LibreDWG
+    /// reports "Invalid num_pages 0, skip" and treats the section
+    /// as empty (sec_dat.size = data_size, contents all zero).
+    pub pages: Vec<SectionPageEntry>,
+}
+
+/// One 56-byte page entry inside a sections-map section descriptor.
+/// Fields mirror LibreDWG's `r2007_section_page` struct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SectionPageEntry {
+    /// Offset within the section's reconstructed buffer where this
+    /// page's bytes start. Single-page sections always use 0.
+    pub offset: u64,
+    /// On-disk page size (bytes written to disk for this page,
+    /// after RS expansion + 8-byte padding).
+    pub size: u64,
+    /// Page id — must appear in the pages-map's records.
+    pub id: i64,
+    /// Decompressed/logical payload size.
+    pub uncomp_size: u64,
+    /// Stored mode uses `comp_size == uncomp_size`.
+    pub comp_size: u64,
+    /// We don't compute this; LibreDWG ignores it on read.
+    pub checksum: u64,
+    /// Same: not validated by LibreDWG.
+    pub crc: u64,
 }
 
 impl SectionDescriptor {
@@ -154,16 +205,51 @@ impl SectionDescriptor {
             name_length: name_bytes.len() as i64,
             unknown: 0,
             encoded: 0,
-            num_pages: 0,
             name: name.to_string(),
+            pages: Vec::new(),
         }
+    }
+
+    /// Build a single-page section descriptor whose data page
+    /// already exists in the pages-map with the given `page_id`.
+    /// `uncomp_size` is the section's logical content length; the
+    /// on-disk page size (after RS expansion + 8-byte padding) is
+    /// `page_size`.
+    pub fn single_page_for_name(
+        name: &str,
+        uncomp_size: u64,
+        page_size: u64,
+        page_id: i64,
+    ) -> Self {
+        let name_bytes = utf16le_bytes(name);
+        Self {
+            data_size: uncomp_size as i64,
+            max_size: uncomp_size as i64,
+            encrypted: 0,
+            hashcode: 0,
+            name_length: name_bytes.len() as i64,
+            unknown: 0,
+            encoded: 0,
+            name: name.to_string(),
+            pages: vec![SectionPageEntry {
+                offset: 0,
+                size: page_size,
+                id: page_id,
+                uncomp_size,
+                comp_size: uncomp_size,
+                checksum: 0,
+                crc: 0,
+            }],
+        }
+    }
+
+    fn num_pages(&self) -> i64 {
+        self.pages.len() as i64
     }
 
     /// Serialize this descriptor onto the sections-map content
     /// payload: 64 bytes of header + `name_length` bytes of
-    /// UTF-16LE name (with no trailing null — LibreDWG allocates
-    /// `name_length + 2` zero bytes and reads `name_length` into
-    /// that buffer, so the terminator is implicit).
+    /// UTF-16LE name + 56 bytes per page entry.
     pub fn encode(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.data_size.to_le_bytes());
         out.extend_from_slice(&self.max_size.to_le_bytes());
@@ -172,14 +258,73 @@ impl SectionDescriptor {
         out.extend_from_slice(&self.name_length.to_le_bytes());
         out.extend_from_slice(&self.unknown.to_le_bytes());
         out.extend_from_slice(&self.encoded.to_le_bytes());
-        out.extend_from_slice(&self.num_pages.to_le_bytes());
+        out.extend_from_slice(&self.num_pages().to_le_bytes());
         let name_bytes = utf16le_bytes(&self.name);
         debug_assert_eq!(name_bytes.len() as i64, self.name_length);
         out.extend_from_slice(&name_bytes);
-        debug_assert_eq!(
-            self.num_pages, 0,
-            "section page entries not yet emitted (num_pages must be 0)"
-        );
+        for entry in &self.pages {
+            out.extend_from_slice(&entry.offset.to_le_bytes());
+            out.extend_from_slice(&entry.size.to_le_bytes());
+            out.extend_from_slice(&entry.id.to_le_bytes());
+            out.extend_from_slice(&entry.uncomp_size.to_le_bytes());
+            out.extend_from_slice(&entry.comp_size.to_le_bytes());
+            out.extend_from_slice(&entry.checksum.to_le_bytes());
+            out.extend_from_slice(&entry.crc.to_le_bytes());
+        }
+    }
+}
+
+const _: () = assert!(SECTION_PAGE_ENTRY_SIZE == 56);
+
+/// On-disk bytes + metadata for an R2007 data page.
+///
+/// `comp_size` is omitted from this struct because we only emit
+/// stored-mode pages (no LZ77), so `comp_size == uncomp_size`
+/// always. Callers that need both values can use `uncomp_size`
+/// twice without ambiguity.
+#[derive(Debug, Clone)]
+pub(crate) struct R2007DataPageOnDisk {
+    pub on_disk: Vec<u8>,
+    pub uncomp_size: u64,
+}
+
+/// Encode an R2007 data page in stored mode: payload zero-padded to
+/// the next 8-byte boundary, written into a column-major
+/// `(255, 251)` Reed–Solomon block layout with **zero parity**, and
+/// the whole buffer padded to a multiple of 8 bytes.
+///
+/// We emit zero parity because LibreDWG 0.13.3's `decode_rs` only
+/// reads the `data_size` columns of each codeword (the 4 parity
+/// columns are sliced off and never validated — see
+/// decode_r2007.c:560-593). Files emitted this way load cleanly in
+/// LibreDWG. ODA Drawings SDK *does* validate parity, so emitting
+/// real RS(255, 251) parity bytes is on the conformance roadmap;
+/// the layout we write now keeps the parity columns at the correct
+/// offsets, so dropping a real encoder in later is a one-function
+/// change.
+pub(crate) fn encode_data_page(payload: &[u8]) -> R2007DataPageOnDisk {
+    let uncomp_size = payload.len();
+    // Round up to 8-byte multiple (LibreDWG `pesize` calculation).
+    let pesize = round_up_8(uncomp_size);
+    let block_count = pesize.div_ceil(RS_DATA_PAGE_DATA_SIZE).max(1);
+    let codeword_bytes = block_count * RS_DATA_PAGE_BLOCK_SIZE;
+    let on_disk_size = round_up_8(codeword_bytes);
+    let mut on_disk = vec![0u8; on_disk_size];
+    for i in 0..block_count {
+        for j in 0..RS_DATA_PAGE_DATA_SIZE {
+            let logical = i * RS_DATA_PAGE_DATA_SIZE + j;
+            let byte = if logical < uncomp_size {
+                payload[logical]
+            } else {
+                0
+            };
+            on_disk[j * block_count + i] = byte;
+        }
+        // Parity columns (j = 251..255) stay zero — see doc comment.
+    }
+    R2007DataPageOnDisk {
+        on_disk,
+        uncomp_size: uncomp_size as u64,
     }
 }
 
@@ -199,27 +344,37 @@ fn utf16le_bytes(name: &str) -> Vec<u8> {
 
 /// Canonical section names that LibreDWG treats as mandatory in
 /// R2007 (`read_data_section` returns `DWG_ERR_SECTIONNOTFOUND` for
-/// any of these missing). Names map 1:1 to
-/// `Dwg_Section_Type_r2004` (1..7 with 5 and 6 excluded as soft).
+/// any of these missing in `dwg_decode_R2007_section_header` and
+/// `_classes`, and `read_2007_section_template` returns it
+/// outright). Names map 1:1 to `Dwg_Section_Type_r2004` ids 1-7.
 /// See dwg.c::dwg_section_r2004_names.
 pub(crate) const MANDATORY_R2007_SECTION_NAMES: &[&str] = &[
-    "AcDb:Header",      // type 1
-    "AcDb:AuxHeader",   // type 2
-    "AcDb:Classes",     // type 3
-    "AcDb:Handles",     // type 4
+    "AcDb:Header",    // type 1
+    "AcDb:AuxHeader", // type 2
+    "AcDb:Classes",   // type 3
+    "AcDb:Handles",   // type 4
+    "AcDb:Template",  // type 5 — read_2007_section_template returns
+    // DWG_ERR_SECTIONNOTFOUND when missing, which crosses the
+    // critical-error threshold and forces dwgread to exit 1.
     "AcDb:AcDbObjects", // type 7
 ];
 
-/// Build the sections-map content for an R2007 file. Currently
-/// emits a placeholder descriptor for each mandatory section type
-/// with `num_pages = 0`; that's enough for LibreDWG's
-/// `read_2007_section_*` functions to find each section by name
-/// and return success with empty content. Real per-section data
-/// pages are wired in by a follow-up commit.
-pub(crate) fn encode_sections_map_content() -> Vec<u8> {
+/// Minimal AcDb:Template section payload that LibreDWG's
+/// `read_2007_section_template` accepts without complaint. The
+/// section content is consumed by `src/template.spec`:
+/// `FIELD_T16 (description, 0);` reads a `RS` (u16 LE) length
+/// followed by that many bytes; here we use length = 0 so no
+/// description bytes follow. Then `FIELD_RS (MEASUREMENT, 0);`
+/// reads one more `RS` (u16 LE) for the MEASUREMENT setting; we
+/// emit 0 (= English / Imperial). Total = 4 bytes.
+const TEMPLATE_MIN_PAYLOAD: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
+
+/// Build the sections-map content for an R2007 file from a list
+/// of pre-built section descriptors. Each descriptor contributes
+/// `64 + name_length + 56 * pages.len()` bytes to the output.
+pub(crate) fn encode_sections_map_content(descriptors: &[SectionDescriptor]) -> Vec<u8> {
     let mut out = Vec::new();
-    for name in MANDATORY_R2007_SECTION_NAMES {
-        let descriptor = SectionDescriptor::empty_for_name(name);
+    for descriptor in descriptors {
         descriptor.encode(&mut out);
     }
     out
@@ -281,23 +436,116 @@ pub fn assemble_r2007(parts: R2007FileParts) -> DwgResult<Vec<u8>> {
     out.resize(out.len() + R2007_CHECK_DATA_LEN, 0);
     debug_assert_eq!(out.len() as u64, R2007_FIRST_PAGE_OFFSET);
 
-    // 3. Sections-map system page (currently empty content).
-    let sections_map_content = encode_sections_map_content();
+    // 3. Per-section data pages.
+    //
+    //    LibreDWG's `read_2007_section_header` and
+    //    `read_2007_section_classes` BOTH bail with a critical
+    //    error if their respective start sentinels are missing:
+    //    `DWG_SENTINEL_VARIABLE_BEGIN` for AcDb:Header and
+    //    `DWG_SENTINEL_CLASS_BEGIN` for AcDb:Classes. To clear
+    //    those critical paths we emit one minimal data page per
+    //    sentinel-required section, containing just the 16-byte
+    //    sentinel. After bit_search_sentinel succeeds, subsequent
+    //    bit_read_RL/RL/BS reads either land on the 16-byte
+    //    sentinel content or fall off the buffer (returns 0) and
+    //    hit a non-critical VALUEOUTOFBOUNDS on `max_num < 500`.
+    //
+    //    The remaining mandatory sections (AcDb:AuxHeader,
+    //    AcDb:Handles, AcDb:AcDbObjects) are still num_pages=0
+    //    placeholders — their `read_2007_section_*` paths return
+    //    VALUEOUTOFBOUNDS (non-critical) on missing content.
+    struct EmittedDataPage {
+        page_id: i64,
+        page: R2007DataPageOnDisk,
+        section_name: &'static str,
+    }
+    let mut data_pages: Vec<EmittedDataPage> = Vec::new();
+    let mut next_page_id: i64 = 2; // 1 is reserved for the sections-map.
+
+    let header_payload = HEADER_VARS_BEGIN.to_vec();
+    let header_page = encode_data_page(&header_payload);
+    let header_page_id = next_page_id;
+    next_page_id += 1;
+    out.extend_from_slice(&header_page.on_disk);
+    data_pages.push(EmittedDataPage {
+        page_id: header_page_id,
+        page: header_page,
+        section_name: "AcDb:Header",
+    });
+
+    let classes_payload = CLASSES_BEGIN.to_vec();
+    let classes_page = encode_data_page(&classes_payload);
+    let classes_page_id = next_page_id;
+    next_page_id += 1;
+    out.extend_from_slice(&classes_page.on_disk);
+    data_pages.push(EmittedDataPage {
+        page_id: classes_page_id,
+        page: classes_page,
+        section_name: "AcDb:Classes",
+    });
+
+    let template_payload = TEMPLATE_MIN_PAYLOAD.to_vec();
+    let template_page = encode_data_page(&template_payload);
+    let template_page_id = next_page_id;
+    next_page_id += 1;
+    out.extend_from_slice(&template_page.on_disk);
+    data_pages.push(EmittedDataPage {
+        page_id: template_page_id,
+        page: template_page,
+        section_name: "AcDb:Template",
+    });
+
+    // 4. Build sections-map descriptors. AcDb:Header and
+    //    AcDb:Classes point at their data pages; the rest stay
+    //    num_pages=0.
+    let descriptors: Vec<SectionDescriptor> = MANDATORY_R2007_SECTION_NAMES
+        .iter()
+        .map(|name| {
+            if let Some(emitted) = data_pages
+                .iter()
+                .find(|emitted| emitted.section_name == *name)
+            {
+                SectionDescriptor::single_page_for_name(
+                    name,
+                    emitted.page.uncomp_size,
+                    emitted.page.on_disk.len() as u64,
+                    emitted.page_id,
+                )
+            } else {
+                SectionDescriptor::empty_for_name(name)
+            }
+        })
+        .collect();
+
+    // 5. Sections-map system page.
+    let sections_map_content = encode_sections_map_content(&descriptors);
     let sections_map = encode_system_page(&sections_map_content);
     let sections_map_page_id: i64 = 1;
-    let sections_map_offset = out.len() as u64;
     out.extend_from_slice(&sections_map.on_disk);
 
-    // 4. Pages-map content: just one record, the sections-map page.
-    //    Each record is (size, id) in u64 LE pairs.
-    let pages_records: Vec<(i64, u64)> =
-        vec![(sections_map_page_id, sections_map.on_disk.len() as u64)];
+    // 6. Pages-map content.
+    //
+    //    LibreDWG computes each page's file offset by accumulating
+    //    `size` from the start of the page region (0x480) — see
+    //    decode_r2007.c:1086-1095 where `offset += size` per page.
+    //    The order of (id, size) records here MUST match the order
+    //    pages were written to disk above. We wrote
+    //    `[AcDb:Header data, AcDb:Classes data, sections-map]`
+    //    above, so the records list mirrors that. Page ids stay
+    //    bound to specific pages via the `id` field — the
+    //    sections-map descriptors still reference id=1 for the
+    //    sections-map and id=2/3 for the two data pages.
+    let mut pages_records: Vec<(i64, u64)> = Vec::with_capacity(data_pages.len() + 1);
+    for emitted in &data_pages {
+        pages_records.push((emitted.page_id, emitted.page.on_disk.len() as u64));
+    }
+    pages_records.push((sections_map_page_id, sections_map.on_disk.len() as u64));
     let pages_map_content = encode_pages_map_content(&pages_records);
     let pages_map = encode_system_page(&pages_map_content);
     let pages_map_offset_rel = (out.len() as u64) - R2007_FIRST_PAGE_OFFSET;
     out.extend_from_slice(&pages_map.on_disk);
 
-    // 5. Build the R2007 file header struct now that all offsets/
+    // 7. Build the R2007 file header struct now that all offsets/
     //    sizes are known.
     let file_size = out.len() as i64;
     let mut header = R2007FileHeader::new();
@@ -308,21 +556,17 @@ pub fn assemble_r2007(parts: R2007FileParts) -> DwgResult<Vec<u8>> {
     header.pages_map_size_uncomp = pages_map.size_uncomp;
     header.pages_map_correction = pages_map.repeat_count;
     header.pages_amount = (pages_records.len() + 1) as i64; // pages + the map itself
-    header.pages_maxid = sections_map_page_id;
+    header.pages_maxid = next_page_id - 1;
     header.num_sections = MANDATORY_R2007_SECTION_NAMES.len() as i64;
     header.sections_map_id = sections_map_page_id;
     header.sections_map_size_comp = sections_map.size_comp;
     header.sections_map_size_uncomp = sections_map.size_uncomp;
     header.sections_map_correction = sections_map.repeat_count;
 
-    // 6. Encode the file header on disk and patch it in at 0x80.
+    // 8. Encode the file header on disk and patch it in at 0x80.
     let header_bytes = encode_file_header_on_disk(&header);
     out[R2007_HEADER_OFFSET..R2007_HEADER_OFFSET + R2007_FILE_HEADER_ON_DISK_SIZE]
         .copy_from_slice(&header_bytes);
-
-    // Silence the unused-binding warnings for variables we keep for
-    // future expansion of the assembler.
-    let _ = sections_map_offset;
 
     Ok(out)
 }
@@ -449,8 +693,16 @@ mod tests {
             MANDATORY_R2007_SECTION_NAMES.len() as i64,
         );
         assert_eq!(parsed.sections_map_id, 1);
-        assert_eq!(parsed.pages_map.len(), 1);
-        assert_eq!(parsed.pages_map[0].0, 1);
+        // pages-map records: 3 data pages (AcDb:Header,
+        // AcDb:Classes, AcDb:Template) then sections-map. The
+        // records are emitted in the same on-disk order as the
+        // pages themselves so LibreDWG's "offset += size"
+        // accumulation lines up.
+        assert_eq!(parsed.pages_map.len(), 4);
+        assert_eq!(parsed.pages_map[0].0, 2); // AcDb:Header id
+        assert_eq!(parsed.pages_map[1].0, 3); // AcDb:Classes id
+        assert_eq!(parsed.pages_map[2].0, 4); // AcDb:Template id
+        assert_eq!(parsed.pages_map[3].0, 1); // sections-map id
     }
 
     #[test]
@@ -490,8 +742,10 @@ mod tests {
         let header_region =
             &file[R2007_HEADER_OFFSET..R2007_HEADER_OFFSET + R2007_FILE_HEADER_ON_DISK_SIZE];
         let header = decode_file_header_on_disk(header_region).unwrap();
-        // 1 user page (sections-map) + 1 for the pages-map itself = 2.
-        assert_eq!(header.pages_amount, 2);
+        // 4 user pages (sections-map + AcDb:Header data +
+        // AcDb:Classes data + AcDb:Template data) + 1 for the
+        // pages-map itself = 5.
+        assert_eq!(header.pages_amount, 5);
         assert_eq!(
             header.num_sections,
             MANDATORY_R2007_SECTION_NAMES.len() as i64,
@@ -536,6 +790,7 @@ mod tests {
                 "AcDb:AuxHeader",
                 "AcDb:Classes",
                 "AcDb:Handles",
+                "AcDb:Template",
                 "AcDb:AcDbObjects",
             ]
         );
