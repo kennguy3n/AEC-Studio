@@ -40,6 +40,18 @@
 //! 5. The second-header sentinel block is **optional**. LibreDWG only
 //!    decodes it if it finds `DWG_SENTINEL_2NDHEADER_BEGIN` via a
 //!    forward search; omitting it is well-formed.
+//!
+//! # Known limitation: no second-header block
+//!
+//! AutoCAD's `RECOVER` command uses the second-header sentinel block
+//! as a redundant cross-check when the primary header is corrupt.
+//! Because [`assemble_r2000`] emits the canonical minimal layout
+//! (3 locators, no second-header), files produced by this writer are
+//! readable by LibreDWG, AutoCAD, and any spec-compliant reader, but
+//! `RECOVER` has nothing to fall back on if the locator-block CRC is
+//! damaged. This is the same tradeoff LibreDWG's own minimal-encoder
+//! path makes; emitting the second-header block is tracked as a
+//! future enhancement and does not affect normal open-and-save flow.
 
 use crate::dwg::bits::crc_x25;
 use crate::dwg::bits::reader::HandleRef;
@@ -63,6 +75,14 @@ const HEADER_CRC_SEED: u16 = 0xC0C1;
 /// anywhere from 3 to 6; the canonical minimal layout is 3:
 /// Header (0), Classes (1), Handles (2).
 const LOCATOR_COUNT: usize = 3;
+
+/// Maximum number of bytes after the locator CRC in which to look for
+/// the HEADER_END sentinel. LibreDWG accepts a few bytes of padding
+/// between the CRC and the sentinel; we pick a generous-but-bounded
+/// window so a corrupt file still fails fast rather than scanning the
+/// entire body. Our writer emits the sentinel immediately, so this
+/// only matters when reading third-party files.
+const SENTINEL_SEARCH_WINDOW: usize = 256;
 
 /// All sections needed to write a complete R14/R2000 file.
 pub struct R2000FileParts {
@@ -281,14 +301,29 @@ pub fn parse_r2000(bytes: &[u8]) -> DwgResult<R2000File> {
         });
     }
 
-    // Verify the HEADER_END sentinel.
-    let sentinel_offset = crc_offset + 2;
-    let actual_sentinel = &bytes[sentinel_offset..sentinel_offset + HEADER_END.len()];
-    if actual_sentinel != HEADER_END {
+    // Forward-search for the HEADER_END sentinel within a bounded
+    // window after the locator CRC. LibreDWG does the same — third-
+    // party R2000 files occasionally have a small variable-length
+    // padding between the CRC and the sentinel, so a strict positional
+    // check would refuse otherwise valid files. The sentinel itself is
+    // 16 random-looking bytes, so the false-match probability inside
+    // any reasonable window is negligible (~2^-128 per candidate
+    // position).
+    let search_start = crc_offset + 2;
+    let search_end = bytes
+        .len()
+        .min(search_start + SENTINEL_SEARCH_WINDOW + HEADER_END.len());
+    if bytes[search_start..search_end]
+        .windows(HEADER_END.len())
+        .position(|w| w == HEADER_END)
+        .is_none()
+    {
         return Err(DwgError::MalformedObject {
             class: "FileLayout".into(),
-            offset: sentinel_offset as u64,
-            message: "missing or wrong HEADER_END sentinel".into(),
+            offset: search_start as u64,
+            message: format!(
+                "HEADER_END sentinel not found within {SENTINEL_SEARCH_WINDOW} bytes of locator CRC"
+            ),
         });
     }
 
@@ -564,6 +599,41 @@ mod tests {
             parse_r2000(&bytes),
             Err(DwgError::HeaderCrcMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn r2000_file_tolerates_padding_before_header_end_sentinel() {
+        // LibreDWG forward-searches for HEADER_END within a bounded
+        // window after the locator CRC, so we must accept a small
+        // amount of padding between the CRC and the sentinel — third-
+        // party R2000 writers occasionally emit a handful of zero
+        // bytes there. Insert 8 bytes of padding and verify the
+        // parser still finds the sentinel.
+        let parts = R2000FileParts {
+            version: Version::R2000,
+            header_vars: HeaderVarsSection::minimal(Version::R2000),
+            classes: ClassesSection::empty(Version::R2000),
+            objects: Vec::new(),
+        };
+        let bytes = assemble_r2000(parts).unwrap();
+        let sentinel_offset = FIXED_HEADER_LEN + LOCATOR_COUNT * 9 + 2;
+        let mut padded = Vec::with_capacity(bytes.len() + 8);
+        padded.extend_from_slice(&bytes[..sentinel_offset]);
+        padded.extend_from_slice(&[0u8; 8]);
+        padded.extend_from_slice(&bytes[sentinel_offset..]);
+        // Note: section locators point into the original bytes layout,
+        // not the padded one. We're only exercising the sentinel
+        // search itself; section walking will fail later, which is
+        // fine — we just want to confirm parse_r2000 advances past
+        // the sentinel-search step without error.
+        match parse_r2000(&padded) {
+            Err(DwgError::MalformedObject { message, .. })
+                if message.contains("HEADER_END sentinel not found") =>
+            {
+                panic!("parser rejected padding before HEADER_END within the search window");
+            }
+            _ => {}
+        }
     }
 
     #[test]
