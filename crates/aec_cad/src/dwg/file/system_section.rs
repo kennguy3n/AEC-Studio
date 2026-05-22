@@ -265,9 +265,12 @@ pub struct SystemPageHeader {
     /// `1 = stored`, `2 = LZ77 compressed`.
     pub compression_type: u32,
     /// LibreDWG `dwg_section_page_checksum` (Adler-32-style, NOT a CRC)
-    /// over the first 20 bytes with `checksum` zeroed, seeded by the
-    /// checksum of the *compressed* payload. See [`system_page_checksum`]
-    /// for the exact two-pass ordering.
+    /// in two passes: first over the 20-byte header with this
+    /// `checksum` field zeroed (producing an intermediate `seed`),
+    /// then chained over the compressed payload using that `seed`. The
+    /// header is checksummed FIRST; the result of the header pass
+    /// seeds the payload pass, NOT the other way around. See
+    /// [`system_page_checksum`] for the exact implementation.
     pub checksum: u32,
 }
 
