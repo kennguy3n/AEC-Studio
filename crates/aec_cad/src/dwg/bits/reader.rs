@@ -197,6 +197,21 @@ impl<'a> BitReader<'a> {
         }
     }
 
+    /// Read a Bit-encoded Object Type (BOT, R2010+).
+    /// 2-bit shape prefix:
+    /// - `00` → followed by RC (8 bits); value range [0, 255]
+    /// - `01` → followed by RC + 0x1f0; value range [0x1f0, 0x2ef]
+    /// - else → followed by RS (16 bits)
+    ///
+    /// See LibreDWG `bit_read_BOT` (bits.c:713).
+    pub fn read_bot(&mut self) -> DwgResult<u16> {
+        match self.read_bb()? {
+            0 => Ok(self.read_bits_u32(8)? as u16),
+            1 => Ok((self.read_bits_u32(8)? as u16).wrapping_add(0x1f0)),
+            _ => Ok(self.read_rs()?),
+        }
+    }
+
     /// Read a Bit Long (BL, signed 32-bit-equivalent).
     /// Control bits:
     /// - `00` → followed by 32-bit raw little-endian long
@@ -448,6 +463,39 @@ impl<'a> BitReader<'a> {
         Err(DwgError::ModularOverflow {
             type_name: "MC",
             bytes: 5,
+        })
+    }
+
+    /// Unsigned Modular Char (UMC). Variable-length 7-bit LE chunks
+    /// with the 0x80 bit of each byte as continuation flag. Up to 8
+    /// bytes (sufficient for any handle value).
+    ///
+    /// Returns the decoded value as u64; the first byte holds the
+    /// least-significant 7 bits and each subsequent byte adds the
+    /// next 7 bits. Last byte has the continuation flag cleared.
+    ///
+    /// See LibreDWG `bit_read_UMC` (bits.c:1006).
+    pub fn read_umc(&mut self) -> DwgResult<u64> {
+        let mut value: u64 = 0;
+        let mut shift: u32 = 0;
+        for byte_idx in 0..8 {
+            let byte = self.read_bits_u32(8)?;
+            let payload = u64::from(byte & 0x7f);
+            value |= payload << shift;
+            if byte & 0x80 == 0 {
+                return Ok(value);
+            }
+            shift += 7;
+            if byte_idx == 7 {
+                return Err(DwgError::ModularOverflow {
+                    type_name: "UMC",
+                    bytes: 8,
+                });
+            }
+        }
+        Err(DwgError::ModularOverflow {
+            type_name: "UMC",
+            bytes: 8,
         })
     }
 

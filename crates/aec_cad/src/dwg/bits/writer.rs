@@ -263,6 +263,28 @@ impl BitWriter {
         }
     }
 
+    /// Bit-encoded Object Type (R2010+). 2-bit shape prefix then a
+    /// variable-length type field — used for the object_type field
+    /// at the start of every entity body in R2010+.
+    ///
+    /// See LibreDWG `bit_write_BOT` (bits.c:733):
+    /// - value `< 256`:   BB 0b00 + RC (1 byte)
+    /// - value `< 0x7fff`: BB 0b01 + RC (value - 0x1f0) (1 byte)
+    /// - else:            BB 0b10 + RS (2 bytes)
+    pub fn write_bot(&mut self, value: u16) -> DwgResult<()> {
+        if value < 256 {
+            self.write_bb(0b00)?;
+            self.write_bits_u32(8, u32::from(value))?;
+        } else if value < 0x7fff && value.wrapping_sub(0x1f0) < 256 {
+            self.write_bb(0b01)?;
+            self.write_bits_u32(8, u32::from(value - 0x1f0))?;
+        } else {
+            self.write_bb(0b10)?;
+            self.write_rs(value)?;
+        }
+        Ok(())
+    }
+
     /// Bit Long — encode using the smallest of the three shapes.
     pub fn write_bl(&mut self, value: i64) -> DwgResult<()> {
         if value == 0 {
@@ -454,6 +476,57 @@ impl BitWriter {
         for (i, payload) in bytes.iter().enumerate() {
             let cont = if i == bytes.len() - 1 { 0u8 } else { 0x80 };
             self.write_bits_u32(8, u32::from(cont | payload))?;
+        }
+        Ok(())
+    }
+
+    /// Unsigned Modular Char (UMC). 7-bit LE chunks with continuation
+    /// flag (0x80) on all bytes except the last. LibreDWG implementation
+    /// (bits.c::bit_write_UMC) always emits at least four payload bytes
+    /// — the upper four `byte[0..4]` slots are reserved for the
+    /// most-significant chunks and are skipped only if AT LEAST one of
+    /// them holds payload bits. We match that quirk exactly so files
+    /// produced here round-trip through `bit_read_UMC` byte-for-byte.
+    /// The bytes are written LSB-chunk first; the last byte's
+    /// continuation flag is cleared.
+    ///
+    /// See LibreDWG `bit_write_UMC` (bits.c:1044) for the reference
+    /// implementation.
+    pub fn write_umc(&mut self, value: u64) -> DwgResult<()> {
+        const MAX_BYTE_UMC: usize = 8;
+        // Split `value` into 7-bit chunks, MSB chunk at index 0 and
+        // LSB chunk at index 7. Each chunk is OR-ed with 0x80
+        // initially; the final write step strips the flag on the
+        // most-significant emitted byte.
+        let mut bytes = [0u8; MAX_BYTE_UMC];
+        let mut mask: u64 = 0x7f;
+        for i in (0..MAX_BYTE_UMC).rev() {
+            let j = (MAX_BYTE_UMC - 1 - i) * 7;
+            bytes[i] = ((value & mask) >> j) as u8 | 0x80;
+            mask = mask.wrapping_shl(7);
+        }
+        // Find first byte (MSB-first) with non-flag payload bits.
+        // Loop only scans the first four slots — LibreDWG mandates
+        // the minimum write length is bytes[4..8] (4 bytes).
+        let mut start: usize = 4;
+        for (i, b) in bytes.iter().enumerate().take(4) {
+            if b & 0x7f != 0 {
+                start = i;
+                break;
+            }
+        }
+        // UMC is unsigned, but the upper-bit-of-chunk-6 ambiguity is
+        // resolved here: if the high payload bit (0x40) of the
+        // most-significant emitted byte is set and we have room for
+        // another byte at index `start - 1`, prepend a zero-payload
+        // continuation byte to keep readers from interpreting the
+        // value as negative.
+        if bytes[start] & 0x40 != 0 && start > 0 {
+            start -= 1;
+        }
+        bytes[start] &= 0x7f;
+        for j in (start..MAX_BYTE_UMC).rev() {
+            self.write_bits_u32(8, u32::from(bytes[j]))?;
         }
         Ok(())
     }
@@ -883,6 +956,82 @@ mod tests {
             let got = round_trip(move |w| w.write_mc(v), |r| r.read_mc());
             assert_eq!(got, v, "MC round-trip failed for {v}");
         }
+    }
+
+    #[test]
+    fn umc_matches_libredwg_minimum_4_byte_encoding() {
+        // LibreDWG's bit_write_UMC for value=10 emits the exact byte
+        // sequence [0x8A, 0x80, 0x80, 0x00] (LSB chunk first, with
+        // three continuation-flagged padding bytes and a zero
+        // terminator). Pin that here so any future "optimization"
+        // toward a shorter varint breaks the test, not the on-disk
+        // format.
+        let mut w = BitWriter::new();
+        w.write_umc(10).unwrap();
+        assert_eq!(w.into_bytes(), [0x8A, 0x80, 0x80, 0x00]);
+
+        // Value with bits in the MSB chunk: 0x12345678 (= 305419896).
+        // LibreDWG splits this into 7-bit chunks: 0x78 (lo) 0x6c 0x4d
+        // 0x12_<...>. Verify writer emits a sequence whose decoder
+        // recovers the value.
+        let mut w2 = BitWriter::new();
+        w2.write_umc(0x1234_5678).unwrap();
+        let got = w2.into_bytes();
+        let mut r = crate::dwg::bits::BitReader::new(&got);
+        assert_eq!(r.read_umc().unwrap(), 0x1234_5678);
+    }
+
+    #[test]
+    fn umc_round_trips() {
+        // LibreDWG's UMC emits a 4-byte minimum encoding even for
+        // small values, so a 0 round-trips through 4 bytes. Verify
+        // the boundary cases — 0, low single-byte values, exact 7/14/21-bit
+        // boundaries, larger 32-bit, and a 56-bit value (max
+        // representable in 8 bytes of 7-bit payload).
+        let cases: &[u64] = &[
+            0,
+            1,
+            0x40,
+            0x7F,
+            0x80,
+            0x3FFF,
+            0x4000,
+            0x1F_FFFF,
+            0x20_0000,
+            0xFFFF_FFFF,
+            0x7F_FFFF_FFFF_FFFF,
+        ];
+        for &v in cases {
+            let got = round_trip(move |w| w.write_umc(v), |r| r.read_umc());
+            assert_eq!(got, v, "UMC round-trip failed for {v:#x}");
+        }
+    }
+
+    #[test]
+    fn bot_round_trips_all_three_shapes() {
+        // Shape 0: 0..=255 (BB 00 + RC).
+        // Shape 1: 0x1f0..=0x2ef (BB 01 + (RC - 0x1f0)). LibreDWG's
+        //          decoder adds 0x1f0 unconditionally to the RC.
+        // Shape 2: anything else (BB 10 + RS).
+        let cases: &[u16] = &[
+            0, 1, 19, 255, 0x1f0, 0x200, 0x2ef, 0x300, 0x500, 0xfff, 0x1234,
+        ];
+        for &v in cases {
+            let got = round_trip(move |w| w.write_bot(v), |r| r.read_bot());
+            assert_eq!(got, v, "BOT round-trip failed for {v:#x}");
+        }
+    }
+
+    #[test]
+    fn bot_matches_libredwg_shape_encoding() {
+        // Pin the exact bit pattern for each shape so a future
+        // refactor can't silently misalign with LibreDWG's reader.
+        // 19 (LINE) → BB 00 (2 bits) + 0x13 (8 bits) = 0b00_00010011 then
+        // padded at the end.
+        let mut w = BitWriter::new();
+        w.write_bot(19).unwrap();
+        let bytes = w.into_bytes();
+        assert_eq!(bytes, [0b00_000100, 0b11_000000]);
     }
 
     #[test]

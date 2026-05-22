@@ -120,31 +120,62 @@ impl Default for BitBuf {
 impl ObjectRecord {
     /// Encode this record to the wire format for `version`.
     ///
-    /// Bit layout (R2010+):
+    /// Bit layout depends on the major version family:
+    ///
+    /// **R2000 .. R2007** (inline `bitsize`, no separate handle stream):
     ///
     /// ```text
-    /// [0]            BS  object_type     (variable: 2-18 bits)
-    /// [bs_end]       RL  bitsize         (32 bits, back-patched)
-    /// [bs_end+32]    H   handle
-    ///                BS  EED-len = 0     (no EED)
-    ///                common entity header
-    ///                per-type payload
-    /// [bitsize]      handle stream
+    /// MS  object_size              (body + CRC, NOT including itself)
+    /// [body:]
+    ///   BS  object_type            (2-18 bits)
+    ///   RL  bitsize                (back-patched: body-bit position of handle stream)
+    ///   H   handle
+    ///   BS  EED-len = 0
+    ///   common entity header
+    ///   per-type payload
+    ///   handle stream              (starts at body-bit position `bitsize`)
+    /// RS  crc                      (over body bytes only)
     /// ```
     ///
-    /// `bitsize` is measured from absolute bit 0 of the body (the
-    /// position right after the MS size prefix), so it == the bit
-    /// position where the handle stream starts. R2000-R2007 omit the
-    /// RL field and the handle stream simply follows the data stream
-    /// contiguously.
+    /// **R2010+** (split data/handle streams, `handlestream_size` UMC
+    /// emitted BEFORE the body so it is NOT counted in `object_size`):
+    ///
+    /// ```text
+    /// MS   object_size             (body + CRC, NOT including UMC or MS itself)
+    /// UMC  handlestream_size       (number of HANDLE-STREAM bits in the body)
+    /// [body:]
+    ///   BS  object_type
+    ///   H   handle
+    ///   BS  EED-len = 0
+    ///   common entity header
+    ///   per-type payload
+    ///   handle stream              (last `handlestream_size` bits of body)
+    /// RS  crc
+    /// ```
+    ///
+    /// The R2010+ decoder recovers the data-stream length via
+    /// `bitsize = object_size * 8 - handlestream_size` and uses
+    /// `handlestream_size` to bound the handle-stream sub-reader. We
+    /// follow LibreDWG's `bit_write_UMC` byte-layout exactly so the
+    /// decoder finds the handle stream at the right offset.
+    ///
+    /// Source: LibreDWG `decode.c::dwg_decode_entity` (line 4136 for
+    /// the R2000-R2007 inline RL branch) and `decode.c::read_objects`
+    /// (line 5150 for the R2010+ UMC branch).
     pub fn encode(&self, version: Version) -> DwgResult<Vec<u8>> {
         let mut body = BitWriter::new();
 
-        body.write_bs(self.object_type as u16 as i32)?;
+        // R2010+ uses BOT (variable-length object type with 2-bit
+        // shape prefix); earlier versions use plain BS.
+        if version >= Version::R2010 {
+            body.write_bot(self.object_type as u16)?;
+        } else {
+            body.write_bs(self.object_type as u16 as i32)?;
+        }
 
-        let has_rl = version >= Version::R2010;
+        let inline_rl_bitsize = (Version::R2000..=Version::R2007).contains(&version);
         let rl_bit_pos = body.bit_position();
-        if has_rl {
+        if inline_rl_bitsize {
             body.write_rl(0)?; // placeholder; back-patched below
         }
 
@@ -153,12 +184,12 @@ impl ObjectRecord {
         self.common.encode_for_version(version, &mut body)?;
         write_bitbuf(&mut body, &self.payload_bits)?;
 
-        // The current position is the absolute body bit position
-        // where the handle stream starts — which is exactly the
-        // `bitsize` value the reader will use as
-        // `hdlpos = bitsize_pos + bitsize` (bitsize_pos = 0 here).
+        // Body-bit position where the handle stream begins. For
+        // R2000-R2007 this is the value of the inline RL `bitsize`
+        // field; for R2010+ this is the boundary used to derive
+        // `handlestream_size = body_total_bits - handle_start`.
         let handle_stream_start_bit = body.bit_position();
-        if has_rl {
+        if inline_rl_bitsize {
             let bitsize_value = u32::try_from(handle_stream_start_bit).map_err(|_| {
                 DwgError::InternalInvariant(format!(
                     "object record body exceeds 4Gib (handle_stream_start_bit={handle_stream_start_bit})"
@@ -169,12 +200,36 @@ impl ObjectRecord {
 
         encode_handle_stream(&mut body, version, &self.handles, &self.common)?;
 
+        let body_total_bits = body.bit_position();
         let body_bytes = body.into_bytes();
         let crc = crc_x25(0xc0c1, &body_bytes);
 
         let mut out = BitWriter::new();
-        // MS counts bytes including the trailing CRC but NOT itself.
+        // MS counts the body bytes including the trailing CRC, but
+        // NOT the UMC handlestream_size prefix (R2010+) and not the
+        // MS itself.
         out.write_ms((body_bytes.len() + 2) as u32)?;
+        if version >= Version::R2010 {
+            // handlestream_size = obj->size * 8 - bitsize where
+            // `bitsize` is the body-relative bit position of the
+            // handle stream start. `obj->size` is the MS value
+            // = body_bytes.len() + 2 (CRC). LibreDWG includes the
+            // 16-bit CRC region in the handle-stream extent (see
+            // `obj_handle_stream` decode.c:4093-4096 and
+            // `hdl_dat->size = obj->size` at decode.c:4098), so
+            // we compute it as `(body_bytes.len() + 2) * 8 -
+            // handle_stream_start_bit`.
+            let _ = body_total_bits; // captured for symmetric debug; not used here
+            let obj_size_bits = (body_bytes.len() as u64 + 2) * 8;
+            let handlestream_size = obj_size_bits
+                .checked_sub(handle_stream_start_bit)
+                .ok_or_else(|| {
+                    DwgError::InternalInvariant(format!(
+                        "handle stream start ({handle_stream_start_bit}) exceeds obj_size_bits ({obj_size_bits})"
+                    ))
+                })?;
+            out.write_umc(handlestream_size)?;
+        }
         for b in &body_bytes {
             out.write_bits_u32(8, u32::from(*b))?;
         }
@@ -256,10 +311,18 @@ impl ObjectRecord {
         Ok((header.object_type, header.handle, header.common, total))
     }
 
-    /// Decode just the header (BS object_type, [RL bitsize], H handle,
-    /// EED terminator, common header) and return the body bit reader
-    /// positioned at the start of the payload, along with the handle
-    /// stream offset hint (Some for R2010+, None for R2000-R2007).
+    /// Decode just the framing (MS size, [UMC handlestream_size for
+    /// R2010+], BS object_type, [RL bitsize for R2000-R2007], H
+    /// handle, EED terminator, common header) and return the body bit
+    /// reader positioned at the start of the per-type payload, along
+    /// with the body-relative bit position where the handle stream
+    /// starts.
+    ///
+    /// The returned `handle_stream_bit_offset` is the body-relative
+    /// bit position where the handle stream begins. For R2000-R2007
+    /// this is the value of the inline RL `bitsize` field; for R2010+
+    /// it is derived from `obj->size * 8 - handlestream_size` per
+    /// LibreDWG `decode.c::read_objects` line 5155.
     fn decode_header_only(
         version: Version,
         bytes: &[u8],
@@ -273,6 +336,14 @@ impl ObjectRecord {
                 message: format!("record declares size {size} < 2"),
             });
         }
+        // R2010+: the UMC handlestream_size sits between MS and the
+        // body. It is NOT counted in `size` (see decode.c:5150-5157),
+        // but it advances the reader cursor before the body begins.
+        let modern_handlestream_size = if version >= Version::R2010 {
+            Some(r.read_umc()?)
+        } else {
+            None
+        };
         let body_start = (r.bit_position() / 8) as usize;
         let body_end = body_start + size - 2;
         let crc_end = body_start + size;
@@ -293,12 +364,34 @@ impl ObjectRecord {
             });
         }
         let mut body_r = BitReader::new(body);
-        let object_type_raw = body_r.read_bs()?;
+        let object_type_raw = if version >= Version::R2010 {
+            body_r.read_bot()?
+        } else {
+            body_r.read_bs()? as u16
+        };
         let object_type =
-            ObjectType::from_u16(object_type_raw as u16).ok_or(DwgError::UnknownObjectType {
-                value: object_type_raw as u16,
+            ObjectType::from_u16(object_type_raw).ok_or(DwgError::UnknownObjectType {
+                value: object_type_raw,
             })?;
-        let handle_stream_offset_hint = if version >= Version::R2010 {
+        let handle_stream_offset_hint = if let Some(handlestream_size) = modern_handlestream_size {
+            // R2010+: bitsize (body-relative bit position of handle
+            // stream start) = obj_size_bits - handlestream_size.
+            let obj_size_bits = (size as u64) * 8;
+            let bitsize = obj_size_bits
+                .checked_sub(handlestream_size)
+                .ok_or_else(|| {
+                    DwgError::MalformedObject {
+                        class: "ObjectRecord".to_string(),
+                        offset: 0,
+                        message: format!(
+                            "handlestream_size ({handlestream_size}) exceeds obj_size_bits ({obj_size_bits})"
+                        ),
+                    }
+                })?;
+            Some(bitsize)
+        } else if (Version::R2000..=Version::R2007).contains(&version) {
+            // R2000-R2007: inline RL bitsize between BS object_type
+            // and H handle (decode.c:4136-4138).
             Some(u64::from(body_r.read_rl()?))
         } else {
             None
@@ -847,16 +940,25 @@ mod tests {
 
     #[test]
     fn record_decode_reports_unknown_object_type() {
-        // Build a minimal "bad type" stream:
+        // Build a minimal R2010+ "bad type" stream. R2010+ format is:
+        //   MS object_size
+        //   UMC handlestream_size  <-- between MS and body
+        //   [body: BS unknown_type, H handle, BS eed-len=0, ...]
+        //   RS crc
         let mut body = BitWriter::new();
-        body.write_bs(0xfff).unwrap(); // unknown type
-        body.write_rl(0).unwrap();
+        // R2010+ uses BOT (variable-length type field), and 0xfff
+        // falls in the third (RS) shape since it's > 0x2ef.
+        body.write_bot(0xfff).unwrap();
         body.write_h(HandleRef { code: 0, value: 1 }).unwrap();
         body.write_bs(0).unwrap(); // EED terminator
         let body_bytes = body.into_bytes();
         let crc = crc_x25(0xc0c1, &body_bytes);
         let mut out = BitWriter::new();
         out.write_ms((body_bytes.len() + 2) as u32).unwrap();
+        // Minimal valid UMC for R2010+. handlestream_size = 0 works
+        // here because the unknown-type check fires before any
+        // handle-stream parsing happens.
+        out.write_umc(0).unwrap();
         for b in &body_bytes {
             out.write_bits_u32(8, u32::from(*b)).unwrap();
         }
