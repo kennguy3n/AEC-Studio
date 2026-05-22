@@ -551,11 +551,20 @@ pub struct R2007FileParts {
 /// — that wiring comes in a follow-up commit once the file-header
 /// layer is validated end-to-end against `dwgread`.
 pub fn assemble_r2007(parts: R2007FileParts) -> DwgResult<Vec<u8>> {
-    if !parts.version.uses_utf16_strings() {
+    // Tight version guard: only Version::R2007 is supported here.
+    //
+    // R2010/R2013/R2018 also satisfy `uses_utf16_strings()`, but they
+    // are routed through `assemble_r2004` in `modern.rs` because
+    // LibreDWG decodes them via `decode_R2004`, not `decode_R2007`.
+    // Accepting them here would produce a file with the wrong-version
+    // signature wrapped around an R2007-style internal layout, which
+    // would confuse downstream parsers. The narrower guard matches
+    // the actual dispatch in `write_modern`.
+    if parts.version != Version::R2007 {
         return Err(DwgError::UnsupportedInVersion {
             version: parts.version,
             what: format!(
-                "assemble_r2007 only handles R2007+; got {:?}",
+                "assemble_r2007 only handles R2007 (R2010+/R2018 go through assemble_r2004); got {:?}",
                 parts.version
             ),
         });
@@ -1141,10 +1150,31 @@ mod tests {
 
     #[test]
     fn assemble_rejects_non_r2007_version() {
-        let err = assemble_r2007(empty_parts(Version::R2004));
-        assert!(err.is_err());
-        let err = assemble_r2007(empty_parts(Version::R2000));
-        assert!(err.is_err());
+        // Pre-R2007 versions are rejected (different file layout).
+        for version in [Version::R12, Version::R14, Version::R2000, Version::R2004] {
+            assert!(
+                assemble_r2007(empty_parts(version)).is_err(),
+                "assemble_r2007 must reject {version:?} (pre-R2007 layout)"
+            );
+        }
+        // R2010/R2013/R2018 also satisfy `uses_utf16_strings()` but
+        // are routed through `assemble_r2004` in modern.rs because
+        // LibreDWG decodes them via decode_R2004, not decode_R2007.
+        // The tightened guard here protects against future callers
+        // that bypass modern.rs and reach assemble_r2007 directly
+        // with a UTF-16-string version that isn't R2007 — they would
+        // otherwise produce a file with the wrong-version signature
+        // wrapped around an R2007-style internal layout. This test
+        // pins that the guard rejects R2010/R2013/R2018.
+        for version in [Version::R2010, Version::R2013, Version::R2018] {
+            let err = assemble_r2007(empty_parts(version));
+            assert!(
+                err.is_err(),
+                "assemble_r2007 must reject {version:?} (uses_utf16_strings is true but routing differs)"
+            );
+        }
+        // Sanity check: R2007 itself is accepted.
+        assert!(assemble_r2007(empty_parts(Version::R2007)).is_ok());
     }
 
     #[test]
