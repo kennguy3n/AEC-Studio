@@ -1,16 +1,30 @@
-//! CRC primitives used by the DWG format.
+//! Checksum primitives used by the DWG format.
 //!
-//! Three distinct CRC variants appear in real DWG files:
+//! Despite the module name (`crc`), DWG files use a mix of **true CRCs**
+//! and **Adler-32-style checksums**. Both groups live here because
+//! every checksum AutoCAD computes for the file format is in this
+//! module, and the encoder/decoder paths need to import them from one
+//! place.
+//!
+//! ## True CRCs (polynomial-based)
 //!
 //! 1. **CRC-8** — the file-header checksum on the leading 16 bytes
 //!    (R13+).  Polynomial `0x07` (x^8 + x^2 + x + 1), MSB-first
 //!    (non-reflected), initial value `0xc0`. The reduction loop in
 //!    [`crc_8`] tests the high bit and shifts left, matching what
 //!    AutoCAD emits and what LibreDWG validates against.
-//! 2. **CRC-32C (Castagnoli)** — section page checksums (R2004+).
-//!    Polynomial `0x1edc6f41`, reflected, initial value `0xffffffff`,
-//!    post-complement. Used by [`crc_32c`].
-//! 3. **CRC-32 (IEEE / "zlib")** — checksum stored *inside* the
+//! 2. **CRC-X25** — section checksums in R13–R2000 modern format.
+//!    Polynomial `0x1021`, reflected, initial value `0xc0c1` per the
+//!    Open Design specification. Used by [`crc_x25`].
+//! 3. **CRC-32C (Castagnoli)** — historically used by an earlier
+//!    iteration of this codec for section page checksums, but
+//!    LibreDWG and AutoCAD do NOT use CRC-32C for that purpose; they
+//!    use [`dwg_section_page_checksum`] (see below). [`crc_32c`] is
+//!    kept here because the `dwg_section_page_checksum_disagrees_with_crc_32c`
+//!    test compares the two to lock in the distinction; it is not
+//!    re-exported from `dwg::bits` because it has no production
+//!    consumer.
+//! 4. **CRC-32 (IEEE / "zlib")** — checksum stored *inside* the
 //!    encrypted R2004 file header (bytes 0x68..0x6c). LibreDWG
 //!    computes this with its `bit_calc_CRC32` over the 108-byte
 //!    decrypted header with the CRC field zeroed. Polynomial
@@ -20,12 +34,23 @@
 //!    This is a different CRC from CRC-32C above; do not confuse the
 //!    two — they share a name but differ in polynomial and final
 //!    inversion.
-//! 4. **CRC-X25** — section checksums in R13–R2000 modern format.
-//!    Polynomial `0x1021`, reflected, initial value `0xc0c1` per the
-//!    Open Design specification.
 //!
-//! The functions below compute these directly; callers verify against
-//! the value stored at a documented offset in each section.
+//! ## Adler-32-style (NOT a CRC despite the module name)
+//!
+//! 5. **`dwg_section_page_checksum`** — every system-page checksum and
+//!    every data-page checksum on R2004+ files. This is Adler-32's
+//!    paired-running-sum update rule with the standard `mod 0xFFF1`
+//!    reduction, but with a seed-derived initial state instead of the
+//!    RFC 1950 `(sum1=1, sum2=0)` fixed state. The two-pass header-
+//!    then-payload composition (or, for data pages, payload-then-
+//!    header) relies on the chaining identity `checksum(a + b) ==
+//!    checksum(b, seed=checksum(a))`. See
+//!    [`dwg_section_page_checksum`] for full algorithm details and
+//!    [`super::super::file::system_section::system_page_checksum`] for
+//!    its canonical wire-format use.
+//!
+//! Callers verify against the value stored at a documented offset in
+//! each section or page header.
 
 /// CRC-X25 (the 16-bit checksum used by R13–R2000 section headers).
 ///
