@@ -190,6 +190,27 @@ impl CommonHeaderData {
     /// 10. R2010+: 3 visual-style flag bits (B).
     /// 11. `invisible` (BS), R2000+ `linewt` (RC).
     pub fn encode_for_version(&self, version: Version, w: &mut BitWriter) -> DwgResult<()> {
+        self.encode_for_version_with_r14_bitsize_slot(version, w)
+            .map(|_| ())
+    }
+
+    /// Same as [`Self::encode_for_version`] but returns the body-bit
+    /// position of the R14 RL bitsize slot (when `version == R14`).
+    /// The caller is responsible for back-patching the slot once the
+    /// payload-end position is known. For non-R14 versions returns
+    /// `None`.
+    ///
+    /// LibreDWG `common_entity_data.spec:340-365` emits the `bitsize`
+    /// RL field INSIDE the common entity data block (right after
+    /// `preview_exists` and before `entmode`) for R13b1..R14, whereas
+    /// R2000..R2007 emit it externally (before the H handle in
+    /// `dwg_encode_entity` at encode.c:6298). R2010+ derive bitsize
+    /// from `obj->size * 8 - handlestream_size` instead.
+    pub fn encode_for_version_with_r14_bitsize_slot(
+        &self,
+        version: Version,
+        w: &mut BitWriter,
+    ) -> DwgResult<Option<u64>> {
         // Step 1: preview_exists. We don't carry preview blobs, so
         // we always emit `false` and skip the conditional block.
         w.write_b(self.preview_exists)?;
@@ -198,6 +219,16 @@ impl CommonHeaderData {
                 "image-preview emit on entities is not yet wired through CommonHeaderData".into(),
             ));
         }
+
+        // Step 2: R13b1..R14 bitsize RL slot (placeholder; the caller
+        // back-patches it once the payload-end position is known).
+        let r14_bitsize_slot = if version <= Version::R14 {
+            let slot = w.bit_position();
+            w.write_rl(0)?;
+            Some(slot)
+        } else {
+            None
+        };
 
         // Step 3: entmode + num_reactors.
         w.write_bb(self.entity_mode.to_bb())?;
@@ -273,17 +304,34 @@ impl CommonHeaderData {
         if version >= Version::R2000 {
             w.write_bits_u32(8, u32::from(self.lineweight))?;
         }
-        Ok(())
+        Ok(r14_bitsize_slot)
     }
 
     /// Decode the data-stream portion of the common entity header.
     pub fn decode_for_version(version: Version, r: &mut BitReader<'_>) -> DwgResult<Self> {
+        Self::decode_for_version_capturing_r14_bitsize(version, r).map(|(h, _)| h)
+    }
+
+    /// Same as [`Self::decode_for_version`] but also returns the value
+    /// of the R14 RL `bitsize` field that LibreDWG embeds in the
+    /// common header between `preview_exists` and `entmode` (see
+    /// `common_entity_data.spec:340-365`). For non-R14 versions the
+    /// returned bitsize is `None`.
+    pub fn decode_for_version_capturing_r14_bitsize(
+        version: Version,
+        r: &mut BitReader<'_>,
+    ) -> DwgResult<(Self, Option<u32>)> {
         let preview_exists = r.read_b()?;
         if preview_exists {
             return Err(DwgError::Unsupported(
                 "image-preview decode on entities is not yet wired through CommonHeaderData".into(),
             ));
         }
+        let r14_bitsize = if version <= Version::R14 {
+            Some(r.read_rl()?)
+        } else {
+            None
+        };
         let entity_mode = EntityMode::from_bb(r.read_bb()?);
         let reactor_count = r.read_bl()? as u32;
         let (isbylayerlt, xdict_missing) = if version <= Version::R14 {
@@ -342,26 +390,29 @@ impl CommonHeaderData {
         } else {
             0x1d
         };
-        Ok(Self {
-            preview_exists,
-            entity_mode,
-            reactor_count,
-            isbylayerlt,
-            nolinks,
-            has_ds_data,
-            color_raw,
-            linetype_scale,
-            linetype_flag,
-            plot_style_flag,
-            material_flag,
-            shadow_flags,
-            has_full_visualstyle,
-            has_face_visualstyle,
-            has_edge_visualstyle,
-            xdict_missing,
-            invisibility,
-            lineweight,
-        })
+        Ok((
+            Self {
+                preview_exists,
+                entity_mode,
+                reactor_count,
+                isbylayerlt,
+                nolinks,
+                has_ds_data,
+                color_raw,
+                linetype_scale,
+                linetype_flag,
+                plot_style_flag,
+                material_flag,
+                shadow_flags,
+                has_full_visualstyle,
+                has_face_visualstyle,
+                has_edge_visualstyle,
+                xdict_missing,
+                invisibility,
+                lineweight,
+            },
+            r14_bitsize,
+        ))
     }
 }
 

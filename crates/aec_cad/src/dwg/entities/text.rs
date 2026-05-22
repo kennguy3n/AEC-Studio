@@ -1,34 +1,60 @@
 //! TEXT entity codec.
 //!
-//! Bit-stream layout (R2000-R2018) — every optional field is gated on
-//! one bit of the leading `data_flags` byte. A flag set to `1` means
-//! the corresponding field is **omitted** and the decoder substitutes
-//! the documented default. Mirrors the LibreDWG `dwg.spec` definition
-//! at lines 100-172 so files written by either codec can be read by
-//! the other.
+//! Mirrors LibreDWG's `dwg.spec` TEXT entity (lines 28-185). There are
+//! two distinct on-wire formats:
+//!
+//! 1. R13b1..R14 (lines 62-97) — no `data_flags` byte. Every field is
+//!    unconditionally present, and the numeric types are different
+//!    from R2000+ (e.g. `elevation` is BD, not RD; `extrusion` is 3BD,
+//!    not BE; `thickness` is BD, not BT).
+//! 2. R2000+ (lines 99-172) — a leading `data_flags` RC byte gates
+//!    each optional field. A flag set to `1` means the field is
+//!    **omitted** and the decoder substitutes the documented default.
 //!
 //! ```text
-//! data_flags: RC   // 8-bit; bit set → field omitted
-//! elevation: RD       if !(data_flags & 0x01)   else 0.0
-//! insertion_point: 2RD
-//! alignment_pt: 2DD   if !(data_flags & 0x02)   else == insertion_point
-//!     (each component defaults to the matching insertion_point component)
-//! extrusion: BE
-//! thickness: BT
-//! oblique_angle: RD   if !(data_flags & 0x04)   else 0.0
-//! rotation: RD        if !(data_flags & 0x08)   else 0.0
-//! height: RD
-//! width_factor: RD    if !(data_flags & 0x10)   else 1.0
-//! text_value: TV/T
-//! generation: BS      if !(data_flags & 0x20)   else 0
-//! horiz_align: BS     if !(data_flags & 0x40)   else 0
-//! vert_align: BS      if !(data_flags & 0x80)   else 0
+//! R14 format:
+//!     elevation: BD
+//!     insertion_point: 2RD
+//!     alignment_pt: 2RD
+//!     extrusion: 3BD
+//!     thickness: BD
+//!     oblique_angle: BD
+//!     rotation: BD
+//!     height: BD
+//!     width_factor: BD
+//!     text_value: TV
+//!     generation: BS
+//!     horiz_alignment: BS
+//!     vert_alignment: BS
+//!
+//! R2000+ format:
+//!     data_flags: RC   // 8-bit; bit set → field omitted
+//!     elevation: RD       if !(data_flags & 0x01)   else 0.0
+//!     insertion_point: 2RD
+//!     alignment_pt: 2DD   if !(data_flags & 0x02)   else == insertion_point
+//!     extrusion: BE
+//!     thickness: BT
+//!     oblique_angle: RD   if !(data_flags & 0x04)   else 0.0
+//!     rotation: RD        if !(data_flags & 0x08)   else 0.0
+//!     height: RD
+//!     width_factor: RD    if !(data_flags & 0x10)   else 1.0
+//!     text_value: TV/T    (T = UTF-16 for R2007+)
+//!     generation: BS      if !(data_flags & 0x20)   else 0
+//!     horiz_align: BS     if !(data_flags & 0x40)   else 0
+//!     vert_align: BS      if !(data_flags & 0x80)   else 0
 //! ```
 //!
-//! In the wider DWG record format the text style is a handle in the
-//! handle stream rather than an inline string. We serialise it inline
-//! here for self-contained round-tripping; the modern bridge layer
-//! reattaches the style handle when writing a complete file.
+//! Per `dwg.spec:174-183`, the text style is a soft-pointer HANDLE
+//! that lives in the handle stream after `COMMON_ENTITY_HANDLE_DATA`
+//! (the per-entity-type extra). It is NOT part of the on-wire payload
+//! described above; handle emission/decode is owned by
+//! `ObjectHandles::type_extras` at the record layer. To preserve the
+//! style name across a self-contained round-trip we ALSO append it as
+//! a trailing TV/T after the LibreDWG-format fields. LibreDWG's
+//! decoder stops at `bitsize` (which we set to the end of the
+//! trailing style string), so the extra inline bytes are skipped
+//! cleanly by the reference decoder while we recover them on our own
+//! side.
 
 use crate::dwg::bits::{BitReader, BitWriter};
 use crate::dwg::error::DwgResult;
@@ -113,22 +139,43 @@ impl TextEntity {
     }
 
     pub fn encode_payload(&self, w: &mut BitWriter, version: Version) -> DwgResult<()> {
+        let ins_pt = [self.position[0], self.position[1]];
+        if version <= Version::R14 {
+            // R13b1..R14 layout. No data_flags byte; every field is
+            // emitted unconditionally with the pre-R2000 numeric
+            // types (BD instead of RD; 3BD instead of BE; BD instead
+            // of BT).
+            w.write_bd(self.position[2])?;
+            w.write_2rd(ins_pt)?;
+            w.write_2rd(ins_pt)?; // alignment_pt (unused; mirror ins_pt)
+            w.write_3bd([0.0, 0.0, 1.0])?; // extrusion +Z
+            w.write_bd(0.0)?; // thickness
+            w.write_bd(self.oblique_angle)?;
+            w.write_bd(self.rotation)?;
+            w.write_bd(self.height)?;
+            w.write_bd(self.width_factor)?;
+            w.write_tv(&self.text)?;
+            w.write_bs(0)?; // generation
+            w.write_bs(0)?; // horiz_alignment
+            w.write_bs(0)?; // vert_alignment
+                            // Trailing inline style (see module doc); R14 never uses
+                            // UTF-16.
+            w.write_tv(&self.style)?;
+            return Ok(());
+        }
+
+        // R2000+ data_flags-gated layout.
         let flags = self.data_flags();
         w.write_bits_u32(8, u32::from(flags))?;
         if flags & DATA_FLAGS_ELEVATION_OMITTED == 0 {
             w.write_rd(self.position[2])?;
         }
-        let ins_pt = [self.position[0], self.position[1]];
         w.write_2rd(ins_pt)?;
         if flags & DATA_FLAGS_ALIGNMENT_OMITTED == 0 {
             // No separate alignment point in our schema; emit
             // ins_pt-relative DDs that evaluate to ins_pt.
             w.write_2dd(ins_pt, ins_pt)?;
         }
-        // R2000+ extrusion uses the BE shape (1-bit prefix + optional
-        // 3 BDs); R14 and earlier use 3 raw BDs. The TEXT entity is
-        // R13+ in this codec, and our minimum is R2000, so always
-        // emit the BE shape.
         w.write_be_r2000_plus([0.0, 0.0, 1.0])?;
         w.write_bt_r2000_plus(0.0)?;
         if flags & DATA_FLAGS_OBLIQUE_OMITTED == 0 {
@@ -156,9 +203,7 @@ impl TextEntity {
         if flags & DATA_FLAGS_VERT_ALIGN_OMITTED == 0 {
             w.write_bs(0)?;
         }
-        // Style is a handle in real DWG; we serialise the name inline
-        // here for self-contained round-tripping. Lives outside the
-        // data_flags-gated region.
+        // Trailing inline style (see module doc).
         if version.uses_utf16_strings() {
             w.write_t(&self.style)?;
         } else {
@@ -172,6 +217,34 @@ impl TextEntity {
         layer: String,
         version: Version,
     ) -> DwgResult<Self> {
+        if version <= Version::R14 {
+            // R13b1..R14 layout (see module doc).
+            let elevation = r.read_bd()?;
+            let ins_pt = r.read_2rd()?;
+            let _alignment_pt = r.read_2rd()?;
+            let _extrusion = r.read_3bd()?;
+            let _thickness = r.read_bd()?;
+            let oblique_angle = r.read_bd()?;
+            let rotation = r.read_bd()?;
+            let height = r.read_bd()?;
+            let width_factor = r.read_bd()?;
+            let text = r.read_tv()?;
+            let _generation = r.read_bs()?;
+            let _horiz_alignment = r.read_bs()?;
+            let _vert_alignment = r.read_bs()?;
+            let style = r.read_tv()?;
+            return Ok(Self {
+                layer,
+                position: [ins_pt[0], ins_pt[1], elevation],
+                height,
+                rotation,
+                width_factor,
+                oblique_angle,
+                text,
+                style,
+            });
+        }
+
         let data_flags = r.read_bits_u32(8)? as u8;
         let elevation = if data_flags & DATA_FLAGS_ELEVATION_OMITTED == 0 {
             r.read_rd()?

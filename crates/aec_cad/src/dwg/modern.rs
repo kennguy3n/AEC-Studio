@@ -227,6 +227,21 @@ fn entity_to_record(entity: &DxfEntity, version: Version, handle: u64) -> DwgRes
             });
         }
     };
+    // Per-entity-type extra handles, appended AFTER the common
+    // handle stream. Mirrors the LibreDWG `dwg.spec` lines that emit
+    // `FIELD_HANDLE (...)` AFTER `COMMON_ENTITY_HANDLE_DATA` for each
+    // entity type. Counts must match `type_extra_handle_count`.
+    let type_extras = match object_type {
+        // TEXT.style: soft pointer to AcDbStyle. We don't yet emit a
+        // text-styles section, so we use a NULL soft pointer; LibreDWG
+        // treats `H { code: 5, value: 0 }` as the STANDARD style.
+        ObjectType::Text => vec![HandleRef { code: 5, value: 0 }],
+        // INSERT.block_header: soft pointer to AcDbBlockTableRecord.
+        // Same NULL-pointer convention; LibreDWG logs "BLOCK_HEADER:
+        // NULL" but does not error.
+        ObjectType::Insert => vec![HandleRef { code: 5, value: 0 }],
+        _ => Vec::new(),
+    };
     Ok(ObjectRecord {
         object_type,
         handle: HandleRef {
@@ -247,8 +262,15 @@ fn entity_to_record(entity: &DxfEntity, version: Version, handle: u64) -> DwgRes
                 value: LAYER_ZERO_HANDLE,
             },
             linetype: None,
-            plot_style: None,
+            prev_entity: None,
+            next_entity: None,
             material: None,
+            shadow: None,
+            plot_style: None,
+            full_visualstyle: None,
+            face_visualstyle: None,
+            edge_visualstyle: None,
+            type_extras,
         },
     })
 }

@@ -960,15 +960,11 @@ mod tests {
                     code: 5,
                     value: 0x01,
                 }),
-                reactors: Vec::new(),
-                x_dictionary: None,
                 layer: HandleRef {
                     code: 5,
                     value: 0x02,
                 },
-                linetype: None,
-                plot_style: None,
-                material: None,
+                ..Default::default()
             },
         }
     }

@@ -54,12 +54,12 @@ fn golden(v: DwgVersion) -> Golden {
             blake3_hex: "e1fdf01aacf6f818b5747e77b0c5df930534e2d72e29244459e2d4d70661ebb5",
         },
         DwgVersion::R14 => Golden {
-            bytes: 477,
-            blake3_hex: "9ee4083c9ee7b0658b17ef42effd0f8052b501e93e038d441f21e6b57900d958",
+            bytes: 483,
+            blake3_hex: "ba8a3d3ab903430913585020987357907e16f041ec5cc9e9470d1cb5b1326b2e",
         },
         DwgVersion::R2000 => Golden {
-            bytes: 544,
-            blake3_hex: "b8d77d61189e9dce39fad7dbd23559bd70c443088956505e8d37667666869367",
+            bytes: 545,
+            blake3_hex: "e25c9dbfc186f2062bb5bf7a3184d203e42f7f97e7dcf294130ac7d60f4ab439",
         },
         DwgVersion::R2004 => Golden {
             bytes: 2152,

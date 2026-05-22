@@ -60,25 +60,74 @@ pub struct ObjectRecord {
 }
 
 /// The handle stream attached to every modern entity.
+///
+/// Field order matches LibreDWG `common_entity_handle_data.spec`. The
+/// presence-bits for each optional handle are gated by the
+/// corresponding flag in `CommonHeaderData`:
+///
+/// | Handle             | Gating flag                                  |
+/// |--------------------|----------------------------------------------|
+/// | `owner`            | `entity_mode == BlockHeader` (entmode==0)    |
+/// | `reactors`         | count = `reactor_count`                      |
+/// | `x_dictionary`     | pre-R2004: always; R2004+: `!xdict_missing`  |
+/// | `layer`            | always                                       |
+/// | `linetype`         | R14: `!isbylayerlt`; R2000+: `ltype_flag==3` |
+/// | `prev_entity` /    | R14/R2000 only, when `!nolinks`              |
+/// |   `next_entity`    |                                              |
+/// | `material`         | R2007+, `material_flag==3`                   |
+/// | `shadow`           | R2007+, `shadow_flags==3` (currently unused) |
+/// | `plot_style`       | R2000+, `plot_style_flag==3`                 |
+/// | `full_visualstyle` | R2010+, `has_full_visualstyle`               |
+/// | `face_visualstyle` | R2010+, `has_face_visualstyle`               |
+/// | `edge_visualstyle` | R2010+, `has_edge_visualstyle`               |
+/// | `type_extras`      | per-entity-type, after the common stream     |
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ObjectHandles {
-    /// Owner handle (block-header for entity-mode 0b00 / 0b01).
+    /// Owner handle (emitted only when `entity_mode == BlockHeader`,
+    /// i.e. the LibreDWG `entmode == 0` case where the owner is
+    /// stored explicitly rather than implied by entity mode).
     pub owner: Option<HandleRef>,
     /// Reactors (count must match `CommonHeaderData::reactor_count`).
     pub reactors: Vec<HandleRef>,
-    /// Extension dictionary handle (R2000+; only present when the
-    /// xdict-missing flag in the data stream is false).
+    /// Extension dictionary handle. For R13-R2002 the handle is
+    /// ALWAYS present (no data-stream flag gates it); for R2004+ it
+    /// is gated by `CommonHeaderData::xdict_missing`. When `None` on a
+    /// pre-R2004 emit path the encoder writes a NULL handle
+    /// (`{ code: 3, value: 0 }`) so the wire layout still has the slot
+    /// — LibreDWG's decoder unconditionally reads it.
     pub x_dictionary: Option<HandleRef>,
     /// Layer handle (always present, code = 0x05 = "soft pointer").
     pub layer: HandleRef,
-    /// Linetype handle (only present when the linetype flag in the
-    /// data stream is 0b11 = "handle follows").
+    /// Linetype handle. R14: emitted when `!isbylayerlt`; R2000+:
+    /// emitted when `linetype_flag == Handle` (0b11).
     pub linetype: Option<HandleRef>,
-    /// Plot-style handle (only present when the plot-style flag is
-    /// 0b11; defaults to BYLAYER when omitted).
-    pub plot_style: Option<HandleRef>,
-    /// Material handle (R2007+, only when material flag is 0b11).
+    /// R14 / R2000 only: previous-entity link in the model-space
+    /// chain. Emitted when `!nolinks`.
+    pub prev_entity: Option<HandleRef>,
+    /// R14 / R2000 only: next-entity link in the model-space chain.
+    /// Emitted when `!nolinks`.
+    pub next_entity: Option<HandleRef>,
+    /// Material handle (R2007+; only when `material_flag == 0b11`).
     pub material: Option<HandleRef>,
+    /// Shadow handle (R2007+; only when `shadow_flags == 3`).
+    pub shadow: Option<HandleRef>,
+    /// Plot-style handle (R2000+; only when `plot_style_flag == 0b11`).
+    pub plot_style: Option<HandleRef>,
+    /// Full visual-style handle (R2010+; only when `has_full_visualstyle`).
+    pub full_visualstyle: Option<HandleRef>,
+    /// Face visual-style handle (R2010+; only when `has_face_visualstyle`).
+    pub face_visualstyle: Option<HandleRef>,
+    /// Edge visual-style handle (R2010+; only when `has_edge_visualstyle`).
+    pub edge_visualstyle: Option<HandleRef>,
+    /// Per-entity-type extra handles, appended AFTER the common
+    /// handle stream. The count and meaning are entity-type-specific:
+    /// - TEXT / MTEXT / ATTRIB: `[style]` (soft pointer to AcDbStyle)
+    /// - INSERT: `[block_header]` (and optionally seqend / attribs)
+    /// - Most other entity types: empty
+    ///
+    /// The decoder uses
+    /// [`type_extra_handle_count`] to know how many to read.
+    pub type_extras: Vec<HandleRef>,
 }
 
 /// Opaque container for a slice of bit-stream payload, used to defer
@@ -175,6 +224,12 @@ impl ObjectRecord {
             body.write_bs(self.object_type as u16 as i32)?;
         }
 
+        // R2000..R2007 emit RL bitsize INLINE between the BS object_type
+        // and the H handle (encode.c:6298). For R14 the RL bitsize is
+        // embedded INSIDE common_entity_data after preview_exists; we
+        // capture that slot below and back-patch it once the payload
+        // ends. For R2010+ there is no inline RL: bitsize is derived
+        // from `obj->size * 8 - handlestream_size` instead.
         let inline_rl_bitsize = (Version::R2000..=Version::R2007).contains(&version);
         let rl_bit_pos = body.bit_position();
         if inline_rl_bitsize {
@@ -183,22 +238,37 @@ impl ObjectRecord {
 
         body.write_h(self.handle)?;
         body.write_bs(0)?; // EED terminator (no EED yet)
-        self.common.encode_for_version(version, &mut body)?;
+        let r14_bitsize_slot = self
+            .common
+            .encode_for_version_with_r14_bitsize_slot(version, &mut body)?;
         write_bitbuf(&mut body, &self.payload_bits)?;
 
         // Body-bit position where the handle stream begins (this is
-        // `bitsize` in LibreDWG terminology).
+        // `bitsize` in LibreDWG terminology). For R2000-R2007 this is
+        // an absolute body-bit offset; for R14 it has the same meaning
+        // (the value LibreDWG writes is `bit_position(dat) - objpos`
+        // at handle-stream start, which equals our body-bit position
+        // because the body buffer starts at byte 0).
         let handle_stream_start_bit = body.bit_position();
+        let bitsize_value = u32::try_from(handle_stream_start_bit).map_err(|_| {
+            DwgError::InternalInvariant(format!(
+                "object record body exceeds 4Gib (handle_stream_start_bit={handle_stream_start_bit})"
+            ))
+        })?;
         if inline_rl_bitsize {
-            let bitsize_value = u32::try_from(handle_stream_start_bit).map_err(|_| {
-                DwgError::InternalInvariant(format!(
-                    "object record body exceeds 4Gib (handle_stream_start_bit={handle_stream_start_bit})"
-                ))
-            })?;
             body.patch_rl_at(rl_bit_pos, bitsize_value)?;
         }
+        if let Some(slot) = r14_bitsize_slot {
+            body.patch_rl_at(slot, bitsize_value)?;
+        }
 
-        encode_handle_stream(&mut body, version, &self.handles, &self.common)?;
+        encode_handle_stream(
+            &mut body,
+            version,
+            self.object_type,
+            &self.handles,
+            &self.common,
+        )?;
 
         // Pad to byte boundary so obj->size is an integer byte count.
         body.align_to_byte();
@@ -283,7 +353,8 @@ impl ObjectRecord {
                 });
             }
         }
-        let handles = decode_handle_stream(&mut body_r, version, &header.common)?;
+        let handles =
+            decode_handle_stream(&mut body_r, version, header.object_type, &header.common)?;
         Ok((
             Self {
                 object_type: header.object_type,
@@ -420,7 +491,16 @@ impl ObjectRecord {
                 "extended entity data (EED) on object records is not yet decoded".into(),
             ));
         }
-        let common = CommonHeaderData::decode_for_version(version, &mut body_r)?;
+        let (common, r14_bitsize) =
+            CommonHeaderData::decode_for_version_capturing_r14_bitsize(version, &mut body_r)?;
+        // For R14 the bitsize lives inside the common header; promote
+        // it into the handle-stream offset hint so the R14 decoder is
+        // bit-perfect with the R2000-R2007 path.
+        let handle_stream_offset_hint = match (handle_stream_offset_hint, r14_bitsize) {
+            (Some(h), _) => Some(h),
+            (None, Some(b)) => Some(u64::from(b)),
+            (None, None) => None,
+        };
         Ok((
             HeaderOnly {
                 object_type,
@@ -478,7 +558,8 @@ impl ObjectRecord {
         }
         let payload_bits = read_bitbuf_bits(&mut body_r, handle_start - cur)?;
         body_r.set_bit_position(handle_start)?;
-        let handles = decode_handle_stream(&mut body_r, version, &header.common)?;
+        let handles =
+            decode_handle_stream(&mut body_r, version, header.object_type, &header.common)?;
         Ok((
             Self {
                 object_type: header.object_type,
@@ -537,23 +618,19 @@ fn read_bitbuf_bits(r: &mut BitReader<'_>, bit_len: u64) -> DwgResult<BitBuf> {
 
 fn encode_handle_stream(
     w: &mut BitWriter,
-    _version: Version,
+    version: Version,
+    object_type: ObjectType,
     handles: &ObjectHandles,
     common: &CommonHeaderData,
 ) -> DwgResult<()> {
-    // Owner handle: emitted only when entity_mode encodes it.
+    // Owner handle: per LibreDWG `common_entity_handle_data.spec:25`,
+    // emitted ONLY when `entmode == 0` (i.e. the entity stores its
+    // owner explicitly rather than inferring from {model,paper}-space
+    // block-record context).
     use crate::dwg::entities::header_codec::EntityMode;
-    if matches!(
-        common.entity_mode,
-        EntityMode::BlockHeader | EntityMode::DistinctBlockHeader
-    ) {
-        if let Some(owner) = handles.owner {
-            w.write_h(owner)?;
-        } else {
-            // Spec says we MUST emit one; use 0x0500000000 (soft
-            // pointer to nothing) as a defensive default.
-            w.write_h(HandleRef { code: 5, value: 0 })?;
-        }
+    if common.entity_mode == EntityMode::BlockHeader {
+        let owner = handles.owner.unwrap_or(HandleRef { code: 4, value: 0 });
+        w.write_h(owner)?;
     }
     // Reactor handles: count is dictated by common.reactor_count.
     for i in 0..common.reactor_count as usize {
@@ -564,13 +641,18 @@ fn encode_handle_stream(
             .unwrap_or(HandleRef { code: 4, value: 0 });
         w.write_h(r)?;
     }
-    // Xdict handle: present only when the xdict-missing flag in the
-    // common header is false. We assert the encoder is internally
-    // consistent — if the caller has an xdict handle to emit, the
-    // common header must say so; if not, we must NOT write any extra
-    // bytes here (writing them would desynchronise the handle stream
-    // from the bit cursor and corrupt every following handle).
-    if !common.xdict_missing {
+    // Xdict handle:
+    //   pre-R2004 (R14, R2000): always emitted, no data-stream gating
+    //     bit exists for those versions in LibreDWG
+    //     (see dec_macros.h:1442 ENT_XDICOBJHANDLE: the `else` branch
+    //      unconditionally reads xdicobjhandle for R_13b1..R_2002).
+    //   R2004+: gated by `xdict_missing` in the data stream.
+    let xdict_present = if version <= Version::R2000 {
+        true
+    } else {
+        !common.xdict_missing
+    };
+    if xdict_present {
         let xd = handles
             .x_dictionary
             .unwrap_or(HandleRef { code: 3, value: 0 });
@@ -578,91 +660,228 @@ fn encode_handle_stream(
     } else if handles.x_dictionary.is_some() {
         return Err(DwgError::InternalInvariant(
             "ObjectHandles::x_dictionary is Some but CommonHeaderData::xdict_missing \
-             is true; set xdict_missing = false to emit the handle."
+             is true (R2004+); set xdict_missing = false to emit the handle."
                 .into(),
         ));
     }
-    // Layer is mandatory.
-    w.write_h(handles.layer)?;
-    // Linetype handle iff flag was Handle.
     use crate::dwg::entities::header_codec::LinetypeFlag;
-    if common.linetype_flag == LinetypeFlag::Handle {
-        let lt = handles.linetype.unwrap_or(HandleRef { code: 5, value: 0 });
-        w.write_h(lt)?;
+    if version <= Version::R14 {
+        // R14 (and R13): layer; ltype iff !isbylayerlt.
+        w.write_h(handles.layer)?;
+        if !common.isbylayerlt {
+            let lt = handles.linetype.unwrap_or(HandleRef { code: 5, value: 0 });
+            w.write_h(lt)?;
+        }
+    } else {
+        // R2000+: layer; ltype iff linetype_flag == Handle (0b11).
+        w.write_h(handles.layer)?;
+        if common.linetype_flag == LinetypeFlag::Handle {
+            let lt = handles.linetype.unwrap_or(HandleRef { code: 5, value: 0 });
+            w.write_h(lt)?;
+        }
     }
-    // Plot-style handle iff flag was 0b11.
-    if common.plot_style_flag == 0b11 {
+    // R14 / R2000: prev/next entity links in the model-space chain,
+    // emitted only when `!nolinks`.
+    if version <= Version::R2000 && !common.nolinks {
+        let prev = handles
+            .prev_entity
+            .unwrap_or(HandleRef { code: 4, value: 0 });
+        let next = handles
+            .next_entity
+            .unwrap_or(HandleRef { code: 4, value: 0 });
+        w.write_h(prev)?;
+        w.write_h(next)?;
+    }
+    // R2007+: material (if mat==3), shadow (if shadow==3).
+    if version >= Version::R2007 {
+        if common.material_flag == 0b11 {
+            let m = handles.material.ok_or_else(|| {
+                DwgError::InternalInvariant(
+                    "CommonHeaderData::material_flag is 0b11 but ObjectHandles::material is None; \
+                     set material_flag to 0 (BYLAYER) or provide a material handle."
+                        .into(),
+                )
+            })?;
+            w.write_h(m)?;
+        } else if handles.material.is_some() {
+            return Err(DwgError::InternalInvariant(
+                "ObjectHandles::material is Some but CommonHeaderData::material_flag is not 0b11; \
+                 set material_flag = 0b11 to emit the handle."
+                    .into(),
+            ));
+        }
+        if common.shadow_flags == 3 {
+            let s = handles.shadow.unwrap_or(HandleRef { code: 5, value: 0 });
+            w.write_h(s)?;
+        }
+    }
+    // R2000+: plot-style iff flag was 0b11.
+    if version >= Version::R2000 && common.plot_style_flag == 0b11 {
         let ps = handles
             .plot_style
             .unwrap_or(HandleRef { code: 5, value: 0 });
         w.write_h(ps)?;
     }
-    // Material handle iff material_flag == 0b11 (R2007+ only). Mirrors
-    // the plot-style handle convention. We treat this as a hard
-    // invariant on the encoder side: if the caller marked the flag as
-    // "handle" we must have a handle to emit, and vice-versa.
-    if common.material_flag == 0b11 {
-        let m = handles.material.ok_or_else(|| {
-            DwgError::InternalInvariant(
-                "CommonHeaderData::material_flag is 0b11 but ObjectHandles::material is None; \
-                 set material_flag to 0 (BYLAYER) or provide a material handle."
-                    .into(),
-            )
-        })?;
-        w.write_h(m)?;
-    } else if handles.material.is_some() {
-        return Err(DwgError::InternalInvariant(
-            "ObjectHandles::material is Some but CommonHeaderData::material_flag is not 0b11; \
-             set material_flag = 0b11 to emit the handle."
-                .into(),
-        ));
+    // R2010+: 3 optional visual-style handles, each gated by the
+    // corresponding `has_*_visualstyle` bit in the data stream.
+    if version >= Version::R2010 {
+        if common.has_full_visualstyle {
+            let h = handles
+                .full_visualstyle
+                .unwrap_or(HandleRef { code: 5, value: 0 });
+            w.write_h(h)?;
+        }
+        if common.has_face_visualstyle {
+            let h = handles
+                .face_visualstyle
+                .unwrap_or(HandleRef { code: 5, value: 0 });
+            w.write_h(h)?;
+        }
+        if common.has_edge_visualstyle {
+            let h = handles
+                .edge_visualstyle
+                .unwrap_or(HandleRef { code: 5, value: 0 });
+            w.write_h(h)?;
+        }
+    }
+    // Per-entity-type extras (e.g. TEXT style, INSERT block_header).
+    let expected_extras = type_extra_handle_count(object_type, common) as usize;
+    if handles.type_extras.len() != expected_extras {
+        return Err(DwgError::InternalInvariant(format!(
+            "ObjectHandles::type_extras for {object_type:?} has {} entries; \
+             type_extra_handle_count says {expected_extras}",
+            handles.type_extras.len(),
+        )));
+    }
+    for extra in &handles.type_extras {
+        w.write_h(*extra)?;
     }
     Ok(())
 }
 
+/// Per-entity-type handle count for the handles appended AFTER the
+/// common handle stream. Mirrors the post-`COMMON_ENTITY_HANDLE_DATA`
+/// `FIELD_HANDLE` lines in LibreDWG `dwg.spec` for each entity type.
+pub fn type_extra_handle_count(object_type: ObjectType, _common: &CommonHeaderData) -> u32 {
+    match object_type {
+        // TEXT / MTEXT / ATTRIB: single `style` handle (soft pointer
+        // to AcDbStyle). dwg.spec:181 (TEXT), 386 (ATTRIB), 615 (MTEXT).
+        ObjectType::Text => 1,
+        // INSERT carries `block_header` (always) and, when has_attribs
+        // is set, a list of attrib handles + a seqend. Our encoder
+        // never sets has_attribs, so this is always exactly 1.
+        // dwg.spec:854 (INSERT).
+        ObjectType::Insert => 1,
+        // LINE, CIRCLE, ARC, ELLIPSE, LWPOLYLINE, etc. have no
+        // post-common type-specific handles.
+        _ => 0,
+    }
+}
+
 fn decode_handle_stream(
     r: &mut BitReader<'_>,
-    _version: Version,
+    version: Version,
+    object_type: ObjectType,
     common: &CommonHeaderData,
 ) -> DwgResult<ObjectHandles> {
     use crate::dwg::entities::header_codec::{EntityMode, LinetypeFlag};
-    let owner = match common.entity_mode {
-        EntityMode::BlockHeader | EntityMode::DistinctBlockHeader => Some(r.read_h()?),
-        _ => None,
+    let owner = if common.entity_mode == EntityMode::BlockHeader {
+        Some(r.read_h()?)
+    } else {
+        None
     };
     let mut reactors = Vec::with_capacity(common.reactor_count as usize);
     for _ in 0..common.reactor_count {
         reactors.push(r.read_h()?);
     }
-    let x_dictionary = if common.xdict_missing {
-        None
-    } else {
-        Some(r.read_h()?)
-    };
-    let layer = r.read_h()?;
-    let linetype = if common.linetype_flag == LinetypeFlag::Handle {
+    // Xdict: pre-R2004 unconditional read; R2004+ gated by xdict_missing.
+    let x_dictionary = if version <= Version::R2000 || !common.xdict_missing {
         Some(r.read_h()?)
     } else {
         None
     };
-    let plot_style = if common.plot_style_flag == 0b11 {
+    let (layer, linetype) = if version <= Version::R14 {
+        let layer = r.read_h()?;
+        let linetype = if common.isbylayerlt {
+            None
+        } else {
+            Some(r.read_h()?)
+        };
+        (layer, linetype)
+    } else {
+        let layer = r.read_h()?;
+        let linetype = if common.linetype_flag == LinetypeFlag::Handle {
+            Some(r.read_h()?)
+        } else {
+            None
+        };
+        (layer, linetype)
+    };
+    let (prev_entity, next_entity) = if version <= Version::R2000 && !common.nolinks {
+        (Some(r.read_h()?), Some(r.read_h()?))
+    } else {
+        (None, None)
+    };
+    let (material, shadow) = if version >= Version::R2007 {
+        let m = if common.material_flag == 0b11 {
+            Some(r.read_h()?)
+        } else {
+            None
+        };
+        let s = if common.shadow_flags == 3 {
+            Some(r.read_h()?)
+        } else {
+            None
+        };
+        (m, s)
+    } else {
+        (None, None)
+    };
+    let plot_style = if version >= Version::R2000 && common.plot_style_flag == 0b11 {
         Some(r.read_h()?)
     } else {
         None
     };
-    let material = if common.material_flag == 0b11 {
-        Some(r.read_h()?)
+    let (full_visualstyle, face_visualstyle, edge_visualstyle) = if version >= Version::R2010 {
+        let full = if common.has_full_visualstyle {
+            Some(r.read_h()?)
+        } else {
+            None
+        };
+        let face = if common.has_face_visualstyle {
+            Some(r.read_h()?)
+        } else {
+            None
+        };
+        let edge = if common.has_edge_visualstyle {
+            Some(r.read_h()?)
+        } else {
+            None
+        };
+        (full, face, edge)
     } else {
-        None
+        (None, None, None)
     };
+    let extras_count = type_extra_handle_count(object_type, common) as usize;
+    let mut type_extras = Vec::with_capacity(extras_count);
+    for _ in 0..extras_count {
+        type_extras.push(r.read_h()?);
+    }
     Ok(ObjectHandles {
         owner,
         reactors,
         x_dictionary,
         layer,
         linetype,
-        plot_style,
+        prev_entity,
+        next_entity,
         material,
+        shadow,
+        plot_style,
+        full_visualstyle,
+        face_visualstyle,
+        edge_visualstyle,
+        type_extras,
     })
 }
 
@@ -696,15 +915,11 @@ mod tests {
                 code: 5,
                 value: 0x10,
             }),
-            reactors: Vec::new(),
-            x_dictionary: None,
             layer: HandleRef {
                 code: 5,
                 value: 0x20,
             },
-            linetype: None,
-            plot_style: None,
-            material: None,
+            ..Default::default()
         }
     }
 
@@ -797,12 +1012,9 @@ mod tests {
                 code: 5,
                 value: 0x10,
             }),
-            reactors: Vec::new(),
             x_dictionary: Some(xdict),
             layer,
-            linetype: None,
-            plot_style: None,
-            material: None,
+            ..Default::default()
         };
         let record = ObjectRecord {
             object_type: ObjectType::Line,
