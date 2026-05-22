@@ -241,6 +241,19 @@ fn compute_page_size(payload_len: usize, repeat_count: i64) -> DwgResult<usize> 
 /// Inverse of [`compute_page_size`] on the codeword side — given the
 /// final 8-byte-aligned page size, return how many 255-byte RS
 /// codewords it contains.
+///
+/// ## Why the simple division works
+///
+/// [`compute_page_size`] produces
+/// `page_size = round_up_8(block_count * RS_BLOCK_SIZE)`, which adds
+/// at most 7 bytes of padding. Since `RS_BLOCK_SIZE = 255 > 7`, the
+/// truncating integer division `page_size / 255` always recovers
+/// the original `block_count` exactly — the padding can never push
+/// the quotient up to the next integer. `compute_page_size` also
+/// applies `.max(1)` to `block_count`, so `page_size >= 256`
+/// (= 255 + 1) and the result here is always `>= 1`.
+///
+/// Pinned by [`page_size_to_block_count_is_inverse_of_compute_page_size`].
 fn page_size_to_block_count(page_size: usize) -> usize {
     page_size / RS_BLOCK_SIZE
 }
@@ -404,5 +417,56 @@ mod tests {
         assert!(err.is_err(), "negative size_comp must be rejected");
         let err = decode_system_page(&result.on_disk, 100, -100, 1);
         assert!(err.is_err(), "negative size_uncomp must be rejected");
+    }
+
+    #[test]
+    fn page_size_to_block_count_is_inverse_of_compute_page_size() {
+        // Pins the property that page_size / RS_BLOCK_SIZE always
+        // recovers the block_count that compute_page_size produced.
+        // Verified across the practical range plus the empty case:
+        //   - payload_len = 0 → block_count = 1 (the .max(1) floor)
+        //   - payload_len = 1, 8, 9, … crosses round_up_8 boundaries
+        //   - payload_len at the 239-byte block boundary (and ±1, ±8)
+        //   - payload_len up to RS_DATA_SIZE * 32 = 7648 bytes
+        //
+        // If anyone ever changes RS_BLOCK_SIZE or the padding scheme
+        // such that page_size grows by >= RS_BLOCK_SIZE bytes beyond
+        // block_count * RS_BLOCK_SIZE, this test fires before that
+        // change can ship a decoder that under-reads.
+        let mut payload_lens: Vec<usize> = Vec::new();
+        payload_lens.extend([0, 1, 7, 8, 9, 15, 16, 17]);
+        for n in 1..=32 {
+            let boundary = n * RS_DATA_SIZE;
+            payload_lens.extend(
+                [
+                    boundary.saturating_sub(8),
+                    boundary.saturating_sub(1),
+                    boundary,
+                ]
+                .iter()
+                .copied(),
+            );
+            payload_lens.push(boundary + 1);
+            payload_lens.push(boundary + 8);
+        }
+        for &payload_len in &payload_lens {
+            for repeat_count in [1i64, 2, 3, 4, 8] {
+                let expected_pesize_aligned = (payload_len + 7) & !7;
+                let expected_pesize = expected_pesize_aligned * (repeat_count as usize);
+                let expected_block_count = (expected_pesize.div_ceil(RS_DATA_SIZE)).max(1);
+                let page_size =
+                    compute_page_size(payload_len, repeat_count).expect("size should compute");
+                let recovered = page_size_to_block_count(page_size);
+                assert_eq!(
+                    recovered, expected_block_count,
+                    "block_count round-trip failed for payload_len={payload_len}, repeat_count={repeat_count} \
+                     (page_size={page_size}, expected_block_count={expected_block_count}, recovered={recovered})"
+                );
+                assert!(
+                    recovered >= 1,
+                    "block_count must be >= 1 (got {recovered} for payload_len={payload_len})"
+                );
+            }
+        }
     }
 }
