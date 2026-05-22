@@ -175,7 +175,13 @@ pub fn assemble_r2004(parts: R2004FileParts) -> DwgResult<Vec<u8>> {
     parts.header_vars.encode(&mut header_vars_bytes);
 
     let mut classes_bytes = Vec::new();
-    parts.classes.encode(&mut classes_bytes)?;
+    // R2010+ files with maint > 3 (R2010 ships with maint=4) and all
+    // R2018+ files prepend an extra 32-bit `hsize` placeholder inside
+    // the Classes section. Thread the actual file-header maint byte
+    // through so the gate matches what `decode.c:2169` checks.
+    parts
+        .classes
+        .encode_with_maint(&mut classes_bytes, parts.version.maintenance_release())?;
 
     // OBJECTS section: concatenated wire bytes, with per-record offsets
     // tracked so the object map can address each one.
@@ -703,7 +709,12 @@ pub fn parse_r2004(bytes: &[u8]) -> DwgResult<R2004File> {
                 header_vars = Some(HeaderVarsSection::parse(version, &combined, 0)?);
             }
             SECTION_CLASSES => {
-                classes = Some(ClassesSection::parse(version, &combined, 0)?);
+                classes = Some(ClassesSection::parse_with_maint(
+                    version,
+                    &combined,
+                    0,
+                    version.maintenance_release(),
+                )?);
             }
             SECTION_OBJECTS => {
                 objects_payload = Some(combined);
