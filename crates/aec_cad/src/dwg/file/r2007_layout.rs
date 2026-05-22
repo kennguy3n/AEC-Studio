@@ -529,12 +529,15 @@ pub fn assemble_r2007(parts: R2007FileParts) -> DwgResult<Vec<u8>> {
     //    `size` from the start of the page region (0x480) — see
     //    decode_r2007.c:1086-1095 where `offset += size` per page.
     //    The order of (id, size) records here MUST match the order
-    //    pages were written to disk above. We wrote
-    //    `[AcDb:Header data, AcDb:Classes data, sections-map]`
-    //    above, so the records list mirrors that. Page ids stay
-    //    bound to specific pages via the `id` field — the
-    //    sections-map descriptors still reference id=1 for the
-    //    sections-map and id=2/3 for the two data pages.
+    //    pages were written to disk above. The disk order is the
+    //    iteration order of `data_pages` (one entry per
+    //    sentinel-bearing section — currently AcDb:Header id=2,
+    //    AcDb:Classes id=3, AcDb:Template id=4) followed by the
+    //    sections-map (id=1). The records list below mirrors that
+    //    exact order; page ids stay bound to specific pages via the
+    //    `id` field of each record, so the sections-map descriptors
+    //    correctly resolve id=1 → sections-map and id=2..N → the
+    //    Nth-1 data page.
     let mut pages_records: Vec<(i64, u64)> = Vec::with_capacity(data_pages.len() + 1);
     for emitted in &data_pages {
         pages_records.push((emitted.page_id, emitted.page.on_disk.len() as u64));
