@@ -2,7 +2,9 @@
 //!
 //! Starting with R2004, AutoCAD replaced the flat section-locator
 //! block with a "system section" that contains paged data. Each page
-//! is independently compressed (LZ77-style) and CRC-32C-checked.
+//! is independently compressed (LZ77-style) and checksummed via
+//! LibreDWG's `dwg_section_page_checksum` (an Adler-32-style
+//! algorithm with `mod 0xFFF1`, NOT a CRC despite its name).
 //! Pages are addressed via a page map (page id → file offset) and a
 //! section map (logical section id → page id list).
 //!
@@ -22,7 +24,7 @@
 //! § "R2004 file header — encryption" and reproduced in LibreDWG
 //! `decrypt_R2004_header`.
 
-use crate::dwg::bits::{crc_32_ieee, crc_32c};
+use crate::dwg::bits::{crc_32_ieee, dwg_section_page_checksum};
 use crate::dwg::error::{DwgError, DwgResult};
 use crate::dwg::file::pages::{compress, decompress};
 
@@ -262,9 +264,13 @@ pub struct SystemPageHeader {
     pub comp_data_size: u32,
     /// `1 = stored`, `2 = LZ77 compressed`.
     pub compression_type: u32,
-    /// CRC-32C over the first 20 bytes (with `checksum` zeroed) seeded
-    /// by the checksum of the *compressed* payload. See the LibreDWG
-    /// helper `dwg_section_page_checksum` for the exact ordering.
+    /// LibreDWG `dwg_section_page_checksum` (Adler-32-style, NOT a CRC)
+    /// in two passes: first over the 20-byte header with this
+    /// `checksum` field zeroed (producing an intermediate `seed`),
+    /// then chained over the compressed payload using that `seed`. The
+    /// header is checksummed FIRST; the result of the header pass
+    /// seeds the payload pass, NOT the other way around. See
+    /// [`system_page_checksum`] for the exact implementation.
     pub checksum: u32,
 }
 
@@ -296,21 +302,31 @@ impl SystemPageHeader {
     }
 }
 
-/// Compute the page checksum the way LibreDWG `dwg_section_page_checksum`
-/// does — two passes of CRC-32C: first over a header with the checksum
-/// field zeroed (20 bytes), then chained over the (compressed) payload.
+/// Compute the system-page checksum the way LibreDWG
+/// `dwg_section_page_checksum` does — Adler-32-style (NOT a CRC) in
+/// two passes: first over the 20-byte page header with the checksum
+/// field zeroed, then chained over the (compressed) payload.
+///
+/// Algorithm verbatim from LibreDWG `decode.c::dwg_section_page_checksum`
+/// (line 1394). Earlier versions of this codec mis-implemented it as
+/// CRC-32C and produced files that LibreDWG would WARN about on read
+/// (the warning is non-fatal — `LOG_WARN` only, never blocked
+/// decode — but it caused phantom "CRC mismatch" messages on every
+/// system page). The Adler-32 implementation matches AutoCAD-emitted
+/// files exactly.
 pub fn system_page_checksum(header: SystemPageHeader, payload: &[u8]) -> u32 {
     let mut header_with_zero_checksum = header;
     header_with_zero_checksum.checksum = 0;
     let header_bytes = header_with_zero_checksum.encode();
-    let seed = crc_32c(0, &header_bytes);
-    crc_32c(seed, payload)
+    let seed = dwg_section_page_checksum(0, &header_bytes);
+    dwg_section_page_checksum(seed, payload)
 }
 
 /// Wrap a logical system-section payload (decompressed) as the
 /// on-disk page: 20-byte header + (optionally encrypted)
-/// LZ77-compressed payload + CRC-32C chained checksum. Returns the
-/// bytes ready to be written at the page's file offset.
+/// LZ77-compressed payload + `dwg_section_page_checksum` (Adler-32-
+/// style, NOT CRC-32C) chained checksum. Returns the bytes ready to
+/// be written at the page's file offset.
 ///
 /// The `encrypted` flag is the per-section flag from
 /// [`SectionInfoDescriptor::encrypted`]: when set, the
@@ -495,10 +511,16 @@ pub fn write_data_page(
     page_file_offset: u64,
 ) -> Vec<u8> {
     let data_size = decomp_payload.len() as u32;
-    // CRC over the data bytes (seed 0); LibreDWG's
-    // `dwg_section_page_checksum` is CRC-32C with reflected output
-    // and final inversion — same as our [`crc_32c`] helper.
-    let data_crc = crc_32c(0, decomp_payload);
+    // Checksum over the data bytes (seed 0). LibreDWG's
+    // `dwg_section_page_checksum` (decode.c:1394) is the Adler-32
+    // variant with `mod 0xFFF1`, NOT a CRC despite its name — see
+    // `dwg_section_page_checksum` in `dwg/bits/crc.rs`. Both system
+    // pages and data pages use the same function on the AutoCAD side
+    // (encode.c uses it for write_R2004_section_data too), so we use
+    // it here as well; getting this wrong is a latent compat bug
+    // because our reader rejects any file whose data-page checksums
+    // it cannot reproduce.
+    let data_crc = dwg_section_page_checksum(0, decomp_payload);
     let mut header = DataPageHeader {
         page_type: DATA_PAGE_MAGIC,
         section_type,
@@ -509,10 +531,11 @@ pub fn write_data_page(
         page_header_crc: 0,
         data_crc,
     };
-    // Compute the header CRC over the cleartext header with the CRC
-    // field zeroed, seeded by `data_crc` (LibreDWG encode.c:4218).
+    // Compute the header checksum over the cleartext header with the
+    // CRC field zeroed, seeded by `data_crc` (LibreDWG encode.c:4218,
+    // which calls `dwg_section_page_checksum` — Adler-32, not CRC).
     let hdr_bytes_for_crc = header.encode();
-    let page_hdr_crc = crc_32c(data_crc, &hdr_bytes_for_crc);
+    let page_hdr_crc = dwg_section_page_checksum(data_crc, &hdr_bytes_for_crc);
     header.page_header_crc = page_hdr_crc;
     let mut encrypted = header.encode();
     xor_data_page_header(&mut encrypted, page_file_offset);
@@ -554,8 +577,10 @@ pub fn read_data_page(
         });
     }
     let payload = &page_bytes[DATA_PAGE_HEADER_SIZE..DATA_PAGE_HEADER_SIZE + data_len];
-    // Recompute and validate the data CRC.
-    let calc_data = crc_32c(0, payload);
+    // Recompute and validate the data checksum (Adler-32 via
+    // `dwg_section_page_checksum`, NOT CRC-32C — must match the
+    // writer above and AutoCAD-emitted files).
+    let calc_data = dwg_section_page_checksum(0, payload);
     if calc_data != header.data_crc {
         return Err(DwgError::SectionCrcMismatch {
             section: "r2004_data_page_data",
@@ -563,10 +588,11 @@ pub fn read_data_page(
             stored: header.data_crc,
         });
     }
-    // Recompute and validate the page-header CRC.
+    // Recompute and validate the page-header checksum (Adler-32 via
+    // `dwg_section_page_checksum`).
     let mut hdr_for_crc = header;
     hdr_for_crc.page_header_crc = 0;
-    let calc_hdr = crc_32c(calc_data, &hdr_for_crc.encode());
+    let calc_hdr = dwg_section_page_checksum(calc_data, &hdr_for_crc.encode());
     if calc_hdr != header.page_header_crc {
         return Err(DwgError::SectionCrcMismatch {
             section: "r2004_data_page_header",

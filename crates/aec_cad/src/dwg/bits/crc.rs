@@ -1,16 +1,30 @@
-//! CRC primitives used by the DWG format.
+//! Checksum primitives used by the DWG format.
 //!
-//! Three distinct CRC variants appear in real DWG files:
+//! Despite the module name (`crc`), DWG files use a mix of **true CRCs**
+//! and **Adler-32-style checksums**. Both groups live here because
+//! every checksum AutoCAD computes for the file format is in this
+//! module, and the encoder/decoder paths need to import them from one
+//! place.
+//!
+//! ## True CRCs (polynomial-based)
 //!
 //! 1. **CRC-8** — the file-header checksum on the leading 16 bytes
 //!    (R13+).  Polynomial `0x07` (x^8 + x^2 + x + 1), MSB-first
 //!    (non-reflected), initial value `0xc0`. The reduction loop in
 //!    [`crc_8`] tests the high bit and shifts left, matching what
 //!    AutoCAD emits and what LibreDWG validates against.
-//! 2. **CRC-32C (Castagnoli)** — section page checksums (R2004+).
-//!    Polynomial `0x1edc6f41`, reflected, initial value `0xffffffff`,
-//!    post-complement. Used by [`crc_32c`].
-//! 3. **CRC-32 (IEEE / "zlib")** — checksum stored *inside* the
+//! 2. **CRC-X25** — section checksums in R13–R2000 modern format.
+//!    Polynomial `0x1021`, reflected, initial value `0xc0c1` per the
+//!    Open Design specification. Used by [`crc_x25`].
+//! 3. **CRC-32C (Castagnoli)** — historically used by an earlier
+//!    iteration of this codec for section page checksums, but
+//!    LibreDWG and AutoCAD do NOT use CRC-32C for that purpose; they
+//!    use [`dwg_section_page_checksum`] (see below). [`crc_32c`] is
+//!    kept here because the `dwg_section_page_checksum_disagrees_with_crc_32c`
+//!    test compares the two to lock in the distinction; it is not
+//!    re-exported from `dwg::bits` because it has no production
+//!    consumer.
+//! 4. **CRC-32 (IEEE / "zlib")** — checksum stored *inside* the
 //!    encrypted R2004 file header (bytes 0x68..0x6c). LibreDWG
 //!    computes this with its `bit_calc_CRC32` over the 108-byte
 //!    decrypted header with the CRC field zeroed. Polynomial
@@ -20,12 +34,23 @@
 //!    This is a different CRC from CRC-32C above; do not confuse the
 //!    two — they share a name but differ in polynomial and final
 //!    inversion.
-//! 4. **CRC-X25** — section checksums in R13–R2000 modern format.
-//!    Polynomial `0x1021`, reflected, initial value `0xc0c1` per the
-//!    Open Design specification.
 //!
-//! The functions below compute these directly; callers verify against
-//! the value stored at a documented offset in each section.
+//! ## Adler-32-style (NOT a CRC despite the module name)
+//!
+//! 5. **`dwg_section_page_checksum`** — every system-page checksum and
+//!    every data-page checksum on R2004+ files. This is Adler-32's
+//!    paired-running-sum update rule with the standard `mod 0xFFF1`
+//!    reduction, but with a seed-derived initial state instead of the
+//!    RFC 1950 `(sum1=1, sum2=0)` fixed state. The two-pass header-
+//!    then-payload composition (or, for data pages, payload-then-
+//!    header) relies on the chaining identity `checksum(a + b) ==
+//!    checksum(b, seed=checksum(a))`. See
+//!    [`dwg_section_page_checksum`] for full algorithm details and
+//!    [`super::super::file::system_section::system_page_checksum`] for
+//!    its canonical wire-format use.
+//!
+//! Callers verify against the value stored at a documented offset in
+//! each section or page header.
 
 /// CRC-X25 (the 16-bit checksum used by R13–R2000 section headers).
 ///
@@ -76,6 +101,95 @@ pub fn crc_32c(seed: u32, data: &[u8]) -> u32 {
         crc = (crc >> 8) ^ table[idx];
     }
     !crc
+}
+
+/// Adler-32 modulus (`65521`). Reduces sum1 / sum2 to fit in 16 bits.
+/// Identical to RFC 1950 zlib Adler-32.
+pub const ADLER32_MOD: u32 = 0xFFF1;
+
+/// Adler-32 NMAX (`5552`, AKA `0x15B0`): the maximum number of bytes
+/// that can be accumulated between `% ADLER32_MOD` reductions without
+/// overflowing the `u32` accumulators.
+///
+/// **Load-bearing constant.** Worst case at this value (seed
+/// `0xFFFFFFFF`, input all `0xFF`) leaves only ≈193,800 bytes of
+/// headroom under `u32::MAX` (less than 200 KB on a 4 GB integer):
+///
+/// ```text
+/// sum1_final = 0xFFFF + 5552 × 0xFF = 1,481,295
+/// sum2_final = 0xFFFF + 5552 × 0xFFFF + 0xFF × (5552 × 5553 / 2)
+///            = 65,535 + 363,850,320 + 3,930,857,640
+///            = 4,294,773,495
+/// headroom   = u32::MAX - sum2_final = 193,800
+/// ```
+///
+/// Raising it even slightly (to `0x15B1`) can overflow at max seed
+/// and turns `dwg_section_page_checksum` into a position-sensitive
+/// hash that breaks the chaining identity AutoCAD relies on for the
+/// two-pass header/payload composition. See
+/// `dwg_section_page_checksum_nmax_invariant` for the lock-in
+/// regression test (re-derives the worst case in u64 and asserts it
+/// stays below `u32::MAX`).
+pub const ADLER32_NMAX: usize = 0x15B0;
+
+/// Adler-32-**style** checksum used by LibreDWG `dwg_section_page_checksum`.
+///
+/// This is NOT a CRC despite the name. It uses the Adler-32 update
+/// rule (paired running sums with `mod ADLER32_MOD (= 0xFFF1)`
+/// reduction) every [`ADLER32_NMAX`] (`0x15B0`) bytes:
+///
+/// ```text
+/// sum1 = seed & 0xFFFF
+/// sum2 = seed >> 16
+/// for byte in data:
+///     sum1 += byte
+///     sum2 += sum1
+///     (mod ADLER32_MOD every ADLER32_NMAX bytes)
+/// return (sum2 << 16) | (sum1 & 0xFFFF)
+/// ```
+///
+/// **Non-standard initial state when seeded with 0.** RFC 1950 / zlib
+/// Adler-32 fixes the initial state at `(sum1=1, sum2=0)` — i.e. its
+/// "empty" output is `0x0000_0001`. This function instead derives the
+/// initial state from `seed`, so `dwg_section_page_checksum(0, &[])`
+/// is `0`, not `1`. To get the RFC 1950 result, pass `seed = 1`. The
+/// `seed`-derived init is what LibreDWG (`decode.c::dwg_section_page_checksum`
+/// line 1394) and AutoCAD-emitted files both use; this asymmetry is
+/// what makes it a "style" of Adler-32 rather than a drop-in alias.
+/// The test `dwg_section_page_checksum_known_vector` pins the value
+/// for `[1, 2, 3, 4]` at `0x0014_000a` to catch a future drift toward
+/// the standard `(1, 0)` initial state.
+///
+/// AutoCAD uses this for the R2004+ system-page checksums (page map +
+/// section info) AND the data-page checksums on R2004/R2007/R2010/
+/// R2013/R2018 files.
+///
+/// `seed` is the previous return value when chaining; pass `0` for a
+/// fresh computation. The two-pass convention is:
+/// ```text
+/// c1 = dwg_section_page_checksum(0, header_bytes_with_zero_checksum)
+/// c  = dwg_section_page_checksum(c1, payload_bytes)
+/// ```
+/// See `dwg_section_page_checksum_chains_at_arbitrary_split` for the
+/// chaining identity's exact preconditions (depends on
+/// [`ADLER32_NMAX`]).
+pub fn dwg_section_page_checksum(seed: u32, data: &[u8]) -> u32 {
+    let mut sum1: u32 = seed & 0xFFFF;
+    let mut sum2: u32 = seed >> 16;
+    let mut remaining = data.len();
+    let mut cursor = 0usize;
+    while remaining > 0 {
+        let chunksize = remaining.min(ADLER32_NMAX);
+        for &b in &data[cursor..cursor + chunksize] {
+            sum1 += u32::from(b);
+            sum2 += sum1;
+        }
+        sum1 %= ADLER32_MOD;
+        sum2 %= ADLER32_MOD;
+        cursor += chunksize;
+        remaining -= chunksize;
+    }
+    (sum2 << 16) | (sum1 & 0xFFFF)
 }
 
 /// CRC-32 IEEE (polynomial `0xedb88320`, reflected, with the standard
@@ -288,5 +402,174 @@ mod tests {
         assert_ne!(ieee, castagnoli);
         assert_eq!(ieee, 0xcbf43926);
         assert_eq!(castagnoli, 0xe3069283);
+    }
+
+    #[test]
+    fn dwg_section_page_checksum_empty_input_returns_seed() {
+        // No data → no mutation of sum1/sum2 → returns the seed
+        // packed identically into the (sum2<<16)|sum1 layout.
+        assert_eq!(dwg_section_page_checksum(0, &[]), 0);
+        assert_eq!(dwg_section_page_checksum(0x1234_5678, &[]), 0x1234_5678);
+
+        // Non-canonical seed where both halves exceed ADLER32_MOD
+        // (sum1 = 0xFFFF = 65535 > 65521, same for sum2). LibreDWG
+        // never reduces the seed up front — the seed is taken
+        // verbatim and reduction only happens at the end of each
+        // chunk. With empty data there are no chunks, so the seed
+        // round-trips unchanged. Pinning this case is the
+        // counterpart to ADLER32_NMAX's worst-case overflow
+        // analysis, which assumes exactly this `(0xFFFF, 0xFFFF)`
+        // starting state. If anyone ever "helpfully" pre-reduces
+        // the seed in `dwg_section_page_checksum`, this assertion
+        // fails immediately and the overflow analysis becomes
+        // invalid.
+        assert_eq!(dwg_section_page_checksum(0xFFFF_FFFF, &[]), 0xFFFF_FFFF);
+    }
+
+    #[test]
+    fn dwg_section_page_checksum_known_vector() {
+        // Hand-computed reference: data = [1, 2, 3, 4], seed=0.
+        // sum1 progression: 0, 1, 3, 6, 10
+        // sum2 progression: 0, 1, 4, 10, 20
+        // result = (20 << 16) | 10 = 0x00140000 | 0x0a = 0x0014000a
+        //
+        // This pin doubles as a regression guard against a future
+        // drift to RFC 1950 / zlib Adler-32 semantics, which fix the
+        // initial state at (sum1=1, sum2=0) regardless of seed and
+        // would produce 0x0018_000b for the same input.
+        assert_eq!(dwg_section_page_checksum(0, &[1, 2, 3, 4]), 0x0014_000a);
+    }
+
+    #[test]
+    fn dwg_section_page_checksum_with_seed_one_matches_rfc1950() {
+        // `dwg_section_page_checksum`'s seed-derived initial state is
+        // what makes it "Adler-32-style" rather than a drop-in RFC 1950
+        // alias: passing `seed = 1` reproduces the RFC 1950 initial
+        // state (sum1=1, sum2=0), so the function emits the standard
+        // zlib Adler-32 result for any data when called with seed=1.
+        //
+        // The RFC 1950 reference value for "Wikipedia" (the canonical
+        // Adler-32 example) is 0x11E60398 (sum1=0x0398, sum2=0x11E6).
+        // Verifies the relationship documented in the rustdoc above.
+        assert_eq!(dwg_section_page_checksum(1, b"Wikipedia"), 0x11E6_0398);
+
+        // And confirms the LibreDWG "empty input with seed=1 returns
+        // 1" behavior, distinguishing it from the seed=0 case which
+        // returns 0.
+        assert_eq!(dwg_section_page_checksum(1, &[]), 1);
+        assert_eq!(dwg_section_page_checksum(0, &[]), 0);
+    }
+
+    #[test]
+    fn dwg_section_page_checksum_chains_at_arbitrary_split() {
+        // The chaining identity AutoCAD relies on for the two-pass
+        // header-then-payload composition: feeding the previous
+        // return value back as the seed reconstructs the full-buffer
+        // computation.
+        //
+        // The previous version of this test claimed "any boundary"
+        // and only proved it on 16 bytes of ASCII, which can't
+        // distinguish mod-induced divergence from trivial equality.
+        // This rewrite exercises ~22 KB of pseudo-random bytes that
+        // cross the ADLER32_NMAX chunk boundary twice and verifies the
+        // identity at three split points: (a) interior to the first
+        // chunk, (b) exactly on the chunk boundary, (c) interior to
+        // the second chunk.
+        //
+        // Why arbitrary splits work in practice: ADLER32_NMAX is
+        // chosen so a single chunk's accumulators stay below u32::MAX
+        // even with adversarial input. See the const's doc and the
+        // dwg_section_page_checksum_nmax_invariant test for the
+        // overflow math; this test exercises the chaining identity
+        // _at_ that constant, while the invariant test pins the
+        // constant itself.
+        let mut data = vec![0u8; ADLER32_NMAX * 2 + 100];
+        let mut state: u32 = 0xdead_beef;
+        for b in &mut data {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            *b = (state >> 16) as u8;
+        }
+        let full = dwg_section_page_checksum(0, &data);
+
+        for split in [100, ADLER32_NMAX, ADLER32_NMAX + 1, ADLER32_NMAX * 2 - 1] {
+            let part = dwg_section_page_checksum(0, &data[..split]);
+            let chained = dwg_section_page_checksum(part, &data[split..]);
+            assert_eq!(
+                full, chained,
+                "chaining mismatch at split = {split} (full = {full:#x}, chained = {chained:#x})"
+            );
+        }
+    }
+
+    #[test]
+    fn dwg_section_page_checksum_disagrees_with_crc_32c() {
+        // Confirms that the new helper is NOT a CRC alias — this
+        // function uses the Adler-32 algorithm with mod 0xFFF1, not
+        // a polynomial CRC. The earlier implementation of
+        // `system_page_checksum` mistakenly used CRC-32C; locking
+        // this divergence in prevents an accidental revert.
+        assert_ne!(
+            dwg_section_page_checksum(0, b"123456789"),
+            crc_32c(0, b"123456789")
+        );
+    }
+
+    #[test]
+    fn dwg_section_page_checksum_nmax_invariant() {
+        // Lock-in regression test for the ADLER32_NMAX constant. The
+        // chunk size is load-bearing: raising it past `0x15B0` can
+        // overflow the u32 accumulators at max seed, which breaks the
+        // chaining identity the wire format relies on. Don't change
+        // the constant without re-doing the overflow math.
+        assert_eq!(
+            ADLER32_NMAX, 0x15B0,
+            "ADLER32_NMAX is the standard Adler-32 NMAX (5552); do NOT change without re-doing overflow math in the const's doc"
+        );
+        assert_eq!(
+            ADLER32_MOD, 0xFFF1,
+            "ADLER32_MOD is the Adler-32 modulus (65521 = largest prime < 2^16); changing it changes the wire format"
+        );
+
+        // Sanity check the worst-case math one more time. Even at
+        // max seed (`0xFFFFFFFF` → sum1=0xFFFF, sum2=0xFFFF) feeding
+        // NMAX bytes of `0xFF`, the next pre-reduction sum2 must
+        // stay under u32::MAX. We don't actually run the computation
+        // here (it would require exposing internal state) — instead
+        // we verify the closed-form bound:
+        //   max sum2 = 0xFFFF + ADLER32_NMAX * 0xFFFF
+        //              + 0xFF * (ADLER32_NMAX * (ADLER32_NMAX + 1) / 2)
+        let n = ADLER32_NMAX as u64;
+        let max_sum2: u64 = 0xFFFF + n * 0xFFFF + 0xFF * (n * (n + 1) / 2);
+        assert!(
+            max_sum2 < u64::from(u32::MAX),
+            "ADLER32_NMAX overflow: max sum2 = {max_sum2} > u32::MAX = {}",
+            u32::MAX
+        );
+        // Headroom must remain positive — currently 193,800 bytes
+        // under u32::MAX. Tighter than the standard Adler-32 NMAX
+        // derivation assumes because we don't pre-reduce the seed.
+        let headroom = u64::from(u32::MAX) - max_sum2;
+        assert_eq!(
+            headroom, 193_800,
+            "ADLER32_NMAX worst-case headroom changed: was 193,800, now {headroom}. \
+             Re-do the overflow analysis in the const's doc comment if this assertion fails."
+        );
+        assert!(
+            headroom > 0,
+            "ADLER32_NMAX leaves zero headroom under u32::MAX"
+        );
+    }
+
+    #[test]
+    fn dwg_section_page_checksum_handles_chunk_boundary() {
+        // The reference implementation applies `mod ADLER32_MOD`
+        // every ADLER32_NMAX bytes. Feed it `ADLER32_NMAX * 2 + 1`
+        // zero bytes to cross the chunk boundary twice, then verify
+        // the result equals the obvious closed-form (mod 65521 of
+        // cumulative sums).
+        let data = vec![0u8; ADLER32_NMAX * 2 + 1];
+        // All-zero input → sum1 and sum2 never advance past their
+        // initial values regardless of chunking.
+        assert_eq!(dwg_section_page_checksum(0, &data), 0);
     }
 }
