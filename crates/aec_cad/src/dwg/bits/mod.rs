@@ -28,6 +28,7 @@
 
 pub mod crc;
 pub mod reader;
+pub mod reed_solomon;
 pub mod writer;
 
 // Only re-export primitives that have at least one production
