@@ -197,6 +197,21 @@ impl<'a> BitReader<'a> {
         }
     }
 
+    /// Read a Bit-encoded Object Type (BOT, R2010+).
+    /// 2-bit shape prefix:
+    /// - `00` → followed by RC (8 bits); value range [0, 255]
+    /// - `01` → followed by RC + 0x1f0; value range [0x1f0, 0x2ef]
+    /// - else → followed by RS (16 bits)
+    ///
+    /// See LibreDWG `bit_read_BOT` (bits.c:713).
+    pub fn read_bot(&mut self) -> DwgResult<u16> {
+        match self.read_bb()? {
+            0 => Ok(self.read_bits_u32(8)? as u16),
+            1 => Ok((self.read_bits_u32(8)? as u16).wrapping_add(0x1f0)),
+            _ => Ok(self.read_rs()?),
+        }
+    }
+
     /// Read a Bit Long (BL, signed 32-bit-equivalent).
     /// Control bits:
     /// - `00` → followed by 32-bit raw little-endian long
@@ -241,6 +256,29 @@ impl<'a> BitReader<'a> {
                 bits: other,
             }),
         }
+    }
+
+    /// Read a Bit LongLong (BLL): 3-bit length prefix encoded as
+    /// `(BB << 1) | B`, followed by `len` little-endian payload bytes.
+    /// Mirrors [`crate::dwg::bits::writer::BitWriter::write_bll`] and
+    /// LibreDWG's `bit_read_BLL` for `REQUIREDVERSIONS` /
+    /// `preview_size`.
+    pub fn read_bll(&mut self) -> DwgResult<u64> {
+        let len_hi = self.read_bb()?;
+        let len_lo = u8::from(self.read_b()?);
+        let len = (len_hi << 1) | len_lo;
+        let mut value: u64 = 0;
+        for i in 0..len {
+            let byte = u64::from(self.read_bits_u32(8)?);
+            value |= byte << (i * 8);
+        }
+        Ok(value)
+    }
+
+    /// Raw Char (RC): exactly 8 bits, bit-aligned. Symmetric counterpart
+    /// to [`crate::dwg::bits::writer::BitWriter::write_rc`].
+    pub fn read_rc(&mut self) -> DwgResult<u8> {
+        Ok(self.read_bits_u32(8)? as u8)
     }
 
     /// Read a Bit Double (BD, IEEE-754 64-bit).
@@ -337,6 +375,37 @@ impl<'a> BitReader<'a> {
         }
     }
 
+    /// Version-aware BT reader. R14 stores a plain BD; R2000+ adds
+    /// the 1-bit "is default" prefix. Mirrors LibreDWG
+    /// `bit_read_BT` at `bits.c:1297`.
+    pub fn read_bt(&mut self, version: crate::dwg::version::Version) -> DwgResult<f64> {
+        use crate::dwg::version::Version;
+        if matches!(version, Version::R12 | Version::R14) {
+            self.read_bd()
+        } else {
+            self.read_bt_r2000_plus()
+        }
+    }
+
+    /// Version-aware BE reader. R14 stores a plain 3BD with the
+    /// LibreDWG z-normalisation when x=y=0; R2000+ adds the
+    /// 1-bit "is default (0,0,1)" prefix. Mirrors LibreDWG
+    /// `bit_read_BE` at `bits.c:1112`.
+    pub fn read_be(&mut self, version: crate::dwg::version::Version) -> DwgResult<[f64; 3]> {
+        use crate::dwg::version::Version;
+        if matches!(version, Version::R12 | Version::R14) {
+            let x = self.read_bd()?;
+            let y = self.read_bd()?;
+            let mut z = self.read_bd()?;
+            if x == 0.0 && y == 0.0 {
+                z = if z <= 0.0 { -1.0 } else { 1.0 };
+            }
+            Ok([x, y, z])
+        } else {
+            self.read_be_r2000_plus()
+        }
+    }
+
     /// Bit Double With Default (DD). The writer in this crate always
     /// emits `00` (use default) or `11` (full RD); for full
     /// AutoCAD-emitted file compatibility we also handle the `01`
@@ -425,6 +494,39 @@ impl<'a> BitReader<'a> {
         Err(DwgError::ModularOverflow {
             type_name: "MC",
             bytes: 5,
+        })
+    }
+
+    /// Unsigned Modular Char (UMC). Variable-length 7-bit LE chunks
+    /// with the 0x80 bit of each byte as continuation flag. Up to 8
+    /// bytes (sufficient for any handle value).
+    ///
+    /// Returns the decoded value as u64; the first byte holds the
+    /// least-significant 7 bits and each subsequent byte adds the
+    /// next 7 bits. Last byte has the continuation flag cleared.
+    ///
+    /// See LibreDWG `bit_read_UMC` (bits.c:1006).
+    pub fn read_umc(&mut self) -> DwgResult<u64> {
+        let mut value: u64 = 0;
+        let mut shift: u32 = 0;
+        for byte_idx in 0..8 {
+            let byte = self.read_bits_u32(8)?;
+            let payload = u64::from(byte & 0x7f);
+            value |= payload << shift;
+            if byte & 0x80 == 0 {
+                return Ok(value);
+            }
+            shift += 7;
+            if byte_idx == 7 {
+                return Err(DwgError::ModularOverflow {
+                    type_name: "UMC",
+                    bytes: 8,
+                });
+            }
+        }
+        Err(DwgError::ModularOverflow {
+            type_name: "UMC",
+            bytes: 8,
         })
     }
 

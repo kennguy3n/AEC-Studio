@@ -39,6 +39,18 @@ fn canonical_doc() -> DxfDocument {
     doc
 }
 
+/// R2007 currently cannot write entities (assemble_r2007 does not
+/// emit entity-bearing data pages; PR-C / phase 6 of the R2007
+/// roadmap is the follow-up). `write_modern` returns
+/// `Err(UnsupportedInVersion)` for any R2007 doc with non-empty
+/// `entities`. The R2007 golden therefore exercises the same wire
+/// layout (file header + classes + handle map + zero data pages)
+/// using an explicitly empty document, instead of relying on the
+/// previous silent-drop behavior.
+fn r2007_doc() -> DxfDocument {
+    DxfDocument::new()
+}
+
 /// (length_in_bytes, blake3_hex) tuple for one version.
 struct Golden {
     bytes: usize,
@@ -51,41 +63,49 @@ fn golden(v: DwgVersion) -> Golden {
     match v {
         DwgVersion::R12 => Golden {
             bytes: 1118,
-            blake3_hex: "0aa4e2fccde03a087c6d0b68120e8f0b7e2e4c46bd20bc1f6b2e58a2e3de4962",
+            blake3_hex: "e1fdf01aacf6f818b5747e77b0c5df930534e2d72e29244459e2d4d70661ebb5",
         },
         DwgVersion::R14 => Golden {
-            bytes: 174,
-            blake3_hex: "1ed827cae802dbdcf6c42345494c6ca716575a2f994bb6d7ff88d7a9c186358d",
+            bytes: 483,
+            blake3_hex: "ba8a3d3ab903430913585020987357907e16f041ec5cc9e9470d1cb5b1326b2e",
         },
         DwgVersion::R2000 => Golden {
-            bytes: 175,
-            blake3_hex: "6cafc0fbda3c7e12b393e0923ffbc62a8a3d7dd5097e429c81a3e3a8fd3c9414",
+            bytes: 545,
+            blake3_hex: "e25c9dbfc186f2062bb5bf7a3184d203e42f7f97e7dcf294130ac7d60f4ab439",
         },
         DwgVersion::R2004 => Golden {
-            bytes: 1051,
-            blake3_hex: "8357dad872a7bb9033d046c68c545f51891c63740c772ee1b50ef6375fadafca",
+            bytes: 2152,
+            blake3_hex: "3601c4fe6a735ba1c1ceccc6cb44a35abbea68079ef794bd9248361ea0d129ef",
         },
         DwgVersion::R2007 => Golden {
             bytes: 2944,
             blake3_hex: "33990028cd7387827e7c2d334de06a5ece4f6a35ade8d39f1db99b144c07230b",
         },
         DwgVersion::R2010 => Golden {
-            bytes: 1056,
-            blake3_hex: "52266c087d8962ce0717367c732e42631dbba3749918241a494fa22812a6c78d",
+            bytes: 2356,
+            blake3_hex: "fec2b42a20a03666aafe0e90a552065c9f07252c77406725281ee4839d765e16",
         },
         DwgVersion::R2013 => Golden {
-            bytes: 1057,
-            blake3_hex: "5330a82ae67c0dc7024494232003c69dc3ec39ad28229df243bb5d98785eb341",
+            bytes: 2359,
+            blake3_hex: "dbe7b5e396eece7834b60d18107c7d25510f3544ae7317650c9feb5980620936",
         },
         DwgVersion::R2018 => Golden {
-            bytes: 1057,
-            blake3_hex: "d7e43d9871899c7be80511c6c6670567e2f82b34f06c020c091e347d62220476",
+            bytes: 2371,
+            blake3_hex: "130f6558008b49fc964520f7df80c6bbe7178f43a4917b6f4012b19f41785173",
         },
     }
 }
 
 fn check_version(v: DwgVersion) {
-    let doc = canonical_doc();
+    // R2007 cannot yet round-trip entities through write_modern —
+    // pass an empty doc so the test exercises the file/sections
+    // layer without tripping the new `UnsupportedInVersion` guard
+    // in `write_modern`.
+    let doc = if v == DwgVersion::R2007 {
+        r2007_doc()
+    } else {
+        canonical_doc()
+    };
 
     let bytes = DwgWriter::write(&doc, v)
         .unwrap_or_else(|e| panic!("DwgWriter::write failed for {v:?}: {e:?}"));
@@ -130,9 +150,12 @@ fn check_version(v: DwgVersion) {
     if v == DwgVersion::R2007 {
         // PR-C in-flight: R2007 now goes through `assemble_r2007`
         // which emits a valid file header + sections-map but no
-        // entity-bearing data pages yet. The entity round-trip is
-        // restored once data-page emission lands later in this PR.
-        assert_eq!(back.entities.len(), 0, "{v:?} placeholder slice");
+        // entity-bearing data pages yet. The encoder now rejects
+        // entities outright (UnsupportedInVersion); the round-trip
+        // therefore exercises the empty-document path and recovers
+        // zero entities. Entity round-trip will be restored once
+        // data-page emission lands later in the R2007 roadmap.
+        assert_eq!(back.entities.len(), 0, "{v:?} empty-doc round-trip");
         return;
     }
     assert_eq!(back.entities.len(), 1, "{v:?} round-trip lost the line");

@@ -33,6 +33,7 @@
 
 use crate::dwg::bits::{crc_x25, BitReader, BitWriter};
 use crate::dwg::error::{DwgError, DwgResult};
+use crate::dwg::file::header_vars_body::{encode_body, HeaderVars, MaintVersion};
 use crate::dwg::file::sentinels::{HEADER_VARS_BEGIN, HEADER_VARS_END};
 use crate::dwg::version::Version;
 
@@ -83,11 +84,15 @@ impl HeaderVarsSection {
             });
         }
         let mut reader = BitReader::new(&bytes[after_sentinel..]);
-        // size_in_bits is encoded as RL (raw 32-bit little-endian).
-        let size_in_bits = reader.read_rl()? as usize;
-        let body_byte_len = size_in_bits.div_ceil(8);
-        // Body bytes = 4 (RL) + body + 2 (CRC).
-        let body_total = 4 + body_byte_len + 2;
+        // The size RL is a *byte* count of the body that follows the
+        // size field itself, matching LibreDWG's `dwg_decode_header`
+        // (`crcpos = pvz + size + 4`). The previous codebase
+        // documented this as a `size_in_bits` field, which only
+        // happened to agree with the encoder when `size == 0`; for
+        // non-empty bodies it would read 8x too few bytes.
+        let size_in_bytes = reader.read_rl()? as usize;
+        // Body bytes = 4 (RL) + size_in_bytes + 2 (CRC).
+        let body_total = 4 + size_in_bytes + 2;
         if bytes.len() < after_sentinel + body_total + 16 {
             return Err(DwgError::UnexpectedEof {
                 byte: bytes.len(),
@@ -119,21 +124,43 @@ impl HeaderVarsSection {
     }
 
     /// Build a minimal-valid section. The body contains:
-    /// - 4 bytes RL size_in_bits = 0
+    /// - 4 bytes RL size_in_bytes = 0
     /// - 2 bytes CRC-X25 over the size field (with seed 0xc0c1)
     ///
-    /// This is enough for parsers that only validate the framing.
-    /// Real AutoCAD-compatible writers will populate the body with the
-    /// per-version variable set; this minimal form is what the
-    /// writer-side scaffolding emits until that work lands.
+    /// This is the bare-frame form. LibreDWG (and AutoCAD) will
+    /// reject this for any version that expects to actually decode
+    /// the variable table — use [`Self::libredwg_conformant`] for
+    /// any file headed for the LibreDWG oracle or AutoCAD.
     pub fn minimal(version: Version) -> Self {
         let mut w = BitWriter::new();
-        // size_in_bits = 0 (no variable bits).
+        // size_in_bytes = 0 (no variable bits).
         w.write_rl(0).expect("scratch BitWriter never overflows");
         let mut body = w.into_bytes();
         // CRC-X25 over the body so far.
         let crc = crc_x25(0xc0c1, &body);
         body.extend_from_slice(&crc.to_le_bytes());
+        Self { version, body }
+    }
+
+    /// Build a LibreDWG-conformant section with the full ~150-field
+    /// bit-packed header variable body. Defaults are taken from
+    /// [`HeaderVars::default`]; callers that need to pin specific
+    /// values can use [`Self::with_vars`] instead.
+    ///
+    /// For modern (R14+) files this is what gets emitted into the
+    /// AcDb:Header section; it is the only form that LibreDWG's
+    /// `dwg_decode_header_variables` can parse without buffer-
+    /// overflow errors.
+    pub fn libredwg_conformant(version: Version) -> Self {
+        Self::with_vars(version, &HeaderVars::default())
+    }
+
+    /// Build the section using a caller-supplied [`HeaderVars`].
+    /// The maintenance-version byte is taken from
+    /// [`Version::maintenance_release`].
+    pub fn with_vars(version: Version, vars: &HeaderVars) -> Self {
+        let body = encode_body(version, MaintVersion(version.maintenance_release()), vars)
+            .expect("encode_body is infallible for in-range defaults");
         Self { version, body }
     }
 

@@ -5,6 +5,7 @@
 //! each scalar type.
 
 use crate::dwg::error::{DwgError, DwgResult};
+use crate::dwg::version::Version;
 
 use super::reader::{Color, HandleRef};
 
@@ -163,6 +164,83 @@ impl BitWriter {
         Ok(())
     }
 
+    /// Raw Char (RC): exactly 8 bits, bit-aligned. Same on-wire shape
+    /// as a single byte through [`Self::write_bytes`]; provided as a
+    /// named alias because the LibreDWG spec calls this the `RC` type
+    /// and several header variables emit it directly.
+    pub fn write_rc(&mut self, value: u8) -> DwgResult<()> {
+        self.write_bits_u32(8, u32::from(value))
+    }
+
+    /// Bit LongLong (BLL): compacted u64. The first 3 bits encode the
+    /// byte-length `len` (0..=7) as `(BB << 1) | B`. The prefix is two
+    /// bits of `BB` (`len >> 1`, valid range `0..=3`) followed by one
+    /// bit of `B` (`len & 1`), which together cover `0..=7` only —
+    /// values of 8 or larger are NOT representable in this format and
+    /// would otherwise corrupt the bit stream (`write_bb` rejects
+    /// shape values above 3). Then `len` raw bytes follow in
+    /// little-endian order (least-significant byte first). Used for
+    /// `REQUIREDVERSIONS` and `preview_size` in the header. Mirrors
+    /// `bit_write_BLL` in LibreDWG (which has the same 7-byte cap;
+    /// `bit_read_BLL` recovers `len = (BB << 1) | B`, so the symmetric
+    /// read maxes out at 7 as well).
+    pub fn write_bll(&mut self, value: u64) -> DwgResult<()> {
+        // Determine minimum byte-length. `len` is the index past the
+        // most-significant non-zero byte; a value of zero produces
+        // `len = 0` (no payload bytes).
+        let len: u8 = if value == 0 {
+            0
+        } else {
+            let bits = 64 - value.leading_zeros() as u8;
+            bits.div_ceil(8)
+        };
+        if len > 7 {
+            return Err(DwgError::InternalInvariant(format!(
+                "write_bll length {len} out of range 0..=7 (value {value:#x} \
+                 needs >7 payload bytes; BLL's 3-bit length prefix cannot \
+                 encode that)"
+            )));
+        }
+        // 3-bit length prefix: BB (high 2 bits = len >> 1) + B (low 1 bit = len & 1).
+        self.write_bb(len >> 1)?;
+        self.write_b(len & 1 != 0)?;
+        let mut v = value;
+        for _ in 0..len {
+            self.write_bits_u32(8, (v & 0xff) as u32)?;
+            v >>= 8;
+        }
+        Ok(())
+    }
+
+    /// Append `len_bits` bits taken from `src` (treated as a forward
+    /// bit-stream starting at `src`'s bit 0) onto this writer at the
+    /// current cursor. Used to splice independent bit streams (e.g.
+    /// the R2007+ handle / string sub-streams) back into the main
+    /// section blob without round-tripping through byte boundaries.
+    pub fn append_bits_from(&mut self, src: &[u8], len_bits: u64) -> DwgResult<()> {
+        let needed_bytes = len_bits.div_ceil(8) as usize;
+        if src.len() < needed_bytes {
+            return Err(DwgError::InternalInvariant(format!(
+                "append_bits_from: source has {} bytes, need {needed_bytes} for {len_bits} bits",
+                src.len()
+            )));
+        }
+        let mut remaining = len_bits;
+        let mut byte_idx = 0usize;
+        while remaining >= 8 {
+            self.write_bits_u32(8, u32::from(src[byte_idx]))?;
+            byte_idx += 1;
+            remaining -= 8;
+        }
+        if remaining > 0 {
+            let last = src[byte_idx];
+            for shift in (8 - remaining as u8..8).rev() {
+                self.write_b((last >> shift) & 1 != 0)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Bit Short — encode using the smallest of the four shapes.
     ///
     /// The 16-bit shape (BB=0b00) carries a signed 16-bit value. Values
@@ -192,6 +270,37 @@ impl BitWriter {
                  use write_bl for wider values"
             )))
         }
+    }
+
+    /// Bit-encoded Object Type (R2010+). 2-bit shape prefix then a
+    /// variable-length type field — used for the object_type field
+    /// at the start of every entity body in R2010+.
+    ///
+    /// See LibreDWG `bit_write_BOT` (bits.c:733). The three on-wire
+    /// shapes (in selection order, narrowest first) are:
+    /// - `value < 256`:                       `BB 0b00` + `RC value`
+    /// - `0x1f0 <= value <= 0x2ef` (i.e.       `BB 0b01` +
+    ///   `value - 0x1f0` fits in a `u8`):       `RC (value - 0x1f0)`
+    /// - any other 16-bit value (incl. the    `BB 0b10` + `RS value`
+    ///   gaps `256..=0x1ef` and `0x2f0..`):
+    ///
+    /// Note: although shape 1 is the densest encoding for class IDs
+    /// in the `[0x1f0, 0x2ef]` window (a common range for built-in
+    /// classes), it is NOT a general `< 0x7fff` shape — values in the
+    /// gaps `[256, 0x1ef]` and `[0x2f0, 0x7ffe]` always fall through
+    /// to the 2-byte `RS` shape 2.
+    pub fn write_bot(&mut self, value: u16) -> DwgResult<()> {
+        if value < 256 {
+            self.write_bb(0b00)?;
+            self.write_bits_u32(8, u32::from(value))?;
+        } else if value < 0x7fff && value.wrapping_sub(0x1f0) < 256 {
+            self.write_bb(0b01)?;
+            self.write_bits_u32(8, u32::from(value - 0x1f0))?;
+        } else {
+            self.write_bb(0b10)?;
+            self.write_rs(value)?;
+        }
+        Ok(())
     }
 
     /// Bit Long — encode using the smallest of the three shapes.
@@ -332,6 +441,47 @@ impl BitWriter {
         }
     }
 
+    /// Version-aware Bit Thickness (BT). For R2000+ we emit the
+    /// optimised `B + optional BD` form; for R14 (and the unused R13
+    /// path) we emit a plain BD — LibreDWG `bit_write_BT` at
+    /// `bits.c:1310` dispatches on `dat->version >= R_2000`.
+    pub fn write_bt(&mut self, value: f64, version: crate::dwg::version::Version) -> DwgResult<()> {
+        use crate::dwg::version::Version;
+        if matches!(version, Version::R12 | Version::R14) {
+            self.write_bd(value)
+        } else {
+            self.write_bt_r2000_plus(value)
+        }
+    }
+
+    /// Version-aware Bit Extrusion (BE). For R2000+ we emit the
+    /// optimised `B + optional 3BD` form; for R14 we emit a plain
+    /// `3BD` (with the LibreDWG z-normalisation rule when x=y=0).
+    /// Matches `bit_write_BE` at `bits.c:1135`.
+    pub fn write_be(
+        &mut self,
+        value: [f64; 3],
+        version: crate::dwg::version::Version,
+    ) -> DwgResult<()> {
+        use crate::dwg::version::Version;
+        if matches!(version, Version::R12 | Version::R14) {
+            self.write_bd(value[0])?;
+            self.write_bd(value[1])?;
+            let z = if value[0] == 0.0 && value[1] == 0.0 {
+                if value[2] <= 0.0 {
+                    -1.0
+                } else {
+                    1.0
+                }
+            } else {
+                value[2]
+            };
+            self.write_bd(z)
+        } else {
+            self.write_be_r2000_plus(value)
+        }
+    }
+
     /// Bit Double With Default (DD): two control bits select between
     /// reusing the default verbatim (00), patching the low 4 bytes
     /// (01), patching the low 6 bytes (10), or reading a full 8-byte
@@ -385,6 +535,57 @@ impl BitWriter {
         for (i, payload) in bytes.iter().enumerate() {
             let cont = if i == bytes.len() - 1 { 0u8 } else { 0x80 };
             self.write_bits_u32(8, u32::from(cont | payload))?;
+        }
+        Ok(())
+    }
+
+    /// Unsigned Modular Char (UMC). 7-bit LE chunks with continuation
+    /// flag (0x80) on all bytes except the last. LibreDWG implementation
+    /// (bits.c::bit_write_UMC) always emits at least four payload bytes
+    /// — the upper four `byte[0..4]` slots are reserved for the
+    /// most-significant chunks and are skipped only if AT LEAST one of
+    /// them holds payload bits. We match that quirk exactly so files
+    /// produced here round-trip through `bit_read_UMC` byte-for-byte.
+    /// The bytes are written LSB-chunk first; the last byte's
+    /// continuation flag is cleared.
+    ///
+    /// See LibreDWG `bit_write_UMC` (bits.c:1044) for the reference
+    /// implementation.
+    pub fn write_umc(&mut self, value: u64) -> DwgResult<()> {
+        const MAX_BYTE_UMC: usize = 8;
+        // Split `value` into 7-bit chunks, MSB chunk at index 0 and
+        // LSB chunk at index 7. Each chunk is OR-ed with 0x80
+        // initially; the final write step strips the flag on the
+        // most-significant emitted byte.
+        let mut bytes = [0u8; MAX_BYTE_UMC];
+        let mut mask: u64 = 0x7f;
+        for i in (0..MAX_BYTE_UMC).rev() {
+            let j = (MAX_BYTE_UMC - 1 - i) * 7;
+            bytes[i] = ((value & mask) >> j) as u8 | 0x80;
+            mask = mask.wrapping_shl(7);
+        }
+        // Find first byte (MSB-first) with non-flag payload bits.
+        // Loop only scans the first four slots — LibreDWG mandates
+        // the minimum write length is bytes[4..8] (4 bytes).
+        let mut start: usize = 4;
+        for (i, b) in bytes.iter().enumerate().take(4) {
+            if b & 0x7f != 0 {
+                start = i;
+                break;
+            }
+        }
+        // UMC is unsigned, but the upper-bit-of-chunk-6 ambiguity is
+        // resolved here: if the high payload bit (0x40) of the
+        // most-significant emitted byte is set and we have room for
+        // another byte at index `start - 1`, prepend a zero-payload
+        // continuation byte to keep readers from interpreting the
+        // value as negative.
+        if bytes[start] & 0x40 != 0 && start > 0 {
+            start -= 1;
+        }
+        bytes[start] &= 0x7f;
+        for j in (start..MAX_BYTE_UMC).rev() {
+            self.write_bits_u32(8, u32::from(bytes[j]))?;
         }
         Ok(())
     }
@@ -511,6 +712,46 @@ impl BitWriter {
             }
         }
     }
+
+    /// Version-aware CMC encoder. R2004 introduced the truecolor wire
+    /// format: index-override `BS = 0`, the full 32-bit ARGB value as
+    /// `BL`, and an `RC` method/flag byte. For pre-R2004 files this
+    /// falls through to the original palette-index `BS` form via
+    /// [`Self::write_cmc`]. Mirrors `bit_write_CMC` in
+    /// `libredwg/src/bits.c`.
+    pub fn write_cmc_v(&mut self, version: Version, color: &Color) -> DwgResult<()> {
+        if version < Version::R2004 {
+            return self.write_cmc(color);
+        }
+        // R2004+ truecolor form. The `method` byte (high byte of rgb)
+        // tags the color kind:
+        //   0xC0 = ByLayer (rgb = 0xC0000000, palette index 256)
+        //   0xC1 = ByBlock (rgb = 0xC1000000, palette index 0)
+        //   0xC2 = Entity / true RGB (low 24 bits are R<<16 | G<<8 | B)
+        //   0xC3 = Named-palette index (rgb = 0xC3000000 | palette_index)
+        // For `Color::Index(n)` the palette index goes into the low 9
+        // bits of rgb with method 0xC3. The trailing RC `flag` is 0
+        // unless method == 0xC2 with attached name/book strings (which
+        // header variables never carry, so flag = 0 here).
+        let rgb: u32 = match color {
+            Color::ByLayer => 0xC000_0000,
+            Color::ByBlock => 0xC100_0000,
+            Color::Rgb(r, g, b) => {
+                0xC200_0000 | (u32::from(*r) << 16) | (u32::from(*g) << 8) | u32::from(*b)
+            }
+            Color::Index(idx) => {
+                let palette = (*idx as i32) & 0x1FF;
+                0xC300_0000 | (palette as u32)
+            }
+            // Named colours are encoded as method = 0xC3 with the
+            // palette index = 0 and the name carried in the string
+            // stream; for header-vars defaults we never hit this path.
+            Color::Named(_) => 0xC300_0000,
+        };
+        self.write_bs(0)?;
+        self.write_bl(i64::from(rgb as i32))?;
+        self.write_rc(0)
+    }
 }
 
 #[cfg(test)]
@@ -609,6 +850,113 @@ mod tests {
     }
 
     #[test]
+    fn bll_round_trips_special_values() {
+        for v in [
+            0_u64,
+            1,
+            255,
+            256,
+            65535,
+            65536,
+            0xff_ff_ff,
+            0xffff_ffff,
+            0x1_0000_0000,
+            0x12_3456_789a_bcde,
+            u64::from(u32::MAX),
+        ] {
+            assert_eq!(v, round_trip(move |w| w.write_bll(v), |r| r.read_bll()));
+        }
+    }
+
+    #[test]
+    fn bll_zero_uses_three_bits() {
+        // The empty-length prefix `000` is the minimal BLL encoding.
+        let mut w = BitWriter::new();
+        w.write_bll(0).unwrap();
+        assert_eq!(w.bit_position(), 3);
+    }
+
+    #[test]
+    fn bll_rejects_values_requiring_more_than_seven_bytes() {
+        // The 3-bit length prefix `(BB << 1) | B` covers `len = 0..=7`
+        // only. Any u64 with bits set in byte 7 (i.e. >= 2^56) would
+        // need `len = 8` and is not encodable. Without this guard the
+        // outer `write_bb` would itself reject `len >> 1 == 4` with a
+        // confusing "BB value 4 out of range" error; we surface a
+        // clear BLL-level error instead.
+        let just_into_byte_seven: u64 = 1u64 << 56;
+        let mut w = BitWriter::new();
+        let err = w.write_bll(just_into_byte_seven).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("write_bll length 8 out of range 0..=7"),
+            "expected length-out-of-range message, got: {msg}"
+        );
+
+        // u64::MAX also rejects (8 bytes worth of payload).
+        let mut w = BitWriter::new();
+        assert!(w.write_bll(u64::MAX).is_err());
+
+        // The largest representable value (`len = 7` => 56 bits)
+        // must still succeed.
+        let mut w = BitWriter::new();
+        let max_seven_byte = (1u64 << 56) - 1;
+        w.write_bll(max_seven_byte).unwrap();
+        // Prefix (3 bits) + 7 payload bytes (56 bits) = 59 bits.
+        assert_eq!(w.bit_position(), 3 + 7 * 8);
+    }
+
+    #[test]
+    fn rc_round_trips() {
+        for v in [0u8, 1, 0x7f, 0x80, 0xc1, 0xff] {
+            assert_eq!(v, round_trip(move |w| w.write_rc(v), |r| r.read_rc()));
+        }
+    }
+
+    #[test]
+    fn append_bits_from_concatenates_streams() {
+        // Build stream A: 0xa5 = 1010_0101 (8 bits) then `01` (2 bits).
+        let mut a = BitWriter::new();
+        a.write_rc(0xa5).unwrap();
+        a.write_b(false).unwrap();
+        a.write_b(true).unwrap();
+        let a_bits = a.bit_position();
+        let a_bytes = a.into_bytes();
+        assert_eq!(a_bits, 10);
+
+        // Stream B: `1101_0110` (8 bits) then `1` (1 bit) = 9 bits.
+        let mut b = BitWriter::new();
+        b.write_rc(0xd6).unwrap();
+        b.write_b(true).unwrap();
+        let b_bits = b.bit_position();
+        let b_bytes = b.into_bytes();
+        assert_eq!(b_bits, 9);
+
+        // Splice: A then B.
+        let mut out = BitWriter::new();
+        out.append_bits_from(&a_bytes, a_bits).unwrap();
+        out.append_bits_from(&b_bytes, b_bits).unwrap();
+        assert_eq!(out.bit_position(), a_bits + b_bits);
+
+        // Read it back.
+        let spliced = out.into_bytes();
+        let mut r = BitReader::new(&spliced);
+        assert_eq!(r.read_rc().unwrap(), 0xa5);
+        assert!(!r.read_b().unwrap());
+        assert!(r.read_b().unwrap());
+        assert_eq!(r.read_rc().unwrap(), 0xd6);
+        assert!(r.read_b().unwrap());
+    }
+
+    #[test]
+    fn append_bits_from_rejects_short_source() {
+        let mut out = BitWriter::new();
+        // Ask for 24 bits but supply only 1 byte (8 bits).
+        let err = out.append_bits_from(&[0xff], 24).unwrap_err();
+        assert!(matches!(err, DwgError::InternalInvariant(_)));
+    }
+
+    #[test]
     fn bd_round_trips_special_values() {
         for v in [0.0_f64, 1.0, -1.0, std::f64::consts::PI, f64::MIN, f64::MAX] {
             let got = round_trip(move |w| w.write_bd(v), |r| r.read_bd());
@@ -697,6 +1045,82 @@ mod tests {
             let got = round_trip(move |w| w.write_mc(v), |r| r.read_mc());
             assert_eq!(got, v, "MC round-trip failed for {v}");
         }
+    }
+
+    #[test]
+    fn umc_matches_libredwg_minimum_4_byte_encoding() {
+        // LibreDWG's bit_write_UMC for value=10 emits the exact byte
+        // sequence [0x8A, 0x80, 0x80, 0x00] (LSB chunk first, with
+        // three continuation-flagged padding bytes and a zero
+        // terminator). Pin that here so any future "optimization"
+        // toward a shorter varint breaks the test, not the on-disk
+        // format.
+        let mut w = BitWriter::new();
+        w.write_umc(10).unwrap();
+        assert_eq!(w.into_bytes(), [0x8A, 0x80, 0x80, 0x00]);
+
+        // Value with bits in the MSB chunk: 0x12345678 (= 305419896).
+        // LibreDWG splits this into 7-bit chunks: 0x78 (lo) 0x6c 0x4d
+        // 0x12_<...>. Verify writer emits a sequence whose decoder
+        // recovers the value.
+        let mut w2 = BitWriter::new();
+        w2.write_umc(0x1234_5678).unwrap();
+        let got = w2.into_bytes();
+        let mut r = crate::dwg::bits::BitReader::new(&got);
+        assert_eq!(r.read_umc().unwrap(), 0x1234_5678);
+    }
+
+    #[test]
+    fn umc_round_trips() {
+        // LibreDWG's UMC emits a 4-byte minimum encoding even for
+        // small values, so a 0 round-trips through 4 bytes. Verify
+        // the boundary cases — 0, low single-byte values, exact 7/14/21-bit
+        // boundaries, larger 32-bit, and a 56-bit value (max
+        // representable in 8 bytes of 7-bit payload).
+        let cases: &[u64] = &[
+            0,
+            1,
+            0x40,
+            0x7F,
+            0x80,
+            0x3FFF,
+            0x4000,
+            0x1F_FFFF,
+            0x20_0000,
+            0xFFFF_FFFF,
+            0x7F_FFFF_FFFF_FFFF,
+        ];
+        for &v in cases {
+            let got = round_trip(move |w| w.write_umc(v), |r| r.read_umc());
+            assert_eq!(got, v, "UMC round-trip failed for {v:#x}");
+        }
+    }
+
+    #[test]
+    fn bot_round_trips_all_three_shapes() {
+        // Shape 0: 0..=255 (BB 00 + RC).
+        // Shape 1: 0x1f0..=0x2ef (BB 01 + (RC - 0x1f0)). LibreDWG's
+        //          decoder adds 0x1f0 unconditionally to the RC.
+        // Shape 2: anything else (BB 10 + RS).
+        let cases: &[u16] = &[
+            0, 1, 19, 255, 0x1f0, 0x200, 0x2ef, 0x300, 0x500, 0xfff, 0x1234,
+        ];
+        for &v in cases {
+            let got = round_trip(move |w| w.write_bot(v), |r| r.read_bot());
+            assert_eq!(got, v, "BOT round-trip failed for {v:#x}");
+        }
+    }
+
+    #[test]
+    fn bot_matches_libredwg_shape_encoding() {
+        // Pin the exact bit pattern for each shape so a future
+        // refactor can't silently misalign with LibreDWG's reader.
+        // 19 (LINE) → BB 00 (2 bits) + 0x13 (8 bits) = 0b00_00010011 then
+        // padded at the end.
+        let mut w = BitWriter::new();
+        w.write_bot(19).unwrap();
+        let bytes = w.into_bytes();
+        assert_eq!(bytes, [0b00_000100, 0b11_000000]);
     }
 
     #[test]

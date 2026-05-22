@@ -52,12 +52,20 @@
 //! Callers verify against the value stored at a documented offset in
 //! each section or page header.
 
-/// CRC-X25 (the 16-bit checksum used by R13–R2000 section headers).
+/// CRC-16 used by every DWG section checksum.
 ///
-/// The OpenDesign spec calls this the "DWG CRC" — it's a CRC-16/X25
-/// variant with initial seed `0xc0c1` (some sources use `0xc1c0`;
-/// libredwg validated against AutoCAD-emitted files settled on
-/// `0xc0c1`).
+/// Although the OpenDesign Specification calls this "DWG CRC" and
+/// some commentary refers to it as "X.25" (poly 0x1021 reflected =
+/// 0x8408), the bytes AutoCAD actually writes — and LibreDWG's
+/// `bit_calc_CRC` table at `bits.c:4078` — use the **CRC-16/IBM**
+/// polynomial (`0xA001` reflected, also known as MODBUS). The
+/// initial seed is `0xc0c1` for almost every section (a few use
+/// chained seeds; see `dwg/bits/crc_seeds.rs`).
+///
+/// The original implementation here used 0x8408 by mistake, which
+/// happened to round-trip internally (both encoder and decoder used
+/// the same wrong polynomial) but produced CRCs that LibreDWG
+/// rejected on every read with "Handles page CRC mismatch" etc.
 pub fn crc_x25(seed: u16, data: &[u8]) -> u16 {
     let table = X25_TABLE;
     let mut crc = seed;
@@ -227,7 +235,7 @@ const X25_TABLE: [u16; 256] = {
         let mut j = 0;
         while j < 8 {
             if crc & 1 != 0 {
-                crc = (crc >> 1) ^ 0x8408;
+                crc = (crc >> 1) ^ 0xA001;
             } else {
                 crc >>= 1;
             }
@@ -294,11 +302,25 @@ mod tests {
         // Lock in the algorithm's output for a single-byte payload
         // `0x55` with seed 0xc0c1.  Any change to the polynomial,
         // table generation, or seeding strategy will break this.
-        // The value comes from running the in-tree algorithm itself
-        // (reflected CRC-16 with poly 0x8408, init 0xc0c1, refin/refout
-        // matching how AutoCAD writes section checksums on disk).
+        // The expected value matches LibreDWG's `bit_calc_CRC` table
+        // for the AutoCAD-emitted polynomial (CRC-16/IBM, 0xA001
+        // reflected, init 0xc0c1).
         let v = crc_x25(0xc0c1, &[0x55]);
-        assert_eq!(v, 0xd26d);
+        assert_eq!(v, 0xafc1);
+    }
+
+    #[test]
+    fn crc_x25_table_matches_libredwg() {
+        // Pin the first 16 table entries against LibreDWG's table at
+        // `src/bits.c:4078`. If this assertion ever fires, the
+        // polynomial used to derive the table no longer matches
+        // AutoCAD's on-disk format and every section CRC in every
+        // emitted file will mismatch.
+        let expected: [u16; 16] = [
+            0x0000, 0xC0C1, 0xC181, 0x0140, 0xC301, 0x03C0, 0x0280, 0xC241, 0xC601, 0x06C0, 0x0780,
+            0xC741, 0x0500, 0xC5C1, 0xC481, 0x0440,
+        ];
+        assert_eq!(&super::X25_TABLE[0..16], &expected);
     }
 
     #[test]

@@ -442,7 +442,10 @@ mod tests {
             extrusion: [0.0, 0.0, 1.0],
         };
         let mut payload = BitWriter::new();
-        line.encode_payload(&mut payload).unwrap();
+        // R2000 path exclusively; pin the version explicitly so the
+        // version-aware LINE codec emits the R2000+ `z_is_zero/RD/DD`
+        // wire form (entities::line::encode_payload).
+        line.encode_payload(&mut payload, Version::R2000).unwrap();
         ObjectRecord {
             object_type: ObjectType::Line,
             handle: HandleRef {
@@ -456,15 +459,11 @@ mod tests {
                     code: 5,
                     value: 0x01,
                 }),
-                reactors: Vec::new(),
-                x_dictionary: None,
                 layer: HandleRef {
                     code: 5,
                     value: 0x02,
                 },
-                linetype: None,
-                plot_style: None,
-                material: None,
+                ..Default::default()
             },
         }
     }

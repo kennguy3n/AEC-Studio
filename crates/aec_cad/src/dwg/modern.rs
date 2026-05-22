@@ -84,31 +84,33 @@ pub fn write_modern(doc: &DxfDocument, version: Version) -> DwgResult<Vec<u8>> {
         // `decode_R2004` codepath instead (encrypted header), so
         // they're handled by `assemble_r2004` like R2004 itself.
         //
-        // Note: section payloads (header_vars / classes / objects)
-        // are NOT yet wired into `assemble_r2007` — the first cut
-        // emits a zero-section file to pin the file-header layer
-        // against the LibreDWG oracle. Section content lands in a
-        // follow-up commit.
-        //
-        // Loud surface for the silent-drop: if the caller hands us
-        // entities, log a warning to stderr so the data loss isn't
-        // invisible in production. aec_cad does not currently
-        // depend on `tracing`/`log`, so `eprintln!` is the
-        // available channel — matches the style used by
-        // `examples/dwg_oracle_fixture.rs`. This goes away when
-        // entity-bearing data pages land.
+        // The R2007 entity-bearing data pages are NOT yet wired into
+        // `assemble_r2007` — the first cut emits a zero-section file
+        // to pin the file-header layer against the LibreDWG oracle.
+        // Until that work lands, callers must NOT pass entities in
+        // the doc when targeting R2007 — silently dropping them is
+        // worse than failing loudly, since the data loss is otherwise
+        // invisible to any caller that doesn't watch stderr.
         if !records.is_empty() {
-            eprintln!(
-                "warning: aec_cad::dwg: dropping {} entity record(s) when \
-                 writing R2007 (entity-bearing data pages not yet wired \
-                 into assemble_r2007; see PR-C / phase 6 of the R2007 \
-                 conformance roadmap)",
-                records.len()
-            );
+            return Err(DwgError::UnsupportedInVersion {
+                version,
+                what: format!(
+                    "writing {n} entity record(s) to a R2007 document is \
+                     not yet supported: `assemble_r2007` does not emit \
+                     entity-bearing data pages (the R2007 system pages \
+                     ship the file header, classes, and handle map only). \
+                     Either target R2004, R2010, R2013, or R2018 -- all of \
+                     which fully round-trip entities through the \
+                     decode_R2004 codepath -- or pre-filter the document \
+                     down to zero entities before writing R2007. See the \
+                     R2007 conformance roadmap (PR-C / phase 6) for the \
+                     follow-up work that lifts this restriction.",
+                    n = records.len()
+                ),
+            });
         }
         let _ = (
-            &records,
-            HeaderVarsSection::minimal(version),
+            HeaderVarsSection::libredwg_conformant(version),
             ClassesSection::empty(version),
         );
         let parts = R2007FileParts { version };
@@ -116,7 +118,7 @@ pub fn write_modern(doc: &DxfDocument, version: Version) -> DwgResult<Vec<u8>> {
     } else if version.has_paged_system_sections() {
         let parts = R2004FileParts {
             version,
-            header_vars: HeaderVarsSection::minimal(version),
+            header_vars: HeaderVarsSection::libredwg_conformant(version),
             classes: ClassesSection::empty(version),
             objects: records,
         };
@@ -124,7 +126,7 @@ pub fn write_modern(doc: &DxfDocument, version: Version) -> DwgResult<Vec<u8>> {
     } else {
         let parts = R2000FileParts {
             version,
-            header_vars: HeaderVarsSection::minimal(version),
+            header_vars: HeaderVarsSection::libredwg_conformant(version),
             classes: ClassesSection::empty(version),
             objects: records,
         };
@@ -189,7 +191,7 @@ fn entity_to_record(entity: &DxfEntity, version: Version, handle: u64) -> DwgRes
     let mut payload = BitWriter::new();
     let object_type = match entity {
         DxfEntity::Line(line) => {
-            LineEntity::from_dxf(line).encode_payload(&mut payload)?;
+            LineEntity::from_dxf(line).encode_payload(&mut payload, version)?;
             ObjectType::Line
         }
         DxfEntity::Arc(arc) => {
@@ -227,6 +229,21 @@ fn entity_to_record(entity: &DxfEntity, version: Version, handle: u64) -> DwgRes
             });
         }
     };
+    // Per-entity-type extra handles, appended AFTER the common
+    // handle stream. Mirrors the LibreDWG `dwg.spec` lines that emit
+    // `FIELD_HANDLE (...)` AFTER `COMMON_ENTITY_HANDLE_DATA` for each
+    // entity type. Counts must match `type_extra_handle_count`.
+    let type_extras = match object_type {
+        // TEXT.style: soft pointer to AcDbStyle. We don't yet emit a
+        // text-styles section, so we use a NULL soft pointer; LibreDWG
+        // treats `H { code: 5, value: 0 }` as the STANDARD style.
+        ObjectType::Text => vec![HandleRef { code: 5, value: 0 }],
+        // INSERT.block_header: soft pointer to AcDbBlockTableRecord.
+        // Same NULL-pointer convention; LibreDWG logs "BLOCK_HEADER:
+        // NULL" but does not error.
+        ObjectType::Insert => vec![HandleRef { code: 5, value: 0 }],
+        _ => Vec::new(),
+    };
     Ok(ObjectRecord {
         object_type,
         handle: HandleRef {
@@ -247,8 +264,15 @@ fn entity_to_record(entity: &DxfEntity, version: Version, handle: u64) -> DwgRes
                 value: LAYER_ZERO_HANDLE,
             },
             linetype: None,
-            plot_style: None,
+            prev_entity: None,
+            next_entity: None,
             material: None,
+            shadow: None,
+            plot_style: None,
+            full_visualstyle: None,
+            face_visualstyle: None,
+            edge_visualstyle: None,
+            type_extras,
         },
     })
 }
@@ -277,7 +301,7 @@ fn payload_to_entity(
 ) -> DwgResult<DxfEntity> {
     match obj_type {
         ObjectType::Line => Ok(DxfEntity::Line(
-            LineEntity::decode_payload(r, layer)?.into_dxf(),
+            LineEntity::decode_payload(r, layer, version)?.into_dxf(),
         )),
         ObjectType::Arc => Ok(DxfEntity::Arc(
             ArcEntity::decode_payload(r, layer)?.into_dxf(),
