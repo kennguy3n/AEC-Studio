@@ -54,32 +54,32 @@ fn golden(v: DwgVersion) -> Golden {
             blake3_hex: "0aa4e2fccde03a087c6d0b68120e8f0b7e2e4c46bd20bc1f6b2e58a2e3de4962",
         },
         DwgVersion::R14 => Golden {
-            bytes: 211,
-            blake3_hex: "113e8063d2988d7b43b1f499706d19b66970929a81c07131863bbf957359c91a",
+            bytes: 174,
+            blake3_hex: "1ed827cae802dbdcf6c42345494c6ca716575a2f994bb6d7ff88d7a9c186358d",
         },
         DwgVersion::R2000 => Golden {
-            bytes: 212,
-            blake3_hex: "fd50b45e7d05b510236c00eed38bc0d60d0409cbca03fc792ca8980c40241447",
+            bytes: 175,
+            blake3_hex: "6cafc0fbda3c7e12b393e0923ffbc62a8a3d7dd5097e429c81a3e3a8fd3c9414",
         },
         DwgVersion::R2004 => Golden {
             bytes: 1051,
-            blake3_hex: "3c1e489f4077f9d32a77a71c8a89be715f8eb373dd1d71e738fb60c77666c0f6",
+            blake3_hex: "64e3e1c025c02f80eb81e1f520d62b8daceb7644cb47685bab5071908fbc7da3",
         },
         DwgVersion::R2007 => Golden {
             bytes: 1052,
-            blake3_hex: "90166f1bb16d994c452276e14e77f789a9fb22462e9169db20e8f36c2699bfca",
+            blake3_hex: "49c1cb6e78fd563e1bba4cf09925273529eb387ed683bf0c1c50bfd6a4e070dd",
         },
         DwgVersion::R2010 => Golden {
             bytes: 1056,
-            blake3_hex: "6fc4f52862463c1974857cb03eb65660493bb3ea9b7c8ed0a52742ed60a7b061",
+            blake3_hex: "e82262622ac5932df4b28e7e5f040b0e132897c9e2416b2e55bbcd08cd997f1b",
         },
         DwgVersion::R2013 => Golden {
             bytes: 1057,
-            blake3_hex: "2a2ac672f88b6b6c34567460ffb7b8bc2012e487b8246020329823b6d830d68a",
+            blake3_hex: "e8f765231fa57e1170019976eb4439c354124e60143455f3349f076d58705398",
         },
         DwgVersion::R2018 => Golden {
             bytes: 1057,
-            blake3_hex: "96df8434e6bb67b0d3eedf113cdfe45c7f965555039ab16dd9746ca33cfde9dd",
+            blake3_hex: "d392c478796c86b922f38be778eb16c3a6149ba79eeacb4defadcab2baae8a07",
         },
     }
 }

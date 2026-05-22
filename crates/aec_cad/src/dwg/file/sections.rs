@@ -1,9 +1,16 @@
 //! Section locator records (R13–R2000) and section identity enum.
 //!
 //! A section locator is a fixed 9-byte tuple `(id: u8, seeker: u32_le, size: u32_le)`
-//! repeated `section_locator_count` times starting at file offset 0x1c
-//! after a R13–R2000 file header. The locator block is followed by
-//! a section CRC.
+//! repeated `section_locator_count` times starting at file offset 0x19
+//! after the R13–R2000 file header. The locator block is followed by
+//! a 2-byte CRC-X25 (seed 0xC0C1) and then the 16-byte `HEADER_END`
+//! sentinel.
+//!
+//! Section IDs match LibreDWG's `Dwg_Section_Type_r13` enum in
+//! `include/dwg.h`. Object records (entity / table data) are NOT a
+//! distinct section in R13–R2000 — they are written between the
+//! Classes section and the Handles map, at file offsets that the
+//! Handles map points to.
 
 use crate::dwg::error::{DwgError, DwgResult};
 
@@ -16,16 +23,29 @@ pub struct SectionLocator {
 }
 
 /// Well-known section identifiers used by R13–R2000.
+///
+/// Numeric values match LibreDWG's `Dwg_Section_Type_r13`:
+///   `0=HEADER, 1=CLASSES, 2=HANDLES, 3=OBJFREESPACE, 4=TEMPLATE,
+///    5=AUXHEADER, 6=THUMBNAIL`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SectionId {
-    /// HEADER variables.
+    /// HEADER variables (id=0).
     Header,
-    /// CLASSES section (R13+).
+    /// CLASSES section (id=1, R13+).
     Classes,
-    /// OBJECTS — the entity and table data.
-    Objects,
-    /// OBJECT_MAP — handle → file-offset map.
-    ObjectMap,
+    /// HANDLES — handle → file-offset map. Note: the actual object
+    /// records live at the file offsets this map points to; they
+    /// are NOT collected in a separate "Objects" section.
+    Handles,
+    /// OBJFREESPACE (id=3, optional, includes the 2nd-header).
+    ObjFreeSpace,
+    /// TEMPLATE (id=4, optional, holds MEASUREMENT data since R13c3).
+    Template,
+    /// AUXHEADER (id=5, R2000 only, no sentinels).
+    AuxHeader,
+    /// THUMBNAIL (id=6, not a section locator in canonical layout but
+    /// emitted in some files).
+    Thumbnail,
     /// Unknown or unsupported section id (kept opaque so we can
     /// tolerate sections we don't decode).
     Unknown(u8),
@@ -36,8 +56,11 @@ impl SectionId {
         match v {
             0 => Self::Header,
             1 => Self::Classes,
-            2 => Self::Objects,
-            3 => Self::ObjectMap,
+            2 => Self::Handles,
+            3 => Self::ObjFreeSpace,
+            4 => Self::Template,
+            5 => Self::AuxHeader,
+            6 => Self::Thumbnail,
             other => Self::Unknown(other),
         }
     }
@@ -46,8 +69,11 @@ impl SectionId {
         match self {
             Self::Header => 0,
             Self::Classes => 1,
-            Self::Objects => 2,
-            Self::ObjectMap => 3,
+            Self::Handles => 2,
+            Self::ObjFreeSpace => 3,
+            Self::Template => 4,
+            Self::AuxHeader => 5,
+            Self::Thumbnail => 6,
             Self::Unknown(v) => v,
         }
     }
@@ -94,8 +120,11 @@ mod tests {
         for id in [
             SectionId::Header,
             SectionId::Classes,
-            SectionId::Objects,
-            SectionId::ObjectMap,
+            SectionId::Handles,
+            SectionId::ObjFreeSpace,
+            SectionId::Template,
+            SectionId::AuxHeader,
+            SectionId::Thumbnail,
             SectionId::Unknown(42),
         ] {
             assert_eq!(SectionId::from_u8(id.to_u8()), id);
@@ -116,7 +145,7 @@ mod tests {
                 size: 0x100,
             },
             SectionLocator {
-                id: SectionId::Objects,
+                id: SectionId::Handles,
                 seeker: 0x1300,
                 size: 0xffff_ffff,
             },
