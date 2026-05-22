@@ -25,6 +25,7 @@
 //! └──────────────────────────────────────────────┘
 //! ```
 
+pub mod aux_sections;
 pub mod classes;
 pub mod header;
 pub mod header_vars;
