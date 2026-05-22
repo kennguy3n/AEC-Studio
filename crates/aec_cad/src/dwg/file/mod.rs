@@ -32,6 +32,7 @@ pub mod object_map;
 pub mod pages;
 pub mod r2000_layout;
 pub mod r2004_layout;
+pub mod r2007_header;
 pub mod sections;
 pub mod sentinels;
 pub mod system_section;

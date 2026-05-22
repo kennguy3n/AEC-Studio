@@ -337,7 +337,9 @@ mod tests {
     /// hidden state).
     #[test]
     fn rs_encode_is_deterministic() {
-        let data: Vec<u8> = (0..RS_DATA_SIZE).map(|i| (i as u8).wrapping_mul(13)).collect();
+        let data: Vec<u8> = (0..RS_DATA_SIZE)
+            .map(|i| (i as u8).wrapping_mul(13))
+            .collect();
         let p1 = rs_encode_block(&data);
         let p2 = rs_encode_block(&data);
         assert_eq!(p1, p2);
