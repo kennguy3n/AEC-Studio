@@ -1,6 +1,13 @@
-//! R2007 file header — the 288-byte structure that lives at offset
+//! R2007 file header — the 272-byte structure that lives at offset
 //! 0x80 of every R2007+ DWG file, wrapped in a 32-byte metadata
 //! block and Reed–Solomon encoded into 984 on-disk bytes.
+//!
+//! The 272-byte logical size is `sizeof(Dwg_R2007_Header)` per
+//! LibreDWG `include/dwg.h:9407-9443` (34 packed `int64_t` fields
+//! under `#pragma pack(1)`). An earlier draft of this code carried
+//! two extra `padding1`/`padding2` trailer fields that pushed the
+//! logical size to 288 bytes; see the doc comment on
+//! [`R2007_HEADER_LOGICAL_SIZE`] for why those were removed.
 //!
 //! ## On-disk layout (0x80 .. 0x458)
 //!
@@ -16,7 +23,7 @@
 //!       │   │ compr_len     (4 bytes LE, 0 = stored mode)       │  │
 //!       │   │ len2          (4 bytes LE, decompressed length)   │  │
 //!       │   ├──────────────────────────────────────────────────┤  │
-//!       │   │ Dwg_R2007_Header (288 bytes, 36 × int64 LE)       │  │
+//!       │   │ Dwg_R2007_Header (272 bytes, 34 × int64 LE)       │  │
 //!       │   ├──────────────────────────────────────────────────┤  │
 //!       │   │ zero padding to 717 bytes (= 3 * RS_DATA_SIZE)    │  │
 //!       │   └──────────────────────────────────────────────────┘  │
@@ -35,7 +42,7 @@
 //! - `compr_len > 0`: the bytes following the 32-byte metadata are
 //!   LZ77-compressed (R2007 variant) and `decompress_r2007` is
 //!   invoked.
-//! - `compr_len == 0`: a plain `memcpy` of the next 288 bytes copies
+//! - `compr_len == 0`: a plain `memcpy` of the next 272 bytes copies
 //!   the header verbatim. **We use this stored-mode path** to avoid
 //!   coupling the file-header writer to the R2007 LZ77 variant. The
 //!   resulting file is bit-for-bit valid; only the on-disk file size
@@ -233,7 +240,7 @@ impl R2007FileHeader {
         }
     }
 
-    /// Serialize the 36-field struct as 288 bytes of little-endian
+    /// Serialize the 34-field struct as 272 bytes of little-endian
     /// `int64_t` values, in the exact order LibreDWG's
     /// `Dwg_R2007_Header` declares them.
     pub fn encode(&self) -> [u8; R2007_HEADER_LOGICAL_SIZE] {
@@ -245,7 +252,7 @@ impl R2007FileHeader {
         out
     }
 
-    /// Inverse of [`encode`](Self::encode) — parse 288 bytes into a
+    /// Inverse of [`encode`](Self::encode) — parse 272 bytes into a
     /// `R2007FileHeader`. Errors if the slice is too short.
     pub fn parse(bytes: &[u8]) -> DwgResult<Self> {
         if bytes.len() < R2007_HEADER_LOGICAL_SIZE {
@@ -343,14 +350,14 @@ impl R2007FileHeader {
     }
 }
 
-/// Wrap a 288-byte serialized `R2007FileHeader` with the 32-byte
+/// Wrap a 272-byte serialized `R2007FileHeader` with the 32-byte
 /// metadata block, pad to 717 bytes (`3 * RS_DATA_SIZE`), Reed–Solomon
 /// encode into 3 interleaved 255-byte codewords, and zero-pad the
 /// final output to exactly [`R2007_FILE_HEADER_ON_DISK_SIZE`] bytes.
 ///
 /// The returned buffer is what writes at byte 0x80 of the DWG file.
 ///
-/// We use **stored-mode** (`compr_len = 0`, `len2 = 288`) — LibreDWG's
+/// We use **stored-mode** (`compr_len = 0`, `len2 = 272`) — LibreDWG's
 /// `read_file_header` then takes the `else` branch on line 1221 and
 /// does a direct `memcpy` instead of invoking `decompress_r2007`.
 /// See the module docstring for the rationale.
@@ -386,7 +393,7 @@ pub fn encode_file_header_on_disk(
 
 /// Inverse of [`encode_file_header_on_disk`] — read 984 bytes, RS
 /// de-interleave (data columns only, parity ignored — matches
-/// LibreDWG), unwrap the 32-byte metadata, and parse the 288-byte
+/// LibreDWG), unwrap the 32-byte metadata, and parse the 272-byte
 /// header struct.
 ///
 /// Errors if the RS de-interleave fails or the metadata indicates a

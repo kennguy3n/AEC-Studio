@@ -850,8 +850,24 @@ pub fn parse_r2007(bytes: &[u8], version: Version) -> DwgResult<R2007File> {
             header.pages_map_correction
         )));
     }
+    // Use `usize::try_from` rather than `as usize` for every i64
+    // value that becomes a buffer offset or length. The negative-value
+    // guards above already reject the < 0 case, but `as usize`
+    // truncates on 32-bit targets if any of these values exceed
+    // `usize::MAX` — producing a small wrapped offset that would
+    // silently pass the bounds check and point the parser at the wrong
+    // data. `try_from` rejects both negatives and 32-bit overflow with
+    // a typed `InternalInvariant`, matching the defense applied to
+    // the sections-map path below. (See Devin Review finding
+    // 3288286638: "Inconsistent i64→usize conversion".)
+    let pages_map_off_typed = usize::try_from(header.pages_map_offset).map_err(|_| {
+        DwgError::InternalInvariant(format!(
+            "parse_r2007: pages_map_offset {} exceeds usize",
+            header.pages_map_offset
+        ))
+    })?;
     let pages_map_off = (R2007_FIRST_PAGE_OFFSET as usize)
-        .checked_add(header.pages_map_offset as usize)
+        .checked_add(pages_map_off_typed)
         .ok_or_else(|| {
             DwgError::InternalInvariant(
                 "parse_r2007: pages_map_offset arithmetic overflowed usize".into(),
@@ -865,10 +881,14 @@ pub fn parse_r2007(bytes: &[u8], version: Version) -> DwgResult<R2007File> {
     // to disk. When LZ77-compressed system pages land,
     // `size_uncomp` will refer to the post-decompression buffer and
     // would over-allocate the bounds check.
-    let pages_map_on_disk_len = system_page_on_disk_size(
-        header.pages_map_size_comp as usize,
-        header.pages_map_correction,
-    )?;
+    let pages_map_size_comp_typed = usize::try_from(header.pages_map_size_comp).map_err(|_| {
+        DwgError::InternalInvariant(format!(
+            "parse_r2007: pages_map_size_comp {} exceeds usize",
+            header.pages_map_size_comp
+        ))
+    })?;
+    let pages_map_on_disk_len =
+        system_page_on_disk_size(pages_map_size_comp_typed, header.pages_map_correction)?;
     let pages_map_end = pages_map_off
         .checked_add(pages_map_on_disk_len)
         .ok_or_else(|| {
@@ -952,10 +972,15 @@ pub fn parse_r2007(bytes: &[u8], version: Version) -> DwgResult<R2007File> {
             "parse_r2007: sections_map_offset {sections_map_offset} exceeds usize"
         ))
     })?;
-    let sections_map_on_disk_len = system_page_on_disk_size(
-        header.sections_map_size_comp as usize,
-        header.sections_map_correction,
-    )?;
+    let sections_map_size_comp_typed =
+        usize::try_from(header.sections_map_size_comp).map_err(|_| {
+            DwgError::InternalInvariant(format!(
+                "parse_r2007: sections_map_size_comp {} exceeds usize",
+                header.sections_map_size_comp
+            ))
+        })?;
+    let sections_map_on_disk_len =
+        system_page_on_disk_size(sections_map_size_comp_typed, header.sections_map_correction)?;
     let sections_map_end = sections_map_off
         .checked_add(sections_map_on_disk_len)
         .ok_or_else(|| {

@@ -140,6 +140,16 @@ pub struct R2004File {
 }
 
 /// Assemble a complete R2004+ file from its in-memory parts.
+///
+/// Accepts R2004, R2010, R2013, R2018 — every version whose on-disk
+/// layout matches LibreDWG's `decode_R2004` codepath. R2007 is
+/// **rejected** because it uses a fundamentally different layout
+/// (RS-encoded file header + RS system pages + sections-by-hashcode
+/// map) and is routed through `assemble_r2007` instead. Accepting
+/// R2007 here would emit a file with the R2007 signature wrapped
+/// around an R2004-style encrypted header — which is exactly the
+/// false-pass output the PR-C series replaced with a real codec.
+/// The matching test `assemble_r2004_rejects_r2007` pins this guard.
 pub fn assemble_r2004(parts: R2004FileParts) -> DwgResult<Vec<u8>> {
     if !parts.version.has_paged_system_sections() {
         return Err(DwgError::UnsupportedInVersion {
@@ -148,6 +158,14 @@ pub fn assemble_r2004(parts: R2004FileParts) -> DwgResult<Vec<u8>> {
                 "assemble_r2004 only handles R2004+; got {:?}",
                 parts.version
             ),
+        });
+    }
+    if parts.version == Version::R2007 {
+        return Err(DwgError::UnsupportedInVersion {
+            version: parts.version,
+            what: "assemble_r2004 cannot handle R2007 — R2007 uses the RS-encoded layout, \
+                 routed through assemble_r2007 in modern.rs"
+                .into(),
         });
     }
 
@@ -551,6 +569,17 @@ pub fn parse_r2004(bytes: &[u8]) -> DwgResult<R2004File> {
             what: "parse_r2004 only handles R2004+; use parse_r2000 for R14/R2000".into(),
         });
     }
+    if version == Version::R2007 {
+        // R2007 files are RS-encoded — the R2004 encrypted-header path
+        // would mis-parse them. `read_modern` already gates R2007 to
+        // `parse_r2007`; this guard catches any direct caller that
+        // bypasses the dispatch (and matches the symmetric guard in
+        // `assemble_r2004`).
+        return Err(DwgError::UnsupportedInVersion {
+            version,
+            what: "parse_r2004 cannot decode R2007 — use parse_r2007 instead".into(),
+        });
+    }
 
     // 1. Legacy file header.
     let _file_header = FileHeader::parse(bytes, version)?;
@@ -830,17 +859,30 @@ mod tests {
         assert_eq!(file.objects.len(), 0);
     }
 
+    /// Pin the architectural invariant: `assemble_r2004` MUST reject
+    /// `Version::R2007`. Production dispatch in `modern.rs` routes
+    /// R2007 through `assemble_r2007` (the RS-encoded codepath); this
+    /// guard catches direct callers that bypass the dispatch and
+    /// guarantees we never silently emit a file with the R2007
+    /// signature wrapped around an R2004-style encrypted header
+    /// (which was the original "false-pass" bug PR-C replaced).
     #[test]
-    fn empty_r2007_file_round_trips() {
+    fn assemble_r2004_rejects_r2007() {
         let parts = R2004FileParts {
             version: Version::R2007,
             header_vars: HeaderVarsSection::minimal(Version::R2007),
             classes: ClassesSection::empty(Version::R2007),
             objects: Vec::new(),
         };
-        let bytes = assemble_r2004(parts).unwrap();
-        let file = parse_r2004(&bytes).unwrap();
-        assert_eq!(file.version, Version::R2007);
+        let err = assemble_r2004(parts).expect_err(
+            "assemble_r2004 must reject R2007 — R2007 has its own RS-encoded codec path",
+        );
+        match err {
+            DwgError::UnsupportedInVersion { version, .. } => {
+                assert_eq!(version, Version::R2007);
+            }
+            other => panic!("expected UnsupportedInVersion for R2007, got {other:?}"),
+        }
     }
 
     #[test]
