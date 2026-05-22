@@ -245,7 +245,15 @@ pub fn rs_deinterleave(src: &[u8], block_count: usize, data_size: usize) -> Opti
     if block_count == 0 {
         return Some(Vec::new());
     }
-    let last_idx = data_size.checked_sub(1)?.checked_mul(block_count)? + (block_count - 1);
+    // Fully-checked bounds computation: `last_idx = (data_size - 1) *
+    // block_count + (block_count - 1)`. Every intermediate uses
+    // `checked_*` so an adversarial caller passing untrusted sizes
+    // can never wrap to a small value that bypasses the
+    // `last_idx >= src.len()` check below.
+    let last_idx = data_size
+        .checked_sub(1)?
+        .checked_mul(block_count)?
+        .checked_add(block_count.checked_sub(1)?)?;
     if last_idx >= src.len() {
         return None;
     }

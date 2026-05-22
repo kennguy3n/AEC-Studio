@@ -630,6 +630,12 @@ pub fn parse_r2007(bytes: &[u8], version: Version) -> DwgResult<R2007File> {
             header.pages_map_offset
         )));
     }
+    if header.pages_map_size_comp < 0 {
+        return Err(DwgError::InternalInvariant(format!(
+            "parse_r2007: negative pages_map_size_comp {}",
+            header.pages_map_size_comp
+        )));
+    }
     if header.pages_map_size_uncomp < 0 {
         return Err(DwgError::InternalInvariant(format!(
             "parse_r2007: negative pages_map_size_uncomp {}",
@@ -649,8 +655,16 @@ pub fn parse_r2007(bytes: &[u8], version: Version) -> DwgResult<R2007File> {
                 "parse_r2007: pages_map_offset arithmetic overflowed usize".into(),
             )
         })?;
+    // The on-disk page size is derived from the COMPRESSED payload
+    // size (`size_comp`), not the uncompressed one. In stored mode
+    // they're equal so today this is a no-op rename, but using
+    // `size_comp` here is the semantically correct version of the
+    // formula — it's the number of bytes that actually get RS-wrapped
+    // to disk. When LZ77-compressed system pages land,
+    // `size_uncomp` will refer to the post-decompression buffer and
+    // would over-allocate the bounds check.
     let pages_map_on_disk_len = system_page_on_disk_size(
-        header.pages_map_size_uncomp as usize,
+        header.pages_map_size_comp as usize,
         header.pages_map_correction,
     )?;
     let pages_map_end = pages_map_off
