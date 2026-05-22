@@ -53,7 +53,7 @@
 
 use crate::dwg::bits::reader::{Color, HandleRef};
 use crate::dwg::bits::{crc_x25, BitWriter};
-use crate::dwg::error::DwgResult;
+use crate::dwg::error::{DwgError, DwgResult};
 use crate::dwg::version::Version;
 
 /// The full set of header variables this codec can encode. Most are
@@ -184,14 +184,18 @@ pub fn encode_body(version: Version, maint: MaintVersion, vars: &HeaderVars) -> 
     if split_streams {
         // Extended size: if data_size > 0x7fff we need a second RS for
         // the high bits. For our writer the strings are short enough
-        // that data_size fits in 15 bits; assert and emit a single
-        // RS. If a future variable bumps us over the threshold the
-        // assert will trip and we'll need to add the hi_size path.
-        debug_assert!(
-            str_bits <= 0x7fff,
-            "header-vars string stream exceeded 0x7fff bits ({str_bits}); \
-             extended-size encoding not yet implemented"
-        );
+        // that data_size fits in 15 bits; we surface an error rather
+        // than silently truncating via `as u16`. If a future variable
+        // bumps us over the threshold this path must learn the
+        // hi_size encoding from `section_string_stream` in LibreDWG.
+        if str_bits > 0x7fff {
+            return Err(DwgError::InternalInvariant(format!(
+                "header-vars string stream exceeded 0x7fff bits ({str_bits}); \
+                 the extended-size encoding (high RS half) is not yet \
+                 implemented -- either shorten the header-vars strings or \
+                 add the hi_size emit/decode path"
+            )));
+        }
         body.append_bits_from(&str_bytes, str_bits)?;
         body.write_rs(str_bits as u16)?;
         body.write_b(true)?; // endbit

@@ -283,15 +283,26 @@ impl ClassesSection {
         // data_size field, then a 1-bit endbit=1. Decoder walks
         // backward from `bitsize + 159|191` to find this.
         if r2007_plus {
-            debug_assert!(
-                str_bits <= 0x7fff,
-                "classes string stream exceeded 0x7fff bits ({str_bits}); \
-                 extended-size encoding not yet implemented"
-            );
+            // The data_size field is a single RS (16 bits) in our
+            // single-record-per-section world. LibreDWG's
+            // `section_string_stream` defines an extended-size shape
+            // that uses a second RS for the high bits when
+            // data_size > 0x7fff; we surface an error rather than
+            // silently truncating via `as u16` if the strings ever
+            // exceed that threshold. In practice this is unreachable
+            // because the placeholder class's strings are short.
+            if str_bits > 0x7fff {
+                return Err(DwgError::InternalInvariant(format!(
+                    "classes string stream exceeded 0x7fff bits ({str_bits}); \
+                     the extended-size encoding (high RS half) is not yet \
+                     implemented -- shorten the per-class strings or add \
+                     the hi_size emit/decode path"
+                )));
+            }
             body.append_bits_from(&str_bytes, str_bits)?;
             #[allow(
                 clippy::cast_possible_truncation,
-                reason = "the debug_assert above already pins str_bits to fit u16"
+                reason = "the runtime guard above pins str_bits to fit u16"
             )]
             body.write_rs(str_bits as u16)?;
             body.write_b(true)?; // endbit

@@ -173,10 +173,17 @@ impl BitWriter {
     }
 
     /// Bit LongLong (BLL): compacted u64. The first 3 bits encode the
-    /// byte-length `len` (0..=15) as `(BB << 1) | B`. Then `len` raw
-    /// bytes follow in little-endian order (least-significant byte
-    /// first). Used for `REQUIREDVERSIONS` and `preview_size` in the
-    /// header. Mirrors `bit_write_BLL` in LibreDWG.
+    /// byte-length `len` (0..=7) as `(BB << 1) | B`. The prefix is two
+    /// bits of `BB` (`len >> 1`, valid range `0..=3`) followed by one
+    /// bit of `B` (`len & 1`), which together cover `0..=7` only —
+    /// values of 8 or larger are NOT representable in this format and
+    /// would otherwise corrupt the bit stream (`write_bb` rejects
+    /// shape values above 3). Then `len` raw bytes follow in
+    /// little-endian order (least-significant byte first). Used for
+    /// `REQUIREDVERSIONS` and `preview_size` in the header. Mirrors
+    /// `bit_write_BLL` in LibreDWG (which has the same 7-byte cap;
+    /// `bit_read_BLL` recovers `len = (BB << 1) | B`, so the symmetric
+    /// read maxes out at 7 as well).
     pub fn write_bll(&mut self, value: u64) -> DwgResult<()> {
         // Determine minimum byte-length. `len` is the index past the
         // most-significant non-zero byte; a value of zero produces
@@ -187,9 +194,11 @@ impl BitWriter {
             let bits = 64 - value.leading_zeros() as u8;
             bits.div_ceil(8)
         };
-        if len > 15 {
+        if len > 7 {
             return Err(DwgError::InternalInvariant(format!(
-                "write_bll length {len} out of range 0..=15"
+                "write_bll length {len} out of range 0..=7 (value {value:#x} \
+                 needs >7 payload bytes; BLL's 3-bit length prefix cannot \
+                 encode that)"
             )));
         }
         // 3-bit length prefix: BB (high 2 bits = len >> 1) + B (low 1 bit = len & 1).
@@ -267,10 +276,19 @@ impl BitWriter {
     /// variable-length type field — used for the object_type field
     /// at the start of every entity body in R2010+.
     ///
-    /// See LibreDWG `bit_write_BOT` (bits.c:733):
-    /// - value `< 256`:   BB 0b00 + RC (1 byte)
-    /// - value `< 0x7fff`: BB 0b01 + RC (value - 0x1f0) (1 byte)
-    /// - else:            BB 0b10 + RS (2 bytes)
+    /// See LibreDWG `bit_write_BOT` (bits.c:733). The three on-wire
+    /// shapes (in selection order, narrowest first) are:
+    /// - `value < 256`:                       `BB 0b00` + `RC value`
+    /// - `0x1f0 <= value <= 0x2ef` (i.e.       `BB 0b01` +
+    ///   `value - 0x1f0` fits in a `u8`):       `RC (value - 0x1f0)`
+    /// - any other 16-bit value (incl. the    `BB 0b10` + `RS value`
+    ///   gaps `256..=0x1ef` and `0x2f0..`):
+    ///
+    /// Note: although shape 1 is the densest encoding for class IDs
+    /// in the `[0x1f0, 0x2ef]` window (a common range for built-in
+    /// classes), it is NOT a general `< 0x7fff` shape — values in the
+    /// gaps `[256, 0x1ef]` and `[0x2f0, 0x7ffe]` always fall through
+    /// to the 2-byte `RS` shape 2.
     pub fn write_bot(&mut self, value: u16) -> DwgResult<()> {
         if value < 256 {
             self.write_bb(0b00)?;
@@ -856,6 +874,36 @@ mod tests {
         let mut w = BitWriter::new();
         w.write_bll(0).unwrap();
         assert_eq!(w.bit_position(), 3);
+    }
+
+    #[test]
+    fn bll_rejects_values_requiring_more_than_seven_bytes() {
+        // The 3-bit length prefix `(BB << 1) | B` covers `len = 0..=7`
+        // only. Any u64 with bits set in byte 7 (i.e. >= 2^56) would
+        // need `len = 8` and is not encodable. Without this guard the
+        // outer `write_bb` would itself reject `len >> 1 == 4` with a
+        // confusing "BB value 4 out of range" error; we surface a
+        // clear BLL-level error instead.
+        let just_into_byte_seven: u64 = 1u64 << 56;
+        let mut w = BitWriter::new();
+        let err = w.write_bll(just_into_byte_seven).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("write_bll length 8 out of range 0..=7"),
+            "expected length-out-of-range message, got: {msg}"
+        );
+
+        // u64::MAX also rejects (8 bytes worth of payload).
+        let mut w = BitWriter::new();
+        assert!(w.write_bll(u64::MAX).is_err());
+
+        // The largest representable value (`len = 7` => 56 bits)
+        // must still succeed.
+        let mut w = BitWriter::new();
+        let max_seven_byte = (1u64 << 56) - 1;
+        w.write_bll(max_seven_byte).unwrap();
+        // Prefix (3 bits) + 7 payload bytes (56 bits) = 59 bits.
+        assert_eq!(w.bit_position(), 3 + 7 * 8);
     }
 
     #[test]
