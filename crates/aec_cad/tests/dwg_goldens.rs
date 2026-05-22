@@ -63,23 +63,23 @@ fn golden(v: DwgVersion) -> Golden {
         },
         DwgVersion::R2004 => Golden {
             bytes: 1051,
-            blake3_hex: "64e3e1c025c02f80eb81e1f520d62b8daceb7644cb47685bab5071908fbc7da3",
+            blake3_hex: "c8efa41aef0bb45c00ca59e1b30e56adf08107f0f15c2af1e4da2b32addb0b0f",
         },
         DwgVersion::R2007 => Golden {
             bytes: 1052,
-            blake3_hex: "49c1cb6e78fd563e1bba4cf09925273529eb387ed683bf0c1c50bfd6a4e070dd",
+            blake3_hex: "87215678a16b9b82cd517c2bf1ffdea5d7f43e531b5003584d49451f1edc7b66",
         },
         DwgVersion::R2010 => Golden {
             bytes: 1056,
-            blake3_hex: "e82262622ac5932df4b28e7e5f040b0e132897c9e2416b2e55bbcd08cd997f1b",
+            blake3_hex: "a7713759d6e7fe089958b7952e16e30c3b0ad6cfb3edfde7c63f70eb0296d434",
         },
         DwgVersion::R2013 => Golden {
             bytes: 1057,
-            blake3_hex: "e8f765231fa57e1170019976eb4439c354124e60143455f3349f076d58705398",
+            blake3_hex: "350d170f3143e3fdfada33dba28f05a3d42cb119d32ee08329b749c5a4205ed4",
         },
         DwgVersion::R2018 => Golden {
             bytes: 1057,
-            blake3_hex: "d392c478796c86b922f38be778eb16c3a6149ba79eeacb4defadcab2baae8a07",
+            blake3_hex: "6edb5237653033cef1e711f6529cfccacb44ebe6fa6624c1eedb82bdd3bc4fb8",
         },
     }
 }

@@ -78,6 +78,50 @@ pub fn crc_32c(seed: u32, data: &[u8]) -> u32 {
     !crc
 }
 
+/// Adler-32-style checksum used by LibreDWG `dwg_section_page_checksum`.
+///
+/// This is NOT a CRC despite the name. It's the Adler-32 algorithm
+/// with the standard `mod 65521 (= 0xFFF1)` reduction:
+///
+/// ```text
+/// sum1 = seed & 0xFFFF
+/// sum2 = seed >> 16
+/// for byte in data:
+///     sum1 += byte
+///     sum2 += sum1
+///     (mod 0xFFF1 every 0x15B0 bytes)
+/// return (sum2 << 16) | (sum1 & 0xFFFF)
+/// ```
+///
+/// AutoCAD uses this for the R2004+ system-page checksums (page map +
+/// section info). See LibreDWG `decode.c::dwg_section_page_checksum`
+/// (line 1394) for the reference implementation.
+///
+/// `seed` is the previous return value when chaining; pass `0` for a
+/// fresh computation. The two-pass convention is:
+/// ```text
+/// c1 = dwg_section_page_checksum(0, header_bytes_with_zero_checksum)
+/// c  = dwg_section_page_checksum(c1, payload_bytes)
+/// ```
+pub fn dwg_section_page_checksum(seed: u32, data: &[u8]) -> u32 {
+    let mut sum1: u32 = seed & 0xFFFF;
+    let mut sum2: u32 = seed >> 16;
+    let mut remaining = data.len();
+    let mut cursor = 0usize;
+    while remaining > 0 {
+        let chunksize = remaining.min(0x15B0);
+        for &b in &data[cursor..cursor + chunksize] {
+            sum1 += u32::from(b);
+            sum2 += sum1;
+        }
+        sum1 %= 0xFFF1;
+        sum2 %= 0xFFF1;
+        cursor += chunksize;
+        remaining -= chunksize;
+    }
+    (sum2 << 16) | (sum1 & 0xFFFF)
+}
+
 /// CRC-32 IEEE (polynomial `0xedb88320`, reflected, with the standard
 /// `~seed` in / `~crc` out inversion) — the variant AutoCAD stores
 /// inside the encrypted R2004 file header at offset `0x68`. LibreDWG
@@ -288,5 +332,60 @@ mod tests {
         assert_ne!(ieee, castagnoli);
         assert_eq!(ieee, 0xcbf43926);
         assert_eq!(castagnoli, 0xe3069283);
+    }
+
+    #[test]
+    fn dwg_section_page_checksum_empty_input_returns_seed() {
+        // No data → no mutation of sum1/sum2 → returns the seed
+        // packed identically into the (sum2<<16)|sum1 layout.
+        assert_eq!(dwg_section_page_checksum(0, &[]), 0);
+        assert_eq!(dwg_section_page_checksum(0x1234_5678, &[]), 0x1234_5678);
+    }
+
+    #[test]
+    fn dwg_section_page_checksum_known_vector() {
+        // Hand-computed reference: data = [1, 2, 3, 4], seed=0.
+        // sum1 progression: 0, 1, 3, 6, 10
+        // sum2 progression: 0, 1, 4, 10, 20
+        // result = (20 << 16) | 10 = 0x00140000 | 0x0a = 0x0014000a
+        assert_eq!(dwg_section_page_checksum(0, &[1, 2, 3, 4]), 0x0014_000a);
+    }
+
+    #[test]
+    fn dwg_section_page_checksum_chains_via_returned_seed() {
+        // The chaining identity AutoCAD relies on for the two-pass
+        // header-then-payload composition: feeding the previous
+        // return value back as the seed reconstructs the full-buffer
+        // computation. Locks in that callers can split the input on
+        // any boundary without changing the answer.
+        let full = dwg_section_page_checksum(0, b"abcdefghijklmnop");
+        let part = dwg_section_page_checksum(0, b"abcdefgh");
+        let chained = dwg_section_page_checksum(part, b"ijklmnop");
+        assert_eq!(full, chained);
+    }
+
+    #[test]
+    fn dwg_section_page_checksum_disagrees_with_crc_32c() {
+        // Confirms that the new helper is NOT a CRC alias — this
+        // function uses the Adler-32 algorithm with mod 0xFFF1, not
+        // a polynomial CRC. The earlier implementation of
+        // `system_page_checksum` mistakenly used CRC-32C; locking
+        // this divergence in prevents an accidental revert.
+        assert_ne!(
+            dwg_section_page_checksum(0, b"123456789"),
+            crc_32c(0, b"123456789")
+        );
+    }
+
+    #[test]
+    fn dwg_section_page_checksum_handles_chunk_boundary() {
+        // The reference implementation applies `mod 0xFFF1` every
+        // 0x15B0 bytes. Feed it `0x15B0 * 2 + 1` zero bytes to cross
+        // the chunk boundary twice, then verify the result equals
+        // the obvious closed-form (mod 65521 of cumulative sums).
+        let data = vec![0u8; 0x15B0 * 2 + 1];
+        // All-zero input → sum1 and sum2 never advance past their
+        // initial values regardless of chunking.
+        assert_eq!(dwg_section_page_checksum(0, &data), 0);
     }
 }

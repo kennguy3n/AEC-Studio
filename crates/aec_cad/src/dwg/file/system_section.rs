@@ -22,7 +22,7 @@
 //! § "R2004 file header — encryption" and reproduced in LibreDWG
 //! `decrypt_R2004_header`.
 
-use crate::dwg::bits::{crc_32_ieee, crc_32c};
+use crate::dwg::bits::{crc_32_ieee, crc_32c, dwg_section_page_checksum};
 use crate::dwg::error::{DwgError, DwgResult};
 use crate::dwg::file::pages::{compress, decompress};
 
@@ -296,15 +296,24 @@ impl SystemPageHeader {
     }
 }
 
-/// Compute the page checksum the way LibreDWG `dwg_section_page_checksum`
-/// does — two passes of CRC-32C: first over a header with the checksum
-/// field zeroed (20 bytes), then chained over the (compressed) payload.
+/// Compute the system-page checksum the way LibreDWG
+/// `dwg_section_page_checksum` does — Adler-32-style (NOT a CRC) in
+/// two passes: first over the 20-byte page header with the checksum
+/// field zeroed, then chained over the (compressed) payload.
+///
+/// Algorithm verbatim from LibreDWG `decode.c::dwg_section_page_checksum`
+/// (line 1394). Earlier versions of this codec mis-implemented it as
+/// CRC-32C and produced files that LibreDWG would WARN about on read
+/// (the warning is non-fatal — `LOG_WARN` only, never blocked
+/// decode — but it caused phantom "CRC mismatch" messages on every
+/// system page). The Adler-32 implementation matches AutoCAD-emitted
+/// files exactly.
 pub fn system_page_checksum(header: SystemPageHeader, payload: &[u8]) -> u32 {
     let mut header_with_zero_checksum = header;
     header_with_zero_checksum.checksum = 0;
     let header_bytes = header_with_zero_checksum.encode();
-    let seed = crc_32c(0, &header_bytes);
-    crc_32c(seed, payload)
+    let seed = dwg_section_page_checksum(0, &header_bytes);
+    dwg_section_page_checksum(seed, payload)
 }
 
 /// Wrap a logical system-section payload (decompressed) as the

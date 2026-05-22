@@ -30,6 +30,6 @@ pub mod crc;
 pub mod reader;
 pub mod writer;
 
-pub use crc::{crc_32_ieee, crc_32c, crc_8, crc_x25};
+pub use crc::{crc_32_ieee, crc_32c, crc_8, crc_x25, dwg_section_page_checksum};
 pub use reader::BitReader;
 pub use writer::BitWriter;

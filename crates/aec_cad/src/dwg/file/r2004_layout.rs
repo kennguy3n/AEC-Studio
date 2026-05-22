@@ -100,6 +100,14 @@ const PAGE_MAP_TYPE_TAG: u32 = 0x4163_0e3b;
 /// LibreDWG constant `0x4163003b` (`section_section_map`).
 const SECTION_INFO_TYPE_TAG: u32 = 0x4163_003b;
 
+/// AutoCAD's canonical maximum-decompressed-size for a single page
+/// in a normal data section. Matches LibreDWG's default in
+/// `decode.c::section_max_decomp_size` (29696 bytes). Used as the
+/// per-section descriptor's `max_decomp_size` field so the reader's
+/// bounds check (`address + 32 + size <= max_decomp_size`) passes
+/// for sections that are tiny in practice.
+const SECTION_MAX_DECOMP_SIZE: u32 = 0x7400;
+
 /// Logical section names that AutoCAD recognizes. We emit exactly
 /// these four so the file is structurally complete; AutoCAD will
 /// synthesize defaults for the optional sections (preview, summary,
@@ -329,7 +337,18 @@ pub fn assemble_r2004(parts: R2004FileParts) -> DwgResult<Vec<u8>> {
             _ => 0,
         };
         desc.size = decompressed_size;
-        desc.max_decomp_size = decompressed_size.max(1) as u32;
+        // `max_decomp_size` is the MAXIMUM DECOMPRESSED SIZE of one
+        // page within the section. LibreDWG enforces (decode.c:2120)
+        // `address + 32 + info->size <= max_decomp_size` where
+        // `address` is the per-page StartOffset (always 0 for our
+        // single-page sections) and `32` is the data-page header. For
+        // a section like AcDb:Header with 38 decompressed bytes, the
+        // minimum legal value is 70. AutoCAD writes 0x7400 (29696)
+        // by default for normal data sections — see LibreDWG
+        // `section_max_decomp_size` (decode.c:1640). We follow that
+        // convention so dwgread accepts our files without the "Some
+        // section size or address out of bounds" hard error.
+        desc.max_decomp_size = SECTION_MAX_DECOMP_SIZE;
         desc.compressed = 1; // stored (raw inside the encrypted page header)
         desc.type_tag = *section_type;
         // R2018: encrypted=2 marks a section as XOR-masked. LibreDWG
@@ -454,7 +473,14 @@ pub fn assemble_r2004(parts: R2004FileParts) -> DwgResult<Vec<u8>> {
     r2004_hdr.section_map_address = page_map_offset - R2004_FIRST_PAGE_OFFSET;
     r2004_hdr.section_info_id = -2;
     r2004_hdr.numsections = section_descriptors.len() as u32;
-    r2004_hdr.section_array_size = page_descriptors.len() as u32;
+    // `section_array_size` is the highest POSITIVE page id in the page
+    // map, NOT the total number of page-map entries. LibreDWG enforces
+    // `max_id == section_array_size` (decode.c:1541); negative-id
+    // system pages (page map = -1, section info = -2) are excluded
+    // from `max_id`. Our data pages use ids 1..=N where N =
+    // section_descriptors.len(), so the highest positive id equals
+    // that count.
+    r2004_hdr.section_array_size = section_descriptors.len() as u32;
     r2004_hdr.last_section_id = section_descriptors.len() as u32;
     let last_section_abs = page_descriptors
         .iter()
@@ -956,6 +982,82 @@ mod tests {
         bytes[..6].copy_from_slice(b"AC9999");
         let err = parse_r2004(&bytes).unwrap_err();
         assert!(matches!(err, DwgError::InvalidSignature(_)));
+    }
+
+    #[test]
+    fn r2004_section_info_max_decomp_size_matches_libredwg_convention() {
+        // LibreDWG decode.c:2120 checks
+        //   `es.fields.address + 32 + info->size > max_decomp_size`
+        // and rejects the file if true. For our 38-byte AcDb:Header
+        // section, `max_decomp_size` must be >= 70. AutoCAD writes
+        // 0x7400 (29696) by default; we match that convention. This
+        // test encodes, re-parses the section info, and asserts every
+        // descriptor's `max_decomp_size` is 0x7400 (not the old
+        // `decompressed_size.max(1)` value that was too small).
+        let bytes = assemble_r2004(R2004FileParts {
+            version: Version::R2004,
+            header_vars: HeaderVarsSection::minimal(Version::R2004),
+            classes: ClassesSection::empty(Version::R2004),
+            objects: vec![one_line_record()],
+        })
+        .unwrap();
+        // Re-parse and inspect section descriptors.
+        let parsed = parse_r2004(&bytes).unwrap();
+        let _ = parsed; // round-trip succeeded
+                        // We also directly inspect the section_info payload to verify
+                        // the max_decomp_size field, bypassing the high-level parser
+                        // which doesn't expose it. Decode the encrypted R2004 header
+                        // to locate the page map, then the section info.
+        let mut encrypted_hdr = [0u8; 120];
+        encrypted_hdr.copy_from_slice(&bytes[R2004_HEADER_OFFSET..R2004_HEADER_OFFSET + 120]);
+        crate::dwg::file::system_section::encrypt_lcg_inplace(&mut encrypted_hdr);
+        let r2004_hdr = R2004FileHeader::from_decrypted(&encrypted_hdr).unwrap();
+        let pmo = (r2004_hdr.section_map_address + R2004_FIRST_PAGE_OFFSET) as usize;
+        let (_, page_map) = read_system_page(&bytes[pmo..], false).unwrap();
+        let pds =
+            crate::dwg::file::system_section::decode_page_map(&page_map, R2004_FIRST_PAGE_OFFSET)
+                .unwrap();
+        let si_off = pds
+            .iter()
+            .find(|p| p.page_id == r2004_hdr.section_info_id)
+            .unwrap()
+            .file_offset as usize;
+        let (_, si_payload) = read_system_page(&bytes[si_off..], false).unwrap();
+        let (_, descriptors) = decode_section_info(&si_payload).unwrap();
+        for d in &descriptors {
+            assert_eq!(
+                d.max_decomp_size,
+                SECTION_MAX_DECOMP_SIZE,
+                "Section {:?} max_decomp_size = {:#x}, expected {:#x}",
+                d.name_str(),
+                d.max_decomp_size,
+                SECTION_MAX_DECOMP_SIZE,
+            );
+        }
+    }
+
+    #[test]
+    fn r2004_section_array_size_equals_data_page_count() {
+        // LibreDWG decode.c:1541 warns if max_id != section_array_size.
+        // Our encoder must set section_array_size = highest positive
+        // page id = number of data pages (4 for a standard file with
+        // Header/Classes/Objects/Handles).
+        let bytes = assemble_r2004(R2004FileParts {
+            version: Version::R2004,
+            header_vars: HeaderVarsSection::minimal(Version::R2004),
+            classes: ClassesSection::empty(Version::R2004),
+            objects: vec![one_line_record()],
+        })
+        .unwrap();
+        let mut encrypted_hdr = [0u8; 120];
+        encrypted_hdr.copy_from_slice(&bytes[R2004_HEADER_OFFSET..R2004_HEADER_OFFSET + 120]);
+        crate::dwg::file::system_section::encrypt_lcg_inplace(&mut encrypted_hdr);
+        let hdr = R2004FileHeader::from_decrypted(&encrypted_hdr).unwrap();
+        // 4 data sections → 4 data pages → section_array_size = 4.
+        assert_eq!(
+            hdr.section_array_size, 4,
+            "section_array_size must equal the number of data pages (4)"
+        );
     }
 
     #[test]
