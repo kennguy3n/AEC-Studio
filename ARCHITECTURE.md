@@ -45,7 +45,7 @@ flowchart TB
     subgraph "CAD Worker (Rust)"
         CADcanvas["wgpu CAD canvas"]
         DXF["DXF read / write"]
-        DWG["DWG adapter (opt-in)"]
+        DWG["DWG read / write (native, R12 → R2018)"]
     end
 
     subgraph "Native BIM Engine (Rust)"
@@ -354,8 +354,8 @@ crates/aec_cad/
 ├── dims/                       # Linear, angular, radial, baseline, continue
 ├── sheets/                     # Title blocks, viewports, sheet sets
 ├── command_line/               # Keyboard-first command parser
-├── dxf/                        # DXF read/write
-└── dwg_adapter/                # Optional DWG adapter (out-of-process)
+├── dxf/                        # DXF read/write (ASCII; R12-compatible subset)
+└── dwg/                        # Native pure-Rust DWG read/write (R12 → R2018; in-process)
 ```
 
 ### Performance design
@@ -364,7 +364,7 @@ crates/aec_cad/
 - The 2D CAD canvas uses wgpu with an orthographic camera; rendering is batched per layer.
 - Snapping precomputes a spatial index for end/mid/center/intersection/perpendicular/tangent snaps.
 - Constraints are solved incrementally; the solver runs in a worker thread.
-- DXF is the canonical format; DWG is a separate adapter that is not loaded by default.
+- DXF is the canonical ASCII format; DWG round-trip uses the in-process native codec under `dwg/`, with version dispatch from R12 (AC1009) through R2018 (AC1032) and no external runtime dependency.
 
 ---
 
