@@ -91,10 +91,12 @@ pub const R2007_FIRST_PAGE_OFFSET: u64 =
 /// always zero in AutoCAD-emitted files and ignored on read.
 pub const R2007_CHECK_DATA_LEN: usize = 0x28;
 
-/// In-memory image of a parsed R2007 file. Currently only carries
-/// the version + the parsed pages-map records — section content
-/// emission lands in a follow-up commit once the file-header layer
-/// is validated end-to-end against `dwgread`.
+/// In-memory image of a parsed R2007 file. Carries every metadata
+/// layer LibreDWG itself reads: the pages-map records, the
+/// sections-map descriptors, and the sections-map's resolved
+/// physical file offset. Section payload content (header_vars,
+/// classes, objects) lands in a follow-up commit once entity
+/// emission is wired in.
 #[derive(Debug, Clone, PartialEq)]
 pub struct R2007File {
     pub version: Version,
@@ -103,8 +105,18 @@ pub struct R2007File {
     pub pages_map: Vec<(i64, u64)>,
     /// The id LibreDWG looks up to find the sections-map page.
     pub sections_map_id: i64,
-    /// Currently always 0; will become the actual count once section
-    /// content emission lands.
+    /// File offset (bytes from the start of the file) where the
+    /// sections-map system page lives on disk. Computed by walking
+    /// the pages-map records in order and accumulating their sizes
+    /// until the entry with `id == sections_map_id` is hit; matches
+    /// LibreDWG `decode_r2007.c::read_sections_map`'s
+    /// `offset += size` accumulator.
+    pub sections_map_offset: u64,
+    /// Decoded sections-map descriptors — one per logical section.
+    /// Length always equals `num_sections`.
+    pub sections: Vec<SectionDescriptor>,
+    /// Convenience mirror of `sections.len()`. Pinned against the
+    /// file header's `num_sections` field during parse.
     pub num_sections: i64,
 }
 
@@ -147,7 +159,7 @@ pub(crate) fn decode_pages_map_content(payload: &[u8]) -> DwgResult<Vec<(i64, u6
 /// 8 × i64 LE fields, mirroring LibreDWG's `r2007_section` struct
 /// (decode_r2007.c line 891-898).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SectionDescriptor {
+pub struct SectionDescriptor {
     pub data_size: i64,
     pub max_size: i64,
     pub encrypted: i64,
@@ -168,7 +180,7 @@ pub(crate) struct SectionDescriptor {
 /// One 56-byte page entry inside a sections-map section descriptor.
 /// Fields mirror LibreDWG's `r2007_section_page` struct.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SectionPageEntry {
+pub struct SectionPageEntry {
     /// Offset within the section's reconstructed buffer where this
     /// page's bytes start. Single-page sections always use 0.
     pub offset: u64,
@@ -380,6 +392,144 @@ pub(crate) fn encode_sections_map_content(descriptors: &[SectionDescriptor]) -> 
     out
 }
 
+/// Inverse of [`encode_sections_map_content`] — parse exactly
+/// `num_sections` descriptors from `payload`.
+///
+/// The on-disk layout (matching LibreDWG `decode_r2007.c::read_sections_map`):
+///   * 8 × i64 LE header (64 bytes): `data_size`, `max_size`,
+///     `encrypted`, `hashcode`, `name_length`, `unknown`, `encoded`,
+///     `num_pages`.
+///   * `name_length` bytes of UTF-16LE section name (no BOM).
+///   * `num_pages` × 56 bytes of page entries — each is 7 × u64 LE:
+///     `offset`, `size`, `id`, `uncomp_size`, `comp_size`, `checksum`,
+///     `crc`.
+///
+/// Every numeric read uses `checked_*` arithmetic so an adversarial
+/// file with a huge `name_length` or `num_pages` produces a typed
+/// `DwgError::InternalInvariant` instead of a slice panic or
+/// arithmetic wrap.
+pub(crate) fn decode_sections_map_content(
+    payload: &[u8],
+    num_sections: i64,
+) -> DwgResult<Vec<SectionDescriptor>> {
+    if num_sections < 0 {
+        return Err(DwgError::InternalInvariant(format!(
+            "decode_sections_map_content: negative num_sections {num_sections}"
+        )));
+    }
+    let num_sections = num_sections as usize;
+    let mut out = Vec::with_capacity(num_sections);
+    let mut pos: usize = 0;
+    for descriptor_index in 0..num_sections {
+        let header_end = pos.checked_add(64).ok_or_else(|| {
+            DwgError::InternalInvariant(format!(
+                "decode_sections_map_content: header end overflow at descriptor {descriptor_index}"
+            ))
+        })?;
+        if header_end > payload.len() {
+            return Err(DwgError::InternalInvariant(format!(
+                "decode_sections_map_content: header for descriptor {descriptor_index} exceeds payload"
+            )));
+        }
+        let header = &payload[pos..header_end];
+        let data_size = i64::from_le_bytes(header[0..8].try_into().unwrap());
+        let max_size = i64::from_le_bytes(header[8..16].try_into().unwrap());
+        let encrypted = i64::from_le_bytes(header[16..24].try_into().unwrap());
+        let hashcode = i64::from_le_bytes(header[24..32].try_into().unwrap());
+        let name_length = i64::from_le_bytes(header[32..40].try_into().unwrap());
+        let unknown = i64::from_le_bytes(header[40..48].try_into().unwrap());
+        let encoded = i64::from_le_bytes(header[48..56].try_into().unwrap());
+        let num_pages = i64::from_le_bytes(header[56..64].try_into().unwrap());
+        if name_length < 0 || name_length % 2 != 0 {
+            return Err(DwgError::InternalInvariant(format!(
+                "decode_sections_map_content: invalid name_length {name_length} at descriptor {descriptor_index}"
+            )));
+        }
+        if num_pages < 0 {
+            return Err(DwgError::InternalInvariant(format!(
+                "decode_sections_map_content: negative num_pages {num_pages} at descriptor {descriptor_index}"
+            )));
+        }
+        pos = header_end;
+        let name_end = pos.checked_add(name_length as usize).ok_or_else(|| {
+            DwgError::InternalInvariant(format!(
+                "decode_sections_map_content: name end overflow at descriptor {descriptor_index}"
+            ))
+        })?;
+        if name_end > payload.len() {
+            return Err(DwgError::InternalInvariant(format!(
+                "decode_sections_map_content: name for descriptor {descriptor_index} exceeds payload"
+            )));
+        }
+        let name = utf16le_string(&payload[pos..name_end])?;
+        pos = name_end;
+        let mut pages = Vec::with_capacity(num_pages as usize);
+        for page_index in 0..(num_pages as usize) {
+            let page_end = pos.checked_add(SECTION_PAGE_ENTRY_SIZE).ok_or_else(|| {
+                DwgError::InternalInvariant(format!(
+                    "decode_sections_map_content: page entry end overflow at descriptor {descriptor_index} page {page_index}"
+                ))
+            })?;
+            if page_end > payload.len() {
+                return Err(DwgError::InternalInvariant(format!(
+                    "decode_sections_map_content: page entry {page_index} for descriptor {descriptor_index} exceeds payload"
+                )));
+            }
+            let entry_bytes = &payload[pos..page_end];
+            let offset = u64::from_le_bytes(entry_bytes[0..8].try_into().unwrap());
+            let size = u64::from_le_bytes(entry_bytes[8..16].try_into().unwrap());
+            let id = i64::from_le_bytes(entry_bytes[16..24].try_into().unwrap());
+            let uncomp_size = u64::from_le_bytes(entry_bytes[24..32].try_into().unwrap());
+            let comp_size = u64::from_le_bytes(entry_bytes[32..40].try_into().unwrap());
+            let checksum = u64::from_le_bytes(entry_bytes[40..48].try_into().unwrap());
+            let crc = u64::from_le_bytes(entry_bytes[48..56].try_into().unwrap());
+            pages.push(SectionPageEntry {
+                offset,
+                size,
+                id,
+                uncomp_size,
+                comp_size,
+                checksum,
+                crc,
+            });
+            pos = page_end;
+        }
+        out.push(SectionDescriptor {
+            data_size,
+            max_size,
+            encrypted,
+            hashcode,
+            name_length,
+            unknown,
+            encoded,
+            name,
+            pages,
+        });
+    }
+    Ok(out)
+}
+
+/// Decode a UTF-16LE byte slice into a Rust `String`. Returns a
+/// typed error rather than panicking on odd lengths or unpaired
+/// surrogates so an adversarial sections-map can't crash the
+/// parser. R2007 section names are always ASCII-safe in practice
+/// but we don't rely on that invariant on the read path.
+fn utf16le_string(bytes: &[u8]) -> DwgResult<String> {
+    if bytes.len() % 2 != 0 {
+        return Err(DwgError::InternalInvariant(format!(
+            "utf16le_string: odd byte length {}",
+            bytes.len()
+        )));
+    }
+    let mut code_units = Vec::with_capacity(bytes.len() / 2);
+    for chunk in bytes.chunks_exact(2) {
+        code_units.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+    }
+    String::from_utf16(&code_units).map_err(|err| {
+        DwgError::InternalInvariant(format!("utf16le_string: invalid UTF-16LE: {err}"))
+    })
+}
+
 /// Parts needed to build an R2007 file.
 ///
 /// Currently only carries the version — section payloads
@@ -574,18 +724,26 @@ pub fn assemble_r2007(parts: R2007FileParts) -> DwgResult<Vec<u8>> {
     Ok(out)
 }
 
-/// Same shape as [`R2007File`] but pulled out so [`parse_r2007`]
-/// can construct it from a partially-decoded file. Internal API.
+/// Assemble an [`R2007File`] from the parts [`parse_r2007`] has
+/// decoded. Internal API — keeps `parse_r2007` readable by hoisting
+/// the field-by-field construction. Pins `num_sections` to
+/// `sections.len()` rather than re-reading it from the header so a
+/// future header-vs-content mismatch turns into a length check that
+/// the caller can assert on.
 fn r2007_file_from_header(
     version: Version,
     header: &R2007FileHeader,
     pages_map: Vec<(i64, u64)>,
+    sections_map_offset: u64,
+    sections: Vec<SectionDescriptor>,
 ) -> R2007File {
     R2007File {
         version,
         pages_map,
         sections_map_id: header.sections_map_id,
-        num_sections: header.num_sections,
+        sections_map_offset,
+        num_sections: sections.len() as i64,
+        sections,
     }
 }
 
@@ -691,23 +849,99 @@ pub fn parse_r2007(bytes: &[u8], version: Version) -> DwgResult<R2007File> {
     let pages_records = decode_pages_map_content(&pages_map_payload)?;
 
     // 4. Locate the sections-map by id.
+    //
+    //    LibreDWG's `read_sections_map` accumulates `offset += size`
+    //    per page in pages-map order until it hits the entry with
+    //    `id == sections_map_id`. We mirror that exact loop here,
+    //    using `checked_add` on every accumulation so an adversarial
+    //    pages-map with huge `size` values can't wrap `u64`. (In
+    //    practice u64::MAX would already overflow the file length
+    //    check below, but the explicit guard means we surface a
+    //    typed error before any cast to `usize` would lose
+    //    information on 32-bit targets.)
     let mut sections_map_offset_running: u64 = R2007_FIRST_PAGE_OFFSET;
-    let mut sections_map_phys_offset: Option<u64> = None;
+    let mut sections_map_offset: Option<u64> = None;
     for &(id, size) in &pages_records {
         if id == header.sections_map_id {
-            sections_map_phys_offset = Some(sections_map_offset_running);
+            sections_map_offset = Some(sections_map_offset_running);
             break;
         }
-        sections_map_offset_running += size;
+        sections_map_offset_running =
+            sections_map_offset_running
+                .checked_add(size)
+                .ok_or_else(|| {
+                    DwgError::InternalInvariant(format!(
+                        "parse_r2007: pages-map offset accumulation overflowed u64 \
+                         (running={sections_map_offset_running}, size={size})"
+                    ))
+                })?;
     }
-    let _sections_map_phys_offset = sections_map_phys_offset.ok_or_else(|| {
+    let sections_map_offset = sections_map_offset.ok_or_else(|| {
         DwgError::InternalInvariant(format!(
             "parse_r2007: sections_map_id {} not in pages-map",
             header.sections_map_id
         ))
     })?;
 
-    Ok(r2007_file_from_header(version, &header, pages_records))
+    // 5. Decode the sections-map at its resolved physical offset.
+    //    Apply the same defense-in-depth pattern as for the
+    //    pages-map: validate sizes are non-negative, compute the
+    //    on-disk length via the checked helper, and verify the
+    //    region lies within the file before slicing.
+    if header.sections_map_size_comp < 0 {
+        return Err(DwgError::InternalInvariant(format!(
+            "parse_r2007: negative sections_map_size_comp {}",
+            header.sections_map_size_comp
+        )));
+    }
+    if header.sections_map_size_uncomp < 0 {
+        return Err(DwgError::InternalInvariant(format!(
+            "parse_r2007: negative sections_map_size_uncomp {}",
+            header.sections_map_size_uncomp
+        )));
+    }
+    if header.sections_map_correction < 1 {
+        return Err(DwgError::InternalInvariant(format!(
+            "parse_r2007: invalid sections_map_correction {}",
+            header.sections_map_correction
+        )));
+    }
+    let sections_map_off = usize::try_from(sections_map_offset).map_err(|_| {
+        DwgError::InternalInvariant(format!(
+            "parse_r2007: sections_map_offset {sections_map_offset} exceeds usize"
+        ))
+    })?;
+    let sections_map_on_disk_len = system_page_on_disk_size(
+        header.sections_map_size_comp as usize,
+        header.sections_map_correction,
+    )?;
+    let sections_map_end = sections_map_off
+        .checked_add(sections_map_on_disk_len)
+        .ok_or_else(|| {
+            DwgError::InternalInvariant(
+                "parse_r2007: sections-map end arithmetic overflowed usize".into(),
+            )
+        })?;
+    if bytes.len() < sections_map_end {
+        return Err(DwgError::InternalInvariant(
+            "parse_r2007: sections-map region exceeds file length".into(),
+        ));
+    }
+    let sections_map_payload = decode_system_page(
+        &bytes[sections_map_off..sections_map_end],
+        header.sections_map_size_comp,
+        header.sections_map_size_uncomp,
+        header.sections_map_correction,
+    )?;
+    let sections = decode_sections_map_content(&sections_map_payload, header.num_sections)?;
+
+    Ok(r2007_file_from_header(
+        version,
+        &header,
+        pages_records,
+        sections_map_offset,
+        sections,
+    ))
 }
 
 #[cfg(test)]
@@ -763,6 +997,131 @@ mod tests {
         assert_eq!(parsed.pages_map[1].0, 3); // AcDb:Classes id
         assert_eq!(parsed.pages_map[2].0, 4); // AcDb:Template id
         assert_eq!(parsed.pages_map[3].0, 1); // sections-map id
+
+        // sections-map round-trip: every canonical section name must
+        // come back through parse_r2007. This pins the actual use of
+        // sections_map_offset (the value parse_r2007 walks to in step
+        // 4 and decodes in step 5). Before this PR the offset was
+        // computed-and-discarded — a future encoder writing the
+        // sections-map at a stale offset wouldn't have been caught
+        // by any test.
+        assert_eq!(
+            parsed.sections.len(),
+            MANDATORY_R2007_SECTION_NAMES.len(),
+            "every canonical section must round-trip"
+        );
+        for (expected_name, descriptor) in MANDATORY_R2007_SECTION_NAMES
+            .iter()
+            .zip(parsed.sections.iter())
+        {
+            assert_eq!(&descriptor.name, expected_name);
+            assert_eq!(
+                descriptor.name_length as usize,
+                expected_name.len() * 2,
+                "name_length must be the UTF-16LE byte count for {expected_name}"
+            );
+        }
+        // Sentinel-bearing sections (AcDb:Header, AcDb:Classes,
+        // AcDb:Template) carry exactly one page entry each, pointing
+        // at the data pages we emitted in step 3.
+        let sentinel_sections = ["AcDb:Header", "AcDb:Classes", "AcDb:Template"];
+        for sentinel in sentinel_sections {
+            let descriptor = parsed
+                .sections
+                .iter()
+                .find(|d| d.name == sentinel)
+                .unwrap_or_else(|| panic!("missing {sentinel} descriptor"));
+            assert_eq!(
+                descriptor.pages.len(),
+                1,
+                "{sentinel} must have exactly one data page entry"
+            );
+            // The page entry's id must appear in the pages-map.
+            let page_id = descriptor.pages[0].id;
+            assert!(
+                parsed.pages_map.iter().any(|&(id, _)| id == page_id),
+                "{sentinel} page id {page_id} not in pages-map"
+            );
+        }
+        // The sections-map's resolved offset must land inside the
+        // file, after the file header / check-data region.
+        assert!(parsed.sections_map_offset >= R2007_FIRST_PAGE_OFFSET);
+        assert!(parsed.sections_map_offset < file.len() as u64);
+    }
+
+    #[test]
+    fn sections_map_content_round_trips_through_decode() {
+        // Pin the encode → decode symmetry of the sections-map
+        // payload independently of the full file assembler so a
+        // regression in either path produces a focused failure. We
+        // mix a no-pages descriptor with a multi-page one to cover
+        // both branches of decode_sections_map_content.
+        let descriptors = vec![
+            SectionDescriptor::single_page_for_name("AcDb:Header", 16, 256, 2),
+            SectionDescriptor::empty_for_name("AcDb:AuxHeader"),
+            SectionDescriptor {
+                data_size: 4096,
+                max_size: 8192,
+                encrypted: 0,
+                hashcode: 0x1234_5678,
+                name_length: ("AcDb:AcDbObjects".len() * 2) as i64,
+                unknown: 0,
+                encoded: 0,
+                name: "AcDb:AcDbObjects".to_string(),
+                pages: vec![
+                    SectionPageEntry {
+                        offset: 0,
+                        size: 1024,
+                        id: 5,
+                        uncomp_size: 1000,
+                        comp_size: 1000,
+                        checksum: 0xDEAD_BEEF,
+                        crc: 0xCAFE_BABE,
+                    },
+                    SectionPageEntry {
+                        offset: 1000,
+                        size: 4096,
+                        id: 6,
+                        uncomp_size: 3096,
+                        comp_size: 3096,
+                        checksum: 0xABCD_1234,
+                        crc: 0,
+                    },
+                ],
+            },
+        ];
+        let bytes = encode_sections_map_content(&descriptors);
+        let parsed = decode_sections_map_content(&bytes, descriptors.len() as i64).unwrap();
+        assert_eq!(parsed, descriptors);
+    }
+
+    #[test]
+    fn sections_map_decode_rejects_negative_num_sections() {
+        let err = decode_sections_map_content(&[], -1);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn sections_map_decode_rejects_truncated_header() {
+        // 32 bytes is half of a single descriptor's 64-byte header.
+        let err = decode_sections_map_content(&[0u8; 32], 1);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn sections_map_decode_rejects_invalid_name_length() {
+        // Build one descriptor header with name_length = -1.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0i64.to_le_bytes()); // data_size
+        bytes.extend_from_slice(&0i64.to_le_bytes()); // max_size
+        bytes.extend_from_slice(&0i64.to_le_bytes()); // encrypted
+        bytes.extend_from_slice(&0i64.to_le_bytes()); // hashcode
+        bytes.extend_from_slice(&(-1i64).to_le_bytes()); // name_length (NEGATIVE)
+        bytes.extend_from_slice(&0i64.to_le_bytes()); // unknown
+        bytes.extend_from_slice(&0i64.to_le_bytes()); // encoded
+        bytes.extend_from_slice(&0i64.to_le_bytes()); // num_pages
+        let err = decode_sections_map_content(&bytes, 1);
+        assert!(err.is_err());
     }
 
     #[test]
