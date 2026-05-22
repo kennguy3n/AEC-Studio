@@ -76,6 +76,23 @@ mod tests {
     }
 
     #[test]
+    fn line_round_trips_through_dwg_writer_reader_r12() {
+        let doc = one_line_document();
+        let bytes = DwgWriter::write(&doc, Version::R12).unwrap();
+        let reader = DwgReader::new(&bytes).unwrap();
+        assert_eq!(reader.version, Version::R12);
+        let back = reader.into_document().unwrap();
+        assert_eq!(back.entities.len(), 1);
+        match &back.entities[0] {
+            DxfEntity::Line(l) => {
+                assert_eq!(l.start, [0.0, 0.0, 0.0]);
+                assert_eq!(l.end, [10.0, 5.0, 0.0]);
+            }
+            other => panic!("expected Line, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn line_round_trips_through_dwg_writer_reader_r14() {
         let doc = one_line_document();
         let bytes = DwgWriter::write(&doc, Version::R14).unwrap();

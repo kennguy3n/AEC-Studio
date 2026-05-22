@@ -1,16 +1,19 @@
-//! R12 reader entry point — top-level driver for AC1009 files.
+//! R12 reader entry point.
 //!
-//! Walks the header offsets, parses each table (LAYER, BLOCK, LTYPE,
-//! STYLE, DIMSTYLE), then the entities section, building a complete
-//! [`crate::dxf::DxfDocument`].
+//! Walks the file header to locate every section, validates each
+//! framed sub-section's CRC, then reconstitutes a
+//! [`crate::dxf::DxfDocument`] via the layer/block/index-aware bridge
+//! in [`super::bridge`].
 
-use crate::dwg::error::{DwgError, DwgResult};
+use crate::dwg::error::DwgResult;
+use crate::dwg::r12::bridge::image_to_document;
+use crate::dwg::r12::file::disassemble;
 use crate::dwg::r12::R12FileHeader;
 use crate::dxf::DxfDocument;
 
 /// Top-level R12 reader.
 pub struct R12Reader<'a> {
-    bytes: &'a [u8],
+    pub bytes: &'a [u8],
     pub header: R12FileHeader,
 }
 
@@ -21,20 +24,43 @@ impl<'a> R12Reader<'a> {
     }
 
     /// Convert the in-buffer R12 file into a canonical
-    /// [`DxfDocument`]. The structural complexity of R12 table records
-    /// (each with its own fixed-size layout per table type) is real
-    /// enough that the fully populated decoder lives behind a feature
-    /// gate; for now we surface a structured error rather than risk a
-    /// half-decoded document.
+    /// [`DxfDocument`]. Disassembles the file into an
+    /// [`crate::dwg::r12::bridge::R12FileImage`] (the wire-level
+    /// shape) and then maps that to the DXF model.
     pub fn into_document(self) -> DwgResult<DxfDocument> {
-        let _ = self.bytes;
-        let _ = self.header;
-        Err(DwgError::UnsupportedInVersion {
-            version: crate::dwg::version::Version::R12,
-            what: "document decoding is delivered in a follow-up commit; \
-                   the header parser round-trips in this commit so the \
-                   table-record decoders can land independently"
-                .into(),
-        })
+        let image = disassemble(self.bytes)?;
+        image_to_document(&image)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dwg::r12::bridge::document_to_image;
+    use crate::dwg::r12::file::assemble;
+    use crate::dxf::{DxfDocument, DxfEntity, DxfLine};
+
+    #[test]
+    fn empty_document_round_trips_through_reader() {
+        let doc = DxfDocument::new();
+        let bytes = assemble(&document_to_image(&doc).unwrap()).unwrap();
+        let recovered = R12Reader::new(&bytes).unwrap().into_document().unwrap();
+        // The default DxfDocument has the dim style "STANDARD"; our
+        // writer encodes it as the only DIMSTYLE record, so the round
+        // trip preserves it exactly.
+        assert_eq!(recovered.entities, doc.entities);
+    }
+
+    #[test]
+    fn line_document_round_trips_through_reader() {
+        let mut doc = DxfDocument::new();
+        doc.entities.push(DxfEntity::Line(DxfLine {
+            layer: "0".to_string(),
+            start: [1.0, 2.0, 3.0],
+            end: [4.0, 5.0, 6.0],
+        }));
+        let bytes = assemble(&document_to_image(&doc).unwrap()).unwrap();
+        let recovered = R12Reader::new(&bytes).unwrap().into_document().unwrap();
+        assert_eq!(recovered.entities, doc.entities);
     }
 }

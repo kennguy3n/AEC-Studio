@@ -33,8 +33,14 @@
 //! table). The entities section is a flat sequence of records terminated
 //! by a sentinel byte. CRC is computed per-table using CRC-X25.
 
+pub mod bridge;
+pub mod entity;
+pub mod file;
 pub mod header;
+pub mod header_vars;
 pub mod reader;
+pub mod record_kinds;
+pub mod tables;
 pub mod writer;
 
 pub use header::R12FileHeader;

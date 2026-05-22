@@ -326,32 +326,48 @@ impl ObjectRecord {
     /// Decode one record from `bytes` starting at offset 0. Returns
     /// the record and the number of bytes consumed.
     ///
-    /// For R2010+ the per-type payload is captured opaquely into
-    /// `payload_bits` via the explicit `bitsize` marker. For
-    /// R2000-R2007 there is no bitsize marker; callers must use
-    /// [`Self::decode_with`] to recover the payload, otherwise the
-    /// handle stream is decoded from the wrong cursor position.
+    /// **R2010+ only.** Only modern files carry the explicit `bitsize`
+    /// field that lets us recover the per-type payload bits without
+    /// invoking a type-specific decoder. For R2000-R2007 we must know
+    /// where the per-type payload ends to find the handle stream, and
+    /// that boundary requires per-type knowledge — callers MUST use
+    /// [`Self::decode_with`] for those versions and pass a payload
+    /// decoder that consumes exactly the right number of bits. To
+    /// prevent silently mis-aligned handle streams the entry point
+    /// hard-errors for any version below R2010.
     pub fn decode(version: Version, bytes: &[u8]) -> DwgResult<(Self, usize)> {
+        if version < Version::R2010 {
+            return Err(DwgError::MalformedObject {
+                class: "ObjectRecord".to_string(),
+                offset: 0,
+                message: format!(
+                    "ObjectRecord::decode is R2010+ only (got {version:?}); \
+                     R2000-R2007 callers must use ObjectRecord::decode_with \
+                     with a per-type payload decoder to locate the handle stream"
+                ),
+            });
+        }
         let (header, mut body_r, hint, total) = Self::decode_header_only(version, bytes)?;
-        let (payload_bits, handle_bits_start) = match hint {
-            Some(handle_start) => {
-                let cur = body_r.bit_position();
-                if handle_start < cur {
-                    return Err(DwgError::MalformedObject {
-                        class: format!("{:?}", header.object_type),
-                        offset: 0,
-                        message: format!(
-                            "bitsize indicates handle stream starts at bit {handle_start} \
-                             which is before current decoder position {cur}"
-                        ),
-                    });
-                }
-                let payload = read_bitbuf_bits(&mut body_r, handle_start - cur)?;
-                (payload, handle_start)
-            }
-            None => (BitBuf::new(), body_r.bit_position()),
-        };
-        body_r.set_bit_position(handle_bits_start)?;
+        let handle_start = hint.ok_or_else(|| {
+            DwgError::InternalInvariant(
+                "R2010+ branch reached decode() without a bitsize hint; \
+             decode_header_only must always return Some(_) for version >= R2010"
+                    .to_string(),
+            )
+        })?;
+        let cur = body_r.bit_position();
+        if handle_start < cur {
+            return Err(DwgError::MalformedObject {
+                class: format!("{:?}", header.object_type),
+                offset: 0,
+                message: format!(
+                    "bitsize indicates handle stream starts at bit {handle_start} \
+                     which is before current decoder position {cur}"
+                ),
+            });
+        }
+        let payload_bits = read_bitbuf_bits(&mut body_r, handle_start - cur)?;
+        body_r.set_bit_position(handle_start)?;
         let handles = decode_handle_stream(&mut body_r, version, &header.common)?;
         Ok((
             Self {
@@ -567,15 +583,16 @@ mod tests {
     }
 
     /// On R2000-R2007 there is no explicit `bitsize` marker that
-    /// separates the per-type payload from the handle stream, so a
-    /// round-trip through `ObjectRecord` alone (without invoking the
-    /// per-type decoder in between) only works for records whose
-    /// payload is empty. Real R2000-R2007 walking is composed by the
-    /// file walker, which dispatches the per-type decoder between
-    /// `decode_for_version` of the common header and the handle
-    /// stream decode.
+    /// separates the per-type payload from the handle stream. Real
+    /// walking is composed by the file walker, which dispatches a
+    /// per-type decoder via [`ObjectRecord::decode_with`]. The bare
+    /// [`ObjectRecord::decode`] entry point is hard-locked to R2010+
+    /// to close that footgun structurally rather than relying on doc
+    /// comments. This test pins both halves of the contract: the bare
+    /// decode errors with a structured `MalformedObject`, and
+    /// `decode_with` round-trips an empty payload correctly.
     #[test]
-    fn empty_payload_record_round_trips_on_r2000() {
+    fn r2000_record_round_trips_via_decode_with_only() {
         let record = ObjectRecord {
             object_type: ObjectType::Line,
             handle: HandleRef { code: 0, value: 1 },
@@ -584,7 +601,19 @@ mod tests {
             handles: build_handles(),
         };
         let bytes = record.encode(Version::R2000).unwrap();
-        let (decoded, consumed) = ObjectRecord::decode(Version::R2000, &bytes).unwrap();
+
+        let err = ObjectRecord::decode(Version::R2000, &bytes).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                DwgError::MalformedObject { ref class, .. } if class == "ObjectRecord"
+            ),
+            "bare decode() must hard-error on R2000-R2007 to prevent silently \
+             mis-aligned handle streams, got: {err:?}"
+        );
+
+        let (decoded, _payload, consumed) =
+            ObjectRecord::decode_with(Version::R2000, &bytes, |_ty, _common, _r| Ok(())).unwrap();
         assert_eq!(decoded.object_type, ObjectType::Line);
         assert_eq!(decoded.handle, record.handle);
         assert_eq!(decoded.handles.layer, record.handles.layer);
