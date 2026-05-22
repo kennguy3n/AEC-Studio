@@ -60,8 +60,22 @@ use crate::dwg::error::{DwgError, DwgResult};
 pub const R2007_HEADER_OFFSET: usize = 0x80;
 
 /// Logical size of `Dwg_R2007_Header` on disk (after LZ77 decompress,
-/// before RS encoding). 36 fields × 8 bytes each.
-pub const R2007_HEADER_LOGICAL_SIZE: usize = 36 * 8;
+/// before RS encoding). 34 fields × 8 bytes each = 272 bytes — the
+/// exact value `sizeof(Dwg_R2007_Header)` evaluates to in LibreDWG
+/// (`include/dwg.h:9407-9443`, under `#pragma pack(1)`), which is
+/// what `read_file_header` passes to `memcpy(file_header, ...,
+/// sizeof(Dwg_R2007_Header))` at decode_r2007.c:1221.
+///
+/// **Do not** add speculative "padding" trailers here. An earlier
+/// version of this code carried two extra `padding1`/`padding2`
+/// fields that pushed the logical size to 288 bytes; LibreDWG read
+/// our header correctly anyway (its memcpy only consumes the first
+/// 272 bytes, so the extras silently shifted into trailing pad of
+/// the 717-byte pedata buffer), but ODA SDK and any decoder that
+/// reads the on-disk format literally would mis-parse the next
+/// section. Pinning the constant to LibreDWG's actual struct size
+/// prevents that footgun.
+pub const R2007_HEADER_LOGICAL_SIZE: usize = 34 * 8;
 
 /// Size of the metadata wrapper prepended to the header before LZ77
 /// + RS encoding. Layout: `seqence_crc(8) || seqence_key(8) ||
@@ -72,9 +86,9 @@ pub const R2007_METADATA_SIZE: usize = 32;
 /// per AutoCAD spec (LibreDWG `decode_rs(data, 3, 239, 0x3d8)`).
 pub const R2007_HEADER_BLOCK_COUNT: usize = 3;
 
-/// The 36-field `Dwg_R2007_Header` struct, mirroring LibreDWG's
-/// `include/dwg.h` definition line-for-line. All fields are 64-bit
-/// little-endian on disk.
+/// The 34-field `Dwg_R2007_Header` struct, mirroring LibreDWG's
+/// `include/dwg.h:9407-9443` definition line-for-line under
+/// `#pragma pack(1)`. All fields are 64-bit little-endian on disk.
 ///
 /// Field-by-field documentation tracks LibreDWG's comments. Where a
 /// field's purpose is "unknown" to LibreDWG itself, we propagate
@@ -160,12 +174,13 @@ pub struct R2007FileHeader {
     /// Random seed (unused).
     pub random_seed: i64,
     /// CRC of the file header itself (unused — LibreDWG only logs).
+    /// **This is the last `int64_t` in `Dwg_R2007_Header`** — the
+    /// struct ends at `dwg.h:9442`, the closing brace is on 9443.
+    /// Any field added after this must also exist in LibreDWG's
+    /// struct (currently it does not) or it will be silently ignored
+    /// by LibreDWG's `memcpy(...sizeof(Dwg_R2007_Header))` while
+    /// breaking ODA SDK readers.
     pub header_crc: i64,
-    /// Reserved field that LibreDWG declares but doesn't comment on
-    /// — `dwg.h` line 9442 is the second-to-last `int64_t`.
-    pub padding1: i64,
-    /// Reserved field — the 36th `int64_t` in `Dwg_R2007_Header`.
-    pub padding2: i64,
 }
 
 impl Default for R2007FileHeader {
@@ -215,8 +230,6 @@ impl R2007FileHeader {
             crc_seed_encoded: 0,
             random_seed: 0,
             header_crc: 0,
-            padding1: 0,
-            padding2: 0,
         }
     }
 
@@ -242,7 +255,7 @@ impl R2007FileHeader {
                 bytes.len()
             )));
         }
-        let mut fields = [0i64; 36];
+        let mut fields = [0i64; 34];
         for (i, slot) in fields.iter_mut().enumerate() {
             let mut buf = [0u8; 8];
             buf.copy_from_slice(&bytes[i * 8..(i + 1) * 8]);
@@ -251,7 +264,7 @@ impl R2007FileHeader {
         Ok(Self::from_array(&fields))
     }
 
-    fn as_array(&self) -> [i64; 36] {
+    fn as_array(&self) -> [i64; 34] {
         [
             self.header_size,
             self.file_size,
@@ -287,12 +300,10 @@ impl R2007FileHeader {
             self.crc_seed_encoded,
             self.random_seed,
             self.header_crc,
-            self.padding1,
-            self.padding2,
         ]
     }
 
-    fn from_array(fields: &[i64; 36]) -> Self {
+    fn from_array(fields: &[i64; 34]) -> Self {
         Self {
             header_size: fields[0],
             file_size: fields[1],
@@ -328,8 +339,6 @@ impl R2007FileHeader {
             crc_seed_encoded: fields[31],
             random_seed: fields[32],
             header_crc: fields[33],
-            padding1: fields[34],
-            padding2: fields[35],
         }
     }
 }
@@ -356,7 +365,7 @@ pub fn encode_file_header_on_disk(
     // bytes 8..16: seqence_key — emit 0.
     // bytes 16..24: compr_crc — emit 0.
     // bytes 24..28: compr_len = 0 → stored mode.
-    // bytes 28..32: len2 = 288 = decompressed size.
+    // bytes 28..32: len2 = 272 = decompressed size (sizeof(Dwg_R2007_Header)).
     pedata[28..32].copy_from_slice(&(R2007_HEADER_LOGICAL_SIZE as u32).to_le_bytes());
 
     // Header bytes follow the metadata.
@@ -437,9 +446,18 @@ mod tests {
 
     #[test]
     fn encoded_size_matches_libredwg_struct_size() {
+        // `sizeof(Dwg_R2007_Header)` in LibreDWG's `include/dwg.h`
+        // (lines 9407–9443, 34 packed `int64_t` fields) is 272.
+        // `read_file_header` at decode_r2007.c:1221 calls
+        // `memcpy(file_header, &pedata[32], sizeof(Dwg_R2007_Header))`
+        // — anything we emit beyond byte 272 is silently dropped on
+        // the LibreDWG side but would mis-shift on ODA SDK / any
+        // decoder that walks the on-disk format literally. Pin both
+        // values here so a future struct edit can't drift them apart.
         let bytes = R2007FileHeader::new().encode();
         assert_eq!(bytes.len(), R2007_HEADER_LOGICAL_SIZE);
-        assert_eq!(R2007_HEADER_LOGICAL_SIZE, 288);
+        assert_eq!(R2007_HEADER_LOGICAL_SIZE, 272);
+        assert_eq!(R2007_HEADER_LOGICAL_SIZE, 34 * std::mem::size_of::<i64>());
     }
 
     #[test]
@@ -522,7 +540,101 @@ mod tests {
         .unwrap();
         // bytes 24..28 = compr_len, must be 0 (stored mode).
         assert_eq!(&pedata[24..28], &[0u8; 4]);
-        // bytes 28..32 = len2, must be 288 (decompressed size).
-        assert_eq!(&pedata[28..32], &288u32.to_le_bytes());
+        // bytes 28..32 = len2, must be 272 (decompressed size,
+        // `sizeof(Dwg_R2007_Header)` per dwg.h:9407-9443).
+        assert_eq!(&pedata[28..32], &272u32.to_le_bytes());
+    }
+
+    /// Pin every field in `R2007FileHeader` against its byte offset
+    /// in LibreDWG's `Dwg_R2007_Header` struct (include/dwg.h lines
+    /// 9407–9443). A mismatch in even a single position swaps two
+    /// header values silently and only surfaces when parsing real
+    /// AutoCAD-produced files — too late. Every field is set to a
+    /// distinguishable sentinel here and the encoded bytes are read
+    /// back at the exact offset where LibreDWG's reader expects them.
+    #[test]
+    fn every_field_lands_at_libredwg_byte_offset() {
+        let h = R2007FileHeader {
+            header_size: 0x70,
+            file_size: 0x01,
+            pages_map_crc_compressed: 0x02,
+            pages_map_correction: 0x03,
+            pages_map_crc_seed: 0x04,
+            pages_map2_offset: 0x05,
+            pages_map2_id: 0x06,
+            pages_map_offset: 0x07,
+            pages_map_id: 0x08,
+            header2_offset: 0x09,
+            pages_map_size_comp: 0x0a,
+            pages_map_size_uncomp: 0x0b,
+            pages_amount: 0x0c,
+            pages_maxid: 0x0d,
+            unknown1: 0x0e,
+            unknown2: 0x0f,
+            pages_map_crc_uncomp: 0x10,
+            unknown3: 0x11,
+            unknown4: 0x12,
+            unknown5: 0x13,
+            num_sections: 0x14,
+            sections_map_crc_uncomp: 0x15,
+            sections_map_size_comp: 0x16,
+            sections_map2_id: 0x17,
+            sections_map_id: 0x18,
+            sections_map_size_uncomp: 0x19,
+            sections_map_crc_comp: 0x1a,
+            sections_map_correction: 0x1b,
+            sections_map_crc_seed: 0x1c,
+            stream_version: 0x1d,
+            crc_seed: 0x1e,
+            crc_seed_encoded: 0x1f,
+            random_seed: 0x20,
+            header_crc: 0x21,
+        };
+        let bytes = h.encode();
+        // Indices match LibreDWG's declaration order at dwg.h:9409.
+        let expected: [(usize, i64, &str); 34] = [
+            (0, 0x70, "header_size"),
+            (1, 0x01, "file_size"),
+            (2, 0x02, "pages_map_crc_compressed"),
+            (3, 0x03, "pages_map_correction"),
+            (4, 0x04, "pages_map_crc_seed"),
+            (5, 0x05, "pages_map2_offset"),
+            (6, 0x06, "pages_map2_id"),
+            (7, 0x07, "pages_map_offset"),
+            (8, 0x08, "pages_map_id"),
+            (9, 0x09, "header2_offset"),
+            (10, 0x0a, "pages_map_size_comp"),
+            (11, 0x0b, "pages_map_size_uncomp"),
+            (12, 0x0c, "pages_amount"),
+            (13, 0x0d, "pages_maxid"),
+            (14, 0x0e, "unknown1"),
+            (15, 0x0f, "unknown2"),
+            (16, 0x10, "pages_map_crc_uncomp"),
+            (17, 0x11, "unknown3"),
+            (18, 0x12, "unknown4"),
+            (19, 0x13, "unknown5"),
+            (20, 0x14, "num_sections"),
+            (21, 0x15, "sections_map_crc_uncomp"),
+            (22, 0x16, "sections_map_size_comp"),
+            (23, 0x17, "sections_map2_id"),
+            (24, 0x18, "sections_map_id"),
+            (25, 0x19, "sections_map_size_uncomp"),
+            (26, 0x1a, "sections_map_crc_comp"),
+            (27, 0x1b, "sections_map_correction"),
+            (28, 0x1c, "sections_map_crc_seed"),
+            (29, 0x1d, "stream_version"),
+            (30, 0x1e, "crc_seed"),
+            (31, 0x1f, "crc_seed_encoded"),
+            (32, 0x20, "random_seed"),
+            (33, 0x21, "header_crc"),
+        ];
+        for (idx, value, name) in expected {
+            let off = idx * 8;
+            assert_eq!(
+                &bytes[off..off + 8],
+                &value.to_le_bytes(),
+                "field {name} at offset {off:#x} did not match LibreDWG's dwg.h ordering"
+            );
+        }
     }
 }

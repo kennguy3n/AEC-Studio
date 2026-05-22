@@ -204,11 +204,21 @@ pub fn system_page_on_disk_size(payload_len: usize, repeat_count: i64) -> DwgRes
 /// `(payload_len, repeat_count)` pair — that consistency is what
 /// `parse_r2007`'s bounds check relies on.
 fn compute_page_size(payload_len: usize, repeat_count: i64) -> DwgResult<usize> {
-    // repeat_count is validated by the callers (>= 1) before we get
-    // here, so the `as usize` cast is numerically safe. We still
-    // checked_mul through every step to defeat adversarial
-    // `payload_len` near `usize::MAX / 2`.
-    let repeat = repeat_count as usize;
+    // `repeat_count` arrives as `i64` because that is how LibreDWG
+    // stores it in the file header. Callers validate `>= 1` but not
+    // an upper bound. `usize::try_from` rejects negatives and (on
+    // 32-bit targets) values above `usize::MAX` so we cannot wrap
+    // into a small positive that would slip past the checked_mul
+    // guards below. On 64-bit targets the conversion is always
+    // lossless; we route through `try_from` regardless to keep the
+    // contract identical across pointer widths. The downstream
+    // `checked_mul`s then defeat adversarial `payload_len` near
+    // `usize::MAX / 2`.
+    let repeat = usize::try_from(repeat_count).map_err(|_| {
+        DwgError::InternalInvariant(format!(
+            "system_page math: repeat_count {repeat_count} does not fit in usize on this target"
+        ))
+    })?;
     // Matches LibreDWG `read_system_page` line 619:
     //     pesize = ((size_comp + 7) & ~7) * repeat_count;
     // We split it in two so each overflow gets its own typed error,
@@ -405,6 +415,27 @@ mod tests {
         // the multiplication.
         let err = system_page_on_disk_size(usize::MAX / 4, i64::MAX);
         assert!(err.is_err());
+    }
+
+    /// Defense-in-depth: even though `system_page_on_disk_size`
+    /// already validates `repeat_count >= 1`, an attacker-controlled
+    /// `i64` value above `usize::MAX` (only reachable on 32-bit
+    /// targets) would, with the old `repeat_count as usize` cast,
+    /// truncate to a small positive value and slip past the
+    /// `checked_mul` guard further down. Pin the corrected
+    /// `usize::try_from` rejection so a future contributor cannot
+    /// quietly switch back to the truncating cast.
+    #[test]
+    fn compute_page_size_rejects_repeat_count_that_overflows_usize() {
+        // i64::MAX fits in u64 but not in u32. On 32-bit targets the
+        // try_from must reject it; on 64-bit it would otherwise be
+        // accepted, but the subsequent `checked_mul(pesize_aligned)`
+        // must catch the resulting overflow. Either way the function
+        // must return Err rather than wrap silently.
+        let err = system_page_on_disk_size(8, i64::MAX);
+        assert!(err.is_err());
+        let err = system_page_on_disk_size(8, i64::MIN);
+        assert!(err.is_err(), "negative i64 must be rejected by try_from");
     }
 
     #[test]
