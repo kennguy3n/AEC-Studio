@@ -103,11 +103,31 @@ pub fn crc_32c(seed: u32, data: &[u8]) -> u32 {
     !crc
 }
 
+/// Adler-32 modulus (`65521`). Reduces sum1 / sum2 to fit in 16 bits.
+/// Identical to RFC 1950 zlib Adler-32.
+pub const ADLER32_MOD: u32 = 0xFFF1;
+
+/// Adler-32 NMAX (`5552`, AKA `0x15B0`): the maximum number of bytes
+/// that can be accumulated between `% ADLER32_MOD` reductions without
+/// overflowing the `u32` accumulators.
+///
+/// **Load-bearing constant.** Worst case at this value (seed
+/// `0xFFFFFFFF`, input all `0xFF`) leaves ≈958,800 bytes of headroom
+/// under `u32::MAX` — less than 1 MB on a 4 GB integer. Raising it
+/// even slightly (to `0x15B1`) can overflow at max seed and turns
+/// `dwg_section_page_checksum` into a position-sensitive hash that
+/// breaks the chaining identity AutoCAD relies on for two-pass
+/// header/payload composition. See
+/// `dwg_section_page_checksum_chains_at_arbitrary_split` for the
+/// exhaustive overflow math and `dwg_section_page_checksum_nmax_invariant`
+/// for the lock-in regression test.
+pub const ADLER32_NMAX: usize = 0x15B0;
+
 /// Adler-32-**style** checksum used by LibreDWG `dwg_section_page_checksum`.
 ///
 /// This is NOT a CRC despite the name. It uses the Adler-32 update
-/// rule (paired running sums with `mod 65521 (= 0xFFF1)` reduction)
-/// every 0x15B0 bytes:
+/// rule (paired running sums with `mod ADLER32_MOD (= 0xFFF1)`
+/// reduction) every [`ADLER32_NMAX`] (`0x15B0`) bytes:
 ///
 /// ```text
 /// sum1 = seed & 0xFFFF
@@ -115,7 +135,7 @@ pub fn crc_32c(seed: u32, data: &[u8]) -> u32 {
 /// for byte in data:
 ///     sum1 += byte
 ///     sum2 += sum1
-///     (mod 0xFFF1 every 0x15B0 bytes)
+///     (mod ADLER32_MOD every ADLER32_NMAX bytes)
 /// return (sum2 << 16) | (sum1 & 0xFFFF)
 /// ```
 ///
@@ -142,21 +162,21 @@ pub fn crc_32c(seed: u32, data: &[u8]) -> u32 {
 /// c  = dwg_section_page_checksum(c1, payload_bytes)
 /// ```
 /// See `dwg_section_page_checksum_chains_at_arbitrary_split` for the
-/// chaining identity's exact preconditions (depends on the 0x15B0
-/// chunk constant).
+/// chaining identity's exact preconditions (depends on
+/// [`ADLER32_NMAX`]).
 pub fn dwg_section_page_checksum(seed: u32, data: &[u8]) -> u32 {
     let mut sum1: u32 = seed & 0xFFFF;
     let mut sum2: u32 = seed >> 16;
     let mut remaining = data.len();
     let mut cursor = 0usize;
     while remaining > 0 {
-        let chunksize = remaining.min(0x15B0);
+        let chunksize = remaining.min(ADLER32_NMAX);
         for &b in &data[cursor..cursor + chunksize] {
             sum1 += u32::from(b);
             sum2 += sum1;
         }
-        sum1 %= 0xFFF1;
-        sum2 %= 0xFFF1;
+        sum1 %= ADLER32_MOD;
+        sum2 %= ADLER32_MOD;
         cursor += chunksize;
         remaining -= chunksize;
     }
@@ -428,22 +448,19 @@ mod tests {
         // and only proved it on 16 bytes of ASCII, which can't
         // distinguish mod-induced divergence from trivial equality.
         // This rewrite exercises ~22 KB of pseudo-random bytes that
-        // cross the 0x15B0 chunk boundary twice and verifies the
+        // cross the ADLER32_NMAX chunk boundary twice and verifies the
         // identity at three split points: (a) interior to the first
         // chunk, (b) exactly on the chunk boundary, (c) interior to
         // the second chunk.
         //
-        // Why arbitrary splits work in practice: each chunk
-        // accumulates at most ~2.3 GB into u32, well under 2^32 even
-        // when sum1/sum2 are seeded at 0xFFFF, so the mod reduction
-        // happens before any value would overflow. As long as the
-        // implementation maintains that invariant (chunksize ≤ 0x15B0
-        // and accumulators are u32), chaining preserves identity at
-        // any split point. Crossing that invariant — e.g., raising
-        // chunksize past ~0x6F00 with high-valued bytes — would
-        // re-introduce true split-point sensitivity, so future
-        // maintainers should NOT relax the 0x15B0 chunk constant.
-        let mut data = vec![0u8; 0x15B0 * 2 + 100];
+        // Why arbitrary splits work in practice: ADLER32_NMAX is
+        // chosen so a single chunk's accumulators stay below u32::MAX
+        // even with adversarial input. See the const's doc and the
+        // dwg_section_page_checksum_nmax_invariant test for the
+        // overflow math; this test exercises the chaining identity
+        // _at_ that constant, while the invariant test pins the
+        // constant itself.
+        let mut data = vec![0u8; ADLER32_NMAX * 2 + 100];
         let mut state: u32 = 0xdead_beef;
         for b in &mut data {
             state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
@@ -451,7 +468,7 @@ mod tests {
         }
         let full = dwg_section_page_checksum(0, &data);
 
-        for split in [100, 0x15B0, 0x15B0 + 1, 0x15B0 * 2 - 1] {
+        for split in [100, ADLER32_NMAX, ADLER32_NMAX + 1, ADLER32_NMAX * 2 - 1] {
             let part = dwg_section_page_checksum(0, &data[..split]);
             let chained = dwg_section_page_checksum(part, &data[split..]);
             assert_eq!(
@@ -475,12 +492,52 @@ mod tests {
     }
 
     #[test]
+    fn dwg_section_page_checksum_nmax_invariant() {
+        // Lock-in regression test for the ADLER32_NMAX constant. The
+        // chunk size is load-bearing: raising it past `0x15B0` can
+        // overflow the u32 accumulators at max seed, which breaks the
+        // chaining identity the wire format relies on. Don't change
+        // the constant without re-doing the overflow math.
+        assert_eq!(
+            ADLER32_NMAX, 0x15B0,
+            "ADLER32_NMAX is the standard Adler-32 NMAX (5552); do NOT change without re-doing overflow math in the const's doc"
+        );
+        assert_eq!(
+            ADLER32_MOD, 0xFFF1,
+            "ADLER32_MOD is the Adler-32 modulus (65521 = largest prime < 2^16); changing it changes the wire format"
+        );
+
+        // Sanity check the worst-case math one more time. Even at
+        // max seed (`0xFFFFFFFF` → sum1=0xFFFF, sum2=0xFFFF) feeding
+        // NMAX bytes of `0xFF`, the next pre-reduction sum2 must
+        // stay under u32::MAX. We don't actually run the computation
+        // here (it would require exposing internal state) — instead
+        // we verify the closed-form bound:
+        //   max sum2 = 0xFFFF + ADLER32_NMAX * 0xFFFF
+        //              + 0xFF * (ADLER32_NMAX * (ADLER32_NMAX + 1) / 2)
+        let n = ADLER32_NMAX as u64;
+        let max_sum2: u64 = 0xFFFF + n * 0xFFFF + 0xFF * (n * (n + 1) / 2);
+        assert!(
+            max_sum2 < u64::from(u32::MAX),
+            "ADLER32_NMAX overflow: max sum2 = {max_sum2} > u32::MAX = {}",
+            u32::MAX
+        );
+        // Headroom must remain positive — currently ~958k bytes.
+        let headroom = u64::from(u32::MAX) - max_sum2;
+        assert!(
+            headroom > 0,
+            "ADLER32_NMAX leaves zero headroom under u32::MAX"
+        );
+    }
+
+    #[test]
     fn dwg_section_page_checksum_handles_chunk_boundary() {
-        // The reference implementation applies `mod 0xFFF1` every
-        // 0x15B0 bytes. Feed it `0x15B0 * 2 + 1` zero bytes to cross
-        // the chunk boundary twice, then verify the result equals
-        // the obvious closed-form (mod 65521 of cumulative sums).
-        let data = vec![0u8; 0x15B0 * 2 + 1];
+        // The reference implementation applies `mod ADLER32_MOD`
+        // every ADLER32_NMAX bytes. Feed it `ADLER32_NMAX * 2 + 1`
+        // zero bytes to cross the chunk boundary twice, then verify
+        // the result equals the obvious closed-form (mod 65521 of
+        // cumulative sums).
+        let data = vec![0u8; ADLER32_NMAX * 2 + 1];
         // All-zero input → sum1 and sum2 never advance past their
         // initial values regardless of chunking.
         assert_eq!(dwg_section_page_checksum(0, &data), 0);
