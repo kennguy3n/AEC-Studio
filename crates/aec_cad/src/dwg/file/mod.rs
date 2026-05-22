@@ -31,10 +31,12 @@ pub mod header_vars;
 pub mod object_map;
 pub mod pages;
 pub mod r2000_layout;
+pub mod r2004_layout;
 pub mod sections;
 pub mod sentinels;
 pub mod system_section;
 
 pub use header::FileHeader;
 pub use r2000_layout::{assemble_r2000, parse_r2000, R2000File, R2000FileParts, R2000Object};
+pub use r2004_layout::{assemble_r2004, parse_r2004, R2004File, R2004FileParts};
 pub use sections::{SectionId, SectionLocator};

@@ -28,16 +28,12 @@ impl<'a> DwgReader<'a> {
     pub fn into_document(self) -> DwgResult<DxfDocument> {
         match self.version {
             Version::R12 => R12Reader::new(self.bytes)?.into_document(),
-            Version::R14 | Version::R2000 => read_modern(self.bytes),
-            other => Err(DwgError::UnsupportedInVersion {
-                version: other,
-                what: format!(
-                    "{other:?} decoding requires the R2004+ page system (LZ77 + system \
-                     sections + page descriptors), the R2007 UTF-16 string switch, \
-                     R2010+ per-version object-table deltas, and (R2018) encrypted \
-                     handle pages — these are delivered by subsequent commits in this PR"
-                ),
-            }),
+            v if v.is_modern() => read_modern(self.bytes),
+            // is_modern() covers R14 and everything above; R12 is
+            // handled by the explicit arm above. The match is
+            // exhaustive — this arm is unreachable.
+            #[allow(unreachable_patterns)]
+            other => unreachable!("non-modern, non-R12 version slipped past dispatch: {other:?}"),
         }
     }
 }
@@ -103,19 +99,59 @@ mod tests {
     }
 
     #[test]
-    fn writer_rejects_versions_not_yet_wired() {
-        let doc = DxfDocument::new();
-        for v in [
-            Version::R2004,
-            Version::R2007,
-            Version::R2010,
-            Version::R2013,
-            Version::R2018,
-        ] {
-            assert!(matches!(
-                DwgWriter::write(&doc, v),
-                Err(DwgError::UnsupportedInVersion { .. })
-            ));
+    fn line_round_trips_through_dwg_writer_reader_r2004() {
+        let doc = one_line_document();
+        let bytes = DwgWriter::write(&doc, Version::R2004).unwrap();
+        let reader = DwgReader::new(&bytes).unwrap();
+        assert_eq!(reader.version, Version::R2004);
+        let back = reader.into_document().unwrap();
+        assert_eq!(back.entities.len(), 1);
+        match &back.entities[0] {
+            DxfEntity::Line(l) => {
+                assert_eq!(l.start, [0.0, 0.0, 0.0]);
+                assert_eq!(l.end, [10.0, 5.0, 0.0]);
+            }
+            other => panic!("expected Line, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn line_round_trips_through_dwg_writer_reader_r2007() {
+        let doc = one_line_document();
+        let bytes = DwgWriter::write(&doc, Version::R2007).unwrap();
+        let reader = DwgReader::new(&bytes).unwrap();
+        assert_eq!(reader.version, Version::R2007);
+        let back = reader.into_document().unwrap();
+        assert_eq!(back.entities.len(), 1);
+    }
+
+    #[test]
+    fn line_round_trips_through_dwg_writer_reader_r2010() {
+        let doc = one_line_document();
+        let bytes = DwgWriter::write(&doc, Version::R2010).unwrap();
+        let reader = DwgReader::new(&bytes).unwrap();
+        assert_eq!(reader.version, Version::R2010);
+        let back = reader.into_document().unwrap();
+        assert_eq!(back.entities.len(), 1);
+    }
+
+    #[test]
+    fn line_round_trips_through_dwg_writer_reader_r2013() {
+        let doc = one_line_document();
+        let bytes = DwgWriter::write(&doc, Version::R2013).unwrap();
+        let reader = DwgReader::new(&bytes).unwrap();
+        assert_eq!(reader.version, Version::R2013);
+        let back = reader.into_document().unwrap();
+        assert_eq!(back.entities.len(), 1);
+    }
+
+    #[test]
+    fn line_round_trips_through_dwg_writer_reader_r2018() {
+        let doc = one_line_document();
+        let bytes = DwgWriter::write(&doc, Version::R2018).unwrap();
+        let reader = DwgReader::new(&bytes).unwrap();
+        assert_eq!(reader.version, Version::R2018);
+        let back = reader.into_document().unwrap();
+        assert_eq!(back.entities.len(), 1);
     }
 }

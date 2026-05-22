@@ -31,6 +31,7 @@ use crate::dwg::error::{DwgError, DwgResult};
 use crate::dwg::file::classes::ClassesSection;
 use crate::dwg::file::header_vars::HeaderVarsSection;
 use crate::dwg::file::r2000_layout::{assemble_r2000, parse_r2000, R2000FileParts, R2000Object};
+use crate::dwg::file::r2004_layout::{assemble_r2004, parse_r2004, R2004FileParts};
 use crate::dwg::version::Version;
 use crate::dxf::{DxfDocument, DxfEntity};
 
@@ -50,12 +51,21 @@ const LAYER_ZERO_HANDLE: u64 = 0x14;
 /// of every entity in model space). Same caveat as above.
 const MODEL_SPACE_HANDLE: u64 = 0x1f;
 
-/// Write a [`DxfDocument`] to R14/R2000 wire bytes.
+/// Write a [`DxfDocument`] to modern (R14 / R2000 / R2004+) wire
+/// bytes.
+///
+/// Per-version dispatch:
+/// - R14, R2000 → flat section-locator layout (`r2000_layout`)
+/// - R2004+ → paged system sections with LZ77-compressed data pages
+///   and the encrypted R2004 file header (`r2004_layout`)
 pub fn write_modern(doc: &DxfDocument, version: Version) -> DwgResult<Vec<u8>> {
-    if !matches!(version, Version::R14 | Version::R2000) {
+    if !version.is_modern() {
         return Err(DwgError::UnsupportedInVersion {
             version,
-            what: format!("modern::write_modern only handles R14/R2000; got {version:?}"),
+            what: format!(
+                "modern::write_modern only handles R14+; got {version:?} \
+                 (R12 uses the fixed-record codepath under dwg::r12)"
+            ),
         });
     }
 
@@ -66,26 +76,60 @@ pub fn write_modern(doc: &DxfDocument, version: Version) -> DwgResult<Vec<u8>> {
         records.push(record);
     }
 
-    let parts = R2000FileParts {
-        version,
-        header_vars: HeaderVarsSection::minimal(version),
-        classes: ClassesSection::empty(version),
-        objects: records,
-    };
-    assemble_r2000(parts)
+    if version.has_paged_system_sections() {
+        let parts = R2004FileParts {
+            version,
+            header_vars: HeaderVarsSection::minimal(version),
+            classes: ClassesSection::empty(version),
+            objects: records,
+        };
+        assemble_r2004(parts)
+    } else {
+        let parts = R2000FileParts {
+            version,
+            header_vars: HeaderVarsSection::minimal(version),
+            classes: ClassesSection::empty(version),
+            objects: records,
+        };
+        assemble_r2000(parts)
+    }
 }
 
-/// Read a [`DxfDocument`] from R14/R2000 wire bytes.
+/// Read a [`DxfDocument`] from modern (R14 / R2000 / R2004+) wire
+/// bytes. Dispatches on the file's signature; the per-version
+/// section format details stay encapsulated inside
+/// `parse_r2000` / `parse_r2004`.
 pub fn read_modern(bytes: &[u8]) -> DwgResult<DxfDocument> {
-    let file = parse_r2000(bytes)?;
+    let version = crate::dwg::version::detect(bytes).ok_or({
+        DwgError::InvalidSignature({
+            let mut s = [0u8; 6];
+            let n = bytes.len().min(6);
+            s[..n].copy_from_slice(&bytes[..n]);
+            s
+        })
+    })?;
+    let (decoded_version, objects) = if version.has_paged_system_sections() {
+        let file = parse_r2004(bytes)?;
+        (file.version, file.objects)
+    } else if matches!(version, Version::R14 | Version::R2000) {
+        let file = parse_r2000(bytes)?;
+        (file.version, file.objects)
+    } else {
+        return Err(DwgError::UnsupportedInVersion {
+            version,
+            what: "modern::read_modern only handles R14+".into(),
+        });
+    };
+
     let mut doc = DxfDocument::new();
-    for object in &file.objects {
-        // parse_r2000 only peeks the structural header on R14/R2000 —
-        // for the per-type payload we re-decode via decode_with on
-        // the stored raw bytes. The per-type decoder consumes exactly
-        // the payload bits and leaves the cursor at the handle stream,
-        // so the framing inside decode_with stays consistent.
-        let entity = record_to_entity(file.version, object)?;
+    for object in &objects {
+        // The on-disk reader (parse_r2000 / parse_r2004) only peeks
+        // each object's structural header. For the per-type payload
+        // we re-decode via decode_with on the stored raw bytes — the
+        // per-type decoder consumes exactly the payload bits and
+        // leaves the cursor at the handle stream, so the framing
+        // inside decode_with stays consistent.
+        let entity = record_to_entity(decoded_version, object)?;
         if let Some(e) = entity {
             doc.entities.push(e);
         }
