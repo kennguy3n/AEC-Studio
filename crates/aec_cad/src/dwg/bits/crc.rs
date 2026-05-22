@@ -112,15 +112,24 @@ pub const ADLER32_MOD: u32 = 0xFFF1;
 /// overflowing the `u32` accumulators.
 ///
 /// **Load-bearing constant.** Worst case at this value (seed
-/// `0xFFFFFFFF`, input all `0xFF`) leaves ≈958,800 bytes of headroom
-/// under `u32::MAX` — less than 1 MB on a 4 GB integer. Raising it
-/// even slightly (to `0x15B1`) can overflow at max seed and turns
-/// `dwg_section_page_checksum` into a position-sensitive hash that
-/// breaks the chaining identity AutoCAD relies on for two-pass
-/// header/payload composition. See
-/// `dwg_section_page_checksum_chains_at_arbitrary_split` for the
-/// exhaustive overflow math and `dwg_section_page_checksum_nmax_invariant`
-/// for the lock-in regression test.
+/// `0xFFFFFFFF`, input all `0xFF`) leaves only ≈193,800 bytes of
+/// headroom under `u32::MAX` (less than 200 KB on a 4 GB integer):
+///
+/// ```text
+/// sum1_final = 0xFFFF + 5552 × 0xFF = 1,481,295
+/// sum2_final = 0xFFFF + 5552 × 0xFFFF + 0xFF × (5552 × 5553 / 2)
+///            = 65,535 + 363,850,320 + 3,930,857,640
+///            = 4,294,773,495
+/// headroom   = u32::MAX - sum2_final = 193,800
+/// ```
+///
+/// Raising it even slightly (to `0x15B1`) can overflow at max seed
+/// and turns `dwg_section_page_checksum` into a position-sensitive
+/// hash that breaks the chaining identity AutoCAD relies on for the
+/// two-pass header/payload composition. See
+/// `dwg_section_page_checksum_nmax_invariant` for the lock-in
+/// regression test (re-derives the worst case in u64 and asserts it
+/// stays below `u32::MAX`).
 pub const ADLER32_NMAX: usize = 0x15B0;
 
 /// Adler-32-**style** checksum used by LibreDWG `dwg_section_page_checksum`.
@@ -522,8 +531,15 @@ mod tests {
             "ADLER32_NMAX overflow: max sum2 = {max_sum2} > u32::MAX = {}",
             u32::MAX
         );
-        // Headroom must remain positive — currently ~958k bytes.
+        // Headroom must remain positive — currently 193,800 bytes
+        // under u32::MAX. Tighter than the standard Adler-32 NMAX
+        // derivation assumes because we don't pre-reduce the seed.
         let headroom = u64::from(u32::MAX) - max_sum2;
+        assert_eq!(
+            headroom, 193_800,
+            "ADLER32_NMAX worst-case headroom changed: was 193,800, now {headroom}. \
+             Re-do the overflow analysis in the const's doc comment if this assertion fails."
+        );
         assert!(
             headroom > 0,
             "ADLER32_NMAX leaves zero headroom under u32::MAX"
