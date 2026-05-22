@@ -62,6 +62,13 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
     let doc = fixture_doc();
+    // R2007 currently cannot write entities (assemble_r2007 does not
+    // emit entity-bearing data pages yet -- PR-C / phase 6). The
+    // writer returns Err(UnsupportedInVersion) for any R2007 doc
+    // with non-empty `entities`, so we emit an explicitly empty
+    // document for the R2007 fixture instead of relying on a
+    // silent-drop. Other versions get the standard 3-entity fixture.
+    let empty_doc = DxfDocument::new();
     let versions = [
         ("r12", Version::R12),
         ("r14", Version::R14),
@@ -73,7 +80,12 @@ fn main() -> ExitCode {
         ("r2018", Version::R2018),
     ];
     for (name, v) in versions {
-        let bytes = match DwgWriter::write(&doc, v) {
+        let doc_for_v = if v == Version::R2007 {
+            &empty_doc
+        } else {
+            &doc
+        };
+        let bytes = match DwgWriter::write(doc_for_v, v) {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("write failed for {name}: {e}");

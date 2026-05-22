@@ -122,16 +122,41 @@ mod tests {
         // header + sections-map but no entity-bearing data pages.
         // Entity round-trip lands in a follow-up commit; for now
         // we assert the file is at least parseable end-to-end
-        // (signature detected, R2007 layout walked).
-        let doc = one_line_document();
+        // (signature detected, R2007 layout walked) when written
+        // from an explicitly empty document. The non-empty case is
+        // rejected at write time with `UnsupportedInVersion` -- see
+        // `r2007_writer_rejects_documents_with_entities` below.
+        let doc = DxfDocument::new();
         let bytes = DwgWriter::write(&doc, Version::R2007).unwrap();
         let reader = DwgReader::new(&bytes).unwrap();
         assert_eq!(reader.version, Version::R2007);
         let back = reader.into_document().unwrap();
-        // Entity content drops in this slice; the in-tree pipeline
-        // simply records that the writer/reader handshake stays
-        // self-consistent until data pages land.
         assert_eq!(back.entities.len(), 0);
+    }
+
+    #[test]
+    fn r2007_writer_rejects_documents_with_entities() {
+        // Until `assemble_r2007` emits entity-bearing data pages,
+        // any caller that hands `write_modern` a non-empty document
+        // for Version::R2007 gets a clean typed error rather than a
+        // silent eprintln + zero-entity output. This pins the
+        // contract so a future refactor that accidentally restores
+        // the silent-drop will fail at test time.
+        use crate::dwg::error::DwgError;
+
+        let doc = one_line_document();
+        let err = DwgWriter::write(&doc, Version::R2007)
+            .expect_err("R2007 + entities must be rejected at write time");
+        match err {
+            DwgError::UnsupportedInVersion { version, what } => {
+                assert_eq!(version, Version::R2007);
+                assert!(
+                    what.contains("entity record") && what.contains("R2007"),
+                    "error message should name the failure scope: {what}"
+                );
+            }
+            other => panic!("expected UnsupportedInVersion for R2007 + entities, got {other:?}"),
+        }
     }
 
     #[test]

@@ -39,6 +39,18 @@ fn canonical_doc() -> DxfDocument {
     doc
 }
 
+/// R2007 currently cannot write entities (assemble_r2007 does not
+/// emit entity-bearing data pages; PR-C / phase 6 of the R2007
+/// roadmap is the follow-up). `write_modern` returns
+/// `Err(UnsupportedInVersion)` for any R2007 doc with non-empty
+/// `entities`. The R2007 golden therefore exercises the same wire
+/// layout (file header + classes + handle map + zero data pages)
+/// using an explicitly empty document, instead of relying on the
+/// previous silent-drop behavior.
+fn r2007_doc() -> DxfDocument {
+    DxfDocument::new()
+}
+
 /// (length_in_bytes, blake3_hex) tuple for one version.
 struct Golden {
     bytes: usize,
@@ -85,7 +97,15 @@ fn golden(v: DwgVersion) -> Golden {
 }
 
 fn check_version(v: DwgVersion) {
-    let doc = canonical_doc();
+    // R2007 cannot yet round-trip entities through write_modern —
+    // pass an empty doc so the test exercises the file/sections
+    // layer without tripping the new `UnsupportedInVersion` guard
+    // in `write_modern`.
+    let doc = if v == DwgVersion::R2007 {
+        r2007_doc()
+    } else {
+        canonical_doc()
+    };
 
     let bytes = DwgWriter::write(&doc, v)
         .unwrap_or_else(|e| panic!("DwgWriter::write failed for {v:?}: {e:?}"));
@@ -130,9 +150,12 @@ fn check_version(v: DwgVersion) {
     if v == DwgVersion::R2007 {
         // PR-C in-flight: R2007 now goes through `assemble_r2007`
         // which emits a valid file header + sections-map but no
-        // entity-bearing data pages yet. The entity round-trip is
-        // restored once data-page emission lands later in this PR.
-        assert_eq!(back.entities.len(), 0, "{v:?} placeholder slice");
+        // entity-bearing data pages yet. The encoder now rejects
+        // entities outright (UnsupportedInVersion); the round-trip
+        // therefore exercises the empty-document path and recovers
+        // zero entities. Entity round-trip will be restored once
+        // data-page emission lands later in the R2007 roadmap.
+        assert_eq!(back.entities.len(), 0, "{v:?} empty-doc round-trip");
         return;
     }
     assert_eq!(back.entities.len(), 1, "{v:?} round-trip lost the line");
