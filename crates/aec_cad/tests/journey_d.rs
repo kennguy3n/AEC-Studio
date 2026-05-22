@@ -13,6 +13,7 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use aec_cad::command_line::{CommandKind, CommandParser};
+use aec_cad::dwg::{DwgReader, DwgVersion, DwgWriter};
 use aec_cad::dxf::{
     DxfArc, DxfBlockRecord, DxfCircle, DxfDimStyle, DxfDimension, DxfDimensionKind, DxfDocument,
     DxfEllipse, DxfEntity, DxfHatch, DxfHatchLoop, DxfInsert, DxfLine, DxfPolyline,
@@ -358,4 +359,85 @@ fn drafter_journey_end_to_end() {
             "entity variant matches"
         );
     }
+
+    // ---------------------------------------------------------------
+    // 7. Native DWG roundtrip — every version family the codec
+    //    supports (R12 fixed-record, modern flat-locator, modern
+    //    paged-with-LZ77, modern encrypted-handle-pages) must read
+    //    back the entities they encoded.
+    //
+    //    The DWG codec today bridges the entity kinds that exist
+    //    on every supported version (LINE, ARC, CIRCLE, TEXT,
+    //    INSERT, POLYLINE). ELLIPSE / SPLINE / HATCH / DIMENSION
+    //    are deferred (modern supports ELLIPSE; R12 does not), so we
+    //    project the drafted document down to that common subset
+    //    for the cross-version journey. The DXF roundtrip above
+    //    already proves the deferred entity kinds survive the
+    //    canonical text path; this section proves the binary
+    //    codec's per-version dispatch works.
+    // ---------------------------------------------------------------
+    let dwg_subset = drafter_dwg_subset(&doc);
+    let expected_kinds: Vec<std::mem::Discriminant<DxfEntity>> = dwg_subset
+        .entities
+        .iter()
+        .map(std::mem::discriminant)
+        .collect();
+
+    for v in [DwgVersion::R12, DwgVersion::R2010, DwgVersion::R2018] {
+        let bytes = DwgWriter::write(&dwg_subset, v)
+            .unwrap_or_else(|e| panic!("DWG write failed for {v:?}: {e:?}"));
+        assert!(
+            !bytes.is_empty(),
+            "DWG writer for {v:?} produced empty output"
+        );
+
+        let reader = DwgReader::new(&bytes)
+            .unwrap_or_else(|e| panic!("DWG read header failed for {v:?}: {e:?}"));
+        assert_eq!(reader.version, v, "version signature dispatch for {v:?}");
+
+        let back = reader
+            .into_document()
+            .unwrap_or_else(|e| panic!("DWG into_document failed for {v:?}: {e:?}"));
+        assert_eq!(
+            back.entities.len(),
+            dwg_subset.entities.len(),
+            "DWG roundtrip entity count for {v:?}"
+        );
+        let round_kinds: Vec<std::mem::Discriminant<DxfEntity>> =
+            back.entities.iter().map(std::mem::discriminant).collect();
+        assert_eq!(
+            round_kinds, expected_kinds,
+            "DWG roundtrip preserves entity variants for {v:?}"
+        );
+    }
+}
+
+/// Subset of the drafter's drawing whose entity kinds the native DWG
+/// codec round-trips across every supported version. Modern (R14+)
+/// adds ELLIPSE to this set; R12 does not, so we keep the lowest
+/// common denominator here.
+fn drafter_dwg_subset(source: &DxfDocument) -> DxfDocument {
+    let mut doc = DxfDocument::new();
+    for layer in source.layers.iter() {
+        doc.layers.upsert(layer.clone());
+    }
+    // INSERT references resolve through block_records during encode,
+    // so the subset must carry over the relevant table entries even
+    // though the bridged DxfDocument doesn't include the block bodies.
+    doc.block_records.clone_from(&source.block_records);
+    for entity in &source.entities {
+        match entity {
+            DxfEntity::Line(_)
+            | DxfEntity::Arc(_)
+            | DxfEntity::Circle(_)
+            | DxfEntity::Text(_)
+            | DxfEntity::Insert(_)
+            | DxfEntity::Polyline(_) => doc.push(entity.clone()),
+            DxfEntity::Ellipse(_)
+            | DxfEntity::Spline(_)
+            | DxfEntity::Hatch(_)
+            | DxfEntity::Dimension(_) => { /* not yet bridged across all 8 versions */ }
+        }
+    }
+    doc
 }

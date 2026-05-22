@@ -106,6 +106,7 @@ version = "0.1.0"
 dependencies = [
  "aec_core",
  "bitflags 2.11.1",
+ "blake3",
  "serde",
  "serde_json",
  "tempfile",

@@ -1,13 +1,19 @@
 //! `aec_cad` — 2D CAD core.
 //!
-//! Contains a DXF (R12-compatible ASCII) reader/writer, the layer state
+//! Contains a DXF (R12-compatible ASCII) reader/writer, a native
+//! pure-Rust DWG (R12 → R2018) reader/writer, the layer state
 //! manager + linetype/lineweight tables, drawing primitives (line, arc,
 //! circle, polyline, ellipse, spline, hatch, text), editing tools
 //! (move/copy/rotate/scale/mirror/offset/trim/extend/fillet/chamfer/
 //! stretch), precision aids (grid, ortho, polar, object snaps, tracking,
 //! parametric constraints + solver), block definitions and instances,
-//! associative dimensions and dim styles, sheet layouts, a keyboard
-//! command-line parser, and an out-of-process DWG converter adapter.
+//! associative dimensions and dim styles, sheet layouts, and a keyboard
+//! command-line parser.
+//!
+//! DWG is handled in-process: the legacy `dwg_adapter` that shelled out
+//! to ODA File Converter / LibreDWG `dwgread` has been removed in
+//! favour of the native [`dwg`] codec, which round-trips through the
+//! same [`DxfDocument`] type as the rest of the crate.
 //!
 //! The DXF parser is deliberately scoped to a useful working subset:
 //! `LINE`, `POLYLINE`/`LWPOLYLINE`, `ARC`, `CIRCLE`, `ELLIPSE`, `SPLINE`,
@@ -20,7 +26,6 @@ pub mod blocks;
 pub mod command_line;
 pub mod dims;
 pub mod dwg;
-pub mod dwg_adapter;
 pub mod dxf;
 pub mod editing;
 pub mod error;

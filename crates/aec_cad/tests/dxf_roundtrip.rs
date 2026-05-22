@@ -19,6 +19,7 @@
 
 use std::time::Instant;
 
+use aec_cad::dwg::{DwgReader, DwgVersion, DwgWriter};
 use aec_cad::dxf::{
     DxfArc, DxfBlockRecord, DxfCircle, DxfDimStyle, DxfDimension, DxfDimensionKind, DxfDocument,
     DxfEllipse, DxfEntity, DxfHatch, DxfHatchLoop, DxfInsert, DxfLine, DxfPolyline,
@@ -308,4 +309,63 @@ fn dxf_roundtrip_handles_ten_thousand_entities_in_under_thirty_seconds() {
         "10k DXF roundtrip should complete in under 30s (took {:?})",
         elapsed
     );
+}
+
+/// Native-DWG companion to the 10k-entity DXF perf test. Every DWG
+/// version family the codec supports gets the same 10k-LINE round-trip
+/// inside the same 30s budget; a regression that turns the encoder
+/// O(n²) — most likely failure mode for paged compression / object-map
+/// page splitting — trips the budget on at least one version.
+fn dwg_ten_thousand_lines_under_thirty_seconds(version: DwgVersion) {
+    let mut doc = DxfDocument::new();
+    let mut wall = Layer::new("A-WALL").unwrap();
+    wall.color = LayerColor(1i16);
+    wall.lineweight = LayerLineweight::from_mm(0.5);
+    doc.layers.upsert(wall);
+
+    for i in 0..10_000 {
+        let x = (i % 100) as f64 * 50.0;
+        let y = (i / 100) as f64 * 50.0;
+        doc.push(DxfEntity::Line(DxfLine {
+            layer: "A-WALL".into(),
+            start: [x, y, 0.0],
+            end: [x + 25.0, y + 25.0, 0.0],
+        }));
+    }
+
+    let t0 = Instant::now();
+    let bytes = DwgWriter::write(&doc, version)
+        .unwrap_or_else(|e| panic!("DWG write failed for {version:?}: {e:?}"));
+    let reader = DwgReader::new(&bytes)
+        .unwrap_or_else(|e| panic!("DWG read header failed for {version:?}: {e:?}"));
+    let reloaded = reader
+        .into_document()
+        .unwrap_or_else(|e| panic!("DWG into_document failed for {version:?}: {e:?}"));
+    let elapsed = t0.elapsed();
+
+    assert_eq!(
+        reloaded.entities.len(),
+        10_000,
+        "10k DWG roundtrip for {version:?} lost entities"
+    );
+    assert!(
+        elapsed.as_secs() < 30,
+        "10k DWG roundtrip for {version:?} should complete in under 30s (took {:?})",
+        elapsed
+    );
+}
+
+#[test]
+fn dwg_roundtrip_handles_ten_thousand_entities_r12() {
+    dwg_ten_thousand_lines_under_thirty_seconds(DwgVersion::R12);
+}
+
+#[test]
+fn dwg_roundtrip_handles_ten_thousand_entities_r2010() {
+    dwg_ten_thousand_lines_under_thirty_seconds(DwgVersion::R2010);
+}
+
+#[test]
+fn dwg_roundtrip_handles_ten_thousand_entities_r2018() {
+    dwg_ten_thousand_lines_under_thirty_seconds(DwgVersion::R2018);
 }
