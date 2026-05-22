@@ -763,10 +763,21 @@ fn r2007_file_from_header(
 /// `header_vars` / `classes` / `objects` until section-content
 /// emission is wired in.
 pub fn parse_r2007(bytes: &[u8], version: Version) -> DwgResult<R2007File> {
-    if !version.uses_utf16_strings() {
+    // Tight version guard, symmetric with `assemble_r2007`. R2010/
+    // R2013/R2018 also pass `uses_utf16_strings()`, but they are
+    // routed through `parse_r2004` in `read_modern` because LibreDWG
+    // decodes them via `decode_R2004`. Accepting them here would
+    // attempt to decode R2004-style structures (file header, paged
+    // sections) as R2007 layout (RS-encoded header at 0x80, pages-
+    // map, sections-map) and produce confusing slice errors deep in
+    // the RS decoder rather than the clean `UnsupportedInVersion`
+    // that `assemble_r2007` surfaces. Narrow the guard to match.
+    if version != Version::R2007 {
         return Err(DwgError::UnsupportedInVersion {
             version,
-            what: format!("parse_r2007 only handles R2007+; got {version:?}"),
+            what: format!(
+                "parse_r2007 only handles R2007 (R2010+/R2018 go through parse_r2004); got {version:?}"
+            ),
         });
     }
     if bytes.len() < (R2007_HEADER_OFFSET + R2007_FILE_HEADER_ON_DISK_SIZE) {
@@ -1175,6 +1186,32 @@ mod tests {
         }
         // Sanity check: R2007 itself is accepted.
         assert!(assemble_r2007(empty_parts(Version::R2007)).is_ok());
+    }
+
+    #[test]
+    fn parse_rejects_non_r2007_version() {
+        // Symmetric with `assemble_rejects_non_r2007_version`. We
+        // build a real R2007 file (the only kind `assemble_r2007`
+        // produces) and then ask `parse_r2007` to interpret it
+        // under each non-R2007 version. The version guard must
+        // reject every one before any structural decoding starts.
+        let bytes = assemble_r2007(empty_parts(Version::R2007)).unwrap();
+        for version in [
+            Version::R12,
+            Version::R14,
+            Version::R2000,
+            Version::R2004,
+            Version::R2010,
+            Version::R2013,
+            Version::R2018,
+        ] {
+            assert!(
+                parse_r2007(&bytes, version).is_err(),
+                "parse_r2007 must reject {version:?} (not the R2007 codepath)"
+            );
+        }
+        // Sanity check: R2007 itself parses cleanly.
+        assert!(parse_r2007(&bytes, Version::R2007).is_ok());
     }
 
     #[test]
