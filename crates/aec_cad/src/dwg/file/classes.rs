@@ -83,13 +83,22 @@ impl ClassesSection {
         // size_in_bytes placeholder (we'll fix once we know it).
         let size_placeholder_off = body.bit_position();
         body.write_rl(0)?;
+        let uses_utf16 = self.version.uses_utf16_strings();
         for c in &self.classes {
             body.write_bs(c.class_number)?;
             // BS in DWG is i32; class.version stored as i32 in our model.
             body.write_bs(c.version)?;
-            body.write_tv(&c.app_name)?;
-            body.write_tv(&c.cpp_class_name)?;
-            body.write_tv(&c.dxf_record_name)?;
+            // R2007+ writes strings as T (UTF-16LE); earlier versions
+            // use TV (CP1252).
+            if uses_utf16 {
+                body.write_t(&c.app_name)?;
+                body.write_t(&c.cpp_class_name)?;
+                body.write_t(&c.dxf_record_name)?;
+            } else {
+                body.write_tv(&c.app_name)?;
+                body.write_tv(&c.cpp_class_name)?;
+                body.write_tv(&c.dxf_record_name)?;
+            }
             body.write_b(c.was_zombie)?;
             body.write_bs(c.item_class_id)?;
         }
@@ -188,7 +197,7 @@ impl ClassesSection {
             // Tentatively decode one record; if it errors, we treat the
             // remaining bits as the trailing RS + padding and stop.
             let snapshot = reader.bit_position();
-            if let Ok(c) = decode_class_record(&mut reader) {
+            if let Ok(c) = decode_class_record(&mut reader, version) {
                 classes.push(c);
             } else {
                 reader.set_bit_position(snapshot)?;
@@ -199,13 +208,20 @@ impl ClassesSection {
     }
 }
 
-fn decode_class_record(r: &mut BitReader<'_>) -> DwgResult<ClassRecord> {
+fn decode_class_record(r: &mut BitReader<'_>, version: Version) -> DwgResult<ClassRecord> {
+    let class_number = r.read_bs()?;
+    let record_version = r.read_bs()?;
+    let (app_name, cpp_class_name, dxf_record_name) = if version.uses_utf16_strings() {
+        (r.read_t()?, r.read_t()?, r.read_t()?)
+    } else {
+        (r.read_tv()?, r.read_tv()?, r.read_tv()?)
+    };
     Ok(ClassRecord {
-        class_number: r.read_bs()?,
-        version: r.read_bs()?,
-        app_name: r.read_tv()?,
-        cpp_class_name: r.read_tv()?,
-        dxf_record_name: r.read_tv()?,
+        class_number,
+        version: record_version,
+        app_name,
+        cpp_class_name,
+        dxf_record_name,
         was_zombie: r.read_b()?,
         item_class_id: r.read_bs()?,
     })
@@ -221,6 +237,67 @@ mod tests {
         let mut buf = Vec::new();
         section.encode(&mut buf).unwrap();
         let parsed = ClassesSection::parse(Version::R2000, &buf, 0).unwrap();
+        assert_eq!(parsed, section);
+    }
+
+    #[test]
+    fn non_empty_section_round_trips_r2000_tv() {
+        let section = ClassesSection {
+            version: Version::R2000,
+            classes: vec![ClassRecord {
+                class_number: 500,
+                version: 0,
+                app_name: "ObjectDBX Classes".into(),
+                cpp_class_name: "AcDbWipeout".into(),
+                dxf_record_name: "WIPEOUT".into(),
+                was_zombie: false,
+                item_class_id: 0x1f2,
+            }],
+        };
+        let mut buf = Vec::new();
+        section.encode(&mut buf).unwrap();
+        let parsed = ClassesSection::parse(Version::R2000, &buf, 0).unwrap();
+        assert_eq!(parsed, section);
+    }
+
+    #[test]
+    fn non_empty_section_round_trips_r2007_utf16() {
+        let section = ClassesSection {
+            version: Version::R2007,
+            classes: vec![ClassRecord {
+                class_number: 500,
+                version: 0,
+                app_name: "ObjectDBX Classes".into(),
+                cpp_class_name: "AcDbWipeout".into(),
+                dxf_record_name: "WIPEOUT".into(),
+                was_zombie: false,
+                item_class_id: 0x1f2,
+            }],
+        };
+        let mut buf = Vec::new();
+        section.encode(&mut buf).unwrap();
+        let parsed = ClassesSection::parse(Version::R2007, &buf, 0).unwrap();
+        assert_eq!(parsed, section);
+    }
+
+    #[test]
+    fn class_record_with_non_ascii_round_trips_r2010_utf16() {
+        // CJK characters require UTF-16 — the CP1252 path would error.
+        let section = ClassesSection {
+            version: Version::R2010,
+            classes: vec![ClassRecord {
+                class_number: 600,
+                version: 1,
+                app_name: "\u{6f22}\u{5b57}App".into(), // 漢字App
+                cpp_class_name: "AcDb\u{571f}Class".into(), // AcDb土Class
+                dxf_record_name: "NONASCII".into(),
+                was_zombie: true,
+                item_class_id: 0x1f3,
+            }],
+        };
+        let mut buf = Vec::new();
+        section.encode(&mut buf).unwrap();
+        let parsed = ClassesSection::parse(Version::R2010, &buf, 0).unwrap();
         assert_eq!(parsed, section);
     }
 

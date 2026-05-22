@@ -286,7 +286,7 @@ fn entity_kind(e: &DxfEntity) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dxf::{DxfArc, DxfCircle, DxfEllipse, DxfLine};
+    use crate::dxf::{DxfArc, DxfCircle, DxfEllipse, DxfInsert, DxfLine, DxfText};
 
     #[test]
     fn empty_document_round_trips_r2000() {
@@ -377,6 +377,81 @@ mod tests {
             }
             other => panic!("expected Arc, got {other:?}"),
         }
+    }
+
+    /// R2007+ swaps strings inside the entity payload from TV (CP1252)
+    /// to T (UTF-16LE). This test feeds a TEXT entity whose `text`
+    /// field contains characters outside the CP1252 set (CJK ideographs)
+    /// through the full DwgWriter/DwgReader pipeline for every R2007+
+    /// version — proving the per-version dispatch actually fires.
+    #[test]
+    fn text_with_non_ascii_round_trips_r2007_through_r2018() {
+        for v in [
+            Version::R2007,
+            Version::R2010,
+            Version::R2013,
+            Version::R2018,
+        ] {
+            let mut doc = DxfDocument::new();
+            doc.push(DxfEntity::Text(DxfText {
+                layer: "0".into(),
+                position: [0.0, 0.0, 0.0],
+                height: 2.5,
+                rotation: 0.0,
+                text: "\u{6f22}\u{5b57}".into(), // 漢字
+            }));
+            let bytes = write_modern(&doc, v).expect("write_modern");
+            let back = read_modern(&bytes).expect("read_modern");
+            assert_eq!(back.entities.len(), 1, "v={v:?}");
+            match &back.entities[0] {
+                DxfEntity::Text(t) => {
+                    assert_eq!(t.text, "\u{6f22}\u{5b57}", "v={v:?}");
+                    assert_eq!(t.height, 2.5, "v={v:?}");
+                }
+                other => panic!("expected Text under {v:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// INSERT carries a block name as a payload-level string. Exercise
+    /// the version dispatch for that too on a R2018 round-trip with a
+    /// non-ASCII block name.
+    #[test]
+    fn insert_with_non_ascii_block_name_round_trips_r2018() {
+        let mut doc = DxfDocument::new();
+        doc.push(DxfEntity::Insert(DxfInsert {
+            layer: "0".into(),
+            block_name: "\u{56fe}\u{5757}-A1".into(), // 图块-A1
+            position: [10.0, 20.0, 0.0],
+            scale: [1.0, 1.0, 1.0],
+            rotation: 0.0,
+        }));
+        let bytes = write_modern(&doc, Version::R2018).expect("write_modern R2018");
+        let back = read_modern(&bytes).expect("read_modern R2018");
+        assert_eq!(back.entities.len(), 1);
+        match &back.entities[0] {
+            DxfEntity::Insert(ins) => {
+                assert_eq!(ins.block_name, "\u{56fe}\u{5757}-A1");
+                assert_eq!(ins.position, [10.0, 20.0, 0.0]);
+            }
+            other => panic!("expected Insert, got {other:?}"),
+        }
+    }
+
+    /// R2000 must still write TV (CP1252). Feeding it a non-CP1252
+    /// string must error rather than corrupt the file silently.
+    #[test]
+    fn text_with_non_ascii_rejects_r2000() {
+        let mut doc = DxfDocument::new();
+        doc.push(DxfEntity::Text(DxfText {
+            layer: "0".into(),
+            position: [0.0, 0.0, 0.0],
+            height: 2.5,
+            rotation: 0.0,
+            text: "\u{6f22}\u{5b57}".into(),
+        }));
+        let err = write_modern(&doc, Version::R2000).unwrap_err();
+        assert!(matches!(err, DwgError::InvalidStringEncoding { .. }));
     }
 
     #[test]
