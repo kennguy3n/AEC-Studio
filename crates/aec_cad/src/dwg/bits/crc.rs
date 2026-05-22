@@ -410,6 +410,20 @@ mod tests {
         // packed identically into the (sum2<<16)|sum1 layout.
         assert_eq!(dwg_section_page_checksum(0, &[]), 0);
         assert_eq!(dwg_section_page_checksum(0x1234_5678, &[]), 0x1234_5678);
+
+        // Non-canonical seed where both halves exceed ADLER32_MOD
+        // (sum1 = 0xFFFF = 65535 > 65521, same for sum2). LibreDWG
+        // never reduces the seed up front — the seed is taken
+        // verbatim and reduction only happens at the end of each
+        // chunk. With empty data there are no chunks, so the seed
+        // round-trips unchanged. Pinning this case is the
+        // counterpart to ADLER32_NMAX's worst-case overflow
+        // analysis, which assumes exactly this `(0xFFFF, 0xFFFF)`
+        // starting state. If anyone ever "helpfully" pre-reduces
+        // the seed in `dwg_section_page_checksum`, this assertion
+        // fails immediately and the overflow analysis becomes
+        // invalid.
+        assert_eq!(dwg_section_page_checksum(0xFFFF_FFFF, &[]), 0xFFFF_FFFF);
     }
 
     #[test]
