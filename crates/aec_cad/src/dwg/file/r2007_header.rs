@@ -102,7 +102,7 @@ pub struct R2007FileHeader {
     /// ID of the secondary pages_map (zero if not used).
     pub pages_map2_id: i64,
     /// Starting address of the Page Map section, RELATIVE to byte
-    /// (0x80 + 0x3d8 + 0x28) = 0x488. The reader does
+    /// (0x80 + 0x3d8 + 0x28) = 0x480. The reader does
     /// `dat->byte = 0x80 + 0x3d8 + 0x28 + pages_map_offset`.
     pub pages_map_offset: i64,
     /// ID of the pages_map page (AutoCAD writes 0).

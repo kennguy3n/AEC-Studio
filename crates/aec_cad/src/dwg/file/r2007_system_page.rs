@@ -84,9 +84,15 @@ pub struct R2007SystemPageOnDisk {
 pub fn encode_system_page(payload: &[u8]) -> R2007SystemPageOnDisk {
     let size_uncomp = payload.len();
     let size_comp = size_uncomp; // stored mode
-    let pesize_unrounded = round_up_8(size_comp);
+                                 // `pesize` is LibreDWG's name for the 8-byte-aligned post-compression
+                                 // payload size that gets fed into the RS encoder. With repeat_count = 1
+                                 // (always, for our writer) the pre-multiplication and post-multiplication
+                                 // values are the same, so we only need one variable here. The
+                                 // [`compute_page_size`] helper used by the decoder/sizing path keeps
+                                 // both names because it has to handle repeat_count > 1.
+    let pesize = round_up_8(size_comp);
     // Number of full RS data-blocks required to hold pesize bytes.
-    let block_count = pesize_unrounded.div_ceil(RS_DATA_SIZE).max(1);
+    let block_count = pesize.div_ceil(RS_DATA_SIZE).max(1);
     let rs_input_len = block_count * RS_DATA_SIZE;
 
     let mut rs_input = vec![0u8; rs_input_len];
@@ -203,17 +209,23 @@ fn compute_page_size(payload_len: usize, repeat_count: i64) -> DwgResult<usize> 
     // checked_mul through every step to defeat adversarial
     // `payload_len` near `usize::MAX / 2`.
     let repeat = repeat_count as usize;
-    let pesize_rounded = round_up_8_checked(payload_len).ok_or_else(|| {
+    // Matches LibreDWG `read_system_page` line 619:
+    //     pesize = ((size_comp + 7) & ~7) * repeat_count;
+    // We split it in two so each overflow gets its own typed error,
+    // but the names track the LibreDWG variable: `pesize_aligned`
+    // is one block's 8-byte-aligned payload size, `pesize` is the
+    // total after repeat-count multiplication.
+    let pesize_aligned = round_up_8_checked(payload_len).ok_or_else(|| {
         DwgError::InternalInvariant(format!(
             "system_page math: round_up_8({payload_len}) overflowed usize"
         ))
     })?;
-    let pesize_unrounded = pesize_rounded.checked_mul(repeat).ok_or_else(|| {
+    let pesize = pesize_aligned.checked_mul(repeat).ok_or_else(|| {
         DwgError::InternalInvariant(format!(
-            "system_page math: pesize * repeat_count overflowed usize ({pesize_rounded} * {repeat})"
+            "system_page math: pesize_aligned * repeat_count overflowed usize ({pesize_aligned} * {repeat})"
         ))
     })?;
-    let block_count = pesize_unrounded.div_ceil(RS_DATA_SIZE).max(1);
+    let block_count = pesize.div_ceil(RS_DATA_SIZE).max(1);
     let codeword_bytes = block_count.checked_mul(RS_BLOCK_SIZE).ok_or_else(|| {
         DwgError::InternalInvariant(format!(
             "system_page math: block_count * RS_BLOCK_SIZE overflowed usize ({block_count} * {RS_BLOCK_SIZE})"
