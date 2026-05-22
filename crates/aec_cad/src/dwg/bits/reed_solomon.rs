@@ -15,10 +15,20 @@
 //! ## Field
 //!
 //! The field is GF(2^8), represented as polynomials in
-//! `Z/2Z [X] / (X^8 + X^6 + X^5 + X^4 + 1)` (primitive poly
-//! 0x171 — the leading X^8 term is implied; the byte representation
-//! is 0x71 with the X^8 set bit). The element `X` is a generator
+//! `Z/2Z [X] / (X^8 + X^6 + X^5 + X^3 + 1)` (primitive poly
+//! 0x169 — the leading X^8 term is implied; the byte representation
+//! is 0x69 with the X^8 set bit). The element `X` is a generator
 //! of the multiplicative group.
+//!
+//! Note: LibreDWG's own `reedsolomon.c` comment spells the
+//! polynomial as `X^8 + X^6 + X^5 + X^4 + 1` while simultaneously
+//! tagging it `(0x0169 hex)` — those two expressions disagree (X^4
+//! would give 0x171; X^3 gives 0x169). The reduction table values
+//! prove the X^3 reading is the one actually implemented:
+//! `F256_RESIDUE[1] = 0x69` means `x^8 ≡ x^6 + x^5 + x^3 + 1`,
+//! and `F256_RESIDUE[2] = 0xd2 = x · 0x69` is consistent only for
+//! the 0x169 polynomial. The 0x171 form in LibreDWG's prose is a
+//! transcription bug — see [`F256_RESIDUE`] for the verification.
 //!
 //! ## Code layout on disk
 //!
@@ -45,7 +55,14 @@
 /// Indexed by `prod >> 8` after the unreduced shift-XOR multiply
 /// (where `prod` is up to 16 bits wide); the lookup returns the
 /// XOR-reduction that brings `prod` back into 8 bits modulo the
-/// primitive polynomial 0x171.
+/// primitive polynomial 0x169 (= `X^8 + X^6 + X^5 + X^3 + 1`).
+///
+/// Sanity check: `F256_RESIDUE[1] = 0x69` says `x^8 ≡ x^6 + x^5 +
+/// x^3 + 1 (mod p)`, which uniquely determines `p(x) = 0x169`.
+/// `F256_RESIDUE[2] = 0xd2 = x · 0x69 (mod p)` confirms the
+/// power-of-2 chain — see the
+/// `f256_residue_powers_match_poly_0x169` and
+/// `f256_residue_linearity_holds` tests below.
 ///
 /// Verbatim from LibreDWG `reedsolomon.c::f256_residue`. The first
 /// entry is 0x00 (high byte zero → no reduction needed). The
@@ -160,6 +177,20 @@ pub fn rs_encode_block(src: &[u8]) -> [u8; RS_PARITY_SIZE] {
     }
 
     // 16 trailing flush iterations — drain the polynomial state.
+    //
+    // Why a flush is needed here even though textbook systematic
+    // RS encoders don't have one: the loop above does NOT use the
+    // standard XOR-feedback-with-data shift register. Instead it
+    // feeds each data byte into the LOW slot (`parity[0]`) of the
+    // shift register and shifts everything up; the high-degree
+    // coefficients are still in flight when the data stream ends.
+    // We need exactly RS_PARITY_SIZE (= 16) trailing pure-shift
+    // iterations to evict those in-flight coefficients into the
+    // top of the register so the final `parity` array equals the
+    // remainder of `data * x^16` divided by `RSGEN`. This LFSR
+    // topology matches LibreDWG `rs_encode_block` byte-for-byte;
+    // the byte-level cross-check lives in
+    // `rs_encode_matches_libredwg_reference`.
     for _ in 0..RS_PARITY_SIZE {
         let leader = parity[RS_PARITY_SIZE - 1];
         for j in (1..RS_PARITY_SIZE).rev() {
@@ -266,6 +297,98 @@ pub fn rs_encode_interleaved(data: &[u8], block_count: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Independently verify that `F256_RESIDUE` is consistent with
+    /// the primitive polynomial `p(x) = 0x169 = X^8 + X^6 + X^5 +
+    /// X^3 + 1`, NOT the `0x171` form printed in LibreDWG's own
+    /// transcription.
+    ///
+    /// `F256_RESIDUE[i] = i · x^8 mod p(x)` is GF(2)-linear in `i`,
+    /// so `F256_RESIDUE[a ^ b] = F256_RESIDUE[a] ^ F256_RESIDUE[b]`
+    /// for every `a, b ∈ [0, 256)`. Combined with the
+    /// `powers_match_poly_0x169` test below (which pins the eight
+    /// powers-of-2 entries against an independently computed
+    /// `x^(8+k) mod p(x)` chain for `p = 0x169`), this proves the
+    /// table encodes the 0x169 polynomial — any other `p` would
+    /// produce different power-of-2 entries.
+    #[test]
+    fn f256_residue_linearity_holds() {
+        for i in 0u16..256 {
+            for j in (i..256).step_by(17) {
+                let combined = (i ^ j) as usize;
+                let parts = F256_RESIDUE[i as usize] ^ F256_RESIDUE[j as usize];
+                assert_eq!(
+                    F256_RESIDUE[combined], parts,
+                    "linearity failed at i={i:#04x}, j={j:#04x}: \
+                     F256_RESIDUE[i^j] = {:#04x}, but \
+                     F256_RESIDUE[i] ^ F256_RESIDUE[j] = {:#04x}",
+                    F256_RESIDUE[combined], parts
+                );
+            }
+        }
+    }
+
+    /// Pin `F256_RESIDUE[2^k] = x^(8+k) mod p(x)` against an
+    /// independently computed chain for `p(x) = 0x169`. Combined
+    /// with [`f256_residue_linearity_holds`], this uniquely
+    /// identifies the polynomial — every other `F256_RESIDUE[i]`
+    /// is determined by XOR-combinations of the eight powers-of-2
+    /// entries.
+    #[test]
+    fn f256_residue_powers_match_poly_0x169() {
+        // Lower 8 bits of p(x) = 0x169. Multiplication by `x`
+        // mod p is `shift left by 1`, then if the pre-shift high
+        // bit was set, XOR with `p_low`.
+        const P_LOW: u8 = 0x69;
+        // x^8 mod p = p - x^8 = p_low = 0x69 (since p is monic with
+        // leading coefficient x^8).
+        let mut v: u8 = P_LOW;
+        assert_eq!(F256_RESIDUE[1], v, "F256_RESIDUE[1] should be x^8 mod p");
+        for k in 1..8 {
+            // v <- x * v mod p
+            let carry = (v & 0x80) != 0;
+            let shifted = v.wrapping_shl(1);
+            v = if carry { shifted ^ P_LOW } else { shifted };
+            let idx = 1usize << k;
+            assert_eq!(
+                F256_RESIDUE[idx],
+                v,
+                "F256_RESIDUE[{idx}] should equal x^{} mod 0x169",
+                8 + k
+            );
+        }
+    }
+
+    /// Negative check: the same chain run with `p(x) = 0x171` (X^4
+    /// instead of X^3) must diverge from the table within the first
+    /// eight powers. If this test ever stops firing, the polynomial
+    /// identification is ambiguous and the doc rewording needs to
+    /// be revisited.
+    #[test]
+    fn f256_residue_powers_reject_poly_0x171() {
+        const P_LOW_WRONG: u8 = 0x71;
+        let mut v: u8 = P_LOW_WRONG; // x^8 mod 0x171 = 0x71
+        let mut diverged = F256_RESIDUE[1] != v;
+        for k in 1..8 {
+            let carry = (v & 0x80) != 0;
+            let shifted = v.wrapping_shl(1);
+            v = if carry {
+                shifted ^ P_LOW_WRONG
+            } else {
+                shifted
+            };
+            let idx = 1usize << k;
+            if F256_RESIDUE[idx] != v {
+                diverged = true;
+                break;
+            }
+        }
+        assert!(
+            diverged,
+            "F256_RESIDUE accidentally satisfies the 0x171 chain too — \
+             polynomial identification is ambiguous"
+        );
+    }
 
     /// Table-pin: spot-check `F256_RESIDUE` against LibreDWG values
     /// at a few positions. These are load-bearing — a single wrong

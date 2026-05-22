@@ -89,6 +89,23 @@ pub fn write_modern(doc: &DxfDocument, version: Version) -> DwgResult<Vec<u8>> {
         // emits a zero-section file to pin the file-header layer
         // against the LibreDWG oracle. Section content lands in a
         // follow-up commit.
+        //
+        // Loud surface for the silent-drop: if the caller hands us
+        // entities, log a warning to stderr so the data loss isn't
+        // invisible in production. aec_cad does not currently
+        // depend on `tracing`/`log`, so `eprintln!` is the
+        // available channel — matches the style used by
+        // `examples/dwg_oracle_fixture.rs`. This goes away when
+        // entity-bearing data pages land.
+        if !records.is_empty() {
+            eprintln!(
+                "warning: aec_cad::dwg: dropping {} entity record(s) when \
+                 writing R2007 (entity-bearing data pages not yet wired \
+                 into assemble_r2007; see PR-C / phase 6 of the R2007 \
+                 conformance roadmap)",
+                records.len()
+            );
+        }
         let _ = (
             &records,
             HeaderVarsSection::minimal(version),

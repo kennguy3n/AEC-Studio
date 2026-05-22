@@ -615,9 +615,52 @@ pub fn parse_r2007(bytes: &[u8], version: Version) -> DwgResult<R2007File> {
     let header = decode_file_header_on_disk(header_region)?;
 
     // 3. Locate the pages-map.
-    let pages_map_off = R2007_FIRST_PAGE_OFFSET as usize + header.pages_map_offset as usize;
-    let pages_map_on_disk_len = system_page_on_disk_size(header.pages_map_size_uncomp as usize);
-    if bytes.len() < pages_map_off + pages_map_on_disk_len {
+    //
+    //    Defense in depth: every numeric field below comes from an
+    //    untrusted input file. They're typed `i64` in the wire
+    //    format, but reaching `as usize` on a negative value wraps
+    //    to a huge positive number that would slip past a naive
+    //    `< bytes.len()` check (and in release mode `off + len`
+    //    could *also* wrap around). Reject negatives and >isize::MAX
+    //    values explicitly with a typed error before we touch the
+    //    address space.
+    if header.pages_map_offset < 0 {
+        return Err(DwgError::InternalInvariant(format!(
+            "parse_r2007: negative pages_map_offset {}",
+            header.pages_map_offset
+        )));
+    }
+    if header.pages_map_size_uncomp < 0 {
+        return Err(DwgError::InternalInvariant(format!(
+            "parse_r2007: negative pages_map_size_uncomp {}",
+            header.pages_map_size_uncomp
+        )));
+    }
+    if header.pages_map_correction < 1 {
+        return Err(DwgError::InternalInvariant(format!(
+            "parse_r2007: invalid pages_map_correction {}",
+            header.pages_map_correction
+        )));
+    }
+    let pages_map_off = (R2007_FIRST_PAGE_OFFSET as usize)
+        .checked_add(header.pages_map_offset as usize)
+        .ok_or_else(|| {
+            DwgError::InternalInvariant(
+                "parse_r2007: pages_map_offset arithmetic overflowed usize".into(),
+            )
+        })?;
+    let pages_map_on_disk_len = system_page_on_disk_size(
+        header.pages_map_size_uncomp as usize,
+        header.pages_map_correction,
+    );
+    let pages_map_end = pages_map_off
+        .checked_add(pages_map_on_disk_len)
+        .ok_or_else(|| {
+            DwgError::InternalInvariant(
+                "parse_r2007: pages_map end arithmetic overflowed usize".into(),
+            )
+        })?;
+    if bytes.len() < pages_map_end {
         return Err(DwgError::InternalInvariant(
             "parse_r2007: pages-map region exceeds file length".into(),
         ));
@@ -776,6 +819,79 @@ mod tests {
             expected_name.extend_from_slice(&code_unit.to_le_bytes());
         }
         assert_eq!(&bytes[64..], &expected_name[..]);
+    }
+
+    /// Regression test for the i64 → usize wrap on a malformed
+    /// `pages_map_offset`. Before the explicit `< 0` guard, a
+    /// negative offset would cast to a huge usize and *might* slip
+    /// past the bounds check in release mode via integer overflow.
+    /// Now it must be rejected with a structured error.
+    #[test]
+    fn parse_rejects_negative_pages_map_offset() {
+        // Round-trip a real file, then poke the file-header bytes to
+        // overwrite `pages_map_offset` with a negative value.
+        use crate::dwg::file::r2007_header::{
+            decode_file_header_on_disk, encode_file_header_on_disk, R2007_HEADER_OFFSET,
+        };
+        let mut file = assemble_r2007(empty_parts(Version::R2007)).unwrap();
+        let header_region =
+            &file[R2007_HEADER_OFFSET..R2007_HEADER_OFFSET + R2007_FILE_HEADER_ON_DISK_SIZE];
+        let mut header = decode_file_header_on_disk(header_region).unwrap();
+        header.pages_map_offset = -1;
+        let new_region = encode_file_header_on_disk(&header);
+        file[R2007_HEADER_OFFSET..R2007_HEADER_OFFSET + R2007_FILE_HEADER_ON_DISK_SIZE]
+            .copy_from_slice(&new_region);
+
+        let err = parse_r2007(&file, Version::R2007).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("negative pages_map_offset"),
+            "expected negative-offset error, got {msg}"
+        );
+    }
+
+    /// Companion negative-input guards for `pages_map_size_uncomp`
+    /// and `pages_map_correction`.
+    #[test]
+    fn parse_rejects_negative_pages_map_size_uncomp() {
+        use crate::dwg::file::r2007_header::{
+            decode_file_header_on_disk, encode_file_header_on_disk, R2007_HEADER_OFFSET,
+        };
+        let mut file = assemble_r2007(empty_parts(Version::R2007)).unwrap();
+        let header_region =
+            &file[R2007_HEADER_OFFSET..R2007_HEADER_OFFSET + R2007_FILE_HEADER_ON_DISK_SIZE];
+        let mut header = decode_file_header_on_disk(header_region).unwrap();
+        header.pages_map_size_uncomp = -7;
+        let new_region = encode_file_header_on_disk(&header);
+        file[R2007_HEADER_OFFSET..R2007_HEADER_OFFSET + R2007_FILE_HEADER_ON_DISK_SIZE]
+            .copy_from_slice(&new_region);
+        let err = parse_r2007(&file, Version::R2007).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("pages_map_size_uncomp"),
+            "expected size-uncomp error, got {msg}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_invalid_pages_map_correction() {
+        use crate::dwg::file::r2007_header::{
+            decode_file_header_on_disk, encode_file_header_on_disk, R2007_HEADER_OFFSET,
+        };
+        let mut file = assemble_r2007(empty_parts(Version::R2007)).unwrap();
+        let header_region =
+            &file[R2007_HEADER_OFFSET..R2007_HEADER_OFFSET + R2007_FILE_HEADER_ON_DISK_SIZE];
+        let mut header = decode_file_header_on_disk(header_region).unwrap();
+        header.pages_map_correction = 0;
+        let new_region = encode_file_header_on_disk(&header);
+        file[R2007_HEADER_OFFSET..R2007_HEADER_OFFSET + R2007_FILE_HEADER_ON_DISK_SIZE]
+            .copy_from_slice(&new_region);
+        let err = parse_r2007(&file, Version::R2007).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("pages_map_correction"),
+            "expected correction error, got {msg}"
+        );
     }
 
     #[test]

@@ -143,11 +143,23 @@ pub fn decode_system_page(
     Ok(pedata[..size_uncomp].to_vec())
 }
 
-/// Compute the on-disk page size for a given payload length — useful
-/// when the caller needs to lay out file offsets before producing
-/// the actual bytes.
-pub fn system_page_on_disk_size(payload_len: usize) -> usize {
-    let pesize_unrounded = round_up_8(payload_len);
+/// Compute the on-disk page size for a given payload length and
+/// `repeat_count` — useful when the caller needs to lay out file
+/// offsets before producing the actual bytes.
+///
+/// The `repeat_count` argument MUST match what the caller will pass
+/// to [`decode_system_page`]; otherwise the bounds check the caller
+/// builds on this value will under-allocate. `repeat_count` is
+/// `header.pages_map_correction` in the R2007 file header context;
+/// AutoCAD-emitted files always use 1, and so does our encoder.
+///
+/// Panics if `repeat_count < 1`.
+pub fn system_page_on_disk_size(payload_len: usize, repeat_count: i64) -> usize {
+    assert!(
+        repeat_count >= 1,
+        "system_page_on_disk_size: repeat_count must be >= 1 (got {repeat_count})"
+    );
+    let pesize_unrounded = round_up_8(payload_len) * repeat_count as usize;
     let block_count = pesize_unrounded.div_ceil(RS_DATA_SIZE).max(1);
     round_up_8(block_count * RS_BLOCK_SIZE)
 }
@@ -178,7 +190,7 @@ mod tests {
         assert_eq!(result.size_uncomp, payload.len() as i64);
         assert_eq!(
             result.on_disk.len(),
-            system_page_on_disk_size(payload.len())
+            system_page_on_disk_size(payload.len(), 1)
         );
         // Round-trip the payload.
         let recovered = decode_system_page(
@@ -267,7 +279,11 @@ mod tests {
     fn on_disk_size_helper_matches_encode() {
         for n in [0usize, 1, 16, 239, 240, 256, 717, 718, 4096] {
             let result = encode_system_page(&vec![0u8; n]);
-            assert_eq!(result.on_disk.len(), system_page_on_disk_size(n), "n={n}");
+            assert_eq!(
+                result.on_disk.len(),
+                system_page_on_disk_size(n, 1),
+                "n={n}"
+            );
         }
     }
 }
