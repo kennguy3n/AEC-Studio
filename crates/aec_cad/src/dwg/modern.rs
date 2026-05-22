@@ -189,7 +189,7 @@ fn entity_to_record(entity: &DxfEntity, version: Version, handle: u64) -> DwgRes
     let mut payload = BitWriter::new();
     let object_type = match entity {
         DxfEntity::Line(line) => {
-            LineEntity::from_dxf(line).encode_payload(&mut payload)?;
+            LineEntity::from_dxf(line).encode_payload(&mut payload, version)?;
             ObjectType::Line
         }
         DxfEntity::Arc(arc) => {
@@ -277,7 +277,7 @@ fn payload_to_entity(
 ) -> DwgResult<DxfEntity> {
     match obj_type {
         ObjectType::Line => Ok(DxfEntity::Line(
-            LineEntity::decode_payload(r, layer)?.into_dxf(),
+            LineEntity::decode_payload(r, layer, version)?.into_dxf(),
         )),
         ObjectType::Arc => Ok(DxfEntity::Arc(
             ArcEntity::decode_payload(r, layer)?.into_dxf(),

@@ -375,6 +375,37 @@ impl<'a> BitReader<'a> {
         }
     }
 
+    /// Version-aware BT reader. R14 stores a plain BD; R2000+ adds
+    /// the 1-bit "is default" prefix. Mirrors LibreDWG
+    /// `bit_read_BT` at `bits.c:1297`.
+    pub fn read_bt(&mut self, version: crate::dwg::version::Version) -> DwgResult<f64> {
+        use crate::dwg::version::Version;
+        if matches!(version, Version::R12 | Version::R14) {
+            self.read_bd()
+        } else {
+            self.read_bt_r2000_plus()
+        }
+    }
+
+    /// Version-aware BE reader. R14 stores a plain 3BD with the
+    /// LibreDWG z-normalisation when x=y=0; R2000+ adds the
+    /// 1-bit "is default (0,0,1)" prefix. Mirrors LibreDWG
+    /// `bit_read_BE` at `bits.c:1112`.
+    pub fn read_be(&mut self, version: crate::dwg::version::Version) -> DwgResult<[f64; 3]> {
+        use crate::dwg::version::Version;
+        if matches!(version, Version::R12 | Version::R14) {
+            let x = self.read_bd()?;
+            let y = self.read_bd()?;
+            let mut z = self.read_bd()?;
+            if x == 0.0 && y == 0.0 {
+                z = if z <= 0.0 { -1.0 } else { 1.0 };
+            }
+            Ok([x, y, z])
+        } else {
+            self.read_be_r2000_plus()
+        }
+    }
+
     /// Bit Double With Default (DD). The writer in this crate always
     /// emits `00` (use default) or `11` (full RD); for full
     /// AutoCAD-emitted file compatibility we also handle the `01`

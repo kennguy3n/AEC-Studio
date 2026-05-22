@@ -423,6 +423,47 @@ impl BitWriter {
         }
     }
 
+    /// Version-aware Bit Thickness (BT). For R2000+ we emit the
+    /// optimised `B + optional BD` form; for R14 (and the unused R13
+    /// path) we emit a plain BD — LibreDWG `bit_write_BT` at
+    /// `bits.c:1310` dispatches on `dat->version >= R_2000`.
+    pub fn write_bt(&mut self, value: f64, version: crate::dwg::version::Version) -> DwgResult<()> {
+        use crate::dwg::version::Version;
+        if matches!(version, Version::R12 | Version::R14) {
+            self.write_bd(value)
+        } else {
+            self.write_bt_r2000_plus(value)
+        }
+    }
+
+    /// Version-aware Bit Extrusion (BE). For R2000+ we emit the
+    /// optimised `B + optional 3BD` form; for R14 we emit a plain
+    /// `3BD` (with the LibreDWG z-normalisation rule when x=y=0).
+    /// Matches `bit_write_BE` at `bits.c:1135`.
+    pub fn write_be(
+        &mut self,
+        value: [f64; 3],
+        version: crate::dwg::version::Version,
+    ) -> DwgResult<()> {
+        use crate::dwg::version::Version;
+        if matches!(version, Version::R12 | Version::R14) {
+            self.write_bd(value[0])?;
+            self.write_bd(value[1])?;
+            let z = if value[0] == 0.0 && value[1] == 0.0 {
+                if value[2] <= 0.0 {
+                    -1.0
+                } else {
+                    1.0
+                }
+            } else {
+                value[2]
+            };
+            self.write_bd(z)
+        } else {
+            self.write_be_r2000_plus(value)
+        }
+    }
+
     /// Bit Double With Default (DD): two control bits select between
     /// reusing the default verbatim (00), patching the low 4 bytes
     /// (01), patching the low 6 bytes (10), or reading a full 8-byte

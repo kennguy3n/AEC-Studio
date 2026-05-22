@@ -942,7 +942,11 @@ mod tests {
             extrusion: [0.0, 0.0, 1.0],
         };
         let mut payload = crate::dwg::bits::BitWriter::new();
-        line.encode_payload(&mut payload).unwrap();
+        // Tests in this module exclusively exercise the R2004 path,
+        // so we pin the version explicitly. The version-aware codec
+        // is what the LINE entity needs (see
+        // `entities::line::encode_payload`).
+        line.encode_payload(&mut payload, Version::R2004).unwrap();
         ObjectRecord {
             object_type: ObjectType::Line,
             handle: HandleRef {

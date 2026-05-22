@@ -680,8 +680,7 @@ mod tests {
             extrusion: [0.0, 0.0, 1.0],
         };
         let mut payload = BitWriter::new();
-        line.encode_payload(&mut payload).unwrap();
-        let _ = version;
+        line.encode_payload(&mut payload, version).unwrap();
         ObjectRecord {
             object_type: ObjectType::Line,
             handle: HandleRef { code: 0, value: 1 },
@@ -922,7 +921,7 @@ mod tests {
         let (decoded, payload, consumed) =
             ObjectRecord::decode_with(Version::R2000, &bytes, |obj_type, _common, r| {
                 assert_eq!(obj_type, ObjectType::Line);
-                LineEntity::decode_payload(r, "0".to_string())
+                LineEntity::decode_payload(r, "0".to_string(), Version::R2000)
             })
             .unwrap();
         assert_eq!(decoded.object_type, ObjectType::Line);
