@@ -30,6 +30,14 @@ pub mod crc;
 pub mod reader;
 pub mod writer;
 
-pub use crc::{crc_32_ieee, crc_32c, crc_8, crc_x25, dwg_section_page_checksum};
+// Only re-export primitives that have at least one production
+// consumer in the workspace. `crc_32c` and `crc_8` exist in `crc` for
+// completeness (and `crc_32c` doubles as the reference value the
+// `dwg_section_page_checksum_disagrees_with_crc_32c` test compares
+// against to lock in the Adler-32 distinction), but neither has a
+// non-test caller, so they're kept module-private to avoid implying a
+// stable public API. Re-add the export at the call site if a real
+// consumer materializes.
+pub use crc::{crc_32_ieee, crc_x25, dwg_section_page_checksum};
 pub use reader::BitReader;
 pub use writer::BitWriter;

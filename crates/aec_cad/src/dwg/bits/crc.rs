@@ -78,10 +78,11 @@ pub fn crc_32c(seed: u32, data: &[u8]) -> u32 {
     !crc
 }
 
-/// Adler-32-style checksum used by LibreDWG `dwg_section_page_checksum`.
+/// Adler-32-**style** checksum used by LibreDWG `dwg_section_page_checksum`.
 ///
-/// This is NOT a CRC despite the name. It's the Adler-32 algorithm
-/// with the standard `mod 65521 (= 0xFFF1)` reduction:
+/// This is NOT a CRC despite the name. It uses the Adler-32 update
+/// rule (paired running sums with `mod 65521 (= 0xFFF1)` reduction)
+/// every 0x15B0 bytes:
 ///
 /// ```text
 /// sum1 = seed & 0xFFFF
@@ -93,9 +94,21 @@ pub fn crc_32c(seed: u32, data: &[u8]) -> u32 {
 /// return (sum2 << 16) | (sum1 & 0xFFFF)
 /// ```
 ///
+/// **Non-standard initial state when seeded with 0.** RFC 1950 / zlib
+/// Adler-32 fixes the initial state at `(sum1=1, sum2=0)` — i.e. its
+/// "empty" output is `0x0000_0001`. This function instead derives the
+/// initial state from `seed`, so `dwg_section_page_checksum(0, &[])`
+/// is `0`, not `1`. To get the RFC 1950 result, pass `seed = 1`. The
+/// `seed`-derived init is what LibreDWG (`decode.c::dwg_section_page_checksum`
+/// line 1394) and AutoCAD-emitted files both use; this asymmetry is
+/// what makes it a "style" of Adler-32 rather than a drop-in alias.
+/// The test `dwg_section_page_checksum_known_vector` pins the value
+/// for `[1, 2, 3, 4]` at `0x0014_000a` to catch a future drift toward
+/// the standard `(1, 0)` initial state.
+///
 /// AutoCAD uses this for the R2004+ system-page checksums (page map +
-/// section info). See LibreDWG `decode.c::dwg_section_page_checksum`
-/// (line 1394) for the reference implementation.
+/// section info) AND the data-page checksums on R2004/R2007/R2010/
+/// R2013/R2018 files.
 ///
 /// `seed` is the previous return value when chaining; pass `0` for a
 /// fresh computation. The two-pass convention is:
@@ -103,6 +116,9 @@ pub fn crc_32c(seed: u32, data: &[u8]) -> u32 {
 /// c1 = dwg_section_page_checksum(0, header_bytes_with_zero_checksum)
 /// c  = dwg_section_page_checksum(c1, payload_bytes)
 /// ```
+/// See `dwg_section_page_checksum_chains_at_arbitrary_split` for the
+/// chaining identity's exact preconditions (depends on the 0x15B0
+/// chunk constant).
 pub fn dwg_section_page_checksum(seed: u32, data: &[u8]) -> u32 {
     let mut sum1: u32 = seed & 0xFFFF;
     let mut sum2: u32 = seed >> 16;
@@ -348,7 +364,32 @@ mod tests {
         // sum1 progression: 0, 1, 3, 6, 10
         // sum2 progression: 0, 1, 4, 10, 20
         // result = (20 << 16) | 10 = 0x00140000 | 0x0a = 0x0014000a
+        //
+        // This pin doubles as a regression guard against a future
+        // drift to RFC 1950 / zlib Adler-32 semantics, which fix the
+        // initial state at (sum1=1, sum2=0) regardless of seed and
+        // would produce 0x0018_000b for the same input.
         assert_eq!(dwg_section_page_checksum(0, &[1, 2, 3, 4]), 0x0014_000a);
+    }
+
+    #[test]
+    fn dwg_section_page_checksum_with_seed_one_matches_rfc1950() {
+        // `dwg_section_page_checksum`'s seed-derived initial state is
+        // what makes it "Adler-32-style" rather than a drop-in RFC 1950
+        // alias: passing `seed = 1` reproduces the RFC 1950 initial
+        // state (sum1=1, sum2=0), so the function emits the standard
+        // zlib Adler-32 result for any data when called with seed=1.
+        //
+        // The RFC 1950 reference value for "Wikipedia" (the canonical
+        // Adler-32 example) is 0x11E60398 (sum1=0x0398, sum2=0x11E6).
+        // Verifies the relationship documented in the rustdoc above.
+        assert_eq!(dwg_section_page_checksum(1, b"Wikipedia"), 0x11E6_0398);
+
+        // And confirms the LibreDWG "empty input with seed=1 returns
+        // 1" behavior, distinguishing it from the seed=0 case which
+        // returns 0.
+        assert_eq!(dwg_section_page_checksum(1, &[]), 1);
+        assert_eq!(dwg_section_page_checksum(0, &[]), 0);
     }
 
     #[test]
