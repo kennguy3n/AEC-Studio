@@ -22,7 +22,7 @@
 //! § "R2004 file header — encryption" and reproduced in LibreDWG
 //! `decrypt_R2004_header`.
 
-use crate::dwg::bits::crc_32c;
+use crate::dwg::bits::{crc_32_ieee, crc_32c};
 use crate::dwg::error::{DwgError, DwgResult};
 use crate::dwg::file::pages::{compress, decompress};
 
@@ -164,14 +164,17 @@ impl R2004FileHeader {
             crc32: read_u32(plain, 0x68),
         };
         // Verify the CRC32 (LE bytes, computed over the header with the
-        // crc32 field zeroed). LibreDWG only warns on mismatch; we
-        // return a hard error so corruption is surfaced rather than
-        // silently propagated.
+        // crc32 field zeroed). LibreDWG uses standard CRC-32 IEEE (its
+        // `bit_calc_CRC32`), NOT the Castagnoli variant used for the
+        // section page checksums — distinct polynomials, distinct
+        // tables. LibreDWG only warns on mismatch; we return a hard
+        // error so corruption is surfaced rather than silently
+        // propagated.
         let mut crc_buf = plain[..R2004_CRC32_OFFSET + 4].to_vec();
         for byte in &mut crc_buf[R2004_CRC32_OFFSET..R2004_CRC32_OFFSET + 4] {
             *byte = 0;
         }
-        let calc = crc_32c(0, &crc_buf);
+        let calc = crc_32_ieee(0, &crc_buf);
         if calc != hdr.crc32 {
             return Err(DwgError::SectionCrcMismatch {
                 section: "r2004_file_header",
@@ -208,9 +211,11 @@ impl R2004FileHeader {
         write_u32(&mut plain, 0x5c, self.section_info_id as u32);
         write_u32(&mut plain, 0x60, self.section_array_size);
         write_u32(&mut plain, 0x64, self.gap_array_size);
-        // CRC32 zeroed before computation.
+        // CRC32 zeroed before computation. LibreDWG uses the standard
+        // IEEE CRC-32 here (its `bit_calc_CRC32`); the CRC-32C variant
+        // used by the page-level checksum is a different algorithm.
         write_u32(&mut plain, 0x68, 0);
-        let crc = crc_32c(0, &plain[..R2004_CRC32_OFFSET + 4]);
+        let crc = crc_32_ieee(0, &plain[..R2004_CRC32_OFFSET + 4]);
         write_u32(&mut plain, 0x68, crc);
         // Padding stays as zeros — it gets encrypted along with the
         // rest. The leading 12 bytes of the next page header
@@ -383,6 +388,193 @@ pub fn read_system_page(bytes: &[u8], encrypted: bool) -> DwgResult<(SystemPageH
         CompressionType::Compressed => decompress(&payload, header.decomp_data_size as usize)?,
     };
     Ok((header, plain))
+}
+
+/// Size of the data-page header (the encrypted preamble that
+/// precedes every data section page — Header, Classes, Objects,
+/// Handles, etc.).
+pub const DATA_PAGE_HEADER_SIZE: usize = 32;
+/// Magic constant identifying a data-section page in its decrypted
+/// page header. Always `0x4163043b`; differs from the page-map
+/// magic ([`SECTION_PAGE_MAP_MAGIC`]) and the section-info magic
+/// ([`SECTION_INFO_MAGIC`]).
+pub const DATA_PAGE_MAGIC: u32 = 0x4163_043b;
+/// XOR mask base used to encrypt data-page headers. The actual
+/// per-page mask is `DATA_PAGE_MASK ^ page_file_offset` (as u32);
+/// see LibreDWG encode.c line 4222.
+pub const DATA_PAGE_MASK: u32 = 0x4164_536b;
+
+/// The 32-byte clear-text data-page header, before XOR-encryption.
+///
+/// LibreDWG layout (`src/decode.c` struct around line 1943,
+/// `src/encode.c` line 4193):
+///
+/// | Offset | Field                | Notes                                  |
+/// |-------:|----------------------|----------------------------------------|
+/// |   0x00 | `page_type`          | Always `DATA_PAGE_MAGIC` (`0x4163043b`)|
+/// |   0x04 | `section_type`       | Section-type id (1=Header, 3=Classes, 4=Handles, 7=Objects, …) |
+/// |   0x08 | `data_size`          | Compressed bytes on disk (= raw count when stored uncompressed) |
+/// |   0x0c | `page_size`          | Decompressed bytes                     |
+/// |   0x10 | `start_offset`       | Offset in the decompressed section where this page's bytes live (multi-page sections only) |
+/// |   0x14 | `unknown`            | Always 0                               |
+/// |   0x18 | `page_header_crc`    | CRC over the header with this field zeroed, seeded by `data_crc` |
+/// |   0x1c | `data_crc`           | CRC over the (compressed) data bytes   |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DataPageHeader {
+    pub page_type: u32,
+    pub section_type: u32,
+    pub data_size: u32,
+    pub page_size: u32,
+    pub start_offset: u32,
+    pub unknown: u32,
+    pub page_header_crc: u32,
+    pub data_crc: u32,
+}
+
+impl DataPageHeader {
+    pub fn encode(&self) -> [u8; DATA_PAGE_HEADER_SIZE] {
+        let mut buf = [0u8; DATA_PAGE_HEADER_SIZE];
+        buf[0x00..0x04].copy_from_slice(&self.page_type.to_le_bytes());
+        buf[0x04..0x08].copy_from_slice(&self.section_type.to_le_bytes());
+        buf[0x08..0x0c].copy_from_slice(&self.data_size.to_le_bytes());
+        buf[0x0c..0x10].copy_from_slice(&self.page_size.to_le_bytes());
+        buf[0x10..0x14].copy_from_slice(&self.start_offset.to_le_bytes());
+        buf[0x14..0x18].copy_from_slice(&self.unknown.to_le_bytes());
+        buf[0x18..0x1c].copy_from_slice(&self.page_header_crc.to_le_bytes());
+        buf[0x1c..0x20].copy_from_slice(&self.data_crc.to_le_bytes());
+        buf
+    }
+
+    pub fn parse(bytes: &[u8]) -> DwgResult<Self> {
+        if bytes.len() < DATA_PAGE_HEADER_SIZE {
+            return Err(DwgError::UnexpectedEof {
+                byte: bytes.len(),
+                bit: 0,
+            });
+        }
+        Ok(Self {
+            page_type: read_u32(bytes, 0x00),
+            section_type: read_u32(bytes, 0x04),
+            data_size: read_u32(bytes, 0x08),
+            page_size: read_u32(bytes, 0x0c),
+            start_offset: read_u32(bytes, 0x10),
+            unknown: read_u32(bytes, 0x14),
+            page_header_crc: read_u32(bytes, 0x18),
+            data_crc: read_u32(bytes, 0x1c),
+        })
+    }
+}
+
+/// XOR-encrypt or decrypt a 32-byte data-page header in place. The
+/// mask is `DATA_PAGE_MASK ^ page_file_offset`, applied to every
+/// 4-byte little-endian word. Symmetric: calling this twice with the
+/// same `page_file_offset` recovers the original bytes.
+pub fn xor_data_page_header(buf: &mut [u8; DATA_PAGE_HEADER_SIZE], page_file_offset: u64) {
+    let mask = DATA_PAGE_MASK ^ (page_file_offset as u32);
+    for word in buf.chunks_exact_mut(4) {
+        let v = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
+        let masked = v ^ mask;
+        word.copy_from_slice(&masked.to_le_bytes());
+    }
+}
+
+/// Wrap a logical (decompressed) data-section payload as the on-disk
+/// page: 32-byte encrypted header + raw payload. Used for R2004+
+/// data sections (Header, Classes, Objects, Handles, …) — NOT for
+/// the system-section pages (page-map and section-info) which use
+/// [`write_system_page`].
+///
+/// We deliberately store the payload uncompressed (LibreDWG does the
+/// same on the encode side; the on-disk format permits it because
+/// the page header carries explicit `data_size == page_size` and the
+/// reader detects this case as "stored, no LZ77 frame to parse").
+pub fn write_data_page(
+    section_type: u32,
+    decomp_payload: &[u8],
+    start_offset: u32,
+    page_file_offset: u64,
+) -> Vec<u8> {
+    let data_size = decomp_payload.len() as u32;
+    // CRC over the data bytes (seed 0); LibreDWG's
+    // `dwg_section_page_checksum` is CRC-32C with reflected output
+    // and final inversion — same as our [`crc_32c`] helper.
+    let data_crc = crc_32c(0, decomp_payload);
+    let mut header = DataPageHeader {
+        page_type: DATA_PAGE_MAGIC,
+        section_type,
+        data_size,
+        page_size: data_size,
+        start_offset,
+        unknown: 0,
+        page_header_crc: 0,
+        data_crc,
+    };
+    // Compute the header CRC over the cleartext header with the CRC
+    // field zeroed, seeded by `data_crc` (LibreDWG encode.c:4218).
+    let hdr_bytes_for_crc = header.encode();
+    let page_hdr_crc = crc_32c(data_crc, &hdr_bytes_for_crc);
+    header.page_header_crc = page_hdr_crc;
+    let mut encrypted = header.encode();
+    xor_data_page_header(&mut encrypted, page_file_offset);
+
+    let mut out = Vec::with_capacity(DATA_PAGE_HEADER_SIZE + decomp_payload.len());
+    out.extend_from_slice(&encrypted);
+    out.extend_from_slice(decomp_payload);
+    out
+}
+
+/// Inverse of [`write_data_page`]: decrypt the 32-byte header at
+/// `page_file_offset`, validate both CRCs, and return the
+/// (decrypted) header + a reference to the raw payload bytes.
+pub fn read_data_page(
+    page_bytes: &[u8],
+    page_file_offset: u64,
+) -> DwgResult<(DataPageHeader, &[u8])> {
+    if page_bytes.len() < DATA_PAGE_HEADER_SIZE {
+        return Err(DwgError::UnexpectedEof {
+            byte: page_bytes.len(),
+            bit: 0,
+        });
+    }
+    let mut hdr_buf = [0u8; DATA_PAGE_HEADER_SIZE];
+    hdr_buf.copy_from_slice(&page_bytes[..DATA_PAGE_HEADER_SIZE]);
+    xor_data_page_header(&mut hdr_buf, page_file_offset);
+    let header = DataPageHeader::parse(&hdr_buf)?;
+    if header.page_type != DATA_PAGE_MAGIC {
+        return Err(DwgError::InternalInvariant(format!(
+            "R2004 data page at offset {page_file_offset:#x}: page_type {:#x} != {:#x}",
+            header.page_type, DATA_PAGE_MAGIC
+        )));
+    }
+    let data_len = header.data_size as usize;
+    if page_bytes.len() < DATA_PAGE_HEADER_SIZE + data_len {
+        return Err(DwgError::UnexpectedEof {
+            byte: page_bytes.len(),
+            bit: 0,
+        });
+    }
+    let payload = &page_bytes[DATA_PAGE_HEADER_SIZE..DATA_PAGE_HEADER_SIZE + data_len];
+    // Recompute and validate the data CRC.
+    let calc_data = crc_32c(0, payload);
+    if calc_data != header.data_crc {
+        return Err(DwgError::SectionCrcMismatch {
+            section: "r2004_data_page_data",
+            computed: calc_data,
+            stored: header.data_crc,
+        });
+    }
+    // Recompute and validate the page-header CRC.
+    let mut hdr_for_crc = header;
+    hdr_for_crc.page_header_crc = 0;
+    let calc_hdr = crc_32c(calc_data, &hdr_for_crc.encode());
+    if calc_hdr != header.page_header_crc {
+        return Err(DwgError::SectionCrcMismatch {
+            section: "r2004_data_page_header",
+            computed: calc_hdr,
+            stored: header.page_header_crc,
+        });
+    }
+    Ok((header, payload))
 }
 
 /// A single page descriptor inside the R2004+ page map.

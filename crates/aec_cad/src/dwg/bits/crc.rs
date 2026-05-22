@@ -7,10 +7,20 @@
 //!    (non-reflected), initial value `0xc0`. The reduction loop in
 //!    [`crc_8`] tests the high bit and shifts left, matching what
 //!    AutoCAD emits and what LibreDWG validates against.
-//! 2. **CRC-32** — section page checksums (R2004+). Standard
-//!    `Castagnoli` (CRC-32C) polynomial `0x1edc6f41`, reflected,
-//!    initial value `0xffffffff`, post-complement.
-//! 3. **CRC-X25** — section checksums in R13–R2000 modern format.
+//! 2. **CRC-32C (Castagnoli)** — section page checksums (R2004+).
+//!    Polynomial `0x1edc6f41`, reflected, initial value `0xffffffff`,
+//!    post-complement. Used by [`crc_32c`].
+//! 3. **CRC-32 (IEEE / "zlib")** — checksum stored *inside* the
+//!    encrypted R2004 file header (bytes 0x68..0x6c). LibreDWG
+//!    computes this with its `bit_calc_CRC32` over the 108-byte
+//!    decrypted header with the CRC field zeroed. Polynomial
+//!    `0xedb88320` (reflected, the standard IEEE 802.3 / zlib /
+//!    PNG polynomial), initial seed passed in as argument (LibreDWG
+//!    seeds with 0), NOT post-complemented. Used by [`crc_32_ieee`].
+//!    This is a different CRC from CRC-32C above; do not confuse the
+//!    two — they share a name but differ in polynomial and final
+//!    inversion.
+//! 4. **CRC-X25** — section checksums in R13–R2000 modern format.
 //!    Polynomial `0x1021`, reflected, initial value `0xc0c1` per the
 //!    Open Design specification.
 //!
@@ -60,6 +70,30 @@ pub fn crc_32c(seed: u32, data: &[u8]) -> u32 {
     !crc
 }
 
+/// CRC-32 IEEE (polynomial `0xedb88320`, reflected, with the standard
+/// `~seed` in / `~crc` out inversion) — the variant AutoCAD stores
+/// inside the encrypted R2004 file header at offset `0x68`. LibreDWG
+/// names it `bit_calc_CRC32`.
+///
+/// Differs from [`crc_32c`] only in the polynomial: IEEE 802.3
+/// (`0xedb88320`, this function) vs Castagnoli (`0x82f63b78`, the
+/// other one). Both apply the same standard inversion at the
+/// boundaries, so the test vector `"123456789"` produces the
+/// canonical CRC-32 value `0xcbf43926` for IEEE and `0xe3069283` for
+/// Castagnoli.
+///
+/// `seed` is the initial register value; LibreDWG always passes `0`.
+/// Two-step seeding is supported (see the chainability test).
+pub fn crc_32_ieee(seed: u32, data: &[u8]) -> u32 {
+    let mut crc = !seed;
+    let table = CRC32_IEEE_TABLE;
+    for &b in data {
+        let idx = ((crc ^ u32::from(b)) & 0xff) as usize;
+        crc = (crc >> 8) ^ table[idx];
+    }
+    !crc
+}
+
 // Precomputed CRC-X25 table.  Computed once at build time via a
 // `const fn` so we don't pay for it at runtime and don't ship a
 // generated test fixture into the crate.
@@ -92,6 +126,26 @@ const CRC32C_TABLE: [u32; 256] = {
         while j < 8 {
             if crc & 1 != 0 {
                 crc = (crc >> 1) ^ 0x82f63b78;
+            } else {
+                crc >>= 1;
+            }
+            j += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
+
+const CRC32_IEEE_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut j = 0;
+        while j < 8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xedb88320;
             } else {
                 crc >>= 1;
             }
@@ -170,5 +224,35 @@ mod tests {
         // the algorithm's behavior in place.)
         let _ = part;
         assert_eq!(full, crc_32c(0, b"hello world"));
+    }
+
+    #[test]
+    fn crc_32_ieee_known_vector() {
+        // Standard CRC-32/IEEE test vector: "123456789" → 0xcbf43926.
+        // (Same string as the CRC-32C test above; the differing
+        // expected value confirms the two algorithms are genuinely
+        // distinct and the IEEE table is not accidentally aliasing
+        // CRC32C_TABLE.)
+        assert_eq!(crc_32_ieee(0, b"123456789"), 0xcbf43926);
+    }
+
+    #[test]
+    fn crc_32_ieee_zero_seed_zero_input_is_zero() {
+        // The seed is inverted on entry and exit (`!seed` in / `!crc`
+        // out), so seed=0, no input → !!0 = 0.
+        assert_eq!(crc_32_ieee(0, &[]), 0);
+    }
+
+    #[test]
+    fn crc_32_ieee_disagrees_with_castagnoli() {
+        // Lock in that the two polynomials produce different outputs
+        // for the same input — guards against an accidental table
+        // swap or copy-paste between the two `const`-table
+        // initializers.
+        let ieee = crc_32_ieee(0, b"123456789");
+        let castagnoli = crc_32c(0, b"123456789");
+        assert_ne!(ieee, castagnoli);
+        assert_eq!(ieee, 0xcbf43926);
+        assert_eq!(castagnoli, 0xe3069283);
     }
 }

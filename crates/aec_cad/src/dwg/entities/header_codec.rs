@@ -22,7 +22,7 @@
 //! [`encode_for_version`] / [`decode_for_version`].
 
 use crate::dwg::bits::{BitReader, BitWriter};
-use crate::dwg::error::DwgResult;
+use crate::dwg::error::{DwgError, DwgResult};
 use crate::dwg::version::Version;
 
 /// Entity mode bits (BB control bits in the common header).
@@ -96,6 +96,13 @@ pub struct CommonHeaderData {
     pub linetype_scale: f64,
     pub linetype_flag: LinetypeFlag,
     pub plot_style_flag: u8, // BB
+    /// R2007+ material flag (BB). Mirrors `plot_style_flag`'s shape:
+    /// 0b00 = BYLAYER, 0b01 = BYBLOCK, 0b10 = continuous (unused),
+    /// 0b11 = handle. When `0b11`, a material handle is appended to
+    /// the handle stream after plot-style. The encoder/decoder for the
+    /// data stream always write/read this BB for R2007+; the handle
+    /// stream emits/consumes a handle iff this flag is 0b11.
+    pub material_flag: u8,
     /// R2004+ extension-dictionary-missing flag. When `true` the
     /// handle stream does NOT carry an xdict handle; when `false` the
     /// handle stream carries one extra `H` for the extension
@@ -120,6 +127,7 @@ impl Default for CommonHeaderData {
             linetype_scale: 1.0,
             linetype_flag: LinetypeFlag::ByLayer,
             plot_style_flag: 0,
+            material_flag: 0,
             xdict_missing: true,
             invisibility: 0,
             lineweight: 0x1d, // BYLAYER
@@ -155,9 +163,17 @@ impl CommonHeaderData {
         w.write_bd(self.linetype_scale)?;
         w.write_bb(self.linetype_flag.to_bb())?;
         w.write_bb(self.plot_style_flag)?;
-        // R2007+: material flag (BB), shadow flag (B).
+        // R2007+: material flag (BB), shadow flag (B). Material flag
+        // mirrors plot_style_flag's BB encoding (00=BYLAYER, 01=BYBLOCK,
+        // 11=handle). When 0b11 the handle stream emits a material H.
         if version >= Version::R2007 {
-            w.write_bb(0)?; // material BYLAYER
+            if self.material_flag > 0b11 {
+                return Err(DwgError::InternalInvariant(format!(
+                    "material_flag {} exceeds 2 bits",
+                    self.material_flag
+                )));
+            }
+            w.write_bb(self.material_flag)?;
             w.write_b(false)?; // shadow flag
         }
         // R2010+: has full visual style (BB).
@@ -205,10 +221,13 @@ impl CommonHeaderData {
         let linetype_scale = r.read_bd()?;
         let linetype_flag = LinetypeFlag::from_bb(r.read_bb()?);
         let plot_style_flag = r.read_bb()?;
-        if version >= Version::R2007 {
-            let _material = r.read_bb()?;
+        let material_flag = if version >= Version::R2007 {
+            let m = r.read_bb()?;
             let _shadow = r.read_b()?;
-        }
+            m
+        } else {
+            0
+        };
         if version >= Version::R2010 {
             let _visual_style = r.read_bb()?;
         }
@@ -236,6 +255,7 @@ impl CommonHeaderData {
             linetype_scale,
             linetype_flag,
             plot_style_flag,
+            material_flag,
             xdict_missing,
             invisibility,
             lineweight,
@@ -331,5 +351,39 @@ mod tests {
             ..CommonHeaderData::default()
         };
         check_round_trip(Version::R2000, &header);
+    }
+
+    #[test]
+    fn material_flag_round_trips_for_r2007_plus() {
+        // material_flag is meaningful from R2007 onward. When set to
+        // 0b11 ("by handle") the handle stream emits a material H;
+        // here we only check the common-header BB round-trips on its
+        // own. Pre-R2007 versions don't carry this field, so we expect
+        // it to come back as the default 0b00.
+        for flag in [0b00, 0b01, 0b10, 0b11] {
+            let header = CommonHeaderData {
+                material_flag: flag,
+                ..CommonHeaderData::default()
+            };
+            check_round_trip(Version::R2007, &header);
+            check_round_trip(Version::R2010, &header);
+            check_round_trip(Version::R2018, &header);
+        }
+    }
+
+    #[test]
+    fn material_flag_pre_r2007_falls_back_to_zero() {
+        // R14/R2000 do not carry the material BB on the wire, so any
+        // input flag is dropped to 0 on round-trip.
+        let header = CommonHeaderData {
+            material_flag: 0b11,
+            ..CommonHeaderData::default()
+        };
+        let mut w = BitWriter::new();
+        header.encode_for_version(Version::R2000, &mut w).unwrap();
+        let bytes = w.into_bytes();
+        let mut r = BitReader::new(&bytes);
+        let got = CommonHeaderData::decode_for_version(Version::R2000, &mut r).unwrap();
+        assert_eq!(got.material_flag, 0);
     }
 }

@@ -69,9 +69,10 @@ use crate::dwg::file::header_vars::HeaderVarsSection;
 use crate::dwg::file::object_map::{ObjectMap, ObjectMapEntry};
 use crate::dwg::file::r2000_layout::R2000Object;
 use crate::dwg::file::system_section::{
-    decode_section_info, encode_page_map, encode_section_info, read_system_page, write_system_page,
-    CompressionType, PageDescriptor, R2004FileHeader, SectionInfoDescriptor, SectionInfoHeader,
-    SectionInfoPage, R2004_HEADER_OFFSET, SYSTEM_PAGE_HEADER_SIZE,
+    decode_section_info, encode_page_map, encode_section_info, read_data_page, read_system_page,
+    write_data_page, write_system_page, CompressionType, PageDescriptor, R2004FileHeader,
+    SectionInfoDescriptor, SectionInfoHeader, SectionInfoPage, R2004_HEADER_OFFSET,
+    SYSTEM_PAGE_HEADER_SIZE,
 };
 use crate::dwg::version::Version;
 
@@ -80,10 +81,16 @@ use crate::dwg::version::Version;
 /// 0x80-0x100, so the first data page sits at exactly 0x100.
 pub const R2004_FIRST_PAGE_OFFSET: u64 = 0x100;
 
-/// Page type tag used in the 20-byte system-page header for our
-/// data pages. AutoCAD uses arbitrary opaque tags here; we use `1` to
-/// match LibreDWG's default for compressed data pages.
-const DATA_PAGE_TYPE_TAG: u32 = 1;
+/// LibreDWG / OpenDesign `Dwg_Section_Type` values for the four
+/// sections we emit. These are the canonical `fixedtype` ids that go
+/// in the section-info descriptor *and* in the encrypted data-page
+/// header's `section_type` field; the reader uses them both to find
+/// a section by name and to assert page integrity. See
+/// `libredwg/include/dwg.h` `enum DWG_SECTION_TYPE`.
+const SECTION_TYPE_HEADER: u32 = 1;
+const SECTION_TYPE_CLASSES: u32 = 3;
+const SECTION_TYPE_HANDLES: u32 = 4;
+const SECTION_TYPE_OBJECTS: u32 = 7;
 
 /// Page type tag used for the page-map system page. Matches the
 /// LibreDWG constant `0x41630e3b` (`section_page_map`).
@@ -169,22 +176,31 @@ pub fn assemble_r2004(parts: R2004FileParts) -> DwgResult<Vec<u8>> {
     // the AcDb:AcDbObjects and AcDb:Handles sections specifically.
     let r2018_encrypted = parts.version == Version::R2018;
     let mut cursor: u64 = R2004_FIRST_PAGE_OFFSET;
-    let mut data_pages: Vec<(String, PageDescriptor, Vec<u8>, bool)> = Vec::with_capacity(4);
+    let mut data_pages: Vec<(String, u32, PageDescriptor, Vec<u8>, bool)> = Vec::with_capacity(4);
 
     let mut next_page_id: i32 = 1;
+    // Emit a data page using the LibreDWG-compatible encrypted 32-byte
+    // page header + raw payload framing (see
+    // `system_section::write_data_page`). `section_type` is the
+    // LibreDWG `Dwg_Section_Type` id; it's stored both in the page
+    // header and in the section-info descriptor that points at this
+    // page, so the reader can cross-check page integrity. `encrypted`
+    // is the R2018 magic-byte XOR flag applied to the payload bytes
+    // (the 32-byte page header has its own per-page XOR mask and is
+    // always scrambled).
     let push_data_page = |name: &str,
+                          section_type: u32,
                           payload: &[u8],
                           encrypted: bool,
                           cursor: &mut u64,
                           next_page_id: &mut i32,
-                          pages: &mut Vec<(String, PageDescriptor, Vec<u8>, bool)>|
+                          pages: &mut Vec<(String, u32, PageDescriptor, Vec<u8>, bool)>|
      -> DwgResult<()> {
-        let wire = write_system_page(
-            DATA_PAGE_TYPE_TAG,
-            payload,
-            CompressionType::Compressed,
-            encrypted,
-        )?;
+        let mut payload_buf = payload.to_vec();
+        if encrypted {
+            crate::dwg::file::pages::xor_decrypt_handle_page(&mut payload_buf, 0);
+        }
+        let wire = write_data_page(section_type, &payload_buf, 0, *cursor);
         let descriptor = PageDescriptor {
             page_id: *next_page_id,
             page_size: wire.len() as u32,
@@ -192,12 +208,13 @@ pub fn assemble_r2004(parts: R2004FileParts) -> DwgResult<Vec<u8>> {
         };
         *cursor += wire.len() as u64;
         *next_page_id += 1;
-        pages.push((name.to_string(), descriptor, wire, encrypted));
+        pages.push((name.to_string(), section_type, descriptor, wire, encrypted));
         Ok(())
     };
 
     push_data_page(
         SECTION_HEADER,
+        SECTION_TYPE_HEADER,
         &header_vars_bytes,
         false,
         &mut cursor,
@@ -206,6 +223,7 @@ pub fn assemble_r2004(parts: R2004FileParts) -> DwgResult<Vec<u8>> {
     )?;
     push_data_page(
         SECTION_CLASSES,
+        SECTION_TYPE_CLASSES,
         &classes_bytes,
         false,
         &mut cursor,
@@ -215,31 +233,43 @@ pub fn assemble_r2004(parts: R2004FileParts) -> DwgResult<Vec<u8>> {
     let objects_page_offset = cursor;
     push_data_page(
         SECTION_OBJECTS,
+        SECTION_TYPE_OBJECTS,
         &objects_bytes,
         r2018_encrypted,
         &mut cursor,
         &mut next_page_id,
         &mut data_pages,
     )?;
-    // Now we know `objects_page_offset`; populate the object map with
-    // absolute file offsets. We add the system-page header size so the
-    // offsets point past the page envelope to the actual record bytes.
-    // (For round-trip purposes this is informational only — the reader
-    // decompresses the page back into a flat byte stream and uses its
-    // own cursor, not these absolute offsets.)
+    // Populate the object map. On R2004+ the OBJECTS section is
+    // LZ77-compressed inside a system page, so a file-absolute offset
+    // would point into compressed bytes and be useless for random
+    // access. The convention (matching LibreDWG and the OpenDesign
+    // Specification § "R2004+ object map") is to record the offset
+    // within the DECOMPRESSED objects section instead — external tools
+    // decompress the page into a flat buffer and then seek into it
+    // using these offsets. `record_section_offsets[i]` is exactly that
+    // logical offset, populated by `objects_section.rs` as it lays out
+    // record bytes.
+    //
+    // (For our own self-round-trip we don't actually consume these
+    // offsets — the reader walks the decompressed buffer
+    // sequentially — but writing the semantically correct value keeps
+    // the file readable by AutoCAD's recovery mode and LibreDWG's
+    // `dwgread`.)
+    let _ = objects_page_offset; // intentionally unused; see comment above
+    let _ = SYSTEM_PAGE_HEADER_SIZE;
     let mut object_map = ObjectMap::new();
     for &i in &sorted_indices {
         object_map.entries.push(ObjectMapEntry {
             handle: parts.objects[i].handle.value,
-            file_offset: objects_page_offset
-                + SYSTEM_PAGE_HEADER_SIZE as u64
-                + record_section_offsets[i],
+            file_offset: record_section_offsets[i],
         });
     }
     let mut object_map_bytes = Vec::new();
     object_map.encode(&mut object_map_bytes)?;
     push_data_page(
         SECTION_HANDLES,
+        SECTION_TYPE_HANDLES,
         &object_map_bytes,
         r2018_encrypted,
         &mut cursor,
@@ -253,7 +283,7 @@ pub fn assemble_r2004(parts: R2004FileParts) -> DwgResult<Vec<u8>> {
     //    about to emit so the page map is self-describing.
     let mut page_descriptors: Vec<PageDescriptor> = data_pages
         .iter()
-        .map(|(_, descriptor, _, _)| *descriptor)
+        .map(|(_, _, descriptor, _, _)| *descriptor)
         .collect();
     // Reserve placeholder slots for the page-map page itself and the
     // section-info page. We'll back-patch their sizes after writing.
@@ -271,8 +301,25 @@ pub fn assemble_r2004(parts: R2004FileParts) -> DwgResult<Vec<u8>> {
     });
 
     // 4. Build the section-info payload.
+    //
+    // **`compressed` flag semantics:** LibreDWG encodes `1 = not
+    // compressed (stored raw)` and `2 = LZ77`. Since we now emit
+    // data pages with raw payloads (matching LibreDWG's
+    // `copy_R2004_section` on the encode side — "always use raw copy
+    // for data section pages, as the LZ compressor output is not yet
+    // ODA-compatible"), the descriptor advertises `1`. The page-map
+    // and section-info system pages remain `2` because they use the
+    // LZ77 "store" framing on disk.
+    //
+    // **`type_tag` (= `fixedtype`)** is the same LibreDWG
+    // `Dwg_Section_Type` id we wrote into the page header's
+    // `section_type` field. The reader uses this to cross-check that
+    // the page it's about to decode actually belongs to the section
+    // it's looking up by name.
     let mut section_descriptors: Vec<SectionInfoDescriptor> = Vec::with_capacity(4);
-    for (logical_id, (name, descriptor, wire, encrypted)) in data_pages.iter().enumerate() {
+    for (logical_id, (name, section_type, descriptor, wire, encrypted)) in
+        data_pages.iter().enumerate()
+    {
         let mut desc = SectionInfoDescriptor::with_name(name);
         let decompressed_size = match logical_id {
             0 => header_vars_bytes.len() as u64,
@@ -283,8 +330,8 @@ pub fn assemble_r2004(parts: R2004FileParts) -> DwgResult<Vec<u8>> {
         };
         desc.size = decompressed_size;
         desc.max_decomp_size = decompressed_size.max(1) as u32;
-        desc.compressed = 2; // LZ77
-        desc.type_tag = DATA_PAGE_TYPE_TAG;
+        desc.compressed = 1; // stored (raw inside the encrypted page header)
+        desc.type_tag = *section_type;
         // R2018: encrypted=2 marks a section as XOR-masked. LibreDWG
         // treats encrypted=0|1 as "plain" and encrypted=2 as the
         // R2018 XOR. We use the same convention.
@@ -306,31 +353,65 @@ pub fn assemble_r2004(parts: R2004FileParts) -> DwgResult<Vec<u8>> {
     };
     let section_info_payload = encode_section_info(section_info_header, &section_descriptors);
 
-    // 5. Page-map system page first (already at `cursor`). The page
-    //    map and section-info pages are never encrypted — they're the
-    //    bootstrap data the reader needs before it can interpret
-    //    section-level encryption flags.
-    let page_map_payload = encode_page_map(&page_descriptors);
-    let page_map_wire = write_system_page(
-        PAGE_MAP_TYPE_TAG,
-        &page_map_payload,
-        CompressionType::Compressed,
-        false,
-    )?;
-    let page_map_offset = cursor;
-    cursor += page_map_wire.len() as u64;
-    page_descriptors[page_map_descriptor_index].page_size = page_map_wire.len() as u32;
-
-    // 6. Section-info system page.
+    // 5. Pre-encode the section-info page so we know its wire size.
+    //    Section info is laid out AFTER the page map but its size is
+    //    independent of the page map's contents (it only describes
+    //    data sections, not bootstrap sections), so we can compute it
+    //    once and freeze the value.
+    //
+    //    The page map and section-info pages are never encrypted —
+    //    they're the bootstrap data the reader needs before it can
+    //    interpret section-level encryption flags.
     let section_info_wire = write_system_page(
         SECTION_INFO_TYPE_TAG,
         &section_info_payload,
         CompressionType::Compressed,
         false,
     )?;
+    page_descriptors[section_info_descriptor_index].page_size = section_info_wire.len() as u32;
+
+    // 6. Iteratively encode the page map until its own page_size
+    //    stabilizes. This breaks the chicken-and-egg between the page
+    //    map's wire size and the page_size field it stores for itself:
+    //    each time the page map's encoded size changes, the
+    //    page_descriptors entry for the map updates, which changes the
+    //    bytes the next iteration compresses. In practice this
+    //    converges in 1-2 rounds because LZ77 of a tiny payload is
+    //    extremely stable — a 4-byte change in one of N fixed-width
+    //    records typically alters the compressed output by 0 bytes,
+    //    rarely by 1-2 bytes when it crosses a literal-run boundary.
+    //
+    //    We cap the loop at 8 iterations as a defensive measure; any
+    //    real input converges in at most 3.
+    let page_map_offset = cursor;
+    let mut page_map_wire: Vec<u8> = Vec::new();
+    let mut prev_page_map_size: u32 = 0;
+    for iteration in 0..8 {
+        page_descriptors[page_map_descriptor_index].page_size = prev_page_map_size;
+        let payload = encode_page_map(&page_descriptors);
+        page_map_wire = write_system_page(
+            PAGE_MAP_TYPE_TAG,
+            &payload,
+            CompressionType::Compressed,
+            false,
+        )?;
+        let new_size = page_map_wire.len() as u32;
+        if new_size == prev_page_map_size {
+            break;
+        }
+        prev_page_map_size = new_size;
+        if iteration == 7 {
+            return Err(DwgError::InternalInvariant(
+                "R2004 page-map size did not converge in 8 iterations".into(),
+            ));
+        }
+    }
+    cursor += page_map_wire.len() as u64;
+    page_descriptors[page_map_descriptor_index].page_size = page_map_wire.len() as u32;
+
+    // 7. Section-info page comes immediately after the page map.
     let section_info_offset = cursor;
     cursor += section_info_wire.len() as u64;
-    page_descriptors[section_info_descriptor_index].page_size = section_info_wire.len() as u32;
     page_descriptors[section_info_descriptor_index].file_offset = section_info_offset;
 
     // 7. Encode the legacy file header (0x80 bytes).
@@ -347,19 +428,38 @@ pub fn assemble_r2004(parts: R2004FileParts) -> DwgResult<Vec<u8>> {
     legacy.resize(R2004_HEADER_OFFSET, 0);
 
     // 8. Encode the encrypted R2004 file header (120 bytes).
+    //
+    // `section_map_address` points to the PAGE MAP system page (id=-1),
+    // not the section info — the page map is the bootstrap that lets
+    // a reader translate page ids into file offsets, and the section
+    // info itself is found by looking up page id=-2 inside that map.
+    // (This matches LibreDWG decode.c::read_R2004_section_map, which
+    // expects to find SECTION_PAGE_MAP_MAGIC at
+    // `section_map_address + 0x100`.)
+    //
+    // **Address convention:** all "address" fields in the R2004 file
+    // header — `section_map_address`, `last_section_address`,
+    // `secondheader_address` — are stored as offsets **relative to
+    // the start of the data-page region** (offset 0x100), NOT as
+    // file-absolute byte offsets. LibreDWG adds `0x100` when reading
+    // (see `dwg->fhdr.r2004_header.section_map_address + 0x100`).
     let mut r2004_hdr = R2004FileHeader::new();
     r2004_hdr.header_address = R2004_FIRST_PAGE_OFFSET as u32;
-    r2004_hdr.section_map_id = (page_descriptors.len() - 1) as u32; // section_info's page id slot
-    r2004_hdr.section_map_address = section_info_offset;
+    // section_map_id is the page id of the page map itself (-1).
+    // R2004FileHeader stores it as u32; LibreDWG reinterprets the bits
+    // as i32 to recover negative ids. We write 0xFFFFFFFF (= -1).
+    r2004_hdr.section_map_id = u32::MAX;
+    r2004_hdr.section_map_address = page_map_offset - R2004_FIRST_PAGE_OFFSET;
     r2004_hdr.section_info_id = -2;
     r2004_hdr.numsections = section_descriptors.len() as u32;
     r2004_hdr.section_array_size = page_descriptors.len() as u32;
     r2004_hdr.last_section_id = section_descriptors.len() as u32;
-    r2004_hdr.last_section_address = page_descriptors
+    let last_section_abs = page_descriptors
         .iter()
         .map(|p| p.file_offset + u64::from(p.page_size))
         .max()
         .unwrap_or(R2004_FIRST_PAGE_OFFSET);
+    r2004_hdr.last_section_address = last_section_abs - R2004_FIRST_PAGE_OFFSET;
     r2004_hdr.secondheader_address = 0; // none emitted yet
     let r2004_encrypted = r2004_hdr.encode_encrypted();
 
@@ -375,7 +475,7 @@ pub fn assemble_r2004(parts: R2004FileParts) -> DwgResult<Vec<u8>> {
     // LibreDWG's `decode_R2004_section` walker consumes.
     out.resize(R2004_FIRST_PAGE_OFFSET as usize, 0);
     debug_assert_eq!(out.len(), R2004_FIRST_PAGE_OFFSET as usize);
-    for (_, _, wire, _) in &data_pages {
+    for (_, _, _, wire, _) in &data_pages {
         out.extend_from_slice(wire);
     }
     debug_assert_eq!(out.len() as u64, page_map_offset);
@@ -420,13 +520,54 @@ pub fn parse_r2004(bytes: &[u8]) -> DwgResult<R2004File> {
     crate::dwg::file::system_section::encrypt_lcg_inplace(&mut encrypted_hdr);
     let r2004_hdr = R2004FileHeader::from_decrypted(&encrypted_hdr)?;
 
-    // 3. Read the section-info system page first (its offset is in
-    //    the file header).
-    let section_info_offset = r2004_hdr.section_map_address as usize;
-    if section_info_offset >= bytes.len() {
+    // 3. Read the PAGE MAP system page first. `section_map_address`
+    //    points at it (NOT at the section info). The page map gives
+    //    us (page_id, page_size) entries from which we compute the
+    //    file offset of every page in the file, including the
+    //    section-info page (id = section_info_id, usually -2).
+    //
+    //    `section_map_address` is stored as a relative offset; the
+    //    absolute file position is `+ R2004_FIRST_PAGE_OFFSET` (0x100).
+    //    See the matching writer comment in `assemble_r2004` and
+    //    LibreDWG decode.c::read_R2004_section_map.
+    let page_map_offset = (r2004_hdr.section_map_address + R2004_FIRST_PAGE_OFFSET) as usize;
+    if page_map_offset >= bytes.len() {
         return Err(DwgError::DanglingHandle {
             handle: 0,
             offset: r2004_hdr.section_map_address,
+            file_size: bytes.len(),
+        });
+    }
+    let (page_map_page_header, page_map_payload) =
+        read_system_page(&bytes[page_map_offset..], false)?;
+    if page_map_page_header.section_type != PAGE_MAP_TYPE_TAG {
+        return Err(DwgError::InternalInvariant(format!(
+            "R2004 page-map page type mismatch: got 0x{:08x} expected 0x{:08x}",
+            page_map_page_header.section_type, PAGE_MAP_TYPE_TAG
+        )));
+    }
+    let page_descriptors = crate::dwg::file::system_section::decode_page_map(
+        &page_map_payload,
+        R2004_FIRST_PAGE_OFFSET,
+    )?;
+
+    // 3b. Look up the section-info page (id = section_info_id, usually
+    //     -2) inside the page map to get its file offset, then read
+    //     it. This matches LibreDWG's two-step bootstrap.
+    let section_info_page_id = r2004_hdr.section_info_id;
+    let section_info_descriptor = page_descriptors
+        .iter()
+        .find(|p| p.page_id == section_info_page_id)
+        .ok_or_else(|| {
+            DwgError::InternalInvariant(format!(
+                "R2004 page map has no entry for section_info_id={section_info_page_id}"
+            ))
+        })?;
+    let section_info_offset = section_info_descriptor.file_offset as usize;
+    if section_info_offset >= bytes.len() {
+        return Err(DwgError::DanglingHandle {
+            handle: 0,
+            offset: section_info_descriptor.file_offset,
             file_size: bytes.len(),
         });
     }
@@ -461,16 +602,25 @@ pub fn parse_r2004(bytes: &[u8]) -> DwgResult<R2004File> {
                     file_size: bytes.len(),
                 });
             }
-            let (page_header, payload) = read_system_page(&bytes[off..], page_encrypted)?;
+            // Data pages use the 32-byte XOR-encrypted page header
+            // (LibreDWG-compatible), NOT the 20-byte system-page
+            // envelope. The two-stage bootstrap above already read the
+            // system pages (page-map, section-info); from here on out
+            // every page we look at is a data page.
+            let (page_header, payload) = read_data_page(&bytes[off..], page.address)?;
             if page_header.section_type != descriptor.type_tag {
                 return Err(DwgError::InternalInvariant(format!(
-                    "R2004 data page type mismatch for section {:?}: got 0x{:08x} expected 0x{:08x}",
+                    "R2004 data page type mismatch for section {:?}: got {} expected {}",
                     descriptor.name_str(),
                     page_header.section_type,
                     descriptor.type_tag,
                 )));
             }
-            combined.extend_from_slice(&payload);
+            let mut payload_owned = payload.to_vec();
+            if page_encrypted {
+                crate::dwg::file::pages::xor_decrypt_handle_page(&mut payload_owned, 0);
+            }
+            combined.extend_from_slice(&payload_owned);
         }
         match descriptor.name_str() {
             SECTION_HEADER => {

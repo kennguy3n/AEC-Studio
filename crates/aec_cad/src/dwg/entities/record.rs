@@ -487,12 +487,25 @@ fn encode_handle_stream(
             .unwrap_or(HandleRef { code: 5, value: 0 });
         w.write_h(ps)?;
     }
-    // Material handle: not yet emitted (we always encode the material
-    // flag as BYLAYER in CommonHeaderData::encode_for_version, so
-    // there's nothing to do here until structured material support
-    // lands).
-    if let Some(m) = handles.material {
+    // Material handle iff material_flag == 0b11 (R2007+ only). Mirrors
+    // the plot-style handle convention. We treat this as a hard
+    // invariant on the encoder side: if the caller marked the flag as
+    // "handle" we must have a handle to emit, and vice-versa.
+    if common.material_flag == 0b11 {
+        let m = handles.material.ok_or_else(|| {
+            DwgError::InternalInvariant(
+                "CommonHeaderData::material_flag is 0b11 but ObjectHandles::material is None; \
+                 set material_flag to 0 (BYLAYER) or provide a material handle."
+                    .into(),
+            )
+        })?;
         w.write_h(m)?;
+    } else if handles.material.is_some() {
+        return Err(DwgError::InternalInvariant(
+            "ObjectHandles::material is Some but CommonHeaderData::material_flag is not 0b11; \
+             set material_flag = 0b11 to emit the handle."
+                .into(),
+        ));
     }
     Ok(())
 }
@@ -527,7 +540,11 @@ fn decode_handle_stream(
     } else {
         None
     };
-    let material = None;
+    let material = if common.material_flag == 0b11 {
+        Some(r.read_h()?)
+    } else {
+        None
+    };
     Ok(ObjectHandles {
         owner,
         reactors,
@@ -690,6 +707,63 @@ mod tests {
         assert_eq!(decoded.handles.x_dictionary, Some(xdict));
         assert_eq!(decoded.handles.layer, layer);
         assert!(!decoded.common.xdict_missing);
+    }
+
+    #[test]
+    fn record_round_trips_material_handle_on_r2010() {
+        // Symmetric counterpart to the xdict round-trip test: encoder
+        // and decoder must both treat the material handle the same way,
+        // gated on common.material_flag == 0b11. Historically the
+        // encoder emitted the handle whenever ObjectHandles::material
+        // was Some(_) but the decoder always returned None, which
+        // silently corrupted the handle-stream alignment whenever a
+        // caller populated the field.
+        let material = HandleRef {
+            code: 5,
+            value: 0xab,
+        };
+        let common = CommonHeaderData {
+            material_flag: 0b11,
+            ..CommonHeaderData::default()
+        };
+        let handles = ObjectHandles {
+            material: Some(material),
+            ..build_handles()
+        };
+        let record = ObjectRecord {
+            object_type: ObjectType::Line,
+            handle: HandleRef { code: 0, value: 1 },
+            common,
+            payload_bits: BitBuf::new(),
+            handles,
+        };
+        let bytes = record.encode(Version::R2010).unwrap();
+        let (decoded, _) = ObjectRecord::decode(Version::R2010, &bytes).unwrap();
+        assert_eq!(decoded.common.material_flag, 0b11);
+        assert_eq!(decoded.handles.material, Some(material));
+        assert_eq!(decoded.handles.layer, record.handles.layer);
+    }
+
+    #[test]
+    fn record_rejects_material_handle_when_flag_disagrees() {
+        // If the caller supplies a material handle but leaves
+        // material_flag at 0b00 (BYLAYER), the encoder must surface the
+        // inconsistency rather than silently emit bytes the decoder
+        // will never read. (Mirrors the xdict invariant above.)
+        let mut handles = build_handles();
+        handles.material = Some(HandleRef {
+            code: 5,
+            value: 0xab,
+        });
+        let record = ObjectRecord {
+            object_type: ObjectType::Line,
+            handle: HandleRef { code: 0, value: 1 },
+            common: CommonHeaderData::default(), // material_flag = 0
+            payload_bits: BitBuf::new(),
+            handles,
+        };
+        let err = record.encode(Version::R2010).unwrap_err();
+        assert!(matches!(err, DwgError::InternalInvariant(_)));
     }
 
     #[test]

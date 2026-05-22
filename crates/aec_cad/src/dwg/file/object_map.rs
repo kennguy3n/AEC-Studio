@@ -36,7 +36,18 @@ use crate::dwg::error::{DwgError, DwgResult};
 pub struct ObjectMapEntry {
     /// Handle value (file-wide unique object identifier).
     pub handle: u64,
-    /// File-absolute byte offset of the object record.
+    /// Byte offset of the object record, interpreted relative to the
+    /// containing OBJECTS section:
+    ///
+    /// - **R13 / R14 / R2000**: file-absolute offset (the OBJECTS
+    ///   section is stored uncompressed at a known file offset, so the
+    ///   absolute file offset and the section-relative offset are
+    ///   numerically identical for AutoCAD's seek-and-decode loop).
+    /// - **R2004+**: offset within the DECOMPRESSED OBJECTS section.
+    ///   The on-disk OBJECTS page is LZ77-compressed, so a file-
+    ///   absolute offset would be meaningless — external tools (e.g.
+    ///   AutoCAD recovery) decompress the page into a flat buffer and
+    ///   then seek into it using these offsets.
     pub file_offset: u64,
 }
 

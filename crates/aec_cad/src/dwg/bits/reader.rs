@@ -381,24 +381,35 @@ impl<'a> BitReader<'a> {
         Ok([self.read_dd(default[0])?, self.read_dd(default[1])?])
     }
 
-    /// Modular Char (MC, signed). Variable-length: up to 4 bytes,
+    /// Modular Char (MC, signed). Variable-length: up to 5 bytes,
     /// 7 data bits per byte, MSB is the continuation flag. The sign
     /// bit is the next-to-MSB of the *last* byte.
+    ///
+    /// The accumulator is u64 because an i32 at the extremes of its
+    /// range (`i32::MIN`, `i32::MAX`) requires 5 MC bytes —
+    /// 5 × 7 = 35 bits — to round-trip through `write_mc` without
+    /// losing the sign bit. Using u32 here would overflow the shift
+    /// (`1 << 34`) on the 5th byte and silently corrupt the value.
     pub fn read_mc(&mut self) -> DwgResult<i32> {
-        let mut value: u32 = 0;
-        let mut shift = 0;
+        let mut value: u64 = 0;
+        let mut shift: u32 = 0;
         for byte_idx in 0..5 {
             let byte = self.read_bits_u32(8)?;
-            let payload = byte & 0x7f;
+            let payload = u64::from(byte & 0x7f);
             value |= payload << shift;
             shift += 7;
             if byte & 0x80 == 0 {
                 // Final byte. Sign bit is bit 6 of this last byte (i.e.
                 // the high bit of the 7-bit payload).
-                let sign_bit_mask: u32 = 1 << (shift - 1);
+                let sign_bit_mask: u64 = 1u64 << (shift - 1);
                 let signed = if value & sign_bit_mask != 0 {
-                    let extended = value | !((1u32 << shift) - 1);
-                    extended as i32
+                    // Sign-extend across the full u64, then truncate to
+                    // i32. The width of the signed window is `shift`
+                    // bits, so the mask of "data bits" is
+                    // `(1 << shift) - 1` and inverting it produces the
+                    // sign-extension high bits.
+                    let extended = value | !((1u64 << shift) - 1);
+                    extended as i64 as i32
                 } else {
                     value as i32
                 };
@@ -681,6 +692,24 @@ mod tests {
         // Second byte (high): continuation=0, payload=0b0000001 → 0x01
         let mut r = BitReader::new(&[0xc8, 0x01]);
         assert_eq!(r.read_mc().unwrap(), 200);
+    }
+
+    #[test]
+    fn read_mc_five_byte_extremes_round_trip() {
+        // Values at the extremes of i32 require a 5-byte MC encoding
+        // (5 × 7 = 35 bits, needed for sign-extended 32-bit ints).
+        // Both writer and reader must agree at the u32-overflow boundary;
+        // historically the reader's u32 accumulator overflowed on the
+        // 5th byte and corrupted the value silently.
+        use crate::dwg::bits::writer::BitWriter;
+        for value in [i32::MAX, i32::MIN, 0x4000_0000, -0x4000_0001, 0x0fff_ffff] {
+            let mut w = BitWriter::new();
+            w.write_mc(value).unwrap();
+            let bytes = w.into_bytes();
+            let mut r = BitReader::new(&bytes);
+            let decoded = r.read_mc().unwrap();
+            assert_eq!(decoded, value, "round-trip failed for {value}");
+        }
     }
 
     #[test]
