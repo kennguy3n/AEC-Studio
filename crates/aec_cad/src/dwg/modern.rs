@@ -108,7 +108,7 @@ pub fn write_modern(doc: &DxfDocument, version: Version) -> DwgResult<Vec<u8>> {
         }
         let _ = (
             &records,
-            HeaderVarsSection::minimal(version),
+            HeaderVarsSection::libredwg_conformant(version),
             ClassesSection::empty(version),
         );
         let parts = R2007FileParts { version };
@@ -116,7 +116,7 @@ pub fn write_modern(doc: &DxfDocument, version: Version) -> DwgResult<Vec<u8>> {
     } else if version.has_paged_system_sections() {
         let parts = R2004FileParts {
             version,
-            header_vars: HeaderVarsSection::minimal(version),
+            header_vars: HeaderVarsSection::libredwg_conformant(version),
             classes: ClassesSection::empty(version),
             objects: records,
         };
@@ -124,7 +124,7 @@ pub fn write_modern(doc: &DxfDocument, version: Version) -> DwgResult<Vec<u8>> {
     } else {
         let parts = R2000FileParts {
             version,
-            header_vars: HeaderVarsSection::minimal(version),
+            header_vars: HeaderVarsSection::libredwg_conformant(version),
             classes: ClassesSection::empty(version),
             objects: records,
         };

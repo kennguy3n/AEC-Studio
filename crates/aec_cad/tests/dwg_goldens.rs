@@ -54,32 +54,32 @@ fn golden(v: DwgVersion) -> Golden {
             blake3_hex: "0aa4e2fccde03a087c6d0b68120e8f0b7e2e4c46bd20bc1f6b2e58a2e3de4962",
         },
         DwgVersion::R14 => Golden {
-            bytes: 174,
-            blake3_hex: "1ed827cae802dbdcf6c42345494c6ca716575a2f994bb6d7ff88d7a9c186358d",
+            bytes: 476,
+            blake3_hex: "c1e7d8b51ad84eeb5e690f5c97bfe08e4bcd96194d0c78cfe0f2074a77936834",
         },
         DwgVersion::R2000 => Golden {
-            bytes: 175,
-            blake3_hex: "6cafc0fbda3c7e12b393e0923ffbc62a8a3d7dd5097e429c81a3e3a8fd3c9414",
+            bytes: 508,
+            blake3_hex: "7e1c8dba79efeccea836b4154c036c32d96af872fd9a2425b16178d182825974",
         },
         DwgVersion::R2004 => Golden {
-            bytes: 1051,
-            blake3_hex: "8357dad872a7bb9033d046c68c545f51891c63740c772ee1b50ef6375fadafca",
+            bytes: 1412,
+            blake3_hex: "9bb7733eea31ce6c373accf628afa69a87cf2977b8f78c2c30356f2e63d744d5",
         },
         DwgVersion::R2007 => Golden {
             bytes: 2944,
             blake3_hex: "33990028cd7387827e7c2d334de06a5ece4f6a35ade8d39f1db99b144c07230b",
         },
         DwgVersion::R2010 => Golden {
-            bytes: 1056,
-            blake3_hex: "52266c087d8962ce0717367c732e42631dbba3749918241a494fa22812a6c78d",
+            bytes: 1547,
+            blake3_hex: "c673af405c8b403b15812659f76a69661a06c3316c7de4bcdbb11230bc6459d6",
         },
         DwgVersion::R2013 => Golden {
-            bytes: 1057,
-            blake3_hex: "5330a82ae67c0dc7024494232003c69dc3ec39ad28229df243bb5d98785eb341",
+            bytes: 1550,
+            blake3_hex: "ecfbdfd29d1c7aae973d4473b26d79e874942780649ad19f01cc4bba7d624c6c",
         },
         DwgVersion::R2018 => Golden {
-            bytes: 1057,
-            blake3_hex: "d7e43d9871899c7be80511c6c6670567e2f82b34f06c020c091e347d62220476",
+            bytes: 1550,
+            blake3_hex: "45dbbc563d77d7790c49783fb5308b0a435a0546fdfffe737949fc6da0677bfa",
         },
     }
 }

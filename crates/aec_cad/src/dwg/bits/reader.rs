@@ -243,6 +243,29 @@ impl<'a> BitReader<'a> {
         }
     }
 
+    /// Read a Bit LongLong (BLL): 3-bit length prefix encoded as
+    /// `(BB << 1) | B`, followed by `len` little-endian payload bytes.
+    /// Mirrors [`crate::dwg::bits::writer::BitWriter::write_bll`] and
+    /// LibreDWG's `bit_read_BLL` for `REQUIREDVERSIONS` /
+    /// `preview_size`.
+    pub fn read_bll(&mut self) -> DwgResult<u64> {
+        let len_hi = self.read_bb()?;
+        let len_lo = u8::from(self.read_b()?);
+        let len = (len_hi << 1) | len_lo;
+        let mut value: u64 = 0;
+        for i in 0..len {
+            let byte = u64::from(self.read_bits_u32(8)?);
+            value |= byte << (i * 8);
+        }
+        Ok(value)
+    }
+
+    /// Raw Char (RC): exactly 8 bits, bit-aligned. Symmetric counterpart
+    /// to [`crate::dwg::bits::writer::BitWriter::write_rc`].
+    pub fn read_rc(&mut self) -> DwgResult<u8> {
+        Ok(self.read_bits_u32(8)? as u8)
+    }
+
     /// Read a Bit Double (BD, IEEE-754 64-bit).
     /// Control bits:
     /// - `00` → followed by 64-bit raw little-endian IEEE-754

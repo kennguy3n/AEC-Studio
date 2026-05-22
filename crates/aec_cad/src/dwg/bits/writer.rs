@@ -5,6 +5,7 @@
 //! each scalar type.
 
 use crate::dwg::error::{DwgError, DwgResult};
+use crate::dwg::version::Version;
 
 use super::reader::{Color, HandleRef};
 
@@ -159,6 +160,74 @@ impl BitWriter {
     pub fn write_bytes(&mut self, bytes: &[u8]) -> DwgResult<()> {
         for &b in bytes {
             self.write_bits_u32(8, u32::from(b))?;
+        }
+        Ok(())
+    }
+
+    /// Raw Char (RC): exactly 8 bits, bit-aligned. Same on-wire shape
+    /// as a single byte through [`Self::write_bytes`]; provided as a
+    /// named alias because the LibreDWG spec calls this the `RC` type
+    /// and several header variables emit it directly.
+    pub fn write_rc(&mut self, value: u8) -> DwgResult<()> {
+        self.write_bits_u32(8, u32::from(value))
+    }
+
+    /// Bit LongLong (BLL): compacted u64. The first 3 bits encode the
+    /// byte-length `len` (0..=15) as `(BB << 1) | B`. Then `len` raw
+    /// bytes follow in little-endian order (least-significant byte
+    /// first). Used for `REQUIREDVERSIONS` and `preview_size` in the
+    /// header. Mirrors `bit_write_BLL` in LibreDWG.
+    pub fn write_bll(&mut self, value: u64) -> DwgResult<()> {
+        // Determine minimum byte-length. `len` is the index past the
+        // most-significant non-zero byte; a value of zero produces
+        // `len = 0` (no payload bytes).
+        let len: u8 = if value == 0 {
+            0
+        } else {
+            let bits = 64 - value.leading_zeros() as u8;
+            bits.div_ceil(8)
+        };
+        if len > 15 {
+            return Err(DwgError::InternalInvariant(format!(
+                "write_bll length {len} out of range 0..=15"
+            )));
+        }
+        // 3-bit length prefix: BB (high 2 bits = len >> 1) + B (low 1 bit = len & 1).
+        self.write_bb(len >> 1)?;
+        self.write_b(len & 1 != 0)?;
+        let mut v = value;
+        for _ in 0..len {
+            self.write_bits_u32(8, (v & 0xff) as u32)?;
+            v >>= 8;
+        }
+        Ok(())
+    }
+
+    /// Append `len_bits` bits taken from `src` (treated as a forward
+    /// bit-stream starting at `src`'s bit 0) onto this writer at the
+    /// current cursor. Used to splice independent bit streams (e.g.
+    /// the R2007+ handle / string sub-streams) back into the main
+    /// section blob without round-tripping through byte boundaries.
+    pub fn append_bits_from(&mut self, src: &[u8], len_bits: u64) -> DwgResult<()> {
+        let needed_bytes = len_bits.div_ceil(8) as usize;
+        if src.len() < needed_bytes {
+            return Err(DwgError::InternalInvariant(format!(
+                "append_bits_from: source has {} bytes, need {needed_bytes} for {len_bits} bits",
+                src.len()
+            )));
+        }
+        let mut remaining = len_bits;
+        let mut byte_idx = 0usize;
+        while remaining >= 8 {
+            self.write_bits_u32(8, u32::from(src[byte_idx]))?;
+            byte_idx += 1;
+            remaining -= 8;
+        }
+        if remaining > 0 {
+            let last = src[byte_idx];
+            for shift in (8 - remaining as u8..8).rev() {
+                self.write_b((last >> shift) & 1 != 0)?;
+            }
         }
         Ok(())
     }
@@ -511,6 +580,46 @@ impl BitWriter {
             }
         }
     }
+
+    /// Version-aware CMC encoder. R2004 introduced the truecolor wire
+    /// format: index-override `BS = 0`, the full 32-bit ARGB value as
+    /// `BL`, and an `RC` method/flag byte. For pre-R2004 files this
+    /// falls through to the original palette-index `BS` form via
+    /// [`Self::write_cmc`]. Mirrors `bit_write_CMC` in
+    /// `libredwg/src/bits.c`.
+    pub fn write_cmc_v(&mut self, version: Version, color: &Color) -> DwgResult<()> {
+        if version < Version::R2004 {
+            return self.write_cmc(color);
+        }
+        // R2004+ truecolor form. The `method` byte (high byte of rgb)
+        // tags the color kind:
+        //   0xC0 = ByLayer (rgb = 0xC0000000, palette index 256)
+        //   0xC1 = ByBlock (rgb = 0xC1000000, palette index 0)
+        //   0xC2 = Entity / true RGB (low 24 bits are R<<16 | G<<8 | B)
+        //   0xC3 = Named-palette index (rgb = 0xC3000000 | palette_index)
+        // For `Color::Index(n)` the palette index goes into the low 9
+        // bits of rgb with method 0xC3. The trailing RC `flag` is 0
+        // unless method == 0xC2 with attached name/book strings (which
+        // header variables never carry, so flag = 0 here).
+        let rgb: u32 = match color {
+            Color::ByLayer => 0xC000_0000,
+            Color::ByBlock => 0xC100_0000,
+            Color::Rgb(r, g, b) => {
+                0xC200_0000 | (u32::from(*r) << 16) | (u32::from(*g) << 8) | u32::from(*b)
+            }
+            Color::Index(idx) => {
+                let palette = (*idx as i32) & 0x1FF;
+                0xC300_0000 | (palette as u32)
+            }
+            // Named colours are encoded as method = 0xC3 with the
+            // palette index = 0 and the name carried in the string
+            // stream; for header-vars defaults we never hit this path.
+            Color::Named(_) => 0xC300_0000,
+        };
+        self.write_bs(0)?;
+        self.write_bl(i64::from(rgb as i32))?;
+        self.write_rc(0)
+    }
 }
 
 #[cfg(test)]
@@ -606,6 +715,83 @@ mod tests {
         for v in [0_u64, 1, 255, 256, 65535, 65536, 4_000_000_000] {
             assert_eq!(v, round_trip(move |w| w.write_blu(v), |r| r.read_blu()));
         }
+    }
+
+    #[test]
+    fn bll_round_trips_special_values() {
+        for v in [
+            0_u64,
+            1,
+            255,
+            256,
+            65535,
+            65536,
+            0xff_ff_ff,
+            0xffff_ffff,
+            0x1_0000_0000,
+            0x12_3456_789a_bcde,
+            u64::from(u32::MAX),
+        ] {
+            assert_eq!(v, round_trip(move |w| w.write_bll(v), |r| r.read_bll()));
+        }
+    }
+
+    #[test]
+    fn bll_zero_uses_three_bits() {
+        // The empty-length prefix `000` is the minimal BLL encoding.
+        let mut w = BitWriter::new();
+        w.write_bll(0).unwrap();
+        assert_eq!(w.bit_position(), 3);
+    }
+
+    #[test]
+    fn rc_round_trips() {
+        for v in [0u8, 1, 0x7f, 0x80, 0xc1, 0xff] {
+            assert_eq!(v, round_trip(move |w| w.write_rc(v), |r| r.read_rc()));
+        }
+    }
+
+    #[test]
+    fn append_bits_from_concatenates_streams() {
+        // Build stream A: 0xa5 = 1010_0101 (8 bits) then `01` (2 bits).
+        let mut a = BitWriter::new();
+        a.write_rc(0xa5).unwrap();
+        a.write_b(false).unwrap();
+        a.write_b(true).unwrap();
+        let a_bits = a.bit_position();
+        let a_bytes = a.into_bytes();
+        assert_eq!(a_bits, 10);
+
+        // Stream B: `1101_0110` (8 bits) then `1` (1 bit) = 9 bits.
+        let mut b = BitWriter::new();
+        b.write_rc(0xd6).unwrap();
+        b.write_b(true).unwrap();
+        let b_bits = b.bit_position();
+        let b_bytes = b.into_bytes();
+        assert_eq!(b_bits, 9);
+
+        // Splice: A then B.
+        let mut out = BitWriter::new();
+        out.append_bits_from(&a_bytes, a_bits).unwrap();
+        out.append_bits_from(&b_bytes, b_bits).unwrap();
+        assert_eq!(out.bit_position(), a_bits + b_bits);
+
+        // Read it back.
+        let spliced = out.into_bytes();
+        let mut r = BitReader::new(&spliced);
+        assert_eq!(r.read_rc().unwrap(), 0xa5);
+        assert!(!r.read_b().unwrap());
+        assert!(r.read_b().unwrap());
+        assert_eq!(r.read_rc().unwrap(), 0xd6);
+        assert!(r.read_b().unwrap());
+    }
+
+    #[test]
+    fn append_bits_from_rejects_short_source() {
+        let mut out = BitWriter::new();
+        // Ask for 24 bits but supply only 1 byte (8 bits).
+        let err = out.append_bits_from(&[0xff], 24).unwrap_err();
+        assert!(matches!(err, DwgError::InternalInvariant(_)));
     }
 
     #[test]
