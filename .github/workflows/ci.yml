@@ -192,7 +192,6 @@ jobs:
     # time to actually invoke `dwgread` on each fixture.
     name: LibreDWG oracle (R12 → R2018)
     needs: gate
-    if: needs.gate.outputs.run_rust == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
