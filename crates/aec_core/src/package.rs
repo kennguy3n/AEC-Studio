@@ -143,29 +143,60 @@ impl ProjectPackage {
     /// Returns the loaded package; the upgraded manifest has been
     /// flushed to disk before this returns so a subsequent strict
     /// reader sees the new value. The DB connection is dropped — the
-    /// caller can re-open via [`Self::open_database`].
+    /// caller can re-open via [`Self::open_database`]. Callers that
+    /// know they will need a connection immediately should prefer
+    /// [`Self::open_with_master_key_and_database`] to avoid the
+    /// open-derive-PRAGMA dance running twice.
     ///
     /// Bridge entry points that have the master key (project_open,
     /// project_save, project_engine_status, project_audit_sync, ...)
     /// should prefer this over [`Self::open`] so legacy projects are
     /// brought to the current version on first touch.
     pub fn open_with_master_key(root: impl AsRef<Path>, master_key: &[u8; 32]) -> AecResult<Self> {
+        // Delegate to the connection-returning variant and discard the
+        // connection. This is a single open under the hood, not a
+        // double-open: the variant runs migrations *and* hands the
+        // connection back, so we just don't keep ours.
+        let (pkg, conn) = Self::open_with_master_key_and_database(root, master_key)?;
+        drop(conn);
+        Ok(pkg)
+    }
+
+    /// Like [`Self::open_with_master_key`] but returns the SQLCipher
+    /// connection that was opened during the upgrade walk, instead of
+    /// dropping it.
+    ///
+    /// Callers that know they will need a connection immediately
+    /// (e.g. `project_audit_sync` calls `AuditLog::mirror_to_sql`
+    /// right after upgrading) should prefer this over the bare
+    /// [`Self::open_with_master_key`] + a separate
+    /// [`Self::open_database`] call. The bare-plus-separate path runs
+    /// the key derivation, the `PRAGMA cipher_*` sequence, AND the
+    /// migration-registry no-op walk a second time, all of which
+    /// this variant avoids.
+    pub fn open_with_master_key_and_database(
+        root: impl AsRef<Path>,
+        master_key: &[u8; 32],
+    ) -> AecResult<(Self, rusqlite::Connection)> {
         let mut pkg = Self::open(root)?;
-        // Run any pending DB migrations even when the manifest is
-        // already at the latest version — `open_encrypted` is
-        // idempotent and this also protects against a manifest that
-        // got bumped without the DB catching up (e.g. an aborted
-        // previous upgrade).
-        // Open the DB once so the migration registry runs. We don't
-        // hold the connection past this scope; callers re-open via
-        // `open_database` when they actually need to query.
-        drop(pkg.open_database(master_key)?);
+        // Open the DB once so the migration registry runs. We hold
+        // the connection past this scope and hand it back to the
+        // caller so a subsequent `open_database` call isn't needed.
+        // `open_database` is itself idempotent (re-running the
+        // registry against an up-to-date DB is a no-op) but the
+        // key-derive + PRAGMA cipher dance is not free, so avoiding
+        // the second open is worth ~1–2 ms per call.
+        let conn = pkg.open_database(master_key)?;
+        // Run the manifest-side upgrade only after the SQL-side one
+        // succeeded. If the migration walk failed we don't want a
+        // bumped `schema_version` lying about which version the
+        // database is actually at.
         if pkg.manifest.needs_upgrade() {
             pkg.manifest.upgrade_schema_version();
             pkg.manifest.touch();
             pkg.write_manifest()?;
         }
-        Ok(pkg)
+        Ok((pkg, conn))
     }
 
     pub fn derive_key(&self, master_key: &[u8; 32]) -> AecResult<Key32> {

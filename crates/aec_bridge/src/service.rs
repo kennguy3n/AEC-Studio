@@ -271,13 +271,17 @@ impl BridgeService {
     /// happily report an out-of-sync state if the renderer forgets to
     /// call this.
     pub fn project_audit_sync(&mut self, path: &str) -> Result<u64, BridgeServiceError> {
-        // `open_with_master_key` runs any pending schema migrations
-        // (so the v2 `audit_chain` table exists on legacy v1
-        // projects) AND upgrades the manifest's `schema_version`
-        // field. Without this, `mirror_to_sql`'s INSERT would fail on
-        // a v1 project because the target table wouldn't exist.
-        let pkg = ProjectPackage::open_with_master_key(path, &self.master_key)?;
-        let mut conn = pkg.open_database(&self.master_key)?;
+        // `open_with_master_key_and_database` runs any pending schema
+        // migrations (so the v2 `audit_chain` table exists on legacy
+        // v1 projects) AND upgrades the manifest's `schema_version`
+        // field, AND hands us back the connection it opened — so we
+        // don't re-run the key-derive + `PRAGMA cipher_*` + migration
+        // walk a second time just to grab a connection for
+        // `mirror_to_sql`. Without the migration step,
+        // `mirror_to_sql`'s INSERT would fail on a v1 project because
+        // the target table wouldn't exist.
+        let (pkg, mut conn) =
+            ProjectPackage::open_with_master_key_and_database(path, &self.master_key)?;
         let log = AuditLog::open(pkg.root().join("audit").join("log.jsonl"))?;
         let n = log.mirror_to_sql(&mut conn)?;
         Ok(n as u64)
@@ -286,7 +290,19 @@ impl BridgeService {
     /// Read-only engine status for the renderer's status pane.
     /// Combines `meta.schema_version` (from the SQLCipher DB) with the
     /// audit chain head (from JSONL) and per-scope row counts (from the
-    /// SQL mirror). Never mutates the project.
+    /// SQL mirror).
+    ///
+    /// **Not** read-only at the byte level: [`ProjectPackage::open_database`]
+    /// calls [`aec_core::db::open_encrypted`], which runs the migration
+    /// registry, so a legacy v1 project's SQLCipher file *will* be
+    /// migrated forward on first read. The on-disk `manifest.json` is
+    /// intentionally left at its on-disk version — only the mutating
+    /// endpoints (`project_open`, `project_save`, `project_audit_sync`)
+    /// route through [`ProjectPackage::open_with_master_key`] to bump
+    /// the manifest. This means the SQL and JSON sides can briefly
+    /// diverge until the user's next mutating action, which is fine:
+    /// `validate()` accepts any version ≤ `SCHEMA_VERSION`, so the
+    /// project still opens cleanly through the read-only path.
     pub fn project_engine_status(
         &self,
         path: &str,
