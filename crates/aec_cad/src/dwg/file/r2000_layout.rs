@@ -430,7 +430,7 @@ mod tests {
     use crate::dwg::bits::BitWriter;
     use crate::dwg::entities::header_codec::CommonHeaderData;
     use crate::dwg::entities::line::LineEntity;
-    use crate::dwg::entities::record::{BitBuf, ObjectHandles};
+    use crate::dwg::entities::record::{BitBuf, ObjectCommonData, ObjectHandles, ObjectSupertype};
     use crate::dwg::entities::{ObjectRecord, ObjectType};
 
     fn one_line_record() -> ObjectRecord {
@@ -452,8 +452,11 @@ mod tests {
                 code: 0,
                 value: 0x10,
             },
+            supertype: ObjectSupertype::Entity,
+            object_common: ObjectCommonData::default(),
             common: CommonHeaderData::default(),
             payload_bits: BitBuf::new(), // empty payload for R2000 round-trip
+            string_payload_bits: BitBuf::new(),
             handles: ObjectHandles {
                 owner: Some(HandleRef {
                     code: 5,

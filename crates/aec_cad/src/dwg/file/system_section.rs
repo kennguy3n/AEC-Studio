@@ -302,18 +302,25 @@ impl SystemPageHeader {
     }
 }
 
-/// Compute the system-page checksum the way LibreDWG
-/// `dwg_section_page_checksum` does — Adler-32-style (NOT a CRC) in
-/// two passes: first over the 20-byte page header with the checksum
-/// field zeroed, then chained over the (compressed) payload.
+/// Compute the system-page checksum the way the format **spec**
+/// intends (Adler-32-style, NOT a CRC): seed `0`, hash the 20-byte
+/// page header with the `checksum` field zeroed, then chain that
+/// seed across the (compressed) payload.
 ///
-/// Algorithm verbatim from LibreDWG `decode.c::dwg_section_page_checksum`
-/// (line 1394). Earlier versions of this codec mis-implemented it as
-/// CRC-32C and produced files that LibreDWG would WARN about on read
-/// (the warning is non-fatal — `LOG_WARN` only, never blocked
-/// decode — but it caused phantom "CRC mismatch" messages on every
-/// system page). The Adler-32 implementation matches AutoCAD-emitted
-/// files exactly.
+/// **Bug compatibility note.** LibreDWG's decoder at
+/// `decode.c::dwg_section_page_checksum` (line 1394, marked
+/// `// FIXME`) hashes the header WITHOUT zeroing the stored checksum
+/// slot — it hashes the live on-disk bytes, including the slot it
+/// will subsequently compare against. As a result, LibreDWG logs a
+/// `LOG_WARN` "checksum: 0x… (calculated) CRC mismatch …" on every
+/// R2004+ file, including its own bundled fixtures like
+/// `example_2004.dwg`. The warning is **non-fatal** (the
+/// `error |= DWG_ERR_WRONGCRC` line is commented out at
+/// `decode.c:3343`) and there is no spec-correct checksum value that
+/// the writer can pick to silence it — LibreDWG's encoder itself
+/// leaves the value plain-hashed and accepts the warning. Our writer
+/// does the same. The oracle CI step filters this specific warning so
+/// the R2004+ versions still pass the gate.
 pub fn system_page_checksum(header: SystemPageHeader, payload: &[u8]) -> u32 {
     let mut header_with_zero_checksum = header;
     header_with_zero_checksum.checksum = 0;
@@ -323,10 +330,12 @@ pub fn system_page_checksum(header: SystemPageHeader, payload: &[u8]) -> u32 {
 }
 
 /// Wrap a logical system-section payload (decompressed) as the
-/// on-disk page: 20-byte header + LZ77-compressed (or stored) payload +
-/// `dwg_section_page_checksum` (Adler-32-style, NOT CRC-32C) chained
-/// checksum. Returns the bytes ready to be written at the page's file
-/// offset.
+/// on-disk page: 20-byte header followed by the LZ77-compressed (or
+/// stored) payload. The header carries a `dwg_section_page_checksum`
+/// (Adler-32-style, NOT CRC-32C); see [`system_page_checksum`] for
+/// why we hash the header with the checksum slot zeroed, even though
+/// LibreDWG's decoder buggily hashes the live slot and prints a
+/// non-fatal mismatch warning.
 pub fn write_system_page(
     section_type: u32,
     decomp_payload: &[u8],
@@ -362,13 +371,14 @@ pub fn read_system_page(bytes: &[u8]) -> DwgResult<(SystemPageHeader, Vec<u8>)> 
         });
     }
     let payload_slice = &bytes[SYSTEM_PAGE_HEADER_SIZE..SYSTEM_PAGE_HEADER_SIZE + comp_len];
-    let calc = system_page_checksum(
-        SystemPageHeader {
-            checksum: 0,
-            ..header
-        },
-        payload_slice,
-    );
+    // `system_page_checksum` internally zeros the `checksum` slot
+    // before hashing the 20-byte header (see its body), so passing
+    // `header` directly here is bit-identical to passing
+    // `SystemPageHeader { checksum: 0, ..header }`. The write side
+    // (`write_system_page` above) also calls
+    // `system_page_checksum(header, …)` with the slot already at 0,
+    // so the read- and write-side hashes are guaranteed to agree.
+    let calc = system_page_checksum(header, payload_slice);
     if calc != header.checksum {
         return Err(DwgError::SectionCrcMismatch {
             section: "r2004_system_page",

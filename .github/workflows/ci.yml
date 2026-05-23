@@ -187,16 +187,17 @@ jobs:
     # entity inventory matches what we wrote, we have strong evidence
     # the bit-level encoding is compliant.
     #
-    # **Currently informational.** Our native codec passes its own
-    # self-round-trip but does not yet produce files that LibreDWG
-    # 0.13.3 accepts on every version (R2007 is the only version
-    # known to round-trip cleanly under upstream `dwgread` today).
-    # Closing the per-version conformance gaps is a follow-up
-    # tracked separately; until then this job runs on every PR for
-    # observability but is marked `continue-on-error: true` so a
-    # known-bad fixture does not block unrelated merges. When all
-    # eight versions parse cleanly, flip the flag off and let this
-    # gate the build.
+    # **Blocking gate.** As of PR-G this job is part of the required
+    # checks set. All eight versions must:
+    #   1. exit 0 from `dwgread`
+    #   2. emit no `Error:` or `ERROR` lines on stderr
+    #   3. emit no `Warning:` lines EXCEPT a small allow-list of two
+    #      known LibreDWG-decoder bugs that fire on its own bundled
+    #      `example_2004.dwg` and cannot be silenced from the writer
+    #      side (see Allow-list in the gate step below).
+    #   4. their DXF round-trip must contain LINE / CIRCLE / TEXT
+    #      entities (except R12 and R2007 which are deliberately
+    #      empty-document fixtures).
     #
     # LibreDWG isn't packaged in Ubuntu, so we build it from source.
     # The build is cached so the steady-state CI run only takes the
@@ -204,7 +205,6 @@ jobs:
     name: LibreDWG oracle (R12 → R2018)
     needs: gate
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -268,58 +268,123 @@ jobs:
       - name: Read each fixture via LibreDWG (dwgread)
         run: |
           set -e
-          # This job is currently informational — the codec passes
-          # its own self-round-trip but does not yet produce files
-          # that upstream `dwgread` accepts on every version. We
-          # surface refusals as ::warning:: (yellow) annotations so
-          # they show in the PR's Files tab and on the run summary,
-          # but do NOT exit non-zero. When the codec reaches full
-          # conformance, swap the `warning` lines back to `error`
-          # and re-add the trailing `exit 1`.
-          pass=0
+          # Blocking gate. Each version must:
+          #   - exit 0 from `dwgread`
+          #   - emit no `Error:`/`ERROR` lines on stderr
+          #   - emit no unfiltered `Warning:` lines (see allow-list)
+          #
+          # Allow-list (two LibreDWG-decoder bugs that fire on its
+          # own bundled `example_2004.dwg` and cannot be silenced from
+          # the writer side — kept narrow to a single, version-gated
+          # pair so a future writer regression that produces a new
+          # warning still fails the gate):
+          #
+          #   * "checksum: 0x........ (calculated) CRC mismatch ..." —
+          #     `decode.c:3329` (marked `// FIXME`). LibreDWG hashes
+          #     the live page-header checksum slot during validation
+          #     instead of zeroing it, then compares to the same
+          #     slot. No writer-side checksum value can satisfy the
+          #     identity. LibreDWG's own encoder leaves it as the
+          #     plain spec-correct Adler-32 over the zero-slot header.
+          #
+          #   * "Invalid sections: 0 != numgaps: 0 + numsections: ..."
+          #     — `decode.c:1552`. LibreDWG reads `dwg->header.sections`
+          #     from the legacy file header `PRE(R_2004a)` only
+          #     (`header.spec:64`); on the R2004+ path the field stays
+          #     at its default 0, so the equality check is statically
+          #     false for any non-empty file. Cannot be fixed from the
+          #     writer.
+          #
+          # Both warnings only apply to R2004+ versions (R2004 /
+          # R2010 / R2013 / R2018); R12 / R14 / R2000 / R2007 use
+          # different wire formats and must remain warning-free.
+          ALLOW_R2004_PLUS='^Warning: checksum: 0x[0-9a-f]+ \(calculated\) CRC mismatch |^Warning: Invalid sections: 0 != numgaps: 0 \+ numsections: '
           fail=0
           for v in r12 r14 r2000 r2004 r2007 r2010 r2013 r2018; do
             path=/tmp/dwg_oracle/$v.dwg
             echo "::group::dwgread $v"
-            if dwgread --version >/dev/null 2>&1; then
-              # The exit code from dwgread is the source of truth.
-              # Non-zero means LibreDWG could not parse our file.
-              if dwgread -O DXF -o /tmp/dwg_oracle/$v.dxf "$path"; then
-                echo "✓ $v.dwg parsed cleanly"
-                pass=$((pass + 1))
-              else
-                echo "::warning::dwgread refused to read $v.dwg (known conformance gap)" >&2
-                fail=$((fail + 1))
-              fi
+            log=$(mktemp)
+            if dwgread -O DXF -o /tmp/dwg_oracle/$v.dxf "$path" >"$log" 2>&1; then
+              ec=0
             else
-              echo "::warning::dwgread binary missing — skipping $v"
+              ec=$?
             fi
+            cat "$log"
+            # Filter `Warning:` lines through the allow-list (R2004+
+            # versions only); everything else must stay warning-free.
+            case "$v" in
+              r2004|r2010|r2013|r2018)
+                unexpected_warnings=$(grep "^Warning:" "$log" | grep -Ev "$ALLOW_R2004_PLUS" || true)
+                ;;
+              *)
+                unexpected_warnings=$(grep "^Warning:" "$log" || true)
+                ;;
+            esac
+            errors=$(grep -E "^Error:|^ERROR" "$log" || true)
+            if [ "$ec" -ne 0 ]; then
+              echo "::error::$v.dwg: dwgread exited $ec" >&2
+              fail=$((fail + 1))
+            fi
+            if [ -n "$errors" ]; then
+              echo "::error::$v.dwg: unexpected Error/ERROR lines" >&2
+              echo "$errors" >&2
+              fail=$((fail + 1))
+            fi
+            if [ -n "$unexpected_warnings" ]; then
+              echo "::error::$v.dwg: unexpected Warning lines (outside allow-list)" >&2
+              echo "$unexpected_warnings" >&2
+              fail=$((fail + 1))
+            fi
+            if [ "$ec" -eq 0 ] && [ -z "$errors" ] && [ -z "$unexpected_warnings" ]; then
+              echo "✓ $v.dwg parsed cleanly"
+            fi
+            rm -f "$log"
             echo "::endgroup::"
           done
-          echo "LibreDWG conformance: $pass version(s) parsed, $fail refused."
+          if [ "$fail" -ne 0 ]; then
+            echo "LibreDWG oracle: $fail version(s) failed the gate."
+            exit 1
+          fi
 
       - name: Cross-check entity inventory in the emitted DXF
         run: |
           set -e
-          # We expect each output DXF (the ones dwgread *did* manage
-          # to translate) to contain LINE, CIRCLE, and TEXT entities
-          # — the three the fixture emitter writes. Missing files
-          # are already covered by the previous step's warnings, so
-          # we don't double-flag them here; missing entities inside
-          # an existing file remain a warning until conformance is
-          # complete.
+          # Each version that ships a non-empty document must contain
+          # LINE, CIRCLE, and TEXT entities — the three the fixture
+          # emitter writes. R12 (AC1009 wire format) and R2007 (sentinel
+          # AcDb:AcDbObjects payload, see PR-F1) are deliberately
+          # empty-document fixtures and skip the inventory check.
+          # `dwgread` writes DOS line endings on its DXF output, so we
+          # strip `\r` before matching.
+          fail=0
           for v in r12 r14 r2000 r2004 r2007 r2010 r2013 r2018; do
             dxf=/tmp/dwg_oracle/$v.dxf
             if [ ! -f "$dxf" ]; then
+              echo "::error::$v.dxf was not produced by dwgread" >&2
+              fail=$((fail + 1))
               continue
             fi
+            case "$v" in
+              r12|r2007)
+                echo "✓ $v: empty-document fixture (no entity inventory expected)"
+                continue
+                ;;
+            esac
+            stripped=$(tr -d '\r' < "$dxf")
             for kind in LINE CIRCLE TEXT; do
-              if ! grep -q "^${kind}$" "$dxf"; then
-                echo "::warning::$v.dxf missing $kind entity (known conformance gap)" >&2
+              if ! echo "$stripped" | grep -q "^${kind}$"; then
+                echo "::error::$v.dxf missing $kind entity" >&2
+                fail=$((fail + 1))
               fi
             done
-            echo "✓ $v: DXF reachable via dwgread"
+            if [ "$fail" -eq 0 ]; then
+              echo "✓ $v: DXF contains LINE / CIRCLE / TEXT"
+            fi
           done
+          if [ "$fail" -ne 0 ]; then
+            echo "LibreDWG oracle: DXF inventory check failed."
+            exit 1
+          fi
 
       - name: Upload oracle artifacts for triage
         if: always()
