@@ -70,7 +70,7 @@ use crate::dwg::file::aux_sections::AuxHeaderSection;
 use crate::dwg::file::classes::ClassesSection;
 use crate::dwg::file::header::FileHeader;
 use crate::dwg::file::header_vars::HeaderVarsSection;
-use crate::dwg::file::object_map::ObjectMap;
+use crate::dwg::file::object_map::{ObjectMap, ObjectMapEntry};
 use crate::dwg::file::r2000_layout::R2000Object;
 use crate::dwg::file::r2007_header::{
     decode_file_header_on_disk, encode_file_header_on_disk, R2007FileHeader, R2007_HEADER_OFFSET,
@@ -79,6 +79,7 @@ use crate::dwg::file::r2007_system_page::{
     decode_system_page, encode_system_page, system_page_on_disk_size,
 };
 use crate::dwg::version::Version;
+use std::collections::HashMap;
 
 /// Number of data bytes per Reed–Solomon block in an R2007 data
 /// page. Equals `0xFB` in LibreDWG `decode_rs (… data_size=0xFB …)`
@@ -808,12 +809,10 @@ pub fn assemble_r2007(parts: R2007FileParts) -> DwgResult<Vec<u8>> {
     let mut sorted_indices: Vec<usize> = (0..parts.objects.len()).collect();
     sorted_indices.sort_by_key(|&i| parts.objects[i].handle.value);
     for &i in &sorted_indices {
-        object_map
-            .entries
-            .push(crate::dwg::file::object_map::ObjectMapEntry {
-                handle: parts.objects[i].handle.value,
-                file_offset: record_section_offsets[i],
-            });
+        object_map.entries.push(ObjectMapEntry {
+            handle: parts.objects[i].handle.value,
+            file_offset: record_section_offsets[i],
+        });
     }
     let mut handles_payload = Vec::new();
     object_map.encode(&mut handles_payload)?;
@@ -890,6 +889,36 @@ pub fn assemble_r2007(parts: R2007FileParts) -> DwgResult<Vec<u8>> {
                 })
         })
         .collect::<DwgResult<Vec<_>>>()?;
+
+    // 4b. Defense-in-depth: every section descriptor MUST satisfy
+    //     `comp_size == uncomp_size`. `encode_data_page` writes raw
+    //     row-major payload bytes (no Reed-Solomon column-major
+    //     transpose), which is correct only because LibreDWG's
+    //     `read_data_section` (`decode_r2007.c:830-855`) takes the
+    //     direct-memcpy branch whenever `comp_size == uncomp_size`.
+    //     If a future change adds LZ77 compression and sets
+    //     `comp_size < uncomp_size` for some descriptor, that
+    //     descriptor's page must be RS-encoded (and the encoder
+    //     replaced or extended). Catch the mismatch here at
+    //     assemble time instead of letting LibreDWG fail with an
+    //     opaque "Failed to read 2007 meta data" downstream.
+    for descriptor in &descriptors {
+        for page in &descriptor.pages {
+            if page.comp_size != page.uncomp_size {
+                return Err(DwgError::InternalInvariant(format!(
+                    "assemble_r2007: section {:?} page {} has \
+                     comp_size={} != uncomp_size={}, but \
+                     `encode_data_page` only emits stored-mode \
+                     (raw row-major) bytes. A compressed-mode \
+                     descriptor requires a sibling \
+                     `encode_compressed_data_page` that produces \
+                     the column-major RS layout LibreDWG's \
+                     `read_data_page` path expects.",
+                    descriptor.name, page.id, page.comp_size, page.uncomp_size,
+                )));
+            }
+        }
+    }
 
     // 5. Sections-map system page.
     let sections_map_content = encode_sections_map_content(&descriptors);
@@ -1215,8 +1244,7 @@ pub fn parse_r2007(bytes: &[u8], version: Version) -> DwgResult<R2007File> {
     //    Page-id → physical file offset resolution uses the same
     //    `offset += size` accumulator as step 4 for the sections-map,
     //    mirroring LibreDWG `decode_r2007.c::read_data_section`.
-    let mut page_offsets: std::collections::HashMap<i64, u64> =
-        std::collections::HashMap::with_capacity(pages_records.len());
+    let mut page_offsets: HashMap<i64, u64> = HashMap::with_capacity(pages_records.len());
     {
         let mut running: u64 = R2007_FIRST_PAGE_OFFSET;
         for &(id, size) in &pages_records {
