@@ -13,5 +13,6 @@ pub mod napi_api;
 
 pub use recents::{RecentsStore, RecentsStoreError};
 pub use service::{
-    BridgeService, BridgeServiceError, ProjectSummary, RuntimeStatusReport, TemplateChoice,
+    BridgeConfig, BridgeService, BridgeServiceError, EngineStatusReport, ProjectSummary,
+    RuntimeStatusReport, TemplateChoice,
 };

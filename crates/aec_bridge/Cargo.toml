@@ -25,6 +25,7 @@ napi = ["dep:napi", "dep:napi-derive"]
 aec_core = { path = "../aec_core" }
 aec_audit = { path = "../aec_audit" }
 aec_command = { path = "../aec_command" }
+rusqlite = { workspace = true }
 aec_geometry = { path = "../aec_geometry" }
 aec_assets = { path = "../aec_assets" }
 aec_render = { path = "../aec_render" }
