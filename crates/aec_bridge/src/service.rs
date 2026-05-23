@@ -14,7 +14,7 @@ use aec_audit::AuditLog;
 use aec_core::config::ProjectSettings;
 use aec_core::package::{ProjectPackage, ProjectSummary as CoreProjectSummary};
 use aec_core::templates::TemplateLoader;
-use aec_core::types::ProjectId;
+use aec_core::types::{ProjectId, Scope};
 use aec_governor::profiler::{CpuProfile, GpuProfile, HardwareProfiler};
 use aec_governor::tier::HardwareTier;
 
@@ -228,8 +228,17 @@ impl BridgeService {
     }
 
     /// Open an existing project package and update the recents store.
+    ///
+    /// Routes through [`ProjectPackage::open_with_master_key`] so any
+    /// pending schema migrations are applied on the SQLCipher database
+    /// AND the on-disk `manifest.json`'s `schema_version` field is
+    /// bumped to the current [`aec_core::manifest::SCHEMA_VERSION`] in
+    /// the same call. Without this step, a v1 project would refuse to
+    /// re-open the next time around (because a future, stricter
+    /// validator could downgrade tolerance) and the `audit_chain` SQL
+    /// table introduced in v2 would not exist on legacy databases.
     pub fn project_open(&mut self, path: &str) -> Result<ProjectSummary, BridgeServiceError> {
-        let pkg = ProjectPackage::open(path)?;
+        let pkg = ProjectPackage::open_with_master_key(path, &self.master_key)?;
         let core_summary = pkg.summary();
         let summary: ProjectSummary = core_summary.clone().into();
         self.recents.record(&core_summary)?;
@@ -237,8 +246,14 @@ impl BridgeService {
     }
 
     /// Persist the manifest of an open project.
+    ///
+    /// Also routes through [`ProjectPackage::open_with_master_key`]
+    /// because Save is a natural "the user actively touched this
+    /// project" checkpoint and is the right place to lazily complete
+    /// any pending v(N-1)→vN walk that a previous open might have
+    /// skipped (e.g. because the binary didn't have the key handy).
     pub fn project_save(&mut self, path: &str) -> Result<ProjectSummary, BridgeServiceError> {
-        let mut pkg = ProjectPackage::open(path)?;
+        let mut pkg = ProjectPackage::open_with_master_key(path, &self.master_key)?;
         pkg.save()?;
         Ok(pkg.summary().into())
     }
@@ -256,7 +271,12 @@ impl BridgeService {
     /// happily report an out-of-sync state if the renderer forgets to
     /// call this.
     pub fn project_audit_sync(&mut self, path: &str) -> Result<u64, BridgeServiceError> {
-        let pkg = ProjectPackage::open(path)?;
+        // `open_with_master_key` runs any pending schema migrations
+        // (so the v2 `audit_chain` table exists on legacy v1
+        // projects) AND upgrades the manifest's `schema_version`
+        // field. Without this, `mirror_to_sql`'s INSERT would fail on
+        // a v1 project because the target table wouldn't exist.
+        let pkg = ProjectPackage::open_with_master_key(path, &self.master_key)?;
         let mut conn = pkg.open_database(&self.master_key)?;
         let log = AuditLog::open(pkg.root().join("audit").join("log.jsonl"))?;
         let n = log.mirror_to_sql(&mut conn)?;
@@ -271,8 +291,15 @@ impl BridgeService {
         &self,
         path: &str,
     ) -> Result<EngineStatusReport, BridgeServiceError> {
-        use aec_core::types::Scope;
-
+        // Engine status is the most likely entry-point for a renderer
+        // to touch a legacy project (the status pane refreshes
+        // periodically), so it MUST tolerate pre-v2 SQL schemas. We
+        // don't take `&mut self` here, so the manifest stays untouched
+        // — but `open_database` calls `open_encrypted` internally
+        // which runs the migration registry, so the SQL side is
+        // brought up to date. The manifest's `schema_version` field
+        // will be advanced the next time the user explicitly
+        // opens/saves the project through the mutating endpoints.
         let pkg = ProjectPackage::open(path)?;
         let conn = pkg.open_database(&self.master_key)?;
         let log = AuditLog::open(pkg.root().join("audit").join("log.jsonl"))?;

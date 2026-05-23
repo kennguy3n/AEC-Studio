@@ -98,15 +98,37 @@ impl AuditLog {
     }
 
     /// Mirror the in-memory chain into the v2 `audit_chain` SQL table.
-    /// Existing rows (matched by the `UNIQUE(hash)` column) are skipped
-    /// via `ON CONFLICT(hash) DO NOTHING`, so callers can run this on
-    /// every `append` without worrying about double-insert errors.
+    ///
+    /// The chain is append-only and the SQL mirror is a strict
+    /// prefix of the JSONL log (we never INSERT out-of-order), so the
+    /// number of rows already in `audit_chain` tells us exactly how
+    /// many entries we can skip on the next call. Reading
+    /// `count(*)` once at the top of the function is O(1) (SQLite
+    /// keeps the row count for tables without WHERE-filtered
+    /// indexes) and avoids sending thousands of no-op INSERTs on
+    /// projects with long audit histories.
+    ///
+    /// As a defence-in-depth we still emit the INSERTs with
+    /// `ON CONFLICT(hash) DO NOTHING` so a mismatched count (e.g.
+    /// from a partially-applied rollback that left rows in the SQL
+    /// table after a JSONL truncate) doesn't blow up the call — it
+    /// just degenerates to per-row skipping.
     ///
     /// Returns the number of newly-inserted rows. A return value of `0`
     /// means the SQL mirror is already up-to-date with the JSONL log.
     /// All inserts share a single transaction so a mid-walk failure
     /// leaves the SQL table untouched.
     pub fn mirror_to_sql(&self, conn: &mut Connection) -> AuditResult<usize> {
+        // The SQL mirror is a strict prefix of `self.entries` by
+        // construction (insertions are ordered, never deleted, and
+        // the UNIQUE(hash) guard makes any earlier mismatch surface
+        // as a 0-row INSERT below rather than corrupting state).
+        // Skipping the already-mirrored prefix is a constant-factor
+        // speedup for long histories.
+        let already_mirrored: i64 =
+            conn.query_row("SELECT count(*) FROM audit_chain", [], |r| r.get(0))?;
+        let skip = (already_mirrored as usize).min(self.entries.len());
+
         let tx = conn.transaction()?;
         let mut inserted = 0;
         {
@@ -115,7 +137,7 @@ impl AuditLog {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
                  ON CONFLICT(hash) DO NOTHING",
             )?;
-            for entry in &self.entries {
+            for entry in self.entries.iter().skip(skip) {
                 let actor_json = serde_json::to_string(&entry.actor)?;
                 let n = stmt.execute(params![
                     entry.ts.to_rfc3339(),

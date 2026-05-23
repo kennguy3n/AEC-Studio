@@ -122,9 +122,50 @@ impl ProjectPackage {
 
     /// Open the encrypted SQLite database, deriving the key from the
     /// per-project nonce.
+    ///
+    /// Routes through [`db::open_encrypted`] so the migration registry
+    /// runs on every open, even when the package was first created by a
+    /// previous schema version. This is what makes legacy v1 projects
+    /// usable after [`crate::manifest::SCHEMA_VERSION`] is bumped — the
+    /// SQL side is brought up to date here, and the JSON manifest is
+    /// brought up to date by [`Self::open_with_master_key`].
     pub fn open_database(&self, master_key: &[u8; 32]) -> AecResult<rusqlite::Connection> {
         let key = self.derive_key(master_key)?;
-        db::open_existing(&self.root.join("project.sqlite"), &key)
+        db::open_encrypted(&self.root.join("project.sqlite"), &key)
+    }
+
+    /// Open a package end-to-end, performing any schema migrations on
+    /// the SQLCipher database (via [`Self::open_database`]) AND
+    /// upgrading the on-disk `manifest.json`'s `schema_version` field
+    /// if it was older than the current
+    /// [`crate::manifest::SCHEMA_VERSION`].
+    ///
+    /// Returns the loaded package; the upgraded manifest has been
+    /// flushed to disk before this returns so a subsequent strict
+    /// reader sees the new value. The DB connection is dropped — the
+    /// caller can re-open via [`Self::open_database`].
+    ///
+    /// Bridge entry points that have the master key (project_open,
+    /// project_save, project_engine_status, project_audit_sync, ...)
+    /// should prefer this over [`Self::open`] so legacy projects are
+    /// brought to the current version on first touch.
+    pub fn open_with_master_key(root: impl AsRef<Path>, master_key: &[u8; 32]) -> AecResult<Self> {
+        let mut pkg = Self::open(root)?;
+        // Run any pending DB migrations even when the manifest is
+        // already at the latest version — `open_encrypted` is
+        // idempotent and this also protects against a manifest that
+        // got bumped without the DB catching up (e.g. an aborted
+        // previous upgrade).
+        // Open the DB once so the migration registry runs. We don't
+        // hold the connection past this scope; callers re-open via
+        // `open_database` when they actually need to query.
+        drop(pkg.open_database(master_key)?);
+        if pkg.manifest.needs_upgrade() {
+            pkg.manifest.upgrade_schema_version();
+            pkg.manifest.touch();
+            pkg.write_manifest()?;
+        }
+        Ok(pkg)
     }
 
     pub fn derive_key(&self, master_key: &[u8; 32]) -> AecResult<Key32> {
@@ -335,6 +376,114 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(5));
         pkg.save().unwrap();
         assert!(pkg.manifest().updated_at > before);
+    }
+
+    #[test]
+    fn legacy_v1_project_is_upgraded_end_to_end() {
+        // This test simulates the real-world case Devin Review flagged:
+        // a project written by an older version (schema_version = 1)
+        // is opened by the current binary (SCHEMA_VERSION = 2) and the
+        // upgrade is supposed to happen automatically. Three things
+        // must hold:
+        //
+        //   1. `ProjectPackage::open` must accept the v1 manifest
+        //      (relaxed validation lets v1 manifests through).
+        //   2. `open_with_master_key` must run the migration registry
+        //      (the v2 `audit_chain` table must exist after the call).
+        //   3. The manifest's `schema_version` field must be bumped to
+        //      `SCHEMA_VERSION` on disk so a subsequent strict reader
+        //      sees the new value.
+        let td = tempfile::tempdir().unwrap();
+        let (path, master) = make_pkg(&td);
+
+        // Force the on-disk manifest back to v1 to look like a legacy
+        // project that was created before the v2 bump landed. We
+        // re-read+rewrite via serde so we exercise the same JSON
+        // serializer the current binary uses to produce manifests; a
+        // raw byte rewrite would risk drifting from real legacy
+        // formats over time.
+        let manifest_path = path.join("manifest.json");
+        let raw = fs::read_to_string(&manifest_path).unwrap();
+        let mut m: ProjectManifest = serde_json::from_str(&raw).unwrap();
+        m.schema_version = 1;
+        let downgraded = serde_json::to_string_pretty(&m).unwrap();
+        fs::write(&manifest_path, downgraded).unwrap();
+
+        // Also reset the SQL-side schema_version back to 1 so the
+        // migration registry has to do its work. This mirrors what a
+        // database written by the v1 codebase would actually look
+        // like.
+        {
+            let pkg = ProjectPackage::open(&path).unwrap();
+            // Validate the on-disk manifest deserialises and passes
+            // the relaxed validator without an upgrade step.
+            assert_eq!(pkg.manifest().schema_version, 1);
+            assert!(pkg.manifest().needs_upgrade());
+            // Bring the DB connection up; this currently advances the
+            // SQL schema_version to SCHEMA_VERSION too, but that's
+            // exactly what we want this test to *also* cover when the
+            // manifest path runs again below — a no-op shouldn't
+            // break anything.
+            let conn = pkg.open_database(&master).unwrap();
+            // Forcibly clobber it back to v1 and drop audit_chain so
+            // the "legacy DB" half of the simulation is realistic.
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS audit_chain; \
+                 INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', '1');",
+            )
+            .unwrap();
+        }
+
+        // Round-trip through `open_with_master_key`. This is the call
+        // the bridge service uses; it has to make every layer agree.
+        let pkg = ProjectPackage::open_with_master_key(&path, &master).unwrap();
+        assert_eq!(
+            pkg.manifest().schema_version,
+            crate::manifest::SCHEMA_VERSION
+        );
+        assert!(!pkg.manifest().needs_upgrade());
+
+        // Reopen — the upgraded manifest must have been flushed to
+        // disk, so a fresh `open()` (no key) sees the new version.
+        let pkg2 = ProjectPackage::open(&path).unwrap();
+        assert_eq!(
+            pkg2.manifest().schema_version,
+            crate::manifest::SCHEMA_VERSION
+        );
+
+        // The v2 `audit_chain` table must exist after the migration.
+        let conn = pkg2.open_database(&master).unwrap();
+        let table_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master \
+                 WHERE type='table' AND name='audit_chain'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            table_count, 1,
+            "audit_chain table must be created by v2 migration"
+        );
+        let sql_version = crate::db::schema_version(&conn).unwrap();
+        assert_eq!(sql_version, crate::manifest::SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn open_rejects_future_schema_version() {
+        // The relaxed validator must still reject manifests claiming a
+        // schema_version higher than this binary supports — those
+        // would have come from a newer release writing fields this
+        // binary doesn't know how to parse.
+        let td = tempfile::tempdir().unwrap();
+        let (path, _master) = make_pkg(&td);
+        let manifest_path = path.join("manifest.json");
+        let mut m: ProjectManifest =
+            serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        m.schema_version = crate::manifest::SCHEMA_VERSION + 7;
+        fs::write(&manifest_path, serde_json::to_string_pretty(&m).unwrap()).unwrap();
+        let err = ProjectPackage::open(&path).unwrap_err();
+        assert!(matches!(err, AecError::SchemaMismatch { .. }));
     }
 
     #[test]
