@@ -220,8 +220,8 @@ mod tests {
 
     #[test]
     fn mirror_to_sql_inserts_each_entry_once_and_is_idempotent() {
-        use aec_core::db::open_encrypted;
         use aec_core::crypto::{derive_project_key, generate_project_nonce};
+        use aec_core::db::open_encrypted;
 
         let dir = tempfile::tempdir().unwrap();
         let log_path = dir.path().join("audit.jsonl");
@@ -233,8 +233,16 @@ mod tests {
 
         let mut log = AuditLog::open(&log_path).unwrap();
         for (scope, tool, payload) in [
-            (Scope::Design, "design.create_wall", serde_json::json!({"x": 1})),
-            (Scope::Design, "design.paint_material", serde_json::json!({"mat": "oak"})),
+            (
+                Scope::Design,
+                "design.create_wall",
+                serde_json::json!({"x": 1}),
+            ),
+            (
+                Scope::Design,
+                "design.paint_material",
+                serde_json::json!({"mat": "oak"}),
+            ),
             (Scope::Render, "render.queue", serde_json::json!({"job": 7})),
         ] {
             log.append(CommandId::new(), scope, Actor::user(), tool, &payload)

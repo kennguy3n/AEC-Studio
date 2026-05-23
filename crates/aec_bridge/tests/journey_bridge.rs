@@ -152,8 +152,16 @@ fn journey_f_bridge_engine_status_and_audit_sync_round_trip() {
     let head_after_three = append_via_audit_log(
         &project_root,
         &[
-            (Scope::Design, "design.create_wall", serde_json::json!({"x": 1})),
-            (Scope::Design, "design.paint_material", serde_json::json!({"mat": "oak"})),
+            (
+                Scope::Design,
+                "design.create_wall",
+                serde_json::json!({"x": 1}),
+            ),
+            (
+                Scope::Design,
+                "design.paint_material",
+                serde_json::json!({"mat": "oak"}),
+            ),
             (Scope::Render, "render.queue", serde_json::json!({"job": 7})),
         ],
     );

@@ -19,7 +19,7 @@ crate-type = ["cdylib", "rlib"]
 # --workspace` doesn't need a Node toolchain. Enable `napi` when packaging
 # the desktop app to produce the `.node` artifact.
 default = []
-napi = ["dep:napi", "dep:napi-derive"]
+napi = ["dep:napi", "dep:napi-derive", "dep:napi-build"]
 
 [dependencies]
 aec_core = { path = "../aec_core" }

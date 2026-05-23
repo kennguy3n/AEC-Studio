@@ -281,9 +281,10 @@ impl BridgeService {
         let audit_chain_head = log.head().to_string();
         let audit_entry_count = log.entries().len() as u64;
 
-        let sql_count: i64 = conn
-            .query_row("SELECT count(*) FROM audit_chain", [], |r| r.get(0))?;
-        let mut by_scope: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+        let sql_count: i64 =
+            conn.query_row("SELECT count(*) FROM audit_chain", [], |r| r.get(0))?;
+        let mut by_scope: std::collections::BTreeMap<String, u64> =
+            std::collections::BTreeMap::new();
         // Initialise all canonical scopes to 0 so the renderer can show
         // a stable set of labels even on a fresh project.
         for s in Scope::all() {
@@ -292,12 +293,8 @@ impl BridgeService {
         // Override with real counts from the SQL mirror. We don't trust
         // arbitrary scope strings — anything not in `Scope::all()` is
         // ignored, which keeps the renderer's label set bounded.
-        let mut stmt = conn.prepare(
-            "SELECT scope, count(*) FROM audit_chain GROUP BY scope",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
-        })?;
+        let mut stmt = conn.prepare("SELECT scope, count(*) FROM audit_chain GROUP BY scope")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
         for row in rows {
             let (scope, n) = row?;
             if by_scope.contains_key(&scope) {
