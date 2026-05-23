@@ -23,7 +23,7 @@ use crate::dxf::{DxfCircle, DxfDocument, DxfEntity, DxfLine, DxfText};
 /// active common-entity-data codepath in `DwgWriter` for the modern
 /// versions (R14 → R2018):
 ///   * LINE — exercises 3RD-stream coordinate writes.
-/// * CIRCLE — exercises BD radius + extrusion encoding.
+///   * CIRCLE — exercises BD radius + extrusion encoding.
 ///   * TEXT — exercises TV/T string dispatch (R2007+ uses T = UTF-16,
 ///     pre-R2007 uses TV = CP1252) and rotation/height fields.
 ///
