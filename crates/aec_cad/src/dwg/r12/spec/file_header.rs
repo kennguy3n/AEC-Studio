@@ -11,7 +11,10 @@
 //! 0x0D  RS numentity_sections  2 bytes LE
 //! 0x0F  RS sections            2 bytes LE (cast to RL on read) =
 //!                              `num_sections` (0..SECTION_VX)
-//! 0x11  RS numheader_vars      2 bytes LE — 204 for AC1009
+//! 0x11  RS numheader_vars      2 bytes LE — 205 for AC1009 (the
+//!                              "AC1009 r11" emission per
+//!                              `header.spec:34`; LibreDWG accepts
+//!                              any value `<= 205`).
 //! 0x13  RC dwg_version         1 byte (R11: 0)
 //! 0x14  RLx entities_start     4 bytes LE
 //! 0x18  RLx entities_end       4 bytes LE

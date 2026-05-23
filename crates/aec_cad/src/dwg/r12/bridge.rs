@@ -1,6 +1,6 @@
 //! Bridge between the in-memory [`crate::dxf::DxfDocument`] and the
 //! R12 wire-level types in [`super::entity`], [`super::record_kinds`],
-//! [`super::header_vars`], and [`super::tables`].
+//! [`super::spec::header_vars`], and [`super::tables`].
 //!
 //! This module owns the *mapping policy* between the document's
 //! string-keyed layer/block model and the R12 file's 1-based table
