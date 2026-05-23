@@ -40,6 +40,7 @@ pub mod header;
 pub mod header_vars;
 pub mod reader;
 pub mod record_kinds;
+pub mod spec;
 pub mod tables;
 pub mod writer;
 
