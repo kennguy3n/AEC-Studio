@@ -823,31 +823,59 @@ mod tests {
             actual = doc.entities.len(),
         );
 
-        // Build the user-entity records the same way `write_modern`
-        // does (handles assigned sequentially from FIRST_USER_ENTITY).
-        let version = Version::R2000;
-        let mut user_entities = Vec::with_capacity(doc.entities.len());
-        for (idx, entity) in doc.entities.iter().enumerate() {
-            let handle = FIRST_ENTITY_HANDLE + idx as u64;
-            let record = entity_to_record(entity, version, handle).unwrap();
-            user_entities.push(record);
-        }
-        let records = build_record_set(version, user_entities).unwrap();
-        let hvars = header_vars_for_records(&records);
+        // Exercise EVERY modern version the CI gate's HANDSEED
+        // allow-list applies to (R14 / R2000 / R2004 / R2010 / R2013
+        // / R2018). HANDSEED is version-invariant within the modern
+        // path today — `build_record_set` emits the same table
+        // objects with the same handles, and entity handles are
+        // assigned sequentially from FIRST_ENTITY_HANDLE regardless
+        // of version — but pinning each version individually is
+        // defense-in-depth against a future version-specific
+        // table-emit change that would otherwise drift past the
+        // single-version check. R12 has a different wire format (no
+        // header_vars HANDSEED slot); R2007 ships an empty-doc
+        // fixture in CI; both are excluded for that reason.
+        let versions = [
+            Version::R14,
+            Version::R2000,
+            Version::R2004,
+            Version::R2010,
+            Version::R2013,
+            Version::R2018,
+        ];
+        for version in versions {
+            // Build the user-entity records the same way
+            // `write_modern` does (handles assigned sequentially
+            // from FIRST_ENTITY_HANDLE).
+            let mut user_entities = Vec::with_capacity(doc.entities.len());
+            for (idx, entity) in doc.entities.iter().enumerate() {
+                let handle = FIRST_ENTITY_HANDLE + idx as u64;
+                let record = entity_to_record(entity, version, handle).unwrap();
+                user_entities.push(record);
+            }
+            let records = build_record_set(version, user_entities).unwrap();
+            let hvars = header_vars_for_records(&records);
 
-        assert_eq!(
-            hvars.handseed.value,
-            EXPECTED_ORACLE_FIXTURE_HANDSEED,
-            "Oracle-fixture HANDSEED drift: computed {actual:#x} but \
-             CI's `ALLOW_HANDSEED` pattern in \
-             `.github/workflows/ci.yml` is hardcoded to `36/0x24`. \
-             This usually means the fixture entity count in \
-             `crate::dwg::test_fixtures::oracle_fixture_doc` changed \
-             but `ALLOW_HANDSEED` / \
-             `EXPECTED_ORACLE_FIXTURE_HANDSEED` weren't updated. \
-             Update both to `<decimal>/0x<hex>` matching the new \
-             HANDSEED value.",
-            actual = hvars.handseed.value,
-        );
+            assert_eq!(
+                hvars.handseed.value,
+                EXPECTED_ORACLE_FIXTURE_HANDSEED,
+                "Oracle-fixture HANDSEED drift on {version:?}: \
+                 computed {actual:#x} but CI's `ALLOW_HANDSEED` \
+                 pattern in `.github/workflows/ci.yml` is hardcoded \
+                 to `36/0x24`. This usually means the fixture entity \
+                 count in `crate::dwg::test_fixtures::oracle_fixture_doc` \
+                 changed but `ALLOW_HANDSEED` / \
+                 `EXPECTED_ORACLE_FIXTURE_HANDSEED` weren't updated. \
+                 If only one version is off, a version-specific \
+                 table-emit change has drifted the HANDSEED \
+                 expectation away from the others — investigate \
+                 `build_record_set` / `object_emit` for \
+                 {version:?}-specific record emission. Update both \
+                 to `<decimal>/0x<hex>` matching the new HANDSEED \
+                 value.",
+                version = version,
+                actual = hvars.handseed.value,
+            );
+        }
     }
 }
