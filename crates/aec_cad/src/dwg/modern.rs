@@ -769,4 +769,72 @@ mod tests {
             other => panic!("expected Ellipse, got {other:?}"),
         }
     }
+
+    /// Pin the HANDSEED value the LibreDWG oracle's `ALLOW_HANDSEED`
+    /// pattern (`.github/workflows/ci.yml`) expects, so a change to
+    /// the fixture entity count fails this test with a clear,
+    /// actionable error rather than a cryptic CI "unexpected
+    /// Warning" surprise.
+    ///
+    /// The 3-entity geometry duplicates
+    /// `crates/aec_cad/examples/dwg_oracle_fixture.rs::fixture_doc`.
+    /// Keep both in lockstep:
+    ///   * If the fixture entity count changes, this test will fail
+    ///     here with the new expected HANDSEED value;
+    ///   * Update the fixture geometry, update
+    ///     `EXPECTED_ORACLE_FIXTURE_HANDSEED` below to match, and
+    ///     update `ALLOW_HANDSEED` in `.github/workflows/ci.yml` to
+    ///     the new `<decimal>/0x<hex>` pair.
+    #[test]
+    fn oracle_fixture_handseed_matches_ci_allow_list() {
+        // CI's `ALLOW_HANDSEED` regex hardcodes `36/0x24` (see
+        // `.github/workflows/ci.yml::libredwg_oracle`). 0x24 == 36.
+        const EXPECTED_ORACLE_FIXTURE_HANDSEED: u64 = 0x24;
+
+        // Build the same 3-entity document the oracle fixture emits.
+        let mut doc = DxfDocument::new();
+        doc.push(DxfEntity::Line(DxfLine {
+            layer: "0".into(),
+            start: [0.0, 0.0, 0.0],
+            end: [100.0, 50.0, 0.0],
+        }));
+        doc.push(DxfEntity::Circle(DxfCircle {
+            layer: "0".into(),
+            center: [50.0, 25.0, 0.0],
+            radius: 12.5,
+        }));
+        doc.push(DxfEntity::Text(DxfText {
+            layer: "0".into(),
+            position: [10.0, 60.0, 0.0],
+            height: 2.5,
+            rotation: 0.0,
+            text: "AEC-Studio".into(),
+        }));
+
+        // Build the user-entity records the same way `write_modern`
+        // does (handles assigned sequentially from FIRST_USER_ENTITY).
+        let version = Version::R2000;
+        let mut user_entities = Vec::with_capacity(doc.entities.len());
+        for (idx, entity) in doc.entities.iter().enumerate() {
+            let handle = FIRST_ENTITY_HANDLE + idx as u64;
+            let record = entity_to_record(entity, version, handle).unwrap();
+            user_entities.push(record);
+        }
+        let records = build_record_set(version, user_entities).unwrap();
+        let hvars = header_vars_for_records(&records);
+
+        assert_eq!(
+            hvars.handseed.value,
+            EXPECTED_ORACLE_FIXTURE_HANDSEED,
+            "Oracle-fixture HANDSEED drift: computed {actual:#x} but the \
+             LibreDWG oracle's `ALLOW_HANDSEED` pattern in \
+             `.github/workflows/ci.yml` is hardcoded to \
+             `36/0x24`. If you changed the fixture entity count in \
+             `crates/aec_cad/examples/dwg_oracle_fixture.rs`, you must \
+             ALSO update `ALLOW_HANDSEED` to `<decimal>/0x<hex>` \
+             matching the new HANDSEED value, and update \
+             `EXPECTED_ORACLE_FIXTURE_HANDSEED` in this test.",
+            actual = hvars.handseed.value
+        );
+    }
 }
