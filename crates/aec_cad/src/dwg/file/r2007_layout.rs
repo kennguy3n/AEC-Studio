@@ -749,19 +749,19 @@ pub fn assemble_r2007(parts: R2007FileParts) -> DwgResult<Vec<u8>> {
         section_name: "AcDb:Template",
     });
 
-    // Real AcDbObjects payload for an empty document: a single byte.
-    // LibreDWG's `read_2007_section_objects` walks the decompressed
-    // payload buffer entry-by-entry, with each entry beginning with a
-    // 2-byte MS size prefix. An empty buffer would trip the
-    // "Invalid num_pages 0" guard before the entry walk even starts.
-    // A 1-byte payload (`0x00`) satisfies `num_pages > 0` and produces
-    // an empty entry walk — the first `bit_read_MS` returns 0
-    // immediately, and the section finishes cleanly. This matches the
-    // R2004+ empty-doc convention from PR-D where the buffer is
-    // 0-length only because the R2004 page wrapper auto-pads to the
-    // page boundary; the R2007 RS page wrapper does not auto-pad an
-    // empty buffer, so we emit one explicit byte.
-    let objects_payload: Vec<u8> = vec![0x00];
+    // Real AcDbObjects payload for an empty document: a 0-byte buffer.
+    // The original "Invalid num_pages 0" error came from the *section
+    // descriptor* having `num_pages = 0`, not from the payload itself
+    // being empty. With a real one-page descriptor (via the
+    // `single_page_for_name(..., uncomp_size=0, page_size=255, ...)`
+    // call below), LibreDWG's `read_2007_section_objects` reads a
+    // 0-length decompressed buffer and runs zero iterations of the
+    // entry walk — matching the R2004+ empty-doc convention from PR-D
+    // exactly, where `assemble_r2004` also emits a 0-byte
+    // `objects_bytes`. No `[0x00]` marker byte is needed (verified
+    // against `dwgread` on the empty-doc fixture: SUCCESS with zero
+    // errors and zero warnings).
+    let objects_payload: Vec<u8> = Vec::new();
     let objects_page = encode_data_page(&objects_payload);
     let objects_page_id = next_page_id;
     next_page_id += 1;
@@ -775,24 +775,39 @@ pub fn assemble_r2007(parts: R2007FileParts) -> DwgResult<Vec<u8>> {
     // 4. Build sections-map descriptors. Each mandatory section now
     //    has exactly one data page; the lookup-by-name in `data_pages`
     //    drives the descriptor's page entry.
+    //
+    //    A name without a corresponding data page is treated as a hard
+    //    encoder bug: emitting a `num_pages=0` descriptor would
+    //    produce a file LibreDWG immediately rejects with
+    //    "Invalid num_pages 0, skip", which would only be caught at
+    //    the oracle stage. Surface the invariant at encode time via a
+    //    structured `InternalInvariant` so a future engineer who adds
+    //    a name to `MANDATORY_R2007_SECTION_NAMES` without also adding
+    //    a `data_pages.push(...)` above sees the failure here, not at
+    //    `dwgread` time.
     let descriptors: Vec<SectionDescriptor> = MANDATORY_R2007_SECTION_NAMES
         .iter()
         .map(|name| {
-            if let Some(emitted) = data_pages
+            data_pages
                 .iter()
                 .find(|emitted| emitted.section_name == *name)
-            {
-                SectionDescriptor::single_page_for_name(
-                    name,
-                    emitted.page.uncomp_size,
-                    emitted.page.on_disk.len() as u64,
-                    emitted.page_id,
-                )
-            } else {
-                SectionDescriptor::empty_for_name(name)
-            }
+                .map(|emitted| {
+                    SectionDescriptor::single_page_for_name(
+                        name,
+                        emitted.page.uncomp_size,
+                        emitted.page.on_disk.len() as u64,
+                        emitted.page_id,
+                    )
+                })
+                .ok_or_else(|| {
+                    DwgError::InternalInvariant(format!(
+                        "assemble_r2007: mandatory section {name} has no data page; \
+                         every name in MANDATORY_R2007_SECTION_NAMES must be emitted above \
+                         (see the per-section `data_pages.push(...)` blocks in step 3)"
+                    ))
+                })
         })
-        .collect();
+        .collect::<DwgResult<Vec<_>>>()?;
 
     // 5. Sections-map system page.
     let sections_map_content = encode_sections_map_content(&descriptors);
