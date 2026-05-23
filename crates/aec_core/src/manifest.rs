@@ -7,7 +7,13 @@ use crate::config::ProjectSettings;
 use crate::error::AecError;
 use crate::types::ProjectId;
 
-pub const SCHEMA_VERSION: u32 = 1;
+/// Latest project schema version. Bumped in lockstep with the
+/// migration registry — every integer from 2 to this value must have
+/// a corresponding [`crate::migrations::Migration`] in
+/// [`crate::migrations::Migration::all`]. New projects are created
+/// at this version; older projects are upgraded by
+/// [`crate::migrations::run_pending`] when opened.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// The `manifest.json` at the root of a `.aecstudio` directory package.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

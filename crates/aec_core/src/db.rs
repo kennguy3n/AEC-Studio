@@ -21,15 +21,22 @@ use crate::crypto::Key32;
 use crate::error::AecResult;
 
 /// Open (or create) a SQLCipher-encrypted project database at `path`,
-/// applying `key` as the page-level encryption key and running schema
-/// initialization migrations.
+/// applying `key` as the page-level encryption key, running schema
+/// initialization for a fresh database and then advancing any existing
+/// database to the current [`crate::manifest::SCHEMA_VERSION`] via
+/// [`crate::migrations::run_pending`].
 pub fn open_encrypted(path: &Path, key: &Key32) -> AecResult<Connection> {
-    let conn = Connection::open_with_flags(
+    let mut conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
     )?;
     apply_pragmas(&conn, key)?;
     initialize_schema(&conn)?;
+    crate::migrations::run_pending(
+        &mut conn,
+        crate::migrations::Migration::all(),
+        crate::manifest::SCHEMA_VERSION,
+    )?;
     Ok(conn)
 }
 
@@ -125,10 +132,21 @@ fn initialize_schema(conn: &Connection) -> AecResult<()> {
         ",
     )?;
 
-    // Write a schema-version marker so future migrations can detect it.
+    // Record the base schema version (v1). `open_encrypted` runs the
+    // migration registry immediately after `initialize_schema`, which
+    // is what advances the version to `crate::manifest::SCHEMA_VERSION`.
+    // Setting the marker here to the base (1) and not the current
+    // value is what makes a fresh database go through the exact same
+    // upgrade walk as an existing v1 file — keeping the two code paths
+    // semantically identical and eliminating "what version did this
+    // database start as" as a possible drift point.
+    //
+    // Use `INSERT OR IGNORE` so re-running on an already-initialised
+    // database (e.g. after a migration has advanced past v1) does not
+    // clobber the recorded version back to 1.
     conn.execute(
-        "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?1)",
-        params![crate::manifest::SCHEMA_VERSION.to_string()],
+        "INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', '1')",
+        params![],
     )?;
     Ok(())
 }
