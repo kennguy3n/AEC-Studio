@@ -117,46 +117,37 @@ mod tests {
 
     #[test]
     fn line_round_trips_through_dwg_writer_reader_r2007() {
-        // PR-C in-flight: R2007's writer now goes through
-        // `assemble_r2007`, which currently emits a valid file
-        // header + sections-map but no entity-bearing data pages.
-        // Entity round-trip lands in a follow-up commit; for now
-        // we assert the file is at least parseable end-to-end
-        // (signature detected, R2007 layout walked) when written
-        // from an explicitly empty document. The non-empty case is
-        // rejected at write time with `UnsupportedInVersion` -- see
-        // `r2007_writer_rejects_documents_with_entities` below.
+        // R2007 now emits real entity-bearing data pages through
+        // `assemble_r2007` — the same `build_record_set` pipeline that
+        // R2004/R2010/R2013/R2018 use, just packaged into RS-coded
+        // data pages instead of paged-section pages. A single-LINE
+        // document must round-trip cleanly.
+        let doc = one_line_document();
+        let bytes = DwgWriter::write(&doc, Version::R2007).unwrap();
+        let reader = DwgReader::new(&bytes).unwrap();
+        assert_eq!(reader.version, Version::R2007);
+        let back = reader.into_document().unwrap();
+        assert_eq!(back.entities.len(), 1);
+        match &back.entities[0] {
+            crate::dxf::DxfEntity::Line(line) => {
+                assert_eq!(line.start, [0.0, 0.0, 0.0]);
+                assert_eq!(line.end, [10.0, 5.0, 0.0]);
+            }
+            other => panic!("expected Line under R2007, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_document_round_trips_through_dwg_writer_reader_r2007() {
+        // The empty-doc path still has to work — every modern
+        // version must emit a structurally valid file even for a
+        // document with zero entities.
         let doc = DxfDocument::new();
         let bytes = DwgWriter::write(&doc, Version::R2007).unwrap();
         let reader = DwgReader::new(&bytes).unwrap();
         assert_eq!(reader.version, Version::R2007);
         let back = reader.into_document().unwrap();
         assert_eq!(back.entities.len(), 0);
-    }
-
-    #[test]
-    fn r2007_writer_rejects_documents_with_entities() {
-        // Until `assemble_r2007` emits entity-bearing data pages,
-        // any caller that hands `write_modern` a non-empty document
-        // for Version::R2007 gets a clean typed error rather than a
-        // silent eprintln + zero-entity output. This pins the
-        // contract so a future refactor that accidentally restores
-        // the silent-drop will fail at test time.
-        use crate::dwg::error::DwgError;
-
-        let doc = one_line_document();
-        let err = DwgWriter::write(&doc, Version::R2007)
-            .expect_err("R2007 + entities must be rejected at write time");
-        match err {
-            DwgError::UnsupportedInVersion { version, what } => {
-                assert_eq!(version, Version::R2007);
-                assert!(
-                    what.contains("entity record") && what.contains("R2007"),
-                    "error message should name the failure scope: {what}"
-                );
-            }
-            other => panic!("expected UnsupportedInVersion for R2007 + entities, got {other:?}"),
-        }
     }
 
     #[test]

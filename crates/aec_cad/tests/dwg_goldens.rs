@@ -39,17 +39,11 @@ fn canonical_doc() -> DxfDocument {
     doc
 }
 
-/// R2007 currently cannot write entities (assemble_r2007 does not
-/// emit entity-bearing data pages; PR-C / phase 6 of the R2007
-/// roadmap is the follow-up). `write_modern` returns
-/// `Err(UnsupportedInVersion)` for any R2007 doc with non-empty
-/// `entities`. The R2007 golden therefore exercises the same wire
-/// layout (file header + classes + handle map + zero data pages)
-/// using an explicitly empty document, instead of relying on the
-/// previous silent-drop behavior.
-fn r2007_doc() -> DxfDocument {
-    DxfDocument::new()
-}
+// R2007 now round-trips entities through the same
+// `build_record_set` + `assemble_r2007` pipeline that R2004+ uses
+// (only the page packaging differs — RS-coded data pages instead
+// of paged-section pages). The golden exercises the same
+// canonical single-LINE fixture as every other modern version.
 
 /// (length_in_bytes, blake3_hex) tuple for one version.
 struct Golden {
@@ -78,8 +72,8 @@ fn golden(v: DwgVersion) -> Golden {
             blake3_hex: "9f8802a0aa1f45bb5c6329227668b874d4c13fa371ed04a5b7eaee8cbd734e1a",
         },
         DwgVersion::R2007 => Golden {
-            bytes: 3968,
-            blake3_hex: "d78f3573167bef2dd48a60ebb6656a23b713f9364f58854a429b88c9d4c643ae",
+            bytes: 4480,
+            blake3_hex: "aa7d0d13ed912d08cfa3b75d65ebc365a758e70dffdc930cf65d9086ee79afd6",
         },
         DwgVersion::R2010 => Golden {
             bytes: 2695,
@@ -97,15 +91,7 @@ fn golden(v: DwgVersion) -> Golden {
 }
 
 fn check_version(v: DwgVersion) {
-    // R2007 cannot yet round-trip entities through write_modern —
-    // pass an empty doc so the test exercises the file/sections
-    // layer without tripping the new `UnsupportedInVersion` guard
-    // in `write_modern`.
-    let doc = if v == DwgVersion::R2007 {
-        r2007_doc()
-    } else {
-        canonical_doc()
-    };
+    let doc = canonical_doc();
 
     let bytes = DwgWriter::write(&doc, v)
         .unwrap_or_else(|e| panic!("DwgWriter::write failed for {v:?}: {e:?}"));
@@ -147,17 +133,6 @@ fn check_version(v: DwgVersion) {
     let back = reader
         .into_document()
         .unwrap_or_else(|e| panic!("DwgReader::into_document failed for {v:?}: {e:?}"));
-    if v == DwgVersion::R2007 {
-        // PR-C in-flight: R2007 now goes through `assemble_r2007`
-        // which emits a valid file header + sections-map but no
-        // entity-bearing data pages yet. The encoder now rejects
-        // entities outright (UnsupportedInVersion); the round-trip
-        // therefore exercises the empty-document path and recovers
-        // zero entities. Entity round-trip will be restored once
-        // data-page emission lands later in the R2007 roadmap.
-        assert_eq!(back.entities.len(), 0, "{v:?} empty-doc round-trip");
-        return;
-    }
     assert_eq!(back.entities.len(), 1, "{v:?} round-trip lost the line");
     match &back.entities[0] {
         DxfEntity::Line(l) => {

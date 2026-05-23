@@ -44,31 +44,42 @@
 //! packaging (Reed–Solomon-coded data pages, RC-wrapped UTF-16 string
 //! sub-streams) differs.
 //!
-//! AcDb:Header still carries the 16-byte `DWG_SENTINEL_VARIABLE_BEGIN`
-//! sentinel only — full `Dwg_Header_Variables` emission for R2007 is
-//! the next chunk of conformance work (it requires extending the
-//! existing emit path with R2007's UTF-16 string sub-stream
-//! wrapping). LibreDWG treats a sentinel-only Header as a non-critical
-//! `VALUEOUTOFBOUNDS` (cumulative error below the critical 128
-//! threshold) so the file still parses clean today.
+//! Since PR-H1, AcDb:Header carries a real `Dwg_Header_Variables`
+//! payload (sentinel + RL size + bit-packed variables + CRC), and
+//! AcDb:AcDbObjects carries real entity records. The encoders are
+//! shared with the R2004+ path (`HeaderVarsSection`,
+//! `ObjectRecord::encode`); only the page packaging differs.
+//!
+//! The R2007 file produced by `assemble_r2007` is now LibreDWG
+//! `dwgread -v1` clean on every section: header_vars decode, classes
+//! decode, handles decode, AcDbObjects decode, and the post-decode
+//! `dwg_resolve_handle` loop resolves all entity-side references
+//! (BLOCK_CONTROL / LAYER_CONTROL / model-space BLOCK_HEADER).
+//! The only remaining warning is the spec-correct HANDSEED
+//! dangling-handle warning, which is identical across R14 / R2000 /
+//! R2004 / R2007 / R2010 / R2013 / R2018 (see
+//! `.github/workflows/ci.yml::ALLOW_HANDSEED`).
 //!
 //! Reference: LibreDWG `decode_r2007.c::read_r2007_meta_data`
 //! (line 2338).
 
 use crate::dwg::bits::reed_solomon::R2007_FILE_HEADER_ON_DISK_SIZE;
+use crate::dwg::entities::record::ObjectRecord;
 use crate::dwg::error::{DwgError, DwgResult};
-use crate::dwg::file::aux_sections::AuxHeaderSection;
+use crate::dwg::file::aux_sections::{AuxHeaderSection, TemplateSection};
 use crate::dwg::file::classes::ClassesSection;
 use crate::dwg::file::header::FileHeader;
-use crate::dwg::file::object_map::ObjectMap;
+use crate::dwg::file::header_vars::HeaderVarsSection;
+use crate::dwg::file::object_map::{ObjectMap, ObjectMapEntry};
+use crate::dwg::file::r2000_layout::R2000Object;
 use crate::dwg::file::r2007_header::{
     decode_file_header_on_disk, encode_file_header_on_disk, R2007FileHeader, R2007_HEADER_OFFSET,
 };
 use crate::dwg::file::r2007_system_page::{
     decode_system_page, encode_system_page, system_page_on_disk_size,
 };
-use crate::dwg::file::sentinels::HEADER_VARS_BEGIN;
 use crate::dwg::version::Version;
+use std::collections::HashMap;
 
 /// Number of data bytes per Reed–Solomon block in an R2007 data
 /// page. Equals `0xFB` in LibreDWG `decode_rs (… data_size=0xFB …)`
@@ -107,10 +118,9 @@ pub const R2007_CHECK_DATA_LEN: usize = 0x28;
 
 /// In-memory image of a parsed R2007 file. Carries every metadata
 /// layer LibreDWG itself reads: the pages-map records, the
-/// sections-map descriptors, and the sections-map's resolved
-/// physical file offset. Section payload content (header_vars,
-/// classes, objects) lands in a follow-up commit once entity
-/// emission is wired in.
+/// sections-map descriptors, the sections-map's resolved physical
+/// file offset, and the decoded section content (`header_vars`,
+/// `classes`, `objects`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct R2007File {
     pub version: Version,
@@ -132,6 +142,16 @@ pub struct R2007File {
     /// Convenience mirror of `sections.len()`. Pinned against the
     /// file header's `num_sections` field during parse.
     pub num_sections: i64,
+    /// Decoded `AcDb:Header` section (Dwg_Header_Variables).
+    /// Mirrors [`R2004File::header_vars`](super::r2004_layout::R2004File::header_vars).
+    pub header_vars: HeaderVarsSection,
+    /// Decoded `AcDb:Classes` section.
+    pub classes: ClassesSection,
+    /// Decoded `AcDb:AcDbObjects` section content. Each entry mirrors
+    /// the per-record peek `parse_r2004` writes — the per-type
+    /// payload bits can be recovered via
+    /// [`ObjectRecord::decode_with`] on `raw_bytes`.
+    pub objects: Vec<R2000Object>,
 }
 
 /// Build the pages-map content for an R2007 file from a list of
@@ -330,44 +350,86 @@ pub(crate) struct R2007DataPageOnDisk {
     pub uncomp_size: u64,
 }
 
-/// Encode an R2007 data page in stored mode: payload zero-padded to
-/// the next 8-byte boundary, written into a column-major
-/// `(255, 251)` Reed–Solomon block layout with **zero parity**, and
-/// the whole buffer padded to a multiple of 8 bytes.
+/// Encode an R2007 data page in stored mode: raw payload bytes
+/// followed by zero padding out to `round_up_8(block_count * 255)`
+/// total on-disk bytes.
 ///
-/// We emit zero parity because LibreDWG 0.13.3's `decode_rs` only
-/// reads the `data_size` columns of each codeword (the 4 parity
-/// columns are sliced off and never validated — see
-/// decode_r2007.c:560-593). Files emitted this way load cleanly in
-/// LibreDWG. ODA Drawings SDK *does* validate parity, so emitting
-/// real RS(255, 251) parity bytes is on the conformance roadmap;
-/// the layout we write now keeps the parity columns at the correct
-/// offsets, so dropping a real encoder in later is a one-function
-/// change.
+/// **Why raw bytes rather than RS-encoded?** LibreDWG's
+/// `read_data_section` (`decode_r2007.c:830-855`) takes one of two
+/// paths per page:
+///
+/// * `comp_size != uncomp_size` → call `read_data_page`, which
+///   reads `page->size` bytes and RS-decodes them with
+///   `decode_rs(rsdata, block_count, 0xFB, page_size)` before
+///   handing them to `decompress_r2007` (when `comp_size <
+///   uncomp_size`) or `memcpy` (when equal).
+/// * `comp_size == uncomp_size` → **direct memcpy** of
+///   `uncomp_size` bytes from the page, skipping RS-decode
+///   entirely.
+///
+/// We only emit stored-mode pages (no LZ77 compression), so the
+/// section descriptors always set `comp_size == uncomp_size`. That
+/// means LibreDWG always takes the direct-memcpy branch — we must
+/// therefore lay the payload out in *row-major* (raw) order, not
+/// the column-major RS layout `decode_rs` would un-transpose.
+///
+/// The single-block case (`uncomp_size <= 251`) used to "work" with
+/// the prior column-major encoder by coincidence — when
+/// `block_count == 1` the column-major and row-major layouts are
+/// identical. The bug only surfaced once a payload crossed the
+/// 251-byte threshold and required multiple blocks (e.g.
+/// `AcDb:Header` carrying real header variables at 511 bytes).
+///
+/// The on-disk size formula stays at `round_up_8(block_count *
+/// 255)` so this change leaves the page-map record sizes
+/// unchanged. The block-count math is kept as the canonical
+/// allocator because system pages and section descriptors elsewhere
+/// in the file format still reference it — see
+/// `R2007_PAGE_HEADER_SIZE`, the per-page `size` field in the
+/// pages-map, and LibreDWG's `read_data_page` which reads exactly
+/// `page->size` bytes regardless of which branch it takes after.
+///
+/// Adding real LZ77 compression later is straightforward: compress
+/// the payload, set `comp_size < uncomp_size` in the section
+/// descriptor, then RS-encode the compressed bytes (re-using the
+/// block_count math here). This pushes LibreDWG into the
+/// `read_data_page` branch, which is where RS-decoding belongs.
 pub(crate) fn encode_data_page(payload: &[u8]) -> R2007DataPageOnDisk {
     let uncomp_size = payload.len();
-    // Round up to 8-byte multiple (LibreDWG `pesize` calculation).
+    // Match LibreDWG's `pesize = ((size_comp + 7) & ~7)` and
+    // `block_count = (pesize + 0xFB - 1) / 0xFB` so the on-disk
+    // page size stays consistent with what its `read_data_page`
+    // computes from `comp_size`. We keep that allocator here
+    // because the pages-map's `size` field has to match what we
+    // actually write.
     let pesize = round_up_8(uncomp_size);
     let block_count = pesize.div_ceil(RS_DATA_PAGE_DATA_SIZE).max(1);
     let codeword_bytes = block_count * RS_DATA_PAGE_BLOCK_SIZE;
     let on_disk_size = round_up_8(codeword_bytes);
     let mut on_disk = vec![0u8; on_disk_size];
-    for i in 0..block_count {
-        for j in 0..RS_DATA_PAGE_DATA_SIZE {
-            let logical = i * RS_DATA_PAGE_DATA_SIZE + j;
-            let byte = if logical < uncomp_size {
-                payload[logical]
-            } else {
-                0
-            };
-            on_disk[j * block_count + i] = byte;
-        }
-        // Parity columns (j = 251..255) stay zero — see doc comment.
-    }
+    on_disk[..uncomp_size].copy_from_slice(payload);
     R2007DataPageOnDisk {
         on_disk,
         uncomp_size: uncomp_size as u64,
     }
+}
+
+/// Inverse of [`encode_data_page`]: extract the first `uncomp_size`
+/// bytes of `page_bytes`, which are the raw payload (the rest is
+/// zero padding to a multiple of 8).
+///
+/// Mirrors LibreDWG's direct-memcpy branch at
+/// `decode_r2007.c:842-855`. Returns an `InternalInvariant` if the
+/// on-disk slice is shorter than `uncomp_size` (the section
+/// descriptor's per-page declaration).
+pub(crate) fn decode_data_page(page_bytes: &[u8], uncomp_size: usize) -> DwgResult<Vec<u8>> {
+    if page_bytes.len() < uncomp_size {
+        return Err(DwgError::InternalInvariant(format!(
+            "decode_data_page: on-disk size {} shorter than declared uncomp_size {uncomp_size}",
+            page_bytes.len(),
+        )));
+    }
+    Ok(page_bytes[..uncomp_size].to_vec())
 }
 
 /// Convert an ASCII section name into UTF-16LE bytes. R2007
@@ -400,16 +462,6 @@ pub(crate) const MANDATORY_R2007_SECTION_NAMES: &[&str] = &[
     // critical-error threshold and forces dwgread to exit 1.
     "AcDb:AcDbObjects", // type 7
 ];
-
-/// Minimal AcDb:Template section payload that LibreDWG's
-/// `read_2007_section_template` accepts without complaint. The
-/// section content is consumed by `src/template.spec`:
-/// `FIELD_T16 (description, 0);` reads a `RS` (u16 LE) length
-/// followed by that many bytes; here we use length = 0 so no
-/// description bytes follow. Then `FIELD_RS (MEASUREMENT, 0);`
-/// reads one more `RS` (u16 LE) for the MEASUREMENT setting; we
-/// emit 0 (= English / Imperial). Total = 4 bytes.
-const TEMPLATE_MIN_PAYLOAD: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
 
 /// Build the sections-map content for an R2007 file from a list
 /// of pre-built section descriptors. Each descriptor contributes
@@ -567,16 +619,19 @@ fn utf16le_string(bytes: &[u8]) -> DwgResult<String> {
 
 /// Parts needed to build an R2007 file.
 ///
-/// Currently only carries the version — R2007's empty-doc layout
-/// derives every section's content from `version` (AuxHeader uses
-/// `AuxHeaderSection::fresh_for(version)`, Classes emits the empty
-/// placeholder, Handles emits the canonical 4-byte terminator,
-/// AcDbObjects emits a 0-byte empty payload matching the R2004+
-/// convention from PR-D). Once R2007 entity round-trip lands, this
-/// struct will grow `objects`, `header_vars`, `classes` fields
-/// mirroring `R2004FileParts`.
+/// Mirrors [`R2004FileParts`](super::r2004_layout::R2004FileParts):
+/// the assembler threads `header_vars` into AcDb:Header, `classes`
+/// into AcDb:Classes, and `objects` into both AcDb:AcDbObjects
+/// (concatenated wire bytes) and AcDb:Handles (per-record offset
+/// map). AuxHeader and Template are still derived from `version`
+/// internally because their content is invariant for the documents
+/// we emit today.
+#[derive(Debug, Clone)]
 pub struct R2007FileParts {
     pub version: Version,
+    pub header_vars: HeaderVarsSection,
+    pub classes: ClassesSection,
+    pub objects: Vec<ObjectRecord>,
 }
 
 /// Assemble a complete R2007+ file from its in-memory parts.
@@ -640,18 +695,12 @@ pub fn assemble_r2007(parts: R2007FileParts) -> DwgResult<Vec<u8>> {
     //    section flagged with `num_pages = 0` triggers an
     //    "Invalid num_pages 0, skip" error at decode_r2007.c:1538.
     //
-    //    AcDb:Header still ships sentinel-only content for now; the
-    //    `read_2007_section_header` path treats a sentinel-only
-    //    payload as a non-critical `VALUEOUTOFBOUNDS` (cumulative
-    //    error stays below the critical 128 threshold). Full
-    //    `Dwg_Header_Variables` emission for R2007 is the next chunk
-    //    of conformance work — it requires either porting PR-D's
-    //    R2004+ header-vars body to R2007's RC-wrapped string
-    //    sub-stream or extending the existing emit path with R2007's
-    //    UTF-16 string sub-stream wrapping. The current empty-doc
-    //    R2007 path doesn't carry any header-vars caller would notice
-    //    losing in self-round-trip (all values come back as defaults),
-    //    so the sentinel-only Header is safe for the current scope.
+    //    AcDb:Header now carries the full `Dwg_Header_Variables`
+    //    payload via `HeaderVarsSection::encode` (split-stream layout
+    //    courtesy of `header_vars_body::encode_body`, which is
+    //    already R2007+-aware). `parts.header_vars` is the canonical
+    //    section for the document; the assembler doesn't synthesize
+    //    its own.
     //
     //    The other five sections (AcDb:AuxHeader, AcDb:Classes,
     //    AcDb:Handles, AcDb:Template, AcDb:AcDbObjects) all carry
@@ -670,7 +719,8 @@ pub fn assemble_r2007(parts: R2007FileParts) -> DwgResult<Vec<u8>> {
     let mut data_pages: Vec<EmittedDataPage> = Vec::new();
     let mut next_page_id: i64 = 2; // 1 is reserved for the sections-map.
 
-    let header_payload = HEADER_VARS_BEGIN.to_vec();
+    let mut header_payload = Vec::new();
+    parts.header_vars.encode(&mut header_payload);
     let header_page = encode_data_page(&header_payload);
     let header_page_id = next_page_id;
     next_page_id += 1;
@@ -708,7 +758,8 @@ pub fn assemble_r2007(parts: R2007FileParts) -> DwgResult<Vec<u8>> {
     // class list after round-trip. R2007's string sub-stream is
     // already supported by `encode_with_maint`.
     let mut classes_payload = Vec::new();
-    ClassesSection::empty(parts.version)
+    parts
+        .classes
         .encode_with_maint(&mut classes_payload, parts.version.maintenance_release())?;
     let classes_page = encode_data_page(&classes_payload);
     let classes_page_id = next_page_id;
@@ -720,15 +771,41 @@ pub fn assemble_r2007(parts: R2007FileParts) -> DwgResult<Vec<u8>> {
         section_name: "AcDb:Classes",
     });
 
-    // Real Handles payload: `ObjectMap::default().encode()` produces
-    // the canonical 4-byte terminator page `[0x00, 0x02, 0x90, 0x01]`
-    // — size=2 big-endian + CRC=0x9001 over those two bytes (X.25 init
-    // 0xc0c1). This clears both `Invalid num_pages 0` for AcDb:Handles
-    // AND the `Handles section page CRC mismatch: 0000 vs calc. 9001`
-    // warning that LibreDWG emits when the section is present but
-    // empty-CRC'd.
+    // PHASE 4 — OBJECTS section: concatenated wire bytes of every
+    // `ObjectRecord`, with per-record offsets captured for the
+    // handles object map. This mirrors `assemble_r2004` PHASE 4 (see
+    // `r2004_layout.rs:241`); R2007's per-page packaging differs from
+    // R2004's compressed page stream but the in-section byte layout
+    // is identical (LibreDWG `read_2007_section_objects` and
+    // `read_2004_section_objects` share the same per-record decoder).
+    let mut objects_payload: Vec<u8> = Vec::new();
+    let mut record_section_offsets: Vec<u64> = Vec::with_capacity(parts.objects.len());
+    for record in &parts.objects {
+        record_section_offsets.push(objects_payload.len() as u64);
+        let wire = record.encode(parts.version)?;
+        objects_payload.extend_from_slice(&wire);
+    }
+
+    // Real Handles payload: an `ObjectMap` populated with one entry
+    // per emitted record at its in-section offset. LibreDWG's
+    // `read_2007_section_handles` walks the same MC-delta encoded
+    // (handle, offset) pairs the R2004+ path uses; `ObjectMap::encode`
+    // is version-agnostic. For an empty document this produces the
+    // canonical 4-byte terminator page `[0x00, 0x02, 0x90, 0x01]` —
+    // size=2 big-endian + CRC=0x9001 over those two bytes (X.25 init
+    // 0xc0c1). For a non-empty document we sort entries by handle and
+    // emit a real lookup table.
+    let mut object_map = ObjectMap::new();
+    let mut sorted_indices: Vec<usize> = (0..parts.objects.len()).collect();
+    sorted_indices.sort_by_key(|&i| parts.objects[i].handle.value);
+    for &i in &sorted_indices {
+        object_map.entries.push(ObjectMapEntry {
+            handle: parts.objects[i].handle.value,
+            file_offset: record_section_offsets[i],
+        });
+    }
     let mut handles_payload = Vec::new();
-    ObjectMap::default().encode(&mut handles_payload)?;
+    object_map.encode(&mut handles_payload)?;
     let handles_page = encode_data_page(&handles_payload);
     let handles_page_id = next_page_id;
     next_page_id += 1;
@@ -739,7 +816,14 @@ pub fn assemble_r2007(parts: R2007FileParts) -> DwgResult<Vec<u8>> {
         section_name: "AcDb:Handles",
     });
 
-    let template_payload = TEMPLATE_MIN_PAYLOAD.to_vec();
+    // AcDb:Template — encode via `TemplateSection::default()` (empty
+    // description + MEASUREMENT=0) to stay symmetric with the R2004
+    // path and reuse the shared encoder. The version-aware encoder
+    // emits a 4-byte payload for R2007 (RS u16 length=0 + RS u16
+    // measurement=0) — same wire shape as the previous hardcoded
+    // `[0x00, 0x00, 0x00, 0x00]` constant, only now structurally
+    // derived rather than pinned.
+    let template_payload = TemplateSection::default().encode(parts.version)?;
     let template_page = encode_data_page(&template_payload);
     let template_page_id = next_page_id;
     next_page_id += 1;
@@ -750,22 +834,12 @@ pub fn assemble_r2007(parts: R2007FileParts) -> DwgResult<Vec<u8>> {
         section_name: "AcDb:Template",
     });
 
-    // Real AcDbObjects payload for an empty document: a 0-byte buffer.
-    // The original "Invalid num_pages 0" error came from the *section
-    // descriptor* having `num_pages = 0`, not from the payload itself
-    // being empty. With a real one-page descriptor (via the
-    // `single_page_for_name(..., uncomp_size=0, page_size=256, ...)`
-    // call below — `encode_data_page` of an empty payload produces a
-    // 256-byte zero-padded RS-coded page: `block_count=1` → 255
-    // codeword bytes → `round_up_8(255)=256`), LibreDWG's
-    // `read_2007_section_objects` reads a 0-length decompressed
-    // buffer and runs zero iterations of the entry walk — matching
-    // the R2004+ empty-doc convention from PR-D exactly, where
-    // `assemble_r2004` also emits a 0-byte `objects_bytes`. No
-    // `[0x00]` marker byte is needed (verified against `dwgread` on
-    // the empty-doc fixture: SUCCESS with zero errors and zero
-    // warnings).
-    let objects_payload: Vec<u8> = Vec::new();
+    // AcDb:AcDbObjects payload — already built above (PHASE 4) into
+    // `objects_payload`. For an empty document it stays a 0-byte
+    // buffer (matches the R2004+ empty-doc convention from PR-D where
+    // `assemble_r2004` also emits a 0-byte `objects_bytes` and
+    // LibreDWG's `read_2007_section_objects` runs zero iterations of
+    // the entry walk).
     let objects_page = encode_data_page(&objects_payload);
     let objects_page_id = next_page_id;
     next_page_id += 1;
@@ -812,6 +886,36 @@ pub fn assemble_r2007(parts: R2007FileParts) -> DwgResult<Vec<u8>> {
                 })
         })
         .collect::<DwgResult<Vec<_>>>()?;
+
+    // 4b. Defense-in-depth: every section descriptor MUST satisfy
+    //     `comp_size == uncomp_size`. `encode_data_page` writes raw
+    //     row-major payload bytes (no Reed-Solomon column-major
+    //     transpose), which is correct only because LibreDWG's
+    //     `read_data_section` (`decode_r2007.c:830-855`) takes the
+    //     direct-memcpy branch whenever `comp_size == uncomp_size`.
+    //     If a future change adds LZ77 compression and sets
+    //     `comp_size < uncomp_size` for some descriptor, that
+    //     descriptor's page must be RS-encoded (and the encoder
+    //     replaced or extended). Catch the mismatch here at
+    //     assemble time instead of letting LibreDWG fail with an
+    //     opaque "Failed to read 2007 meta data" downstream.
+    for descriptor in &descriptors {
+        for page in &descriptor.pages {
+            if page.comp_size != page.uncomp_size {
+                return Err(DwgError::InternalInvariant(format!(
+                    "assemble_r2007: section {:?} page {} has \
+                     comp_size={} != uncomp_size={}, but \
+                     `encode_data_page` only emits stored-mode \
+                     (raw row-major) bytes. A compressed-mode \
+                     descriptor requires a sibling \
+                     `encode_compressed_data_page` that produces \
+                     the column-major RS layout LibreDWG's \
+                     `read_data_page` path expects.",
+                    descriptor.name, page.id, page.comp_size, page.uncomp_size,
+                )));
+            }
+        }
+    }
 
     // 5. Sections-map system page.
     let sections_map_content = encode_sections_map_content(&descriptors);
@@ -877,12 +981,16 @@ pub fn assemble_r2007(parts: R2007FileParts) -> DwgResult<Vec<u8>> {
 /// `sections.len()` rather than re-reading it from the header so a
 /// future header-vs-content mismatch turns into a length check that
 /// the caller can assert on.
+#[allow(clippy::too_many_arguments)]
 fn r2007_file_from_header(
     version: Version,
     header: &R2007FileHeader,
     pages_map: Vec<(i64, u64)>,
     sections_map_offset: u64,
     sections: Vec<SectionDescriptor>,
+    header_vars: HeaderVarsSection,
+    classes: ClassesSection,
+    objects: Vec<R2000Object>,
 ) -> R2007File {
     R2007File {
         version,
@@ -891,6 +999,9 @@ fn r2007_file_from_header(
         sections_map_offset,
         num_sections: sections.len() as i64,
         sections,
+        header_vars,
+        classes,
+        objects,
     }
 }
 
@@ -1118,12 +1229,193 @@ pub fn parse_r2007(bytes: &[u8], version: Version) -> DwgResult<R2007File> {
     )?;
     let sections = decode_sections_map_content(&sections_map_payload, header.num_sections)?;
 
+    // 6. Decode the per-section content for the four sections whose
+    //    payloads round-trip into the document bridge: AcDb:Header
+    //    (header_vars), AcDb:Classes (classes), AcDb:AcDbObjects
+    //    (object record wire bytes) and AcDb:Handles (object map).
+    //    AcDb:AuxHeader and AcDb:Template round-trip via their
+    //    parsers for wire-format validation only; their decoded form
+    //    isn't needed by the bridge (the values they carry are
+    //    duplicated in header_vars).
+    //
+    //    Page-id → physical file offset resolution uses the same
+    //    `offset += size` accumulator as step 4 for the sections-map,
+    //    mirroring LibreDWG `decode_r2007.c::read_data_section`.
+    let mut page_offsets: HashMap<i64, u64> = HashMap::with_capacity(pages_records.len());
+    {
+        let mut running: u64 = R2007_FIRST_PAGE_OFFSET;
+        for &(id, size) in &pages_records {
+            page_offsets.insert(id, running);
+            running = running.checked_add(size).ok_or_else(|| {
+                DwgError::InternalInvariant(
+                    "parse_r2007: page offset accumulation overflowed u64".into(),
+                )
+            })?;
+        }
+    }
+    let read_section = |descriptor: &SectionDescriptor| -> DwgResult<Vec<u8>> {
+        let mut combined = Vec::with_capacity(descriptor.data_size.max(0) as usize);
+        for page in &descriptor.pages {
+            let page_offset = *page_offsets.get(&page.id).ok_or_else(|| {
+                DwgError::InternalInvariant(format!(
+                    "parse_r2007: section {:?} references unknown page id {}",
+                    descriptor.name, page.id,
+                ))
+            })?;
+            let page_offset_usize = usize::try_from(page_offset).map_err(|_| {
+                DwgError::InternalInvariant(format!(
+                    "parse_r2007: page_offset {page_offset} exceeds usize"
+                ))
+            })?;
+            let page_size_usize = usize::try_from(page.size).map_err(|_| {
+                DwgError::InternalInvariant(format!(
+                    "parse_r2007: page.size {} exceeds usize",
+                    page.size
+                ))
+            })?;
+            let page_end = page_offset_usize
+                .checked_add(page_size_usize)
+                .ok_or_else(|| {
+                    DwgError::InternalInvariant(
+                        "parse_r2007: page end arithmetic overflowed usize".into(),
+                    )
+                })?;
+            if bytes.len() < page_end {
+                return Err(DwgError::InternalInvariant(format!(
+                    "parse_r2007: section {:?} page {} extends past file (off={page_offset_usize}, size={page_size_usize}, file_len={})",
+                    descriptor.name, page.id, bytes.len(),
+                )));
+            }
+            let uncomp_size = usize::try_from(page.uncomp_size).map_err(|_| {
+                DwgError::InternalInvariant(format!(
+                    "parse_r2007: page.uncomp_size {} exceeds usize",
+                    page.uncomp_size,
+                ))
+            })?;
+            let decoded = decode_data_page(&bytes[page_offset_usize..page_end], uncomp_size)?;
+            combined.extend_from_slice(&decoded);
+        }
+        Ok(combined)
+    };
+
+    let mut header_vars: Option<HeaderVarsSection> = None;
+    let mut classes: Option<ClassesSection> = None;
+    let mut objects_payload: Option<Vec<u8>> = None;
+    let mut handles_payload: Option<Vec<u8>> = None;
+
+    for descriptor in &sections {
+        let combined = read_section(descriptor)?;
+        match descriptor.name.as_str() {
+            "AcDb:Header" => {
+                header_vars = Some(HeaderVarsSection::parse(version, &combined, 0)?);
+            }
+            "AcDb:Classes" => {
+                classes = Some(ClassesSection::parse_with_maint(
+                    version,
+                    &combined,
+                    0,
+                    version.maintenance_release(),
+                )?);
+            }
+            "AcDb:AcDbObjects" => {
+                objects_payload = Some(combined);
+            }
+            "AcDb:Handles" => {
+                handles_payload = Some(combined);
+            }
+            "AcDb:AuxHeader" => {
+                // Round-trip validation only — values mirrored in
+                // header_vars, not needed by the bridge. Parsing
+                // still runs so we catch wire-format regressions.
+                let _ = AuxHeaderSection::parse(version, &combined)?;
+            }
+            "AcDb:Template" => {
+                // Round-trip validation only — the decoded form
+                // (description + MEASUREMENT) is invariant for the
+                // documents we emit today, but parsing still runs so
+                // we catch wire-format regressions. Mirrors the R2004
+                // path (`r2004_layout.rs::parse_r2004` SECTION_NAME_TEMPLATE
+                // branch). `TemplateSection::parse` dispatches on
+                // `version.uses_utf16_strings()` so it handles R2007
+                // and R2010+ uniformly.
+                let _ = TemplateSection::parse(version, &combined)?;
+            }
+            _ => {
+                // Other optional section (preview, summary, etc.) -
+                // preserved structurally via the descriptor; the
+                // document bridge doesn't need its decoded form.
+            }
+        }
+    }
+
+    let header_vars = header_vars.ok_or_else(|| DwgError::MalformedObject {
+        class: "FileLayout".into(),
+        offset: 0,
+        message: "parse_r2007: no AcDb:Header section descriptor".into(),
+    })?;
+    let classes = classes.ok_or_else(|| DwgError::MalformedObject {
+        class: "FileLayout".into(),
+        offset: 0,
+        message: "parse_r2007: no AcDb:Classes section descriptor".into(),
+    })?;
+    let objects_payload = objects_payload.ok_or_else(|| DwgError::MalformedObject {
+        class: "FileLayout".into(),
+        offset: 0,
+        message: "parse_r2007: no AcDb:AcDbObjects section descriptor".into(),
+    })?;
+    let handles_payload = handles_payload.ok_or_else(|| DwgError::MalformedObject {
+        class: "FileLayout".into(),
+        offset: 0,
+        message: "parse_r2007: no AcDb:Handles section descriptor".into(),
+    })?;
+
+    // 7. Decode object map from the handles payload.
+    let object_map = ObjectMap::parse(&handles_payload)?;
+
+    // 8. Recover each object record from the objects payload. The
+    //    payload is a flat concatenation of ObjectRecord wire bytes;
+    //    we peek each one structurally and store the raw bytes for
+    //    later per-type decoding (same pattern as parse_r2004).
+    let mut objects = Vec::with_capacity(object_map.entries.len());
+    let mut cursor = 0usize;
+    while cursor < objects_payload.len() {
+        let (object_type, record_handle, common, total) =
+            ObjectRecord::peek_header(version, &objects_payload[cursor..])?;
+        if cursor + total > objects_payload.len() {
+            return Err(DwgError::UnexpectedEof {
+                byte: cursor + total,
+                bit: 0,
+            });
+        }
+        let raw_bytes = objects_payload[cursor..cursor + total].to_vec();
+        // The object map lookup the bot flagged here was a no-op:
+        // `.find(|e| e.handle == record_handle.value).map_or(record_handle.value, |e| e.handle)`
+        // returns `record_handle.value` on both branches (the predicate
+        // forces `e.handle == record_handle.value`). The object map's
+        // role is to validate handle presence + recover the per-record
+        // offset within the section, not to relabel handles. Drop the
+        // O(n) scan; keep `map_handle` semantically named for the
+        // downstream consumer.
+        let map_handle = record_handle.value;
+        objects.push(R2000Object {
+            map_handle,
+            object_type,
+            record_handle,
+            common,
+            raw_bytes,
+        });
+        cursor += total;
+    }
+
     Ok(r2007_file_from_header(
         version,
         &header,
         pages_records,
         sections_map_offset,
         sections,
+        header_vars,
+        classes,
+        objects,
     ))
 }
 
@@ -1133,7 +1425,12 @@ mod tests {
     use crate::dwg::version::Version;
 
     fn empty_parts(version: Version) -> R2007FileParts {
-        R2007FileParts { version }
+        R2007FileParts {
+            version,
+            header_vars: HeaderVarsSection::libredwg_conformant(version),
+            classes: ClassesSection::empty(version),
+            objects: Vec::new(),
+        }
     }
 
     #[test]

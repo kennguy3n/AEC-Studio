@@ -86,13 +86,7 @@ pub fn write_modern(doc: &DxfDocument, version: Version) -> DwgResult<Vec<u8>> {
         user_entities.push(record);
     }
 
-    let records = if version == Version::R2007 {
-        // R2007 ships an empty document today; the table-object
-        // wrapper is unused, so keep `records` empty.
-        Vec::new()
-    } else {
-        build_record_set(version, user_entities)?
-    };
+    let records = build_record_set(version, user_entities)?;
 
     if version == Version::R2007 {
         // R2007 uses LibreDWG's `decode_R2007` codepath: RS-encoded
@@ -101,43 +95,19 @@ pub fn write_modern(doc: &DxfDocument, version: Version) -> DwgResult<Vec<u8>> {
         // `decode_R2004` codepath instead (encrypted header), so
         // they're handled by `assemble_r2004` like R2004 itself.
         //
-        // The R2007 entity-bearing data pages are NOT yet wired into
-        // `assemble_r2007` — the first cut emits a zero-section file
-        // to pin the file-header layer against the LibreDWG oracle.
-        // Until that work lands, callers must NOT pass entities in
-        // the doc when targeting R2007 — silently dropping them is
-        // worse than failing loudly, since the data loss is otherwise
-        // invisible to any caller that doesn't watch stderr.
-        if !doc.entities.is_empty() {
-            return Err(DwgError::UnsupportedInVersion {
-                version,
-                what: format!(
-                    "writing {n} entity record(s) to a R2007 document is \
-                     not yet supported: `assemble_r2007` does not emit \
-                     entity-bearing data pages (the R2007 system pages \
-                     ship the file header, classes, and handle map only). \
-                     Either target R2004, R2010, R2013, or R2018 -- all of \
-                     which fully round-trip entities through the \
-                     decode_R2004 codepath -- or pre-filter the document \
-                     down to zero entities before writing R2007. See the \
-                     R2007 conformance roadmap (PR-C / phase 6) for the \
-                     follow-up work that lifts this restriction.",
-                    // Report the count from the original user document.
-                    // `records` was reset to `Vec::new()` above (R2007's
-                    // table-object wrapper is empty), so its length is
-                    // always 0 here.
-                    n = doc.entities.len()
-                ),
-            });
-        }
-        // `assemble_r2007` now derives every section's content from
-        // `version` internally — it builds its own `AuxHeaderSection`,
-        // `ClassesSection`, and `ObjectMap` at the layout step (see
-        // `r2007_layout::assemble_r2007`'s step 3). When R2007 entity
-        // round-trip lands, `R2007FileParts` will grow `objects`,
-        // `header_vars`, `classes` fields mirroring `R2004FileParts`
-        // and this branch will start threading them in.
-        let parts = R2007FileParts { version };
+        // `R2007FileParts` mirrors `R2004FileParts`'s shape exactly:
+        // header_vars + classes + objects are threaded through the
+        // same `build_record_set` pipeline, then `assemble_r2007`
+        // packages them into RS-coded data pages while reusing the
+        // same in-section wire formats (LibreDWG's `read_2007_section_*`
+        // functions all delegate to the same body decoders as the
+        // R2004+ path).
+        let parts = R2007FileParts {
+            version,
+            header_vars: HeaderVarsSection::with_vars(version, &header_vars_for_records(&records)),
+            classes: ClassesSection::empty(version),
+            objects: records,
+        };
         assemble_r2007(parts)
     } else if version.has_paged_system_sections() {
         let parts = R2004FileParts {
@@ -332,11 +302,7 @@ pub fn read_modern(bytes: &[u8]) -> DwgResult<DxfDocument> {
     })?;
     let (decoded_version, objects) = if version == Version::R2007 {
         let file = parse_r2007(bytes, version)?;
-        // R2007 section content not yet decoded — return version
-        // only. Once `assemble_r2007` writes real sections, the
-        // parser will populate this vector via the same r2004-style
-        // record bridge.
-        (file.version, Vec::new())
+        (file.version, file.objects)
     } else if version.has_paged_system_sections() {
         let file = parse_r2004(bytes)?;
         (file.version, file.objects)
@@ -666,14 +632,16 @@ mod tests {
     /// version — proving the per-version dispatch actually fires.
     #[test]
     fn text_with_non_ascii_round_trips_r2007_through_r2018() {
-        // R2007 itself is intentionally excluded here — PR-C is
-        // mid-flight: the file-header layer is wired against the
-        // LibreDWG oracle, but entity-bearing data pages aren't
-        // emitted yet, so the round-trip drops content. R2010 /
-        // R2013 / R2018 still go through assemble_r2004 and round-
-        // trip cleanly. Re-enabling R2007 here is pinned by the
-        // entity-content commit later in this same PR.
-        for v in [Version::R2010, Version::R2013, Version::R2018] {
+        // R2007 round-trips entity-bearing data pages via the same
+        // `build_record_set` + per-record wire encoding the R2004+
+        // path uses; only the page packaging differs (RS-coded data
+        // pages vs. paged-section pages).
+        for v in [
+            Version::R2007,
+            Version::R2010,
+            Version::R2013,
+            Version::R2018,
+        ] {
             let mut doc = DxfDocument::new();
             doc.push(DxfEntity::Text(DxfText {
                 layer: "0".into(),
@@ -835,12 +803,15 @@ mod tests {
         // defense-in-depth against a future version-specific
         // table-emit change that would otherwise drift past the
         // single-version check. R12 has a different wire format (no
-        // header_vars HANDSEED slot); R2007 ships an empty-doc
-        // fixture in CI; both are excluded for that reason.
+        // header_vars HANDSEED slot) and is excluded for that
+        // reason; R2007 joined this list in PR-H1 once `assemble_r2007`
+        // started shipping the same BLOCK_CONTROL / LAYER_CONTROL /
+        // model-space chain as R14+.
         let versions = [
             Version::R14,
             Version::R2000,
             Version::R2004,
+            Version::R2007,
             Version::R2010,
             Version::R2013,
             Version::R2018,

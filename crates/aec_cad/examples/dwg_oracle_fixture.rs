@@ -41,21 +41,18 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
     let doc = oracle_fixture_doc();
-    // R2007 cannot write entities (assemble_r2007 does not emit
-    // entity-bearing data pages yet -- PR-C / phase 6). The writer
-    // returns Err(UnsupportedInVersion) for any R2007 doc with
-    // non-empty `entities`.
-    //
-    // R12 is also restricted to the empty-doc oracle fixture in
-    // PR-F2: the AC1009 wire-format assembler (file header,
-    // section locators, header_vars, sentinel-framed regions, aux
-    // header, CRC) is clean against LibreDWG `dwgread` with
-    // EXIT=0 / 0 errors / 0 warnings, but the per-entity record
-    // wire format is still our internal CRC-framed shape. Once a
-    // future PR ports the R12 entity codec to LibreDWG's
-    // `decode_preR13_entities` byte layout (RC type + per-type
-    // fixed-record fields + RS CRC at end), the R12 fixture will
-    // pick up the standard 3-entity geometry.
+    // R12 is restricted to the empty-doc oracle fixture: the AC1009
+    // wire-format assembler (file header, section locators,
+    // header_vars, sentinel-framed regions, aux header, CRC) is
+    // clean against LibreDWG `dwgread` with EXIT=0 / 0 errors / 0
+    // warnings, but the per-entity record wire format is still our
+    // internal CRC-framed shape. Once a future PR ports the R12
+    // entity codec to LibreDWG's `decode_preR13_entities` byte
+    // layout (RC type + per-type fixed-record fields + RS CRC at
+    // end), the R12 fixture will pick up the standard 3-entity
+    // geometry. R2007 was lifted out of this list in PR-H1 once
+    // `assemble_r2007` learned to package real entity records into
+    // RS-coded data pages.
     //
     // Other versions get the standard 3-entity fixture.
     let empty_doc = DxfDocument::new();
@@ -70,7 +67,7 @@ fn main() -> ExitCode {
         ("r2018", Version::R2018),
     ];
     for (name, v) in versions {
-        let doc_for_v = if matches!(v, Version::R12 | Version::R2007) {
+        let doc_for_v = if matches!(v, Version::R12) {
             &empty_doc
         } else {
             &doc
