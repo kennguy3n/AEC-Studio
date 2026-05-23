@@ -62,12 +62,23 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
     let doc = fixture_doc();
-    // R2007 currently cannot write entities (assemble_r2007 does not
-    // emit entity-bearing data pages yet -- PR-C / phase 6). The
-    // writer returns Err(UnsupportedInVersion) for any R2007 doc
-    // with non-empty `entities`, so we emit an explicitly empty
-    // document for the R2007 fixture instead of relying on a
-    // silent-drop. Other versions get the standard 3-entity fixture.
+    // R2007 cannot write entities (assemble_r2007 does not emit
+    // entity-bearing data pages yet -- PR-C / phase 6). The writer
+    // returns Err(UnsupportedInVersion) for any R2007 doc with
+    // non-empty `entities`.
+    //
+    // R12 is also restricted to the empty-doc oracle fixture in
+    // PR-F2: the AC1009 wire-format assembler (file header,
+    // section locators, header_vars, sentinel-framed regions, aux
+    // header, CRC) is clean against LibreDWG `dwgread` with
+    // EXIT=0 / 0 errors / 0 warnings, but the per-entity record
+    // wire format is still our internal CRC-framed shape. Once a
+    // future PR ports the R12 entity codec to LibreDWG's
+    // `decode_preR13_entities` byte layout (RC type + per-type
+    // fixed-record fields + RS CRC at end), the R12 fixture will
+    // pick up the standard 3-entity geometry.
+    //
+    // Other versions get the standard 3-entity fixture.
     let empty_doc = DxfDocument::new();
     let versions = [
         ("r12", Version::R12),
@@ -80,7 +91,7 @@ fn main() -> ExitCode {
         ("r2018", Version::R2018),
     ];
     for (name, v) in versions {
-        let doc_for_v = if v == Version::R2007 {
+        let doc_for_v = if matches!(v, Version::R12 | Version::R2007) {
             &empty_doc
         } else {
             &doc

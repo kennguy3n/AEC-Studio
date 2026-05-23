@@ -1,6 +1,6 @@
 //! Bridge between the in-memory [`crate::dxf::DxfDocument`] and the
 //! R12 wire-level types in [`super::entity`], [`super::record_kinds`],
-//! [`super::header_vars`], and [`super::tables`].
+//! [`super::spec::header_vars`], and [`super::tables`].
 //!
 //! This module owns the *mapping policy* between the document's
 //! string-keyed layer/block model and the R12 file's 1-based table
@@ -15,13 +15,13 @@ use crate::dwg::error::{DwgError, DwgResult};
 use crate::dwg::r12::entity::{
     common_flag, encode_record, R12EntityCommon, R12EntityRecord, R12EntityType,
 };
-use crate::dwg::r12::header_vars::R12HeaderVars;
 use crate::dwg::r12::record_kinds::{
     encode_arc, encode_circle, encode_insert, encode_line, encode_polyline_header, encode_text,
     encode_vertex, R12Arc, R12Circle, R12Insert, R12Line, R12PolylineHeader, R12Text, R12Vertex,
     INSERT_HAS_ROTATION, INSERT_HAS_SCALE_X, INSERT_HAS_SCALE_Y, INSERT_HAS_SCALE_Z,
     TEXT_HAS_ROTATION, VERTEX_HAS_BULGE,
 };
+use crate::dwg::r12::spec::header_vars::R12HeaderVars;
 use crate::dwg::r12::tables::{
     R12AppIdRecord, R12BlockRecord, R12DimstyleRecord, R12LayerRecord, R12LinetypeRecord,
     R12StyleRecord, R12Tables, R12UcsRecord, R12VportRecord,
