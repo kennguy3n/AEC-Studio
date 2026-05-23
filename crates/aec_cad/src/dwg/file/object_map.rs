@@ -30,7 +30,7 @@
 
 use crate::dwg::bits::crc_x25;
 use crate::dwg::error::{DwgError, DwgResult};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// One entry in the object map.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,37 +181,68 @@ impl ObjectMap {
     }
 
     /// Cross-check that every record handle is present in the
-    /// object map (and vice versa).
+    /// object map (and vice versa), and that neither side contains
+    /// duplicate handles.
     ///
     /// Used by the R2004/R2007 parsers as a defense-in-depth
     /// check after [`crate::dwg::file::objects_section::recover_objects_sequential`]:
     /// the records were walked from a flat payload, and a
     /// well-formed file's `AcDb:Handles` page MUST list every
-    /// record handle (LibreDWG's `read_2007_section_handles`
-    /// relies on this for the post-decode `dwg_resolve_handle`
-    /// pass).
+    /// record handle exactly once (LibreDWG's
+    /// `read_2007_section_handles` relies on this for the
+    /// post-decode `dwg_resolve_handle` pass; two map entries with
+    /// the same handle would race on which offset wins).
     ///
-    /// Returns:
-    /// - `DwgError::MalformedObject` when a record's handle is
-    ///   absent from the map (the map is the canonical lookup
-    ///   side; a missing entry indicates a corrupted handles
-    ///   section).
-    /// - `DwgError::MalformedObject` when the map contains a
-    ///   handle that no record claims (orphaned map entry).
+    /// Returns `DwgError::MalformedObject` for:
+    /// - A duplicate handle inside the object map (two entries
+    ///   pointing at the same handle, possibly different offsets).
+    /// - A duplicate handle inside the recovered records (two
+    ///   records claiming the same handle).
+    /// - A record handle absent from the map (the map is the
+    ///   canonical lookup side; a missing entry indicates a
+    ///   corrupted handles section).
+    /// - A map entry whose handle no record claims (orphaned map
+    ///   entry).
     pub fn validate_against_records(
         &self,
         records: &[crate::dwg::file::r2000_layout::R2000Object],
     ) -> DwgResult<()> {
-        let map_handles: BTreeSet<u64> = self.entries.iter().map(|e| e.handle).collect();
-        let record_handles: BTreeSet<u64> = records.iter().map(|r| r.record_handle.value).collect();
+        let mut map_handles: BTreeMap<u64, u64> = BTreeMap::new();
+        for entry in &self.entries {
+            if let Some(prev_offset) = map_handles.insert(entry.handle, entry.file_offset) {
+                return Err(DwgError::MalformedObject {
+                    class: "ObjectMap".into(),
+                    offset: entry.file_offset,
+                    message: format!(
+                        "duplicate handle {:#x} in object map (previously at \
+                         offset {:#x}, now at offset {:#x}); a handle must \
+                         resolve to exactly one record",
+                        entry.handle, prev_offset, entry.file_offset
+                    ),
+                });
+            }
+        }
+        let mut record_handles: BTreeSet<u64> = BTreeSet::new();
         for record in records {
-            if !map_handles.contains(&record.record_handle.value) {
+            if !record_handles.insert(record.record_handle.value) {
                 return Err(DwgError::MalformedObject {
                     class: "ObjectMap".into(),
                     offset: 0,
                     message: format!(
-                        "record handle {:#x} is missing from the object map (map has \
-                         {} entries; expected every record handle to appear)",
+                        "duplicate record handle {:#x} in recovered OBJECTS \
+                         payload; each record must claim a unique handle",
+                        record.record_handle.value
+                    ),
+                });
+            }
+            if !map_handles.contains_key(&record.record_handle.value) {
+                return Err(DwgError::MalformedObject {
+                    class: "ObjectMap".into(),
+                    offset: 0,
+                    message: format!(
+                        "record handle {:#x} is missing from the object map \
+                         (map has {} entries; expected every record handle to \
+                         appear)",
                         record.record_handle.value,
                         self.entries.len()
                     ),
@@ -388,6 +419,109 @@ mod tests {
             write_mc_i64(&mut buf, v);
             let (decoded, _) = read_mc_i64(&buf).unwrap();
             assert_eq!(decoded, v, "round-trip failure for {v}");
+        }
+    }
+
+    mod validation {
+        use super::*;
+        use crate::dwg::bits::reader::HandleRef;
+        use crate::dwg::entities::header_codec::CommonHeaderData;
+        use crate::dwg::entities::ObjectType;
+        use crate::dwg::file::r2000_layout::R2000Object;
+
+        fn record(handle_value: u64) -> R2000Object {
+            R2000Object {
+                map_handle: handle_value,
+                object_type: ObjectType::Line,
+                record_handle: HandleRef {
+                    code: 0,
+                    value: handle_value,
+                },
+                common: CommonHeaderData::default(),
+                raw_bytes: Vec::new(),
+            }
+        }
+
+        fn entry(handle: u64, file_offset: u64) -> ObjectMapEntry {
+            ObjectMapEntry {
+                handle,
+                file_offset,
+            }
+        }
+
+        #[test]
+        fn matching_handles_validate() {
+            let map = ObjectMap {
+                entries: vec![entry(0x10, 0x100), entry(0x20, 0x200)],
+            };
+            map.validate_against_records(&[record(0x10), record(0x20)])
+                .unwrap();
+        }
+
+        #[test]
+        fn duplicate_map_handle_is_rejected() {
+            let map = ObjectMap {
+                entries: vec![entry(0x10, 0x100), entry(0x10, 0x200)],
+            };
+            match map.validate_against_records(&[record(0x10)]) {
+                Err(DwgError::MalformedObject { message, .. }) => {
+                    assert!(
+                        message.contains("duplicate handle 0x10 in object map"),
+                        "unexpected message: {message}"
+                    );
+                }
+                other => panic!("expected MalformedObject for duplicate map handle, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn duplicate_record_handle_is_rejected() {
+            let map = ObjectMap {
+                entries: vec![entry(0x10, 0x100)],
+            };
+            match map.validate_against_records(&[record(0x10), record(0x10)]) {
+                Err(DwgError::MalformedObject { message, .. }) => {
+                    assert!(
+                        message.contains("duplicate record handle 0x10"),
+                        "unexpected message: {message}"
+                    );
+                }
+                other => {
+                    panic!("expected MalformedObject for duplicate record handle, got {other:?}")
+                }
+            }
+        }
+
+        #[test]
+        fn record_missing_from_map_is_rejected() {
+            let map = ObjectMap {
+                entries: vec![entry(0x10, 0x100)],
+            };
+            match map.validate_against_records(&[record(0x10), record(0x20)]) {
+                Err(DwgError::MalformedObject { message, .. }) => {
+                    assert!(
+                        message.contains("record handle 0x20 is missing from the object map"),
+                        "unexpected message: {message}"
+                    );
+                }
+                other => panic!("expected MalformedObject for missing map entry, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn orphan_map_entry_is_rejected() {
+            let map = ObjectMap {
+                entries: vec![entry(0x10, 0x100), entry(0x20, 0x200)],
+            };
+            match map.validate_against_records(&[record(0x10)]) {
+                Err(DwgError::MalformedObject { message, .. }) => {
+                    assert!(
+                        message.contains("references handle 0x20 but no record"),
+                        "unexpected message: {message}"
+                    );
+                }
+                other => panic!("expected MalformedObject for orphan map entry, got {other:?}"),
+            }
         }
     }
 }
