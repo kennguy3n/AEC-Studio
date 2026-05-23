@@ -571,9 +571,10 @@ fn utf16le_string(bytes: &[u8]) -> DwgResult<String> {
 /// derives every section's content from `version` (AuxHeader uses
 /// `AuxHeaderSection::fresh_for(version)`, Classes emits the empty
 /// placeholder, Handles emits the canonical 4-byte terminator,
-/// AcDbObjects emits a 1-byte empty-entry marker). Once R2007 entity
-/// round-trip lands, this struct will grow `objects`, `header_vars`,
-/// `classes` fields mirroring `R2004FileParts`.
+/// AcDbObjects emits a 0-byte empty payload matching the R2004+
+/// convention from PR-D). Once R2007 entity round-trip lands, this
+/// struct will grow `objects`, `header_vars`, `classes` fields
+/// mirroring `R2004FileParts`.
 pub struct R2007FileParts {
     pub version: Version,
 }
@@ -753,14 +754,17 @@ pub fn assemble_r2007(parts: R2007FileParts) -> DwgResult<Vec<u8>> {
     // The original "Invalid num_pages 0" error came from the *section
     // descriptor* having `num_pages = 0`, not from the payload itself
     // being empty. With a real one-page descriptor (via the
-    // `single_page_for_name(..., uncomp_size=0, page_size=255, ...)`
-    // call below), LibreDWG's `read_2007_section_objects` reads a
-    // 0-length decompressed buffer and runs zero iterations of the
-    // entry walk — matching the R2004+ empty-doc convention from PR-D
-    // exactly, where `assemble_r2004` also emits a 0-byte
-    // `objects_bytes`. No `[0x00]` marker byte is needed (verified
-    // against `dwgread` on the empty-doc fixture: SUCCESS with zero
-    // errors and zero warnings).
+    // `single_page_for_name(..., uncomp_size=0, page_size=256, ...)`
+    // call below — `encode_data_page` of an empty payload produces a
+    // 256-byte zero-padded RS-coded page: `block_count=1` → 255
+    // codeword bytes → `round_up_8(255)=256`), LibreDWG's
+    // `read_2007_section_objects` reads a 0-length decompressed
+    // buffer and runs zero iterations of the entry walk — matching
+    // the R2004+ empty-doc convention from PR-D exactly, where
+    // `assemble_r2004` also emits a 0-byte `objects_bytes`. No
+    // `[0x00]` marker byte is needed (verified against `dwgread` on
+    // the empty-doc fixture: SUCCESS with zero errors and zero
+    // warnings).
     let objects_payload: Vec<u8> = Vec::new();
     let objects_page = encode_data_page(&objects_payload);
     let objects_page_id = next_page_id;
