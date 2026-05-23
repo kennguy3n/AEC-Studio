@@ -418,15 +418,27 @@ pub fn assemble_r2004(parts: R2004FileParts) -> DwgResult<Vec<u8>> {
         data_pages.iter().map(|page| page.descriptor).collect();
     // Reserve placeholder slots for the page-map page itself and the
     // section-info page. We'll back-patch their sizes after writing.
+    // System pages (the page map and the section info) are numbered
+    // with POSITIVE ids that follow the data pages. LibreDWG's encoder
+    // assigns `section_info_id = numsections + 1` and
+    // `section_map_id = numsections + 2` (see `encode.c:4289-4293`).
+    // AutoCAD-emitted files match this convention
+    // (`example_2004.dwg`: 26 data pages + section_info_id=27 +
+    // section_map_id=28). Using positive ids keeps every descriptor in
+    // the page map within `[1, section_array_size]` so LibreDWG does
+    // NOT trip the `Overflow section_array_size` warning at decode.
+    let num_data_pages = data_pages.len() as i32;
+    let section_info_page_id: i32 = num_data_pages + 1;
+    let section_map_page_id: i32 = num_data_pages + 2;
     let page_map_descriptor_index = page_descriptors.len();
     page_descriptors.push(PageDescriptor {
-        page_id: -1,
+        page_id: section_map_page_id,
         page_size: 0, // back-patched
         file_offset: cursor,
     });
     let section_info_descriptor_index = page_descriptors.len();
     page_descriptors.push(PageDescriptor {
-        page_id: -2,
+        page_id: section_info_page_id,
         page_size: 0,   // back-patched
         file_offset: 0, // back-patched
     });
@@ -561,6 +573,16 @@ pub fn assemble_r2004(parts: R2004FileParts) -> DwgResult<Vec<u8>> {
     page_descriptors[section_info_descriptor_index].file_offset = section_info_offset;
 
     // 7. Encode the legacy file header (0x80 bytes).
+    // `section_locator_count` is the legacy R12-style section count
+    // stored at offset 0x14 of the file header. R2004+ replaces the
+    // section locator with the encrypted R2004 header + page map and
+    // AutoCAD writes 0 here. LibreDWG's decoder reads this field
+    // PRE(R_2004a) only (`header.spec:64`); on the R2004+ path
+    // `dwg->header.sections` stays at the default 0, so its
+    // `Invalid sections: 0 != numgaps + numsections` warning at
+    // `decode.c:1552` is unavoidable — it fires on every R2004+ file
+    // including LibreDWG's own bundled `example_2004.dwg`. The oracle
+    // CI step filters this warning for R2004+ versions.
     let file_header = FileHeader {
         version: parts.version,
         maintenance_release: parts.version.maintenance_release(),
@@ -602,19 +624,20 @@ pub fn assemble_r2004(parts: R2004FileParts) -> DwgResult<Vec<u8>> {
     // section_map_id is the page id of the page map itself (-1).
     // R2004FileHeader stores it as u32; LibreDWG reinterprets the bits
     // as i32 to recover negative ids. We write 0xFFFFFFFF (= -1).
-    r2004_hdr.section_map_id = u32::MAX;
+    r2004_hdr.section_map_id = section_map_page_id as u32;
     r2004_hdr.section_map_address = page_map_offset - R2004_FIRST_PAGE_OFFSET;
-    r2004_hdr.section_info_id = -2;
+    r2004_hdr.section_info_id = section_info_page_id;
     r2004_hdr.numsections = section_descriptors.len() as u32;
-    // `section_array_size` is the highest POSITIVE page id in the page
-    // map, NOT the total number of page-map entries. LibreDWG enforces
-    // `max_id == section_array_size` (decode.c:1541); negative-id
-    // system pages (page map = -1, section info = -2) are excluded
-    // from `max_id`. Our data pages use ids 1..=N where N =
-    // section_descriptors.len(), so the highest positive id equals
-    // that count.
-    r2004_hdr.section_array_size = section_descriptors.len() as u32;
-    r2004_hdr.last_section_id = section_descriptors.len() as u32;
+    // `section_array_size` matches LibreDWG's encoder convention
+    // (`encode.c:4292`): `numsections + 2` — covering the data pages
+    // plus the two system pages (section info at +1 and page map at
+    // +2). This is the largest positive page id we emit, AND it is
+    // the lower bound for the `i >= section_array_size` check
+    // LibreDWG runs while walking the page map (decode.c:1518). Any
+    // value smaller than the descriptor count would trigger
+    // `Overflow section_array_size` warnings.
+    r2004_hdr.section_array_size = section_descriptors.len() as u32 + 2;
+    r2004_hdr.last_section_id = r2004_hdr.section_array_size;
     let last_section_abs = page_descriptors
         .iter()
         .map(|p| p.file_offset + u64::from(p.page_size))
@@ -1479,12 +1502,16 @@ mod tests {
 
     #[test]
     fn r2004_section_array_size_equals_data_page_count() {
-        // LibreDWG decode.c:1541 warns if max_id != section_array_size.
-        // Our encoder must set section_array_size = highest positive
-        // page id = number of data pages. After Phase 5 we emit the
-        // 4 mandatory data sections (Header/Classes/Objects/Handles)
-        // plus 3 LibreDWG-required sentinels
-        // (AuxHeader/Template/AppInfo) = 7 data pages.
+        // LibreDWG decode.c:1541 warns if `max_id != section_array_size`,
+        // where `max_id` is the highest POSITIVE page id observed while
+        // walking the page map. AutoCAD's encoder and LibreDWG's own
+        // encoder both assign positive ids to the two system pages
+        // (section_info_id = numsections + 1, section_map_id =
+        // numsections + 2; see `encode.c:4289-4293`), so `max_id` is
+        // `numsections + 2`. After Phase 5 we emit 4 mandatory data
+        // sections (Header/Classes/Objects/Handles) plus 3
+        // LibreDWG-required sentinels (AuxHeader/Template/AppInfo) =
+        // 7 data pages, giving `section_array_size = 7 + 2 = 9`.
         let bytes = assemble_r2004(R2004FileParts {
             version: Version::R2004,
             header_vars: HeaderVarsSection::minimal(Version::R2004),
@@ -1497,9 +1524,13 @@ mod tests {
         crate::dwg::file::system_section::encrypt_lcg_inplace(&mut encrypted_hdr);
         let hdr = R2004FileHeader::from_decrypted(&encrypted_hdr).unwrap();
         assert_eq!(
-            hdr.section_array_size, 7,
-            "section_array_size must equal the number of data pages \
-             (4 mandatory + 3 sentinel = 7)"
+            hdr.section_array_size, 9,
+            "section_array_size must equal numsections + 2 (data + page_map + section_info); \
+             4 mandatory + 3 sentinel = 7 data, plus 2 system = 9"
+        );
+        assert_eq!(
+            hdr.numsections, 7,
+            "numsections must equal the data-page count (4 mandatory + 3 sentinel)"
         );
     }
 

@@ -187,6 +187,91 @@ impl ObjectType {
     pub fn as_u16(self) -> u16 {
         self as u16
     }
+
+    /// Whether this object type uses the **entity** common header
+    /// (`common_entity_data.spec` + `common_entity_handle_data.spec`)
+    /// or the **object** common header (`common_object_data.spec` +
+    /// `common_object_handle_data.spec`).
+    ///
+    /// LibreDWG dispatches on `dwg_class[type_idx].is_entity` in
+    /// `decode_entity` vs `decode_object`. The classification mirrors
+    /// `objects.inc`: geometry types (LINE, ARC, CIRCLE, INSERT,
+    /// VERTEX_*, POLYLINE_*, BLOCK / ENDBLK, etc.) are entities;
+    /// table records and dictionary-like records (LAYER,
+    /// BLOCK_HEADER, *_CONTROL, DICTIONARY, STYLE, …) are objects.
+    pub fn is_entity(self) -> bool {
+        match self {
+            // Geometry / drawing entities.
+            ObjectType::Text
+            | ObjectType::Attrib
+            | ObjectType::AttDef
+            | ObjectType::Block
+            | ObjectType::EndBlk
+            | ObjectType::SeqEnd
+            | ObjectType::Insert
+            | ObjectType::MInsert
+            | ObjectType::Vertex2d
+            | ObjectType::Vertex3d
+            | ObjectType::VertexMesh
+            | ObjectType::VertexPFace
+            | ObjectType::VertexPFaceFace
+            | ObjectType::Polyline2d
+            | ObjectType::Polyline3d
+            | ObjectType::Arc
+            | ObjectType::Circle
+            | ObjectType::Line
+            | ObjectType::DimensionOrdinate
+            | ObjectType::DimensionLinear
+            | ObjectType::DimensionAligned
+            | ObjectType::DimensionAng3Pt
+            | ObjectType::DimensionAng2Ln
+            | ObjectType::DimensionRadius
+            | ObjectType::DimensionDiameter
+            | ObjectType::Point
+            | ObjectType::Face3D
+            | ObjectType::PolylinePFace
+            | ObjectType::PolylineMesh
+            | ObjectType::Solid
+            | ObjectType::Trace
+            | ObjectType::Shape
+            | ObjectType::Viewport
+            | ObjectType::Ellipse
+            | ObjectType::Spline
+            | ObjectType::Region
+            | ObjectType::Body
+            | ObjectType::Ray
+            | ObjectType::XLine
+            | ObjectType::MText
+            | ObjectType::Leader
+            | ObjectType::Tolerance
+            | ObjectType::MLine
+            | ObjectType::LwPolyline
+            | ObjectType::Hatch => true,
+            // Non-graphical objects (dictionary, table records, control objects).
+            ObjectType::Dictionary
+            | ObjectType::BlockControl
+            | ObjectType::BlockHeader
+            | ObjectType::LayerControl
+            | ObjectType::Layer
+            | ObjectType::StyleControl
+            | ObjectType::Style
+            | ObjectType::LinetypeControl
+            | ObjectType::Linetype
+            | ObjectType::ViewControl
+            | ObjectType::View
+            | ObjectType::UcsControl
+            | ObjectType::Ucs
+            | ObjectType::VPortControl
+            | ObjectType::VPort
+            | ObjectType::AppIdControl
+            | ObjectType::AppId
+            | ObjectType::DimStyleControl
+            | ObjectType::DimStyle
+            | ObjectType::VPortEntityHeader
+            | ObjectType::VPortEntityControl
+            | ObjectType::XRecord => false,
+        }
+    }
 }
 
 #[cfg(test)]

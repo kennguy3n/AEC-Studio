@@ -93,6 +93,38 @@ pub struct HeaderVars {
     pub dimstyle: HandleRef,
     /// `CMLSTYLE` — current multiline style handle. Defaults to null.
     pub cmlstyle: HandleRef,
+    /// `BLOCK_CONTROL_OBJECT` — hard-owner handle of the
+    /// `AcDbBlockTable` object. Real fixtures point this at the
+    /// BLOCK_CONTROL record (typically handle `0x01`); leaving it
+    /// null is what triggers LibreDWG's
+    /// `dxf_tables_write` → `dwg_get_first_object(BLOCK_CONTROL)`
+    /// → `DWG_ERR_INVALIDDWG` cascade.
+    ///
+    /// Expected handle code per `header_variables.spec:500` is 3
+    /// (soft owner).
+    pub block_control_object: HandleRef,
+    /// `LAYER_CONTROL_OBJECT` — hard-owner handle of the
+    /// `AcDbLayerTable` object. Same wiring requirement as
+    /// `BLOCK_CONTROL_OBJECT`; expected code 3 per
+    /// `header_variables.spec:501`.
+    pub layer_control_object: HandleRef,
+    /// `BLOCK_RECORD_PSPACE` — hard-pointer to the `*Paper_Space`
+    /// BLOCK_HEADER record. We don't emit a paper-space block, so
+    /// this defaults to null.
+    ///
+    /// Expected handle code per `header_variables.spec:605` is 5
+    /// (hard pointer).
+    pub block_record_pspace: HandleRef,
+    /// `BLOCK_RECORD_MSPACE` — hard-pointer to the `*Model_Space`
+    /// BLOCK_HEADER record. This is the handle LibreDWG's
+    /// `dwg_model_space_object` resolves to walk the entity chain
+    /// for DXF emission; if it's null or points at a missing
+    /// object, `dxf_entities_write` truncates after the TABLES
+    /// section.
+    ///
+    /// Expected handle code per `header_variables.spec:606` is 5
+    /// (hard pointer).
+    pub block_record_mspace: HandleRef,
 }
 
 impl Default for HeaderVars {
@@ -116,6 +148,10 @@ impl Default for HeaderVars {
             cecolor: Color::ByLayer,
             dimstyle: HandleRef::default(),
             cmlstyle: HandleRef::default(),
+            block_control_object: HandleRef::default(),
+            layer_control_object: HandleRef::default(),
+            block_record_pspace: HandleRef::default(),
+            block_record_mspace: HandleRef::default(),
         }
     }
 }
@@ -670,8 +706,8 @@ fn emit_fields(
     }
 
     // Control-object handles
-    write_handle(sec, hdl, HandleRef::default())?; // BLOCK_CONTROL_OBJECT
-    write_handle(sec, hdl, HandleRef::default())?; // LAYER_CONTROL_OBJECT
+    write_handle(sec, hdl, vars.block_control_object)?; // BLOCK_CONTROL_OBJECT
+    write_handle(sec, hdl, vars.layer_control_object)?; // LAYER_CONTROL_OBJECT
     write_handle(sec, hdl, HandleRef::default())?; // STYLE_CONTROL_OBJECT
     write_handle(sec, hdl, HandleRef::default())?; // LTYPE_CONTROL_OBJECT
     write_handle(sec, hdl, HandleRef::default())?; // VIEW_CONTROL_OBJECT
@@ -744,8 +780,8 @@ fn emit_fields(
         }
     }
 
-    write_handle(sec, hdl, HandleRef::default())?; // BLOCK_RECORD_PSPACE
-    write_handle(sec, hdl, HandleRef::default())?; // BLOCK_RECORD_MSPACE
+    write_handle(sec, hdl, vars.block_record_pspace)?; // BLOCK_RECORD_PSPACE
+    write_handle(sec, hdl, vars.block_record_mspace)?; // BLOCK_RECORD_MSPACE
     write_handle(sec, hdl, HandleRef::default())?; // LTYPE_BYLAYER
     write_handle(sec, hdl, HandleRef::default())?; // LTYPE_BYBLOCK
     write_handle(sec, hdl, HandleRef::default())?; // LTYPE_CONTINUOUS

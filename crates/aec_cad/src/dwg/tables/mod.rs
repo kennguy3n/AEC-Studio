@@ -9,6 +9,7 @@ pub mod block;
 pub mod dim_style;
 pub mod layer;
 pub mod linetype;
+pub mod object_emit;
 pub mod style;
 
 pub use block::BlockRecord;

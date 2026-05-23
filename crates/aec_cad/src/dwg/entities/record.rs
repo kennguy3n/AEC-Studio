@@ -394,7 +394,13 @@ impl ObjectRecord {
                          implemented yet (max 32767 bits per record)"
                     )));
                 }
-                body.write_bits_u32(16, u32::from(data_size))?;
+                // `data_size` is an RS (16-bit little-endian), not a
+                // big-endian raw 16-bit field. LibreDWG's `bit_read_RS`
+                // pulls low byte first then high byte (see
+                // `bits.c:384`), so we must emit the same ordering or
+                // the decoder reads a byte-swapped value and warns
+                // "Invalid string stream data_size".
+                body.write_rs(data_size)?;
                 body.write_b(true)?; // has_strings = 1
             } else {
                 body.write_b(false)?; // has_strings = 0
@@ -427,7 +433,7 @@ impl ObjectRecord {
             &self.handles,
             &self.common,
             self.supertype,
-            &self.object_common,
+            self.object_common,
         )?;
 
         // Pad to byte boundary so obj->size is an integer byte count.
@@ -519,9 +525,9 @@ impl ObjectRecord {
             Self {
                 object_type: header.object_type,
                 handle: header.handle,
-                supertype: ObjectSupertype::Entity,
+                supertype: header.supertype,
                 common: header.common,
-                object_common: ObjectCommonData::default(),
+                object_common: header.object_common,
                 payload_bits: BitBuf::new(), // payload was consumed via callback
                 string_payload_bits: BitBuf::new(),
                 handles,
@@ -654,8 +660,47 @@ impl ObjectRecord {
                 "extended entity data (EED) on object records is not yet decoded".into(),
             ));
         }
-        let (common, r14_bitsize) =
-            CommonHeaderData::decode_for_version_capturing_r14_bitsize(version, &mut body_r)?;
+        // Dispatch the common-header block by supertype. For OBJECT
+        // records (LAYER, BLOCK_HEADER, *_CONTROL, …) the entity
+        // common header layout doesn't apply — we read the much
+        // smaller object common-data block instead: optional R13/R14
+        // inline `bitsize` RL, then `num_reactors` BL, then
+        // `is_xdic_missing` B (R2004+), then `has_ds_data` B
+        // (R2013+). Mirrors `dwg_decode_object` in LibreDWG
+        // `decode.c:6532-6580` and the writer block at
+        // `encode_with` lines 326-359 of this file.
+        let (common, object_common, supertype, r14_bitsize) = if object_type.is_entity() {
+            let (c, b) =
+                CommonHeaderData::decode_for_version_capturing_r14_bitsize(version, &mut body_r)?;
+            (c, ObjectCommonData::default(), ObjectSupertype::Entity, b)
+        } else {
+            let r14_bitsize_obj = if version <= Version::R14 {
+                Some(body_r.read_rl()?)
+            } else {
+                None
+            };
+            let num_reactors = body_r.read_bl()? as u32;
+            let is_xdic_missing = if version >= Version::R2004 {
+                body_r.read_b()?
+            } else {
+                false
+            };
+            let has_ds_data = if version >= Version::R2013 {
+                body_r.read_b()?
+            } else {
+                false
+            };
+            (
+                CommonHeaderData::default(),
+                ObjectCommonData {
+                    num_reactors,
+                    is_xdic_missing,
+                    has_ds_data,
+                },
+                ObjectSupertype::Object,
+                r14_bitsize_obj,
+            )
+        };
         // For R14 the bitsize lives inside the common header; promote
         // it into the handle-stream offset hint so the R14 decoder is
         // bit-perfect with the R2000-R2007 path.
@@ -668,7 +713,9 @@ impl ObjectRecord {
             HeaderOnly {
                 object_type,
                 handle,
+                supertype,
                 common,
+                object_common,
             },
             body_r,
             handle_stream_offset_hint,
@@ -727,9 +774,9 @@ impl ObjectRecord {
             Self {
                 object_type: header.object_type,
                 handle: header.handle,
-                supertype: ObjectSupertype::Entity,
+                supertype: header.supertype,
                 common: header.common,
-                object_common: ObjectCommonData::default(),
+                object_common: header.object_common,
                 payload_bits,
                 string_payload_bits: BitBuf::new(),
                 handles,
@@ -744,7 +791,9 @@ impl ObjectRecord {
 struct HeaderOnly {
     object_type: ObjectType,
     handle: HandleRef,
+    supertype: ObjectSupertype,
     common: CommonHeaderData,
+    object_common: ObjectCommonData,
 }
 
 fn write_bitbuf(w: &mut BitWriter, buf: &BitBuf) -> DwgResult<()> {
@@ -782,6 +831,13 @@ fn read_bitbuf_bits(r: &mut BitReader<'_>, bit_len: u64) -> DwgResult<BitBuf> {
     Ok(BitBuf { bytes, bit_len })
 }
 
+// `!common.nolinks` mirrors LibreDWG's `if (!FIELD_VALUE (nolinks))`
+// at `common_entity_handle_data.spec:85` verbatim, so we keep the
+// same negative-defined branching here rather than inverting to
+// please `clippy::if_not_else` — the inverted form makes the
+// has-prev/next case the `else` branch and obscures the parallel
+// with the spec.
+#[allow(clippy::if_not_else)]
 fn encode_handle_stream(
     w: &mut BitWriter,
     version: Version,
@@ -789,7 +845,7 @@ fn encode_handle_stream(
     handles: &ObjectHandles,
     common: &CommonHeaderData,
     supertype: ObjectSupertype,
-    object_common: &ObjectCommonData,
+    object_common: ObjectCommonData,
 ) -> DwgResult<()> {
     // For OBJECT supertype, the handle stream is just:
     //   owner H (code 4 = soft owner; per FIELD_HANDLE expected-code
@@ -880,32 +936,55 @@ fn encode_handle_stream(
         ));
     }
     use crate::dwg::entities::header_codec::LinetypeFlag;
+    // Per LibreDWG `common_entity_handle_data.spec`:
+    //   * R13 / R14: `layer` + `linetype` come FIRST, then the
+    //     R_13b1..R_2000 block emits `prev_entity` / `next_entity`
+    //     (when `!nolinks`).
+    //   * R2000 (R_2000b): the R_13b1..R_2000 block still emits
+    //     `prev_entity` / `next_entity` (when `!nolinks`), but the
+    //     SINCE(R_2000b) `layer` / `linetype` block runs AFTER it.
+    //     So the on-wire order flips: prev/next FIRST, then layer.
+    //   * R2004+: only the SINCE(R_2000b) block runs; no prev/next at
+    //     all (BLOCK_HEADER carries `entities[]` instead).
     if version <= Version::R14 {
-        // R14 (and R13): layer; ltype iff !isbylayerlt.
         w.write_h(handles.layer)?;
         if !common.isbylayerlt {
             let lt = handles.linetype.unwrap_or(HandleRef { code: 5, value: 0 });
             w.write_h(lt)?;
         }
-    } else {
-        // R2000+: layer; ltype iff linetype_flag == Handle (0b11).
+        if !common.nolinks {
+            let prev = handles
+                .prev_entity
+                .unwrap_or(HandleRef { code: 4, value: 0 });
+            let next = handles
+                .next_entity
+                .unwrap_or(HandleRef { code: 4, value: 0 });
+            w.write_h(prev)?;
+            w.write_h(next)?;
+        }
+    } else if version == Version::R2000 {
+        if !common.nolinks {
+            let prev = handles
+                .prev_entity
+                .unwrap_or(HandleRef { code: 4, value: 0 });
+            let next = handles
+                .next_entity
+                .unwrap_or(HandleRef { code: 4, value: 0 });
+            w.write_h(prev)?;
+            w.write_h(next)?;
+        }
         w.write_h(handles.layer)?;
         if common.linetype_flag == LinetypeFlag::Handle {
             let lt = handles.linetype.unwrap_or(HandleRef { code: 5, value: 0 });
             w.write_h(lt)?;
         }
-    }
-    // R14 / R2000: prev/next entity links in the model-space chain,
-    // emitted only when `!nolinks`.
-    if version <= Version::R2000 && !common.nolinks {
-        let prev = handles
-            .prev_entity
-            .unwrap_or(HandleRef { code: 4, value: 0 });
-        let next = handles
-            .next_entity
-            .unwrap_or(HandleRef { code: 4, value: 0 });
-        w.write_h(prev)?;
-        w.write_h(next)?;
+    } else {
+        // R2004+: no prev/next; layer + (optional) linetype only.
+        w.write_h(handles.layer)?;
+        if common.linetype_flag == LinetypeFlag::Handle {
+            let lt = handles.linetype.unwrap_or(HandleRef { code: 5, value: 0 });
+            w.write_h(lt)?;
+        }
     }
     // R2007+: material (if mat==3), shadow (if shadow==3).
     if version >= Version::R2007 {
@@ -993,6 +1072,7 @@ pub fn type_extra_handle_count(object_type: ObjectType, _common: &CommonHeaderDa
     }
 }
 
+#[allow(clippy::if_not_else)] // see `encode_handle_stream` for rationale
 fn decode_handle_stream(
     r: &mut BitReader<'_>,
     version: Version,
@@ -1015,14 +1095,35 @@ fn decode_handle_stream(
     } else {
         None
     };
-    let (layer, linetype) = if version <= Version::R14 {
+    // See the encoder for the matching write order; the on-wire order
+    // flips between R14 and R2000 (prev/next come BEFORE layer on
+    // R2000).
+    let (layer, linetype, prev_entity, next_entity) = if version <= Version::R14 {
         let layer = r.read_h()?;
         let linetype = if common.isbylayerlt {
             None
         } else {
             Some(r.read_h()?)
         };
-        (layer, linetype)
+        let (prev, next) = if !common.nolinks {
+            (Some(r.read_h()?), Some(r.read_h()?))
+        } else {
+            (None, None)
+        };
+        (layer, linetype, prev, next)
+    } else if version == Version::R2000 {
+        let (prev, next) = if !common.nolinks {
+            (Some(r.read_h()?), Some(r.read_h()?))
+        } else {
+            (None, None)
+        };
+        let layer = r.read_h()?;
+        let linetype = if common.linetype_flag == LinetypeFlag::Handle {
+            Some(r.read_h()?)
+        } else {
+            None
+        };
+        (layer, linetype, prev, next)
     } else {
         let layer = r.read_h()?;
         let linetype = if common.linetype_flag == LinetypeFlag::Handle {
@@ -1030,12 +1131,7 @@ fn decode_handle_stream(
         } else {
             None
         };
-        (layer, linetype)
-    };
-    let (prev_entity, next_entity) = if version <= Version::R2000 && !common.nolinks {
-        (Some(r.read_h()?), Some(r.read_h()?))
-    } else {
-        (None, None)
+        (layer, linetype, None, None)
     };
     let (material, shadow) = if version >= Version::R2007 {
         let m = if common.material_flag == 0b11 {
