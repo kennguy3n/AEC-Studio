@@ -56,9 +56,18 @@
 //! - R2010/R2013 — minor additions to the object dictionary; the
 //!   per-version object table deltas land alongside symbol-table
 //!   wiring.
-//! - R2018 — handle pages are scrambled with the magic-byte XOR mask.
-//!   The mask is applied per-page on encode and decode; the wrapper
-//!   layout doesn't change.
+//! - R2018 — wire layout is byte-for-byte identical to R2013 except for
+//!   the version signature (`AC1032` vs `AC1027`) and version-gated
+//!   header-variable fields. AcDb:AcDbObjects and AcDb:Handles are
+//!   **not** XOR-scrambled at the section payload level; LibreDWG
+//!   reference fixtures and AutoCAD-emitted files both leave
+//!   `SectionInfoDescriptor.encrypted = 0` for every named section.
+//!   The 32-byte data-page header carries its own per-page XOR mask
+//!   (`sec_mask = 0x4164536b ^ address`) that is applied
+//!   unconditionally for every R2004+ version inside
+//!   [`crate::dwg::file::system_section::write_data_page`].
+//!   See PR-E and the bot's research notes for the history of the
+//!   spurious `xor_decrypt_handle_page` scaffolding that was removed.
 //!
 //! Self-round-trip is guaranteed: `parse_r2004(assemble_r2004(p)) == p`
 //! for every supported version. AutoCAD-format conformance is gated
@@ -1279,13 +1288,15 @@ mod tests {
         assert_eq!(file.objects[0].object_type, ObjectType::Line);
     }
 
-    /// R2018 must mark its AcDb:AcDbObjects + AcDb:Handles sections
-    /// as encrypted, and the on-disk bytes for those pages must differ
-    /// from the equivalent R2013 layout. This proves the XOR mask is
-    /// actually being applied to the wire form rather than the flag
-    /// just being set and ignored.
+    /// R2013 and R2018 self-round-trip the same logical object stream
+    /// and produce distinct wire bytes (because of the AC1027 vs
+    /// AC1032 version signature and version-gated header-variable
+    /// fields — **not** because of any section-payload XOR mask, which
+    /// does not exist for either version). Both files must report
+    /// `SectionInfoDescriptor.encrypted = 0` for every data section,
+    /// matching LibreDWG `example_2018.dwg`.
     #[test]
-    fn r2018_object_and_handle_sections_emit_encrypted_pages() {
+    fn r2013_and_r2018_self_round_trip_with_distinct_wire_bytes() {
         let r2013_bytes = assemble_r2004(R2004FileParts {
             version: Version::R2013,
             header_vars: HeaderVarsSection::minimal(Version::R2013),
@@ -1300,34 +1311,61 @@ mod tests {
             objects: vec![one_line_record()],
         })
         .unwrap();
-        // The two files differ in their AC10NN signature bytes (R2013
-        // = AC1027, R2018 = AC1032) which trivially makes the byte
-        // sequences unequal. The interesting bit is that the object /
-        // handle page payloads also differ — confirming the XOR mask
-        // is applied. Parse both back out and check by descriptor:
+        // Self-round-trip yields the same logical object stream.
         let r2013_file = parse_r2004(&r2013_bytes).unwrap();
         let r2018_file = parse_r2004(&r2018_bytes).unwrap();
-        // Both round-trip the same logical object stream.
         assert_eq!(r2013_file.objects.len(), 1);
         assert_eq!(r2018_file.objects.len(), 1);
         assert_eq!(r2013_file.objects[0].object_type, ObjectType::Line);
         assert_eq!(r2018_file.objects[0].object_type, ObjectType::Line);
-        // The R2018 bytes are strictly longer or differ on the
-        // encrypted sections. The simplest invariant we can check
-        // without re-parsing the page map: the bytes after the file
-        // header (where the data pages live) differ.
+        // The data-page region of the two files differs (version
+        // signature, version-gated header_vars encoding, and
+        // version-stamped secondheader copy). This pins that the
+        // two versions actually emit version-specific bytes.
         assert_ne!(
             &r2013_bytes[R2004_FIRST_PAGE_OFFSET as usize..],
             &r2018_bytes[R2004_FIRST_PAGE_OFFSET as usize..]
         );
+        // Both versions must leave every named data section flagged
+        // as `encrypted = 0`. There is no R2004+ section-payload XOR.
+        for bytes in [&r2013_bytes, &r2018_bytes] {
+            let mut encrypted_hdr = [0u8; 120];
+            encrypted_hdr.copy_from_slice(&bytes[R2004_HEADER_OFFSET..R2004_HEADER_OFFSET + 120]);
+            crate::dwg::file::system_section::encrypt_lcg_inplace(&mut encrypted_hdr);
+            let r2004_hdr = R2004FileHeader::from_decrypted(&encrypted_hdr).unwrap();
+            let pmo = (r2004_hdr.section_map_address + R2004_FIRST_PAGE_OFFSET) as usize;
+            let (_, page_map) = read_system_page(&bytes[pmo..]).unwrap();
+            let pds = crate::dwg::file::system_section::decode_page_map(
+                &page_map,
+                R2004_FIRST_PAGE_OFFSET,
+            )
+            .unwrap();
+            let si_off = pds
+                .iter()
+                .find(|p| p.page_id == r2004_hdr.section_info_id)
+                .unwrap()
+                .file_offset as usize;
+            let (_, si_payload) = read_system_page(&bytes[si_off..]).unwrap();
+            let (_, descriptors) = decode_section_info(&si_payload).unwrap();
+            for d in &descriptors {
+                assert_eq!(
+                    d.encrypted,
+                    0,
+                    "section {:?} must be emitted with encrypted=0",
+                    d.name_str()
+                );
+            }
+        }
     }
 
-    /// If somebody flips the encrypted bit on the descriptor by hand
-    /// without re-XORing the page, parse_r2004 must fail loudly (LZ77
-    /// decompression of garbled bytes will hit an invalid opcode or
-    /// CRC mismatch — either way, structured error not a panic).
+    /// Tampering with the encrypted data-page region of an R2018 file
+    /// must surface as a structured `DwgError` (CRC mismatch, LZ77
+    /// opcode, entity-decode failure, etc.) and never as a panic. This
+    /// guards the general defense-in-depth invariant — R2004+ payloads
+    /// are not section-XORed, so any byte mutation in the data-page
+    /// region must be caught downstream by integrity checks.
     #[test]
-    fn r2018_corrupted_encryption_flag_errors_cleanly() {
+    fn r2018_corrupted_data_page_region_errors_cleanly() {
         let mut bytes = assemble_r2004(R2004FileParts {
             version: Version::R2018,
             header_vars: HeaderVarsSection::minimal(Version::R2018),
