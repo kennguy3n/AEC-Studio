@@ -236,8 +236,10 @@ fn build_record_set(
     // as long as every referenced handle resolves. We emit the
     // control objects first so the file is easy to inspect with
     // `dwgread -v9`.
-    let mut records =
-        Vec::with_capacity(4 /* table objects */ + 1 /* block_header */ + chain.len());
+    // 4 table/header objects pushed below + the user-entity chain.
+    // (`block_header` is one of the four; the breakdown is
+    // block_control + layer_control + layer_zero + block_header.)
+    let mut records = Vec::with_capacity(4 + chain.len());
     records.push(block_control);
     records.push(layer_control);
     records.push(layer_zero);
@@ -249,43 +251,51 @@ fn build_record_set(
 /// Build a `HeaderVars` whose handle fields point at the table
 /// objects we emit alongside every modern DWG.
 ///
-/// `_records` is accepted so the call sites read symmetrically with
-/// the table-object builders that DO inspect the record list; this
-/// function currently has all the handle values baked in as
-/// constants (see `object_handles` and `MODEL_SPACE_HANDLE`), so the
-/// slice is unused. Kept as a parameter so a future move to
-/// `HANDSEED = max(handle) + 1` (with an oracle-gate allow-list)
-/// has a natural place to compute the max without changing the
-/// public shape.
-fn header_vars_for_records(_records: &[ObjectRecord]) -> HeaderVars {
-    // **HANDSEED trade-off.** The spec definition of HANDSEED is
-    // "next handle to allocate" — i.e., `max(handle) + 1`. LibreDWG's
-    // post-decode `dwg_resolve_handle` loop iterates every
-    // `object_ref` in the model (including header_vars handle slots)
-    // and unconditionally warns
+/// `HANDSEED` is computed from the actual record set as
+/// `max(handle.value) + 1`, matching the spec definition ("next
+/// handle to allocate"). Falls back to `FIRST_USER_ENTITY` if
+/// `records` is empty so an empty-document fixture still gets a
+/// sane next-unused value.
+fn header_vars_for_records(records: &[ObjectRecord]) -> HeaderVars {
+    // **HANDSEED = max(handle) + 1.** Spec-correct: HANDSEED is the
+    // "next handle to allocate", so it points one past the highest
+    // handle currently in use. LibreDWG's post-decode
+    // `dwg_resolve_handle` loop (see `dwg.c:896-911`) iterates every
+    // `object_ref` in the model — including the HANDSEED slot in
+    // header_vars — and warns
     // `Warning: Object handle not found <abs>/<abs_hex>` for any
-    // handle not in the `object_map`. A spec-correct HANDSEED is by
-    // definition not in `object_map`, so the warning fires on every
-    // conformant file — LibreDWG's own `example_2000.dwg` triggers it
-    // for its `HANDSEED = 0xBE7`.
+    // value not in the `object_map`. Since HANDSEED by definition
+    // points at an unused handle, it ALWAYS triggers this warning;
+    // LibreDWG's own `example_2000.dwg` fires it for its
+    // `HANDSEED = 0xBE7`.
     //
-    // We could allow-list that warning at the oracle gate, but the
-    // warning text is structurally indistinguishable from a real
-    // regression where an entity points at a missing object — so
-    // allow-listing would substantially weaken the gate's regression
-    // detection. We instead point HANDSEED at the model-space
-    // `BLOCK_HEADER`, which is guaranteed to exist in `object_map`
-    // for every file we emit. The "next-unused" semantics are
-    // slightly off, but our fixtures are read-only — no consumer ever
-    // mints fresh handles from this HANDSEED. Real DWG editors that
-    // need accurate HANDSEED on the write path can recompute it from
-    // `_records.iter().map(|r| r.handle.value).max() + 1` at the
-    // call site; the `_records` slice is plumbed in deliberately to
-    // make that future change a localized edit.
+    // We accept that warning at the oracle gate, but only the
+    // **exact** warning produced by our HANDSEED — see the
+    // `ALLOW_HANDSEED` pattern in
+    // `.github/workflows/ci.yml::libredwg_oracle`. The allow-list
+    // is scoped to the precise decimal/hex pair our writer emits
+    // (one past the highest user-entity handle), so any OTHER
+    // dangling-handle regression — an entity pointing at a missing
+    // BLOCK_HEADER, a corrupted owner pointer, a typo in a table
+    // record — still fails the gate because it produces a different
+    // numeric value (or the long-form warning text when the dangling
+    // handle is below HANDSEED).
+    //
+    // Edge case: if `records` is empty (no entities, no table
+    // objects), we have no handles to look at. Fall back to
+    // `FIRST_USER_ENTITY` (0x21), which is what the next allocation
+    // would use anyway — consistent with the spec definition of
+    // "next handle to allocate".
+    let max_handle = records
+        .iter()
+        .map(|r| r.handle.value)
+        .max()
+        .unwrap_or(object_handles::FIRST_USER_ENTITY - 1);
+    let handseed_value = max_handle + 1;
     HeaderVars {
         handseed: HandleRef {
             code: 0,
-            value: object_handles::MODEL_SPACE_BLOCK_HEADER,
+            value: handseed_value,
         },
         clayer: HandleRef {
             code: 5,
@@ -759,6 +769,115 @@ mod tests {
                 assert_eq!(e.ratio, 0.5);
             }
             other => panic!("expected Ellipse, got {other:?}"),
+        }
+    }
+
+    /// Pin the HANDSEED value the LibreDWG oracle's `ALLOW_HANDSEED`
+    /// pattern (`.github/workflows/ci.yml`) expects, so a change to
+    /// the fixture entity count fails this test with a clear,
+    /// actionable error rather than a cryptic CI "unexpected
+    /// Warning" surprise.
+    ///
+    /// **Pins the coupling end-to-end** by importing
+    /// `crate::dwg::test_fixtures::oracle_fixture_doc` — the same
+    /// function `crates/aec_cad/examples/dwg_oracle_fixture.rs` uses
+    /// to build the per-version .dwg files CI feeds into `dwgread`.
+    /// Any change to that function's entity count fails both
+    /// assertions below with explicit, actionable messages before it
+    /// can land in CI.
+    ///
+    /// Keep all three in lockstep:
+    ///   1. `crate::dwg::test_fixtures::oracle_fixture_doc` (geometry);
+    ///   2. `EXPECTED_ORACLE_FIXTURE_ENTITY_COUNT` and
+    ///      `EXPECTED_ORACLE_FIXTURE_HANDSEED` below (the pinned
+    ///      counts the CI gate expects);
+    ///   3. `ALLOW_HANDSEED` in `.github/workflows/ci.yml` (the
+    ///      `<decimal>/0x<hex>` pair CI's regex matches against).
+    #[test]
+    fn oracle_fixture_handseed_matches_ci_allow_list() {
+        use crate::dwg::test_fixtures::oracle_fixture_doc;
+
+        // CI's `ALLOW_HANDSEED` regex hardcodes `36/0x24` (see
+        // `.github/workflows/ci.yml::libredwg_oracle`). 0x24 == 36.
+        const EXPECTED_ORACLE_FIXTURE_ENTITY_COUNT: usize = 3;
+        const EXPECTED_ORACLE_FIXTURE_HANDSEED: u64 = 0x24;
+
+        // Use the SAME function the example binary uses, not a
+        // duplicate. This is what gives the test its end-to-end
+        // pinning power — drift in `oracle_fixture_doc` shows up
+        // immediately in the entity-count assert below.
+        let doc = oracle_fixture_doc();
+
+        assert_eq!(
+            doc.entities.len(),
+            EXPECTED_ORACLE_FIXTURE_ENTITY_COUNT,
+            "Oracle-fixture entity-count drift: \
+             `crate::dwg::test_fixtures::oracle_fixture_doc` now \
+             returns {actual} entities, but CI's `ALLOW_HANDSEED` \
+             regex in `.github/workflows/ci.yml` is hardcoded to \
+             `36/0x24` (which assumes exactly 3 entities at handles \
+             0x21 / 0x22 / 0x23 → HANDSEED = 0x24). If the new \
+             entity count is intentional, update \
+             `EXPECTED_ORACLE_FIXTURE_ENTITY_COUNT` and \
+             `EXPECTED_ORACLE_FIXTURE_HANDSEED` in this test, and \
+             update `ALLOW_HANDSEED` in `.github/workflows/ci.yml` \
+             to `<decimal>/0x<hex>` matching the new HANDSEED value.",
+            actual = doc.entities.len(),
+        );
+
+        // Exercise EVERY modern version the CI gate's HANDSEED
+        // allow-list applies to (R14 / R2000 / R2004 / R2010 / R2013
+        // / R2018). HANDSEED is version-invariant within the modern
+        // path today — `build_record_set` emits the same table
+        // objects with the same handles, and entity handles are
+        // assigned sequentially from FIRST_ENTITY_HANDLE regardless
+        // of version — but pinning each version individually is
+        // defense-in-depth against a future version-specific
+        // table-emit change that would otherwise drift past the
+        // single-version check. R12 has a different wire format (no
+        // header_vars HANDSEED slot); R2007 ships an empty-doc
+        // fixture in CI; both are excluded for that reason.
+        let versions = [
+            Version::R14,
+            Version::R2000,
+            Version::R2004,
+            Version::R2010,
+            Version::R2013,
+            Version::R2018,
+        ];
+        for version in versions {
+            // Build the user-entity records the same way
+            // `write_modern` does (handles assigned sequentially
+            // from FIRST_ENTITY_HANDLE).
+            let mut user_entities = Vec::with_capacity(doc.entities.len());
+            for (idx, entity) in doc.entities.iter().enumerate() {
+                let handle = FIRST_ENTITY_HANDLE + idx as u64;
+                let record = entity_to_record(entity, version, handle).unwrap();
+                user_entities.push(record);
+            }
+            let records = build_record_set(version, user_entities).unwrap();
+            let hvars = header_vars_for_records(&records);
+
+            assert_eq!(
+                hvars.handseed.value,
+                EXPECTED_ORACLE_FIXTURE_HANDSEED,
+                "Oracle-fixture HANDSEED drift on {version:?}: \
+                 computed {actual:#x} but CI's `ALLOW_HANDSEED` \
+                 pattern in `.github/workflows/ci.yml` is hardcoded \
+                 to `36/0x24`. This usually means the fixture entity \
+                 count in `crate::dwg::test_fixtures::oracle_fixture_doc` \
+                 changed but `ALLOW_HANDSEED` / \
+                 `EXPECTED_ORACLE_FIXTURE_HANDSEED` weren't updated. \
+                 If only one version is off, a version-specific \
+                 table-emit change has drifted the HANDSEED \
+                 expectation away from the others — investigate \
+                 `build_record_set` / `object_emit` for \
+                 {version:?}-specific record emission. Update both \
+                 to `<decimal>/0x<hex>` matching the new HANDSEED \
+                 value.",
+                version = version,
+                actual = hvars.handseed.value,
+            );
         }
     }
 }

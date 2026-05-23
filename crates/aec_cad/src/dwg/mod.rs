@@ -26,6 +26,7 @@ pub mod modern;
 pub mod r12;
 pub mod reader;
 pub mod tables;
+pub mod test_fixtures;
 pub mod version;
 pub mod writer;
 
