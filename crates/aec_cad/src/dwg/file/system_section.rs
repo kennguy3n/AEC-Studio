@@ -371,9 +371,13 @@ pub fn read_system_page(bytes: &[u8]) -> DwgResult<(SystemPageHeader, Vec<u8>)> 
         });
     }
     let payload_slice = &bytes[SYSTEM_PAGE_HEADER_SIZE..SYSTEM_PAGE_HEADER_SIZE + comp_len];
-    // Use the bug-for-bug variant so we accept files written under the
-    // new fixed-point convention. The old "zero the slot" variant
-    // would reject our own output.
+    // `system_page_checksum` internally zeros the `checksum` slot
+    // before hashing the 20-byte header (see its body), so passing
+    // `header` directly here is bit-identical to passing
+    // `SystemPageHeader { checksum: 0, ..header }`. The write side
+    // (`write_system_page` above) also calls
+    // `system_page_checksum(header, …)` with the slot already at 0,
+    // so the read- and write-side hashes are guaranteed to agree.
     let calc = system_page_checksum(header, payload_slice);
     if calc != header.checksum {
         return Err(DwgError::SectionCrcMismatch {

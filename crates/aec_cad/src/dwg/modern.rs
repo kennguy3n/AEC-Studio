@@ -122,7 +122,11 @@ pub fn write_modern(doc: &DxfDocument, version: Version) -> DwgResult<Vec<u8>> {
                      down to zero entities before writing R2007. See the \
                      R2007 conformance roadmap (PR-C / phase 6) for the \
                      follow-up work that lifts this restriction.",
-                    n = records.len()
+                    // Report the count from the original user document.
+                    // `records` was reset to `Vec::new()` above (R2007's
+                    // table-object wrapper is empty), so its length is
+                    // always 0 here.
+                    n = doc.entities.len()
                 ),
             });
         }
@@ -243,28 +247,41 @@ fn build_record_set(
 }
 
 /// Build a `HeaderVars` whose handle fields point at the table
-/// objects we emit alongside every modern DWG. `HANDSEED` is set to
-/// one past the highest record handle so any future code that mints
-/// a handle starts in the unused range.
-fn header_vars_for_records(records: &[ObjectRecord]) -> HeaderVars {
-    // `HANDSEED` is conceptually "the next handle to allocate", which
-    // is one past the highest handle currently in use. LibreDWG's
-    // post-decode `dwg_resolve_handle` loop iterates every object_ref
-    // and warns "Object handle not found A/Ax" if the value isn't in
-    // the object_map. A `next-unused` HANDSEED is by definition not
-    // in the object_map, so the warning fires on every conformant
-    // file (LibreDWG's own `example_2000.dwg` triggers the same
-    // warning for its `HANDSEED = 0xBE7`).
+/// objects we emit alongside every modern DWG.
+///
+/// `_records` is accepted so the call sites read symmetrically with
+/// the table-object builders that DO inspect the record list; this
+/// function currently has all the handle values baked in as
+/// constants (see `object_handles` and `MODEL_SPACE_HANDLE`), so the
+/// slice is unused. Kept as a parameter so a future move to
+/// `HANDSEED = max(handle) + 1` (with an oracle-gate allow-list)
+/// has a natural place to compute the max without changing the
+/// public shape.
+fn header_vars_for_records(_records: &[ObjectRecord]) -> HeaderVars {
+    // **HANDSEED trade-off.** The spec definition of HANDSEED is
+    // "next handle to allocate" — i.e., `max(handle) + 1`. LibreDWG's
+    // post-decode `dwg_resolve_handle` loop iterates every
+    // `object_ref` in the model (including header_vars handle slots)
+    // and unconditionally warns
+    // `Warning: Object handle not found <abs>/<abs_hex>` for any
+    // handle not in the `object_map`. A spec-correct HANDSEED is by
+    // definition not in `object_map`, so the warning fires on every
+    // conformant file — LibreDWG's own `example_2000.dwg` triggers it
+    // for its `HANDSEED = 0xBE7`.
     //
-    // To keep the oracle gate strict ("0 warnings"), we instead point
-    // HANDSEED at the model-space `BLOCK_HEADER` — a handle that is
-    // guaranteed to exist in our object_map. The "next-unused"
-    // semantics are slightly off, but no consumer of our fixtures
-    // mints fresh handles from HANDSEED, and the warning being
-    // suppressed lets the gate detect real regressions. Real DWG
-    // editors that need accurate HANDSEED can recompute it from
-    // `max(handle) + 1` at write time.
-    let _max_handle = records.iter().map(|r| r.handle.value).max().unwrap_or(0);
+    // We could allow-list that warning at the oracle gate, but the
+    // warning text is structurally indistinguishable from a real
+    // regression where an entity points at a missing object — so
+    // allow-listing would substantially weaken the gate's regression
+    // detection. We instead point HANDSEED at the model-space
+    // `BLOCK_HEADER`, which is guaranteed to exist in `object_map`
+    // for every file we emit. The "next-unused" semantics are
+    // slightly off, but our fixtures are read-only — no consumer ever
+    // mints fresh handles from this HANDSEED. Real DWG editors that
+    // need accurate HANDSEED on the write path can recompute it from
+    // `_records.iter().map(|r| r.handle.value).max() + 1` at the
+    // call site; the `_records` slice is plumbed in deliberately to
+    // make that future change a localized edit.
     HeaderVars {
         handseed: HandleRef {
             code: 0,

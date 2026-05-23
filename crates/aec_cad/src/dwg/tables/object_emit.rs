@@ -550,7 +550,14 @@ pub fn emit_model_space_block_entity(
             // entity_mode = BlockHeader → owner handle emitted
             // explicitly (entmode = 0 in LibreDWG terminology).
             entity_mode: crate::dwg::entities::header_codec::EntityMode::BlockHeader,
-            nolinks: false, // emit prev/next links on R14/R2000
+            // Default to `nolinks: true` (no prev/next handles in
+            // the handle stream). `wire_block_chain` flips this to
+            // `false` for R14 / R2000 when it wires the actual
+            // chain; on R2004+ it is a no-op and `nolinks` stays
+            // true — matching the spec reality that R2004+ uses the
+            // BLOCK_HEADER `entities[]` vector for ownership rather
+            // than a prev/next chain.
+            nolinks: true,
             ..CommonHeaderData::default()
         },
         object_common: ObjectCommonData::default(),
@@ -568,8 +575,8 @@ pub fn emit_model_space_block_entity(
                 value: layer_handle,
             },
             linetype: None,
-            // pre/next set up via wire_block_chain after the full
-            // entity list is known.
+            // prev/next wired via `wire_block_chain` after the full
+            // entity list is known (R14 / R2000 only).
             prev_entity: None,
             next_entity: None,
             material: None,
@@ -598,7 +605,9 @@ pub fn emit_model_space_endblk_entity(
         supertype: ObjectSupertype::Entity,
         common: CommonHeaderData {
             entity_mode: crate::dwg::entities::header_codec::EntityMode::BlockHeader,
-            nolinks: false,
+            // See `emit_model_space_block_entity` for the
+            // `nolinks: true` rationale — symmetric with BLOCK.
+            nolinks: true,
             ..CommonHeaderData::default()
         },
         object_common: ObjectCommonData::default(),

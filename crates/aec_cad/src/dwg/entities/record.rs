@@ -502,6 +502,33 @@ impl ObjectRecord {
     {
         let (header, mut body_r, handle_stream_offset_hint, total) =
             Self::decode_header_only(version, bytes)?;
+        // The body / handle-stream decoders below only know the
+        // **entity** common-header layout (`preview_exists` B, layer
+        // / linetype / prev / next / material / shadow handles, …).
+        // OBJECT-supertype records (LAYER, BLOCK_HEADER, *_CONTROL,
+        // DICTIONARY, …) carry a structurally different common
+        // header (`num_reactors` BL, `is_xdic_missing` B from
+        // R2004+, `has_ds_data` B from R2013+) and a different
+        // handle stream (owner + reactors + xdict + per-type extras
+        // only). Rejecting them with a structured error here
+        // prevents callers from silently mis-parsing handles for an
+        // object record; see Devin Review PR-G finding
+        // ANALYSIS_…0003 for context. In-process the only caller is
+        // `record_to_entity`, which already filters non-entity
+        // records, but the API is public.
+        if header.supertype != ObjectSupertype::Entity {
+            return Err(DwgError::MalformedObject {
+                class: format!("{:?}", header.object_type),
+                offset: 0,
+                message: format!(
+                    "ObjectRecord::decode_with only supports ENTITY-supertype \
+                     records; got OBJECT supertype for {:?}. Filter OBJECT \
+                     records (use ObjectType::is_entity()) before invoking \
+                     decode_with, or implement an OBJECT-aware decoder",
+                    header.object_type
+                ),
+            });
+        }
         let payload_start_bit = body_r.bit_position();
         let payload = payload_decoder(header.object_type, &header.common, &mut body_r)?;
         let payload_end_bit = body_r.bit_position();
@@ -748,6 +775,24 @@ impl ObjectRecord {
             });
         }
         let (header, mut body_r, hint, total) = Self::decode_header_only(version, bytes)?;
+        // Same supertype guard as `decode_with` — see the longer
+        // explanation there. OBJECT records (LAYER, BLOCK_HEADER,
+        // *_CONTROL, DICTIONARY, …) use a different handle stream
+        // layout and must not flow through `decode_handle_stream`,
+        // which only knows the entity layout.
+        if header.supertype != ObjectSupertype::Entity {
+            return Err(DwgError::MalformedObject {
+                class: format!("{:?}", header.object_type),
+                offset: 0,
+                message: format!(
+                    "ObjectRecord::decode only supports ENTITY-supertype \
+                     records; got OBJECT supertype for {:?}. Filter OBJECT \
+                     records (use ObjectType::is_entity()) before invoking \
+                     decode, or implement an OBJECT-aware decoder",
+                    header.object_type
+                ),
+            });
+        }
         let handle_start = hint.ok_or_else(|| {
             DwgError::InternalInvariant(
                 "R2010+ branch reached decode() without a bitsize hint; \
