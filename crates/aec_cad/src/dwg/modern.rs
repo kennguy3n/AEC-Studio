@@ -249,43 +249,51 @@ fn build_record_set(
 /// Build a `HeaderVars` whose handle fields point at the table
 /// objects we emit alongside every modern DWG.
 ///
-/// `_records` is accepted so the call sites read symmetrically with
-/// the table-object builders that DO inspect the record list; this
-/// function currently has all the handle values baked in as
-/// constants (see `object_handles` and `MODEL_SPACE_HANDLE`), so the
-/// slice is unused. Kept as a parameter so a future move to
-/// `HANDSEED = max(handle) + 1` (with an oracle-gate allow-list)
-/// has a natural place to compute the max without changing the
-/// public shape.
-fn header_vars_for_records(_records: &[ObjectRecord]) -> HeaderVars {
-    // **HANDSEED trade-off.** The spec definition of HANDSEED is
-    // "next handle to allocate" — i.e., `max(handle) + 1`. LibreDWG's
-    // post-decode `dwg_resolve_handle` loop iterates every
-    // `object_ref` in the model (including header_vars handle slots)
-    // and unconditionally warns
+/// `HANDSEED` is computed from the actual record set as
+/// `max(handle.value) + 1`, matching the spec definition ("next
+/// handle to allocate"). Falls back to `FIRST_USER_ENTITY` if
+/// `records` is empty so an empty-document fixture still gets a
+/// sane next-unused value.
+fn header_vars_for_records(records: &[ObjectRecord]) -> HeaderVars {
+    // **HANDSEED = max(handle) + 1.** Spec-correct: HANDSEED is the
+    // "next handle to allocate", so it points one past the highest
+    // handle currently in use. LibreDWG's post-decode
+    // `dwg_resolve_handle` loop (see `dwg.c:896-911`) iterates every
+    // `object_ref` in the model — including the HANDSEED slot in
+    // header_vars — and warns
     // `Warning: Object handle not found <abs>/<abs_hex>` for any
-    // handle not in the `object_map`. A spec-correct HANDSEED is by
-    // definition not in `object_map`, so the warning fires on every
-    // conformant file — LibreDWG's own `example_2000.dwg` triggers it
-    // for its `HANDSEED = 0xBE7`.
+    // value not in the `object_map`. Since HANDSEED by definition
+    // points at an unused handle, it ALWAYS triggers this warning;
+    // LibreDWG's own `example_2000.dwg` fires it for its
+    // `HANDSEED = 0xBE7`.
     //
-    // We could allow-list that warning at the oracle gate, but the
-    // warning text is structurally indistinguishable from a real
-    // regression where an entity points at a missing object — so
-    // allow-listing would substantially weaken the gate's regression
-    // detection. We instead point HANDSEED at the model-space
-    // `BLOCK_HEADER`, which is guaranteed to exist in `object_map`
-    // for every file we emit. The "next-unused" semantics are
-    // slightly off, but our fixtures are read-only — no consumer ever
-    // mints fresh handles from this HANDSEED. Real DWG editors that
-    // need accurate HANDSEED on the write path can recompute it from
-    // `_records.iter().map(|r| r.handle.value).max() + 1` at the
-    // call site; the `_records` slice is plumbed in deliberately to
-    // make that future change a localized edit.
+    // We accept that warning at the oracle gate, but only the
+    // **exact** warning produced by our HANDSEED — see the
+    // `ALLOW_HANDSEED` pattern in
+    // `.github/workflows/ci.yml::libredwg_oracle`. The allow-list
+    // is scoped to the precise decimal/hex pair our writer emits
+    // (one past the highest user-entity handle), so any OTHER
+    // dangling-handle regression — an entity pointing at a missing
+    // BLOCK_HEADER, a corrupted owner pointer, a typo in a table
+    // record — still fails the gate because it produces a different
+    // numeric value (or the long-form warning text when the dangling
+    // handle is below HANDSEED).
+    //
+    // Edge case: if `records` is empty (no entities, no table
+    // objects), we have no handles to look at. Fall back to
+    // `FIRST_USER_ENTITY` (0x21), which is what the next allocation
+    // would use anyway — consistent with the spec definition of
+    // "next handle to allocate".
+    let max_handle = records
+        .iter()
+        .map(|r| r.handle.value)
+        .max()
+        .unwrap_or(object_handles::FIRST_USER_ENTITY - 1);
+    let handseed_value = max_handle + 1;
     HeaderVars {
         handseed: HandleRef {
             code: 0,
-            value: object_handles::MODEL_SPACE_BLOCK_HEADER,
+            value: handseed_value,
         },
         clayer: HandleRef {
             code: 5,

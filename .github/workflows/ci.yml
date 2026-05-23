@@ -191,10 +191,11 @@ jobs:
     # checks set. All eight versions must:
     #   1. exit 0 from `dwgread`
     #   2. emit no `Error:` or `ERROR` lines on stderr
-    #   3. emit no `Warning:` lines EXCEPT a small allow-list of two
+    #   3. emit no `Warning:` lines EXCEPT a small allow-list of
     #      known LibreDWG-decoder bugs that fire on its own bundled
-    #      `example_2004.dwg` and cannot be silenced from the writer
-    #      side (see Allow-list in the gate step below).
+    #      fixtures and cannot be silenced from the writer side, plus
+    #      the spec-correct HANDSEED's intentional dangling-handle
+    #      warning (see Allow-list in the gate step below).
     #   4. their DXF round-trip must contain LINE / CIRCLE / TEXT
     #      entities (except R12 and R2007 which are deliberately
     #      empty-document fixtures).
@@ -273,11 +274,12 @@ jobs:
           #   - emit no `Error:`/`ERROR` lines on stderr
           #   - emit no unfiltered `Warning:` lines (see allow-list)
           #
-          # Allow-list (two LibreDWG-decoder bugs that fire on its
-          # own bundled `example_2004.dwg` and cannot be silenced from
-          # the writer side — kept narrow to a single, version-gated
-          # pair so a future writer regression that produces a new
-          # warning still fails the gate):
+          # Allow-list group 1 (LibreDWG-decoder bugs — R2004+ only,
+          # fire on LibreDWG's own bundled `example_2004.dwg` and
+          # cannot be silenced from the writer side; both kept narrow
+          # to a single, version-gated pair so a future writer
+          # regression that produces a new warning still fails the
+          # gate):
           #
           #   * "checksum: 0x........ (calculated) CRC mismatch ..." —
           #     `decode.c:3329` (marked `// FIXME`). LibreDWG hashes
@@ -299,6 +301,37 @@ jobs:
           # R2010 / R2013 / R2018); R12 / R14 / R2000 / R2007 use
           # different wire formats and must remain warning-free.
           ALLOW_R2004_PLUS='^Warning: checksum: 0x[0-9a-f]+ \(calculated\) CRC mismatch |^Warning: Invalid sections: 0 != numgaps: 0 \+ numsections: '
+
+          # Allow-list group 2 (spec-correct HANDSEED dangling-handle
+          # warning — modern-path versions only). Per the DWG spec
+          # HANDSEED is "the next handle to allocate", i.e. one past
+          # the highest in-use handle, and therefore by definition
+          # not present in the object_map. LibreDWG's post-decode
+          # `dwg_resolve_handle` loop (`dwg.c:907`) iterates every
+          # `object_ref` — including the HANDSEED slot in header_vars
+          # — and warns when a handle is missing. LibreDWG's own
+          # bundled `example_2000.dwg` fires the same warning for its
+          # `HANDSEED = 0xBE7`.
+          #
+          # The allow-list is intentionally scoped to the EXACT
+          # decimal/hex pair our oracle fixture emits (36 / 0x24 —
+          # one past the highest user-entity handle 0x23 in the
+          # standard 3-entity fixture; see
+          # `crates/aec_cad/examples/dwg_oracle_fixture.rs`). Any
+          # OTHER dangling-handle regression — entity points at a
+          # missing BLOCK_HEADER, corrupted owner pointer, typo in a
+          # table record — produces a different numeric value (or
+          # the long-form warning text from `dwg.c:900` when the
+          # dangling handle is below HANDSEED), so the gate still
+          # detects it.
+          #
+          # If the fixture entity count ever changes, update both
+          # `dwg_oracle_fixture.rs` AND this pattern in lockstep.
+          # The HANDSEED warning only fires on the modern path
+          # (R14 / R2000 / R2004 / R2010 / R2013 / R2018); R12 uses
+          # a different wire format (no header_vars HANDSEED slot)
+          # and R2007 currently ships an empty-doc fixture.
+          ALLOW_HANDSEED='^Warning: Object handle not found 36/0x24$'
           fail=0
           for v in r12 r14 r2000 r2004 r2007 r2010 r2013 r2018; do
             path=/tmp/dwg_oracle/$v.dwg
@@ -314,9 +347,20 @@ jobs:
             # versions only); everything else must stay warning-free.
             case "$v" in
               r2004|r2010|r2013|r2018)
-                unexpected_warnings=$(grep "^Warning:" "$log" | grep -Ev "$ALLOW_R2004_PLUS" || true)
+                # R2004+ allows both decoder-bug warnings and the
+                # spec-correct HANDSEED warning.
+                unexpected_warnings=$(grep "^Warning:" "$log" | grep -Ev "$ALLOW_R2004_PLUS" | grep -Ev "$ALLOW_HANDSEED" || true)
+                ;;
+              r14|r2000)
+                # R14/R2000 allows the HANDSEED warning only; the
+                # R2004+ decoder bugs don't apply to the flat
+                # section-locator layout.
+                unexpected_warnings=$(grep "^Warning:" "$log" | grep -Ev "$ALLOW_HANDSEED" || true)
                 ;;
               *)
+                # R12 / R2007 currently emit empty-doc fixtures with
+                # no header_vars HANDSEED slot (R12) or no entities
+                # (R2007), so no warnings are expected.
                 unexpected_warnings=$(grep "^Warning:" "$log" || true)
                 ;;
             esac
