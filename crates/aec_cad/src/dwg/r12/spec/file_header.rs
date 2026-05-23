@@ -58,14 +58,20 @@ pub struct R12SectionLocator {
     /// First byte of block-entity payload (after the
     /// `DWG_SENTINEL_R11_BLOCK_ENTITIES_BEGIN` sentinel).
     pub blocks_start: u32,
-    /// Byte-length of the block-entity payload. Encoded with the
-    /// `0x40000000` flag added when `version > R_2_22` (always true
-    /// for R12). The decoder strips the high bits via `& 0xffffff`.
+    /// Byte-length of the block-entity payload OR'd with the
+    /// `0x40000000` flag (always set for R12, per `encode.c:3107-3108`
+    /// since `R_11 > R_2_22`). The decoder recovers the payload via
+    /// `& 0xffffff` ([`spec::assemble::SIZE_FIELD_MASK`]); the encoder
+    /// enforces the matching 24-bit ceiling with `WriteOverflow` so
+    /// the two paths stay symmetric and oversized payloads never
+    /// silently truncate.
     pub blocks_size: u32,
     /// First byte of extra-entity (objects) payload.
     pub extras_start: u32,
-    /// Byte-length of the extra-entity payload with the `0x80000000`
-    /// flag added (R12+).
+    /// Byte-length of the extra-entity payload OR'd with the
+    /// `0x80000000` flag (R12+, per `encode.c:3122-3124`). The same
+    /// 24-bit symmetry described on [`Self::blocks_size`] applies
+    /// here as well.
     pub extras_size: u32,
 }
 

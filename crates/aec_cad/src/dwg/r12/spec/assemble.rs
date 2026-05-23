@@ -91,6 +91,23 @@ pub const EMPTY_TABLE_COUNT: usize = 10;
 /// sentinel, no records).
 pub const EMPTY_TABLE_LEN: usize = 2 * SENTINEL_LEN;
 
+/// Width of the payload size field embedded in `blocks_size` /
+/// `extras_size`. Per `decode_r11.c` LibreDWG strips the high byte of
+/// these fields via `& 0xffffff` to recover the payload length, so the
+/// AC1009 wire format effectively caps each region at 16 MB minus one.
+/// The high-byte bits are reserved for the type flags
+/// ([`BLOCKS_SIZE_FLAG`], [`EXTRAS_SIZE_FLAG`]).
+pub const SIZE_FIELD_MASK: u32 = 0x00FF_FFFF;
+
+/// Bit-30 flag OR'd into `blocks_size` per `encode.c:3107-3108`
+/// whenever `version > R_2_22` (always true for R12). Without it,
+/// LibreDWG reads `blocks_size` as zero and skips block parsing.
+pub const BLOCKS_SIZE_FLAG: u32 = 0x4000_0000;
+
+/// Bit-31 flag OR'd into `extras_size` per `encode.c:3122-3124`
+/// (R12+).
+pub const EXTRAS_SIZE_FLAG: u32 = 0x8000_0000;
+
 /// Sentinel-pair sequence for the ten empty per-table sections.
 /// The order matches `encode.c:3072-3089` exactly.
 const EMPTY_TABLE_SENTINELS: [(Sentinel, Sentinel); EMPTY_TABLE_COUNT] = [
@@ -239,7 +256,7 @@ pub fn assemble(input: &R12Assembly) -> DwgResult<Vec<u8>> {
     out.extend_from_slice(&input.block_entities);
     let blocks_payload_size = u32_from_offset(out.len())? - blocks_start;
     out.extend_from_slice(&BLOCK_ENTITIES_END);
-    let blocks_size = blocks_payload_size | 0x4000_0000;
+    let blocks_size = encode_payload_size("block_entities", blocks_payload_size, BLOCKS_SIZE_FLAG)?;
 
     // ------------------------------------------------------------
     // (8) EXTRA_ENTITIES region. `extras_size` carries an
@@ -250,7 +267,7 @@ pub fn assemble(input: &R12Assembly) -> DwgResult<Vec<u8>> {
     out.extend_from_slice(&input.extras);
     let extras_payload_size = u32_from_offset(out.len())? - extras_start;
     out.extend_from_slice(&EXTRA_ENTITIES_END);
-    let extras_size = 0x8000_0000 | (extras_payload_size & 0x8FFF_FFFF);
+    let extras_size = encode_payload_size("extras", extras_payload_size, EXTRAS_SIZE_FLAG)?;
 
     // ------------------------------------------------------------
     // (9) R11 aux header — sentinel-framed 138-byte block.
@@ -423,7 +440,7 @@ pub fn disassemble(bytes: &[u8]) -> DwgResult<R12Disassembly> {
             ),
         });
     }
-    let blocks_size_payload = (locator.blocks_size & 0xFF_FFFF) as usize;
+    let blocks_size_payload = (locator.blocks_size & SIZE_FIELD_MASK) as usize;
     if bytes.len() < cur + blocks_size_payload + SENTINEL_LEN {
         return Err(DwgError::UnexpectedEof {
             byte: cur + blocks_size_payload + SENTINEL_LEN,
@@ -450,7 +467,7 @@ pub fn disassemble(bytes: &[u8]) -> DwgResult<R12Disassembly> {
             ),
         });
     }
-    let extras_size_payload = (locator.extras_size & 0xFF_FFFF) as usize;
+    let extras_size_payload = (locator.extras_size & SIZE_FIELD_MASK) as usize;
     if bytes.len() < cur + extras_size_payload + SENTINEL_LEN {
         return Err(DwgError::UnexpectedEof {
             byte: cur + extras_size_payload + SENTINEL_LEN,
@@ -599,6 +616,28 @@ fn u32_from_offset(byte_offset: usize) -> DwgResult<u32> {
     })
 }
 
+/// Encode a payload-length into the AC1009 `blocks_size` / `extras_size`
+/// field: an explicit overflow check against [`SIZE_FIELD_MASK`]
+/// (LibreDWG `decode_r11.c` truncates to 24 bits, so any payload past
+/// that ceiling would be silently corrupted on read) plus the
+/// type-flag OR. Keeps the encode and decode paths symmetric: the
+/// disassembler always reads back `size & SIZE_FIELD_MASK`, so we
+/// guarantee here that the payload never overlaps the flag bits.
+fn encode_payload_size(region: &'static str, payload_size: u32, flag_bit: u32) -> DwgResult<u32> {
+    if payload_size > SIZE_FIELD_MASK {
+        return Err(DwgError::WriteOverflow {
+            limit: SIZE_FIELD_MASK as usize,
+        });
+    }
+    debug_assert_eq!(
+        payload_size & flag_bit,
+        0,
+        "encode_payload_size({region}): payload bit overlaps {flag_bit:#010x} flag bit"
+    );
+    let _ = region;
+    Ok(payload_size | flag_bit)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -730,5 +769,33 @@ mod tests {
         let got = disassemble(&bytes).unwrap();
         assert_eq!(got.header_vars.handseed, hv.handseed);
         assert_eq!(got.header_vars.handling, hv.handling);
+    }
+
+    #[test]
+    fn encode_payload_size_rejects_oversized_payload() {
+        // 24-bit ceiling: anything > 0x00FF_FFFF must error out so the
+        // wire format never silently truncates on the read path.
+        let too_big = SIZE_FIELD_MASK + 1;
+        let err = encode_payload_size("test", too_big, BLOCKS_SIZE_FLAG).unwrap_err();
+        assert!(
+            matches!(err, DwgError::WriteOverflow { limit } if limit == SIZE_FIELD_MASK as usize),
+            "expected WriteOverflow {{ limit: {:#x} }}, got {err:?}",
+            SIZE_FIELD_MASK
+        );
+    }
+
+    #[test]
+    fn encode_payload_size_preserves_max_24_bit_payload() {
+        // At the ceiling itself we OR in the flag bit cleanly with no
+        // bit overlap (regression test for the deleted `0x8FFF_FFFF`
+        // typo mask: that mask cleared bits 28-30, which would have
+        // truncated `SIZE_FIELD_MASK` from 0x00FFFFFF to 0x008FFFFF).
+        let max_payload = SIZE_FIELD_MASK;
+        let blocks = encode_payload_size("blocks", max_payload, BLOCKS_SIZE_FLAG).unwrap();
+        assert_eq!(blocks, max_payload | BLOCKS_SIZE_FLAG);
+        assert_eq!(blocks & SIZE_FIELD_MASK, max_payload);
+        let extras = encode_payload_size("extras", max_payload, EXTRAS_SIZE_FLAG).unwrap();
+        assert_eq!(extras, max_payload | EXTRAS_SIZE_FLAG);
+        assert_eq!(extras & SIZE_FIELD_MASK, max_payload);
     }
 }
