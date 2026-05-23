@@ -1373,16 +1373,18 @@ mod tests {
             objects: vec![one_line_record()],
         })
         .unwrap();
-        // Locate the section-info page (last system page) and corrupt
-        // the encrypted=2 byte in the AcDb:AcDbObjects descriptor.
-        // The simplest reliable corruption is to XOR a byte inside the
-        // data-page payload region — that scrambles the encrypted data
-        // so the matching decrypt won't restore it.
+        // Flip a single byte in the middle of the data-page region.
+        // After PR-E there is no section-level XOR to undo, so the
+        // mutation lands directly on either an LZ77-compressed page
+        // payload, the per-page 32-byte header (its sec_mask /
+        // checksum), or the section-info / page-map tables. Any of
+        // those is caught by a structured `DwgError` downstream
+        // (CRC mismatch, invalid LZ77 opcode, bad section magic,
+        // entity-decode failure, ...). The contract this test pins
+        // is just: no panic, structured error.
         let mid = (R2004_FIRST_PAGE_OFFSET as usize + bytes.len()) / 2;
         bytes[mid] ^= 0xff;
         let err = parse_r2004(&bytes).unwrap_err();
-        // Any structured DwgError is acceptable (CRC, LZ77 opcode,
-        // entity decode, ...). We only require: not a panic.
         let _ = err;
     }
 
