@@ -236,8 +236,10 @@ fn build_record_set(
     // as long as every referenced handle resolves. We emit the
     // control objects first so the file is easy to inspect with
     // `dwgread -v9`.
-    let mut records =
-        Vec::with_capacity(4 /* table objects */ + 1 /* block_header */ + chain.len());
+    // 4 table/header objects pushed below + the user-entity chain.
+    // (`block_header` is one of the four; the breakdown is
+    // block_control + layer_control + layer_zero + block_header.)
+    let mut records = Vec::with_capacity(4 + chain.len());
     records.push(block_control);
     records.push(layer_control);
     records.push(layer_zero);
