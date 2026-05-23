@@ -197,8 +197,8 @@ jobs:
     #      the spec-correct HANDSEED's intentional dangling-handle
     #      warning (see Allow-list in the gate step below).
     #   4. their DXF round-trip must contain LINE / CIRCLE / TEXT
-    #      entities (except R12 and R2007 which are deliberately
-    #      empty-document fixtures).
+    #      entities (except R12 which is the only remaining
+    #      empty-document fixture).
     #
     # LibreDWG isn't packaged in Ubuntu, so we build it from source.
     # The build is cached so the steady-state CI run only takes the
@@ -327,10 +327,10 @@ jobs:
           #
           # If the fixture entity count ever changes, update both
           # `dwg_oracle_fixture.rs` AND this pattern in lockstep.
-          # The HANDSEED warning only fires on the modern path
-          # (R14 / R2000 / R2004 / R2010 / R2013 / R2018); R12 uses
-          # a different wire format (no header_vars HANDSEED slot)
-          # and R2007 currently ships an empty-doc fixture.
+          # The HANDSEED warning fires on every modern path
+          # (R14 / R2000 / R2004 / R2007 / R2010 / R2013 / R2018);
+          # R12 uses a different wire format (no header_vars
+          # HANDSEED slot).
           ALLOW_HANDSEED='^Warning: Object handle not found 36/0x24$'
           fail=0
           for v in r12 r14 r2000 r2004 r2007 r2010 r2013 r2018; do
@@ -343,30 +343,15 @@ jobs:
             # the allow-list filter below a vacuous no-op. `-v1`
             # surfaces post-decode warnings (Object handle not found,
             # CRC mismatch, etc.) so the allow-list actually
-            # exercises and catches regressions. R2007 is the one
-            # exception: at `-v1` it surfaces R2007's known-empty
-            # `BLOCK_CONTROL missing` ERROR, which is real (the
-            # empty-doc fixture from PR-F1 doesn't ship a
-            # BLOCK_CONTROL chain). Until PR-H1 lands R2007 entity
-            # round-trip + BLOCK_CONTROL, R2007 must stay at default
-            # verbose where dwgread reads the file cleanly. Drop this
-            # special case in PR-H1 when R2007 becomes -v1-clean.
-            case "$v" in
-              r2007)
-                if dwgread -O DXF -o /tmp/dwg_oracle/$v.dxf "$path" >"$log" 2>&1; then
-                  ec=0
-                else
-                  ec=$?
-                fi
-                ;;
-              *)
-                if dwgread -v1 -O DXF -o /tmp/dwg_oracle/$v.dxf "$path" >"$log" 2>&1; then
-                  ec=0
-                else
-                  ec=$?
-                fi
-                ;;
-            esac
+            # exercises and catches regressions. Every version is
+            # run at `-v1` since PR-H1 lifted R2007's empty-doc
+            # restriction — R2007 now ships the same BLOCK_CONTROL /
+            # LAYER_CONTROL / model-space chain as R14+.
+            if dwgread -v1 -O DXF -o /tmp/dwg_oracle/$v.dxf "$path" >"$log" 2>&1; then
+              ec=0
+            else
+              ec=$?
+            fi
             cat "$log"
             # Filter `Warning:` lines through the allow-list (R2004+
             # versions only); everything else must stay warning-free.
@@ -376,16 +361,17 @@ jobs:
                 # spec-correct HANDSEED warning.
                 unexpected_warnings=$(grep "^Warning:" "$log" | grep -Ev "$ALLOW_R2004_PLUS" | grep -Ev "$ALLOW_HANDSEED" || true)
                 ;;
-              r14|r2000)
-                # R14/R2000 allows the HANDSEED warning only; the
-                # R2004+ decoder bugs don't apply to the flat
-                # section-locator layout.
+              r14|r2000|r2007)
+                # R14/R2000/R2007 allow the HANDSEED warning only;
+                # the R2004+ decoder bugs don't apply (R14/R2000 use
+                # a flat section-locator layout, R2007 uses the
+                # decode_r2007 codepath which doesn't share the
+                # buggy section_array / page-checksum slot logic).
                 unexpected_warnings=$(grep "^Warning:" "$log" | grep -Ev "$ALLOW_HANDSEED" || true)
                 ;;
               *)
-                # R12 / R2007 currently emit empty-doc fixtures with
-                # no header_vars HANDSEED slot (R12) or no entities
-                # (R2007), so no warnings are expected.
+                # R12 emits an empty-doc fixture with no header_vars
+                # HANDSEED slot, so no warnings are expected.
                 unexpected_warnings=$(grep "^Warning:" "$log" || true)
                 ;;
             esac
@@ -420,9 +406,10 @@ jobs:
           set -e
           # Each version that ships a non-empty document must contain
           # LINE, CIRCLE, and TEXT entities — the three the fixture
-          # emitter writes. R12 (AC1009 wire format) and R2007 (sentinel
-          # AcDb:AcDbObjects payload, see PR-F1) are deliberately
-          # empty-document fixtures and skip the inventory check.
+          # emitter writes. R12 (AC1009 wire format) is the only
+          # remaining empty-document fixture and skips the inventory
+          # check. PR-H1 lifted R2007's empty-doc restriction; it now
+          # round-trips the same 3-entity geometry as R14+.
           # `dwgread` writes DOS line endings on its DXF output, so we
           # strip `\r` before matching.
           fail=0
@@ -434,7 +421,7 @@ jobs:
               continue
             fi
             case "$v" in
-              r12|r2007)
+              r12)
                 echo "✓ $v: empty-document fixture (no entity inventory expected)"
                 continue
                 ;;
