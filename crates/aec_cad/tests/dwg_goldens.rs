@@ -78,8 +78,8 @@ fn golden(v: DwgVersion) -> Golden {
             blake3_hex: "0d22463894d0a571b04fbc3d06c027d6a72a86fa3f0d055ecb254508345556be",
         },
         DwgVersion::R2007 => Golden {
-            bytes: 2944,
-            blake3_hex: "33990028cd7387827e7c2d334de06a5ece4f6a35ade8d39f1db99b144c07230b",
+            bytes: 3968,
+            blake3_hex: "d78f3573167bef2dd48a60ebb6656a23b713f9364f58854a429b88c9d4c643ae",
         },
         DwgVersion::R2010 => Golden {
             bytes: 2484,

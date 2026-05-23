@@ -109,10 +109,13 @@ pub fn write_modern(doc: &DxfDocument, version: Version) -> DwgResult<Vec<u8>> {
                 ),
             });
         }
-        let _ = (
-            HeaderVarsSection::libredwg_conformant(version),
-            ClassesSection::empty(version),
-        );
+        // `assemble_r2007` now derives every section's content from
+        // `version` internally — it builds its own `AuxHeaderSection`,
+        // `ClassesSection`, and `ObjectMap` at the layout step (see
+        // `r2007_layout::assemble_r2007`'s step 3). When R2007 entity
+        // round-trip lands, `R2007FileParts` will grow `objects`,
+        // `header_vars`, `classes` fields mirroring `R2004FileParts`
+        // and this branch will start threading them in.
         let parts = R2007FileParts { version };
         assemble_r2007(parts)
     } else if version.has_paged_system_sections() {
