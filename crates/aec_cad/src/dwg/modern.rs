@@ -253,8 +253,11 @@ fn entity_to_record(entity: &DxfEntity, version: Version, handle: u64) -> DwgRes
             code: 0,
             value: handle,
         },
+        supertype: crate::dwg::entities::record::ObjectSupertype::Entity,
         common: CommonHeaderData::default(),
+        object_common: crate::dwg::entities::record::ObjectCommonData::default(),
         payload_bits: BitBuf::from_writer(payload),
+        string_payload_bits: BitBuf::new(),
         handles: ObjectHandles {
             owner: Some(HandleRef {
                 code: 5,

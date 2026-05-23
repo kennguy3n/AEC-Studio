@@ -45,18 +45,103 @@ use crate::dwg::entities::ObjectType;
 use crate::dwg::error::{DwgError, DwgResult};
 use crate::dwg::version::Version;
 
+/// Whether a record carries an ENTITY (geometry: LINE, CIRCLE, TEXT, …)
+/// or an OBJECT (non-geometric: LAYER, BLOCK_HEADER, DICTIONARY, …).
+///
+/// LibreDWG dispatches on `dwg_class[type_idx].is_entity` to pick which
+/// codec runs `dwg_encode_entity` vs `dwg_encode_object`. The two share
+/// the outer envelope (MS size, BS type, [RL bitsize for R2000-R2007],
+/// H handle, EED) but differ on the common header in the data stream:
+///
+/// - **Entity** (`dwg_encode_entity`, `common_entity_data.spec`):
+///   preview_exists, entmode, num_reactors, isbylayerlt/xdict_missing,
+///   nolinks/has_ds_data, color, ltscale, ltype_flags, plotstyle_flags,
+///   material_flags, shadow_flags, visualstyle flags, invisible, linewt.
+///
+/// - **Object** (`dwg_encode_object`, `encode.c:6540`):
+///   num_reactors (BL), is_xdic_missing (B, R2004+), has_ds_data
+///   (B, R2013+). No entity-specific flags.
+///
+/// The handle stream also differs: entities carry layer/ltype/prev/next
+/// /material/shadow/plotstyle/visualstyle; objects carry only the
+/// generic owner+reactors+xdict, plus per-type extras (e.g. LAYER's
+/// xref+plotstyle+material+ltype+visualstyle, BLOCK_HEADER's
+/// block_entity+first/last/owned/endblk/inserts).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ObjectSupertype {
+    /// Geometric entity (LINE, CIRCLE, TEXT, INSERT, …). Default for
+    /// back-compat: existing callers that constructed `ObjectRecord`
+    /// without specifying a supertype get the entity codec.
+    #[default]
+    Entity,
+    /// Non-geometric object (LAYER, LAYER_CONTROL, BLOCK_HEADER,
+    /// BLOCK_CONTROL, DICTIONARY, …).
+    Object,
+}
+
 /// One object record, decoded into typed parts (still carrying the
 /// per-type payload as opaque bits so this module stays type-agnostic).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObjectRecord {
     pub object_type: ObjectType,
     pub handle: HandleRef,
+    /// Whether this record uses the entity or object common-header
+    /// layout. See [`ObjectSupertype`].
+    pub supertype: ObjectSupertype,
     pub common: CommonHeaderData,
+    /// Object-supertype common header. Only used when `supertype ==
+    /// Object`; ignored for entities (their flags live in `common`).
+    pub object_common: ObjectCommonData,
     /// Type-specific payload bits, starting immediately after the
     /// common entity header data and ending immediately before the
     /// handle stream.
     pub payload_bits: BitBuf,
+    /// R2007+ wide-string region (`T` fields) for OBJECT-supertype
+    /// records. LibreDWG `obj_string_stream` reads `has_strings` at
+    /// bit `bitsize - 1` and, when set, parses `data_size` (16 bits)
+    /// at `bitsize - 17` followed by the string content immediately
+    /// before that. We model that layout by appending these bits to
+    /// the body just before the handle stream, followed by the
+    /// `data_size` RS and `has_strings` B markers.
+    ///
+    /// Empty (`bit_len == 0`) means "no `T` fields", and the encoder
+    /// writes `has_strings = 0` for R2007+ OBJECT records so the bit
+    /// at `bitsize - 1` is deterministic. For pre-R2007 versions the
+    /// string region is ignored — `T` fields encode inline as TV
+    /// inside `payload_bits` instead.
+    ///
+    /// Currently consumed only by OBJECT-supertype emitters (LAYER,
+    /// BLOCK_HEADER, etc.). ENTITY-supertype records still emit T
+    /// fields inline in `payload_bits` regardless of version — the
+    /// R2007+ string-stream layout for entities is a separate fix
+    /// (tracked alongside the TEXT round-trip work).
+    pub string_payload_bits: BitBuf,
     pub handles: ObjectHandles,
+}
+
+/// Object-supertype common header data, written immediately after the
+/// EED terminator and the (R13/R14-only) inline RL bitsize, BEFORE the
+/// per-type payload.
+///
+/// Source: LibreDWG `encode.c::dwg_encode_object` lines 6540-6550:
+/// ```c
+/// FIELD_BL (num_reactors, 0);
+/// SINCE (R_2004a) { FIELD_B (is_xdic_missing, 0); }
+/// SINCE (R_2013b) { FIELD_B (has_ds_data, 0); }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ObjectCommonData {
+    /// Number of reactor handles attached to this object (max 0x1000
+    /// per LibreDWG `encode.c:1153`). For tables like LAYER, this is
+    /// typically 0.
+    pub num_reactors: u32,
+    /// R2004+: when `true`, the xdict handle is NOT emitted in the
+    /// handle stream. For empty/default tables we set this `true` to
+    /// avoid emitting a dangling NULL xdict reference.
+    pub is_xdic_missing: bool,
+    /// R2013+: when `true`, an AcDs DATA chunk follows. We do not emit
+    /// AcDs data, so this is always `false`.
+    pub has_ds_data: bool,
 }
 
 /// The handle stream attached to every modern entity.
@@ -238,10 +323,83 @@ impl ObjectRecord {
 
         body.write_h(self.handle)?;
         body.write_bs(0)?; // EED terminator (no EED yet)
-        let r14_bitsize_slot = self
-            .common
-            .encode_for_version_with_r14_bitsize_slot(version, &mut body)?;
+        let r14_bitsize_slot = match self.supertype {
+            ObjectSupertype::Entity => self
+                .common
+                .encode_for_version_with_r14_bitsize_slot(version, &mut body)?,
+            ObjectSupertype::Object => {
+                // For OBJECT supertype, R13/R14 still emit an inline RL
+                // bitsize slot before the common-object-data block —
+                // see `dwg_encode_object` at encode.c:6532:
+                //   VERSIONS (R_13b1, R_14) {
+                //     obj->bitsize_pos = bit_position (dat);
+                //     FIELD_RL (bitsize, 0);
+                //   }
+                // We capture the slot position here so the caller can
+                // back-patch it once `handle_stream_start_bit` is known
+                // (same machinery used for entities).
+                let slot = if version <= Version::R14 {
+                    let pos = body.bit_position();
+                    body.write_rl(0)?;
+                    Some(pos)
+                } else {
+                    None
+                };
+                // BL num_reactors
+                body.write_bl(i64::from(self.object_common.num_reactors))?;
+                // B is_xdic_missing (R2004+)
+                if version >= Version::R2004 {
+                    body.write_b(self.object_common.is_xdic_missing)?;
+                }
+                // B has_ds_data (R2013+)
+                if version >= Version::R2013 {
+                    body.write_b(self.object_common.has_ds_data)?;
+                }
+                slot
+            }
+        };
         write_bitbuf(&mut body, &self.payload_bits)?;
+
+        // R2007+ OBJECT-supertype string region. LibreDWG's
+        // `obj_string_stream` (decode_r2007.c:1297) reads `has_strings`
+        // B at body bit position `bitsize - 1`. When set, it reads a
+        // 16-bit `data_size` RS at `bitsize - 17` and parses the
+        // wide-string content forward from that position minus
+        // `data_size` bits. We mirror that forward layout here by
+        // appending the string content, then the data_size RS, then
+        // the has_strings B — so the marker lands at the exact bit
+        // `bitsize - 1` the decoder probes. ENTITY-supertype records
+        // are intentionally NOT changed here: their `T` fields are
+        // written inline in `payload_bits` today (the proper R2007+
+        // entity string-stream wiring is tracked alongside the TEXT
+        // round-trip work). Pre-R2007 versions also leave
+        // `string_payload_bits` empty and write `T` fields inline.
+        let emit_object_string_markers =
+            version >= Version::R2007 && self.supertype == ObjectSupertype::Object;
+        if emit_object_string_markers {
+            let str_bits = self.string_payload_bits.bit_len;
+            if str_bits > 0 {
+                write_bitbuf(&mut body, &self.string_payload_bits)?;
+                let data_size = u16::try_from(str_bits).map_err(|_| {
+                    DwgError::InternalInvariant(format!(
+                        "string region {str_bits} bits overflows the 15-bit \
+                         data_size RS slot (max 32767); the >32k path with \
+                         the `hi_size` RS extension is not implemented yet"
+                    ))
+                })?;
+                if data_size & 0x8000 != 0 {
+                    return Err(DwgError::InternalInvariant(format!(
+                        "string region {data_size} bits has high bit set; \
+                         the LibreDWG hi_size RS extension path is not \
+                         implemented yet (max 32767 bits per record)"
+                    )));
+                }
+                body.write_bits_u32(16, u32::from(data_size))?;
+                body.write_b(true)?; // has_strings = 1
+            } else {
+                body.write_b(false)?; // has_strings = 0
+            }
+        }
 
         // Body-bit position where the handle stream begins (this is
         // `bitsize` in LibreDWG terminology). For R2000-R2007 this is
@@ -268,6 +426,8 @@ impl ObjectRecord {
             self.object_type,
             &self.handles,
             &self.common,
+            self.supertype,
+            &self.object_common,
         )?;
 
         // Pad to byte boundary so obj->size is an integer byte count.
@@ -359,8 +519,11 @@ impl ObjectRecord {
             Self {
                 object_type: header.object_type,
                 handle: header.handle,
+                supertype: ObjectSupertype::Entity,
                 common: header.common,
+                object_common: ObjectCommonData::default(),
                 payload_bits: BitBuf::new(), // payload was consumed via callback
+                string_payload_bits: BitBuf::new(),
                 handles,
             },
             payload,
@@ -564,8 +727,11 @@ impl ObjectRecord {
             Self {
                 object_type: header.object_type,
                 handle: header.handle,
+                supertype: ObjectSupertype::Entity,
                 common: header.common,
+                object_common: ObjectCommonData::default(),
                 payload_bits,
+                string_payload_bits: BitBuf::new(),
                 handles,
             },
             total,
@@ -622,7 +788,56 @@ fn encode_handle_stream(
     object_type: ObjectType,
     handles: &ObjectHandles,
     common: &CommonHeaderData,
+    supertype: ObjectSupertype,
+    object_common: &ObjectCommonData,
 ) -> DwgResult<()> {
+    // For OBJECT supertype, the handle stream is just:
+    //   owner H (code 4 = soft owner; per FIELD_HANDLE expected-code
+    //   warning in encode.c:786)
+    //   reactors H[num_reactors]
+    //   xdict H (R13/R2000: always; R2004+: iff !is_xdic_missing)
+    //   per-type extras (type_extras, in dwg.spec order)
+    //
+    // No layer / ltype / prev_entity / next_entity / material / shadow
+    // / plotstyle / visualstyle in the OBJECT handle stream \u2014 those are
+    // entity-only.
+    if supertype == ObjectSupertype::Object {
+        let owner = handles.owner.unwrap_or(HandleRef { code: 4, value: 0 });
+        w.write_h(owner)?;
+        for i in 0..object_common.num_reactors as usize {
+            let r = handles
+                .reactors
+                .get(i)
+                .copied()
+                .unwrap_or(HandleRef { code: 4, value: 0 });
+            w.write_h(r)?;
+        }
+        let xdict_present = if version <= Version::R2000 {
+            true
+        } else {
+            !object_common.is_xdic_missing
+        };
+        if xdict_present {
+            let xd = handles
+                .x_dictionary
+                .unwrap_or(HandleRef { code: 3, value: 0 });
+            w.write_h(xd)?;
+        } else if handles.x_dictionary.is_some() {
+            return Err(DwgError::InternalInvariant(
+                "ObjectHandles::x_dictionary is Some but \
+                 ObjectCommonData::is_xdic_missing is true (R2004+); set \
+                 is_xdic_missing = false to emit the handle."
+                    .into(),
+            ));
+        }
+        // Per-object-type extras (e.g. LAYER's xref/plotstyle/material/
+        // ltype/visualstyle; BLOCK_HEADER's block_entity/first/last/
+        // owned/endblk/inserts/layout).
+        for extra in &handles.type_extras {
+            w.write_h(*extra)?;
+        }
+        return Ok(());
+    }
     // Owner handle: per LibreDWG `common_entity_handle_data.spec:25`,
     // emitted ONLY when `entmode == 0` (i.e. the entity stores its
     // owner explicitly rather than inferring from {model,paper}-space
@@ -903,8 +1118,11 @@ mod tests {
         ObjectRecord {
             object_type: ObjectType::Line,
             handle: HandleRef { code: 0, value: 1 },
+            supertype: ObjectSupertype::Entity,
+            object_common: ObjectCommonData::default(),
             common: CommonHeaderData::default(),
             payload_bits: BitBuf::from_writer(payload),
+            string_payload_bits: BitBuf::new(),
             handles: build_handles(),
         }
     }
@@ -937,8 +1155,11 @@ mod tests {
         let record = ObjectRecord {
             object_type: ObjectType::Line,
             handle: HandleRef { code: 0, value: 1 },
+            supertype: ObjectSupertype::Entity,
+            object_common: ObjectCommonData::default(),
             common: CommonHeaderData::default(),
             payload_bits: BitBuf::new(),
+            string_payload_bits: BitBuf::new(),
             handles: build_handles(),
         };
         let bytes = record.encode(Version::R2000).unwrap();
@@ -1019,8 +1240,11 @@ mod tests {
         let record = ObjectRecord {
             object_type: ObjectType::Line,
             handle: HandleRef { code: 0, value: 1 },
+            supertype: ObjectSupertype::Entity,
+            object_common: ObjectCommonData::default(),
             common,
             payload_bits: BitBuf::new(),
+            string_payload_bits: BitBuf::new(),
             handles,
         };
         let bytes = record.encode(Version::R2010).unwrap();
@@ -1054,8 +1278,11 @@ mod tests {
         let record = ObjectRecord {
             object_type: ObjectType::Line,
             handle: HandleRef { code: 0, value: 1 },
+            supertype: ObjectSupertype::Entity,
+            object_common: ObjectCommonData::default(),
             common,
             payload_bits: BitBuf::new(),
+            string_payload_bits: BitBuf::new(),
             handles,
         };
         let bytes = record.encode(Version::R2010).unwrap();
@@ -1079,8 +1306,11 @@ mod tests {
         let record = ObjectRecord {
             object_type: ObjectType::Line,
             handle: HandleRef { code: 0, value: 1 },
+            supertype: ObjectSupertype::Entity,
+            object_common: ObjectCommonData::default(),
             common: CommonHeaderData::default(), // material_flag = 0
             payload_bits: BitBuf::new(),
+            string_payload_bits: BitBuf::new(),
             handles,
         };
         let err = record.encode(Version::R2010).unwrap_err();
@@ -1102,8 +1332,11 @@ mod tests {
         let record = ObjectRecord {
             object_type: ObjectType::Line,
             handle: HandleRef { code: 0, value: 1 },
+            supertype: ObjectSupertype::Entity,
+            object_common: ObjectCommonData::default(),
             common: CommonHeaderData::default(), // xdict_missing = true
             payload_bits: BitBuf::new(),
+            string_payload_bits: BitBuf::new(),
             handles,
         };
         let err = record.encode(Version::R2010).unwrap_err();
