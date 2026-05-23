@@ -1008,7 +1008,7 @@ pub fn parse_r2004(bytes: &[u8]) -> DwgResult<R2004File> {
     //    (`validate_against_records`) so a corrupted handles page
     //    — missing or orphaned entries — is rejected up-front
     //    rather than discovered later in `dwg_resolve_handle`.
-    let objects = recover_objects_sequential(&objects_payload, version)?;
+    let objects = recover_objects_sequential(&objects_payload, version, object_map.entries.len())?;
     object_map.validate_against_records(&objects)?;
 
     Ok(R2004File {

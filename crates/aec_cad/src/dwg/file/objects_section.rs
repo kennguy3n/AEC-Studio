@@ -100,11 +100,18 @@ pub(crate) fn build_handle_object_map(
 /// stored as a single decompressed payload buffer (the object
 /// map's offsets are section-relative to that buffer, and we walk
 /// it from index 0).
+///
+/// `capacity_hint` is a non-binding pre-allocation hint for the
+/// returned vector. Callers that have already parsed the object
+/// map should pass `object_map.entries.len()` so the recovery loop
+/// doesn't grow-reallocate on every record; a wrong hint affects
+/// allocation count only, never correctness.
 pub(crate) fn recover_objects_sequential(
     payload: &[u8],
     version: Version,
+    capacity_hint: usize,
 ) -> DwgResult<Vec<R2000Object>> {
-    let mut objects: Vec<R2000Object> = Vec::new();
+    let mut objects: Vec<R2000Object> = Vec::with_capacity(capacity_hint);
     let mut cursor = 0usize;
     while cursor < payload.len() {
         let (object_type, record_handle, common, total) =
@@ -223,7 +230,8 @@ mod tests {
         let records = vec![line_record(0x42), line_record(0x10), line_record(0x99)];
         let (payload, offsets) = encode_objects_payload(&records, Version::R2000).unwrap();
         assert_eq!(offsets.len(), 3);
-        let recovered = recover_objects_sequential(&payload, Version::R2000).unwrap();
+        let recovered =
+            recover_objects_sequential(&payload, Version::R2000, records.len()).unwrap();
         assert_eq!(recovered.len(), 3);
         // recover_objects_sequential walks the payload in input
         // order; the per-record handle is preserved.

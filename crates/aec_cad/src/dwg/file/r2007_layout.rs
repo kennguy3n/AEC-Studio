@@ -1380,7 +1380,7 @@ pub fn parse_r2007(bytes: &[u8], version: Version) -> DwgResult<R2007File> {
     //    against the object map so a corrupted handles page
     //    — missing or orphaned entries — fails up-front rather than
     //    surfacing later in `dwg_resolve_handle`.
-    let objects = recover_objects_sequential(&objects_payload, version)?;
+    let objects = recover_objects_sequential(&objects_payload, version, object_map.entries.len())?;
     object_map.validate_against_records(&objects)?;
 
     Ok(r2007_file_from_header(
