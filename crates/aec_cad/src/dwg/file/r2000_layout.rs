@@ -62,7 +62,10 @@ use crate::dwg::error::{DwgError, DwgResult};
 use crate::dwg::file::classes::ClassesSection;
 use crate::dwg::file::header::{FileHeader, FIXED_HEADER_LEN};
 use crate::dwg::file::header_vars::HeaderVarsSection;
-use crate::dwg::file::object_map::{ObjectMap, ObjectMapEntry};
+use crate::dwg::file::object_map::ObjectMap;
+use crate::dwg::file::objects_section::{
+    build_handle_object_map, encode_objects_payload, recover_objects_via_map,
+};
 use crate::dwg::file::sections::{encode_locators, parse_locators, SectionId, SectionLocator};
 use crate::dwg::file::sentinels::HEADER_END;
 use crate::dwg::version::Version;
@@ -167,13 +170,8 @@ pub fn assemble_r2000(parts: R2000FileParts) -> DwgResult<Vec<u8>> {
     // Track each record's offset within the concatenated object
     // stream so we can patch absolute file offsets after we know
     // where the stream begins.
-    let mut objects_bytes = Vec::new();
-    let mut record_stream_offsets: Vec<u64> = Vec::with_capacity(parts.objects.len());
-    for record in &parts.objects {
-        record_stream_offsets.push(objects_bytes.len() as u64);
-        let wire = record.encode(parts.version)?;
-        objects_bytes.extend_from_slice(&wire);
-    }
+    let (objects_bytes, record_stream_offsets) =
+        encode_objects_payload(&parts.objects, parts.version)?;
 
     // Compute file-absolute offsets.
     let mut cursor = prefix_size as u32;
@@ -185,17 +183,16 @@ pub fn assemble_r2000(parts: R2000FileParts) -> DwgResult<Vec<u8>> {
     cursor += objects_bytes.len() as u32;
     let handles_offset = cursor;
 
-    // Build the object map: entries sorted by handle, file offsets
-    // resolved relative to the objects-stream start.
-    let mut sorted_indices: Vec<usize> = (0..parts.objects.len()).collect();
-    sorted_indices.sort_by_key(|&i| parts.objects[i].handle.value);
-    let mut object_map = ObjectMap::new();
-    for &i in &sorted_indices {
-        object_map.entries.push(ObjectMapEntry {
-            handle: parts.objects[i].handle.value,
-            file_offset: objects_offset as u64 + record_stream_offsets[i],
-        });
-    }
+    // Build the object map. Entries are sorted by handle (canonical
+    // R13–R2000 layout); each entry's `file_offset` is
+    // *file-absolute* — `offset_base = objects_offset` so the parser
+    // (`recover_objects_via_map`) can seek into the file directly
+    // without a section-relative buffer.
+    let object_map = build_handle_object_map(
+        &parts.objects,
+        &record_stream_offsets,
+        objects_offset as u64,
+    )?;
     let mut handles_bytes = Vec::new();
     object_map.encode(&mut handles_bytes)?;
     let total_size = cursor + handles_bytes.len() as u32;
@@ -379,41 +376,20 @@ pub fn parse_r2000(bytes: &[u8]) -> DwgResult<R2000File> {
 
     let object_map = ObjectMap::parse(&bytes[handles_range.0..handles_range.1])?;
 
-    // For each object-map entry, peek the structural header (so we know
-    // the record's wire size) and store the raw record bytes. We do
-    // NOT eagerly call `ObjectRecord::decode` because for R14/R2000
-    // that would mis-parse any record with a non-empty payload — the
-    // payload-to-handle-stream boundary requires per-type knowledge
-    // and `decode` has no version-specific bitsize marker to fall back
-    // on. The caller invokes `ObjectRecord::decode_with(raw_bytes, ..)`
-    // with a per-type decoder to recover the full entity.
-    let mut objects = Vec::with_capacity(object_map.entries.len());
-    for entry in &object_map.entries {
-        let off = entry.file_offset as usize;
-        if off >= bytes.len() {
-            return Err(DwgError::DanglingHandle {
-                handle: entry.handle,
-                offset: entry.file_offset,
-                file_size: bytes.len(),
-            });
-        }
-        let (object_type, record_handle, common, total) =
-            ObjectRecord::peek_header(version, &bytes[off..])?;
-        if off + total > bytes.len() {
-            return Err(DwgError::UnexpectedEof {
-                byte: off + total,
-                bit: 0,
-            });
-        }
-        let raw_bytes = bytes[off..off + total].to_vec();
-        objects.push(R2000Object {
-            map_handle: entry.handle,
-            object_type,
-            record_handle,
-            common,
-            raw_bytes,
-        });
-    }
+    // For each object-map entry, peek the structural header (so we
+    // know the record's wire size) and store the raw record bytes.
+    // We do NOT eagerly call `ObjectRecord::decode` because for
+    // R14/R2000 that would mis-parse any record with a non-empty
+    // payload — the payload-to-handle-stream boundary requires
+    // per-type knowledge and `decode` has no version-specific
+    // bitsize marker to fall back on. The caller invokes
+    // `ObjectRecord::decode_with(raw_bytes, ..)` with a per-type
+    // decoder to recover the full entity. Shared with R2004/R2007
+    // recovery; only R14/R2000 uses the file-absolute-offset seek
+    // path because its OBJECTS stream lives at a known file offset
+    // (R2004/R2007 wrap it in a paged section and walk a
+    // decompressed buffer instead).
+    let objects = recover_objects_via_map(bytes, &object_map, version)?;
 
     Ok(R2000File {
         version,

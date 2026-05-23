@@ -30,6 +30,7 @@
 
 use crate::dwg::bits::crc_x25;
 use crate::dwg::error::{DwgError, DwgResult};
+use std::collections::BTreeSet;
 
 /// One entry in the object map.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +178,60 @@ impl ObjectMap {
             }
             cursor = page_end + 2;
         }
+    }
+
+    /// Cross-check that every record handle is present in the
+    /// object map (and vice versa).
+    ///
+    /// Used by the R2004/R2007 parsers as a defense-in-depth
+    /// check after [`crate::dwg::file::objects_section::recover_objects_sequential`]:
+    /// the records were walked from a flat payload, and a
+    /// well-formed file's `AcDb:Handles` page MUST list every
+    /// record handle (LibreDWG's `read_2007_section_handles`
+    /// relies on this for the post-decode `dwg_resolve_handle`
+    /// pass).
+    ///
+    /// Returns:
+    /// - `DwgError::MalformedObject` when a record's handle is
+    ///   absent from the map (the map is the canonical lookup
+    ///   side; a missing entry indicates a corrupted handles
+    ///   section).
+    /// - `DwgError::MalformedObject` when the map contains a
+    ///   handle that no record claims (orphaned map entry).
+    pub fn validate_against_records(
+        &self,
+        records: &[crate::dwg::file::r2000_layout::R2000Object],
+    ) -> DwgResult<()> {
+        let map_handles: BTreeSet<u64> = self.entries.iter().map(|e| e.handle).collect();
+        let record_handles: BTreeSet<u64> = records.iter().map(|r| r.record_handle.value).collect();
+        for record in records {
+            if !map_handles.contains(&record.record_handle.value) {
+                return Err(DwgError::MalformedObject {
+                    class: "ObjectMap".into(),
+                    offset: 0,
+                    message: format!(
+                        "record handle {:#x} is missing from the object map (map has \
+                         {} entries; expected every record handle to appear)",
+                        record.record_handle.value,
+                        self.entries.len()
+                    ),
+                });
+            }
+        }
+        for entry in &self.entries {
+            if !record_handles.contains(&entry.handle) {
+                return Err(DwgError::MalformedObject {
+                    class: "ObjectMap".into(),
+                    offset: entry.file_offset,
+                    message: format!(
+                        "object map entry references handle {:#x} but no record \
+                         with that handle was recovered from the OBJECTS payload",
+                        entry.handle
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 }
 
