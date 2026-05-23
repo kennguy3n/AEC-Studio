@@ -16,6 +16,9 @@
 
 pub type Sentinel = [u8; 16];
 
+/// Width of one R11/R12 sentinel in bytes.
+pub const SENTINEL_LEN: usize = 16;
+
 /// Entities region: top-level model-space + paper-space entities.
 pub const ENTITIES_BEGIN: Sentinel = [
     0xC4, 0x6E, 0x68, 0x54, 0xF8, 0x6E, 0x33, 0x30, 0x63, 0x3E, 0xC1, 0x85, 0x2A, 0xDC, 0x94, 0x01,

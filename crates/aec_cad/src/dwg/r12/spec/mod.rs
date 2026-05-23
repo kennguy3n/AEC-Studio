@@ -14,6 +14,7 @@
 //! * `src/encode.c` lines 2956-3187 — PRE(R_13b1) emit order
 //! * `src/decode_r11.c` — the matching decoder
 
+pub mod assemble;
 pub mod file_header;
 pub mod header_vars;
 pub mod section_table;

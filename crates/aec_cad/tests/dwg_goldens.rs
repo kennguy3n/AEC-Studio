@@ -62,8 +62,8 @@ struct Golden {
 fn golden(v: DwgVersion) -> Golden {
     match v {
         DwgVersion::R12 => Golden {
-            bytes: 1118,
-            blake3_hex: "e1fdf01aacf6f818b5747e77b0c5df930534e2d72e29244459e2d4d70661ebb5",
+            bytes: 2371,
+            blake3_hex: "d9d5f8053b2e4e020d0d178baf62d9969b0fdffe469c38642ee9f7042f32948f",
         },
         DwgVersion::R14 => Golden {
             bytes: 483,
