@@ -337,11 +337,36 @@ jobs:
             path=/tmp/dwg_oracle/$v.dwg
             echo "::group::dwgread $v"
             log=$(mktemp)
-            if dwgread -O DXF -o /tmp/dwg_oracle/$v.dxf "$path" >"$log" 2>&1; then
-              ec=0
-            else
-              ec=$?
-            fi
+            # Verbose level matters. `dwgread -O DXF -o file.dxf` at
+            # default verbose suppresses all `Warning:` lines (only
+            # `SUCCESS` / `ERROR:` reach stderr) — which would make
+            # the allow-list filter below a vacuous no-op. `-v1`
+            # surfaces post-decode warnings (Object handle not found,
+            # CRC mismatch, etc.) so the allow-list actually
+            # exercises and catches regressions. R2007 is the one
+            # exception: at `-v1` it surfaces R2007's known-empty
+            # `BLOCK_CONTROL missing` ERROR, which is real (the
+            # empty-doc fixture from PR-F1 doesn't ship a
+            # BLOCK_CONTROL chain). Until PR-H1 lands R2007 entity
+            # round-trip + BLOCK_CONTROL, R2007 must stay at default
+            # verbose where dwgread reads the file cleanly. Drop this
+            # special case in PR-H1 when R2007 becomes -v1-clean.
+            case "$v" in
+              r2007)
+                if dwgread -O DXF -o /tmp/dwg_oracle/$v.dxf "$path" >"$log" 2>&1; then
+                  ec=0
+                else
+                  ec=$?
+                fi
+                ;;
+              *)
+                if dwgread -v1 -O DXF -o /tmp/dwg_oracle/$v.dxf "$path" >"$log" 2>&1; then
+                  ec=0
+                else
+                  ec=$?
+                fi
+                ;;
+            esac
             cat "$log"
             # Filter `Warning:` lines through the allow-list (R2004+
             # versions only); everything else must stay warning-free.
