@@ -21,9 +21,24 @@ pub use header_codec::{CommonHeaderData, EntityMode, LinetypeFlag};
 pub use record::{BitBuf, ObjectHandles, ObjectRecord};
 
 /// Numeric object type tag stored inside every entity's bit stream.
-/// These IDs are AutoCAD's `OBJECT_TYPE` enum (see OpenDesign spec
-/// § "Object type values").  We list the ones we encode/decode; other
-/// types are tolerated opaquely on read and dropped on write.
+/// These IDs are AutoCAD's `OBJECT_TYPE` enum. We list the ones we
+/// encode/decode; other types are tolerated opaquely on read and
+/// dropped on write.
+///
+/// Variant names follow LibreDWG's `dwg.h` enum (which is also the
+/// upstream convention every modern DWG tool uses today) rather than
+/// the older OpenDesign spec terminology. The two diverge on the VX
+/// pair:
+///
+///   * `0x46` is the CONTROL object (`DWG_TYPE_VX_CONTROL`); the
+///     OpenDesign spec called it `VPORT_ENT_HEADER_CTRL_OBJ`.
+///   * `0x47` is the TABLE RECORD (`DWG_TYPE_VX_TABLE_RECORD`); the
+///     OpenDesign spec called it `VPORT_ENT_HEADER`.
+///
+/// Earlier versions of this enum named them `VPortEntityHeader = 0x46`
+/// and `VPortEntityControl = 0x47` — the names were inverted relative
+/// to which opcode is the control vs. the record. Renamed to the
+/// LibreDWG names to remove the confusion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum ObjectType {
@@ -89,8 +104,8 @@ pub enum ObjectType {
     AppId = 0x43,
     DimStyleControl = 0x44,
     DimStyle = 0x45,
-    VPortEntityHeader = 0x46,
-    VPortEntityControl = 0x47,
+    VxControl = 0x46,
+    VxTableRecord = 0x47,
     LwPolyline = 0x4e,
     Hatch = 0x4f,
     XRecord = 0x50,
@@ -108,8 +123,8 @@ impl ObjectType {
             Line, Linetype, LinetypeControl, LwPolyline, MInsert, MLine, MText, Point, Polyline2d,
             Polyline3d, PolylineMesh, PolylinePFace, Ray, Region, SeqEnd, Shape, Solid, Spline,
             Style, StyleControl, Text, Tolerance, Trace, Ucs, UcsControl, VPort, VPortControl,
-            VPortEntityControl, VPortEntityHeader, Vertex2d, Vertex3d, VertexMesh, VertexPFace,
-            VertexPFaceFace, View, ViewControl, Viewport, XLine, XRecord,
+            Vertex2d, Vertex3d, VertexMesh, VertexPFace, VertexPFaceFace, View, ViewControl,
+            Viewport, VxControl, VxTableRecord, XLine, XRecord,
         };
         let mapped = match v {
             0x01 => Text,
@@ -174,8 +189,8 @@ impl ObjectType {
             0x43 => AppId,
             0x44 => DimStyleControl,
             0x45 => DimStyle,
-            0x46 => VPortEntityHeader,
-            0x47 => VPortEntityControl,
+            0x46 => VxControl,
+            0x47 => VxTableRecord,
             0x4e => LwPolyline,
             0x4f => Hatch,
             0x50 => XRecord,
@@ -267,8 +282,8 @@ impl ObjectType {
             | ObjectType::AppId
             | ObjectType::DimStyleControl
             | ObjectType::DimStyle
-            | ObjectType::VPortEntityHeader
-            | ObjectType::VPortEntityControl
+            | ObjectType::VxControl
+            | ObjectType::VxTableRecord
             | ObjectType::XRecord => false,
         }
     }
@@ -292,6 +307,12 @@ mod tests {
             ObjectType::BlockHeader,
             ObjectType::Spline,
             ObjectType::Ellipse,
+            // VX pair — included explicitly because of the previous
+            // name/value inversion history (see the enum's top-level
+            // doc comment). Round-trip alone would catch a value
+            // swap; the explicit pin test below catches a name swap.
+            ObjectType::VxControl,
+            ObjectType::VxTableRecord,
         ] {
             let raw = v.as_u16();
             assert_eq!(
@@ -300,6 +321,44 @@ mod tests {
                 "round-trip failed for {v:?}"
             );
         }
+    }
+
+    /// Pin the VX-pair opcode mapping explicitly, so any future
+    /// attempt to re-invert the names against the opcodes (the
+    /// historical bug PR-H2 corrected) fails the test directly with
+    /// an actionable mismatch rather than a downstream decoder
+    /// surprise.
+    ///
+    /// `0x46` MUST be the CONTROL (`DWG_TYPE_VX_CONTROL` in LibreDWG;
+    /// `VPORT_ENT_HEADER_CTRL_OBJ` in OpenDesign).
+    /// `0x47` MUST be the TABLE RECORD (`DWG_TYPE_VX_TABLE_RECORD` in
+    /// LibreDWG; `VPORT_ENT_HEADER` in OpenDesign).
+    #[test]
+    fn vx_pair_opcodes_match_libredwg() {
+        assert_eq!(
+            ObjectType::VxControl as u16,
+            0x46,
+            "VxControl must be opcode 0x46 (DWG_TYPE_VX_CONTROL). \
+             A change here probably means the enum variant has been \
+             renamed or swapped — see the enum's top-level doc \
+             comment for the historical inversion that this test \
+             guards against."
+        );
+        assert_eq!(
+            ObjectType::VxTableRecord as u16,
+            0x47,
+            "VxTableRecord must be opcode 0x47 \
+             (DWG_TYPE_VX_TABLE_RECORD). A change here probably \
+             means the enum variant has been renamed or swapped — \
+             see the enum's top-level doc comment for the historical \
+             inversion that this test guards against."
+        );
+        // Belt-and-suspenders: decode side must agree with encode
+        // side. Already covered by the round-trip test, but if a
+        // future change inverts only one direction of the mapping
+        // this catches it independently of the assertion above.
+        assert_eq!(ObjectType::from_u16(0x46), Some(ObjectType::VxControl));
+        assert_eq!(ObjectType::from_u16(0x47), Some(ObjectType::VxTableRecord));
     }
 
     #[test]
