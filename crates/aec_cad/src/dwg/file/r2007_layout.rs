@@ -1389,11 +1389,15 @@ pub fn parse_r2007(bytes: &[u8], version: Version) -> DwgResult<R2007File> {
             });
         }
         let raw_bytes = objects_payload[cursor..cursor + total].to_vec();
-        let map_handle = object_map
-            .entries
-            .iter()
-            .find(|e| e.handle == record_handle.value)
-            .map_or(record_handle.value, |e| e.handle);
+        // The object map lookup the bot flagged here was a no-op:
+        // `.find(|e| e.handle == record_handle.value).map_or(record_handle.value, |e| e.handle)`
+        // returns `record_handle.value` on both branches (the predicate
+        // forces `e.handle == record_handle.value`). The object map's
+        // role is to validate handle presence + recover the per-record
+        // offset within the section, not to relabel handles. Drop the
+        // O(n) scan; keep `map_handle` semantically named for the
+        // downstream consumer.
+        let map_handle = record_handle.value;
         objects.push(R2000Object {
             map_handle,
             object_type,
