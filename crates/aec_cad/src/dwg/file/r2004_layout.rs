@@ -83,7 +83,10 @@ use crate::dwg::file::aux_sections::{
 use crate::dwg::file::classes::ClassesSection;
 use crate::dwg::file::header::FileHeader;
 use crate::dwg::file::header_vars::HeaderVarsSection;
-use crate::dwg::file::object_map::{ObjectMap, ObjectMapEntry};
+use crate::dwg::file::object_map::ObjectMap;
+use crate::dwg::file::objects_section::{
+    build_handle_object_map, encode_objects_payload, recover_objects_sequential,
+};
 use crate::dwg::file::r2000_layout::R2000Object;
 use crate::dwg::file::system_section::{
     decode_section_info, encode_page_map, encode_section_info, read_data_page, read_system_page,
@@ -236,21 +239,12 @@ pub fn assemble_r2004(parts: R2004FileParts) -> DwgResult<Vec<u8>> {
         .classes
         .encode_with_maint(&mut classes_bytes, parts.version.maintenance_release())?;
 
-    // OBJECTS section: concatenated wire bytes, with per-record offsets
-    // tracked so the object map can address each one.
-    let mut objects_bytes = Vec::new();
-    let mut record_section_offsets: Vec<u64> = Vec::with_capacity(parts.objects.len());
-    for record in &parts.objects {
-        record_section_offsets.push(objects_bytes.len() as u64);
-        let wire = record.encode(parts.version)?;
-        objects_bytes.extend_from_slice(&wire);
-    }
-
-    // OBJECT_MAP: sort by handle for canonical layout (matches the
-    // R2000 layout's policy). We don't know the absolute file offsets
-    // yet — they'll be patched after the data pages are laid out.
-    let mut sorted_indices: Vec<usize> = (0..parts.objects.len()).collect();
-    sorted_indices.sort_by_key(|&i| parts.objects[i].handle.value);
+    // OBJECTS section: concatenated wire bytes, with per-record
+    // offsets tracked so the object map can address each one.
+    // Shared with R2000/R2007 assemblers (see
+    // `crate::dwg::file::objects_section`).
+    let (objects_bytes, record_section_offsets) =
+        encode_objects_payload(&parts.objects, parts.version)?;
 
     // 2. Wrap each section in a data page (32-byte encrypted page
     //    header + raw payload) and track the (page_id, page_size,
@@ -348,13 +342,12 @@ pub fn assemble_r2004(parts: R2004FileParts) -> DwgResult<Vec<u8>> {
     // `dwgread`.)
     let _ = objects_page_offset; // intentionally unused; see comment above
     let _ = SYSTEM_PAGE_HEADER_SIZE;
-    let mut object_map = ObjectMap::new();
-    for &i in &sorted_indices {
-        object_map.entries.push(ObjectMapEntry {
-            handle: parts.objects[i].handle.value,
-            file_offset: record_section_offsets[i],
-        });
-    }
+    // `offset_base = 0`: R2004+ object-map entries are section-
+    // relative (the OBJECTS section is LZ77-compressed inside a
+    // system page so file-absolute offsets would point into
+    // compressed bytes). The parser (`recover_objects_sequential`)
+    // walks the decompressed buffer from index 0.
+    let object_map = build_handle_object_map(&parts.objects, &record_section_offsets, 0)?;
     let mut object_map_bytes = Vec::new();
     object_map.encode(&mut object_map_bytes)?;
     push_data_page(
@@ -999,60 +992,24 @@ pub fn parse_r2004(bytes: &[u8]) -> DwgResult<R2004File> {
         message: "no AcDb:Handles section descriptor".into(),
     })?;
 
-    // 5. Decode object map from the handles payload.
+    // 5. Decode the object map from the handles payload.
     let object_map = ObjectMap::parse(&handles_payload)?;
 
     // 6. Recover each object record from the objects payload. The
-    //    payload is a flat concatenation of ObjectRecord wire bytes; we
-    //    peek each one structurally and store the raw bytes for later
-    //    per-type decoding (same pattern as parse_r2000).
+    //    payload is a flat concatenation of ObjectRecord wire bytes;
+    //    we peek each one structurally and store the raw bytes for
+    //    later per-type decoding (same pattern as parse_r2007 and
+    //    parse_r2000 — see `crate::dwg::file::objects_section`).
     //
-    //    The object map's per-entry file_offset is an absolute file
-    //    offset in the original file (pointing into the data page),
-    //    but our objects_payload is the decompressed concatenation
-    //    starting at logical offset 0. We reconstruct the logical
-    //    offsets by walking the entries in handle order: the OBJECTS
-    //    section's records were laid out in entity-iteration order
-    //    during assembly, and the object map was sorted by handle —
-    //    so we sort the map back to the original order using a
-    //    minimum-heap on logical offset.
-    //
-    //    For round-trip we walk the objects_payload buffer sequentially
-    //    and assign records to handles by their position. The object
-    //    map then validates that each handle is present.
-    let mut objects = Vec::with_capacity(object_map.entries.len());
-    let mut cursor = 0usize;
-    let mut record_index = 0usize;
-    while cursor < objects_payload.len() {
-        let (object_type, record_handle, common, total) =
-            ObjectRecord::peek_header(version, &objects_payload[cursor..])?;
-        if cursor + total > objects_payload.len() {
-            return Err(DwgError::UnexpectedEof {
-                byte: cursor + total,
-                bit: 0,
-            });
-        }
-        let raw_bytes = objects_payload[cursor..cursor + total].to_vec();
-        // The object map lookup the bot flagged here was a no-op:
-        // `.find(|e| e.handle == record_handle.value).map_or(record_handle.value, |e| e.handle)`
-        // returns `record_handle.value` on both branches (the predicate
-        // forces `e.handle == record_handle.value`). The object map's
-        // role is to validate handle presence + recover the per-record
-        // offset within the section, not to relabel handles. Drop the
-        // O(n) scan; keep `map_handle` semantically named for the
-        // downstream consumer.
-        let map_handle = record_handle.value;
-        objects.push(R2000Object {
-            map_handle,
-            object_type,
-            record_handle,
-            common,
-            raw_bytes,
-        });
-        cursor += total;
-        record_index += 1;
-    }
-    let _ = record_index;
+    //    The object map carries section-relative offsets that index
+    //    into this same decompressed buffer. We rely on the
+    //    sequential walk for record recovery and then cross-validate
+    //    the resulting record set against the map
+    //    (`validate_against_records`) so a corrupted handles page
+    //    — missing or orphaned entries — is rejected up-front
+    //    rather than discovered later in `dwg_resolve_handle`.
+    let objects = recover_objects_sequential(&objects_payload, version, object_map.entries.len())?;
+    object_map.validate_against_records(&objects)?;
 
     Ok(R2004File {
         version,

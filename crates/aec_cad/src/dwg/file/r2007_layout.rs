@@ -70,7 +70,10 @@ use crate::dwg::file::aux_sections::{AuxHeaderSection, TemplateSection};
 use crate::dwg::file::classes::ClassesSection;
 use crate::dwg::file::header::FileHeader;
 use crate::dwg::file::header_vars::HeaderVarsSection;
-use crate::dwg::file::object_map::{ObjectMap, ObjectMapEntry};
+use crate::dwg::file::object_map::ObjectMap;
+use crate::dwg::file::objects_section::{
+    build_handle_object_map, encode_objects_payload, recover_objects_sequential,
+};
 use crate::dwg::file::r2000_layout::R2000Object;
 use crate::dwg::file::r2007_header::{
     decode_file_header_on_disk, encode_file_header_on_disk, R2007FileHeader, R2007_HEADER_OFFSET,
@@ -432,6 +435,49 @@ pub(crate) fn decode_data_page(page_bytes: &[u8], uncomp_size: usize) -> DwgResu
     Ok(page_bytes[..uncomp_size].to_vec())
 }
 
+/// Bookkeeping for one R2007 data page emitted by [`assemble_r2007`].
+///
+/// Tracked separately from `R2007DataPageOnDisk` so the section
+/// emission loop can pair the canonical section name with the
+/// page-id allocation and on-disk bytes — the sections-map
+/// descriptor builder downstream looks each page up by
+/// `section_name`.
+struct EmittedDataPage {
+    page_id: i64,
+    page: R2007DataPageOnDisk,
+    section_name: &'static str,
+}
+
+/// Encode `payload` as an R2007 data page, append its on-disk
+/// bytes to `out`, allocate the next page id, and record the page
+/// in `data_pages` under `section_name`.
+///
+/// Centralises the per-section bookkeeping that previously lived
+/// inline at six near-identical call sites in [`assemble_r2007`].
+/// Mechanically guarantees the `data_pages.push(...)` step happens
+/// — the previous open-coded form let a future contributor add a
+/// new section's `encode_data_page` + `out.extend_from_slice`
+/// without remembering the bookkeeping push, which would surface
+/// only at LibreDWG's `Invalid num_pages 0, skip` error during
+/// CI's oracle stage.
+fn emit_section_page(
+    section_name: &'static str,
+    payload: &[u8],
+    out: &mut Vec<u8>,
+    data_pages: &mut Vec<EmittedDataPage>,
+    next_page_id: &mut i64,
+) {
+    let page = encode_data_page(payload);
+    let page_id = *next_page_id;
+    *next_page_id += 1;
+    out.extend_from_slice(&page.on_disk);
+    data_pages.push(EmittedDataPage {
+        page_id,
+        page,
+        section_name,
+    });
+}
+
 /// Convert an ASCII section name into UTF-16LE bytes. R2007
 /// sections-map names are stored as wide chars with no BOM, in
 /// little-endian byte order. Names are always ASCII-safe in the
@@ -711,25 +757,36 @@ pub fn assemble_r2007(parts: R2007FileParts) -> DwgResult<Vec<u8>> {
     //    reusing the R2004+ encoders is mechanically correct (see
     //    LibreDWG `encode_r2007.c:write_R2007_section_*` which all
     //    delegate to the same `encode_R2004_section_*` body builders).
-    struct EmittedDataPage {
-        page_id: i64,
-        page: R2007DataPageOnDisk,
-        section_name: &'static str,
-    }
     let mut data_pages: Vec<EmittedDataPage> = Vec::new();
     let mut next_page_id: i64 = 2; // 1 is reserved for the sections-map.
 
+    // PHASE 4 — OBJECTS section: concatenated wire bytes of every
+    // `ObjectRecord`, with per-record section-relative offsets
+    // captured for the handles object map. Shared with R2000/R2004
+    // (see `crate::dwg::file::objects_section::encode_objects_payload`);
+    // R2007's per-page packaging differs from R2004's compressed page
+    // stream but the in-section byte layout is identical (LibreDWG
+    // `read_2007_section_objects` and `read_2004_section_objects`
+    // share the same per-record decoder).
+    let (objects_payload, record_section_offsets) =
+        encode_objects_payload(&parts.objects, parts.version)?;
+
+    // Build the handles payload from the per-record offsets. LibreDWG's
+    // `read_2007_section_handles` walks the same MC-delta encoded
+    // (handle, offset) pairs the R2004+ path uses; `ObjectMap::encode`
+    // is version-agnostic. For an empty document this produces the
+    // canonical 4-byte terminator page `[0x00, 0x02, 0x90, 0x01]` —
+    // size=2 big-endian + CRC=0x9001 over those two bytes (X.25 init
+    // 0xc0c1). For a non-empty document we sort entries by handle and
+    // emit a real lookup table. `offset_base = 0` because R2004/R2007
+    // object-map offsets are section-relative (the parser walks the
+    // decompressed buffer from index 0, not a file-absolute offset).
+    let object_map = build_handle_object_map(&parts.objects, &record_section_offsets, 0)?;
+    let mut handles_payload = Vec::new();
+    object_map.encode(&mut handles_payload)?;
+
     let mut header_payload = Vec::new();
     parts.header_vars.encode(&mut header_payload);
-    let header_page = encode_data_page(&header_payload);
-    let header_page_id = next_page_id;
-    next_page_id += 1;
-    out.extend_from_slice(&header_page.on_disk);
-    data_pages.push(EmittedDataPage {
-        page_id: header_page_id,
-        page: header_page,
-        section_name: "AcDb:Header",
-    });
 
     // Real AuxHeader payload: LibreDWG's `read_2007_section_auxheader`
     // first reads a 3-byte `aux_intro` vector (RC × 3) — the
@@ -739,15 +796,6 @@ pub fn assemble_r2007(parts: R2007FileParts) -> DwgResult<Vec<u8>> {
     // emits the canonical `[0xff, 0x77, 0x01]` prefix followed by the
     // version-gated DWG/maint/numsaves/time fields per auxheader.spec.
     let auxheader_payload = AuxHeaderSection::fresh_for(parts.version).encode(parts.version)?;
-    let auxheader_page = encode_data_page(&auxheader_payload);
-    let auxheader_page_id = next_page_id;
-    next_page_id += 1;
-    out.extend_from_slice(&auxheader_page.on_disk);
-    data_pages.push(EmittedDataPage {
-        page_id: auxheader_page_id,
-        page: auxheader_page,
-        section_name: "AcDb:AuxHeader",
-    });
 
     // Real Classes payload: `ClassesSection::empty(version)` produces
     // a section with one synthetic AcDbPlaceHolder record at
@@ -761,94 +809,45 @@ pub fn assemble_r2007(parts: R2007FileParts) -> DwgResult<Vec<u8>> {
     parts
         .classes
         .encode_with_maint(&mut classes_payload, parts.version.maintenance_release())?;
-    let classes_page = encode_data_page(&classes_payload);
-    let classes_page_id = next_page_id;
-    next_page_id += 1;
-    out.extend_from_slice(&classes_page.on_disk);
-    data_pages.push(EmittedDataPage {
-        page_id: classes_page_id,
-        page: classes_page,
-        section_name: "AcDb:Classes",
-    });
-
-    // PHASE 4 — OBJECTS section: concatenated wire bytes of every
-    // `ObjectRecord`, with per-record offsets captured for the
-    // handles object map. This mirrors `assemble_r2004` PHASE 4 (see
-    // `r2004_layout.rs:241`); R2007's per-page packaging differs from
-    // R2004's compressed page stream but the in-section byte layout
-    // is identical (LibreDWG `read_2007_section_objects` and
-    // `read_2004_section_objects` share the same per-record decoder).
-    let mut objects_payload: Vec<u8> = Vec::new();
-    let mut record_section_offsets: Vec<u64> = Vec::with_capacity(parts.objects.len());
-    for record in &parts.objects {
-        record_section_offsets.push(objects_payload.len() as u64);
-        let wire = record.encode(parts.version)?;
-        objects_payload.extend_from_slice(&wire);
-    }
-
-    // Real Handles payload: an `ObjectMap` populated with one entry
-    // per emitted record at its in-section offset. LibreDWG's
-    // `read_2007_section_handles` walks the same MC-delta encoded
-    // (handle, offset) pairs the R2004+ path uses; `ObjectMap::encode`
-    // is version-agnostic. For an empty document this produces the
-    // canonical 4-byte terminator page `[0x00, 0x02, 0x90, 0x01]` —
-    // size=2 big-endian + CRC=0x9001 over those two bytes (X.25 init
-    // 0xc0c1). For a non-empty document we sort entries by handle and
-    // emit a real lookup table.
-    let mut object_map = ObjectMap::new();
-    let mut sorted_indices: Vec<usize> = (0..parts.objects.len()).collect();
-    sorted_indices.sort_by_key(|&i| parts.objects[i].handle.value);
-    for &i in &sorted_indices {
-        object_map.entries.push(ObjectMapEntry {
-            handle: parts.objects[i].handle.value,
-            file_offset: record_section_offsets[i],
-        });
-    }
-    let mut handles_payload = Vec::new();
-    object_map.encode(&mut handles_payload)?;
-    let handles_page = encode_data_page(&handles_payload);
-    let handles_page_id = next_page_id;
-    next_page_id += 1;
-    out.extend_from_slice(&handles_page.on_disk);
-    data_pages.push(EmittedDataPage {
-        page_id: handles_page_id,
-        page: handles_page,
-        section_name: "AcDb:Handles",
-    });
 
     // AcDb:Template — encode via `TemplateSection::default()` (empty
     // description + MEASUREMENT=0) to stay symmetric with the R2004
     // path and reuse the shared encoder. The version-aware encoder
     // emits a 4-byte payload for R2007 (RS u16 length=0 + RS u16
-    // measurement=0) — same wire shape as the previous hardcoded
-    // `[0x00, 0x00, 0x00, 0x00]` constant, only now structurally
-    // derived rather than pinned.
+    // measurement=0).
     let template_payload = TemplateSection::default().encode(parts.version)?;
-    let template_page = encode_data_page(&template_payload);
-    let template_page_id = next_page_id;
-    next_page_id += 1;
-    out.extend_from_slice(&template_page.on_disk);
-    data_pages.push(EmittedDataPage {
-        page_id: template_page_id,
-        page: template_page,
-        section_name: "AcDb:Template",
-    });
 
-    // AcDb:AcDbObjects payload — already built above (PHASE 4) into
-    // `objects_payload`. For an empty document it stays a 0-byte
-    // buffer (matches the R2004+ empty-doc convention from PR-D where
-    // `assemble_r2004` also emits a 0-byte `objects_bytes` and
-    // LibreDWG's `read_2007_section_objects` runs zero iterations of
-    // the entry walk).
-    let objects_page = encode_data_page(&objects_payload);
-    let objects_page_id = next_page_id;
-    next_page_id += 1;
-    out.extend_from_slice(&objects_page.on_disk);
-    data_pages.push(EmittedDataPage {
-        page_id: objects_page_id,
-        page: objects_page,
-        section_name: "AcDb:AcDbObjects",
-    });
+    // Emit each mandatory section as a single data page in the
+    // canonical `MANDATORY_R2007_SECTION_NAMES` order. The shared
+    // `emit_section_page` helper enforces the per-section bookkeeping
+    // (page-id allocation, on-disk write, `data_pages` tracking) so
+    // adding a new section name above is a one-liner here rather than
+    // a 6-line copy-paste — and forgetting to push to `data_pages`
+    // is impossible by construction.
+    //
+    // The on-disk page order ends up matching the iteration order of
+    // `MANDATORY_R2007_SECTION_NAMES`: Header → AuxHeader → Classes
+    // → Handles → Template → AcDbObjects. The pages-map records the
+    // same order (step 7 below), and LibreDWG resolves sections by
+    // hashcode rather than by position so any disk order would
+    // work — we just pin the canonical one for golden stability.
+    let section_payloads: [(&str, &[u8]); 6] = [
+        ("AcDb:Header", &header_payload),
+        ("AcDb:AuxHeader", &auxheader_payload),
+        ("AcDb:Classes", &classes_payload),
+        ("AcDb:Handles", &handles_payload),
+        ("AcDb:Template", &template_payload),
+        ("AcDb:AcDbObjects", &objects_payload),
+    ];
+    for (section_name, payload) in section_payloads {
+        emit_section_page(
+            section_name,
+            payload,
+            &mut out,
+            &mut data_pages,
+            &mut next_page_id,
+        );
+    }
 
     // 4. Build sections-map descriptors. Each mandatory section now
     //    has exactly one data page; the lookup-by-name in `data_pages`
@@ -1369,43 +1368,20 @@ pub fn parse_r2007(bytes: &[u8], version: Version) -> DwgResult<R2007File> {
         message: "parse_r2007: no AcDb:Handles section descriptor".into(),
     })?;
 
-    // 7. Decode object map from the handles payload.
+    // 7. Decode the object map from the handles payload.
     let object_map = ObjectMap::parse(&handles_payload)?;
 
-    // 8. Recover each object record from the objects payload. The
-    //    payload is a flat concatenation of ObjectRecord wire bytes;
-    //    we peek each one structurally and store the raw bytes for
-    //    later per-type decoding (same pattern as parse_r2004).
-    let mut objects = Vec::with_capacity(object_map.entries.len());
-    let mut cursor = 0usize;
-    while cursor < objects_payload.len() {
-        let (object_type, record_handle, common, total) =
-            ObjectRecord::peek_header(version, &objects_payload[cursor..])?;
-        if cursor + total > objects_payload.len() {
-            return Err(DwgError::UnexpectedEof {
-                byte: cursor + total,
-                bit: 0,
-            });
-        }
-        let raw_bytes = objects_payload[cursor..cursor + total].to_vec();
-        // The object map lookup the bot flagged here was a no-op:
-        // `.find(|e| e.handle == record_handle.value).map_or(record_handle.value, |e| e.handle)`
-        // returns `record_handle.value` on both branches (the predicate
-        // forces `e.handle == record_handle.value`). The object map's
-        // role is to validate handle presence + recover the per-record
-        // offset within the section, not to relabel handles. Drop the
-        // O(n) scan; keep `map_handle` semantically named for the
-        // downstream consumer.
-        let map_handle = record_handle.value;
-        objects.push(R2000Object {
-            map_handle,
-            object_type,
-            record_handle,
-            common,
-            raw_bytes,
-        });
-        cursor += total;
-    }
+    // 8. Recover each object record from the objects payload.
+    //    Shared with `parse_r2004` (see
+    //    `crate::dwg::file::objects_section::recover_objects_sequential`):
+    //    the payload is a flat concatenation of `ObjectRecord` wire
+    //    bytes, walked structurally with per-type decode deferred to
+    //    callers via `raw_bytes`. After recovery we cross-validate
+    //    against the object map so a corrupted handles page
+    //    — missing or orphaned entries — fails up-front rather than
+    //    surfacing later in `dwg_resolve_handle`.
+    let objects = recover_objects_sequential(&objects_payload, version, object_map.entries.len())?;
+    object_map.validate_against_records(&objects)?;
 
     Ok(r2007_file_from_header(
         version,

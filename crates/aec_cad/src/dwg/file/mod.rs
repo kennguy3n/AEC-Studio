@@ -31,6 +31,7 @@ pub mod header;
 pub mod header_vars;
 pub mod header_vars_body;
 pub mod object_map;
+pub mod objects_section;
 pub mod pages;
 pub mod r2000_layout;
 pub mod r2004_layout;
