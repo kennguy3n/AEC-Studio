@@ -66,7 +66,7 @@
 use crate::dwg::bits::reed_solomon::R2007_FILE_HEADER_ON_DISK_SIZE;
 use crate::dwg::entities::record::ObjectRecord;
 use crate::dwg::error::{DwgError, DwgResult};
-use crate::dwg::file::aux_sections::AuxHeaderSection;
+use crate::dwg::file::aux_sections::{AuxHeaderSection, TemplateSection};
 use crate::dwg::file::classes::ClassesSection;
 use crate::dwg::file::header::FileHeader;
 use crate::dwg::file::header_vars::HeaderVarsSection;
@@ -463,16 +463,6 @@ pub(crate) const MANDATORY_R2007_SECTION_NAMES: &[&str] = &[
     "AcDb:AcDbObjects", // type 7
 ];
 
-/// Minimal AcDb:Template section payload that LibreDWG's
-/// `read_2007_section_template` accepts without complaint. The
-/// section content is consumed by `src/template.spec`:
-/// `FIELD_T16 (description, 0);` reads a `RS` (u16 LE) length
-/// followed by that many bytes; here we use length = 0 so no
-/// description bytes follow. Then `FIELD_RS (MEASUREMENT, 0);`
-/// reads one more `RS` (u16 LE) for the MEASUREMENT setting; we
-/// emit 0 (= English / Imperial). Total = 4 bytes.
-const TEMPLATE_MIN_PAYLOAD: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
-
 /// Build the sections-map content for an R2007 file from a list
 /// of pre-built section descriptors. Each descriptor contributes
 /// `64 + name_length + 56 * pages.len()` bytes to the output.
@@ -826,7 +816,14 @@ pub fn assemble_r2007(parts: R2007FileParts) -> DwgResult<Vec<u8>> {
         section_name: "AcDb:Handles",
     });
 
-    let template_payload = TEMPLATE_MIN_PAYLOAD.to_vec();
+    // AcDb:Template — encode via `TemplateSection::default()` (empty
+    // description + MEASUREMENT=0) to stay symmetric with the R2004
+    // path and reuse the shared encoder. The version-aware encoder
+    // emits a 4-byte payload for R2007 (RS u16 length=0 + RS u16
+    // measurement=0) — same wire shape as the previous hardcoded
+    // `[0x00, 0x00, 0x00, 0x00]` constant, only now structurally
+    // derived rather than pinned.
+    let template_payload = TemplateSection::default().encode(parts.version)?;
     let template_page = encode_data_page(&template_payload);
     let template_page_id = next_page_id;
     next_page_id += 1;
@@ -1333,13 +1330,15 @@ pub fn parse_r2007(bytes: &[u8], version: Version) -> DwgResult<R2007File> {
                 let _ = AuxHeaderSection::parse(version, &combined)?;
             }
             "AcDb:Template" => {
-                // Template content (description + MEASUREMENT) is
-                // structural-only for our writer; the canonical
-                // 4-byte minimal payload is invariant for fresh
-                // saves so we don't need its decoded form. Skip the
-                // round-trip parse here - R2007's
-                // `read_2007_section_template` body decoder differs
-                // from R2010+'s and isn't exposed by `TemplateSection`.
+                // Round-trip validation only — the decoded form
+                // (description + MEASUREMENT) is invariant for the
+                // documents we emit today, but parsing still runs so
+                // we catch wire-format regressions. Mirrors the R2004
+                // path (`r2004_layout.rs::parse_r2004` SECTION_NAME_TEMPLATE
+                // branch). `TemplateSection::parse` dispatches on
+                // `version.uses_utf16_strings()` so it handles R2007
+                // and R2010+ uniformly.
+                let _ = TemplateSection::parse(version, &combined)?;
             }
             _ => {
                 // Other optional section (preview, summary, etc.) -
