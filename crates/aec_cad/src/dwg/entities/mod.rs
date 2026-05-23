@@ -307,6 +307,12 @@ mod tests {
             ObjectType::BlockHeader,
             ObjectType::Spline,
             ObjectType::Ellipse,
+            // VX pair — included explicitly because of the previous
+            // name/value inversion history (see the enum's top-level
+            // doc comment). Round-trip alone would catch a value
+            // swap; the explicit pin test below catches a name swap.
+            ObjectType::VxControl,
+            ObjectType::VxTableRecord,
         ] {
             let raw = v.as_u16();
             assert_eq!(
@@ -315,6 +321,44 @@ mod tests {
                 "round-trip failed for {v:?}"
             );
         }
+    }
+
+    /// Pin the VX-pair opcode mapping explicitly, so any future
+    /// attempt to re-invert the names against the opcodes (the
+    /// historical bug PR-H2 corrected) fails the test directly with
+    /// an actionable mismatch rather than a downstream decoder
+    /// surprise.
+    ///
+    /// `0x46` MUST be the CONTROL (`DWG_TYPE_VX_CONTROL` in LibreDWG;
+    /// `VPORT_ENT_HEADER_CTRL_OBJ` in OpenDesign).
+    /// `0x47` MUST be the TABLE RECORD (`DWG_TYPE_VX_TABLE_RECORD` in
+    /// LibreDWG; `VPORT_ENT_HEADER` in OpenDesign).
+    #[test]
+    fn vx_pair_opcodes_match_libredwg() {
+        assert_eq!(
+            ObjectType::VxControl as u16,
+            0x46,
+            "VxControl must be opcode 0x46 (DWG_TYPE_VX_CONTROL). \
+             A change here probably means the enum variant has been \
+             renamed or swapped — see the enum's top-level doc \
+             comment for the historical inversion that this test \
+             guards against."
+        );
+        assert_eq!(
+            ObjectType::VxTableRecord as u16,
+            0x47,
+            "VxTableRecord must be opcode 0x47 \
+             (DWG_TYPE_VX_TABLE_RECORD). A change here probably \
+             means the enum variant has been renamed or swapped — \
+             see the enum's top-level doc comment for the historical \
+             inversion that this test guards against."
+        );
+        // Belt-and-suspenders: decode side must agree with encode
+        // side. Already covered by the round-trip test, but if a
+        // future change inverts only one direction of the mapping
+        // this catches it independently of the assertion above.
+        assert_eq!(ObjectType::from_u16(0x46), Some(ObjectType::VxControl));
+        assert_eq!(ObjectType::from_u16(0x47), Some(ObjectType::VxTableRecord));
     }
 
     #[test]
