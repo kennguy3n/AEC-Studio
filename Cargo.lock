@@ -54,6 +54,7 @@ dependencies = [
  "aec_core",
  "blake3",
  "chrono",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

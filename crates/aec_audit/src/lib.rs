@@ -9,6 +9,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -22,6 +23,8 @@ pub enum AuditError {
     Io(#[from] std::io::Error),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("sqlite: {0}")]
+    Sqlite(#[from] rusqlite::Error),
     #[error("audit chain mismatch at line {line}: expected prev_hash {expected}, found {found}")]
     ChainMismatch {
         line: usize,
@@ -92,6 +95,42 @@ impl AuditLog {
 
     pub fn entries(&self) -> &[AuditEntry] {
         &self.entries
+    }
+
+    /// Mirror the in-memory chain into the v2 `audit_chain` SQL table.
+    /// Existing rows (matched by the `UNIQUE(hash)` column) are skipped
+    /// via `ON CONFLICT(hash) DO NOTHING`, so callers can run this on
+    /// every `append` without worrying about double-insert errors.
+    ///
+    /// Returns the number of newly-inserted rows. A return value of `0`
+    /// means the SQL mirror is already up-to-date with the JSONL log.
+    /// All inserts share a single transaction so a mid-walk failure
+    /// leaves the SQL table untouched.
+    pub fn mirror_to_sql(&self, conn: &mut Connection) -> AuditResult<usize> {
+        let tx = conn.transaction()?;
+        let mut inserted = 0;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO audit_chain (ts, actor, scope, tool, payload_hash, prev_hash, hash) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                 ON CONFLICT(hash) DO NOTHING",
+            )?;
+            for entry in &self.entries {
+                let actor_json = serde_json::to_string(&entry.actor)?;
+                let n = stmt.execute(params![
+                    entry.ts.to_rfc3339(),
+                    actor_json,
+                    entry.scope.as_str(),
+                    entry.tool,
+                    entry.payload_hash,
+                    entry.prev_hash,
+                    entry.hash,
+                ])?;
+                inserted += n;
+            }
+        }
+        tx.commit()?;
+        Ok(inserted)
     }
 
     /// Append a new entry. The hash is computed as
@@ -177,6 +216,80 @@ mod tests {
         assert_eq!(reopened.entries().len(), 2);
         assert_eq!(reopened.entries()[0].hash, h1);
         assert_eq!(reopened.entries()[1].prev_hash, h1);
+    }
+
+    #[test]
+    fn mirror_to_sql_inserts_each_entry_once_and_is_idempotent() {
+        use aec_core::db::open_encrypted;
+        use aec_core::crypto::{derive_project_key, generate_project_nonce};
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("audit.jsonl");
+        let db_path = dir.path().join("project.sqlite");
+        let master = [11u8; 32];
+        let nonce = generate_project_nonce().unwrap();
+        let key = derive_project_key(&master, &nonce);
+        let mut conn = open_encrypted(&db_path, &key).unwrap();
+
+        let mut log = AuditLog::open(&log_path).unwrap();
+        for (scope, tool, payload) in [
+            (Scope::Design, "design.create_wall", serde_json::json!({"x": 1})),
+            (Scope::Design, "design.paint_material", serde_json::json!({"mat": "oak"})),
+            (Scope::Render, "render.queue", serde_json::json!({"job": 7})),
+        ] {
+            log.append(CommandId::new(), scope, Actor::user(), tool, &payload)
+                .unwrap();
+        }
+
+        // First mirror: all 3 entries land.
+        let n = log.mirror_to_sql(&mut conn).unwrap();
+        assert_eq!(n, 3);
+        // Second mirror with no new entries: zero inserts.
+        let n2 = log.mirror_to_sql(&mut conn).unwrap();
+        assert_eq!(n2, 0);
+
+        // Counts match by scope.
+        let render_n: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM audit_chain WHERE scope = 'render'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(render_n, 1);
+        let design_n: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM audit_chain WHERE scope = 'design'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(design_n, 2);
+        // Head hash is the last-inserted row's `hash`.
+        let head_in_sql: String = conn
+            .query_row(
+                "SELECT hash FROM audit_chain ORDER BY seq DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(head_in_sql, log.head());
+
+        // Append one more entry; subsequent mirror inserts only the new row.
+        log.append(
+            CommandId::new(),
+            Scope::Deliver,
+            Actor::user(),
+            "deliver.export_pack",
+            &serde_json::json!({"format": "zip"}),
+        )
+        .unwrap();
+        let n3 = log.mirror_to_sql(&mut conn).unwrap();
+        assert_eq!(n3, 1);
+        let total: i64 = conn
+            .query_row("SELECT count(*) FROM audit_chain", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 4);
     }
 
     #[test]

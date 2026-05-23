@@ -23,7 +23,8 @@
 //! - `ts TEXT NOT NULL` — ISO-8601 (matches `AuditEntry.ts`).
 //! - `actor TEXT NOT NULL` — `Actor` serialised via serde (matches
 //!   `AuditEntry.actor`).
-//! - `scope TEXT NOT NULL` — `Scope::display_name()`.
+//! - `scope TEXT NOT NULL` — `Scope::as_str()` (one of
+//!   `design`/`draft`/`bim`/`render`/`deliver`).
 //! - `tool TEXT NOT NULL` — bare string; `None` becomes `""` on the
 //!   writer side so the column is `NOT NULL` and queryable.
 //! - `payload_hash TEXT NOT NULL` — 64-hex BLAKE3.
