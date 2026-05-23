@@ -24,31 +24,10 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use aec_cad::dwg::test_fixtures::oracle_fixture_doc;
 use aec_cad::dwg::version::Version;
 use aec_cad::dwg::writer::DwgWriter;
-use aec_cad::dxf::{DxfCircle, DxfDocument, DxfEntity, DxfLine, DxfText};
-
-fn fixture_doc() -> DxfDocument {
-    let mut doc = DxfDocument::new();
-    doc.push(DxfEntity::Line(DxfLine {
-        layer: "0".into(),
-        start: [0.0, 0.0, 0.0],
-        end: [100.0, 50.0, 0.0],
-    }));
-    doc.push(DxfEntity::Circle(DxfCircle {
-        layer: "0".into(),
-        center: [50.0, 25.0, 0.0],
-        radius: 12.5,
-    }));
-    doc.push(DxfEntity::Text(DxfText {
-        layer: "0".into(),
-        position: [10.0, 60.0, 0.0],
-        height: 2.5,
-        rotation: 0.0,
-        text: "AEC-Studio".into(),
-    }));
-    doc
-}
+use aec_cad::dxf::DxfDocument;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -61,7 +40,7 @@ fn main() -> ExitCode {
         eprintln!("failed to create {}: {e}", out_dir.display());
         return ExitCode::from(1);
     }
-    let doc = fixture_doc();
+    let doc = oracle_fixture_doc();
     // R2007 cannot write entities (assemble_r2007 does not emit
     // entity-bearing data pages yet -- PR-C / phase 6). The writer
     // returns Err(UnsupportedInVersion) for any R2007 doc with

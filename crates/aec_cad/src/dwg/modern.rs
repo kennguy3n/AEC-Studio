@@ -776,40 +776,52 @@ mod tests {
     /// actionable error rather than a cryptic CI "unexpected
     /// Warning" surprise.
     ///
-    /// The 3-entity geometry duplicates
-    /// `crates/aec_cad/examples/dwg_oracle_fixture.rs::fixture_doc`.
-    /// Keep both in lockstep:
-    ///   * If the fixture entity count changes, this test will fail
-    ///     here with the new expected HANDSEED value;
-    ///   * Update the fixture geometry, update
-    ///     `EXPECTED_ORACLE_FIXTURE_HANDSEED` below to match, and
-    ///     update `ALLOW_HANDSEED` in `.github/workflows/ci.yml` to
-    ///     the new `<decimal>/0x<hex>` pair.
+    /// **Pins the coupling end-to-end** by importing
+    /// `crate::dwg::test_fixtures::oracle_fixture_doc` — the same
+    /// function `crates/aec_cad/examples/dwg_oracle_fixture.rs` uses
+    /// to build the per-version .dwg files CI feeds into `dwgread`.
+    /// Any change to that function's entity count fails both
+    /// assertions below with explicit, actionable messages before it
+    /// can land in CI.
+    ///
+    /// Keep all three in lockstep:
+    ///   1. `crate::dwg::test_fixtures::oracle_fixture_doc` (geometry);
+    ///   2. `EXPECTED_ORACLE_FIXTURE_ENTITY_COUNT` and
+    ///      `EXPECTED_ORACLE_FIXTURE_HANDSEED` below (the pinned
+    ///      counts the CI gate expects);
+    ///   3. `ALLOW_HANDSEED` in `.github/workflows/ci.yml` (the
+    ///      `<decimal>/0x<hex>` pair CI's regex matches against).
     #[test]
     fn oracle_fixture_handseed_matches_ci_allow_list() {
+        use crate::dwg::test_fixtures::oracle_fixture_doc;
+
         // CI's `ALLOW_HANDSEED` regex hardcodes `36/0x24` (see
         // `.github/workflows/ci.yml::libredwg_oracle`). 0x24 == 36.
+        const EXPECTED_ORACLE_FIXTURE_ENTITY_COUNT: usize = 3;
         const EXPECTED_ORACLE_FIXTURE_HANDSEED: u64 = 0x24;
 
-        // Build the same 3-entity document the oracle fixture emits.
-        let mut doc = DxfDocument::new();
-        doc.push(DxfEntity::Line(DxfLine {
-            layer: "0".into(),
-            start: [0.0, 0.0, 0.0],
-            end: [100.0, 50.0, 0.0],
-        }));
-        doc.push(DxfEntity::Circle(DxfCircle {
-            layer: "0".into(),
-            center: [50.0, 25.0, 0.0],
-            radius: 12.5,
-        }));
-        doc.push(DxfEntity::Text(DxfText {
-            layer: "0".into(),
-            position: [10.0, 60.0, 0.0],
-            height: 2.5,
-            rotation: 0.0,
-            text: "AEC-Studio".into(),
-        }));
+        // Use the SAME function the example binary uses, not a
+        // duplicate. This is what gives the test its end-to-end
+        // pinning power — drift in `oracle_fixture_doc` shows up
+        // immediately in the entity-count assert below.
+        let doc = oracle_fixture_doc();
+
+        assert_eq!(
+            doc.entities.len(),
+            EXPECTED_ORACLE_FIXTURE_ENTITY_COUNT,
+            "Oracle-fixture entity-count drift: \
+             `crate::dwg::test_fixtures::oracle_fixture_doc` now \
+             returns {actual} entities, but CI's `ALLOW_HANDSEED` \
+             regex in `.github/workflows/ci.yml` is hardcoded to \
+             `36/0x24` (which assumes exactly 3 entities at handles \
+             0x21 / 0x22 / 0x23 → HANDSEED = 0x24). If the new \
+             entity count is intentional, update \
+             `EXPECTED_ORACLE_FIXTURE_ENTITY_COUNT` and \
+             `EXPECTED_ORACLE_FIXTURE_HANDSEED` in this test, and \
+             update `ALLOW_HANDSEED` in `.github/workflows/ci.yml` \
+             to `<decimal>/0x<hex>` matching the new HANDSEED value.",
+            actual = doc.entities.len(),
+        );
 
         // Build the user-entity records the same way `write_modern`
         // does (handles assigned sequentially from FIRST_USER_ENTITY).
@@ -826,15 +838,16 @@ mod tests {
         assert_eq!(
             hvars.handseed.value,
             EXPECTED_ORACLE_FIXTURE_HANDSEED,
-            "Oracle-fixture HANDSEED drift: computed {actual:#x} but the \
-             LibreDWG oracle's `ALLOW_HANDSEED` pattern in \
-             `.github/workflows/ci.yml` is hardcoded to \
-             `36/0x24`. If you changed the fixture entity count in \
-             `crates/aec_cad/examples/dwg_oracle_fixture.rs`, you must \
-             ALSO update `ALLOW_HANDSEED` to `<decimal>/0x<hex>` \
-             matching the new HANDSEED value, and update \
-             `EXPECTED_ORACLE_FIXTURE_HANDSEED` in this test.",
-            actual = hvars.handseed.value
+            "Oracle-fixture HANDSEED drift: computed {actual:#x} but \
+             CI's `ALLOW_HANDSEED` pattern in \
+             `.github/workflows/ci.yml` is hardcoded to `36/0x24`. \
+             This usually means the fixture entity count in \
+             `crate::dwg::test_fixtures::oracle_fixture_doc` changed \
+             but `ALLOW_HANDSEED` / \
+             `EXPECTED_ORACLE_FIXTURE_HANDSEED` weren't updated. \
+             Update both to `<decimal>/0x<hex>` matching the new \
+             HANDSEED value.",
+            actual = hvars.handseed.value,
         );
     }
 }
