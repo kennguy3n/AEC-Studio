@@ -11,9 +11,6 @@
 //! (all literals followed by the `0x11` terminator) which is what
 //! LibreDWG also emits for system sections; the bit-for-bit pattern is
 //! a valid LZ77 stream that `decompress` parses identically.
-//!
-//! Encrypted-handle-page support for R2018 lives in
-//! [`xor_decrypt_handle_page`] (a byte-XOR mask, not real crypto).
 
 use crate::dwg::error::{DwgError, DwgResult};
 
@@ -294,22 +291,6 @@ fn encode_literal_length(out: &mut Vec<u8>, len: usize) {
     out.push(rem as u8);
 }
 
-/// Decrypt R2018 handle pages by XORing each byte with the documented
-/// magic mask. Pre-declared for the R2018 dispatch path.
-pub fn xor_decrypt_handle_page(page: &mut [u8], offset: u64) {
-    // Magic key — 12-byte ASCII-leaning constant cycled through the
-    // page. The exact bytes are documented in OpenDesign § "R2018 —
-    // encrypted handle pages" and reproduced verbatim from there.
-    const KEY: [u8; 12] = [
-        0x35, 0xa4, 0x64, 0x41, // "5\xa4dA"
-        0x63, 0x69, 0x67, 0x61, // "ciga"
-        0x4d, 0x61, 0x67, 0x69, // "Magi"
-    ];
-    for (i, b) in page.iter_mut().enumerate() {
-        *b ^= KEY[(offset as usize + i) % KEY.len()];
-    }
-}
-
 /// A trivial single-pass byte reader. We don't reuse [`BitReader`]
 /// here because the LZ77 stream is byte-aligned end-to-end.
 struct ByteReader<'a> {
@@ -338,26 +319,6 @@ impl<'a> ByteReader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn xor_decrypt_is_involutive() {
-        let original = b"hello, R2018 handle page".to_vec();
-        let mut buf = original.clone();
-        xor_decrypt_handle_page(&mut buf, 0);
-        assert_ne!(buf, original);
-        xor_decrypt_handle_page(&mut buf, 0);
-        assert_eq!(buf, original);
-    }
-
-    #[test]
-    fn xor_decrypt_uses_offset_in_key_cycle() {
-        let payload = b"AAAAAAAAAAAA".to_vec();
-        let mut a = payload.clone();
-        let mut b = payload.clone();
-        xor_decrypt_handle_page(&mut a, 0);
-        xor_decrypt_handle_page(&mut b, 3);
-        assert_ne!(a, b);
-    }
 
     #[test]
     fn compress_empty_emits_only_eos() {

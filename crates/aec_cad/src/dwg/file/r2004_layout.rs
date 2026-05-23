@@ -157,12 +157,9 @@ struct DataPageRecord {
     /// File-offset / page-size / page-id, populated as the page is
     /// laid out.
     descriptor: PageDescriptor,
-    /// Final on-disk bytes (data-page header + payload, with any
-    /// R2018 XOR mask applied).
+    /// Final on-disk bytes (data-page header + payload).
     wire: Vec<u8>,
-    /// True if the payload bytes were XOR-masked (R2018 only).
-    encrypted: bool,
-    /// Original payload size, before XOR / compression. Becomes the
+    /// Original payload size, before compression. Becomes the
     /// section-info descriptor's `size` field.
     decompressed_size: u64,
 }
@@ -246,49 +243,42 @@ pub fn assemble_r2004(parts: R2004FileParts) -> DwgResult<Vec<u8>> {
     let mut sorted_indices: Vec<usize> = (0..parts.objects.len()).collect();
     sorted_indices.sort_by_key(|&i| parts.objects[i].handle.value);
 
-    // 2. Wrap each section in a single LZ77-compressed system page and
-    //    track the (page_id, page_size, file_offset) for each.
+    // 2. Wrap each section in a data page (32-byte encrypted page
+    //    header + raw payload) and track the (page_id, page_size,
+    //    file_offset) for each.
     //
     // We allocate page ids starting at 1; AutoCAD reserves negative
     // ids for the system pages (page map = -1, section info = -2).
     //
-    // R2018 encrypts certain sections with the magic-byte XOR mask
-    // (see file/pages.rs::xor_decrypt_handle_page and OpenDesign
-    // § "R2018 — encrypted handle pages"). LibreDWG applies this to
-    // the AcDb:AcDbObjects and AcDb:Handles sections specifically.
-    let r2018_encrypted = parts.version == Version::R2018;
+    // The 32-byte data-page header carries its own per-page XOR mask
+    // (sec_mask = 0x4164536b ^ address; see
+    // `system_section::write_data_page`). The payload bytes themselves
+    // are never scrambled by any additional R2004+ stream cipher —
+    // LibreDWG's reference fixtures (e.g. `example_2018.dwg`) emit
+    // OBJECTS and HANDLES with `SectionInfoDescriptor.encrypted = 0`
+    // and `read_2004_section_handles` parses them as plain bytes.
     let mut cursor: u64 = R2004_FIRST_PAGE_OFFSET;
     let mut data_pages: Vec<DataPageRecord> = Vec::with_capacity(7);
 
     let mut next_page_id: i32 = 1;
-    // Emit a data page using the LibreDWG-compatible encrypted 32-byte
-    // page header + raw payload framing (see
-    // `system_section::write_data_page`). `section_type` is the
-    // LibreDWG `Dwg_Section_Type` id; it's stored both in the page
-    // header and in the section-info descriptor that points at this
-    // page, so the reader can cross-check page integrity. `encrypted`
-    // is the R2018 magic-byte XOR flag applied to the payload bytes
-    // (the 32-byte page header has its own per-page XOR mask and is
-    // always scrambled).
+    // `section_type` is the LibreDWG `Dwg_Section_Type` id; it's
+    // stored both in the page header and in the section-info
+    // descriptor that points at this page, so the reader can
+    // cross-check page integrity.
     //
-    // `decompressed_size` records the original payload length (before
-    // any compression / XOR) so the section-info descriptor can
-    // advertise the section's true size to readers without needing a
-    // logical-id → buffer-length lookup table downstream.
+    // `decompressed_size` records the payload length so the
+    // section-info descriptor can advertise the section's true size
+    // to readers without needing a logical-id → buffer-length lookup
+    // table downstream.
     let push_data_page = |name: &str,
                           section_type: u32,
                           payload: &[u8],
-                          encrypted: bool,
                           cursor: &mut u64,
                           next_page_id: &mut i32,
                           pages: &mut Vec<DataPageRecord>|
      -> DwgResult<()> {
         let decompressed_size = payload.len() as u64;
-        let mut payload_buf = payload.to_vec();
-        if encrypted {
-            crate::dwg::file::pages::xor_decrypt_handle_page(&mut payload_buf, 0);
-        }
-        let wire = write_data_page(section_type, &payload_buf, 0, *cursor);
+        let wire = write_data_page(section_type, payload, 0, *cursor);
         let descriptor = PageDescriptor {
             page_id: *next_page_id,
             page_size: wire.len() as u32,
@@ -301,7 +291,6 @@ pub fn assemble_r2004(parts: R2004FileParts) -> DwgResult<Vec<u8>> {
             section_type,
             descriptor,
             wire,
-            encrypted,
             decompressed_size,
         });
         Ok(())
@@ -311,7 +300,6 @@ pub fn assemble_r2004(parts: R2004FileParts) -> DwgResult<Vec<u8>> {
         SECTION_HEADER,
         SECTION_TYPE_HEADER,
         &header_vars_bytes,
-        false,
         &mut cursor,
         &mut next_page_id,
         &mut data_pages,
@@ -320,7 +308,6 @@ pub fn assemble_r2004(parts: R2004FileParts) -> DwgResult<Vec<u8>> {
         SECTION_CLASSES,
         SECTION_TYPE_CLASSES,
         &classes_bytes,
-        false,
         &mut cursor,
         &mut next_page_id,
         &mut data_pages,
@@ -330,7 +317,6 @@ pub fn assemble_r2004(parts: R2004FileParts) -> DwgResult<Vec<u8>> {
         SECTION_OBJECTS,
         SECTION_TYPE_OBJECTS,
         &objects_bytes,
-        r2018_encrypted,
         &mut cursor,
         &mut next_page_id,
         &mut data_pages,
@@ -366,7 +352,6 @@ pub fn assemble_r2004(parts: R2004FileParts) -> DwgResult<Vec<u8>> {
         SECTION_HANDLES,
         SECTION_TYPE_HANDLES,
         &object_map_bytes,
-        r2018_encrypted,
         &mut cursor,
         &mut next_page_id,
         &mut data_pages,
@@ -395,7 +380,6 @@ pub fn assemble_r2004(parts: R2004FileParts) -> DwgResult<Vec<u8>> {
         SECTION_NAME_AUXHEADER,
         SECTION_TYPE_AUXHEADER,
         &aux_header_bytes,
-        false,
         &mut cursor,
         &mut next_page_id,
         &mut data_pages,
@@ -404,7 +388,6 @@ pub fn assemble_r2004(parts: R2004FileParts) -> DwgResult<Vec<u8>> {
         SECTION_NAME_TEMPLATE,
         SECTION_TYPE_TEMPLATE,
         &template_bytes,
-        false,
         &mut cursor,
         &mut next_page_id,
         &mut data_pages,
@@ -413,7 +396,6 @@ pub fn assemble_r2004(parts: R2004FileParts) -> DwgResult<Vec<u8>> {
         SECTION_NAME_APPINFO,
         SECTION_TYPE_APPINFO,
         &appinfo_bytes,
-        false,
         &mut cursor,
         &mut next_page_id,
         &mut data_pages,
@@ -477,10 +459,12 @@ pub fn assemble_r2004(parts: R2004FileParts) -> DwgResult<Vec<u8>> {
         desc.max_decomp_size = section_max_decomp_size(page.section_type);
         desc.compressed = 1; // stored (raw inside the encrypted page header)
         desc.type_tag = page.section_type;
-        // R2018: encrypted=2 marks a section as XOR-masked. LibreDWG
-        // treats encrypted=0|1 as "plain" and encrypted=2 as the
-        // R2018 XOR. We use the same convention.
-        desc.encrypted = if page.encrypted { 2 } else { 0 };
+        // No section is XOR-encrypted at the payload level. LibreDWG's
+        // own R2004+ writer and AutoCAD-emitted fixtures both leave
+        // `encrypted = 0` for every named data section. The 32-byte
+        // data-page header XOR is applied unconditionally inside
+        // `write_data_page`.
+        desc.encrypted = 0;
         desc.unknown = 0;
         desc.pages.push(SectionInfoPage {
             page_number: page.descriptor.page_id,
@@ -520,14 +504,10 @@ pub fn assemble_r2004(parts: R2004FileParts) -> DwgResult<Vec<u8>> {
     //    data sections, not bootstrap sections), so we can compute it
     //    once and freeze the value.
     //
-    //    The page map and section-info pages are never encrypted —
-    //    they're the bootstrap data the reader needs before it can
-    //    interpret section-level encryption flags.
     let section_info_wire = write_system_page(
         SECTION_INFO_TYPE_TAG,
         &section_info_payload,
         CompressionType::Compressed,
-        false,
     )?;
     page_descriptors[section_info_descriptor_index].page_size = section_info_wire.len() as u32;
 
@@ -550,12 +530,8 @@ pub fn assemble_r2004(parts: R2004FileParts) -> DwgResult<Vec<u8>> {
     for iteration in 0..8 {
         page_descriptors[page_map_descriptor_index].page_size = prev_page_map_size;
         let payload = encode_page_map(&page_descriptors);
-        page_map_wire = write_system_page(
-            PAGE_MAP_TYPE_TAG,
-            &payload,
-            CompressionType::Compressed,
-            false,
-        )?;
+        page_map_wire =
+            write_system_page(PAGE_MAP_TYPE_TAG, &payload, CompressionType::Compressed)?;
         let new_size = page_map_wire.len() as u32;
         if new_size == prev_page_map_size {
             break;
@@ -600,12 +576,18 @@ pub fn assemble_r2004(parts: R2004FileParts) -> DwgResult<Vec<u8>> {
     // expects to find SECTION_PAGE_MAP_MAGIC at
     // `section_map_address + 0x100`.)
     //
-    // **Address convention:** all "address" fields in the R2004 file
-    // header — `section_map_address`, `last_section_address`,
-    // `secondheader_address` — are stored as offsets **relative to
-    // the start of the data-page region** (offset 0x100), NOT as
-    // file-absolute byte offsets. LibreDWG adds `0x100` when reading
-    // (see `dwg->fhdr.r2004_header.section_map_address + 0x100`).
+    // **Address convention:** `section_map_address` and
+    // `last_section_address` are stored as offsets **relative to the
+    // start of the data-page region** (offset 0x100); LibreDWG adds
+    // `0x100` when reading. `secondheader_address` is the lone
+    // exception — it is stored as a **file-absolute** byte position,
+    // matching `LibreDWG encode.c:4259`
+    // (`secondheader_address = secondheader_pos + 20`, no -0x100). The
+    // value points at the 108-byte encrypted-header copy that sits
+    // 20 bytes past the start of the trailing "new 2nd-header" block;
+    // a reader can seek directly to that offset and copy 108 bytes to
+    // recover the R2004 file header without re-decrypting the
+    // pre-data-page region.
     let mut r2004_hdr = R2004FileHeader::new();
     r2004_hdr.header_address = R2004_FIRST_PAGE_OFFSET as u32;
     // section_map_id is the page id of the page map itself (-1).
@@ -630,11 +612,37 @@ pub fn assemble_r2004(parts: R2004FileParts) -> DwgResult<Vec<u8>> {
         .max()
         .unwrap_or(R2004_FIRST_PAGE_OFFSET);
     r2004_hdr.last_section_address = last_section_abs - R2004_FIRST_PAGE_OFFSET;
-    r2004_hdr.secondheader_address = 0; // none emitted yet
+    // The trailing "new 2nd-header" is appended after the section-info
+    // page (the last system page). LibreDWG / ODA-compatible writers
+    // emit a 128-byte block — a 20-byte system-page-style header
+    // followed by a 108-byte verbatim copy of the encrypted R2004
+    // file header. `secondheader_address` is the absolute file offset
+    // of the encrypted-header copy (i.e. 20 bytes past the start of
+    // the block).
+    let secondheader_block_offset = section_info_offset + section_info_wire.len() as u64;
+    r2004_hdr.secondheader_address = secondheader_block_offset + 20;
     let r2004_encrypted = r2004_hdr.encode_encrypted();
 
-    // 9. Assemble the full file.
-    let total_len = (cursor as usize).max(R2004_FIRST_PAGE_OFFSET as usize);
+    // 9. Build the trailing "new 2nd-header" block (LibreDWG
+    //    `encode.c:4361`). The 20-byte preamble carries the
+    //    `0x4163_0e3b` magic and `compression_type = 2`; the 108
+    //    following bytes are the first 108 bytes of the encrypted
+    //    R2004 file header. LibreDWG's R2004+ decoder reads
+    //    `secondheader_address` from the file header but does **not**
+    //    seek to it (the `secondheader_private` parser at
+    //    `decode.c:2702` runs only for r13-r2000). ODA-conformant
+    //    readers — and AutoCAD's own recovery path — use this block
+    //    to recover the encrypted R2004 header if the leading 0x80
+    //    region is corrupted.
+    let mut secondheader_block = vec![0u8; SECONDHEADER_BLOCK_LEN];
+    secondheader_block[0..4].copy_from_slice(&SECONDHEADER_MAGIC.to_le_bytes());
+    secondheader_block[12] = 0x02; // compression_type slot
+    secondheader_block[20..20 + SECONDHEADER_HEADER_COPY_LEN]
+        .copy_from_slice(&r2004_encrypted[..SECONDHEADER_HEADER_COPY_LEN]);
+
+    // 10. Assemble the full file.
+    let total_len =
+        (cursor as usize).max(R2004_FIRST_PAGE_OFFSET as usize) + SECONDHEADER_BLOCK_LEN;
     let mut out: Vec<u8> = Vec::with_capacity(total_len);
     out.extend_from_slice(&legacy);
     out.extend_from_slice(&r2004_encrypted);
@@ -652,9 +660,76 @@ pub fn assemble_r2004(parts: R2004FileParts) -> DwgResult<Vec<u8>> {
     out.extend_from_slice(&page_map_wire);
     debug_assert_eq!(out.len() as u64, section_info_offset);
     out.extend_from_slice(&section_info_wire);
+    debug_assert_eq!(out.len() as u64, secondheader_block_offset);
+    out.extend_from_slice(&secondheader_block);
 
     Ok(out)
 }
+
+/// Size of the trailing "new 2nd-header" block emitted at end-of-file
+/// for R2004+ files. 20-byte system-page-style preamble + 108-byte
+/// encrypted-R2004-header copy. Matches LibreDWG `encode.c:4254`
+/// (`dat->byte += 128`).
+const SECONDHEADER_BLOCK_LEN: usize = 128;
+/// Number of bytes of the encrypted R2004 file header copied into the
+/// trailing 2nd-header block. The full encrypted header is 120 bytes;
+/// the last 12 are padding, so the conformant copy is 108 bytes
+/// (LibreDWG `encode.c:4372`).
+const SECONDHEADER_HEADER_COPY_LEN: usize = 108;
+/// Little-endian magic stored in the first 4 bytes of the 20-byte
+/// secondheader preamble (`3b 0e 63 41` on disk). Equal to
+/// `SECTION_PAGE_MAP_MAGIC` / `PAGE_MAP_TYPE_TAG`; LibreDWG reuses the
+/// same constant when manufacturing the preamble at `encode.c:4367`.
+const SECONDHEADER_MAGIC: u32 = 0x4163_0e3b;
+
+/// Validate the trailing "new 2nd-header" block of an R2004+ file.
+/// `secondheader_address` is the absolute file offset of the
+/// 108-byte encrypted-header copy (i.e. 20 bytes past the start of
+/// the block). `primary_encrypted_hdr` is the still-encrypted 120-byte
+/// R2004 file header read from offset 0x80; the secondheader's copy
+/// must match its first 108 bytes verbatim.
+fn validate_secondheader_block(
+    bytes: &[u8],
+    secondheader_address: u64,
+    primary_encrypted_hdr: &[u8; 120],
+) -> DwgResult<()> {
+    let copy_start = secondheader_address as usize;
+    if copy_start < SECONDHEADER_PREAMBLE_LEN {
+        return Err(DwgError::InternalInvariant(format!(
+            "R2004 secondheader_address 0x{secondheader_address:x} \
+             does not leave room for the 20-byte preamble"
+        )));
+    }
+    let preamble_start = copy_start - SECONDHEADER_PREAMBLE_LEN;
+    let copy_end = copy_start + SECONDHEADER_HEADER_COPY_LEN;
+    if copy_end > bytes.len() {
+        return Err(DwgError::UnexpectedEof {
+            byte: copy_end,
+            bit: 0,
+        });
+    }
+    let preamble = &bytes[preamble_start..copy_start];
+    let magic = u32::from_le_bytes([preamble[0], preamble[1], preamble[2], preamble[3]]);
+    if magic != SECONDHEADER_MAGIC {
+        return Err(DwgError::InternalInvariant(format!(
+            "R2004 secondheader preamble magic mismatch: got 0x{magic:08x} \
+             expected 0x{SECONDHEADER_MAGIC:08x}"
+        )));
+    }
+    let copy_bytes = &bytes[copy_start..copy_end];
+    if copy_bytes != &primary_encrypted_hdr[..SECONDHEADER_HEADER_COPY_LEN] {
+        return Err(DwgError::InternalInvariant(
+            "R2004 secondheader 108-byte copy does not match the encrypted \
+             R2004 file header at offset 0x80"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Length of the 20-byte system-page-style preamble at the start of
+/// the secondheader block.
+const SECONDHEADER_PREAMBLE_LEN: usize = 20;
 
 /// Parse a complete R2004+ file. Returns the decoded sections plus the
 /// object-record stream (recovered from the AcDb:AcDbObjects /
@@ -698,8 +773,31 @@ pub fn parse_r2004(bytes: &[u8]) -> DwgResult<R2004File> {
     }
     let mut encrypted_hdr = [0u8; 120];
     encrypted_hdr.copy_from_slice(&bytes[R2004_HEADER_OFFSET..R2004_HEADER_OFFSET + 120]);
+    let primary_encrypted_hdr = encrypted_hdr;
     crate::dwg::file::system_section::encrypt_lcg_inplace(&mut encrypted_hdr);
     let r2004_hdr = R2004FileHeader::from_decrypted(&encrypted_hdr)?;
+
+    // 2b. Validate the trailing "new 2nd-header" block (LibreDWG
+    //     `encode.c:4254-4375`). LibreDWG itself never seeks to this
+    //     block when decoding R2004+ (see `decode.c:2702`,
+    //     `secondheader_private` is gated to r13-r2000), but
+    //     well-formed R2004+ files always carry it: a 20-byte
+    //     system-page-style preamble followed by a 108-byte verbatim
+    //     copy of the encrypted R2004 header. We cross-check that the
+    //     108-byte copy matches the primary encrypted header at 0x80;
+    //     a mismatch indicates corruption or a non-conformant writer.
+    //
+    //     The block is optional only in the sense that
+    //     `secondheader_address` may legally be 0 (LibreDWG itself
+    //     emits zero in some historic codepaths). When the address is
+    //     non-zero we treat it as a hard structural check.
+    if r2004_hdr.secondheader_address != 0 {
+        validate_secondheader_block(
+            bytes,
+            r2004_hdr.secondheader_address,
+            &primary_encrypted_hdr,
+        )?;
+    }
 
     // 3. Read the PAGE MAP system page first. `section_map_address`
     //    points at it (NOT at the section info). The page map gives
@@ -719,8 +817,7 @@ pub fn parse_r2004(bytes: &[u8]) -> DwgResult<R2004File> {
             file_size: bytes.len(),
         });
     }
-    let (page_map_page_header, page_map_payload) =
-        read_system_page(&bytes[page_map_offset..], false)?;
+    let (page_map_page_header, page_map_payload) = read_system_page(&bytes[page_map_offset..])?;
     if page_map_page_header.section_type != PAGE_MAP_TYPE_TAG {
         return Err(DwgError::InternalInvariant(format!(
             "R2004 page-map page type mismatch: got 0x{:08x} expected 0x{:08x}",
@@ -753,7 +850,7 @@ pub fn parse_r2004(bytes: &[u8]) -> DwgResult<R2004File> {
         });
     }
     let (section_info_page_header, section_info_payload) =
-        read_system_page(&bytes[section_info_offset..], false)?;
+        read_system_page(&bytes[section_info_offset..])?;
     if section_info_page_header.section_type != SECTION_INFO_TYPE_TAG {
         return Err(DwgError::InternalInvariant(format!(
             "R2004 section-info page type mismatch: got 0x{:08x} expected 0x{:08x}",
@@ -769,10 +866,19 @@ pub fn parse_r2004(bytes: &[u8]) -> DwgResult<R2004File> {
     let mut handles_payload: Option<Vec<u8>> = None;
 
     for descriptor in &section_descriptors {
-        // R2018 encrypts certain sections; the descriptor.encrypted
-        // field tells us which. LibreDWG accepts encrypted=1 or 2 as
-        // "XOR-masked"; we encode as 2 and accept either on read.
-        let page_encrypted = descriptor.encrypted != 0;
+        // LibreDWG-emitted R2004+ data sections are never XOR-encrypted
+        // at the payload level (see encode side comment above). Defend
+        // against malformed inputs that flag a section as encrypted by
+        // refusing to decode them — we don't have a documented
+        // keystream to invert.
+        if descriptor.encrypted != 0 {
+            return Err(DwgError::InternalInvariant(format!(
+                "R2004 section {:?} flagged as encrypted ({}), but no R2004+ \
+                 payload-level encryption is documented or supported",
+                descriptor.name_str(),
+                descriptor.encrypted,
+            )));
+        }
         let mut combined: Vec<u8> = Vec::with_capacity(descriptor.size as usize);
         for page in &descriptor.pages {
             let off = page.address as usize;
@@ -797,11 +903,7 @@ pub fn parse_r2004(bytes: &[u8]) -> DwgResult<R2004File> {
                     descriptor.type_tag,
                 )));
             }
-            let mut payload_owned = payload.to_vec();
-            if page_encrypted {
-                crate::dwg::file::pages::xor_decrypt_handle_page(&mut payload_owned, 0);
-            }
-            combined.extend_from_slice(&payload_owned);
+            combined.extend_from_slice(payload);
         }
         match descriptor.name_str() {
             SECTION_HEADER => {
@@ -982,6 +1084,105 @@ mod tests {
         assert_eq!(file.version, Version::R2004);
         assert_eq!(file.classes.classes.len(), 0);
         assert_eq!(file.objects.len(), 0);
+    }
+
+    /// The "new 2nd-header" block (LibreDWG `encode.c:4254-4375`)
+    /// must be present at end-of-file for every R2004+ version, and
+    /// `r2004_header.secondheader_address` must point at the
+    /// 108-byte encrypted-header copy inside it.
+    #[test]
+    fn r2004plus_emits_trailing_secondheader_block() {
+        for version in [
+            Version::R2004,
+            Version::R2010,
+            Version::R2013,
+            Version::R2018,
+        ] {
+            let parts = R2004FileParts {
+                version,
+                header_vars: HeaderVarsSection::minimal(version),
+                classes: ClassesSection::empty(version),
+                objects: Vec::new(),
+            };
+            let bytes = assemble_r2004(parts)
+                .unwrap_or_else(|e| panic!("assemble_r2004 failed for {version:?}: {e:?}"));
+
+            // The block occupies the trailing 128 bytes of the file.
+            assert!(
+                bytes.len() >= SECONDHEADER_BLOCK_LEN,
+                "{version:?}: file too short to contain secondheader block"
+            );
+            let block_start = bytes.len() - SECONDHEADER_BLOCK_LEN;
+            let preamble = &bytes[block_start..block_start + SECONDHEADER_PREAMBLE_LEN];
+            assert_eq!(
+                u32::from_le_bytes([preamble[0], preamble[1], preamble[2], preamble[3]]),
+                SECONDHEADER_MAGIC,
+                "{version:?}: secondheader preamble magic mismatch"
+            );
+            assert_eq!(
+                preamble[12], 0x02,
+                "{version:?}: secondheader preamble compression-type slot mismatch"
+            );
+
+            // The 108-byte copy must match the encrypted R2004 header
+            // at offset 0x80 byte-for-byte.
+            let copy_start = block_start + SECONDHEADER_PREAMBLE_LEN;
+            let copy = &bytes[copy_start..copy_start + SECONDHEADER_HEADER_COPY_LEN];
+            let primary = &bytes[R2004_HEADER_OFFSET..R2004_HEADER_OFFSET + 120];
+            assert_eq!(
+                copy,
+                &primary[..SECONDHEADER_HEADER_COPY_LEN],
+                "{version:?}: secondheader 108-byte copy != encrypted R2004 header"
+            );
+
+            // The file header's secondheader_address must point at
+            // the copy (absolute file offset).
+            let mut encrypted_hdr = [0u8; 120];
+            encrypted_hdr.copy_from_slice(primary);
+            crate::dwg::file::system_section::encrypt_lcg_inplace(&mut encrypted_hdr);
+            let r2004_hdr = R2004FileHeader::from_decrypted(&encrypted_hdr).unwrap();
+            assert_eq!(
+                r2004_hdr.secondheader_address as usize, copy_start,
+                "{version:?}: secondheader_address must equal absolute offset of 108-byte copy"
+            );
+        }
+    }
+
+    /// A corrupted secondheader block (mutated magic or mismatched
+    /// 108-byte copy) must be rejected by `parse_r2004` with an
+    /// `InternalInvariant` error, not silently accepted.
+    #[test]
+    fn parse_r2004_rejects_corrupted_secondheader() {
+        let parts = R2004FileParts {
+            version: Version::R2018,
+            header_vars: HeaderVarsSection::minimal(Version::R2018),
+            classes: ClassesSection::empty(Version::R2018),
+            objects: Vec::new(),
+        };
+        let bytes = assemble_r2004(parts).unwrap();
+
+        // Sanity: clean file parses.
+        assert!(parse_r2004(&bytes).is_ok());
+
+        // Flip the magic byte in the secondheader preamble.
+        let block_start = bytes.len() - SECONDHEADER_BLOCK_LEN;
+        let mut mutated = bytes.clone();
+        mutated[block_start] ^= 0xff;
+        let err = parse_r2004(&mutated).expect_err("corrupted magic must be rejected");
+        assert!(
+            matches!(err, DwgError::InternalInvariant(ref s) if s.contains("secondheader preamble magic")),
+            "unexpected error: {err:?}"
+        );
+
+        // Mutate a byte inside the 108-byte copy.
+        let mut mutated = bytes.clone();
+        let copy_start = block_start + SECONDHEADER_PREAMBLE_LEN;
+        mutated[copy_start + 30] ^= 0x55;
+        let err = parse_r2004(&mutated).expect_err("mismatched copy must be rejected");
+        assert!(
+            matches!(err, DwgError::InternalInvariant(ref s) if s.contains("does not match the encrypted")),
+            "unexpected error: {err:?}"
+        );
     }
 
     /// Pin the architectural invariant: `assemble_r2004` MUST reject
@@ -1199,7 +1400,7 @@ mod tests {
         crate::dwg::file::system_section::encrypt_lcg_inplace(&mut encrypted_hdr);
         let r2004_hdr = R2004FileHeader::from_decrypted(&encrypted_hdr).unwrap();
         let pmo = (r2004_hdr.section_map_address + R2004_FIRST_PAGE_OFFSET) as usize;
-        let (_, page_map) = read_system_page(&bytes[pmo..], false).unwrap();
+        let (_, page_map) = read_system_page(&bytes[pmo..]).unwrap();
         let pds =
             crate::dwg::file::system_section::decode_page_map(&page_map, R2004_FIRST_PAGE_OFFSET)
                 .unwrap();
@@ -1208,7 +1409,7 @@ mod tests {
             .find(|p| p.page_id == r2004_hdr.section_info_id)
             .unwrap()
             .file_offset as usize;
-        let (_, si_payload) = read_system_page(&bytes[si_off..], false).unwrap();
+        let (_, si_payload) = read_system_page(&bytes[si_off..]).unwrap();
         let (_, descriptors) = decode_section_info(&si_payload).unwrap();
         for d in &descriptors {
             let expected = section_max_decomp_size(d.type_tag);

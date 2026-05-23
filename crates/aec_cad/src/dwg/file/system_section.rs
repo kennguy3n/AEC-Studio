@@ -323,30 +323,19 @@ pub fn system_page_checksum(header: SystemPageHeader, payload: &[u8]) -> u32 {
 }
 
 /// Wrap a logical system-section payload (decompressed) as the
-/// on-disk page: 20-byte header + (optionally encrypted)
-/// LZ77-compressed payload + `dwg_section_page_checksum` (Adler-32-
-/// style, NOT CRC-32C) chained checksum. Returns the bytes ready to
-/// be written at the page's file offset.
-///
-/// The `encrypted` flag is the per-section flag from
-/// [`SectionInfoDescriptor::encrypted`]: when set, the
-/// (compressed) payload is XORed with the R2018 magic-byte mask
-/// before the checksum is computed. The checksum is computed over
-/// the encrypted bytes so the page can be validated without first
-/// decrypting.
+/// on-disk page: 20-byte header + LZ77-compressed (or stored) payload +
+/// `dwg_section_page_checksum` (Adler-32-style, NOT CRC-32C) chained
+/// checksum. Returns the bytes ready to be written at the page's file
+/// offset.
 pub fn write_system_page(
     section_type: u32,
     decomp_payload: &[u8],
     compression: CompressionType,
-    encrypted: bool,
 ) -> DwgResult<Vec<u8>> {
-    let mut payload = match compression {
+    let payload = match compression {
         CompressionType::Stored => decomp_payload.to_vec(),
         CompressionType::Compressed => compress(decomp_payload)?,
     };
-    if encrypted {
-        crate::dwg::file::pages::xor_decrypt_handle_page(&mut payload, 0);
-    }
     let mut header = SystemPageHeader {
         section_type,
         decomp_data_size: decomp_payload.len() as u32,
@@ -362,12 +351,8 @@ pub fn write_system_page(
 }
 
 /// Read one system-section page back out and return its logical
-/// payload. Verifies the checksum, decrypts (if `encrypted`), and
-/// decompresses if needed.
-///
-/// The checksum is computed over the encrypted-and-compressed payload
-/// (the same way it was on write), so we validate before decrypting.
-pub fn read_system_page(bytes: &[u8], encrypted: bool) -> DwgResult<(SystemPageHeader, Vec<u8>)> {
+/// payload. Verifies the checksum and decompresses if needed.
+pub fn read_system_page(bytes: &[u8]) -> DwgResult<(SystemPageHeader, Vec<u8>)> {
     let header = SystemPageHeader::parse(bytes)?;
     let comp_len = header.comp_data_size as usize;
     if bytes.len() < SYSTEM_PAGE_HEADER_SIZE + comp_len {
@@ -391,17 +376,10 @@ pub fn read_system_page(bytes: &[u8], encrypted: bool) -> DwgResult<(SystemPageH
             stored: header.checksum,
         });
     }
-    // XOR is involutive, so we can decrypt in-place by XORing again
-    // with the same key. Copy first so we don't disturb the caller's
-    // buffer.
-    let mut payload = payload_slice.to_vec();
-    if encrypted {
-        crate::dwg::file::pages::xor_decrypt_handle_page(&mut payload, 0);
-    }
     let compression = CompressionType::from_u32(header.compression_type)?;
     let plain = match compression {
-        CompressionType::Stored => payload,
-        CompressionType::Compressed => decompress(&payload, header.decomp_data_size as usize)?,
+        CompressionType::Stored => payload_slice.to_vec(),
+        CompressionType::Compressed => decompress(payload_slice, header.decomp_data_size as usize)?,
     };
     Ok((header, plain))
 }
@@ -1043,10 +1021,9 @@ mod tests {
             SECTION_PAGE_MAP_MAGIC,
             &payload,
             CompressionType::Compressed,
-            false,
         )
         .unwrap();
-        let (header, decoded) = read_system_page(&on_disk, false).unwrap();
+        let (header, decoded) = read_system_page(&on_disk).unwrap();
         assert_eq!(header.section_type, SECTION_PAGE_MAP_MAGIC);
         assert_eq!(header.decomp_data_size as usize, payload.len());
         assert_eq!(decoded, payload);
@@ -1056,9 +1033,8 @@ mod tests {
     fn system_page_round_trips_stored() {
         let payload = b"page contents that do not compress".to_vec();
         let on_disk =
-            write_system_page(SECTION_INFO_MAGIC, &payload, CompressionType::Stored, false)
-                .unwrap();
-        let (header, decoded) = read_system_page(&on_disk, false).unwrap();
+            write_system_page(SECTION_INFO_MAGIC, &payload, CompressionType::Stored).unwrap();
+        let (header, decoded) = read_system_page(&on_disk).unwrap();
         assert_eq!(header.compression_type, CompressionType::Stored.as_u32());
         assert_eq!(decoded, payload);
     }
@@ -1067,46 +1043,11 @@ mod tests {
     fn system_page_detects_checksum_corruption() {
         let payload = b"checksum-corruption-test payload bytes here".to_vec();
         let mut on_disk =
-            write_system_page(SECTION_INFO_MAGIC, &payload, CompressionType::Stored, false)
-                .unwrap();
+            write_system_page(SECTION_INFO_MAGIC, &payload, CompressionType::Stored).unwrap();
         // Corrupt the first payload byte; checksum should now fail.
         on_disk[SYSTEM_PAGE_HEADER_SIZE] ^= 0xff;
-        let err = read_system_page(&on_disk, false).unwrap_err();
+        let err = read_system_page(&on_disk).unwrap_err();
         assert!(matches!(err, DwgError::SectionCrcMismatch { .. }));
-    }
-
-    #[test]
-    fn encrypted_system_page_round_trips_compressed() {
-        // R2018 handle-page emulation: an LZ77-compressed payload
-        // XORed with the magic-byte mask. Must round-trip via the
-        // matching encrypted=true on read.
-        let payload: Vec<u8> = (0..1024).map(|i| (i & 0xff) as u8).collect();
-        let on_disk = write_system_page(
-            SECTION_PAGE_MAP_MAGIC,
-            &payload,
-            CompressionType::Compressed,
-            true,
-        )
-        .unwrap();
-        let (header, decoded) = read_system_page(&on_disk, true).unwrap();
-        assert_eq!(header.section_type, SECTION_PAGE_MAP_MAGIC);
-        assert_eq!(decoded, payload);
-    }
-
-    #[test]
-    fn encrypted_system_page_differs_from_plain_one() {
-        // Two pages written with the same payload but different
-        // encrypted flags must differ in their on-disk bytes —
-        // confirms the XOR is actually applied.
-        let payload: Vec<u8> = (0..256).map(|i| (i & 0xff) as u8).collect();
-        let plain = write_system_page(SECTION_INFO_MAGIC, &payload, CompressionType::Stored, false)
-            .unwrap();
-        let encrypted =
-            write_system_page(SECTION_INFO_MAGIC, &payload, CompressionType::Stored, true).unwrap();
-        assert_ne!(
-            &plain[SYSTEM_PAGE_HEADER_SIZE..],
-            &encrypted[SYSTEM_PAGE_HEADER_SIZE..]
-        );
     }
 
     #[test]
