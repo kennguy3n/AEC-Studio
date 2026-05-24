@@ -107,35 +107,7 @@ impl PanoramaPipeline {
             }
         }
 
-        let sky = scene_sky(scene);
-        let pt_scene = build_path_trace_scene(scene, &self.materials, sky);
-
-        // Force 2:1 aspect ratio so each pixel covers equal solid angle.
-        // Equirectangular panoramas REQUIRE width = 2 * height exactly,
-        // otherwise the bottom row covers a slightly different solid
-        // angle than the rest, breaking VR / 360° viewer conventions.
-        // Integer division on odd widths (e.g. 65) silently produces an
-        // off-by-one height (32, giving 65:32 = 2.03:1) so clamp width
-        // down to the nearest even value before deriving height. Stock
-        // presets ship even widths (1024, 2048, 4096), but a caller
-        // wiring a custom resolution_x should not be able to break the
-        // invariant.
-        let mut config =
-            path_trace_config_from_preset(&preset.config, CameraProjection::Equirectangular);
-        let width = (config.width.max(2)) & !1u32;
-        // height = width / 2 is now exact (no truncation).
-        let height = width / 2;
-        config.width = width;
-        config.height = height;
-
-        let start = Instant::now();
-        let buffer = render_or_fallback(&pt_scene, camera, &config, None, cancel.clone());
-        let elapsed = start.elapsed();
-        if let Some(token) = &cancel {
-            if token.is_cancelled() {
-                return Err(PanoramaError::Cancelled);
-            }
-        }
+        let (buffer, elapsed) = self.render_buffer(scene, preset, camera, cancel)?;
 
         let buf_width = buffer.width;
         let buf_height = buffer.height;
@@ -159,6 +131,79 @@ impl PanoramaPipeline {
             elapsed,
             denoised,
         })
+    }
+
+    /// Render the radiance + aux buffers for a panorama, without
+    /// encoding them to disk. Exposed at crate visibility so unit
+    /// tests can pin the aux-channel contract (i.e. that
+    /// `preset.config.denoise = true` actually produces an
+    /// aux-populated buffer) without going through the file-I/O path.
+    ///
+    /// Public callers should use [`Self::render_with_camera`] which
+    /// composes this with tone-mapping and PNG encoding.
+    pub(crate) fn render_buffer(
+        &self,
+        scene: &RenderScene,
+        preset: &RenderPreset,
+        camera: &RenderCamera,
+        cancel: Option<CancelToken>,
+    ) -> Result<(crate::path_trace::AccumulationBuffer, Duration), PanoramaError> {
+        let sky = scene_sky(scene);
+        let pt_scene = build_path_trace_scene(scene, &self.materials, sky);
+
+        // Force 2:1 aspect ratio so each pixel covers equal solid angle.
+        // Equirectangular panoramas REQUIRE width = 2 * height exactly,
+        // otherwise the bottom row covers a slightly different solid
+        // angle than the rest, breaking VR / 360° viewer conventions.
+        // Integer division on odd widths (e.g. 65) silently produces an
+        // off-by-one height (32, giving 65:32 = 2.03:1) so clamp width
+        // down to the nearest even value before deriving height. Stock
+        // presets ship even widths (1024, 2048, 4096), but a caller
+        // wiring a custom resolution_x should not be able to break the
+        // invariant.
+        let mut config =
+            path_trace_config_from_preset(&preset.config, CameraProjection::Equirectangular);
+        let width = (config.width.max(2)) & !1u32;
+        // height = width / 2 is now exact (no truncation).
+        let height = width / 2;
+        config.width = width;
+        config.height = height;
+
+        let start = Instant::now();
+        // Aux feature buffers (albedo / normal / depth) are gated on
+        // the preset's `denoise` flag — same contract as the flat /
+        // walkthrough paths via `scheduler::config_from_preset`. Wiring
+        // aux to a hardcoded `false` (the pre-PR-J-round-3 behavior)
+        // meant panorama presets that ship with `denoise = true` got
+        // luminance-only bilateral filtering even though the matched
+        // flat preset got feature-guided filtering — a silent
+        // quality regression vs. the rest of the render surface.
+        //
+        // Equirectangular pole distortion is sometimes cited as a
+        // reason to avoid aux on panoramas, but: (a) the aux signals
+        // themselves are world-space (albedo, world-normal, depth) and
+        // projection-invariant; (b) the bilateral kernel's spatial
+        // weight is already off near the poles regardless of aux, so
+        // adding aux can only *improve* the kernel's surface-vs-edge
+        // discrimination in the noisy pole regions; (c) at the
+        // equator a panorama pixel neighborhood is identical to a
+        // perspective pixel neighborhood, so aux is strictly more
+        // useful there. Defer to the preset, not the projection.
+        let buffer = render_or_fallback(
+            &pt_scene,
+            camera,
+            &config,
+            None,
+            cancel.clone(),
+            preset.config.denoise,
+        );
+        let elapsed = start.elapsed();
+        if let Some(token) = &cancel {
+            if token.is_cancelled() {
+                return Err(PanoramaError::Cancelled);
+            }
+        }
+        Ok((buffer, elapsed))
     }
 }
 
@@ -287,7 +332,7 @@ mod tests {
             x_end: config.width,
             y_end: config.height,
         };
-        let result = render_tile_pass(&scene, &camera, &config, tile, 4, 0xC0FFEE);
+        let result = render_tile_pass(&scene, &camera, &config, tile, 4, 0, 0xC0FFEE);
         assert_eq!(result.sums.len() as u32, config.width * config.height);
         for px in &result.sums {
             // Every pixel must produce *some* radiance — at minimum the
@@ -398,12 +443,82 @@ mod tests {
         assert_eq!(out.width, 2 * out.height);
     }
 
+    /// Regression test pinning that a panorama preset with
+    /// `denoise = true` actually drives the renderer in
+    /// aux-capturing mode — i.e. the intermediate
+    /// [`crate::path_trace::AccumulationBuffer`] has all three aux
+    /// channels populated, not just allocated.
+    ///
+    /// Pre PR-J round-3, panorama hardcoded `capture_aux = false`,
+    /// which silently downgraded panorama denoising to luminance-only
+    /// bilateral filtering even when the preset asked for the
+    /// feature-guided kernel. That was a quality split between the
+    /// flat / walkthrough paths (which honoured the preset via
+    /// `scheduler::config_from_preset`) and the panorama path. This
+    /// test asserts the two sides now agree.
+    #[test]
+    fn panorama_with_denoise_true_produces_aux_populated_buffer() {
+        let scene = tiny_scene();
+        let mut preset = fast_preset();
+        preset.config.denoise = true;
+        // The aux signal needs at least one geometric hit to be
+        // non-degenerate; tiny_scene's floor at y = 0 ensures the
+        // bottom hemisphere of the panorama hits geometry.
+        let camera = scene.cameras[0].clone();
+        let pipeline = PanoramaPipeline::new();
+        let (buffer, _elapsed) = pipeline
+            .render_buffer(&scene, &preset, &camera, None)
+            .expect("render_buffer must succeed");
+        assert!(
+            buffer.has_aux(),
+            "panorama with denoise = true must produce a buffer with all aux channels"
+        );
+        let normals = buffer
+            .average_normal()
+            .expect("aux is populated; average_normal must succeed");
+        let any_nonzero = normals
+            .iter()
+            .any(|n| n[0].abs() > 1e-3 || n[1].abs() > 1e-3 || n[2].abs() > 1e-3);
+        assert!(
+            any_nonzero,
+            "aux normals must be populated by the first-hit pass, not just allocated to zero"
+        );
+    }
+
+    /// Inverse contract: `denoise = false` must NOT pay the aux
+    /// accumulation cost. This pins that the preset → capture_aux
+    /// wiring is symmetric — i.e. we didn't accidentally always
+    /// capture aux.
+    #[test]
+    fn panorama_with_denoise_false_produces_aux_less_buffer() {
+        let scene = tiny_scene();
+        let mut preset = fast_preset();
+        preset.config.denoise = false;
+        let camera = scene.cameras[0].clone();
+        let pipeline = PanoramaPipeline::new();
+        let (buffer, _elapsed) = pipeline
+            .render_buffer(&scene, &preset, &camera, None)
+            .expect("render_buffer must succeed");
+        assert!(
+            !buffer.has_aux(),
+            "panorama with denoise = false must NOT allocate aux channels"
+        );
+    }
+
     #[test]
     fn equirectangular_dir_test_via_two_distinct_pixels() {
         // Verify two different pixels yield different world-space
-        // directions. We do this indirectly by rendering a 4x2 image of
-        // an empty scene with a custom-tinted sky and checking that the
-        // left edge and right edge produce visibly different radiance.
+        // directions. Render a panorama where the sun is large enough
+        // that stratified jitter will see it at the equator but not at
+        // the zenith, and check that the two regions differ in radiance.
+        //
+        // (We deliberately do *not* compare bit-identical pixel sums
+        // here: with low-discrepancy jitter [stratified Halton(2,3)],
+        // every pixel's per-sample directions cluster on the same
+        // unit-square Halton points, so two pixels seeing the same
+        // uniform sky background reliably produce identical radiance.
+        // The brittleness of an exact-sum comparison was a property of
+        // the prior pure-random ray-gen, not a feature.)
         let mut scene = PathTraceScene {
             bvh: crate::bvh::Bvh::build(&[]),
             triangles: Vec::new(),
@@ -413,14 +528,13 @@ mod tests {
             lights: Vec::new(),
             sky: crate::lighting::SkyParams::default(),
         };
-        // Aim the sun at a specific direction so the panorama has a
-        // bright spot at known longitude.
+        // Large sun (~17° angular radius) so even a 2-sample pixel at
+        // the equator reliably hits it; tiny suns are too brittle.
         scene.lights.push(crate::light_sampling::NativeLight::Sun {
             direction: Vec3::new(0.0, -1.0, 0.0).normalize(),
             radiance: Vec3::splat(10.0),
-            angular_radius_rad: 0.05,
+            angular_radius_rad: 0.3,
         });
-        // No geometry, just sky+sun visible.
         let camera = RenderCamera {
             id: "c".into(),
             position_mm: [0.0, 0.0, 0.0],
@@ -433,7 +547,7 @@ mod tests {
         let config = PathTraceConfig {
             width: 8,
             height: 4,
-            samples_per_pixel: 2,
+            samples_per_pixel: 4,
             max_bounces: 1,
             tile_size: 8,
             russian_roulette_min_bounces: 3,
@@ -446,16 +560,25 @@ mod tests {
             x_end: 8,
             y_end: 4,
         };
-        let result = render_tile_pass(&scene, &camera, &config, tile, 2, 0xBEEF);
-        // Top row (closer to zenith) should differ from the bottom row
-        // (closer to the sun pointing -Y). At minimum the per-channel
-        // sums must not be bit-identical, which would mean the ray-gen
-        // ignored pixel coordinates entirely. Sums share the same
-        // sample count so we can compare them directly without
-        // averaging.
-        let first = result.sums[0];
-        let last = result.sums[result.sums.len() - 1];
-        let differs = (0..3).any(|c| (first[c] - last[c]).abs() > 1e-4);
-        assert!(differs, "equirectangular pixels must vary across image");
+        let result = render_tile_pass(&scene, &camera, &config, tile, 4, 0, 0xBEEF);
+        // The panorama mapping at v=0 (top row) points toward +Y; sun
+        // direction is `Vec3::new(0, -1, 0)` so the apparent sun is at
+        // +Y, which lands on the top row. The top row must therefore
+        // be measurably brighter than the bottom row, proving (a)
+        // pixel coordinates affect ray direction and (b) the mapping
+        // is the documented centre-forward convention.
+        let top_row_lum: f32 = (0..8)
+            .map(|x| result.sums[x][0] + result.sums[x][1] + result.sums[x][2])
+            .sum();
+        let bottom_row_lum: f32 = (0..8)
+            .map(|x| {
+                let i = 3 * 8 + x;
+                result.sums[i][0] + result.sums[i][1] + result.sums[i][2]
+            })
+            .sum();
+        assert!(
+            top_row_lum > bottom_row_lum + 1.0,
+            "equirectangular pixels must vary across image: top {top_row_lum}, bottom {bottom_row_lum}"
+        );
     }
 }

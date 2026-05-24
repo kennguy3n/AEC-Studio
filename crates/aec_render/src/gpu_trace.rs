@@ -733,16 +733,52 @@ fn build_camera_frame(camera: &RenderCamera) -> CameraFrame {
 /// Convenience: attempt GPU render; on any failure fall back to the
 /// CPU [`crate::path_trace::render`]. This is the entry point the
 /// scheduler / queue should call.
+///
+/// **GPU + aux contract.** The WGSL kernel currently emits radiance
+/// only; first-hit aux feature buffers (albedo / normal / depth) would
+/// require new storage bindings plus a GBuffer write on bounce 0.
+/// Rather than silently drop aux when `capture_aux = true` (which made
+/// GPU-equipped machines produce measurably worse denoising than the
+/// CPU fallback for the same preset — the per-hardware quality split
+/// flagged by Devin Review on PR-J round-3), we run a cheap CPU
+/// first-hit aux pass after the GPU radiance pass and merge the aux
+/// channels into the returned buffer. The aux pass is a single
+/// center-of-pixel primary ray per pixel — no shading, no bounces,
+/// no NEE — and adds < 1 % to total render time even for
+/// production-resolution renders. See
+/// [`crate::path_trace::fill_first_hit_aux`] for the per-sample
+/// convention and accumulator-format details.
+///
+/// A future PR can replace the CPU companion pass with a native WGSL
+/// GBuffer emission; that change is a pure perf optimisation (the
+/// quality contract is already met by the hybrid path).
 pub fn render_or_fallback(
     scene: &PathTraceScene,
     camera: &RenderCamera,
     config: &PathTraceConfig,
     progress: Option<ProgressFn>,
     cancel: Option<CancelToken>,
+    capture_aux: bool,
 ) -> AccumulationBuffer {
     match GpuPathTracer::try_new() {
-        Ok(tracer) => tracer.render(scene, camera, config, progress, cancel),
-        Err(_) => crate::path_trace::render(scene, camera, config, progress, cancel),
+        Ok(tracer) => {
+            // Clone the cancel token because we need to consult it
+            // both inside the GPU dispatch and again (cheaply) after
+            // the GPU render returns, to short-circuit the aux pass
+            // if the user cancelled mid-render.
+            let mut buffer = tracer.render(scene, camera, config, progress, cancel.clone());
+            if capture_aux && !cancel.as_ref().is_some_and(CancelToken::is_cancelled) {
+                crate::path_trace::fill_first_hit_aux(scene, camera, config, &mut buffer);
+            }
+            buffer
+        }
+        Err(_) => {
+            if capture_aux {
+                crate::path_trace::render_with_aux(scene, camera, config, progress, cancel)
+            } else {
+                crate::path_trace::render(scene, camera, config, progress, cancel)
+            }
+        }
     }
 }
 
@@ -847,6 +883,69 @@ mod tests {
         assert!((cross.dot(frame.forward).abs() - 1.0).abs() < 0.05);
     }
 
+    /// Regression test pinning the contract that
+    /// `render_or_fallback` with `capture_aux = true` always returns a
+    /// buffer with all three aux channels populated — *regardless of
+    /// hardware*. Two paths exercise this:
+    ///
+    /// 1. **GPU-available** (when present): GPU radiance pass +
+    ///    [`crate::path_trace::fill_first_hit_aux`] CPU companion pass
+    ///    that scales by `pixels[i][3]` so the aux integrates with the
+    ///    GPU's accumulator format.
+    /// 2. **GPU-unavailable** (CI default): direct CPU
+    ///    [`crate::path_trace::render_with_aux`] which produces aux
+    ///    natively.
+    ///
+    /// Pre PR-J round-3, the GPU arm returned an aux-less buffer and
+    /// downstream `encode_srgb8` silently fell back to luminance-only
+    /// bilateral filtering — i.e. GPU-equipped machines got measurably
+    /// worse denoising quality than CPU-fallback machines for the
+    /// same preset. This test fails fast if that gap reopens.
+    #[test]
+    fn render_or_fallback_with_capture_aux_produces_buffer_with_aux() {
+        let scene = quad_scene();
+        let camera = RenderCamera {
+            id: "cam".into(),
+            position_mm: [0.0, 1500.0, 3000.0],
+            target_mm: [0.0, 0.0, 0.0],
+            focal_length_mm: 35.0,
+            exposure_ev: 0.0,
+            white_balance_k: 5500.0,
+            aperture_f: 5.6,
+        };
+        let cfg = PathTraceConfig {
+            width: 16,
+            height: 12,
+            samples_per_pixel: 1,
+            max_bounces: 1,
+            tile_size: 8,
+            russian_roulette_min_bounces: 1,
+            adaptive_threshold: 0.0,
+            projection: crate::path_trace::CameraProjection::Perspective,
+        };
+        let buf = render_or_fallback(&scene, &camera, &cfg, None, None, true);
+        assert_eq!(buf.width, 16);
+        assert_eq!(buf.height, 12);
+        assert!(
+            buf.has_aux(),
+            "capture_aux = true must produce a buffer with all three aux channels"
+        );
+        // The aux must actually be populated — `has_aux` only checks
+        // allocation. Verify a non-degenerate signal by asserting the
+        // averaged normal magnitudes are non-zero somewhere in the
+        // image (the quad-floor scene has plenty of geometry hits).
+        let normals = buf
+            .average_normal()
+            .expect("aux is populated above; average_normal must succeed");
+        let any_nonzero = normals
+            .iter()
+            .any(|n| n[0].abs() > 1e-3 || n[1].abs() > 1e-3 || n[2].abs() > 1e-3);
+        assert!(
+            any_nonzero,
+            "aux normals must be populated by the first-hit pass, not just allocated to zero"
+        );
+    }
+
     #[test]
     fn render_or_fallback_returns_buffer_even_without_gpu() {
         // On CI we typically have no GPU. The function must still
@@ -871,7 +970,7 @@ mod tests {
             adaptive_threshold: 0.0,
             projection: crate::path_trace::CameraProjection::Perspective,
         };
-        let buf = render_or_fallback(&scene, &camera, &cfg, None, None);
+        let buf = render_or_fallback(&scene, &camera, &cfg, None, None, false);
         assert_eq!(buf.width, 16);
         assert_eq!(buf.height, 12);
         assert_eq!(buf.pixels.len(), 16 * 12);
@@ -904,7 +1003,7 @@ mod tests {
         };
         let token = CancelToken::new();
         token.cancel();
-        let buf = render_or_fallback(&scene, &camera, &cfg, None, Some(token));
+        let buf = render_or_fallback(&scene, &camera, &cfg, None, Some(token), false);
         // Even cancelled, the buffer is allocated with the requested
         // dimensions.
         assert_eq!(buf.width, 16);
@@ -1187,7 +1286,7 @@ mod tests {
                     adaptive_threshold: 0.0,
                     projection: crate::path_trace::CameraProjection::Perspective,
                 };
-                let buf = render_or_fallback(&scene, &camera, &cfg, None, None);
+                let buf = render_or_fallback(&scene, &camera, &cfg, None, None, false);
                 assert_eq!(buf.pixels.len(), 48);
             }
             Err(e) => panic!("unexpected error: {e:?}"),

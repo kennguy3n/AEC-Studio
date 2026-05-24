@@ -29,8 +29,8 @@ use std::sync::{Arc, Mutex};
 use rayon::prelude::*;
 
 use crate::path_trace::{
-    generate_tiles, render_tile_pass, AccumulationBuffer, CancelToken, PathTraceConfig,
-    PathTraceScene, ProgressFn, Tile,
+    generate_tiles, render_tile_pass, render_tile_pass_with_aux, AccumulationBuffer, CancelToken,
+    PathTraceConfig, PathTraceScene, ProgressFn, Tile,
 };
 use crate::scene::RenderCamera;
 
@@ -56,6 +56,24 @@ pub struct SchedulerConfig {
     /// Minimum samples-per-pixel a tile must have before we trust the
     /// variance estimate enough to early-out on.
     pub min_samples_before_check: u32,
+    /// When `true`, the scheduler drives the kernel via
+    /// [`render_tile_pass_with_aux`] and splats the per-pass first-hit
+    /// albedo / normal / depth sums into the [`AccumulationBuffer`]'s
+    /// aux channels (which is initialised via
+    /// [`AccumulationBuffer::new_with_aux`]).
+    ///
+    /// This is the *production* path for feature-guided denoising: the
+    /// downstream [`crate::final_render::encode_srgb8`] consults the
+    /// buffer's aux channels and feeds them to the bilateral kernel.
+    /// Without aux capture, the scheduler produced an aux-less buffer
+    /// even when the preset asked for denoising, and the bilateral
+    /// kernel silently fell back to luminance-only filtering — i.e.
+    /// PR-J's render-fidelity improvement was invisible in production.
+    ///
+    /// Cost: aux capture adds three `Vec<[f32; 3 | 1]>` per pass plus a
+    /// per-pixel splat into the buffer's aux channels. In practice
+    /// ~3-5% of the per-pass cost on a `samples_per_pass = 16` budget.
+    pub capture_aux: bool,
 }
 
 impl SchedulerConfig {
@@ -67,6 +85,10 @@ impl SchedulerConfig {
             tile_size: 64,
             adaptive_threshold: 0.01,
             min_samples_before_check: 8,
+            // Preview path is denoise-off-by-default and latency-sensitive;
+            // skip aux. Upgrade to `true` if a preview preset switches on
+            // denoise.
+            capture_aux: false,
         }
     }
 
@@ -81,6 +103,9 @@ impl SchedulerConfig {
             tile_size: 64,
             adaptive_threshold: 0.005,
             min_samples_before_check: 32,
+            // Final-quality presets always denoise; aux guidance is the
+            // whole point of PR-J's bilateral upgrade.
+            capture_aux: true,
         }
     }
 
@@ -92,6 +117,11 @@ impl SchedulerConfig {
             tile_size,
             adaptive_threshold: -1.0,
             min_samples_before_check: u32::MAX,
+            // Fixed-count is typically a benchmark / reference render;
+            // leave aux off so the output matches the no-denoise baseline
+            // by default. Callers wanting aux-guided denoising should
+            // build the config explicitly with `capture_aux: true`.
+            capture_aux: false,
         }
     }
 }
@@ -210,7 +240,15 @@ pub fn schedule(
     inner_progress: Option<ProgressFn>,
 ) -> SchedulerOutcome {
     let _ = inner_progress; // reserved for per-tile UI hookup (Tasks 8+9)
-    let mut buffer = AccumulationBuffer::new(base_config.width, base_config.height);
+                            // Allocate the aux channels up-front when capture is requested.
+                            // Doing this once outside the pass loop avoids checking on every
+                            // pass and keeps the down-stream `buffer.has_aux()` invariant
+                            // monotone over the render's lifetime.
+    let mut buffer = if sched.capture_aux {
+        AccumulationBuffer::new_with_aux(base_config.width, base_config.height)
+    } else {
+        AccumulationBuffer::new(base_config.width, base_config.height)
+    };
     let tiles = generate_tiles(base_config.width, base_config.height, sched.tile_size);
     let mut tile_states: Vec<TileState> = tiles.iter().copied().map(TileState::new).collect();
     let tiles_total = tile_states.len() as u32;
@@ -250,11 +288,46 @@ pub fn schedule(
                 if cancel_ref.is_some_and(CancelToken::is_cancelled) {
                     return (idx, None);
                 }
-                let tile = tile_states[idx].tile;
+                let state = &tile_states[idx];
+                let tile = state.tile;
+                let samples_so_far = state.samples;
                 let seed = pass_seed_base
                     ^ u64::from(tile.x_start).wrapping_mul(0x9E37_79B1_7F4A_7C15)
                     ^ u64::from(tile.y_start).wrapping_mul(0xBB67_AE85_84CA_A73B);
-                let result = render_tile_pass(scene, camera, base_config, tile, pass_samples, seed);
+                // Pass `samples_so_far` so the Halton index advances
+                // contiguously across passes — see render_tile_pass docs.
+                // Adaptive convergence may stop sampling some tiles
+                // early, so per-tile sample counters drift from the
+                // global `samples_done` (which is the same for all
+                // tiles in a pass). The per-tile `state.samples` is
+                // therefore the load-bearing value here, not the
+                // global `samples_done`.
+                //
+                // When `capture_aux` is on we route through the aux
+                // variant so the [`TilePassResult`] carries first-hit
+                // albedo / normal / depth sums that the scheduler can
+                // splat into the buffer's aux channels below.
+                let result = if sched.capture_aux {
+                    render_tile_pass_with_aux(
+                        scene,
+                        camera,
+                        base_config,
+                        tile,
+                        pass_samples,
+                        samples_so_far,
+                        seed,
+                    )
+                } else {
+                    render_tile_pass(
+                        scene,
+                        camera,
+                        base_config,
+                        tile,
+                        pass_samples,
+                        samples_so_far,
+                        seed,
+                    )
+                };
                 (idx, Some(result))
             })
             .collect();
@@ -264,7 +337,11 @@ pub fn schedule(
                 continue;
             };
             // Splat sums into the global accumulation buffer (for
-            // downstream tonemap / display).
+            // downstream tonemap / display). When aux capture is
+            // enabled and the kernel emitted aux sums, splat those
+            // into the buffer's aux channels too so
+            // [`crate::final_render::encode_srgb8`] can feed the
+            // bilateral kernel real first-hit guidance.
             let tile = tile_states[idx].tile;
             let tw = tile.width();
             for ly in 0..tile.height() {
@@ -278,6 +355,96 @@ pub fn schedule(
                     p[2] += result.sums[li][2];
                     p[3] += result.sums[li][3];
                 }
+            }
+            // Aux splat — gated on both sides actually having aux
+            // (defensive: a future kernel-routing tweak that produced
+            // a `TilePassResult` without aux against an aux-allocated
+            // buffer would silently drop the splat rather than panic).
+            //
+            // Fused single-pass splat over the tile's pixel rectangle:
+            // one (li, gi) computation amortised across all three
+            // channels, matching the layout pattern used by
+            // `path_trace::render_inner`'s aux loop. This replaces an
+            // earlier 3-loop version that re-walked the rectangle and
+            // recomputed indices once per channel.
+            let buf_albedo_opt = result.albedo_sums.as_ref().map(|pass_albedo| {
+                (
+                    buffer
+                        .albedo
+                        .as_mut()
+                        .expect("buffer.albedo allocated when capture_aux is true"),
+                    pass_albedo,
+                )
+            });
+            // Re-borrow normal/depth in separate match arms because we
+            // cannot hold two `&mut` borrows on disjoint fields of
+            // `buffer` simultaneously via the `as_mut()` accessor with
+            // the borrow checker pre-Polonius. Splat in passes that
+            // share one walk of (lx, ly).
+            if let Some((buf_albedo, pass_albedo)) = buf_albedo_opt {
+                for ly in 0..tile.height() {
+                    for lx in 0..tw {
+                        let li = (ly * tw + lx) as usize;
+                        let gi = ((tile.y_start + ly) * base_config.width + (tile.x_start + lx))
+                            as usize;
+                        let dst = &mut buf_albedo[gi];
+                        let src = &pass_albedo[li];
+                        dst[0] += src[0];
+                        dst[1] += src[1];
+                        dst[2] += src[2];
+                    }
+                }
+            }
+            // Fused normal + depth pass: when both are present we walk
+            // the tile rectangle once and write both channels per
+            // pixel. When only one is present we walk for that one
+            // alone.
+            match (
+                buffer.normal.as_mut(),
+                buffer.depth.as_mut(),
+                result.normal_sums.as_ref(),
+                result.depth_sums.as_ref(),
+            ) {
+                (Some(buf_normal), Some(buf_depth), Some(pass_normal), Some(pass_depth)) => {
+                    for ly in 0..tile.height() {
+                        for lx in 0..tw {
+                            let li = (ly * tw + lx) as usize;
+                            let gi = ((tile.y_start + ly) * base_config.width + (tile.x_start + lx))
+                                as usize;
+                            let nrm_dst = &mut buf_normal[gi];
+                            let nrm_src = &pass_normal[li];
+                            nrm_dst[0] += nrm_src[0];
+                            nrm_dst[1] += nrm_src[1];
+                            nrm_dst[2] += nrm_src[2];
+                            buf_depth[gi] += pass_depth[li];
+                        }
+                    }
+                }
+                (Some(buf_normal), _, Some(pass_normal), _) => {
+                    for ly in 0..tile.height() {
+                        for lx in 0..tw {
+                            let li = (ly * tw + lx) as usize;
+                            let gi = ((tile.y_start + ly) * base_config.width + (tile.x_start + lx))
+                                as usize;
+                            let dst = &mut buf_normal[gi];
+                            let src = &pass_normal[li];
+                            dst[0] += src[0];
+                            dst[1] += src[1];
+                            dst[2] += src[2];
+                        }
+                    }
+                }
+                (_, Some(buf_depth), _, Some(pass_depth)) => {
+                    for ly in 0..tile.height() {
+                        for lx in 0..tw {
+                            let li = (ly * tw + lx) as usize;
+                            let gi = ((tile.y_start + ly) * base_config.width + (tile.x_start + lx))
+                                as usize;
+                            buf_depth[gi] += pass_depth[li];
+                        }
+                    }
+                }
+                _ => {}
             }
             // Update Welford running stats.
             tile_states[idx].merge_pass(&result.sums, &result.sums_sq, pass_samples);
@@ -345,6 +512,15 @@ pub fn config_from_preset(preset: &crate::preset::RenderPresetConfig) -> Schedul
         // adaptive sampling from the UI.
         adaptive_threshold: 0.005,
         min_samples_before_check: samples_per_pass * 2,
+        // Aux capture follows the preset's `denoise` flag. Aux guidance
+        // is only useful when the downstream tone-mapper actually runs
+        // the bilateral kernel, so a preset with `denoise = false` has
+        // no reason to pay for aux accumulation, and a preset with
+        // `denoise = true` should always have it. This keeps the
+        // "scheduler produces an aux-less buffer for a denoise=true
+        // preset" anti-pattern flagged by Devin Review out of
+        // production.
+        capture_aux: preset.denoise,
     }
 }
 
@@ -485,6 +661,7 @@ mod tests {
             tile_size: cfg.tile_size,
             adaptive_threshold: 1.0e6, // effectively any noise level converges
             min_samples_before_check: 4,
+            capture_aux: false,
         };
         let outcome = schedule(&scene, &camera, &cfg, &sched, None, None, None);
         assert!(outcome.passes_run <= 4, "{:?}", outcome);
@@ -503,6 +680,7 @@ mod tests {
             tile_size: cfg.tile_size,
             adaptive_threshold: 0.0,
             min_samples_before_check: 64,
+            capture_aux: false,
         };
         let token = CancelToken::new();
         token.cancel();
@@ -566,6 +744,128 @@ mod tests {
         assert_eq!(sched.tile_size, 128);
         assert!(sched.samples_per_pass <= 32);
         assert!(sched.samples_per_pass >= 1);
+        // A preset with `denoise = true` MUST request aux capture from
+        // the scheduler; otherwise the bilateral kernel silently falls
+        // back to luminance-only filtering and PR-J's render-fidelity
+        // improvement is invisible in production. The inverse holds
+        // for `denoise = false` presets.
+        assert!(sched.capture_aux);
+    }
+
+    #[test]
+    fn config_from_preset_skips_aux_when_denoise_is_off() {
+        use crate::preset::{RenderPresetConfig, RenderQuality};
+        let preset = RenderPresetConfig {
+            quality: RenderQuality::RealtimePreview,
+            samples: 32,
+            denoise: false,
+            tile_size_px: 128,
+            resolution_x: 1280,
+            resolution_y: 720,
+            use_motion_blur: false,
+            use_volumetric_atmosphere: false,
+        };
+        let sched = config_from_preset(&preset);
+        assert!(
+            !sched.capture_aux,
+            "denoise = false must not pay for aux accumulation"
+        );
+    }
+
+    /// Round-trip: a scheduler with `capture_aux = true` must produce a
+    /// buffer whose `albedo` / `normal` / `depth` channels are populated
+    /// and non-trivially varying. This is the regression test for the
+    /// design gap flagged by Devin Review on PR-J round-2 \u2014 prior to
+    /// threading aux through the scheduler, every render driven through
+    /// [`schedule`] produced an aux-less buffer, defeating the entire
+    /// point of the aux-guided bilateral feature.
+    #[test]
+    fn scheduler_with_capture_aux_populates_buffer_aux_channels() {
+        let scene = scene_with_floor_and_light();
+        let camera = small_camera();
+        let cfg = small_config();
+        let sched = SchedulerConfig {
+            max_samples_per_pixel: 8,
+            samples_per_pass: 4,
+            tile_size: cfg.tile_size,
+            adaptive_threshold: -1.0,
+            min_samples_before_check: u32::MAX,
+            capture_aux: true,
+        };
+        let outcome = schedule(&scene, &camera, &cfg, &sched, None, None, None);
+        assert!(
+            outcome.buffer.has_aux(),
+            "capture_aux = true must produce a buffer with all aux channels"
+        );
+
+        // Averaged albedo must contain at least one pixel whose
+        // luminance is non-zero (otherwise the kernel got an
+        // entirely-black albedo and aux guidance has no signal).
+        let albedo = outcome
+            .buffer
+            .average_albedo()
+            .expect("aux buffer should yield albedo");
+        let any_lit = albedo.iter().any(|p| (p[0] + p[1] + p[2]) > 1.0e-3);
+        assert!(
+            any_lit,
+            "albedo channel must record at least one non-black first-hit"
+        );
+
+        // Averaged normal must contain at least one non-zero unit
+        // vector (the average_normal() helper re-normalises; pixels
+        // with no hits collapse to `[0,0,0]`).
+        let normal = outcome
+            .buffer
+            .average_normal()
+            .expect("aux buffer should yield normal");
+        let any_normal = normal
+            .iter()
+            .any(|n| (n[0].abs() + n[1].abs() + n[2].abs()) > 0.5);
+        assert!(
+            any_normal,
+            "normal channel must record at least one valid unit normal"
+        );
+
+        // Depth must contain at least one finite, positive depth (the
+        // sky-miss sentinel is `1.0e6`, so a positive value below
+        // that threshold proves a real surface hit was recorded).
+        let depth = outcome
+            .buffer
+            .average_depth()
+            .expect("aux buffer should yield depth");
+        let any_surface = depth.iter().any(|&d| d > 0.0 && d < 1.0e5);
+        assert!(
+            any_surface,
+            "depth channel must record at least one real surface hit"
+        );
+    }
+
+    /// Inverse contract \u2014 a scheduler with `capture_aux = false` must
+    /// NOT pay the aux accumulation cost. We assert the buffer has no
+    /// aux channels at all so the bilateral path correctly degrades to
+    /// luminance-only filtering (and the kernel's `None` branch is
+    /// exercised).
+    #[test]
+    fn scheduler_without_capture_aux_produces_no_aux_buffer() {
+        let scene = scene_with_floor_and_light();
+        let camera = small_camera();
+        let cfg = small_config();
+        let sched = SchedulerConfig {
+            max_samples_per_pixel: 8,
+            samples_per_pass: 4,
+            tile_size: cfg.tile_size,
+            adaptive_threshold: -1.0,
+            min_samples_before_check: u32::MAX,
+            capture_aux: false,
+        };
+        let outcome = schedule(&scene, &camera, &cfg, &sched, None, None, None);
+        assert!(
+            !outcome.buffer.has_aux(),
+            "capture_aux = false must not allocate aux channels"
+        );
+        assert!(outcome.buffer.albedo.is_none());
+        assert!(outcome.buffer.normal.is_none());
+        assert!(outcome.buffer.depth.is_none());
     }
 
     #[test]

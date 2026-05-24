@@ -148,7 +148,21 @@ impl FinalRenderPipeline {
         let config = path_trace_config_from_preset(&preset.config, CameraProjection::Perspective);
 
         let start = Instant::now();
-        let buffer = render_or_fallback(&pt_scene, camera, &config, None, cancel.clone());
+        // When the preset asks for denoising, render with first-hit
+        // aux feature buffers (albedo / normal / depth) so the
+        // bilateral pass in `encode_srgb8` gets the geometric and
+        // material edge guidance it needs to avoid smearing. Without
+        // aux, the bilateral kernel degenerates to a luminance-only
+        // filter, which silently softens silhouettes and material
+        // boundaries.
+        let buffer = render_or_fallback(
+            &pt_scene,
+            camera,
+            &config,
+            None,
+            cancel.clone(),
+            preset.config.denoise,
+        );
         let elapsed = start.elapsed();
 
         if let Some(token) = &cancel {
@@ -243,14 +257,43 @@ pub(crate) fn encode_srgb8(buffer: &AccumulationBuffer, denoise: bool) -> Vec<u8
         return buffer.as_srgb8();
     }
     let avg = buffer.average_rgb();
+    // When the buffer carries first-hit aux guidance (because the
+    // renderer was driven via `render_with_aux`), feed it to the
+    // bilateral kernel. The kernel falls back gracefully to a
+    // luminance-only filter when aux is `None`, but the quality
+    // difference is large: aux-guided bilateral preserves albedo
+    // boundaries and geometric silhouettes that a luminance-only
+    // kernel smears.
+    let albedo_img = buffer
+        .average_albedo()
+        .map(|pixels| crate::denoise::ImageRgb {
+            width: buffer.width,
+            height: buffer.height,
+            pixels,
+        });
+    let normal_img = buffer
+        .average_normal()
+        .map(|pixels| crate::denoise::ImageRgb {
+            width: buffer.width,
+            height: buffer.height,
+            pixels,
+        });
+    // Argument order must match `bilateral_denoise(color, normal, albedo, params)`.
+    // Mismatching the two aux images is silently incorrect because the
+    // kernel computes a normal-edge term `(1 - dot(nc, ns))²` (which
+    // assumes unit-length vectors with range [-1, 1]) on the second
+    // argument and an L2 RGB-distance term on the third — fed the wrong
+    // way around, geometric silhouettes get over-smoothed and material
+    // boundaries get over-sharpened because the sigmas are tuned for
+    // mismatched value ranges.
     let denoised = crate::denoise::bilateral_denoise(
         &crate::denoise::ImageRgb {
             width: buffer.width,
             height: buffer.height,
             pixels: avg,
         },
-        None,
-        None,
+        normal_img.as_ref(),
+        albedo_img.as_ref(),
         crate::denoise::BilateralParams::default(),
     );
 

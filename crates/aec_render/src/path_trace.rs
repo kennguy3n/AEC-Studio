@@ -31,7 +31,8 @@ use rayon::prelude::*;
 use crate::bvh::{BuilderTriangle, Bvh};
 use crate::intersect::{any_hit, closest_hit, geom_normal, Ray, ShadingTriangle};
 use crate::light_sampling::{
-    environment_radiance, is_delta, power_heuristic, sample_light, NativeLight,
+    area_light_contains_world_point, environment_radiance, is_delta, light_pdf, power_heuristic,
+    sample_light, NativeLight,
 };
 use crate::lighting::SkyParams;
 use crate::material::{eval_bsdf, pdf_bsdf, sample_bsdf, PathTraceMaterial};
@@ -243,12 +244,42 @@ impl PathTraceConfig {
 
 /// Tile in the accumulation buffer. Each pixel stores RGB radiance sums
 /// plus the count of contributing samples for averaging.
+///
+/// `albedo`, `normal`, `depth` are **auxiliary feature buffers**
+/// captured from the *first surface hit* of each primary ray. They are
+/// the standard guidance inputs for joint bilateral / OIDN-class
+/// denoisers (see [`crate::denoise::bilateral_denoise`]):
+///
+/// * **Albedo** is the un-shaded base colour at the first hit. Edge
+///   transitions in albedo correspond to texture / material boundaries
+///   that the denoiser must not smear across.
+/// * **Normal** is the world-space shading normal at the first hit.
+///   Edge transitions in normal correspond to geometric creases that
+///   the denoiser must not smear across.
+/// * **Depth** is the camera-space distance (in scene units, metres)
+///   to the first hit. Provides depth-discontinuity guidance for
+///   silhouettes the denoiser must not smear across.
+///
+/// All three aux buffers are *much* less noisy than the colour buffer
+/// (they only need one sample to fully resolve at most hit points),
+/// so they make excellent guidance for a noisy colour buffer.
+///
+/// `aux_pixels` are `Some` iff the renderer was asked to produce aux
+/// guidance. Older / GPU code paths that do not yet produce aux leave
+/// these as `None` and the denoiser falls back to a colour-only kernel.
 #[derive(Debug, Clone)]
 pub struct AccumulationBuffer {
     pub width: u32,
     pub height: u32,
     /// Length = width * height; each entry is `[r_sum, g_sum, b_sum, samples]`.
     pub pixels: Vec<[f32; 4]>,
+    /// First-hit albedo sums (one `[r,g,b]` per pixel) when aux capture
+    /// is enabled.
+    pub albedo: Option<Vec<[f32; 3]>>,
+    /// First-hit world-space shading-normal sums (one `[x,y,z]` per pixel).
+    pub normal: Option<Vec<[f32; 3]>>,
+    /// First-hit depth sums (one `f32` per pixel) in scene units.
+    pub depth: Option<Vec<f32>>,
 }
 
 impl AccumulationBuffer {
@@ -257,7 +288,35 @@ impl AccumulationBuffer {
             width,
             height,
             pixels: vec![[0.0; 4]; (width as usize) * (height as usize)],
+            albedo: None,
+            normal: None,
+            depth: None,
         }
+    }
+
+    /// Buffer with auxiliary feature channels (albedo, normal, depth)
+    /// allocated alongside the radiance buffer.
+    ///
+    /// Use this when the buffer will be denoised with a feature-guided
+    /// kernel (bilateral or OIDN); [`AccumulationBuffer::new`] is fine
+    /// when only radiance is needed (e.g. the GPU path that does not
+    /// yet emit aux buffers, or the equirectangular / panorama path
+    /// where edge-preserving guidance is less critical).
+    pub fn new_with_aux(width: u32, height: u32) -> Self {
+        let n = (width as usize) * (height as usize);
+        Self {
+            width,
+            height,
+            pixels: vec![[0.0; 4]; n],
+            albedo: Some(vec![[0.0; 3]; n]),
+            normal: Some(vec![[0.0; 3]; n]),
+            depth: Some(vec![0.0_f32; n]),
+        }
+    }
+
+    /// True iff this buffer has all three aux channels allocated.
+    pub fn has_aux(&self) -> bool {
+        self.albedo.is_some() && self.normal.is_some() && self.depth.is_some()
     }
 
     pub fn average_rgb(&self) -> Vec<[f32; 3]> {
@@ -268,6 +327,64 @@ impl AccumulationBuffer {
                 [p[0] / n, p[1] / n, p[2] / n]
             })
             .collect()
+    }
+
+    /// Per-pixel averaged albedo. Returns `None` if aux capture was
+    /// not enabled for this buffer.
+    pub fn average_albedo(&self) -> Option<Vec<[f32; 3]>> {
+        let albedo = self.albedo.as_ref()?;
+        Some(
+            albedo
+                .iter()
+                .zip(self.pixels.iter())
+                .map(|(a, p)| {
+                    let n = p[3].max(1.0);
+                    [a[0] / n, a[1] / n, a[2] / n]
+                })
+                .collect(),
+        )
+    }
+
+    /// Per-pixel averaged shading normal. Returned vectors are
+    /// re-normalised because the mean of unit vectors is generally not
+    /// a unit vector. Returns `None` if aux capture was not enabled.
+    pub fn average_normal(&self) -> Option<Vec<[f32; 3]>> {
+        let normal = self.normal.as_ref()?;
+        Some(
+            normal
+                .iter()
+                .zip(self.pixels.iter())
+                .map(|(nrm, p)| {
+                    let n = p[3].max(1.0);
+                    let v = [nrm[0] / n, nrm[1] / n, nrm[2] / n];
+                    // Re-normalise: averaged unit vectors are no longer
+                    // unit, but the denoiser expects unit normals for
+                    // its dot-product range term.
+                    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+                    if len > 1e-6 {
+                        [v[0] / len, v[1] / len, v[2] / len]
+                    } else {
+                        [0.0, 0.0, 0.0]
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    /// Per-pixel averaged depth in scene units (metres). Returns
+    /// `None` if aux capture was not enabled.
+    pub fn average_depth(&self) -> Option<Vec<f32>> {
+        let depth = self.depth.as_ref()?;
+        Some(
+            depth
+                .iter()
+                .zip(self.pixels.iter())
+                .map(|(d, p)| {
+                    let n = p[3].max(1.0);
+                    d / n
+                })
+                .collect(),
+        )
     }
 
     /// Tone-map this buffer to an sRGB-8 byte triplet array without
@@ -323,6 +440,10 @@ impl CancelToken {
 }
 
 /// Render the scene into a fresh accumulation buffer.
+///
+/// This entry point does **not** allocate first-hit aux feature buffers
+/// (albedo / normal / depth). Callers that intend to denoise the output
+/// with a feature-guided kernel should use [`render_with_aux`] instead.
 pub fn render(
     scene: &PathTraceScene,
     camera: &RenderCamera,
@@ -330,43 +451,250 @@ pub fn render(
     progress: Option<ProgressFn>,
     cancel: Option<CancelToken>,
 ) -> AccumulationBuffer {
-    let mut accum = AccumulationBuffer::new(config.width, config.height);
+    render_inner(scene, camera, config, progress, cancel, false)
+}
+
+/// Render the scene into an accumulation buffer that also carries
+/// first-hit aux feature buffers (albedo / normal / depth).
+///
+/// The aux buffers are populated from the *primary* (bounce-0) hit of
+/// each sample — this matches OIDN's and Cycles' "Denoising Albedo /
+/// Normal" conventions. They are then consumed by
+/// [`crate::denoise::bilateral_denoise`] in
+/// [`crate::final_render::encode_srgb8`] to preserve material and
+/// geometric edges during denoising.
+pub fn render_with_aux(
+    scene: &PathTraceScene,
+    camera: &RenderCamera,
+    config: &PathTraceConfig,
+    progress: Option<ProgressFn>,
+    cancel: Option<CancelToken>,
+) -> AccumulationBuffer {
+    render_inner(scene, camera, config, progress, cancel, true)
+}
+
+/// Fill the first-hit aux feature channels (albedo / normal / depth)
+/// of an existing [`AccumulationBuffer`] by tracing a single
+/// center-of-pixel primary ray per pixel — no jitter, no bounces, no
+/// shading.
+///
+/// This is the cheap "companion pass" used by
+/// [`crate::gpu_trace::render_or_fallback`] when the GPU path produces
+/// a radiance-only buffer but the caller asked for aux. The GPU does
+/// the expensive multi-bounce radiance integration, and this function
+/// adds aux feature buffers so the downstream bilateral kernel in
+/// [`crate::final_render::encode_srgb8`] runs in feature-guided mode
+/// rather than luminance-only — closing the quality gap between
+/// GPU-equipped and CPU-fallback machines for the same denoise preset.
+///
+/// **Cost.** One BVH traversal per pixel — empirically < 1 % of a
+/// full path-traced render's cost. The first-hit computation has no
+/// shading and no NEE, so it scales linearly in pixel count and is
+/// independent of `samples_per_pixel` and `max_bounces`.
+///
+/// **Sampling convention.** Single-sample, center-of-pixel, no jitter.
+/// This is the convention used by OIDN ("Denoising Albedo / Normal" /
+/// "Denoising Depth") and by Cycles' aux passes. The bilateral kernel
+/// consumes aux as a *similarity signal* — "are these two pixels on
+/// the same surface?" — not as a precise per-sample integral, so
+/// per-pixel jitter averaging would buy nothing for denoising
+/// guidance but would cost N× more rays.
+///
+/// **Bit-stability vs. CPU `render_with_aux`.** This function does NOT
+/// reproduce `render_with_aux`'s jittered per-sample aux average. For
+/// the same scene the two paths produce numerically different aux
+/// buffers: this one is the *primary-ray* first hit, `render_with_aux`
+/// is the *sample-averaged* first hit. Both are valid OIDN-style aux
+/// inputs; the bilateral kernel treats them identically.
+///
+/// **Accumulator format.** Aux is stored as `(per-pixel value) ×
+/// pixels[i][3]` so the existing
+/// [`AccumulationBuffer::average_albedo`] / `average_normal` /
+/// `average_depth` helpers — which divide by `pixels[i][3]` — recover
+/// the first-hit value directly. If `buffer.albedo` / `normal` /
+/// `depth` are `None`, they are allocated to match `width × height`.
+pub fn fill_first_hit_aux(
+    scene: &PathTraceScene,
+    camera: &RenderCamera,
+    config: &PathTraceConfig,
+    buffer: &mut AccumulationBuffer,
+) {
+    debug_assert_eq!(
+        buffer.width, config.width,
+        "buffer.width must match config.width"
+    );
+    debug_assert_eq!(
+        buffer.height, config.height,
+        "buffer.height must match config.height"
+    );
+    let pixel_count = (buffer.width as usize) * (buffer.height as usize);
+    // Allocate aux channels up-front (if absent) so the loop below can
+    // index into them without re-checking `Option` on every pixel.
+    let _ = buffer
+        .albedo
+        .get_or_insert_with(|| vec![[0.0_f32; 3]; pixel_count]);
+    let _ = buffer
+        .normal
+        .get_or_insert_with(|| vec![[0.0_f32; 3]; pixel_count]);
+    let _ = buffer
+        .depth
+        .get_or_insert_with(|| vec![0.0_f32; pixel_count]);
+
+    let view = build_view(camera);
+    let aspect = config.width as f32 / config.height.max(1) as f32;
+    let half_h = focal_to_half_height(camera.focal_length_mm).max(1e-4);
+    let half_w = half_h * aspect;
+    let width = config.width;
+    let height = config.height;
+    let projection = config.projection;
+
+    // Borrow the three aux channels out of `buffer` and zip them with
+    // the per-pixel radiance sample-count (read-only, parallel-safe).
+    // The aux loop is embarrassingly parallel — each pixel's first-hit
+    // ray is independent — and at 4K (≈ 8.3 M pixels) the BVH walk
+    // alone dominates over Rayon's per-iteration overhead. We chunk
+    // along scanlines so the cache pattern matches the radiance pass.
+    //
+    // Safe to unwrap: we just inserted these above.
+    let pixels: &[[f32; 4]] = &buffer.pixels;
+    let albedo = buffer.albedo.as_mut().unwrap();
+    let normal = buffer.normal.as_mut().unwrap();
+    let depth = buffer.depth.as_mut().unwrap();
+    albedo
+        .par_iter_mut()
+        .zip(normal.par_iter_mut())
+        .zip(depth.par_iter_mut())
+        .enumerate()
+        .for_each(|(i, ((alb_px, nrm_px), depth_px))| {
+            let px = (i as u32) % width;
+            let py = (i as u32) / width;
+            // Sample-count scale so that `average_*` helpers recover
+            // the per-pixel first-hit value: `aux_sum / samples = aux`.
+            // Use `max(1.0)` to defend against an uninitialised
+            // `pixels[i][3]` (e.g. GPU returned an empty buffer on
+            // cancel) — division would otherwise blow up.
+            let scale = pixels[i][3].max(1.0);
+            let dir_world = match projection {
+                CameraProjection::Perspective => {
+                    let nx = (px as f32 + 0.5) / width as f32 * 2.0 - 1.0;
+                    let ny = 1.0 - (py as f32 + 0.5) / height as f32 * 2.0;
+                    let dir_view = Vec3::new(nx * half_w, ny * half_h, -1.0).normalize();
+                    view.basis * dir_view
+                }
+                CameraProjection::Equirectangular => {
+                    equirectangular_dir(px as f32 + 0.5, py as f32 + 0.5, width, height, &view)
+                }
+            };
+            let ray = Ray::new(view.origin, dir_world);
+            let aux = compute_first_hit_aux(scene, &ray);
+            let (a, nrm, d) = aux.to_triplet(dir_world);
+            *alb_px = [a[0] * scale, a[1] * scale, a[2] * scale];
+            *nrm_px = [nrm[0] * scale, nrm[1] * scale, nrm[2] * scale];
+            *depth_px = d * scale;
+        });
+}
+
+/// Compute the first-hit aux features for a single primary ray. Used
+/// by [`fill_first_hit_aux`] and mirrors the bounce-0 aux capture
+/// logic inside [`trace_path`] so the standalone aux-only pass and the
+/// integrated radiance pass produce semantically-identical aux for the
+/// same primary ray.
+fn compute_first_hit_aux(scene: &PathTraceScene, ray: &Ray) -> FirstHitAux {
+    let Some(hit) = closest_hit(&scene.bvh, &scene.triangles, ray) else {
+        return FirstHitAux::Miss;
+    };
+    let tri = &scene.triangles[hit.prim_id as usize];
+    let shading = &scene.shading_data[hit.prim_id as usize];
+    let mat = scene.material_for(hit.prim_id);
+    let w = 1.0 - hit.u - hit.v;
+    let smooth = shading.n0 * w + shading.n1 * hit.u + shading.n2 * hit.v;
+    let n_shade = if smooth.length_squared() < 1e-8 {
+        crate::intersect::geom_normal(tri)
+    } else {
+        smooth.normalize()
+    };
+    let n = if n_shade.dot(-ray.dir) > 0.0 {
+        n_shade
+    } else {
+        -n_shade
+    };
+    FirstHitAux::Hit {
+        albedo: mat.base_color,
+        normal: n,
+        depth: hit.t,
+    }
+}
+
+fn render_inner(
+    scene: &PathTraceScene,
+    camera: &RenderCamera,
+    config: &PathTraceConfig,
+    progress: Option<ProgressFn>,
+    cancel: Option<CancelToken>,
+    capture_aux: bool,
+) -> AccumulationBuffer {
+    let mut accum = if capture_aux {
+        AccumulationBuffer::new_with_aux(config.width, config.height)
+    } else {
+        AccumulationBuffer::new(config.width, config.height)
+    };
     let tiles = generate_tiles(config.width, config.height, config.tile_size);
     let total_tiles = tiles.len() as u32;
     let completed = Arc::new(AtomicU32::new(0));
 
     // Each tile is rendered into a local accumulation chunk; we then
     // splat the chunk back into the global buffer in a serial pass.
-    let results: Vec<(Tile, Vec<[f32; 4]>)> = tiles
+    let results: Vec<(Tile, Option<TileChunk>)> = tiles
         .par_iter()
         .map(|tile| {
             let cancel = cancel.as_ref();
             if cancel.is_some_and(CancelToken::is_cancelled) {
-                return (*tile, Vec::new());
+                return (*tile, None);
             }
-            let chunk = render_tile(scene, camera, config, *tile);
+            let chunk = render_tile(scene, camera, config, *tile, capture_aux);
             let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
             if let Some(cb) = progress.as_ref() {
                 cb(done, total_tiles);
             }
-            (*tile, chunk)
+            (*tile, Some(chunk))
         })
         .collect();
 
     for (tile, chunk) in results {
-        if chunk.is_empty() {
-            continue;
-        }
+        let Some(chunk) = chunk else { continue };
         let tw = tile.x_end - tile.x_start;
         for y in 0..(tile.y_end - tile.y_start) {
             for x in 0..tw {
                 let gi = ((tile.y_start + y) * config.width + (tile.x_start + x)) as usize;
                 let li = (y * tw + x) as usize;
                 let p = &mut accum.pixels[gi];
-                p[0] += chunk[li][0];
-                p[1] += chunk[li][1];
-                p[2] += chunk[li][2];
-                p[3] += chunk[li][3];
+                p[0] += chunk.pixels[li][0];
+                p[1] += chunk.pixels[li][1];
+                p[2] += chunk.pixels[li][2];
+                p[3] += chunk.pixels[li][3];
+                if let (Some(global_a), Some(local_a)) =
+                    (accum.albedo.as_mut(), chunk.albedo.as_ref())
+                {
+                    let a = &mut global_a[gi];
+                    let la = local_a[li];
+                    a[0] += la[0];
+                    a[1] += la[1];
+                    a[2] += la[2];
+                }
+                if let (Some(global_n), Some(local_n)) =
+                    (accum.normal.as_mut(), chunk.normal.as_ref())
+                {
+                    let nrm = &mut global_n[gi];
+                    let ln = local_n[li];
+                    nrm[0] += ln[0];
+                    nrm[1] += ln[1];
+                    nrm[2] += ln[2];
+                }
+                if let (Some(global_d), Some(local_d)) =
+                    (accum.depth.as_mut(), chunk.depth.as_ref())
+                {
+                    global_d[gi] += local_d[li];
+                }
             }
         }
     }
@@ -406,25 +734,159 @@ pub struct TilePassResult {
     /// Per-pixel sum of squared deviations from the running mean (Welford
     /// M2) for each RGB channel, used by the scheduler to estimate noise.
     pub sums_sq: Vec<[f32; 3]>,
+    /// First-hit albedo sums per pixel (one `[r,g,b]` per pixel). `Some`
+    /// when aux capture was requested for this pass via
+    /// [`render_tile_pass_with_aux`].
+    pub albedo_sums: Option<Vec<[f32; 3]>>,
+    /// First-hit world-space shading-normal sums per pixel.
+    pub normal_sums: Option<Vec<[f32; 3]>>,
+    /// First-hit depth sums per pixel.
+    pub depth_sums: Option<Vec<f32>>,
+}
+
+/// First-hit guidance captured by [`trace_path`] for each primary ray.
+///
+/// Only the *first surface hit* contributes: that's the convention
+/// shared with OIDN and Cycles' "denoising_albedo" / "denoising_normal"
+/// passes. Subsequent bounces would dilute the guidance signal and
+/// defeat the point.
+///
+/// Rays that escape the scene (hit only the environment) produce
+/// [`FirstHitAux::Miss`]: the denoiser treats them as zero-albedo,
+/// view-aligned, infinity-depth regions, which is what existing
+/// feature-guided kernels expect for sky.
+#[derive(Debug, Clone, Copy)]
+pub enum FirstHitAux {
+    Hit {
+        albedo: Vec3,
+        normal: Vec3,
+        depth: f32,
+    },
+    Miss,
+}
+
+impl FirstHitAux {
+    /// Triplet `(albedo, normal, depth)` suitable for accumulation into
+    /// aux buffers. Miss → sky-region sentinel: black albedo,
+    /// view-direction normal (computed from `ray_dir` by the caller),
+    /// large-but-finite depth.
+    fn to_triplet(self, ray_dir: Vec3) -> ([f32; 3], [f32; 3], f32) {
+        match self {
+            FirstHitAux::Hit {
+                albedo,
+                normal,
+                depth,
+            } => (
+                [albedo.x, albedo.y, albedo.z],
+                [normal.x, normal.y, normal.z],
+                depth,
+            ),
+            FirstHitAux::Miss => {
+                // OIDN convention for "no hit": zero albedo (sky has
+                // no material), view-aligned normal so the denoiser
+                // doesn't see a crease, and a large finite depth so
+                // depth-discontinuity guidance doesn't go inf.
+                let nrm = -ray_dir;
+                ([0.0, 0.0, 0.0], [nrm.x, nrm.y, nrm.z], 1.0e6)
+            }
+        }
+    }
 }
 
 /// Render `samples_this_pass` more samples into a tile, returning sums +
 /// Welford-style sum-of-squared-deviations. Stateless — the caller is
 /// responsible for accumulating into a buffer. Used by
 /// [`crate::scheduler::TileScheduler`].
+///
+/// This wrapper does not capture aux feature buffers. Schedulers that
+/// will denoise the output with a feature-guided kernel should call
+/// [`render_tile_pass_with_aux`] and accumulate the aux sums into an
+/// [`AccumulationBuffer::new_with_aux`] target.
+///
+/// `samples_so_far` is the number of samples per pixel this tile has
+/// already accumulated in previous passes (0 for the first pass). It's
+/// fed into the stratified-jitter sample index so the Halton sequence
+/// advances *across* passes rather than restarting — i.e. K passes of
+/// N samples each form a single coherent length-`K*N` low-discrepancy
+/// sequence per pixel, not K independent length-N sequences.
 pub fn render_tile_pass(
     scene: &PathTraceScene,
     camera: &RenderCamera,
     config: &PathTraceConfig,
     tile: Tile,
     samples_this_pass: u32,
+    samples_so_far: u32,
     rng_seed: u64,
+) -> TilePassResult {
+    render_tile_pass_inner(
+        scene,
+        camera,
+        config,
+        tile,
+        samples_this_pass,
+        samples_so_far,
+        rng_seed,
+        false,
+    )
+}
+
+/// Same as [`render_tile_pass`] but additionally accumulates first-hit
+/// albedo / normal / depth sums into the returned [`TilePassResult`].
+pub fn render_tile_pass_with_aux(
+    scene: &PathTraceScene,
+    camera: &RenderCamera,
+    config: &PathTraceConfig,
+    tile: Tile,
+    samples_this_pass: u32,
+    samples_so_far: u32,
+    rng_seed: u64,
+) -> TilePassResult {
+    render_tile_pass_inner(
+        scene,
+        camera,
+        config,
+        tile,
+        samples_this_pass,
+        samples_so_far,
+        rng_seed,
+        true,
+    )
+}
+
+// Internal helper used by [`render_tile_pass`] and
+// [`render_tile_pass_with_aux`]. Eight arguments is one over clippy's
+// default cap, but every single one is load-bearing:
+//   - scene / camera / config: scene context
+//   - tile / samples_this_pass / samples_so_far: scheduling state
+//   - rng_seed / capture_aux: per-call kernel knobs
+// Packing them into a struct would just move the verbosity from the
+// callers into the struct literal and add a `&` indirection on every
+// hot-loop field access. Allow it locally instead.
+#[allow(clippy::too_many_arguments)]
+fn render_tile_pass_inner(
+    scene: &PathTraceScene,
+    camera: &RenderCamera,
+    config: &PathTraceConfig,
+    tile: Tile,
+    samples_this_pass: u32,
+    samples_so_far: u32,
+    rng_seed: u64,
+    capture_aux: bool,
 ) -> TilePassResult {
     let tw = tile.width() as usize;
     let th = tile.height() as usize;
     let pixel_count = tw * th;
     let mut sums = vec![[0.0_f32; 4]; pixel_count];
     let mut sums_sq = vec![[0.0_f32; 3]; pixel_count];
+    let (mut albedo_sums, mut normal_sums, mut depth_sums) = if capture_aux {
+        (
+            Some(vec![[0.0_f32; 3]; pixel_count]),
+            Some(vec![[0.0_f32; 3]; pixel_count]),
+            Some(vec![0.0_f32; pixel_count]),
+        )
+    } else {
+        (None, None, None)
+    };
     let mut rng = fastrand::Rng::with_seed(rng_seed);
 
     let view = build_view(camera);
@@ -437,11 +899,24 @@ pub fn render_tile_pass(
             let li = ly * tw + lx;
             let mut mean = [0.0_f32; 3];
             let mut m2 = [0.0_f32; 3];
+            let mut alb_accum = [0.0_f32; 3];
+            let mut nrm_accum = [0.0_f32; 3];
+            let mut dep_accum = 0.0_f32;
+            let px = tile.x_start + lx as u32;
+            let py = tile.y_start + ly as u32;
+            // Per-pixel Cranley-Patterson rotation. Drawn deterministically
+            // from pixel coordinates (not from `rng`!) so the rotation is
+            // the *same* across multiple progressive passes — that is
+            // what lets the Halton index advance from `samples_so_far` to
+            // `samples_so_far + samples_this_pass` form a single coherent
+            // shifted low-discrepancy sequence per pixel. If the rotation
+            // changed per pass (the previous `[rng.f32(), rng.f32()]`
+            // approach), each pass would produce an independently-shifted
+            // sequence and the multi-pass renders would lose the
+            // O(log²N/N) cross-pass convergence benefit.
+            let pixel_seed = crate::sampling::pixel_rotation_seed(px, py);
             for s in 0..samples_this_pass {
-                let px = tile.x_start + lx as u32;
-                let py = tile.y_start + ly as u32;
-                let jx = rng.f32();
-                let jy = rng.f32();
+                let (jx, jy) = crate::sampling::stratified_jitter(samples_so_far + s, pixel_seed);
                 let dir_world = match config.projection {
                     CameraProjection::Perspective => {
                         let nx = (px as f32 + jx) / config.width as f32 * 2.0 - 1.0;
@@ -458,7 +933,7 @@ pub fn render_tile_pass(
                     ),
                 };
                 let ray = Ray::new(view.origin, dir_world);
-                let r = trace_path(scene, ray, config, &mut rng);
+                let (r, aux) = trace_path(scene, ray, config, &mut rng);
                 let rgb = [r.x, r.y, r.z];
                 let n = (s + 1) as f32;
                 for c in 0..3 {
@@ -466,6 +941,14 @@ pub fn render_tile_pass(
                     mean[c] += delta / n;
                     let delta2 = rgb[c] - mean[c];
                     m2[c] += delta * delta2;
+                }
+                if capture_aux {
+                    let (a, nrm, d) = aux.to_triplet(dir_world);
+                    for c in 0..3 {
+                        alb_accum[c] += a[c];
+                        nrm_accum[c] += nrm[c];
+                    }
+                    dep_accum += d;
                 }
             }
             // Convert means back to sums for the caller's accumulator,
@@ -475,12 +958,24 @@ pub fn render_tile_pass(
             let n = samples_this_pass as f32;
             sums[li] = [mean[0] * n, mean[1] * n, mean[2] * n, n];
             sums_sq[li] = m2;
+            if let (Some(a), Some(nrm), Some(d)) = (
+                albedo_sums.as_mut(),
+                normal_sums.as_mut(),
+                depth_sums.as_mut(),
+            ) {
+                a[li] = alb_accum;
+                nrm[li] = nrm_accum;
+                d[li] = dep_accum;
+            }
         }
     }
     TilePassResult {
         tile,
         sums,
         sums_sq,
+        albedo_sums,
+        normal_sums,
+        depth_sums,
     }
 }
 
@@ -506,15 +1001,38 @@ pub(crate) fn generate_tiles(width: u32, height: u32, tile_size: u32) -> Vec<Til
     out
 }
 
+/// Per-tile chunk produced by [`render_tile`]: pixel sums plus the
+/// optional first-hit aux sums for [`AccumulationBuffer`] guidance.
+///
+/// `albedo` / `normal` / `depth` carry sums (not means) so they compose
+/// the same way `pixels` does when tiles are splatted into the global
+/// buffer.
+struct TileChunk {
+    pixels: Vec<[f32; 4]>,
+    albedo: Option<Vec<[f32; 3]>>,
+    normal: Option<Vec<[f32; 3]>>,
+    depth: Option<Vec<f32>>,
+}
+
 fn render_tile(
     scene: &PathTraceScene,
     camera: &RenderCamera,
     config: &PathTraceConfig,
     tile: Tile,
-) -> Vec<[f32; 4]> {
+    capture_aux: bool,
+) -> TileChunk {
     let tw = (tile.x_end - tile.x_start) as usize;
     let th = (tile.y_end - tile.y_start) as usize;
     let mut buf = vec![[0.0_f32; 4]; tw * th];
+    let (mut albedo_buf, mut normal_buf, mut depth_buf) = if capture_aux {
+        (
+            Some(vec![[0.0_f32; 3]; tw * th]),
+            Some(vec![[0.0_f32; 3]; tw * th]),
+            Some(vec![0.0_f32; tw * th]),
+        )
+    } else {
+        (None, None, None)
+    };
     let mut rng = fastrand::Rng::with_seed(
         u64::from(tile.x_start).wrapping_mul(0x9E37_79B1_7F4A_7C15)
             ^ u64::from(tile.y_start).wrapping_mul(0xBB67_AE85_84CA_A73B),
@@ -528,11 +1046,35 @@ fn render_tile(
     for ly in 0..th {
         for lx in 0..tw {
             let mut accum = Vec3::ZERO;
-            for _ in 0..config.samples_per_pixel {
-                let px = tile.x_start + lx as u32;
-                let py = tile.y_start + ly as u32;
-                let jx = rng.f32();
-                let jy = rng.f32();
+            let mut alb_accum = [0.0_f32; 3];
+            let mut nrm_accum = [0.0_f32; 3];
+            let mut dep_accum = 0.0_f32;
+            let px = tile.x_start + lx as u32;
+            let py = tile.y_start + ly as u32;
+            // Per-pixel Cranley-Patterson rotation, derived
+            // deterministically from `(px, py)` rather than drawn from
+            // `rng`. Two reasons to keep the single-shot path and the
+            // multi-pass [`render_tile_pass_inner`] path on the same
+            // strategy here:
+            //
+            // 1. Output determinism — the rotation is now a pure
+            //    function of pixel coordinates, so identical scenes
+            //    render bit-identically regardless of how many RNG
+            //    draws happened earlier in the tile loop. Drawing from
+            //    `rng` made the rotation depend on whichever pixel was
+            //    visited first, which entangled tile-iteration order
+            //    into pixel output.
+            // 2. Path-coherence — if a caller later switches a render
+            //    from single-shot ([`render_tile`]) to progressive
+            //    ([`render_tile_pass`]) or back, the rotation matches
+            //    and the resulting Halton-shifted sequence per pixel
+            //    is bit-stable across the swap. Otherwise the same
+            //    scene with the same total sample count would produce
+            //    a slightly different image depending on which
+            //    scheduling path drove it.
+            let pixel_seed = crate::sampling::pixel_rotation_seed(px, py);
+            for s in 0..config.samples_per_pixel {
+                let (jx, jy) = crate::sampling::stratified_jitter(s, pixel_seed);
                 let dir_world = match config.projection {
                     CameraProjection::Perspective => {
                         let nx = (px as f32 + jx) / config.width as f32 * 2.0 - 1.0;
@@ -549,8 +1091,16 @@ fn render_tile(
                     ),
                 };
                 let ray = Ray::new(view.origin, dir_world);
-                let radiance = trace_path(scene, ray, config, &mut rng);
+                let (radiance, aux) = trace_path(scene, ray, config, &mut rng);
                 accum += radiance;
+                if capture_aux {
+                    let (a, nrm, d) = aux.to_triplet(dir_world);
+                    for c in 0..3 {
+                        alb_accum[c] += a[c];
+                        nrm_accum[c] += nrm[c];
+                    }
+                    dep_accum += d;
+                }
             }
             // Store `[r_sum, g_sum, b_sum, sample_count]` so the output
             // matches the documented `AccumulationBuffer` "sums + count"
@@ -561,9 +1111,21 @@ fn render_tile(
             let n = config.samples_per_pixel.max(1) as f32;
             let li = ly * tw + lx;
             buf[li] = [accum.x, accum.y, accum.z, n];
+            if let (Some(a), Some(nrm), Some(d)) =
+                (albedo_buf.as_mut(), normal_buf.as_mut(), depth_buf.as_mut())
+            {
+                a[li] = alb_accum;
+                nrm[li] = nrm_accum;
+                d[li] = dep_accum;
+            }
         }
     }
-    buf
+    TileChunk {
+        pixels: buf,
+        albedo: albedo_buf,
+        normal: normal_buf,
+        depth: depth_buf,
+    }
 }
 
 struct ViewFrame {
@@ -637,73 +1199,82 @@ fn equirectangular_dir(px: f32, py: f32, width: u32, height: u32, view: &ViewFra
     (view.basis * dir_view).normalize_or_zero()
 }
 
-/// Sum the radiance from analytic lights (sun, area) whose support
-/// contains `ray.dir`. Used by `trace_path` to add direct visibility of
-/// these lights for rays that escape the scene without hitting any
-/// triangle — without this, looking straight at a sun would render
-/// only the sky background.
+/// Radiance from a single analytic light whose geometric support
+/// contains the direction of `ray` (escape-ray case). Returns
+/// `Vec3::ZERO` when the ray does not intersect the light's support
+/// or when the light has no geometric surface (point / IES — these
+/// have zero solid angle and their illumination flows entirely
+/// through NEE).
 ///
-/// Point/IES lights are intentionally excluded: they are point delta
-/// emitters with zero solid angle, so a ray can never "hit" one.
-fn direct_visible_lights(lights: &[NativeLight], ray: &Ray) -> Vec3 {
-    let mut total = Vec3::ZERO;
-    for light in lights {
-        match light {
-            NativeLight::Sun {
-                direction,
-                radiance,
-                angular_radius_rad,
-            } => {
-                // The sun's apparent direction is `-direction` (the
-                // direction light *comes from*). A primary ray points
-                // away from the camera; it "hits" the sun if its
-                // direction lies inside the sun's angular cone.
-                let to_sun = -*direction;
-                let cos_cone = angular_radius_rad.cos();
-                let cos_angle = ray.dir.normalize_or_zero().dot(to_sun.normalize_or_zero());
-                if cos_angle >= cos_cone {
-                    total += *radiance;
-                }
-            }
-            NativeLight::Area {
-                position,
-                normal,
-                u_axis,
-                v_axis,
-                width,
-                height,
-                radiance,
-            } => {
-                // Ray-plane intersection: solve t such that the ray
-                // crosses the plane defined by `position`/`normal`,
-                // then check the (u, v) hit point is inside the
-                // rectangle. The area light is two-sided so the dot
-                // product sign is irrelevant.
-                let denom = normal.dot(ray.dir);
-                if denom.abs() < 1e-6 {
-                    continue;
-                }
-                let t = (*position - ray.origin).dot(*normal) / denom;
-                if t < ray.t_min || t > ray.t_max {
-                    continue;
-                }
-                let hit_pt = ray.origin + ray.dir * t;
-                let local = hit_pt - *position;
-                let u = local.dot(*u_axis);
-                let v = local.dot(*v_axis);
-                if u.abs() <= *width * 0.5 && v.abs() <= *height * 0.5 {
-                    total += *radiance;
-                }
-            }
-            NativeLight::Point { .. } | NativeLight::Ies { .. } => {
-                // Delta luminaires have zero solid angle; a ray cannot
-                // intersect them in the geometric sense, so they
-                // contribute nothing to direct-miss visibility. Their
-                // illumination flows entirely through NEE.
+/// This is the per-light variant of the old `direct_visible_lights`
+/// sum. We expose the per-light shape so [`trace_path`] can MIS-pair
+/// each contributing light's radiance with that same light's NEE pdf,
+/// preserving the per-light symmetric partition
+/// `w_NEE(p_i, p_b) + w_BSDF(p_b, p_i) = 1`. Summing radiances and
+/// using `nee_sum_pdf` on the BSDF side collapses the partition and
+/// under-counts overlapping non-delta lights by 1−Σ(p_i/Σp)·… in the
+/// power heuristic (~30 % loss for two coincident equal-pdf area
+/// lights).
+fn visible_light_radiance(light: &NativeLight, ray: &Ray) -> Vec3 {
+    match light {
+        NativeLight::Sun {
+            direction,
+            radiance,
+            angular_radius_rad,
+        } => {
+            // The sun's apparent direction is `-direction` (the
+            // direction light *comes from*). A primary ray points
+            // away from the camera; it "hits" the sun if its
+            // direction lies inside the sun's angular cone.
+            let to_sun = -*direction;
+            let cos_cone = angular_radius_rad.cos();
+            let cos_angle = ray.dir.normalize_or_zero().dot(to_sun.normalize_or_zero());
+            if cos_angle >= cos_cone {
+                *radiance
+            } else {
+                Vec3::ZERO
             }
         }
+        NativeLight::Area {
+            position,
+            normal,
+            u_axis,
+            v_axis,
+            width,
+            height,
+            radiance,
+        } => {
+            // Ray-plane intersection: solve t such that the ray
+            // crosses the plane defined by `position`/`normal`,
+            // then check the (u, v) hit point is inside the
+            // rectangle. The area light is two-sided so the dot
+            // product sign is irrelevant.
+            let denom = normal.dot(ray.dir);
+            if denom.abs() < 1e-6 {
+                return Vec3::ZERO;
+            }
+            let t = (*position - ray.origin).dot(*normal) / denom;
+            if t < ray.t_min || t > ray.t_max {
+                return Vec3::ZERO;
+            }
+            let hit_pt = ray.origin + ray.dir * t;
+            let local = hit_pt - *position;
+            let u = local.dot(*u_axis);
+            let v = local.dot(*v_axis);
+            if u.abs() <= *width * 0.5 && v.abs() <= *height * 0.5 {
+                *radiance
+            } else {
+                Vec3::ZERO
+            }
+        }
+        NativeLight::Point { .. } | NativeLight::Ies { .. } => {
+            // Delta luminaires have zero solid angle; a ray cannot
+            // intersect them in the geometric sense, so they
+            // contribute nothing to direct-miss visibility. Their
+            // illumination flows entirely through NEE.
+            Vec3::ZERO
+        }
     }
-    total
 }
 
 fn trace_path(
@@ -711,31 +1282,85 @@ fn trace_path(
     ray_in: Ray,
     config: &PathTraceConfig,
     rng: &mut fastrand::Rng,
-) -> Vec3 {
+) -> (Vec3, FirstHitAux) {
     let mut radiance = Vec3::ZERO;
     let mut throughput = Vec3::ONE;
     let mut ray = ray_in;
+    // `last_was_specular = true` on the primary ray means "no prior
+    // BSDF sample to MIS-combine with" — the visible-emitter and
+    // env-hit branches treat that as MIS weight = 1.0, matching the
+    // "primary ray sees emitters directly" convention.
     let mut last_was_specular = true;
     let mut prev_bsdf_pdf = 1.0_f32;
+    // World-space position of the *previous* surface interaction (the
+    // hit point we last sampled a BSDF from). Used to recompute the
+    // NEE-side pdf that would have produced `ray.dir` from that
+    // position when a BSDF sample lands on an emitter at a later
+    // bounce (BSDF-side MIS combine).
+    let mut prev_hit_pos = ray.origin;
+    let mut aux: Option<FirstHitAux> = None;
 
     for bounce in 0..config.max_bounces {
         let hit = closest_hit(&scene.bvh, &scene.triangles, &ray);
         let Some(hit) = hit else {
             let env = environment_radiance(&scene.sky, ray.dir);
+            // The environment background itself is not currently
+            // sampled by NEE (there is no sky-light sampler), so its
+            // contribution always has MIS weight 1.0 regardless of
+            // `last_was_specular`. A future PR adding an environment
+            // sampler would change this branch to a power-heuristic
+            // combine like the emitter branch below.
             radiance += throughput * env;
-            // Cycles parity: a ray that escapes the scene also sees any
-            // analytic light whose support contains `ray.dir`. Without
-            // this branch a panorama or a "shoot ray at the sky"
-            // primary ray would never observe the sun disk, only the
-            // diffuse sky background. Sun lights are evaluated as a
-            // delta-cone test; area lights as a ray-rectangle test.
-            // Direct-lighting NEE already accounts for these analytic
-            // lights inside the bouncing loop, so we skip the analytic
-            // contribution on rays that came from a BSDF sample to
-            // avoid double-counting (`last_was_specular` is true for
-            // the primary ray and for rays after specular bounces).
-            if last_was_specular {
-                radiance += throughput * direct_visible_lights(&scene.lights, &ray);
+            // A ray that escapes the scene can also "hit" an analytic
+            // light whose support contains `ray.dir` — the visible
+            // sun disk or a panel light seen edge-on. NEE samples
+            // those lights at every shading point, so when a BSDF
+            // sample at bounce ≥ 1 happens to land on one we must
+            // MIS-combine the BSDF and NEE estimators rather than
+            // dropping the contribution outright (the old
+            // `last_was_specular` gate did the drop and silently
+            // crushed variance reduction on geometry that sees a
+            // light along a glossy direction).
+            // Per-light symmetric MIS for BSDF-found emitters: iterate
+            // every non-delta light and pair the light's OWN NEE pdf
+            // with the BSDF pdf. This preserves the per-light partition
+            // `w_NEE(p_i, p_b) + w_BSDF(p_b, p_i) = 1`, even when two
+            // or more lights overlap in solid-angle support from this
+            // shading point (e.g. a finite-cone sun seen through an
+            // area light). Using the summed `nee_sum_pdf` here would
+            // make every overlapping light's BSDF-side weight
+            // p_b²/(p_b²+(Σp_i)²) instead of p_b²/(p_b²+p_i²),
+            // collapsing the partition and losing ~30 % of each
+            // light's energy in regions of overlap.
+            for light in &scene.lights {
+                if is_delta(light) {
+                    continue;
+                }
+                let light_radiance = visible_light_radiance(light, &ray);
+                if light_radiance.length_squared() == 0.0 {
+                    continue;
+                }
+                let mis_w = if last_was_specular {
+                    1.0
+                } else {
+                    let p = light_pdf(light, prev_hit_pos, ray.dir);
+                    if p > 0.0 {
+                        power_heuristic(prev_bsdf_pdf, p)
+                    } else {
+                        // The light's geometric support covers
+                        // `ray.dir` (we got non-zero radiance above)
+                        // but its NEE pdf evaluates to zero — e.g. an
+                        // area light hit on its back face, where
+                        // `light_pdf` returns 0 by convention. NEE
+                        // never samples this direction, so the BSDF
+                        // strategy takes full weight.
+                        1.0
+                    }
+                };
+                radiance += throughput * light_radiance * mis_w;
+            }
+            if bounce == 0 {
+                aux = Some(FirstHitAux::Miss);
             }
             break;
         };
@@ -760,10 +1385,86 @@ fn trace_path(
         let hit_pos = ray.at(hit.t);
         let wo = -ray.dir;
 
-        // Self-emission: only contribute on bounce 0 OR if we just took
-        // a specular bounce (no NEE was attempted).
-        if last_was_specular {
-            radiance += throughput * mat.emissive;
+        if bounce == 0 {
+            // Capture *first-hit* guidance for the feature-guided
+            // denoiser. `base_color` is the un-shaded albedo as used
+            // by Cycles' "Denoising Albedo" pass and OIDN. The normal
+            // is in world space (we deliberately do NOT transform it
+            // to camera space here: every consumer in this crate
+            // works in world space). `depth` is the parametric `t`
+            // of the primary ray, which equals world-space distance
+            // because the ray direction is unit length.
+            aux = Some(FirstHitAux::Hit {
+                albedo: mat.base_color,
+                normal: n,
+                depth: hit.t,
+            });
+        }
+
+        // Self-emission on a surface hit. Three regimes:
+        //
+        // * Bounce 0: `last_was_specular = true` (primary ray), so MIS
+        //   weight is 1.0 — there is no prior BSDF sample to combine
+        //   with. This is the "visible emitter" term and matches the
+        //   camera-rays-see-emitters convention every PBR renderer
+        //   uses.
+        // * Bounce ≥ 1 after a specular event: MIS weight is also 1.0,
+        //   because a delta BSDF cannot be sampled by NEE (NEE has no
+        //   way to pick the exact mirror direction), so the BSDF
+        //   strategy is the only one that could have produced the hit.
+        // * Bounce ≥ 1 after a diffuse / glossy event: both BSDF and
+        //   NEE could have produced this direction. Use the power
+        //   heuristic to combine, pairing the owning light's pdf with
+        //   the BSDF pdf (see per-light symmetric MIS above). If no
+        //   analytic light claims this emissive surface — a mesh with
+        //   non-zero emissive material that the scene converter did
+        //   *not* register as a `NativeLight` — MIS weight is 1.0 and
+        //   BSDF takes the full contribution (no double-count because
+        //   NEE never sampled it).
+        if mat.emissive.length_squared() > 0.0 {
+            let mis_w = if last_was_specular {
+                1.0
+            } else {
+                // Per-light symmetric MIS: find the analytic area
+                // light (if any) whose rectangle contains `hit_pos`,
+                // then pair THAT light's pdf with the BSDF pdf. For
+                // overlapping lights only the first matching one
+                // "owns" this hit — its pdf alone goes in the
+                // denominator so the partition
+                // `w_NEE(p_i, p_b) + w_BSDF(p_b, p_i) = 1` holds per
+                // light. If no analytic light claims this emissive
+                // surface (mesh with non-zero `mat.emissive` but the
+                // scene converter did *not* register it as an
+                // analytic light), MIS weight is 1.0 — BSDF takes
+                // full contribution because NEE never sampled it.
+                //
+                // Sun lights cannot "own" a surface hit: Sun has no
+                // geometric surface in scene.triangles, only an
+                // angular cone for the miss branch above.
+                // `area_light_contains_world_point` correctly
+                // returns false for non-Area variants.
+                let owning = scene
+                    .lights
+                    .iter()
+                    .find(|l| area_light_contains_world_point(l, hit_pos));
+                match owning {
+                    Some(light) => {
+                        let p = light_pdf(light, prev_hit_pos, ray.dir);
+                        if p > 0.0 {
+                            power_heuristic(prev_bsdf_pdf, p)
+                        } else {
+                            // Owning light's NEE pdf is zero in this
+                            // direction (e.g. back-face hit on a
+                            // one-sided area light). NEE never
+                            // samples this direction — BSDF takes
+                            // full weight.
+                            1.0
+                        }
+                    }
+                    None => 1.0,
+                }
+            };
+            radiance += throughput * mat.emissive * mis_w;
         }
 
         // Next-event estimation for each light.
@@ -809,14 +1510,17 @@ fn trace_path(
         }
 
         ray = Ray::new(hit_pos, sample.direction);
+        // Remember where this BSDF sample was taken from, so the next
+        // iteration can compute the owning light's NEE pdf from the
+        // same shading point when MIS-combining a BSDF-found emitter
+        // contribution.
+        prev_hit_pos = hit_pos;
     }
 
-    // Silence unused warning when last_was_specular ends specular but no
-    // further bounce happens — we still want the prev_bsdf_pdf available
-    // for callers that may extend this loop with environment MIS.
-    let _ = prev_bsdf_pdf;
-
-    radiance
+    // If max_bounces == 0 (a degenerate but valid config), neither the
+    // hit nor the miss branch above ran — fall back to Miss so the aux
+    // buffer's first-hit invariant ("primary ray got *some* aux") holds.
+    (radiance, aux.unwrap_or(FirstHitAux::Miss))
 }
 
 fn matrix_from_array(m: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
@@ -1151,5 +1855,362 @@ mod tests {
         );
         let b = pt.bvh.root_bounds();
         assert!(b.min.x > 8.0 && b.max.x < 12.0);
+    }
+
+    // ---- First-hit aux feature buffers ------------------------------
+
+    fn aux_test_camera() -> RenderCamera {
+        RenderCamera {
+            id: "aux-cam".into(),
+            position_mm: [0.0, 1500.0, 4000.0],
+            target_mm: [0.0, 0.0, 0.0],
+            focal_length_mm: 35.0,
+            exposure_ev: 0.0,
+            white_balance_k: 5500.0,
+            aperture_f: 4.0,
+        }
+    }
+
+    fn aux_test_config() -> PathTraceConfig {
+        PathTraceConfig {
+            width: 16,
+            height: 16,
+            samples_per_pixel: 2,
+            max_bounces: 2,
+            tile_size: 16,
+            russian_roulette_min_bounces: 3,
+            adaptive_threshold: 0.0,
+            projection: CameraProjection::Perspective,
+        }
+    }
+
+    #[test]
+    fn render_without_aux_leaves_aux_buffers_none() {
+        let scene = cornell_box_scene();
+        let materials = vec![{
+            let mut m = PathTraceMaterial::default_grey();
+            m.base_color = Vec3::new(0.8, 0.4, 0.2);
+            m
+        }];
+        let pt = PathTraceScene::from_render_scene(
+            &scene,
+            materials,
+            |id| if id == "floor" { Some(0) } else { None },
+            SkyParams::default(),
+        );
+        let buf = render(&pt, &aux_test_camera(), &aux_test_config(), None, None);
+        assert!(!buf.has_aux(), "render() must not allocate aux buffers");
+        assert!(buf.albedo.is_none());
+        assert!(buf.normal.is_none());
+        assert!(buf.depth.is_none());
+    }
+
+    #[test]
+    fn render_with_aux_populates_first_hit_albedo() {
+        // Floor with a distinctive base colour; first-hit albedo must
+        // be that colour (modulo float rounding) for every pixel the
+        // primary ray actually hits the floor.
+        let scene = cornell_box_scene();
+        let mut mat = PathTraceMaterial::default_grey();
+        mat.base_color = Vec3::new(0.8, 0.4, 0.2);
+        let pt = PathTraceScene::from_render_scene(
+            &scene,
+            vec![mat],
+            |id| if id == "floor" { Some(0) } else { None },
+            SkyParams {
+                strength: 0.0,
+                color: [0.0; 3],
+                turbidity: 2.0,
+            },
+        );
+        let buf = render_with_aux(&pt, &aux_test_camera(), &aux_test_config(), None, None);
+        assert!(buf.has_aux());
+        let albedo = buf.average_albedo().expect("aux requested");
+        let normal = buf.average_normal().expect("aux requested");
+        let depth = buf.average_depth().expect("aux requested");
+        // At least one pixel must show the floor's albedo (the camera
+        // looks at the floor; the floor fills most of the frame).
+        let floor_pixels = albedo
+            .iter()
+            .filter(|p| (p[0] - 0.8).abs() < 1e-3 && (p[1] - 0.4).abs() < 1e-3)
+            .count();
+        assert!(
+            floor_pixels > 0,
+            "expected at least one pixel to record the floor's base_color in the aux albedo buffer; got 0"
+        );
+        // Floor normal points up; at least some pixels should record it.
+        let up_pixels = normal.iter().filter(|n| n[1] > 0.99).count();
+        assert!(up_pixels > 0, "expected floor pixels with +Y normal in aux");
+        // Floor depth should be in metres (camera is at y=1.5 m, floor
+        // at y=0 m, so closest hit is ~1.5-4 m away).
+        let plausible_depth = depth.iter().filter(|d| **d > 1.0 && **d < 100.0).count();
+        assert!(
+            plausible_depth > 0,
+            "expected at least one plausible scene-unit depth in aux"
+        );
+    }
+
+    #[test]
+    fn render_with_aux_records_miss_sentinel_for_sky_pixels() {
+        // Camera staring into a sky-only world; every primary ray
+        // misses geometry. The miss sentinel is: albedo=0, normal
+        // anti-aligned with ray dir, depth=1e6.
+        let scene = RenderScene::new();
+        let pt = PathTraceScene::from_render_scene(
+            &scene,
+            vec![],
+            |_| None,
+            SkyParams {
+                strength: 1.0,
+                color: [0.5, 0.5, 0.5],
+                turbidity: 2.0,
+            },
+        );
+        let buf = render_with_aux(&pt, &aux_test_camera(), &aux_test_config(), None, None);
+        let albedo = buf.average_albedo().expect("aux requested");
+        let depth = buf.average_depth().expect("aux requested");
+        // Sky albedo must be zero (denoiser convention).
+        for p in &albedo {
+            assert!(
+                p[0].abs() < 1e-6 && p[1].abs() < 1e-6 && p[2].abs() < 1e-6,
+                "sky pixel must record black albedo, got {p:?}"
+            );
+        }
+        // Sky depth must be the large sentinel.
+        for d in &depth {
+            assert!(*d > 1.0e5, "sky pixel depth should be ~1e6, got {d}");
+        }
+    }
+
+    #[test]
+    fn aux_normal_average_is_unit_length() {
+        // The bilateral kernel dot-products the normal aux; if our
+        // `average_normal` doesn't re-normalise, the dot-product range
+        // is wrong and edge preservation degrades silently. This
+        // pins the normalisation invariant.
+        let scene = cornell_box_scene();
+        let mut mat = PathTraceMaterial::default_grey();
+        mat.base_color = Vec3::new(0.5, 0.5, 0.5);
+        let pt = PathTraceScene::from_render_scene(
+            &scene,
+            vec![mat],
+            |id| if id == "floor" { Some(0) } else { None },
+            SkyParams::default(),
+        );
+        let buf = render_with_aux(&pt, &aux_test_camera(), &aux_test_config(), None, None);
+        let normal = buf.average_normal().expect("aux requested");
+        for n in &normal {
+            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            // The re-normaliser collapses (0,0,0) to (0,0,0) explicitly
+            // (no hit recorded); accept either unit length OR zero.
+            assert!(
+                (len - 1.0).abs() < 1e-3 || len < 1e-3,
+                "averaged normal must be unit (or zero for un-touched pixels); got len={len}"
+            );
+        }
+    }
+
+    // ---- BSDF-found emitter MIS (correctness) -----------------------
+
+    #[test]
+    fn bsdf_sample_lands_on_emissive_geometry_without_double_counting() {
+        // Build a scene where an emissive *material* is on a piece of
+        // geometry that is NOT registered as an analytic light. The
+        // pre-MIS code dropped this contribution whenever
+        // `last_was_specular = false` (i.e. after a diffuse bounce).
+        // With MIS combining, a BSDF sample at bounce ≥ 1 that lands
+        // on the emissive material must contribute (MIS weight 1.0
+        // because no NEE sampler covers it), and the result must be
+        // strictly positive even without any direct lighting.
+        let mut scene = RenderScene::new();
+        // Diffuse floor at y=0.
+        scene.push_mesh(SerializedMesh {
+            id: "floor".into(),
+            indices: vec![0, 1, 2, 0, 2, 3],
+            positions: vec![
+                [-2.0, 0.0, -2.0],
+                [2.0, 0.0, -2.0],
+                [2.0, 0.0, 2.0],
+                [-2.0, 0.0, 2.0],
+            ],
+            normals: vec![[0.0, 1.0, 0.0]; 4],
+            uvs: vec![[0.0, 0.0]; 4],
+            material_id: Some("diffuse".into()),
+            transform: identity_matrix(),
+        });
+        // Emissive ceiling at y=4, pointing down.
+        scene.push_mesh(SerializedMesh {
+            id: "ceiling".into(),
+            indices: vec![0, 1, 2, 0, 2, 3],
+            positions: vec![
+                [-2.0, 4.0, -2.0],
+                [-2.0, 4.0, 2.0],
+                [2.0, 4.0, 2.0],
+                [2.0, 4.0, -2.0],
+            ],
+            normals: vec![[0.0, -1.0, 0.0]; 4],
+            uvs: vec![[0.0, 0.0]; 4],
+            material_id: Some("emissive".into()),
+            transform: identity_matrix(),
+        });
+        // Diffuse material + emissive material. No analytic lights:
+        // illumination must flow purely via BSDF-bounce-then-emissive.
+        let mut diffuse = PathTraceMaterial::default_grey();
+        diffuse.base_color = Vec3::new(0.7, 0.7, 0.7);
+        let mut emissive = PathTraceMaterial::default_grey();
+        emissive.emissive = Vec3::splat(20.0);
+        let mat_table = vec![diffuse, emissive];
+        let pt = PathTraceScene::from_render_scene(
+            &scene,
+            mat_table,
+            |id| match id {
+                "diffuse" => Some(0),
+                "emissive" => Some(1),
+                _ => None,
+            },
+            SkyParams {
+                strength: 0.0,
+                color: [0.0; 3],
+                turbidity: 2.0,
+            },
+        );
+        // Camera looks at the floor; first-hit is the floor; bounce 1
+        // sample may land on the emissive ceiling.
+        let camera = RenderCamera {
+            id: "c".into(),
+            position_mm: [0.0, 2000.0, 3000.0],
+            target_mm: [0.0, 0.0, 0.0],
+            focal_length_mm: 35.0,
+            exposure_ev: 0.0,
+            white_balance_k: 5500.0,
+            aperture_f: 4.0,
+        };
+        let cfg = PathTraceConfig {
+            width: 16,
+            height: 16,
+            // Many samples so at least some bounces hit the ceiling.
+            samples_per_pixel: 64,
+            max_bounces: 3,
+            tile_size: 16,
+            russian_roulette_min_bounces: 3,
+            adaptive_threshold: 0.0,
+            projection: CameraProjection::Perspective,
+        };
+        let buf = render(&pt, &camera, &cfg, None, None);
+        let avg = buf.average_rgb();
+        let max_lum = avg
+            .iter()
+            .map(|p| p[0] + p[1] + p[2])
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_lum > 0.0,
+            "BSDF-sampled emissive ceiling must illuminate the floor; got max_lum {max_lum}. \
+             Pre-MIS regression: the `last_was_specular` gate dropped this contribution."
+        );
+    }
+
+    #[test]
+    fn primary_ray_seeing_emissive_surface_contributes_full_radiance() {
+        // Direct visibility of an emissive surface (bounce 0) must
+        // produce the full emissive radiance, with no NEE weighting.
+        // This pins the camera-rays-see-emitters contract.
+        let mut scene = RenderScene::new();
+        scene.push_mesh(SerializedMesh {
+            id: "panel".into(),
+            indices: vec![0, 1, 2, 0, 2, 3],
+            positions: vec![
+                [-1.0, -1.0, 0.0],
+                [1.0, -1.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [-1.0, 1.0, 0.0],
+            ],
+            normals: vec![[0.0, 0.0, 1.0]; 4],
+            uvs: vec![[0.0, 0.0]; 4],
+            material_id: Some("emissive".into()),
+            transform: identity_matrix(),
+        });
+        let mut emissive = PathTraceMaterial::default_grey();
+        emissive.emissive = Vec3::new(5.0, 0.0, 0.0); // pure red
+        let pt = PathTraceScene::from_render_scene(
+            &scene,
+            vec![emissive],
+            |id| if id == "emissive" { Some(0) } else { None },
+            SkyParams {
+                strength: 0.0,
+                color: [0.0; 3],
+                turbidity: 2.0,
+            },
+        );
+        let camera = RenderCamera {
+            id: "c".into(),
+            position_mm: [0.0, 0.0, 3000.0],
+            target_mm: [0.0, 0.0, 0.0],
+            focal_length_mm: 35.0,
+            exposure_ev: 0.0,
+            white_balance_k: 5500.0,
+            aperture_f: 4.0,
+        };
+        let cfg = PathTraceConfig {
+            width: 16,
+            height: 16,
+            samples_per_pixel: 2,
+            max_bounces: 1,
+            tile_size: 16,
+            russian_roulette_min_bounces: 3,
+            adaptive_threshold: 0.0,
+            projection: CameraProjection::Perspective,
+        };
+        let buf = render(&pt, &camera, &cfg, None, None);
+        let avg = buf.average_rgb();
+        // Centre pixel must record red ≥ ~5.0 (or close to it, allowing
+        // for tone-map-free linear radiance accumulation).
+        let centre = avg[(cfg.height * cfg.width / 2 + cfg.width / 2) as usize];
+        assert!(
+            centre[0] > 4.0,
+            "primary ray must see full emissive radiance; got centre red {}",
+            centre[0]
+        );
+        assert!(
+            centre[1] < 0.5 && centre[2] < 0.5,
+            "primary ray must not bleed into green/blue; got centre {centre:?}"
+        );
+    }
+
+    #[test]
+    fn render_tile_pass_with_aux_includes_albedo_sums() {
+        let scene = cornell_box_scene();
+        let mut mat = PathTraceMaterial::default_grey();
+        mat.base_color = Vec3::new(0.7, 0.2, 0.9);
+        let pt = PathTraceScene::from_render_scene(
+            &scene,
+            vec![mat],
+            |id| if id == "floor" { Some(0) } else { None },
+            SkyParams::default(),
+        );
+        let cfg = aux_test_config();
+        let tile = Tile {
+            x_start: 0,
+            y_start: 0,
+            x_end: cfg.width,
+            y_end: cfg.height,
+        };
+        let pass =
+            render_tile_pass_with_aux(&pt, &aux_test_camera(), &cfg, tile, 4, 0, 0xDEAD_BEEF);
+        assert!(pass.albedo_sums.is_some());
+        assert!(pass.normal_sums.is_some());
+        assert!(pass.depth_sums.is_some());
+        let albedo = pass.albedo_sums.as_ref().unwrap();
+        // At least one pixel sums to the floor's albedo × samples.
+        let expected_r = 0.7 * 4.0;
+        let hit = albedo.iter().any(|a| (a[0] - expected_r).abs() < 1e-3);
+        assert!(
+            hit,
+            "expected at least one pixel summing to floor base_color × samples"
+        );
+        // Without aux capture, the legacy entry point still returns None.
+        let pass_no_aux = render_tile_pass(&pt, &aux_test_camera(), &cfg, tile, 4, 0, 0xDEAD_BEEF);
+        assert!(pass_no_aux.albedo_sums.is_none());
+        assert!(pass_no_aux.normal_sums.is_none());
+        assert!(pass_no_aux.depth_sums.is_none());
     }
 }
