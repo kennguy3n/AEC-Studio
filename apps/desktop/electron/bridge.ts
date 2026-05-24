@@ -723,6 +723,29 @@ interface NativeApi {
   command_undo(project_path: string, active_scope: string): unknown;
   command_redo(project_path: string, active_scope: string): unknown;
   project_graph_list(project_path: string, kind_filter: string | null | undefined): unknown;
+  // Render endpoints wired in PR-R. The `priority` and `scene_json`
+  // parameters on `render_enqueue` (and `scene_json` on
+  // `render_enqueue_batch`) are optional from napi-rs's POV;
+  // declaring them as required `unknown` here keeps the TS adaptor
+  // strict-mode happy without forcing the renderer to thread the
+  // optionality through every caller.
+  render_enqueue(
+    camera_id: string,
+    preset_id: string,
+    priority: number | null,
+    scene_json: string | null,
+  ): unknown;
+  render_enqueue_batch(
+    camera_ids: string[],
+    preset_ids: string[],
+    scene_json: string | null,
+  ): unknown;
+  render_batch_progress(batch_id: string): unknown;
+  render_list_jobs(): unknown;
+  render_cancel_job(job_id: string): unknown;
+  render_apply_preset(preset_id: string): unknown;
+  render_diagnose(job_id: string): unknown;
+  render_check_materials(): unknown;
 }
 
 /**
@@ -761,6 +784,19 @@ export const NATIVE_WIRED_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   "commandUndo",
   "commandRedo",
   "projectGraphList",
+  // Render queue + preset + doctor surface wired in Phase 10 PR-R.
+  // Backed by `BridgeService::render_state` (`Mutex<RenderState>`
+  // owning a `RenderQueue` + `RenderPresetStore`). Status / list
+  // endpoints take the read side of the napi singleton's `RwLock`
+  // so they don't block status-pane polls.
+  "renderEnqueue",
+  "renderEnqueueBatch",
+  "renderBatchProgress",
+  "renderListJobs",
+  "renderCancelJob",
+  "renderApplyPreset",
+  "renderDiagnose",
+  "renderCheckMaterials",
 ];
 
 /**
@@ -794,14 +830,6 @@ export const NATIVE_FALLBACK_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   "bimGenerateSchedule",
   "bimValidate",
   "bimDiff",
-  "renderEnqueue",
-  "renderEnqueueBatch",
-  "renderBatchProgress",
-  "renderListJobs",
-  "renderCancelJob",
-  "renderApplyPreset",
-  "renderDiagnose",
-  "renderCheckMaterials",
   "aiListTools",
   "aiPlan",
   "aiAcceptDiff",
@@ -880,6 +908,101 @@ function adaptNative(n: NativeApi): BridgeBackend {
       (n.project_graph_list(projectPath, kindFilter ?? null) as EntityRecordJs[]).map(
         decodeEntityRecordJs,
       ),
+    // ----- Render endpoints (PR-R) -----
+    //
+    // `renderEnqueue` accepts a loose `Record<string, unknown>` for
+    // back-compat with the in-process fallback. The native side has a
+    // strict signature; we extract `cameraId` / `preset` / `priority`
+    // / `sceneJson` defensively, falling back to safe defaults when
+    // the renderer omits a field (today's `Render` page never sends
+    // `priority` or `sceneJson`). An unknown preset id is a hard
+    // error on the Rust side — the resulting napi `Error` is
+    // re-thrown as a JS error and surfaces in the renderer's catch.
+    renderEnqueue: async (params) => {
+      const cameraId = typeof params.cameraId === "string" ? params.cameraId : "";
+      const preset = typeof params.preset === "string" ? params.preset : "";
+      const priority =
+        typeof params.priority === "number" && Number.isFinite(params.priority)
+          ? params.priority
+          : null;
+      const sceneJson =
+        typeof params.sceneJson === "string" && params.sceneJson.length > 0
+          ? params.sceneJson
+          : null;
+      return n.render_enqueue(cameraId, preset, priority, sceneJson) as {
+        jobId: string;
+      };
+    },
+    renderEnqueueBatch: async (params) => {
+      // `sceneJson` is not on the typed `RenderEnqueueBatchParams`
+      // surface (the renderer's BatchRenderModal doesn't send it
+      // today), but the native side accepts it for forward
+      // compatibility with the in-process queue. We pull it
+      // defensively via a typeof-narrowed cast through `unknown`.
+      const candidate = (params as unknown as { sceneJson?: unknown }).sceneJson;
+      const sceneJson =
+        typeof candidate === "string" && candidate.length > 0 ? candidate : null;
+      const presetIds =
+        params.presetIds && params.presetIds.length > 0
+          ? params.presetIds
+          : params.presetId
+            ? [params.presetId]
+            : [];
+      return n.render_enqueue_batch(
+        params.cameraIds,
+        presetIds,
+        sceneJson,
+      ) as {
+        batchId: string;
+        jobIds: string[];
+      };
+    },
+    renderBatchProgress: async (batchId) =>
+      n.render_batch_progress(batchId) as {
+        batchId: string;
+        total: number;
+        queued: number;
+        running: number;
+        completed: number;
+        failed: number;
+        cancelled: number;
+        averageProgress: number;
+      } | null,
+    renderListJobs: async () => n.render_list_jobs() as RenderJob[],
+    renderCancelJob: async (jobId) => {
+      // Invoke the native call for its side effect (status transition
+      // to Cancelled, or a no-op for a job that already reached a
+      // terminal state). The TS contract is the literal
+      // `{ cancelled: true }` — distinguishing "I cancelled a running
+      // job" from "I no-op'd an already-completed job" is intentionally
+      // not exposed because the renderer's Cancel button is
+      // idempotent. The native short-circuit-on-terminal information
+      // is still surfaced via the service-layer log on the Rust side.
+      n.render_cancel_job(jobId);
+      return { cancelled: true };
+    },
+    renderApplyPreset: async (params) => {
+      const presetId = typeof params.preset === "string" ? params.preset : "";
+      // Invoke the native call for its side effect (preset store
+      // selection update). The TS contract is `{ ok: true }`; the
+      // resolved active preset id is available to the caller via a
+      // follow-up `renderListJobs` (jobs queued after the apply
+      // carry the new preset).
+      n.render_apply_preset(presetId);
+      return { ok: true };
+    },
+    renderDiagnose: async (jobId) =>
+      n.render_diagnose(jobId) as { jobId: string; suggestions: string[] },
+    renderCheckMaterials: async () =>
+      n.render_check_materials() as {
+        findings: Array<{
+          code: string;
+          severity: "info" | "warning" | "error";
+          materialId: string | null;
+          message: string;
+          fix: string | null;
+        }>;
+      },
   };
   // Self-check: the two catalogues above must, together, reference every
   // method on the in-process backend. We throw rather than warn so a new

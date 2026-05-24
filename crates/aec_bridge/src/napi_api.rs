@@ -681,6 +681,248 @@ pub fn runtime_status() -> Result<RuntimeStatusJs> {
     })
 }
 
+// ----- Render endpoints (Phase 10 PR-R) -----
+//
+// JS-facing render queue + preset + doctor surface. Every struct in this
+// section is field-aligned with the corresponding TS interface in
+// `apps/desktop/electron/bridge.ts` — drift is a runtime bug surfaced
+// as `undefined` on the renderer side.
+//
+// All endpoints route through `with_service_ref_fallible`: the service
+// methods are `&self` with interior mutability behind a `Mutex` (see
+// `BridgeService::render_state`), so the napi singleton's outer
+// `RwLock` only needs the *read* side. This means a long
+// `render_enqueue_batch` (N cameras × M presets) does NOT block a
+// concurrent `project_engine_status` poll for status-pane refresh.
+
+/// JS-facing render-job summary. Mirrors the `RenderJob` interface
+/// in `apps/desktop/electron/bridge.ts`. The full Rust
+/// [`aec_render::RenderJob`] carries a `RenderScene` + per-frame
+/// resume markers; both are intentionally absent here — the queue
+/// view never displays them, and shipping the scene through every
+/// `render_list_jobs` poll would be cripplingly expensive for
+/// non-trivial projects.
+#[napi(object)]
+pub struct RenderJobJs {
+    pub job_id: String,
+    pub status: String,
+    pub preset: String,
+    /// `0.0..=1.0`. Carried as `f64` for the napi-rs Number
+    /// conversion (`f32` would force an extra `as f64` on every
+    /// progress update for no precision gain).
+    pub progress: f64,
+    pub camera_id: Option<String>,
+    pub batch_id: Option<String>,
+}
+
+impl From<crate::service::RenderJobSummary> for RenderJobJs {
+    fn from(s: crate::service::RenderJobSummary) -> Self {
+        Self {
+            job_id: s.job_id,
+            status: s.status,
+            preset: s.preset,
+            progress: s.progress as f64,
+            camera_id: s.camera_id,
+            batch_id: s.batch_id,
+        }
+    }
+}
+
+/// JS-facing render-batch progress aggregate. Mirrors the
+/// `renderBatchProgress` return shape in
+/// `apps/desktop/electron/bridge.ts`. Per-status counts are
+/// `u32` because no realistic project ever queues more than 4
+/// billion render jobs at once; the cast at the service-layer
+/// projection saturates at `u32::MAX` defensively.
+#[napi(object)]
+pub struct RenderBatchProgressJs {
+    pub batch_id: String,
+    pub total: u32,
+    pub queued: u32,
+    pub running: u32,
+    pub completed: u32,
+    pub failed: u32,
+    pub cancelled: u32,
+    pub average_progress: f64,
+}
+
+impl From<crate::service::RenderBatchProgressReport> for RenderBatchProgressJs {
+    fn from(r: crate::service::RenderBatchProgressReport) -> Self {
+        Self {
+            batch_id: r.batch_id,
+            total: r.total,
+            queued: r.queued,
+            running: r.running,
+            completed: r.completed,
+            failed: r.failed,
+            cancelled: r.cancelled,
+            average_progress: r.average_progress as f64,
+        }
+    }
+}
+
+/// JS-facing render-doctor finding. Mirrors the per-finding object
+/// shape returned by `renderCheckMaterials` in
+/// `apps/desktop/electron/bridge.ts`.
+///
+/// `material_id` is nullable because the doctor uses placeholder
+/// strings (`<material>` / `<unknown>`) for findings that aren't
+/// associated with a real material id; the service-layer
+/// projection turns those into `None` rather than leaking the
+/// placeholder through.
+#[napi(object)]
+pub struct RenderMaterialFindingJs {
+    pub code: String,
+    pub severity: String,
+    pub material_id: Option<String>,
+    pub message: String,
+    pub fix: Option<String>,
+}
+
+impl From<crate::service::RenderMaterialFinding> for RenderMaterialFindingJs {
+    fn from(f: crate::service::RenderMaterialFinding) -> Self {
+        Self {
+            code: f.code,
+            severity: f.severity,
+            material_id: f.material_id,
+            message: f.message,
+            fix: f.fix,
+        }
+    }
+}
+
+#[napi(object)]
+pub struct RenderCheckMaterialsJs {
+    pub findings: Vec<RenderMaterialFindingJs>,
+}
+
+impl From<crate::service::RenderCheckMaterialsReport> for RenderCheckMaterialsJs {
+    fn from(r: crate::service::RenderCheckMaterialsReport) -> Self {
+        Self {
+            findings: r.findings.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[napi(object)]
+pub struct RenderDiagnoseJs {
+    pub job_id: String,
+    pub suggestions: Vec<String>,
+}
+
+impl From<crate::service::RenderDiagnoseReport> for RenderDiagnoseJs {
+    fn from(r: crate::service::RenderDiagnoseReport) -> Self {
+        Self {
+            job_id: r.job_id,
+            suggestions: r.suggestions,
+        }
+    }
+}
+
+#[napi(object)]
+pub struct RenderEnqueueJs {
+    pub job_id: String,
+}
+
+#[napi(object)]
+pub struct RenderEnqueueBatchJs {
+    pub batch_id: String,
+    pub job_ids: Vec<String>,
+}
+
+#[napi(object)]
+pub struct RenderCancelJs {
+    pub cancelled: bool,
+}
+
+#[napi(object)]
+pub struct RenderApplyPresetJs {
+    pub ok: bool,
+    pub active_preset_id: String,
+}
+
+/// Submit a render job for `camera_id` at the resolved `preset_id`.
+///
+/// `priority` defaults to `0` when callers send a missing / null
+/// value (napi-rs surfaces `Option<f64>` for nullable numbers; we
+/// truncate to `i32` because the queue's priority field is `i32`).
+/// `scene_json` is the optional serialised [`aec_render::RenderScene`]
+/// for the job — the doctor / diagnose paths run against this scene.
+#[napi]
+pub fn render_enqueue(
+    camera_id: String,
+    preset_id: String,
+    priority: Option<f64>,
+    scene_json: Option<String>,
+) -> Result<RenderEnqueueJs> {
+    let priority = priority.map_or(0, |p| p as i32);
+    with_service_ref_fallible(|svc| {
+        svc.render_enqueue(&camera_id, &preset_id, priority, scene_json.as_deref())
+    })
+    .map(|r| RenderEnqueueJs { job_id: r.job_id })
+}
+
+/// Submit a batch: one job per (camera × preset) pair. Empty
+/// `camera_ids` or empty `preset_ids` is a hard error — silently
+/// substituting defaults would hide a renderer-side dropdown bug.
+#[napi]
+pub fn render_enqueue_batch(
+    camera_ids: Vec<String>,
+    preset_ids: Vec<String>,
+    scene_json: Option<String>,
+) -> Result<RenderEnqueueBatchJs> {
+    with_service_ref_fallible(|svc| {
+        svc.render_enqueue_batch(&camera_ids, &preset_ids, scene_json.as_deref())
+    })
+    .map(|r| RenderEnqueueBatchJs {
+        batch_id: r.batch_id,
+        job_ids: r.job_ids,
+    })
+}
+
+/// Return progress for the given batch id, or `null` (via
+/// `Option::None`) when no jobs match. Mirrors the JS contract
+/// where a stale batch id is a no-op on the UI side.
+#[napi]
+pub fn render_batch_progress(batch_id: String) -> Result<Option<RenderBatchProgressJs>> {
+    with_service_ref_fallible(|svc| svc.render_batch_progress(&batch_id))
+        .map(|opt| opt.map(Into::into))
+}
+
+#[napi]
+pub fn render_list_jobs() -> Result<Vec<RenderJobJs>> {
+    with_service_ref_fallible(super::service::BridgeService::render_list_jobs)
+        .map(|v| v.into_iter().map(Into::into).collect())
+}
+
+#[napi]
+pub fn render_cancel_job(job_id: String) -> Result<RenderCancelJs> {
+    with_service_ref_fallible(|svc| svc.render_cancel_job(&job_id)).map(|r| RenderCancelJs {
+        cancelled: r.cancelled,
+    })
+}
+
+#[napi]
+pub fn render_apply_preset(preset_id: String) -> Result<RenderApplyPresetJs> {
+    with_service_ref_fallible(|svc| svc.render_apply_preset(&preset_id)).map(|r| {
+        RenderApplyPresetJs {
+            ok: r.ok,
+            active_preset_id: r.active_preset_id,
+        }
+    })
+}
+
+#[napi]
+pub fn render_diagnose(job_id: String) -> Result<RenderDiagnoseJs> {
+    with_service_ref_fallible(|svc| svc.render_diagnose(&job_id)).map(Into::into)
+}
+
+#[napi]
+pub fn render_check_materials() -> Result<RenderCheckMaterialsJs> {
+    with_service_ref_fallible(super::service::BridgeService::render_check_materials)
+        .map(Into::into)
+}
+
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
     if s.len() % 2 != 0 {
         return None;
