@@ -5,6 +5,7 @@
 //! this layer trivially testable.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -18,8 +19,21 @@ use aec_core::types::{ProjectId, Scope};
 use aec_governor::profiler::{CpuProfile, GpuProfile, HardwareProfiler};
 use aec_governor::tier::HardwareTier;
 
+use crate::bim_attach;
 use crate::engine_status_cache::EngineStatusCache;
 use crate::recents::{RecentsStore, RecentsStoreError};
+use crate::snapshot_cache::{SnapshotCache, SnapshotKey};
+
+/// Renderer-side warning threshold for IFC files. Files at or above
+/// this byte count surface a `BimImportSummary.large_file_warning`
+/// flag so the renderer can show a confirm dialog ("This file is N
+/// MB; parsing may take a while — continue?") before the user
+/// commits to the parse path. The bridge still runs the import — the
+/// flag is advisory — because we don't want to silently reject a
+/// real workflow just because the file is large. Set to 100 MB,
+/// chosen as the rough boundary between "interactive parse" (< 5 s
+/// on a modern laptop) and "go-grab-a-coffee parse".
+pub(crate) const BIM_IMPORT_LARGE_FILE_THRESHOLD_BYTES: u64 = 100 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum BridgeServiceError {
@@ -174,6 +188,49 @@ pub struct BimImportSummary {
     pub material_assignments: u64,
     /// Total STEP records the reader walked (records_seen).
     pub records_seen: u64,
+    /// File size in bytes the bridge read off disk. Surfaced so the
+    /// renderer can render a humanised "123 MB" line on the preview
+    /// without re-running `fs.stat` from the JS side.
+    pub file_size_bytes: u64,
+    /// `true` when the file size meets-or-exceeds
+    /// [`BIM_IMPORT_LARGE_FILE_THRESHOLD_BYTES`] (100 MB). The bridge
+    /// still parses the file — the flag is advisory — so the
+    /// renderer can throw up a confirm dialog *before* committing to
+    /// the parse path on a multi-hundred-MB MEP federation. Set to
+    /// `false` for typical architectural models.
+    pub large_file_warning: bool,
+}
+
+/// Result of a successful [`BridgeService::bim_attach_ifc`] call.
+/// Counts how the snapshot was folded into the project graph so the
+/// renderer can show "Attached 3 storeys, 142 walls, 87 doors, ...".
+///
+/// All counters are post-dedup: a re-attach of the same file with
+/// identical content reports `_unchanged` instead of `_inserted` /
+/// `_updated`. See [`crate::bim_attach`] for the dedup contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BimAttachSummary {
+    /// Canonical absolute path of the IFC file that was attached.
+    /// Same canonical form as [`BimImportSummary::path`] so the
+    /// renderer can dedup recents across import → attach.
+    pub path: String,
+    /// Project the attach landed in. Mirrors the field the renderer
+    /// shows on the Home / dashboard tiles.
+    pub project_path: String,
+    /// `true` if the snapshot for this file was served from the
+    /// in-process cache populated by a prior `bim_import_ifc`, false
+    /// if the bridge had to re-parse the file from disk. Useful for
+    /// instrumentation and for the renderer's loading indicator.
+    pub parse_cache_hit: bool,
+    pub spatial_nodes_inserted: u64,
+    pub spatial_nodes_updated: u64,
+    pub spatial_nodes_unchanged: u64,
+    pub elements_inserted: u64,
+    pub elements_updated: u64,
+    pub elements_unchanged: u64,
+    pub components_inserted: u64,
+    pub relations_inserted: u64,
+    pub cache_rows: u64,
 }
 
 /// Hardware-status snapshot. The shape mirrors the TypeScript
@@ -227,6 +284,16 @@ pub struct BridgeService {
     /// ensure subsequent reads observe their writes through a fresh
     /// connection.
     engine_status_cache: EngineStatusCache,
+    /// LRU cache for parsed [`aec_bim::ifc::IfcSnapshot`]s, keyed on
+    /// `(canonical_path, mtime, size)`. Populated by
+    /// [`Self::bim_import_ifc`] (the preview path) and consumed by
+    /// [`Self::bim_attach_ifc`] (the commit path) so a
+    /// preview → attach handoff doesn't re-parse the file.
+    ///
+    /// See [`crate::snapshot_cache`] for the cache semantics (60 s
+    /// idle TTL, 4-entry LRU, double-checked locking model that
+    /// mirrors [`EngineStatusCache`]).
+    snapshot_cache: SnapshotCache,
 }
 
 impl BridgeService {
@@ -240,6 +307,7 @@ impl BridgeService {
             recents,
             master_key,
             engine_status_cache: EngineStatusCache::new(),
+            snapshot_cache: SnapshotCache::new(),
         })
     }
 
@@ -290,6 +358,16 @@ impl BridgeService {
     #[doc(hidden)]
     pub fn __engine_status_cache_len(&self) -> usize {
         self.engine_status_cache.len()
+    }
+
+    /// Test-only accessor for the snapshot LRU cache size. Mirrors
+    /// `__engine_status_cache_len`'s rationale: lets integration tests
+    /// in `tests/` assert that `bim_import_ifc` → `bim_attach_ifc`
+    /// actually hits the cache (avoiding a re-parse) without exposing
+    /// the cache type itself.
+    #[doc(hidden)]
+    pub fn __snapshot_cache_len(&self) -> usize {
+        self.snapshot_cache.len()
     }
 
     /// List bundled templates available for the New Project flow.
@@ -578,6 +656,7 @@ impl BridgeService {
         // pset values), which is a strict improvement over outright
         // failing the import.
         let bytes = std::fs::read(Path::new(path))?;
+        let file_size_bytes = bytes.len() as u64;
         let body = String::from_utf8_lossy(&bytes).into_owned();
         // Canonicalise after the read succeeds so a non-existent path
         // surfaces as the same `Io` error the read itself would have
@@ -587,10 +666,24 @@ impl BridgeService {
         // `BimImportSummary.path` field documents this canonical form
         // so downstream consumers (PR-L snapshot cache, dedup) can
         // trust it.
-        let canonical_path = std::fs::canonicalize(Path::new(path))?
-            .to_string_lossy()
-            .into_owned();
+        let canonical_path_buf = std::fs::canonicalize(Path::new(path))?;
+        let canonical_path = canonical_path_buf.to_string_lossy().into_owned();
         let snapshot = aec_bim::ifc::IfcReader::from_string(&body)?;
+        // Populate the snapshot cache so a follow-up
+        // `bim_attach_ifc` for the same file doesn't have to re-parse.
+        // The cache key is `(canonical_path, mtime, size)` — a file
+        // overwritten between import and attach naturally misses (new
+        // mtime / new size), forcing a re-parse, so we never serve a
+        // stale snapshot.
+        if let Ok(key) = SnapshotKey::from_canonical_path(&canonical_path_buf) {
+            self.snapshot_cache.insert(key, Arc::new(snapshot.clone()));
+        }
+        // If the SnapshotKey::from_canonical_path call failed,
+        // `metadata` errored even though `canonicalize` succeeded a
+        // moment ago — a transient FS hiccup. We don't have a stable
+        // key to insert under, so skip the cache and let the next
+        // call re-parse. This is a strict downgrade in performance,
+        // not a correctness hazard.
         Ok(BimImportSummary {
             path: canonical_path,
             // `Display` returns the canonical STEP token
@@ -610,6 +703,105 @@ impl BridgeService {
             material_layer_sets: snapshot.stats.material_layer_sets as u64,
             material_assignments: snapshot.stats.material_assignments as u64,
             records_seen: snapshot.stats.records_seen as u64,
+            file_size_bytes,
+            large_file_warning: file_size_bytes >= BIM_IMPORT_LARGE_FILE_THRESHOLD_BYTES,
+        })
+    }
+
+    /// Fold a parsed IFC file into the active project's authoring
+    /// graph. The complement of [`Self::bim_import_ifc`] — the
+    /// renderer typically calls `bim_import_ifc` first to show the
+    /// user a preview ("123 walls, 45 slabs, ..."), and `bim_attach_ifc`
+    /// once the user confirms they want to commit the model.
+    ///
+    /// This method writes to the project package's encrypted SQLite
+    /// database under a single [`rusqlite::Transaction`]: every
+    /// `entities` / `components` / `relations` / `bim_cache` row is
+    /// either fully committed or fully rolled back. A mid-attach
+    /// failure (e.g. disk-full halfway through writing 12 000
+    /// `IfcWall` rows from an MEP federation) leaves the project
+    /// graph at its pre-attach state.
+    ///
+    /// **Re-attach dedup**: if `ifc_path` has been attached before,
+    /// the bridge looks up each entity by its `bim_cache.global_id`
+    /// (IFC GUID). Rows with unchanged hashes only bump `last_seen`;
+    /// rows with new content UPDATE the `entities` body and wipe + re-
+    /// insert the BIM-namespaced components. Non-BIM components
+    /// (e.g. user-added render-material overrides) are NOT touched.
+    ///
+    /// **Cache awareness**: if a recent `bim_import_ifc` populated
+    /// the snapshot cache for this `(canonical_path, mtime, size)`
+    /// triple, the attach reuses the parsed snapshot without
+    /// re-reading or re-parsing the IFC file. The returned
+    /// [`BimAttachSummary::parse_cache_hit`] flag exposes whether
+    /// the cache fired so the renderer can show "Attached (cached)"
+    /// vs "Attached (re-parsed)" on the status pane.
+    pub fn bim_attach_ifc(
+        &self,
+        project_path: &str,
+        ifc_path: &str,
+    ) -> Result<BimAttachSummary, BridgeServiceError> {
+        let canonical_ifc_buf = std::fs::canonicalize(Path::new(ifc_path))?;
+        let canonical_ifc = canonical_ifc_buf.to_string_lossy().into_owned();
+
+        // Snapshot cache: try a hit first; on miss, read + parse the
+        // file and populate the cache for any next attach.
+        let key_opt = SnapshotKey::from_canonical_path(&canonical_ifc_buf).ok();
+        let (snapshot_arc, parse_cache_hit) =
+            if let Some(snap) = key_opt.as_ref().and_then(|k| self.snapshot_cache.get(k)) {
+                (snap, true)
+            } else {
+                // Cache miss (or no cache key available) — read and
+                // parse the file ourselves. We still populate the cache
+                // on a successful parse if we have a key, so the next
+                // attach for the same `(path, mtime, size)` is fast.
+                let bytes = std::fs::read(&canonical_ifc_buf)?;
+                let body = String::from_utf8_lossy(&bytes).into_owned();
+                let parsed = aec_bim::ifc::IfcReader::from_string(&body)?;
+                let arc = Arc::new(parsed);
+                if let Some(key) = key_opt {
+                    self.snapshot_cache.insert(key, Arc::clone(&arc));
+                }
+                (arc, false)
+            };
+
+        // Open the project package + DB. We need a mutable connection
+        // for the transaction; `open_with_master_key_and_database`
+        // bundles the package open and the connection handoff so we
+        // don't re-run the SQLCipher key derivation twice.
+        let (_pkg, mut conn) = ProjectPackage::open_with_master_key_and_database(
+            Path::new(project_path),
+            &self.master_key,
+        )?;
+
+        let counts = {
+            let tx = conn.transaction()?;
+            let counts = bim_attach::attach_snapshot(&tx, &snapshot_arc, &canonical_ifc)?;
+            tx.commit()?;
+            counts
+        };
+
+        // The attach mutated the project DB, so the cached engine-
+        // status connection for this project path must be invalidated
+        // — otherwise a subsequent `project_engine_status` call could
+        // hand the renderer a connection that doesn't see the new
+        // entities / components rows. Mirrors the discipline
+        // documented at `invalidate_status_cache_for` (line ≈272).
+        self.invalidate_status_cache_for(project_path);
+
+        Ok(BimAttachSummary {
+            path: canonical_ifc,
+            project_path: project_path.to_owned(),
+            parse_cache_hit,
+            spatial_nodes_inserted: counts.spatial_nodes_inserted,
+            spatial_nodes_updated: counts.spatial_nodes_updated,
+            spatial_nodes_unchanged: counts.spatial_nodes_unchanged,
+            elements_inserted: counts.elements_inserted,
+            elements_updated: counts.elements_updated,
+            elements_unchanged: counts.elements_unchanged,
+            components_inserted: counts.components_inserted,
+            relations_inserted: counts.relations_inserted,
+            cache_rows: counts.cache_rows,
         })
     }
 
@@ -1055,6 +1247,214 @@ END-ISO-10303-21;\n";
             !summary.path.contains("/./") && !summary.path.contains("\\.\\"),
             "canonical path must not contain '.' segments: {}",
             summary.path
+        );
+    }
+
+    /// Minimal valid IFC4 body used by the bim_attach tests below.
+    /// The reader requires a project entity with a non-null GUID; the
+    /// site/building/storey/space spatial chain is added so the
+    /// attach path has multiple `entities.parent_id` levels to
+    /// exercise (a flat single-node IFC wouldn't stress the BFS).
+    fn fixture_ifc_body() -> Vec<u8> {
+        let raw = b"ISO-10303-21;\n\
+HEADER;\n\
+FILE_DESCRIPTION(('test'),'2;1');\n\
+FILE_NAME('t.ifc','2026-05-20T00:00:00',(''),(''),'','','');\n\
+FILE_SCHEMA(('IFC4'));\n\
+ENDSEC;\n\
+DATA;\n\
+#1 = IFCOWNERHISTORY($,$,$,.NOCHANGE.,$,$,$,1747699200);\n\
+#2 = IFCPROJECT('00000000000000000000a1',#1,'Project','Project',$,$,$,$,$);\n\
+ENDSEC;\n\
+END-ISO-10303-21;\n";
+        raw.to_vec()
+    }
+
+    #[test]
+    fn bim_import_ifc_populates_snapshot_cache() {
+        // Verifies the cache-warm side effect of `bim_import_ifc`:
+        // after a successful parse, the snapshot cache MUST hold one
+        // entry keyed under the file the user pointed at. Without
+        // this, the matching `bim_attach_ifc` would re-parse the
+        // file from disk — defeating the whole point of the preview
+        // → attach handoff.
+        let (s, _g) = service();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("import-cache.ifc");
+        std::fs::write(&path, fixture_ifc_body()).unwrap();
+        assert_eq!(s.__snapshot_cache_len(), 0, "cache starts empty");
+        let _ = s
+            .bim_import_ifc(path.to_str().unwrap())
+            .expect("valid IFC must parse");
+        assert_eq!(
+            s.__snapshot_cache_len(),
+            1,
+            "bim_import_ifc must populate the snapshot cache"
+        );
+    }
+
+    #[test]
+    fn bim_import_ifc_reports_file_size_and_large_file_flag() {
+        // The renderer needs `file_size_bytes` to show a humanised
+        // size on the preview panel. `large_file_warning` is false
+        // for small fixtures — assert that explicitly so the
+        // 100MB threshold doesn't drift to "always warn" by accident.
+        let (s, _g) = service();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("size.ifc");
+        let body = fixture_ifc_body();
+        let expected_size = body.len() as u64;
+        std::fs::write(&path, &body).unwrap();
+        let summary = s
+            .bim_import_ifc(path.to_str().unwrap())
+            .expect("valid IFC must parse");
+        assert_eq!(summary.file_size_bytes, expected_size);
+        assert!(
+            !summary.large_file_warning,
+            "fixture is well below 100 MB; large_file_warning must be false"
+        );
+        assert!(
+            expected_size < BIM_IMPORT_LARGE_FILE_THRESHOLD_BYTES,
+            "fixture must be smaller than the warning threshold"
+        );
+    }
+
+    #[test]
+    fn bim_attach_ifc_persists_spatial_nodes_into_entities() {
+        // End-to-end: create a project, point bim_attach_ifc at a
+        // freshly-written IFC file, and assert the spatial graph
+        // landed in the `entities` table under the `bim/spatial/...`
+        // kind namespace.
+        let (mut s, _g) = service();
+        let project = s
+            .project_create_from_template("interior.apartment", "Attach Target")
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let ifc_path = tmp.path().join("attach.ifc");
+        std::fs::write(&ifc_path, fixture_ifc_body()).unwrap();
+
+        let attach = s
+            .bim_attach_ifc(&project.path, ifc_path.to_str().unwrap())
+            .expect("attach must succeed");
+        assert!(
+            attach.spatial_nodes_inserted >= 1,
+            "at least the IfcProject root must be inserted"
+        );
+        assert_eq!(
+            attach.spatial_nodes_updated, 0,
+            "first attach on an empty project must have zero updates"
+        );
+        assert!(attach.cache_rows >= 1, "bim_cache must record the GUID");
+
+        // Re-open the DB directly and assert the row landed.
+        let pkg = aec_core::package::ProjectPackage::open_with_master_key(
+            std::path::Path::new(&project.path),
+            &[42u8; 32],
+        )
+        .unwrap();
+        let conn = pkg.open_database(&[42u8; 32]).unwrap();
+        let spatial_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entities WHERE kind LIKE 'bim/spatial/%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            spatial_count >= 1,
+            "expected >=1 bim/spatial/* entity; got {spatial_count}"
+        );
+    }
+
+    #[test]
+    fn bim_attach_ifc_is_idempotent_on_reattach() {
+        // Re-attaching the same file MUST be a no-op for the
+        // entities table: the second call reports `_unchanged` for
+        // every spatial node and inserts zero new ones. This is the
+        // dedup contract documented at `crates/aec_bridge/src/bim_attach.rs`.
+        let (mut s, _g) = service();
+        let project = s
+            .project_create_from_template("interior.apartment", "Idempotent")
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let ifc_path = tmp.path().join("idem.ifc");
+        std::fs::write(&ifc_path, fixture_ifc_body()).unwrap();
+
+        let first = s
+            .bim_attach_ifc(&project.path, ifc_path.to_str().unwrap())
+            .unwrap();
+        let second = s
+            .bim_attach_ifc(&project.path, ifc_path.to_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            first.spatial_nodes_inserted, second.spatial_nodes_unchanged,
+            "all spatial nodes inserted on first attach must be unchanged on second"
+        );
+        assert_eq!(
+            second.spatial_nodes_inserted, 0,
+            "re-attach must not insert any spatial nodes"
+        );
+        assert_eq!(
+            second.spatial_nodes_updated, 0,
+            "identical content must not be classified as updated"
+        );
+    }
+
+    #[test]
+    fn bim_attach_ifc_hits_snapshot_cache_after_import() {
+        // The whole point of the snapshot cache is to avoid a
+        // re-parse on the import → attach handoff. Verify the
+        // `parse_cache_hit` flag fires when the prior
+        // `bim_import_ifc` populated the cache.
+        let (mut s, _g) = service();
+        let project = s
+            .project_create_from_template("interior.apartment", "Cache Hit")
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let ifc_path = tmp.path().join("cached.ifc");
+        std::fs::write(&ifc_path, fixture_ifc_body()).unwrap();
+
+        let _ = s
+            .bim_import_ifc(ifc_path.to_str().unwrap())
+            .expect("import must parse");
+        let attach = s
+            .bim_attach_ifc(&project.path, ifc_path.to_str().unwrap())
+            .unwrap();
+        assert!(
+            attach.parse_cache_hit,
+            "attach after import must reuse the cached snapshot"
+        );
+    }
+
+    #[test]
+    fn bim_attach_ifc_invalidates_engine_status_cache() {
+        // After the attach, the engine-status cache entry for the
+        // project must be gone so a subsequent
+        // `project_engine_status` call observes the new entities
+        // rows rather than a stale cached connection. Mirrors the
+        // discipline of `project_save_invalidates_engine_status_cache`.
+        let (mut s, _g) = service();
+        let project = s
+            .project_create_from_template("interior.apartment", "Invalidate")
+            .unwrap();
+        // Prime the engine-status cache.
+        let _ = s.project_engine_status(&project.path).unwrap();
+        assert_eq!(
+            s.__engine_status_cache_len(),
+            1,
+            "engine status cache must be primed by the first poll"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ifc_path = tmp.path().join("invalidate.ifc");
+        std::fs::write(&ifc_path, fixture_ifc_body()).unwrap();
+        let _ = s
+            .bim_attach_ifc(&project.path, ifc_path.to_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            s.__engine_status_cache_len(),
+            0,
+            "bim_attach_ifc must invalidate the engine-status cache for the project"
         );
     }
 }

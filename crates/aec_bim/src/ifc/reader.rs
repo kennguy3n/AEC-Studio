@@ -215,6 +215,15 @@ impl IfcReader {
         // `IfcRelAssociatesMaterial` whose `RelatingMaterial` is a usage
         // must be followed one hop to reach the real set.
         let mut material_layer_set_usage_step: HashMap<u32, u32> = HashMap::new();
+        // Orientation metadata extracted from the same
+        // `IfcMaterialLayerSetUsage`. Used in Stage 3 to attach a
+        // synthetic `AEC_LayerSetUsage` Pset to each element bound
+        // through the usage indirection, so the writer can re-emit
+        // a real `IfcMaterialLayerSetUsage` wrapper on export. See
+        // [`crate::materials::AEC_LAYER_SET_USAGE_PSET`] for the
+        // contract; without this side-channel, AEC Studio's own
+        // round-trip would silently drop per-wall layer orientation.
+        let mut material_layer_set_usage_meta: HashMap<u32, LayerSetUsageMeta> = HashMap::new();
 
         for g in &groups {
             match g.kind.as_str() {
@@ -395,17 +404,40 @@ impl IfcReader {
                     //                            OffsetFromReferenceLine,
                     //                            ReferenceExtent)
                     //
-                    // Orientation / offset metadata is intentionally
-                    // dropped here — AEC Studio's project graph stores
-                    // material assignments without per-wall layer
-                    // direction (the LayerSetDirection / DirectionSense
-                    // fields are reconstructed on export from element
-                    // geometry). What we DO need is the `ForLayerSet`
-                    // ref so a downstream `IfcRelAssociatesMaterial`
-                    // pointing at this usage can be followed through to
-                    // the underlying `IfcMaterialLayerSet`.
+                    // We record both the `ForLayerSet` indirection
+                    // (used by Stage 3 to resolve assignments through
+                    // the usage wrapper) AND the orientation metadata
+                    // (LayerSetDirection / DirectionSense /
+                    // OffsetFromReferenceLine) so the writer can
+                    // re-emit a real `IfcMaterialLayerSetUsage` on
+                    // export. The metadata is stored on the element
+                    // as a synthetic `AEC_LayerSetUsage` Pset — see
+                    // Stage 3 below and the writer's IfcRelAssociates
+                    // Material section.
+                    //
+                    // `ReferenceExtent` (arg 4) is ignored: it's a
+                    // measure mandated by the schema but used by no
+                    // real BIM consumer for round-trip purposes, and
+                    // the writer reproduces it as `$` (not-provided)
+                    // on the way back out.
                     if let Ok(layer_set_ref) = g.ref_arg(0) {
                         material_layer_set_usage_step.insert(g.step_id, layer_set_ref);
+                        let direction = step_enum_arg(g, 1);
+                        let sense = step_enum_arg(g, 2);
+                        let offset = g
+                            .args
+                            .get(3)
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty() && *s != "$")
+                            .and_then(parse_step_real);
+                        material_layer_set_usage_meta.insert(
+                            g.step_id,
+                            LayerSetUsageMeta {
+                                direction,
+                                sense,
+                                offset_m: offset,
+                            },
+                        );
                     }
                 }
                 other => {
@@ -734,6 +766,7 @@ impl IfcReader {
             // Hop through `IfcMaterialLayerSetUsage` to its `ForLayerSet`
             // ref before any other lookup. Real-world exports almost
             // always go through the usage indirection.
+            let usage_meta = material_layer_set_usage_meta.get(mat_ref).cloned();
             let effective_ref = material_layer_set_usage_step
                 .get(mat_ref)
                 .copied()
@@ -758,8 +791,23 @@ impl IfcReader {
                     .map(|el| el.entity.clone())
                     .or_else(|| spatial.get(elem_step).map(|sp| sp.entity.clone()));
                 if let Some(entity) = entity_opt {
-                    if materials_store.assign_to_element(entity, assignment.clone()) {
+                    if materials_store.assign_to_element(entity.clone(), assignment.clone()) {
                         material_assignment_count += 1;
+                        // Attach the layer-set usage metadata as a
+                        // synthetic Pset so the writer round-trips
+                        // it through `IfcMaterialLayerSetUsage`.
+                        // Only emit when:
+                        //   (1) the assignment came through the
+                        //       usage indirection (otherwise there's
+                        //       no metadata to preserve), AND
+                        //   (2) the assignment is a LayerSet (a
+                        //       single Material has no usage wrapper
+                        //       in the IFC schema).
+                        if let (Some(meta), MaterialAssignment::LayerSet(_)) =
+                            (usage_meta.as_ref(), &assignment)
+                        {
+                            attach_layer_set_usage_pset(&mut props, entity, meta);
+                        }
                     }
                 }
             }
@@ -1762,6 +1810,78 @@ fn optional_string_arg(g: &StepRecord, idx: usize) -> IfcReadResult<Option<Strin
         )));
     }
     Ok(Some(unescape_step_string(&s[1..s.len() - 1])))
+}
+
+/// Captured `IfcMaterialLayerSetUsage` orientation metadata. The
+/// reader bundles these three fields together so Stage 3 can pass a
+/// single value into [`attach_layer_set_usage_pset`]; the writer
+/// reverse-engineers it from the synthetic `AEC_LayerSetUsage` Pset
+/// to emit a real `IfcMaterialLayerSetUsage` wrapper on export.
+///
+/// `direction` and `sense` are STEP enum literals like `.AXIS2.`,
+/// `.POSITIVE.`. Stored verbatim (including the leading + trailing
+/// `.`) so the writer can emit them back without re-encoding. `None`
+/// for any field means the source file had `$` in that slot.
+#[derive(Debug, Clone)]
+struct LayerSetUsageMeta {
+    direction: Option<String>,
+    sense: Option<String>,
+    offset_m: Option<f64>,
+}
+
+/// Decode a STEP enum argument (`.AXIS2.`, `.POSITIVE.`, `.UNSET.`,
+/// ...) at `idx`. Returns `None` when the slot is `$` or missing.
+/// The returned string includes the surrounding `.` delimiters so
+/// callers can pass it straight back to the writer.
+fn step_enum_arg(g: &StepRecord, idx: usize) -> Option<String> {
+    let raw = g.args.get(idx)?;
+    let s = raw.trim();
+    if s == "$" || s.is_empty() {
+        return None;
+    }
+    // Don't be strict about the delimiter shape — the writer is the
+    // canonical source of truth and emits well-formed `.NAME.` enum
+    // literals. Hand-edited files might omit the trailing `.`; we
+    // still preserve the raw token so the writer can re-emit it.
+    Some(s.to_owned())
+}
+
+/// Attach the `AEC_LayerSetUsage` synthetic Pset to `entity` in
+/// `properties`. Skips writing if all three fields are `None` (the
+/// usage wrapper existed but carried no orientation info \u2014 in that
+/// case the writer can fall back to a direct layer-set ref without
+/// losing anything).
+fn attach_layer_set_usage_pset(
+    properties: &mut crate::properties::PropertyStore,
+    entity: EntityId,
+    meta: &LayerSetUsageMeta,
+) {
+    use crate::materials::{
+        AEC_LAYER_SET_USAGE_KEY_DIRECTION, AEC_LAYER_SET_USAGE_KEY_OFFSET,
+        AEC_LAYER_SET_USAGE_KEY_SENSE, AEC_LAYER_SET_USAGE_PSET,
+    };
+    use crate::properties::{PropertySet, PropertyValue};
+
+    if meta.direction.is_none() && meta.sense.is_none() && meta.offset_m.is_none() {
+        return;
+    }
+    let mut pset = PropertySet::new(AEC_LAYER_SET_USAGE_PSET);
+    if let Some(d) = &meta.direction {
+        pset.set(
+            AEC_LAYER_SET_USAGE_KEY_DIRECTION,
+            PropertyValue::Label(d.clone()),
+        );
+    }
+    if let Some(s) = &meta.sense {
+        pset.set(
+            AEC_LAYER_SET_USAGE_KEY_SENSE,
+            PropertyValue::Label(s.clone()),
+        );
+    }
+    if let Some(o) = meta.offset_m {
+        pset.set(AEC_LAYER_SET_USAGE_KEY_OFFSET, PropertyValue::Length(o));
+    }
+    properties.entry(entity).upsert_pset(pset);
 }
 
 /// Decode an entity reference (`#N`) argument at `idx`, returning

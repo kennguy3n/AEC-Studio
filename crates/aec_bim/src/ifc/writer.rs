@@ -30,7 +30,10 @@ use thiserror::Error;
 use aec_core::types::EntityId;
 
 use crate::classification::{ClassificationStore, IfcClass};
-use crate::materials::{MaterialAssignment, MaterialStore};
+use crate::materials::{
+    MaterialAssignment, MaterialStore, AEC_LAYER_SET_USAGE_KEY_DIRECTION,
+    AEC_LAYER_SET_USAGE_KEY_OFFSET, AEC_LAYER_SET_USAGE_KEY_SENSE, AEC_LAYER_SET_USAGE_PSET,
+};
 use crate::properties::{PropertyStore, PropertyValue};
 use crate::spatial::Project;
 
@@ -337,6 +340,18 @@ DATA;\n";
                 continue;
             };
             for (name, pset) in &props.psets {
+                // Skip the synthetic `AEC_LayerSetUsage` Pset — it's a
+                // side-channel the reader uses to preserve
+                // `IfcMaterialLayerSetUsage` metadata, not a real
+                // user-facing Pset. The material section below
+                // re-emits it as a proper IfcMaterialLayerSetUsage
+                // wrapper. Emitting it here too would (a) duplicate
+                // the metadata in the output and (b) silently leak
+                // into BIM-tool BoQ / Pset reports as `AEC_LayerSetUsage`
+                // rows, which would confuse downstream consumers.
+                if name == AEC_LAYER_SET_USAGE_PSET {
+                    continue;
+                }
                 let prop_steps: Vec<u32> = pset
                     .properties
                     .iter()
@@ -513,16 +528,30 @@ DATA;\n";
                 );
             }
             // Group element ↔ material bindings by the material /
-            // layer-set side so we emit one `IfcRelAssociatesMaterial`
-            // per material with a list of associated elements (rather
-            // than one rel per element). This mirrors how authoring
-            // tools (Revit, ArchiCAD) emit the relation and keeps the
-            // STEP file small.
+            // layer-set side AND (for layer-sets) by per-element
+            // `IfcMaterialLayerSetUsage` metadata so we emit one
+            // `IfcRelAssociatesMaterial` per (set + usage) combo
+            // with a list of associated elements. Two walls with
+            // identical (set, direction, sense, offset) share a rel;
+            // two walls that diverge on any usage field get separate
+            // rels (and separate `IfcMaterialLayerSetUsage` wrapper
+            // steps, since the wrapper carries the per-instance
+            // metadata).
             //
             // BTreeMap so iteration is deterministic (alphabetical
-            // by material name) — matters for the byte-identical
-            // round-trip guarantee.
-            let mut by_material: BTreeMap<(bool, String), Vec<u32>> = BTreeMap::new();
+            // by material name, then by usage key) — matters for the
+            // byte-identical round-trip guarantee.
+            //
+            // The grouping key for `Single` assignments is
+            // `(false, name, None)`. For `LayerSet` assignments it is
+            // `(true, name, Some(LayerSetUsageKey { ... }))` when the
+            // element has a synthetic `AEC_LayerSetUsage` Pset, or
+            // `(true, name, None)` when it doesn't (the writer falls
+            // back to a direct layer-set ref, preserving the
+            // pre-feature behaviour for assignments that don't carry
+            // usage metadata).
+            let mut by_material: BTreeMap<(bool, String, Option<LayerSetUsageKey>), Vec<u32>> =
+                BTreeMap::new();
             for (entity, assignment) in materials.assignments() {
                 // Per IFC4 schema, `IfcRelAssociatesMaterial.RelatedObjects`
                 // is `SET[1:?] OF IfcObjectDefinition` — same supertype
@@ -543,23 +572,48 @@ DATA;\n";
                     continue;
                 };
                 let key = match assignment {
-                    MaterialAssignment::Single(name) => (false, name.clone()),
-                    MaterialAssignment::LayerSet(name) => (true, name.clone()),
+                    MaterialAssignment::Single(name) => (false, name.clone(), None),
+                    MaterialAssignment::LayerSet(name) => {
+                        let usage = LayerSetUsageKey::from_property_store(properties, entity);
+                        (true, name.clone(), usage)
+                    }
                 };
                 by_material.entry(key).or_default().push(*elem_step);
             }
-            for ((is_layer_set, name), elem_steps) in by_material {
-                let mat_ref = if is_layer_set {
+            for ((is_layer_set, name, usage), elem_steps) in by_material {
+                let direct_mat_ref = if is_layer_set {
                     layer_set_step.get(&name).copied()
                 } else {
                     material_step.get(&name).copied()
                 };
-                let Some(mat_ref) = mat_ref else {
+                let Some(direct_mat_ref) = direct_mat_ref else {
                     continue;
+                };
+                // If this is a LayerSet assignment with usage
+                // metadata, emit an `IfcMaterialLayerSetUsage`
+                // wrapper and have the rel reference that wrapper
+                // instead of the bare layer-set. This is the inverse
+                // of the reader's `material_layer_set_usage_step`
+                // indirection — see reader.rs ≈730.
+                let (mat_ref, usage_tag) = if let Some(ref usage) = usage {
+                    let wrap = buf.alloc();
+                    buf.write_line(
+                        wrap,
+                        format!(
+                            "IFCMATERIALLAYERSETUSAGE(#{set},{dir},{sense},{offset},$)",
+                            set = direct_mat_ref,
+                            dir = usage.step_direction(),
+                            sense = usage.step_sense(),
+                            offset = usage.step_offset(),
+                        ),
+                    );
+                    (wrap, usage.guid_suffix())
+                } else {
+                    (direct_mat_ref, String::new())
                 };
                 let rel = buf.alloc();
                 let rel_guid = derive_guid_from_str(&format!(
-                    "rel-mat::{kind}::{name}",
+                    "rel-mat::{kind}::{name}::{usage_tag}",
                     kind = if is_layer_set { "set" } else { "single" },
                 ));
                 buf.write_line(
@@ -841,5 +895,125 @@ fn format_real(x: f64) -> String {
         format!("{:.1}", x)
     } else {
         format!("{}", x)
+    }
+}
+
+/// Per-element `IfcMaterialLayerSetUsage` orientation captured from
+/// the synthetic `AEC_LayerSetUsage` Pset. Used as a sub-key inside
+/// the writer's `by_material` map so two walls with the same layer
+/// set but different per-instance offset get distinct
+/// `IfcMaterialLayerSetUsage` wrappers + distinct
+/// `IfcRelAssociatesMaterial` rels — matching how Revit / ArchiCAD
+/// emit the relation.
+///
+/// The offset is stored as the IEEE-754 bit pattern to make the type
+/// `Ord` + `Hash` + `Eq` (which `f64` is not). Two walls with the same
+/// offset value (down to the bit) share a rel; the writer doesn't
+/// fuzz-match nearby offsets together because that would change the
+/// output behaviour silently and IFC round-trip determinism matters
+/// more than a few bytes saved in the STEP file.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct LayerSetUsageKey {
+    /// STEP enum literal for `LayerSetDirection` (e.g. `.AXIS2.` for
+    /// walls). `None` when the source Pset didn't have a direction
+    /// entry, in which case the writer emits `$`.
+    direction: Option<String>,
+    /// STEP enum literal for `DirectionSense` (`.POSITIVE.` /
+    /// `.NEGATIVE.`). `None` → `$` on emission.
+    sense: Option<String>,
+    /// IEEE-754 bit pattern of `OffsetFromReferenceLine` in metres.
+    /// `None` → `$` on emission.
+    offset_bits: Option<u64>,
+}
+
+impl LayerSetUsageKey {
+    /// Recover the usage metadata from `properties.entry(entity)`'s
+    /// `AEC_LayerSetUsage` synthetic Pset, if present. Returns
+    /// `None` when the element has no such Pset or the Pset is
+    /// empty (i.e. all three fields are missing) — in either case
+    /// the writer falls back to a direct `IfcMaterialLayerSet` ref.
+    fn from_property_store(
+        properties: &PropertyStore,
+        entity: &EntityId,
+    ) -> Option<LayerSetUsageKey> {
+        let props = properties.get(entity)?;
+        let pset = props.psets.get(AEC_LAYER_SET_USAGE_PSET)?;
+        let direction = pset
+            .properties
+            .get(AEC_LAYER_SET_USAGE_KEY_DIRECTION)
+            .and_then(label_value);
+        let sense = pset
+            .properties
+            .get(AEC_LAYER_SET_USAGE_KEY_SENSE)
+            .and_then(label_value);
+        let offset_bits = pset
+            .properties
+            .get(AEC_LAYER_SET_USAGE_KEY_OFFSET)
+            .and_then(length_value)
+            .map(f64::to_bits);
+        if direction.is_none() && sense.is_none() && offset_bits.is_none() {
+            return None;
+        }
+        Some(LayerSetUsageKey {
+            direction,
+            sense,
+            offset_bits,
+        })
+    }
+
+    /// Emit the STEP literal for `LayerSetDirection`, or `$` when
+    /// the field is missing in the source Pset.
+    fn step_direction(&self) -> String {
+        self.direction.clone().unwrap_or_else(|| "$".to_string())
+    }
+
+    /// Emit the STEP literal for `DirectionSense`, or `$` when the
+    /// field is missing.
+    fn step_sense(&self) -> String {
+        self.sense.clone().unwrap_or_else(|| "$".to_string())
+    }
+
+    /// Emit the STEP literal for `OffsetFromReferenceLine`, or `$`
+    /// when the field is missing. Reuses [`format_real`] so the
+    /// offset goes through the same canonical real-literal formatter
+    /// as material-layer thickness.
+    fn step_offset(&self) -> String {
+        self.offset_bits
+            .map(f64::from_bits)
+            .map_or_else(|| "$".to_string(), format_real)
+    }
+
+    /// Per-usage tag mixed into the `derive_guid_from_str` seed so
+    /// two walls bound to the same layer set with different usage
+    /// metadata get distinct `IfcRelAssociatesMaterial.GlobalId`
+    /// values. Without this, both rels would derive the same GUID
+    /// and any conformance checker (Solibri, IFC4-validators) would
+    /// flag the duplicate.
+    fn guid_suffix(&self) -> String {
+        format!(
+            "{}|{}|{}",
+            self.direction.as_deref().unwrap_or("$"),
+            self.sense.as_deref().unwrap_or("$"),
+            self.offset_bits
+                .map_or_else(|| "$".to_string(), |b| b.to_string()),
+        )
+    }
+}
+
+fn label_value(v: &PropertyValue) -> Option<String> {
+    match v {
+        PropertyValue::Label(s) | PropertyValue::Text(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+fn length_value(v: &PropertyValue) -> Option<f64> {
+    match v {
+        PropertyValue::Length(x)
+        | PropertyValue::Real(x)
+        | PropertyValue::Area(x)
+        | PropertyValue::Volume(x)
+        | PropertyValue::Ratio(x) => Some(*x),
+        _ => None,
     }
 }

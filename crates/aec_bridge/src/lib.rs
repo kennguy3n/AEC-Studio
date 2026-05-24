@@ -5,15 +5,17 @@
 //! Those functions delegate to [`service`], which is plain Rust and
 //! straightforward to unit-test.
 
+mod bim_attach;
 mod engine_status_cache;
 pub mod recents;
 pub mod service;
+mod snapshot_cache;
 
 #[cfg(feature = "napi")]
 pub mod napi_api;
 
 pub use recents::{RecentsStore, RecentsStoreError};
 pub use service::{
-    BridgeConfig, BridgeService, BridgeServiceError, EngineStatusReport, ProjectSummary,
-    RuntimeStatusReport, TemplateChoice,
+    BimAttachSummary, BimImportSummary, BridgeConfig, BridgeService, BridgeServiceError,
+    EngineStatusReport, ProjectSummary, RuntimeStatusReport, TemplateChoice,
 };
