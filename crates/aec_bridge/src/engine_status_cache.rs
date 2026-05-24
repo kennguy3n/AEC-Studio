@@ -278,9 +278,9 @@ impl EngineStatusCache {
             // `with_conn` stamps `last_used = Instant::now()` *without*
             // holding the cache mutex, so a concurrent `with_conn` on
             // a different cache entry can finish *between* this
-            // function's `now = Instant::now()` capture (line 254) and
-            // the per-entry `last_used.lock()` here. That makes it
-            // possible to observe `last_used > now`. In current Rust
+            // function's `now` capture above and the per-entry
+            // `last_used.lock()` here. That makes it possible to
+            // observe `last_used > now`. In current Rust
             // `Instant::duration_since` saturates to `Duration::ZERO`
             // in that case, but the std-lib docs explicitly warn
             // "Future versions may reintroduce the panic in some
