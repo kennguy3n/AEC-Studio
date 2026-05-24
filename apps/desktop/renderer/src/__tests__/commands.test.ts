@@ -11,6 +11,7 @@ import {
   paintMaterial,
   projectGraphList,
   saveCamera,
+  setLighting,
 } from "../api/commands";
 
 /**
@@ -225,5 +226,53 @@ describe("renderer command surface", () => {
   it("undo on an empty journal rejects with a clear error", async () => {
     const projectPath = `/projects/empty_${Date.now()}.aecstudio`;
     await expect(commandUndo(projectPath, "design")).rejects.toThrow(/nothing to undo/i);
+  });
+
+  // Pins the audit-only contract for `design.set_lighting`. The Rust
+  // engine returns zero `EntityDelta`s for `SetLighting`, so the
+  // in-process fallback must do the same — otherwise undoing a
+  // lighting change would silently revert an entity body in dev/test
+  // mode but be a no-op on the native backend.
+  it("setLighting produces zero deltas (audit-only) but advances the undo journal", async () => {
+    const projectPath = `/projects/set_lighting_${Date.now()}.aecstudio`;
+    await createWall(projectPath, {
+      entity_id: "wall_lit",
+      start_mm: [0, 0],
+      end_mm: [4500, 0],
+      height_mm: 2700,
+      thickness_mm: 100,
+    });
+    const before = await projectGraphList(projectPath, "wall");
+    expect(before).toHaveLength(1);
+    const wallBodyBefore = before[0]!.body;
+
+    const result = await setLighting(projectPath, { preset_id: "warm_evening" });
+    expect(result.applied).toEqual([]);
+    expect(result.undoLen).toBe(2); // create_wall + set_lighting both recorded
+    expect(result.redoLen).toBe(0);
+
+    // The wall body must be unchanged — set_lighting is audit-only.
+    const afterApply = await projectGraphList(projectPath, "wall");
+    expect(afterApply).toHaveLength(1);
+    expect(afterApply[0]!.body).toEqual(wallBodyBefore);
+
+    // Undoing set_lighting must not touch the graph either.
+    const undone = await commandUndo(projectPath, "design");
+    expect(undone.applied).toEqual([]);
+    expect(undone.undoLen).toBe(1);
+    expect(undone.redoLen).toBe(1);
+    const afterUndo = await projectGraphList(projectPath, "wall");
+    expect(afterUndo).toHaveLength(1);
+    expect(afterUndo[0]!.body).toEqual(wallBodyBefore);
+  });
+
+  it("setLighting rejects empty preset_id", async () => {
+    const projectPath = `/projects/set_lighting_invalid_${Date.now()}.aecstudio`;
+    await expect(setLighting(projectPath, { preset_id: "" })).rejects.toThrow(
+      /preset_id must not be empty/i,
+    );
+    await expect(setLighting(projectPath, { preset_id: "   " })).rejects.toThrow(
+      /preset_id must not be empty/i,
+    );
   });
 });

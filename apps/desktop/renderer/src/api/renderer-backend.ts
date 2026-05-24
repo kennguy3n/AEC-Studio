@@ -466,7 +466,6 @@ function commandMock() {
       tool === "design.move_opening" ||
       tool === "design.paint_material" ||
       tool === "design.swap_finish" ||
-      tool === "design.set_lighting" ||
       tool === "design.update_camera"
     ) {
       const id = args.entity_id as string | undefined;
@@ -475,6 +474,19 @@ function commandMock() {
       if (!existing) throw new Error(`${tool}: entity not found: ${id}`);
       const after = { ...(existing.body as Record<string, unknown>), ...args };
       return [{ kind: "update", id, before: existing.body, after }];
+    }
+    if (tool === "design.set_lighting") {
+      // Audit-only command: mirrors
+      // `aec_command::engine::CommandEngine::compute_deltas`'s
+      // `SetLighting` arm, which returns zero `EntityDelta`s. The
+      // journal entry still gets pushed (forward = inverse = []),
+      // preserving the round-trip property for undo/redo without
+      // mutating the graph.
+      const presetId = args.preset_id as string | undefined;
+      if (!presetId || presetId.trim() === "") {
+        throw new Error("design.set_lighting: preset_id must not be empty");
+      }
+      return [];
     }
     throw new Error(`commandApply (renderer-fallback): unsupported tool: ${tool}`);
   };

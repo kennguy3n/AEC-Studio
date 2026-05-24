@@ -224,10 +224,17 @@ export async function saveCamera(
   );
 }
 
-/** Build + apply `design.set_lighting`. */
+/**
+ * Build + apply `design.set_lighting`. The Rust
+ * `aec_command::commands::lighting::SetLighting` struct is
+ * `{ preset_id: String }` — there is no `entity_id` because the command
+ * is audit-only and applies a scene-wide lighting preset rather than
+ * mutating a specific entity. Field name must be `preset_id` (not
+ * `preset`) to roundtrip through serde on the native backend.
+ */
 export async function setLighting(
   projectPath: string,
-  args: { entity_id: string; preset: string },
+  args: { preset_id: string },
 ): Promise<CommandApplyResult> {
   return commandApply(
     projectPath,

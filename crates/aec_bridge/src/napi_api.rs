@@ -549,13 +549,14 @@ impl From<aec_command::commands::EntityRecord> for EntityRecordJs {
 /// so the SQL and in-memory layers advance in lock-step, and
 /// returns the resulting deltas + audit envelope.
 ///
-/// Routes through `with_service_ref_fallible` because
-/// [`crate::service::BridgeService::command_apply`] is `&mut self`
-/// at the signature level but uses interior mutability (the project
-/// DB connection serialises writes through `Mutex<rusqlite::Connection>`).
-/// We use the *mut* helper here because the service-level method
-/// mutates the engine-status cache; otherwise a stale row count
-/// could be served after a command lands.
+/// Routes through `with_service` (the `&mut self` helper) because
+/// [`crate::service::BridgeService::command_apply`] takes `&mut self`
+/// to mutate the engine-status cache after a command lands — without
+/// taking the write lock here, a status poll racing against the apply
+/// could read a stale row count. The DB connection itself serialises
+/// writes through `Mutex<rusqlite::Connection>`, so the outer lock is
+/// not protecting on-disk state, only the in-memory caches that hang
+/// off [`crate::service::BridgeService`].
 #[napi]
 pub fn command_apply(project_path: String, command_json: String) -> Result<CommandApplyResultJs> {
     let cmd: aec_command::commands::Command = serde_json::from_str(&command_json).map_err(|e| {

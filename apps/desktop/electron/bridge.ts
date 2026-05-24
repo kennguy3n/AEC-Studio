@@ -1444,7 +1444,6 @@ function computeForwardDeltas(graph: InProcessGraph, command: Command): EntityDe
     case "design.move_opening":
     case "design.paint_material":
     case "design.swap_finish":
-    case "design.set_lighting":
     case "design.update_camera": {
       const id = args?.entity_id as string | undefined;
       if (!id) throw new Error(`${command.tool}: missing entity_id`);
@@ -1452,6 +1451,21 @@ function computeForwardDeltas(graph: InProcessGraph, command: Command): EntityDe
       if (!existing) throw new Error(`${command.tool}: entity not found: ${id}`);
       const after = { ...(existing.body as Record<string, unknown>), ...(args ?? {}) };
       return [{ kind: "update", id, before: existing.body, after }];
+    }
+    case "design.set_lighting": {
+      // Mirror the Rust engine: lighting preset is captured as audit-only
+      // state with **zero** entity deltas (see
+      // `aec_command::engine::CommandEngine::compute_deltas`'s `SetLighting`
+      // arm). Producing an Update here would let the in-process fallback
+      // silently diverge from the native backend's undo/redo semantics —
+      // undoing a SetLighting must be a no-op against the graph, not a
+      // body revert. We still validate `preset_id` so a missing field
+      // surfaces at apply-time rather than as a silent shadow.
+      const presetId = args?.preset_id as string | undefined;
+      if (!presetId || presetId.trim() === "") {
+        throw new Error("design.set_lighting: preset_id must not be empty");
+      }
+      return [];
     }
     default:
       throw new Error(`commandApply (in-process): unsupported tool: ${command.tool}`);
