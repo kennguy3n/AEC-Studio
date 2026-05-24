@@ -1454,29 +1454,14 @@ impl BridgeService {
         project_path: &str,
         ifc_path: &str,
     ) -> Result<BimAttachSummary, BridgeServiceError> {
-        let canonical_ifc_buf = std::fs::canonicalize(Path::new(ifc_path))?;
-        let canonical_ifc = canonical_ifc_buf.to_string_lossy().into_owned();
-
-        // Snapshot cache: try a hit first; on miss, read + parse the
-        // file and populate the cache for any next attach.
-        let key_opt = SnapshotKey::from_canonical_path(&canonical_ifc_buf).ok();
-        let (snapshot_arc, parse_cache_hit) =
-            if let Some(snap) = key_opt.as_ref().and_then(|k| self.snapshot_cache.get(k)) {
-                (snap, true)
-            } else {
-                // Cache miss (or no cache key available) — read and
-                // parse the file ourselves. We still populate the cache
-                // on a successful parse if we have a key, so the next
-                // attach for the same `(path, mtime, size)` is fast.
-                let bytes = std::fs::read(&canonical_ifc_buf)?;
-                let body = String::from_utf8_lossy(&bytes).into_owned();
-                let parsed = aec_bim::ifc::IfcReader::from_string(&body)?;
-                let arc = Arc::new(parsed);
-                if let Some(key) = key_opt {
-                    self.snapshot_cache.insert(key, Arc::clone(&arc));
-                }
-                (arc, false)
-            };
+        // Cache-fronted parse via the shared helper that PR-T's
+        // read-only methods also use. Previously this method had its
+        // own inline copy of the canonicalise → cache lookup → read →
+        // parse → cache populate dance; consolidating onto
+        // `load_ifc_snapshot` ensures all five call sites share one
+        // implementation of the cache contract (Devin Review
+        // ANALYSIS_pr-T_0006).
+        let (snapshot_arc, parse_cache_hit, canonical_ifc) = self.load_ifc_snapshot(ifc_path)?;
 
         // Open the project package + DB. We need a mutable connection
         // for the transaction; `open_with_master_key_and_database`

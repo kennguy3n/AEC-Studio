@@ -1478,40 +1478,31 @@ export function inProcessBackend(): BridgeBackend {
       };
     },
     // In-process implementations for the four read-only BIM ops
-    // wired in PR-T. These mirror the napi service-layer
-    // semantics 1:1: parse the source IFC (via `aec_bim`'s
-    // pure-Rust reader, transpiled? — no, we don't have a JS IFC
-    // reader, so we shell out via a vitest fallback that
-    // exercises only the path-validation + summary-shape contract
-    // and returns realistic empty / zero-finding payloads).
+    // wired in PR-T. They return zeroed-out, wire-format-compliant
+    // payloads — no filesystem access, no placeholder file writes.
     //
-    // Concretely: in the vitest renderer-only path there is no
-    // .node artefact loaded, so these stubs are exercised by
-    // tests that check the renderer's parameter marshalling and
-    // result-shape narrowing — not the actual IFC parse pipeline
-    // (covered by `tests/bim_readonly_ops.rs`). The stubs validate
-    // their input paths exist on disk so a renderer that fat-
-    // fingers `sourcePath` gets the same `ENOENT` error in
-    // dev-mode that it would get from the native bridge.
+    // Rationale: this dev-mode/test backend is invoked by the
+    // renderer when the .node artefact isn't loaded. The demo
+    // `Bim.tsx` page (and other UI surfaces wired in this PR) pass
+    // synthetic `demo://project.ifc` paths that aren't expected to
+    // exist on disk; an earlier draft of these stubs called
+    // `fs.promises.access(...)` against the source path, which
+    // raised `ENOENT` and broke every BIM-toolbar action in dev
+    // mode (Devin Review BUG_pr-T_0001).
+    //
+    // The existing pattern from PR-O / PR-P (`bimImportIfc`,
+    // `bimCheckFileSize`, `bimAttachIfc` above) is to return
+    // shape-faithful zero data without touching the filesystem; the
+    // renderer's status panes only need a typed object, and the
+    // actual IFC pipeline is exercised end-to-end by
+    // `crates/aec_bridge/tests/bim_readonly_ops.rs`. Keep these
+    // stubs aligned with that pattern.
     async bimExportIfc(params) {
-      await fs.promises.access(params.sourcePath);
-      // Mirror the native: write a placeholder STEP envelope to
-      // `outPath` so downstream code that follows the export with
-      // a read sees a real (if minimal) file. The bytes match the
-      // ISO-10303-21 header structure even though they're an
-      // empty model — the renderer's "Export BIM" panel just
-      // checks the file exists and has a non-zero size.
-      const placeholder =
-        "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION(('AEC dev-mode placeholder'),'2;1');\n" +
-        "FILE_NAME('aec_studio.ifc','2026-05-20T00:00:00',('AEC Studio'),('Studio'),'AEC Studio','AEC Studio','');\n" +
-        "FILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\nENDSEC;\nEND-ISO-10303-21;\n";
-      await fs.promises.writeFile(params.outPath, placeholder, "utf-8");
-      const stat = await fs.promises.stat(params.outPath);
       return {
         sourcePath: params.sourcePath,
         outPath: params.outPath,
         schema: "IFC4",
-        bytesWritten: stat.size,
+        bytesWritten: 0,
         parseCacheHit: false,
       };
     },
@@ -1522,32 +1513,18 @@ export function inProcessBackend(): BridgeBackend {
       return { ok: true };
     },
     async bimGenerateSchedule(params) {
-      await fs.promises.access(params.sourcePath);
-      // Write a placeholder XLSX (zero-byte file is fine for the
-      // dev-mode stub; the renderer's status code just checks
-      // that the path appeared on disk). Realistic row / column
-      // counts mirror the schedule kinds in `aec_bim`:
-      // door = 8, window = 9, room = 7, material = 4.
-      await fs.promises.writeFile(params.outPath, "");
-      const columnsByKind: Record<typeof params.kind, number> = {
-        door: 8,
-        window: 9,
-        room: 7,
-        material: 4,
-      };
       return {
         scheduleId: id("sched"),
         kind: params.kind,
         sourcePath: params.sourcePath,
         outPath: params.outPath,
         rows: 0,
-        columns: columnsByKind[params.kind] ?? 0,
+        columns: 0,
         bytesWritten: 0,
         parseCacheHit: false,
       };
     },
     async bimValidate(params) {
-      await fs.promises.access(params.sourcePath);
       return {
         ok: true,
         sourcePath: params.sourcePath,
@@ -1559,8 +1536,6 @@ export function inProcessBackend(): BridgeBackend {
       };
     },
     async bimDiff(params) {
-      await fs.promises.access(params.beforePath);
-      await fs.promises.access(params.afterPath);
       return {
         diffId: id("diff"),
         beforePath: params.beforePath,

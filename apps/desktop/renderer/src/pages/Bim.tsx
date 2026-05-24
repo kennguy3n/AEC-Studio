@@ -15,10 +15,11 @@ import {
   ScheduleKind,
   ScheduleRow,
 } from "../components/bim/ScheduleView";
+import { ValidatorPanel } from "../components/bim/ValidatorPanel";
 import {
-  ValidatorPanel,
-  ValidationFinding,
-} from "../components/bim/ValidatorPanel";
+  bimReportToFindings,
+  type ValidationFinding,
+} from "../api/bim-validation";
 import {
   BimToolbar,
   BimAction,
@@ -139,37 +140,14 @@ export function Bim() {
           // PR-T wired `bim_validate` to the native bridge. The
           // bridge runs the rule-based BIM validator over the
           // parsed snapshot and splits findings into three vectors
-          // (errors / warnings / infos). The wire format uses
-          // `description` / `element` / `suggestion`; the renderer
-          // re-maps those to the existing `message` / `entityId` /
-          // `hint` shape used by `ValidatorPanel`.
+          // (errors / warnings / infos). The wire→UI mapping lives
+          // in `api/bim-validation.ts` so this page and
+          // `ValidatorPanel` share one adapter (Devin Review
+          // ANALYSIS_pr-T_0002).
           const result = await aec.bim.validate({
             sourcePath: "demo://project.ifc",
           });
-          const merged: ValidationFinding[] = [
-            ...result.errors.map((f) => ({
-              code: f.code,
-              severity: "error" as const,
-              message: f.description,
-              entityId: f.element,
-              hint: f.suggestion,
-            })),
-            ...result.warnings.map((f) => ({
-              code: f.code,
-              severity: "warning" as const,
-              message: f.description,
-              entityId: f.element,
-              hint: f.suggestion,
-            })),
-            ...result.infos.map((f) => ({
-              code: f.code,
-              severity: "info" as const,
-              message: f.description,
-              entityId: f.element,
-              hint: f.suggestion,
-            })),
-          ];
-          setFindings(merged);
+          setFindings(bimReportToFindings(result));
           break;
         }
         case "classify":
