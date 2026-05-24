@@ -244,7 +244,12 @@ describe("renderer-backend in-process export methods", () => {
     await expect(
       b.export.buildProposalPack({ outPath: "/tmp/p.pdf" }),
     ).rejects.toThrow(
-      /buildProposalPack: missing required string field 'projectName'/,
+      // Renderer fallback uses the underlying `BridgeBackend.
+      // exportBuildProposalPack` method name in the error string so
+      // tests can assert on a single regex regardless of which backend
+      // produced the exception. See `renderer-backend.ts` and
+      // `bridge.ts:1038` for the matching string on the other layer.
+      /exportBuildProposalPack: missing required string field 'projectName'/,
     );
   });
 

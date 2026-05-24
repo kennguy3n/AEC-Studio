@@ -295,13 +295,22 @@ export function rendererInProcessBackend(): AecApi {
         requireStringField(params, "exportGltf", "projectName");
         return { outPath };
       },
+      // Uses the underlying `BridgeBackend.exportBuildProposalPack`
+      // method name (NOT the renderer-surface `buildProposalPack`) so
+      // the error string matches the electron-side fallback and the
+      // native napi `ExportProposalPackParamsJs` struct. This honours
+      // the JSDoc contract below: "The error message format is
+      // identical across the three layers so renderer tests can
+      // assert on the exception text without branching on which
+      // backend produced it." Pinned by `export-in-process.test.ts`
+      // line 247 against the same regex the electron-side test uses.
       buildProposalPack: async (params) => {
         const outPath = requireStringField(
           params,
-          "buildProposalPack",
+          "exportBuildProposalPack",
           "outPath",
         );
-        requireStringField(params, "buildProposalPack", "projectName");
+        requireStringField(params, "exportBuildProposalPack", "projectName");
         return { outPath };
       },
     },
