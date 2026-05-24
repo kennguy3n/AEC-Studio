@@ -173,15 +173,31 @@ impl EngineStatusCache {
         F: FnOnce() -> Result<Connection, E>,
     {
         // Phase 1: hot-path lookup under the cache lock.
+        //
+        // If the cached entry's `conn` mutex is poisoned (a previous
+        // `with_conn` callback panicked while holding it), evict the
+        // entry and fall through to the cold-open path. Without this
+        // step, every subsequent `get_or_open` for the same key would
+        // hand out the poisoned `Arc<CachedConn>` and the next
+        // `with_conn` call would re-panic on the poison check,
+        // creating a cascading panic chain that only stopped when
+        // the 30-s TTL eviction removed the entry. The fix is O(1)
+        // (`Mutex::is_poisoned()` is a non-blocking atomic load) and
+        // self-heals on the very next access instead of waiting out
+        // the TTL.
         {
             let mut cache = self.entries.lock().expect("cache mutex poisoned");
             self.evict_stale(&mut cache);
             if let Some(entry) = cache.get(key) {
-                *entry
-                    .last_used
-                    .lock()
-                    .expect("cached connection last_used mutex poisoned") = Instant::now();
-                return Ok(entry.clone());
+                if entry.conn.is_poisoned() {
+                    cache.remove(key);
+                } else {
+                    *entry
+                        .last_used
+                        .lock()
+                        .expect("cached connection last_used mutex poisoned") = Instant::now();
+                    return Ok(entry.clone());
+                }
             }
         }
 
@@ -661,5 +677,67 @@ mod tests {
             "panic in f must leave last_used unchanged \
              (was {before:?}, became {after:?})"
         );
+    }
+
+    #[test]
+    fn get_or_open_evicts_poisoned_entry_and_reopens() {
+        // After a `with_conn` callback panics the inner `conn` Mutex
+        // is poisoned. A naive cache would keep handing out the
+        // poisoned `Arc<CachedConn>` until the 30-s TTL evicted it,
+        // and every interim `with_conn` would re-panic. Verify the
+        // hot-path lookup detects poison via `Mutex::is_poisoned()`,
+        // removes the entry, and falls through to a fresh open.
+        let cache = Arc::new(EngineStatusCache::new());
+        let key = PathBuf::from("/tmp/poison-recover");
+
+        // First open seeds the cache.
+        let first = cache
+            .get_or_open::<_, rusqlite::Error>(&key, || Ok(in_memory_conn()))
+            .unwrap();
+        assert_eq!(cache.len(), 1);
+
+        // Poison the entry's conn mutex by panicking inside with_conn.
+        let first_for_panic = first.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            first_for_panic.with_conn(|_c| -> () { panic!("simulated query panic") });
+        }));
+        assert!(
+            first.conn.is_poisoned(),
+            "fixture: with_conn panic must poison the inner conn mutex"
+        );
+
+        // Drop our reference to the poisoned entry so the cache holds
+        // the only Arc — verifying the cache really does remove and
+        // free it on the next lookup (the count goes 1 → 0 → 1, with
+        // the second 1 being the fresh entry).
+        drop(first);
+
+        // Next get_or_open must detect poison, evict, and re-open.
+        // Track whether `open` ran to prove the cold-open path was
+        // taken.
+        let opens = Cell::new(0u32);
+        let fresh = cache
+            .get_or_open::<_, rusqlite::Error>(&key, || {
+                opens.set(opens.get() + 1);
+                Ok(in_memory_conn())
+            })
+            .unwrap();
+        assert_eq!(
+            opens.get(),
+            1,
+            "poisoned cache entry must force a cold open on next access"
+        );
+        assert!(
+            !fresh.conn.is_poisoned(),
+            "fresh entry must have a non-poisoned conn mutex"
+        );
+
+        // The fresh entry must actually work: calling `with_conn`
+        // on it should not panic.
+        fresh.with_conn(|conn| {
+            conn.execute_batch("SELECT 1;").expect("fresh conn works");
+        });
+
+        assert_eq!(cache.len(), 1, "cache must hold exactly the fresh entry");
     }
 }
