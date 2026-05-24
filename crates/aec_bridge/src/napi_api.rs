@@ -11,7 +11,7 @@
 #![cfg(feature = "napi")]
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::RwLock;
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -19,18 +19,35 @@ use napi_derive::napi;
 use crate::service::{BridgeConfig, BridgeService};
 
 /// Process-wide bridge singleton. The Electron main process initialises
-/// this once at startup; every other call goes through [`with_service`].
-static SERVICE: Mutex<Option<BridgeService>> = Mutex::new(None);
+/// this once at startup; every subsequent call goes through one of the
+/// three `with_service*` helpers.
+///
+/// Stored under [`RwLock`] (not [`std::sync::Mutex`]) so the read-only
+/// endpoints can run concurrently. Concretely: an Electron status-pane
+/// poll of [`project_engine_status`] and a `runtime_status` refresh
+/// taken from a renderer thread no longer serialize against each other,
+/// nor do they block a concurrent [`project_save`] from making
+/// progress (each takes a read lock; the writer-side mutating endpoint
+/// holds the write lock for the duration of the SQLCipher write).
+static SERVICE: RwLock<Option<BridgeService>> = RwLock::new(None);
 
-/// Run `f` with mutable access to the bridge singleton, converting all
-/// lock poisoning and "not initialised" errors into typed N-API errors so
-/// the renderer can recover gracefully instead of crashing the host.
+/// Run `f` with **mutable** access to the bridge singleton, converting
+/// all lock poisoning and "not initialised" errors into typed N-API
+/// errors so the renderer can recover gracefully instead of crashing
+/// the host.
+///
+/// Acquires the writer side of [`SERVICE`]'s [`RwLock`]. This excludes
+/// all concurrent readers AND writers for the duration of `f`. Use
+/// this for the mutating endpoints (`project_open`, `project_save`,
+/// `project_audit_sync`, `project_create_from_template`) and for any
+/// future endpoint that needs to mutate the [`BridgeService`]
+/// in-memory state (recents, caches, ...).
 fn with_service<F, R>(f: F) -> Result<R>
 where
     F: FnOnce(&mut BridgeService) -> std::result::Result<R, crate::service::BridgeServiceError>,
 {
     let mut guard = SERVICE
-        .lock()
+        .write()
         .map_err(|e| Error::from_reason(e.to_string()))?;
     let svc = guard
         .as_mut()
@@ -38,22 +55,56 @@ where
     f(svc).map_err(|e| Error::from_reason(e.to_string()))
 }
 
-/// Same as [`with_service`] but for read-only callers that just need a
-/// shared reference. Sharing the lock/unwrap pattern in one place avoids
-/// drift between `with_service` and ad-hoc lock sites (the previous
-/// `runtime_status` implementation had its own copy, which had to be
-/// updated in lockstep every time poisoning semantics changed).
+/// Same as [`with_service`] but for **infallible** read-only callers.
+/// Acquires the reader side of [`SERVICE`]'s [`RwLock`] so other
+/// readers can run concurrently. Use this for endpoints that take
+/// `&self` on [`BridgeService`] AND cannot fail (e.g. `runtime_status`
+/// where any error has been pushed into the construction of the
+/// returned struct).
+///
+/// For *fallible* read-only endpoints (the common case for
+/// SQL-touching reads like `project_engine_status` that return
+/// [`crate::service::BridgeServiceError`]), use
+/// [`with_service_ref_fallible`] instead — it threads the `Result`
+/// through the closure properly.
 fn with_service_ref<F, R>(f: F) -> Result<R>
 where
     F: FnOnce(&BridgeService) -> R,
 {
     let guard = SERVICE
-        .lock()
+        .read()
         .map_err(|e| Error::from_reason(e.to_string()))?;
     let svc = guard
         .as_ref()
         .ok_or_else(|| Error::from_reason("bridge not initialised"))?;
     Ok(f(svc))
+}
+
+/// Same as [`with_service_ref`] but the closure may return a
+/// [`crate::service::BridgeServiceError`].
+///
+/// Acquires the reader side of [`SERVICE`]'s [`RwLock`]. Multiple
+/// fallible reads can run concurrently with each other AND with
+/// infallible reads via [`with_service_ref`]; only the writer-side
+/// [`with_service`] excludes them.
+///
+/// This is the right primitive for SQL-touching read endpoints whose
+/// service-layer method is `&self` but returns `Result<_, _>` — the
+/// motivating case for adding this helper was `project_engine_status`,
+/// which previously had to take the write lock just to thread the
+/// `Result` (blocking every other endpoint for the duration of an
+/// O(50 µs) status read).
+fn with_service_ref_fallible<F, R>(f: F) -> Result<R>
+where
+    F: FnOnce(&BridgeService) -> std::result::Result<R, crate::service::BridgeServiceError>,
+{
+    let guard = SERVICE
+        .read()
+        .map_err(|e| Error::from_reason(e.to_string()))?;
+    let svc = guard
+        .as_ref()
+        .ok_or_else(|| Error::from_reason("bridge not initialised"))?;
+    f(svc).map_err(|e| Error::from_reason(e.to_string()))
 }
 
 #[napi(object)]
@@ -86,7 +137,7 @@ pub fn bridge_init(opts: InitOptions) -> Result<()> {
     // panicked init can't bring down the Electron host with a cryptic
     // `PoisonError` — surface the failure as a typed N-API error.
     let mut guard = SERVICE
-        .lock()
+        .write()
         .map_err(|e| Error::from_reason(e.to_string()))?;
     *guard = Some(svc);
     Ok(())
@@ -190,7 +241,15 @@ impl From<crate::service::EngineStatusReport> for EngineStatusJs {
 
 #[napi]
 pub fn project_engine_status(path: String) -> Result<EngineStatusJs> {
-    with_service(|svc| svc.project_engine_status(&path)).map(Into::into)
+    // `project_engine_status` is `&self` on `BridgeService`, so the
+    // bridge singleton only needs a *read* lock for the duration of
+    // the call. Using `with_service_ref_fallible` instead of
+    // `with_service` is what allows the renderer's status pane to
+    // poll without blocking concurrent mutating endpoints — e.g. a
+    // `project_save` triggered by Cmd-S can run while the status pane
+    // is mid-poll, with the cache invalidation in `project_save`
+    // ensuring the next poll observes the post-save state.
+    with_service_ref_fallible(|svc| svc.project_engine_status(&path)).map(Into::into)
 }
 
 #[napi]

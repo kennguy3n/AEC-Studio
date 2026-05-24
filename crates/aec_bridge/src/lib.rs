@@ -5,6 +5,7 @@
 //! Those functions delegate to [`service`], which is plain Rust and
 //! straightforward to unit-test.
 
+mod engine_status_cache;
 pub mod recents;
 pub mod service;
 
