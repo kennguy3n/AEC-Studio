@@ -919,8 +919,7 @@ pub fn render_diagnose(job_id: String) -> Result<RenderDiagnoseJs> {
 
 #[napi]
 pub fn render_check_materials() -> Result<RenderCheckMaterialsJs> {
-    with_service_ref_fallible(super::service::BridgeService::render_check_materials)
-        .map(Into::into)
+    with_service_ref_fallible(super::service::BridgeService::render_check_materials).map(Into::into)
 }
 
 fn hex_decode(s: &str) -> Option<Vec<u8>> {

@@ -358,16 +358,33 @@ pub struct RenderBatchProgressReport {
 
 impl From<CoreBatchProgress> for RenderBatchProgressReport {
     fn from(p: CoreBatchProgress) -> Self {
+        // Saturate at `u32::MAX` defensively rather than letting `as u32`
+        // wrap on 64-bit hosts: plain `usize as u32` truncates the upper
+        // bits, so a hypothetical 2^32-job batch would report `0` rather
+        // than `u32::MAX`. The doc comment on `RenderBatchProgressJs`
+        // promises saturating behaviour; this is where that promise is
+        // kept.
         Self {
             batch_id: p.batch_id,
-            total: p.total as u32,
-            queued: p.queued as u32,
-            running: p.running as u32,
-            completed: p.completed as u32,
-            failed: p.failed as u32,
-            cancelled: p.cancelled as u32,
+            total: saturating_u32(p.total),
+            queued: saturating_u32(p.queued),
+            running: saturating_u32(p.running),
+            completed: saturating_u32(p.completed),
+            failed: saturating_u32(p.failed),
+            cancelled: saturating_u32(p.cancelled),
             average_progress: p.average_progress,
         }
+    }
+}
+
+/// Clamp `n` to `u32::MAX` before casting to `u32`. Plain `as u32`
+/// silently wraps on 64-bit platforms (`u32::MAX as usize + 1` becomes
+/// `0`); this saturates as documented on `RenderBatchProgressJs`.
+fn saturating_u32(n: usize) -> u32 {
+    if n > u32::MAX as usize {
+        u32::MAX
+    } else {
+        n as u32
     }
 }
 
@@ -3309,5 +3326,30 @@ END-ISO-10303-21;\n";
         );
         let report = s.render_check_materials().unwrap();
         let _ = serde_json::to_string(&report).expect("RenderCheckMaterialsReport must serialise");
+    }
+
+    #[test]
+    fn render_batch_progress_count_saturates_at_u32_max() {
+        // Plain `usize as u32` wraps on 64-bit hosts — a `usize::MAX`
+        // input would round-trip as `u32::MAX` (0xffff_ffff) via the
+        // truncation rules, but `(u32::MAX as usize) + 1` would land at
+        // `0`, silently corrupting the renderer's status pane. Pin the
+        // saturating behaviour the `RenderBatchProgressJs` doc comment
+        // advertises so this contract can't drift.
+        let big = u32::MAX as usize + 1;
+        assert_eq!(
+            saturating_u32(big),
+            u32::MAX,
+            "count above u32::MAX must clamp, not wrap"
+        );
+        assert_eq!(
+            saturating_u32(usize::MAX),
+            u32::MAX,
+            "usize::MAX must clamp at u32::MAX"
+        );
+        // Below-threshold inputs must round-trip unchanged.
+        assert_eq!(saturating_u32(0), 0);
+        assert_eq!(saturating_u32(7), 7);
+        assert_eq!(saturating_u32(u32::MAX as usize), u32::MAX);
     }
 }

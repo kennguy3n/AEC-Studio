@@ -1213,10 +1213,20 @@ export function inProcessBackend(): BridgeBackend {
     },
 
     async renderEnqueue(params) {
+      // Reject a missing preset id the same way the native side
+      // (`BridgeService::render_enqueue`) does. Silently substituting
+      // `"standard"` here would let a renderer-side dropdown bug pass
+      // dev/Vitest only to crash in production once the `.node` artefact
+      // is loaded — the whole point of `NATIVE_WIRED_METHODS` is that
+      // dev and production behave the same.
+      const preset = typeof params.preset === "string" ? params.preset : "";
+      if (preset.length === 0) {
+        throw new Error("renderEnqueue requires a preset id");
+      }
       const job: RenderJob = {
         jobId: id("job"),
         status: "queued",
-        preset: String(params.preset ?? "standard"),
+        preset,
         progress: 0,
       };
       jobs.unshift(job);
@@ -1225,13 +1235,23 @@ export function inProcessBackend(): BridgeBackend {
     async renderEnqueueBatch(params) {
       // Mirror the Rust aec_render::queue::RenderQueue::submit_batch /
       // submit_matrix: one job per (camera × preset) pair, all sharing
-      // one batch id.
+      // one batch id. As with `renderEnqueue` above, empty inputs are a
+      // hard error — the native side at
+      // `BridgeService::render_enqueue_batch` rejects them; the
+      // in-process backend rejects them for the same dev/prod-parity
+      // reason.
       const presets: string[] =
         params.presetIds && params.presetIds.length > 0
           ? params.presetIds
           : params.presetId
-          ? [params.presetId]
-          : ["standard"];
+            ? [params.presetId]
+            : [];
+      if (params.cameraIds.length === 0) {
+        throw new Error("renderEnqueueBatch requires at least one camera id");
+      }
+      if (presets.length === 0) {
+        throw new Error("renderEnqueueBatch requires at least one preset id");
+      }
       const batchId = id("batch");
       const created: string[] = [];
       for (const cameraId of params.cameraIds) {
