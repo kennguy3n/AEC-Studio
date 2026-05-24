@@ -342,28 +342,36 @@ pub fn bim_import_ifc(path: String) -> Result<BimImportSummaryJs> {
 /// JS-facing cheap file-size check. Mirrors the renderer's
 /// `BimFileSizeCheck` interface in `apps/desktop/electron/bridge.ts`.
 ///
-/// `file_size_bytes` and `threshold_bytes` use the
-/// JS-safe-integer-friendly `BigInt` shape via napi's `BigInt`
-/// type to avoid the f64-precision-cliff at 2^53 bytes (≈ 9 PB);
-/// any realistic IFC file is many orders of magnitude below
-/// that, but the type discipline matches the renderer's expected
-/// numeric handling and removes one class of "u64 silently
-/// truncated to JS Number" footgun.
+/// `file_size_bytes` and `threshold_bytes` are exposed as `f64`
+/// (JS `number`) so the renderer can do arithmetic on them directly
+/// (`fileSizeBytes / (1024 * 1024)` for humanised MB strings,
+/// `fileSizeBytes >= thresholdBytes` for the large-file guard)
+/// without BigInt / Number incompatibility. `f64` has exact
+/// integer precision up to 2^53 ≈ 9 PB — well beyond any
+/// conceivable IFC file — and matches the TS interface declaration
+/// of `number` in `bridge.ts` and `preload.ts`.
+///
+/// Consistency: this deliberately follows the same pattern as
+/// [`BimImportSummaryJs`], which uses `u32` (safe `number`) for
+/// entity counts. When this method is wired to the native bridge
+/// (i.e. moved from `NATIVE_FALLBACK_METHODS` to
+/// `NATIVE_WIRED_METHODS`), the JS side receives `number`
+/// directly — no BigInt / Number coercion footgun.
 #[napi(object)]
 pub struct BimFileSizeCheckJs {
     pub path: String,
-    pub file_size_bytes: BigInt,
+    pub file_size_bytes: f64,
     pub large_file_warning: bool,
-    pub threshold_bytes: BigInt,
+    pub threshold_bytes: f64,
 }
 
 impl From<crate::service::BimFileSizeCheck> for BimFileSizeCheckJs {
     fn from(r: crate::service::BimFileSizeCheck) -> Self {
         Self {
             path: r.path,
-            file_size_bytes: BigInt::from(r.file_size_bytes),
+            file_size_bytes: r.file_size_bytes as f64,
             large_file_warning: r.large_file_warning,
-            threshold_bytes: BigInt::from(r.threshold_bytes),
+            threshold_bytes: r.threshold_bytes as f64,
         }
     }
 }

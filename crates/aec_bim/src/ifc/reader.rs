@@ -230,7 +230,42 @@ impl IfcReader {
                 "IFCOWNERHISTORY" => {}
                 "IFCPROJECT" | "IFCSITE" | "IFCBUILDING" | "IFCBUILDINGSTOREY" | "IFCSPACE" => {
                     let class = ifc_class_from_tag(&g.kind, &g.raw_kind);
-                    let name = g.string_arg(3)?;
+                    // Display-name extraction with two-stage fallback:
+                    //
+                    //   1. Arg 3 (`IfcRoot.Description`) — AEC Studio's
+                    //      own writer convention: the display name
+                    //      ("Café", "Ground", "Site") is emitted here
+                    //      while arg 2 (`IfcRoot.Name`) is left as `$`.
+                    //      Path (a): preferred read.
+                    //
+                    //   2. Arg 2 (`IfcRoot.Name`) — IFC standard
+                    //      convention: Revit / ArchiCAD / Tekla /
+                    //      buildingSMART exemplars typically put the
+                    //      human-facing name here and leave Description
+                    //      as `$`. Path (b): fallback so external IFCs
+                    //      with `$` at arg 3 don't abort the whole
+                    //      parse with an `IfcReadError::Malformed`.
+                    //
+                    //   3. Empty string — both slots are `$` or
+                    //      malformed. The spatial node is still
+                    //      captured (so the project graph isn't
+                    //      missing nodes), just with no display label.
+                    //      The renderer's tree falls back to the IFC
+                    //      class label ("Site", "Building"…).
+                    //
+                    // Without this fallback chain the entire parse
+                    // would error on a real-world Revit export whose
+                    // `IFCBUILDING` has `$` at arg 3 — silently
+                    // collapsing the whole BIM workflow to "import
+                    // failed: missing arg 3 on IFCBUILDING". The
+                    // `string_arg(2)` probe is gated on the trim ==
+                    // "$" check inside `string_arg` itself: if arg 2
+                    // is `$` too, we land in the empty-string branch
+                    // and continue without erroring.
+                    let name = g
+                        .string_arg(3)
+                        .or_else(|_| g.string_arg(2))
+                        .unwrap_or_default();
                     // Spatial nodes are authored by the writer with the
                     // user-facing display name ("Café", "Ground"). They
                     // don't carry the `{tag}::{eid}` Name-field
@@ -503,99 +538,129 @@ impl IfcReader {
                     //       rows as fresh inserts on every attach,
                     //       which is the least-surprising behaviour
                     //       for malformed input).
-                    if let Ok(name) = g.string_arg(3) {
-                        if let Some((tag, eid)) = name.rsplit_once("::") {
-                            // (a) Path: AEC-Studio-authored.
-                            //
-                            // Prefer the tag carried in the Name field
-                            // over the STEP entity type. The two are
-                            // identical for safe classes (the writer
-                            // emits `{ifc_tag}::{eid}` and uses
-                            // `ifc_tag` as the STEP type), but for
-                            // `IfcClass::Other(s)` where `s` contains
-                            // STEP-unsafe chars like `(`, `)` or `'`,
-                            // the writer falls back to STEP type
-                            // `IfcBuildingElementProxy` and keeps the
-                            // original `s` only in the Name field.
-                            // Reading the class from the Name tag
-                            // therefore makes the round-trip lossless
-                            // even for arbitrary user-supplied
-                            // extension classifier strings. We pass
-                            // `tag` for both the case-normalised match
-                            // and the raw (case-preserving) fallback
-                            // so `Other("Some::Custom::Type")`
-                            // round-trips verbatim.
-                            let class = ifc_class_from_tag(tag, tag);
-                            let _ = other; // STEP type is informational
-                            let guid = g.string_arg(0)?;
-                            let entity = EntityId::from_string(eid).map_err(|e| {
-                                IfcReadError::Malformed(format!(
-                                    "embedded EntityId `{eid}` is invalid: {e}"
-                                ))
-                            })?;
-                            elements.insert(
-                                g.step_id,
-                                ElementRow {
-                                    entity,
-                                    guid,
-                                    class,
-                                    tag: tag.to_string(),
-                                },
-                            );
-                        } else {
-                            // (b) Path: external IFC.
-                            //
-                            // Classify by STEP entity tag. Only
-                            // capture records whose STEP type maps
-                            // to a typed [`IfcClass`] variant —
-                            // i.e. one of the recognized building-
-                            // element classes (IFCWALL, IFCWINDOW,
-                            // IFCSLAB, IFCBEAM, IFCCOLUMN, …). Any
-                            // other STEP record that happens to
-                            // pass the `string_arg(3)` Name-field
-                            // probe — type entities (IfcWindowType,
-                            // IfcDoorType), library declarations
-                            // (IfcProjectLibrary), or unknown
-                            // extension entities — is intentionally
-                            // skipped here: capturing them as
-                            // elements would either poison the
-                            // classification table with non-element
-                            // rows or duplicate the type vs.
-                            // instance distinction that
-                            // `IfcRelDefinesByType` should be doing.
-                            // (Future work: type-Pset propagation
-                            // would land them as type_psets on the
-                            // instances they declare, not as
-                            // elements in their own right.)
-                            let class = ifc_class_from_tag(other, &g.raw_kind);
-                            if matches!(class, IfcClass::Other(_)) {
-                                continue;
-                            }
-                            // Only extract the GUID once we've
-                            // committed to creating an ElementRow
-                            // — some non-element STEP records
-                            // (notably IFCAPPLICATION) also have
-                            // a string-shaped arg 3 but use a
-                            // `#ref` at arg 0, so blindly
-                            // calling `string_arg(0)` on every
-                            // record reaching this branch would
-                            // panic the parser.
-                            let guid = g.string_arg(0)?;
-                            let entity = if guid.is_empty() {
-                                EntityId::new()
-                            } else {
-                                EntityId::from_guid_seed(&guid)
-                            };
-                            elements.insert(
-                                g.step_id,
-                                ElementRow {
-                                    entity,
-                                    guid,
-                                    class,
-                                    tag: other.to_string(),
-                                },
-                            );
+                    // First, try path (a) — AEC-Studio-authored.
+                    // The writer's Name field is the `{tag}::{eid}`
+                    // encoding lives at arg 3 (`IfcRoot.Description`),
+                    // so probe that first. If arg 3 doesn't have an
+                    // `rsplit_once("::")` match (either because arg 3
+                    // is absent / `$` / malformed, or because the
+                    // string is a real Description like "Basic Wall:
+                    // Generic - 200mm" without `::`), fall through to
+                    // path (b) below.
+                    let aec_authored_eid = g.string_arg(3).ok().and_then(|name| {
+                        name.rsplit_once("::")
+                            .map(|(tag, eid)| (tag.to_string(), eid.to_string()))
+                    });
+
+                    if let Some((tag, eid)) = aec_authored_eid {
+                        // (a) Path: AEC-Studio-authored.
+                        //
+                        // Prefer the tag carried in the Name field
+                        // over the STEP entity type. The two are
+                        // identical for safe classes (the writer
+                        // emits `{ifc_tag}::{eid}` and uses
+                        // `ifc_tag` as the STEP type), but for
+                        // `IfcClass::Other(s)` where `s` contains
+                        // STEP-unsafe chars like `(`, `)` or `'`,
+                        // the writer falls back to STEP type
+                        // `IfcBuildingElementProxy` and keeps the
+                        // original `s` only in the Name field.
+                        // Reading the class from the Name tag
+                        // therefore makes the round-trip lossless
+                        // even for arbitrary user-supplied
+                        // extension classifier strings. We pass
+                        // `tag` for both the case-normalised match
+                        // and the raw (case-preserving) fallback
+                        // so `Other("Some::Custom::Type")`
+                        // round-trips verbatim.
+                        let class = ifc_class_from_tag(&tag, &tag);
+                        let _ = other; // STEP type is informational
+                        let guid = g.string_arg(0)?;
+                        let entity = EntityId::from_string(&eid).map_err(|e| {
+                            IfcReadError::Malformed(format!(
+                                "embedded EntityId `{eid}` is invalid: {e}"
+                            ))
+                        })?;
+                        elements.insert(
+                            g.step_id,
+                            ElementRow {
+                                entity,
+                                guid,
+                                class,
+                                tag,
+                            },
+                        );
+                    } else {
+                        // (b) Path: external IFC.
+                        //
+                        // Classify by STEP entity tag. Only
+                        // capture records whose STEP type maps
+                        // to a typed [`IfcClass`] variant —
+                        // i.e. one of the recognized building-
+                        // element classes (IFCWALL, IFCWINDOW,
+                        // IFCSLAB, IFCBEAM, IFCCOLUMN, …). Any
+                        // other STEP record reaching this branch
+                        // — type entities (IfcWindowType,
+                        // IfcDoorType), library declarations
+                        // (IfcProjectLibrary), application
+                        // metadata (IfcApplication), or unknown
+                        // extension entities — is intentionally
+                        // skipped here: capturing them as
+                        // elements would either poison the
+                        // classification table with non-element
+                        // rows or duplicate the type vs.
+                        // instance distinction that
+                        // `IfcRelDefinesByType` should be doing.
+                        // (Future work: type-Pset propagation
+                        // would land them as type_psets on the
+                        // instances they declare, not as
+                        // elements in their own right.)
+                        //
+                        // Critical: this branch fires unconditionally
+                        // when path (a) doesn't match — INCLUDING the
+                        // case where arg 3 (`IfcRoot.Description`) is
+                        // `$`. Real-world Revit / ArchiCAD exports
+                        // routinely put the meaningful identity at
+                        // arg 2 (`IfcRoot.Name`) and leave arg 3 as
+                        // `$`. Without unconditional fall-through,
+                        // every wall / window / slab in such a file
+                        // would be silently dropped on read. The
+                        // `IfcClass::Other(_)` filter below is what
+                        // keeps non-element records (`IFCAPPLICATION`,
+                        // unknown types) from being captured as
+                        // elements — including any record whose STEP
+                        // tag doesn't classify cleanly, regardless
+                        // of arg-3 state.
+                        let class = ifc_class_from_tag(other, &g.raw_kind);
+                        if matches!(class, IfcClass::Other(_)) {
+                            continue;
                         }
+                        // Only extract the GUID once we've
+                        // committed to creating an ElementRow
+                        // — some non-element STEP records
+                        // (notably IFCAPPLICATION) use a `#ref`
+                        // at arg 0 rather than a quoted GUID,
+                        // so blindly calling `string_arg(0)` on
+                        // every record reaching this branch
+                        // would panic the parser. The
+                        // `IfcClass::Other(_)` guard above
+                        // filters those out before we touch
+                        // arg 0.
+                        let guid = g.string_arg(0)?;
+                        let entity = if guid.is_empty() {
+                            EntityId::new()
+                        } else {
+                            EntityId::from_guid_seed(&guid)
+                        };
+                        elements.insert(
+                            g.step_id,
+                            ElementRow {
+                                entity,
+                                guid,
+                                class,
+                                tag: other.to_string(),
+                            },
+                        );
                     }
                 }
             }
@@ -3849,6 +3914,127 @@ END-ISO-10303-21;\n";
             }
             other => panic!("expected Malformed error for NaN literal; got {other:?}"),
         }
+    }
+
+    /// Real-world Revit / ArchiCAD / Tekla exporters routinely
+    /// emit `IfcWall`, `IfcWindow`, `IfcSlab`, etc. with their
+    /// human-facing identity at arg 2 (`IfcRoot.Name`) and `$`
+    /// (not-provided) at arg 3 (`IfcRoot.Description`). Before
+    /// the BUG_0002 fix the reader probed arg 3 unconditionally
+    /// via `g.string_arg(3)?`, which propagated an
+    /// `IfcReadError::Malformed("expected quoted string at
+    /// arg 3 of IFCWALL but got '$'")` error up to the caller
+    /// — so the *entire* parse aborted on the first element
+    /// with `$` at arg 3, silently rendering every real-world
+    /// Revit export un-importable. Post-fix the reader falls
+    /// through to path (b) (classify by STEP tag, derive
+    /// EntityId from GlobalId) on any element whose arg 3
+    /// doesn't match the `{tag}::{eid}` AEC-Studio writer
+    /// encoding — including the `$` case — and the element is
+    /// captured.
+    ///
+    /// This is a minimum-fixture test: hand-rolled STEP with
+    /// just an `IfcProject`, `IfcSite`, and a single
+    /// `IfcWall` whose arg 2 is `'External Revit Wall'` and
+    /// whose arg 3 is `$`. The test asserts the wall is
+    /// captured (count == 1), classified as `IfcWall`, and
+    /// the EntityId is deterministically derived from the
+    /// GlobalId via `EntityId::from_guid_seed`.
+    #[test]
+    fn external_ifc_with_dollar_description_captures_elements_via_step_tag() {
+        let step = "\
+ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('External-style export'),'2;1');
+FILE_NAME('test.ifc','2024-01-01T00:00:00',(''),(''),'','','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('2vqOSiJTrEEvbbnEAh4Lay',$,'External Revit Project',$,$,$,$,(#2),#3);
+#2=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-5,#4,$);
+#3=IFCUNITASSIGNMENT((#5));
+#4=IFCAXIS2PLACEMENT3D(#6,$,$);
+#5=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#6=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCSITE('2vqOSiJTrEEvbbnEAh4Lb1',$,'External Revit Site',$,$,#4,$,$,.ELEMENT.,$,$,$,$,$);
+#100=IFCWALL('1bbU_VHpzCEvLPibG6XfX2',$,'External Revit Wall',$,$,#4,$,$,.NOTDEFINED.);
+ENDSEC;
+END-ISO-10303-21;
+";
+        let snap = IfcReader::from_string(step)
+            .expect("external IFC with `$` at arg 3 must parse without erroring");
+
+        // The wall is captured (path b fall-through).
+        let walls: Vec<_> = snap
+            .classification
+            .iter()
+            .filter(|(_, a)| matches!(a.class, IfcClass::IfcWall))
+            .collect();
+        assert_eq!(
+            walls.len(),
+            1,
+            "exactly one wall must be captured; got {walls:?}",
+        );
+
+        // EntityId is deterministically derived from GlobalId.
+        let (wall_id, _) = walls[0];
+        let expected = EntityId::from_guid_seed("1bbU_VHpzCEvLPibG6XfX2");
+        assert_eq!(
+            wall_id, &expected,
+            "external-IFC wall must use EntityId::from_guid_seed for re-attach dedup",
+        );
+    }
+
+    /// Companion spatial-node test for the same arg-2 / arg-3
+    /// fallback. Pre-fix the reader's spatial-node parser used
+    /// `g.string_arg(3)?` unconditionally, so a real-world
+    /// `IFCBUILDING('guid',$,'Office Building',$,...)` — with
+    /// the meaningful name at arg 2 and `$` at arg 3 — would
+    /// abort the whole parse with `expected quoted string at
+    /// arg 3 of IFCBUILDING but got '$'`. Post-fix the parser
+    /// tries arg 3 first (writer convention), falls back to
+    /// arg 2 (IFC standard convention), and finally to the
+    /// empty string. This test pins the fallback chain end-
+    /// to-end: an `IfcBuilding` with `$` at arg 3 and a real
+    /// name at arg 2 must be captured with the arg-2 string
+    /// as its display name.
+    #[test]
+    fn external_ifc_with_dollar_description_uses_arg2_name_on_spatial_nodes() {
+        let step = "\
+ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('External-style export'),'2;1');
+FILE_NAME('test.ifc','2024-01-01T00:00:00',(''),(''),'','','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('2vqOSiJTrEEvbbnEAh4Lay',$,'External Revit Project',$,$,$,$,(#2),#3);
+#2=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-5,#4,$);
+#3=IFCUNITASSIGNMENT((#5));
+#4=IFCAXIS2PLACEMENT3D(#6,$,$);
+#5=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#6=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCSITE('2vqOSiJTrEEvbbnEAh4Lb1',$,'External Revit Site',$,$,#4,$,$,.ELEMENT.,$,$,$,$,$);
+#20=IFCBUILDING('2vqOSiJTrEEvbbnEAh4Lb2',$,'Office Building',$,$,#4,$,$,.ELEMENT.,$,$,$);
+ENDSEC;
+END-ISO-10303-21;
+";
+        let snap = IfcReader::from_string(step)
+            .expect("external IFC spatial node with `$` at arg 3 must parse without erroring");
+
+        // The building was captured.
+        let building = snap
+            .project
+            .nodes
+            .iter()
+            .find(|(_, n)| matches!(n.class, IfcClass::IfcBuilding))
+            .expect("IfcBuilding must be present in the project graph");
+        // And it picked up the arg-2 name ("Office Building"),
+        // not arg 3 ("$" — which would render as empty).
+        assert_eq!(
+            building.1.name, "Office Building",
+            "spatial node must fall back to arg 2 when arg 3 is `$`",
+        );
     }
 
     /// Conversely, a HEADER section that legitimately declares
