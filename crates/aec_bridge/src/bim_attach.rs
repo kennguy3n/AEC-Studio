@@ -358,7 +358,7 @@ pub(crate) fn attach_snapshot(
     // wipe at element granularity (one DELETE per entity_id) rather
     // than a bulk DELETE so the SQL trace is auditable per element.
     //
-    // Compose the wipe set from THREE sources, deliberately wider than
+    // Compose the wipe set from FOUR sources, deliberately wider than
     // strictly necessary for today's reader:
     //   1. Every spatial node we just visited (`bfs_order`).
     //   2. Every element we just visited (`seen_elements`).
