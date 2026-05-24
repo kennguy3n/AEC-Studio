@@ -435,13 +435,23 @@ pub fn write_deliver_pack(
     }
 
     if kind == DeliverPackKind::Contractor && options.include_proposal {
-        let mut tmp_pdf = tempfile::NamedTempFile::new()?;
+        let tmp_pdf = tempfile::NamedTempFile::new()?;
         // Reuse the proposal pack writer so the embedded PDF is the
         // same shape the standalone `exportBuildProposalPack` call
         // produces — keeps the two surfaces consistent.
+        //
+        // Read back via `std::fs::read(path)` rather than
+        // `io::copy(tmp_pdf.as_file_mut(), …)`: `write_proposal_pack`
+        // internally calls `PdfBuilder::save`, which today truncates-
+        // and-writes the same path but is free to switch to an atomic
+        // write-temp+rename in a future PR. A fresh fd opened from the
+        // canonical path is robust against either implementation;
+        // `as_file_mut` would silently observe the pre-truncated state
+        // (position 0, empty) if `PdfBuilder::save` ever swaps the
+        // inode. Same pattern as `build_summary_pdf` (`read(&saved)`)
+        // a few lines below.
         let _ = write_proposal_pack(tmp_pdf.path(), project_name, "Contractor")?;
-        let mut buf = Vec::new();
-        std::io::copy(tmp_pdf.as_file_mut(), &mut buf)?;
+        let buf = std::fs::read(tmp_pdf.path())?;
         planned.push(("proposal.pdf".to_string(), buf));
     }
 

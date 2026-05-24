@@ -877,12 +877,18 @@ pub fn deliver_build_pack(params: DeliverBuildPackParamsJs) -> Result<DeliverBui
         out_path: params.out_path,
         kind: params.kind,
         project_name,
+        // Default each include_* flag to `true` to match the JS in-process
+        // backend's `?? true` semantics (`apps/desktop/electron/bridge.ts`'s
+        // `packContents`). Renderer callers may legitimately omit these
+        // optional booleans and expect the "full pack for this kind" — the
+        // native path would otherwise silently drop renders/sheets/boq/
+        // ifc/proposal whenever the renderer didn't explicitly set them.
         options: crate::service::DeliverPackInventoryFlags {
-            include_renders: params.include_renders.unwrap_or(false),
-            include_sheets: params.include_sheets.unwrap_or(false),
-            include_ifc: params.include_ifc.unwrap_or(false),
-            include_boq: params.include_boq.unwrap_or(false),
-            include_proposal: params.include_proposal.unwrap_or(false),
+            include_renders: params.include_renders.unwrap_or(true),
+            include_sheets: params.include_sheets.unwrap_or(true),
+            include_ifc: params.include_ifc.unwrap_or(true),
+            include_boq: params.include_boq.unwrap_or(true),
+            include_proposal: params.include_proposal.unwrap_or(true),
         },
     };
     with_service_ref_fallible(|svc| svc.deliver_build_pack(svc_params.clone())).map(Into::into)

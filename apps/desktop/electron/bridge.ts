@@ -252,6 +252,16 @@ export interface BridgeBackend {
   deliverBuildPack(params: {
     kind: "concept" | "interior" | "contractor" | "bim";
     outPath: string;
+    /**
+     * Project label printed on the in-archive PDF summary
+     * (`contractor_summary.pdf`, etc.). The native backend defaults
+     * this to `"Project"` if `undefined` is passed (see
+     * `crates/aec_bridge/src/napi_api.rs` `deliver_build_pack` —
+     * `params.project_name.clone().unwrap_or_else(|| "Project".to_string())`),
+     * so renderers that want the real open-project name shown on the
+     * archive's summary PDF must thread it through here.
+     */
+    projectName?: string;
     includeRenders?: boolean;
     includeSheets?: boolean;
     includeIfc?: boolean;
@@ -1493,30 +1503,41 @@ export function inProcessBackend(): BridgeBackend {
     async exportPdf(params) {
       // In-process fallback mirrors the native `export_pdf` napi
       // return shape so renderer tests can exercise the full call
-      // path. Honours `params.outPath` when supplied (rather than a
-      // fixed path) so the renderer can pass through the same value
-      // it shows in the UI, and reports a deterministic page count
-      // of 2 (cover + overview) to match the behaviour of
+      // path. `outPath` and `projectName` are mandatory on the
+      // native side (non-Option `String` fields in
+      // `ExportPdfParamsJs`) — we enforce the same requirement here
+      // so a renderer call missing them fails identically in dev
+      // (vitest / in-process) and in prod (native). The reported
+      // page count is a deterministic 2 (cover + overview), matching
       // `aec_export::write_project_pdf` (1 cover + 1 overview,
       // regardless of body length; Phase 11 will add pagination on
       // long bodies and both sides will move together).
-      const outPath = optionalStringField(params, "outPath") ?? "/exports/out.pdf";
+      const outPath = requireStringField(params, "exportPdf", "outPath");
+      requireStringField(params, "exportPdf", "projectName");
       return { outPath, pages: 2 };
     },
     async exportDxf(params) {
-      const outPath = optionalStringField(params, "outPath") ?? "/exports/out.dxf";
+      const outPath = requireStringField(params, "exportDxf", "outPath");
+      requireStringField(params, "exportDxf", "projectName");
       return { outPath };
     },
     async exportIfc(params) {
-      const outPath = optionalStringField(params, "outPath") ?? "/exports/out.ifc";
+      const outPath = requireStringField(params, "exportIfc", "outPath");
+      requireStringField(params, "exportIfc", "projectName");
       return { outPath };
     },
     async exportGltf(params) {
-      const outPath = optionalStringField(params, "outPath") ?? "/exports/out.gltf";
+      const outPath = requireStringField(params, "exportGltf", "outPath");
+      requireStringField(params, "exportGltf", "projectName");
       return { outPath };
     },
     async exportBuildProposalPack(params) {
-      const outPath = optionalStringField(params, "outPath") ?? "/exports/proposal.pdf";
+      const outPath = requireStringField(
+        params,
+        "exportBuildProposalPack",
+        "outPath",
+      );
+      requireStringField(params, "exportBuildProposalPack", "projectName");
       return { outPath };
     },
 
@@ -2033,21 +2054,33 @@ export function applyDeltas(graph: InProcessGraph, deltas: EntityDelta[]): Entit
 }
 
 /**
- * Read an optional `string` field from a renderer-supplied
- * `Record<string, unknown>` params object. Returns `null` if the
- * field is absent or not a string — the caller picks a default.
+ * Read a **required** `string` field from a renderer-supplied
+ * `Record<string, unknown>` params object. Throws when the field is
+ * absent / `null` / `undefined` / not a string.
  *
- * The native side has its own (stricter) typed-params validation
- * via `#[napi(object)]` structs; this helper is purely for the
- * in-process fallback where the renderer talks `Record<string,
- * unknown>` directly to the TS layer.
+ * Used by the in-process backend's `export*` methods to enforce the
+ * same mandatory-field contract as the native `#[napi(object)]`
+ * structs in `crates/aec_bridge/src/napi_api.rs` (where `out_path`
+ * and `project_name` are non-`Option` and produce a napi
+ * deserialisation error when missing). Without this, a renderer call
+ * like `exportPdf({})` would succeed silently in vitest / dev with a
+ * fake `/exports/out.pdf` and then surface as a napi error in
+ * production — the asymmetry Devin Review flagged in PR-S round 1
+ * "Export methods have asymmetric strictness between native and
+ * in-process backends". The wording of the thrown error matches the
+ * shape napi produces (`{method}: missing required string field
+ * '{field}'`) so renderer test snapshots are stable across backends.
  */
-function optionalStringField(
+function requireStringField(
   params: Record<string, unknown>,
+  method: string,
   key: string,
-): string | null {
+): string {
   const v = params[key];
-  return typeof v === "string" ? v : null;
+  if (typeof v !== "string") {
+    throw new Error(`${method}: missing required string field '${key}'`);
+  }
+  return v;
 }
 
 function inProcessEngineStatus(): EngineStatus {
@@ -2149,6 +2182,32 @@ export function diffRevisionsInProcess(
   };
 }
 
+/**
+ * Build the file inventory the renderer's "Deliver Pack" preview pane
+ * shows.
+ *
+ * **Pinning contract**: this function must produce the same `contents`
+ * array (modulo trailing `manifest.json`, which the native backend
+ * appends at the end of the archive but reports in the JS shape too)
+ * as the native `aec_export::write_deliver_pack` (see
+ * `crates/aec_export/src/project_export.rs`). When the renderer
+ * switches between `inProcessBackend` (vitest / dev without `.node`)
+ * and the native backend, the file list users see must match — there's
+ * an explicit Devin Review finding pinning this (PR-S round 1
+ * "Content inventory divergence between JS in-process and Rust native
+ * deliver packs").
+ *
+ * Per-kind shape (all flags `true`):
+ * - `concept`     → summary, [sheet A100 cover], [render 01_cover], manifest
+ * - `interior`    → summary, [renders 01_living + 02_kitchen], materials.xlsx, manifest
+ * - `contractor`  → summary, [sheets A100 + A101], materials.xlsx, [boq.xlsx],
+ *                   [model/project.ifc], [proposal.pdf], manifest
+ * - `bim`         → summary, [sheets A100 + A101], [model/project.ifc], manifest
+ *
+ * Default for every `include*` flag is `true` (i.e. omitted ⇒ on),
+ * matching the native side's `unwrap_or(true)` in the napi binding —
+ * see `crates/aec_bridge/src/napi_api.rs` `deliver_build_pack`.
+ */
 function packContents(params: {
   kind: "concept" | "interior" | "contractor" | "bim";
   includeRenders?: boolean;
@@ -2157,37 +2216,43 @@ function packContents(params: {
   includeBoq?: boolean;
   includeProposal?: boolean;
 }): string[] {
+  const includeRenders = params.includeRenders ?? true;
+  const includeSheets = params.includeSheets ?? true;
+  const includeIfc = params.includeIfc ?? true;
+  const includeBoq = params.includeBoq ?? true;
+  const includeProposal = params.includeProposal ?? true;
   const base: string[] = [];
   if (params.kind === "concept") {
     base.push("concept_pack.pdf");
-    if (params.includeRenders ?? true) base.push("renders/01_cover.png");
-    if (params.includeSheets ?? true) base.push("sheets/A100.pdf");
+    if (includeSheets) base.push("sheets/A100.pdf");
+    if (includeRenders) base.push("renders/01_cover.png");
     base.push("manifest.json");
     return base;
   }
   if (params.kind === "interior") {
     base.push("interior_summary.pdf");
-    if (params.includeRenders ?? true) {
+    if (includeRenders) {
       base.push("renders/01_living.png", "renders/02_kitchen.png");
     }
-    base.push("schedules/materials.xlsx", "manifest.json");
+    base.push("schedules/materials.xlsx");
+    base.push("manifest.json");
     return base;
   }
   if (params.kind === "contractor") {
-    if (params.includeSheets ?? true)
-      base.push("sheets/A100.pdf", "sheets/A101.pdf");
-    if (params.includeBoq ?? true) base.push("schedules/boq.xlsx");
+    base.push("contractor_summary.pdf");
+    if (includeSheets) base.push("sheets/A100.pdf", "sheets/A101.pdf");
     base.push("schedules/materials.xlsx");
-    if (params.includeIfc ?? true) base.push("model/project.ifc");
-    if (params.includeProposal ?? true) base.push("proposal.pdf");
+    if (includeBoq) base.push("schedules/boq.xlsx");
+    if (includeIfc) base.push("model/project.ifc");
+    if (includeProposal) base.push("proposal.pdf");
     base.push("manifest.json");
     return base;
   }
   // bim
-  if (params.includeIfc ?? true) base.push("model/project.ifc");
-  if (params.includeSheets ?? true)
-    base.push("sheets/A100.pdf", "sheets/A101.pdf");
-  base.push("validation_report.pdf", "manifest.json");
+  base.push("validation_report.pdf");
+  if (includeSheets) base.push("sheets/A100.pdf", "sheets/A101.pdf");
+  if (includeIfc) base.push("model/project.ifc");
+  base.push("manifest.json");
   return base;
 }
 

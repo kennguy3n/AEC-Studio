@@ -265,30 +265,30 @@ export function rendererInProcessBackend(): AecApi {
     },
     export: {
       // Vitest fallback for the export IPC namespace. Mirrors the
-      // shape of the in-process backend in
-      // `apps/desktop/electron/bridge.ts` so renderer tests see the
-      // same `{ outPath, pages? }` shape they get when Electron is
-      // loaded. Honours the caller-supplied `outPath` so the renderer
-      // can assert on the path it requested, falling back to a fixed
-      // sentinel path when the renderer didn't supply one. Page count
+      // shape AND the strictness of the in-process backend in
+      // `apps/desktop/electron/bridge.ts` (which itself mirrors the
+      // native napi struct contract): `outPath` and `projectName` are
+      // mandatory non-empty strings, missing fields throw the same
+      // error shape (`{method}: missing required string field
+      // '{field}'`) the electron-side fallback produces. Page count
       // (`exportPdf`) is pinned at `2` to match
       // `aec_export::write_project_pdf` (1 cover + 1 overview); the
       // electron-side in-process fallback uses the same value.
       exportPdf: async (params) => ({
-        outPath: readOutPath(params, "/exports/out.pdf"),
+        outPath: requireStringField(params, "exportPdf", "outPath"),
         pages: 2,
       }),
       exportDxf: async (params) => ({
-        outPath: readOutPath(params, "/exports/out.dxf"),
+        outPath: requireStringField(params, "exportDxf", "outPath"),
       }),
       exportIfc: async (params) => ({
-        outPath: readOutPath(params, "/exports/out.ifc"),
+        outPath: requireStringField(params, "exportIfc", "outPath"),
       }),
       exportGltf: async (params) => ({
-        outPath: readOutPath(params, "/exports/out.gltf"),
+        outPath: requireStringField(params, "exportGltf", "outPath"),
       }),
       buildProposalPack: async (params) => ({
-        outPath: readOutPath(params, "/exports/proposal.pdf"),
+        outPath: requireStringField(params, "buildProposalPack", "outPath"),
       }),
     },
     deliver: deliverMock(newId),
@@ -315,15 +315,29 @@ export function rendererInProcessBackend(): AecApi {
 }
 
 /**
- * Read the `outPath` field from a renderer-supplied
- * `Record<string, unknown>` params object, falling back to a fixed
- * default when it's missing or not a string. Used by the vitest
- * fallback for the export IPC namespace so renderer tests see the
- * `outPath` they passed in (rather than always a fixed sentinel).
+ * Read a **required** `string` field from a renderer-supplied
+ * `Record<string, unknown>` params object. Throws when the field is
+ * absent / `null` / `undefined` / not a string.
+ *
+ * Mirrors the electron-side `requireStringField` in
+ * `apps/desktop/electron/bridge.ts` so the vitest fallback enforces
+ * the same mandatory-field contract as both the in-process backend
+ * and the native napi structs in
+ * `crates/aec_bridge/src/napi_api.rs`. The error message format
+ * (`{method}: missing required string field '{field}'`) is identical
+ * across the three layers so renderer tests can assert on the
+ * exception text without branching on which backend produced it.
  */
-function readOutPath(params: Record<string, unknown>, fallback: string): string {
-  const v = params.outPath;
-  return typeof v === "string" ? v : fallback;
+function requireStringField(
+  params: Record<string, unknown>,
+  method: string,
+  key: string,
+): string {
+  const v = params[key];
+  if (typeof v !== "string") {
+    throw new Error(`${method}: missing required string field '${key}'`);
+  }
+  return v;
 }
 
 /**
