@@ -189,15 +189,44 @@ export function rendererInProcessBackend(): AecApi {
       enqueueRender: async () => ({ jobId: newId("job") }),
       listJobs: async () => [],
       cancelJob: async () => ({ cancelled: true }),
-      applyPreset: async () => ({ ok: true }),
+      applyPreset: async (params) => {
+        const presetId = typeof params.preset === "string" ? params.preset : "";
+        const known = [
+          "quick",
+          "standard",
+          "high",
+          "studio",
+          "eevee_preview",
+          "walkthrough",
+          "panorama",
+        ];
+        if (!known.includes(presetId)) {
+          throw new Error(`unknown render preset id \`${presetId}\``);
+        }
+        return { ok: true };
+      },
       diagnose: async (jobId) => ({ jobId, suggestions: [] }),
       enqueueBatch: async (params) => {
+        // Mirror the in-process electron backend and the native side:
+        // empty cameras/presets are a hard error, not a silent
+        // `["standard"]` fallback. Renderer vitest tests must see the
+        // same rejection contract as production.
         const presets =
-          (params.presetIds && params.presetIds.length > 0
+          params.presetIds && params.presetIds.length > 0
             ? params.presetIds
             : params.presetId
               ? [params.presetId]
-              : ["standard"]);
+              : [];
+        if (params.cameraIds.length === 0) {
+          throw new Error(
+            "renderEnqueueBatch requires at least one camera id",
+          );
+        }
+        if (presets.length === 0) {
+          throw new Error(
+            "renderEnqueueBatch requires at least one preset id",
+          );
+        }
         const batchId = newId("batch");
         const jobIds: string[] = [];
         for (let i = 0; i < params.cameraIds.length * presets.length; i++) {

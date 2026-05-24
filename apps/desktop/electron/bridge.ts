@@ -1319,7 +1319,31 @@ export function inProcessBackend(): BridgeBackend {
       if (j) j.status = "cancelled";
       return { cancelled: true };
     },
-    async renderApplyPreset(_p) {
+    async renderApplyPreset(params) {
+      // Reject unknown / missing preset ids the same way the native
+      // side (`BridgeService::render_apply_preset` →
+      // `RenderPresetStore::select`) does. The full set of built-in
+      // ids must stay in sync with `RenderPresetKey` in
+      // `apps/desktop/renderer/src/components/render/PresetSelector.tsx`
+      // and `aec_render::preset::built_in_presets`. Without this
+      // validation, a renderer-side dropdown bug that sends a missing
+      // or typo'd preset id would silently no-op in dev (vitest /
+      // in-process) and crash with a Rust error in production once the
+      // `.node` artefact loads — exactly the dev/prod-parity hazard
+      // `NATIVE_WIRED_METHODS` exists to prevent.
+      const presetId = typeof params.preset === "string" ? params.preset : "";
+      const known = [
+        "quick",
+        "standard",
+        "high",
+        "studio",
+        "eevee_preview",
+        "walkthrough",
+        "panorama",
+      ];
+      if (!known.includes(presetId)) {
+        throw new Error(`unknown render preset id \`${presetId}\``);
+      }
       return { ok: true };
     },
     async renderDiagnose(jobId) {
