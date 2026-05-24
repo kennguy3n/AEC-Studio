@@ -1252,7 +1252,33 @@ impl SweptDiskSolid {
             }
         }
         let segs = self.segments.clamp(3, 256) as usize;
-        let path_len = self.path.len();
+
+        // Coalesce consecutive coincident path vertices. The IFC4
+        // schema doesn't actually forbid them (some real-world Revit
+        // / IfcOpenShell exports emit a duplicated vertex at a
+        // segment join), and a zero-length edge breaks the
+        // parallel-transport math below: `normalize3` of `[0, 0, 0]`
+        // returns the zero vector, which collapses the local frame
+        // and emits degenerate (zero-area) triangles. De-duplicating
+        // up-front is cheaper than scattering guards through the
+        // frame builder and ring emitter.
+        let path: Vec<[f64; 3]> = {
+            let mut out: Vec<[f64; 3]> = Vec::with_capacity(self.path.len());
+            for p in &self.path {
+                let keep = match out.last() {
+                    None => true,
+                    Some(prev) => !approx_eq_point3(*prev, *p, 1e-12),
+                };
+                if keep {
+                    out.push(*p);
+                }
+            }
+            out
+        };
+        if path.len() < 2 {
+            return Ok(mesh);
+        }
+        let path_len = path.len();
 
         // Parallel-transport frames along the polyline. Avoid the
         // Frenet-frame twist at S-curves by rotating the previous
@@ -1261,14 +1287,14 @@ impl SweptDiskSolid {
         let mut tangents: Vec<[f64; 3]> = Vec::with_capacity(path_len);
         for i in 0..path_len {
             let t = if i == 0 {
-                sub3(self.path[1], self.path[0])
+                sub3(path[1], path[0])
             } else if i == path_len - 1 {
-                sub3(self.path[i], self.path[i - 1])
+                sub3(path[i], path[i - 1])
             } else {
                 // Average of incoming + outgoing edges → tangent at the
                 // joint. Smoother than picking one or the other.
-                let incoming = normalize3(sub3(self.path[i], self.path[i - 1]));
-                let outgoing = normalize3(sub3(self.path[i + 1], self.path[i]));
+                let incoming = normalize3(sub3(path[i], path[i - 1]));
+                let outgoing = normalize3(sub3(path[i + 1], path[i]));
                 [
                     incoming[0] + outgoing[0],
                     incoming[1] + outgoing[1],
@@ -1304,7 +1330,7 @@ impl SweptDiskSolid {
         //     inner[i, k] = (i * segs * 2) + segs + k         if hollow
         let stride = if r_in.is_some() { segs * 2 } else { segs };
         for (i, &(uvec, vvec)) in frames.iter().enumerate() {
-            let center = self.path[i];
+            let center = path[i];
             for k in 0..segs {
                 let t = (k as f64) / (segs as f64) * TAU;
                 let (sin_t, cos_t) = t.sin_cos();
@@ -1470,6 +1496,14 @@ fn pick_perpendicular(t: [f64; 3]) -> [f64; 3] {
 fn project_perpendicular(v: [f64; 3], n: [f64; 3]) -> [f64; 3] {
     let d = v[0] * n[0] + v[1] * n[1] + v[2] * n[2];
     [v[0] - d * n[0], v[1] - d * n[1], v[2] - d * n[2]]
+}
+
+/// Test two 3D points for approximate equality within an
+/// epsilon-bounded box. Used by [`SweptDiskSolid::tessellate`] to
+/// coalesce consecutive coincident directrix vertices before the
+/// parallel-transport frame builder runs.
+fn approx_eq_point3(a: [f64; 3], b: [f64; 3], eps: f64) -> bool {
+    (a[0] - b[0]).abs() <= eps && (a[1] - b[1]).abs() <= eps && (a[2] - b[2]).abs() <= eps
 }
 
 // ---------------------------------------------------------------------
@@ -2205,6 +2239,56 @@ mod tests {
             segments: 16,
         };
         let mesh = solid.tessellate().expect("invalid inner");
+        assert!(mesh.positions.is_empty());
+        assert!(mesh.indices.is_empty());
+    }
+
+    /// Coincident consecutive path vertices are coalesced before the
+    /// parallel-transport frame is built. A 3-vertex path with a
+    /// duplicated middle vertex produces the same mesh as the
+    /// equivalent 2-vertex straight-cylinder path.
+    #[test]
+    fn swept_disk_coalesces_coincident_path_vertices() {
+        // Duplicated middle vertex — would produce a zero-length edge
+        // and collapse the frame at i = 1 without coalescing.
+        let duped = SweptDiskSolid {
+            path: vec![
+                [0.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0],
+                [0.0, 0.0, 1.0],
+                [0.0, 0.0, 2.0],
+            ],
+            radius_m: 0.25,
+            inner_radius_m: None,
+            segments: 16,
+        };
+        // Reference: straight cylinder of the same length.
+        let ref_solid = SweptDiskSolid {
+            path: vec![[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 2.0]],
+            radius_m: 0.25,
+            inner_radius_m: None,
+            segments: 16,
+        };
+        let m_duped = duped.tessellate().expect("duped path");
+        let m_ref = ref_solid.tessellate().expect("ref path");
+        // Same vertex / triangle count after coalescing.
+        assert_eq!(m_duped.positions.len(), m_ref.positions.len());
+        assert_eq!(m_duped.indices.len(), m_ref.indices.len());
+        // Coalescing must not collapse the mesh to zero.
+        assert!(!m_duped.positions.is_empty());
+    }
+
+    /// All-coincident path collapses to fewer than 2 unique vertices
+    /// and returns an empty mesh.
+    #[test]
+    fn swept_disk_all_coincident_path_is_empty() {
+        let solid = SweptDiskSolid {
+            path: vec![[1.0, 2.0, 3.0], [1.0, 2.0, 3.0], [1.0, 2.0, 3.0]],
+            radius_m: 0.25,
+            inner_radius_m: None,
+            segments: 16,
+        };
+        let mesh = solid.tessellate().expect("all-coincident");
         assert!(mesh.positions.is_empty());
         assert!(mesh.indices.is_empty());
     }

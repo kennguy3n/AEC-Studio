@@ -553,7 +553,13 @@ impl BridgeService {
         let snapshot = aec_bim::ifc::IfcReader::from_string(&body)?;
         Ok(BimImportSummary {
             path: path.to_string(),
-            schema: format!("{:?}", snapshot.schema),
+            // `Display` returns the canonical STEP token
+            // (`"IFC2X3"` / `"IFC4"` / `"IFC4X3"`) — a stable
+            // contract for the renderer's "Import BIM" panel.
+            // The `Debug` form would render the Rust variant name
+            // (`"Ifc4"`), which is fragile against enum-variant
+            // renaming.
+            schema: snapshot.schema.to_string(),
             spatial_nodes: snapshot.stats.spatial_nodes as u64,
             elements: snapshot.stats.elements as u64,
             psets: snapshot.stats.psets as u64,

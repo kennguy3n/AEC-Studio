@@ -99,6 +99,20 @@ impl IfcSchema {
     }
 }
 
+/// `Display` renders the canonical STEP token — `"IFC2X3"`, `"IFC4"`,
+/// `"IFC4X3"`. This is the load-bearing contract that downstream
+/// consumers (the bridge `BimImportSummary`, the renderer's "Import
+/// BIM" panel) match on, so it cannot drift with enum-variant
+/// renaming. Use this in `format!("{}")` over `format!("{:?}")` —
+/// the `Debug` form would render the Rust variant name (`"Ifc4"`)
+/// which is convenient for logs but a fragile contract for any
+/// non-debug caller.
+impl std::fmt::Display for IfcSchema {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_step_literal())
+    }
+}
+
 /// Lightweight stats returned alongside the snapshot, useful for
 /// assertions in roundtrip tests.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -194,6 +208,13 @@ impl IfcReader {
         let mut material_layers_step: HashMap<u32, MaterialLayer> = HashMap::new();
         let mut material_layer_sets_step: HashMap<u32, (String, Option<String>, Vec<u32>)> =
             HashMap::new();
+        // `IfcMaterialLayerSetUsage` indirection: maps a usage STEP id to
+        // the underlying `IfcMaterialLayerSet` STEP id. Revit and ArchiCAD
+        // bind walls / slabs / roofs to layer-sets through this wrapper
+        // (carrying orientation + offset metadata), so an
+        // `IfcRelAssociatesMaterial` whose `RelatingMaterial` is a usage
+        // must be followed one hop to reach the real set.
+        let mut material_layer_set_usage_step: HashMap<u32, u32> = HashMap::new();
 
         for g in &groups {
             match g.kind.as_str() {
@@ -344,6 +365,27 @@ impl IfcReader {
                     let description = optional_string_arg(g, 2)?;
                     if !name.is_empty() {
                         material_layer_sets_step.insert(g.step_id, (name, description, layer_refs));
+                    }
+                }
+                "IFCMATERIALLAYERSETUSAGE" => {
+                    // IFC4 form:
+                    //   IFCMATERIALLAYERSETUSAGE(#ForLayerSet,
+                    //                            LayerSetDirection,
+                    //                            DirectionSense,
+                    //                            OffsetFromReferenceLine,
+                    //                            ReferenceExtent)
+                    //
+                    // Orientation / offset metadata is intentionally
+                    // dropped here — AEC Studio's project graph stores
+                    // material assignments without per-wall layer
+                    // direction (the LayerSetDirection / DirectionSense
+                    // fields are reconstructed on export from element
+                    // geometry). What we DO need is the `ForLayerSet`
+                    // ref so a downstream `IfcRelAssociatesMaterial`
+                    // pointing at this usage can be followed through to
+                    // the underlying `IfcMaterialLayerSet`.
+                    if let Ok(layer_set_ref) = g.ref_arg(0) {
+                        material_layer_set_usage_step.insert(g.step_id, layer_set_ref);
                     }
                 }
                 other => {
@@ -651,11 +693,25 @@ impl IfcReader {
             materials_store.upsert_layer_set(set);
         }
         // Stage 3: assignments
+        //
+        // `IfcRelAssociatesMaterial.RelatingMaterial` is a select that
+        // can target an `IfcMaterial`, an `IfcMaterialLayerSet`, an
+        // `IfcMaterialLayerSetUsage` (the Revit / ArchiCAD case),
+        // an `IfcMaterialProfileSet`, or an `IfcMaterialConstituentSet`.
+        // We resolve the first three; the last two fall through the
+        // tolerate-and-skip path per the module contract.
         let mut material_assignment_count = 0usize;
         for (elem_steps, mat_ref) in &associates_material {
-            let assignment_opt = if let Some(mat) = materials_step.get(mat_ref) {
+            // Hop through `IfcMaterialLayerSetUsage` to its `ForLayerSet`
+            // ref before any other lookup. Real-world exports almost
+            // always go through the usage indirection.
+            let effective_ref = material_layer_set_usage_step
+                .get(mat_ref)
+                .copied()
+                .unwrap_or(*mat_ref);
+            let assignment_opt = if let Some(mat) = materials_step.get(&effective_ref) {
                 Some(MaterialAssignment::Single(mat.name.clone()))
-            } else if let Some((set_name, _, _)) = material_layer_sets_step.get(mat_ref) {
+            } else if let Some((set_name, _, _)) = material_layer_sets_step.get(&effective_ref) {
                 Some(MaterialAssignment::LayerSet(set_name.clone()))
             } else {
                 None

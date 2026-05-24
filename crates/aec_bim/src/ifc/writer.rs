@@ -22,7 +22,7 @@
 //!     deterministically derived from the `EntityId` via
 //!     [`super::compress_entity_id_to_guid`]).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 
 use thiserror::Error;
@@ -487,6 +487,15 @@ DATA;\n";
                         ),
                     );
                 }
+                // IFC4 `IfcMaterialLayerSet.MaterialLayers` is
+                // `LIST [1:?]` — emitting a set with zero resolved
+                // layers would produce a schema-invalid `(())` literal.
+                // Drop the set entirely: any `MaterialAssignment::LayerSet`
+                // bound to this name will then cascade into the
+                // tolerate-and-skip path below.
+                if layer_step_ids.is_empty() {
+                    continue;
+                }
                 let sid = buf.alloc();
                 layer_set_step.insert(set_name.clone(), sid);
                 let desc_lit = step_optional_quoted(set.description.as_deref());
@@ -513,7 +522,6 @@ DATA;\n";
             // BTreeMap so iteration is deterministic (alphabetical
             // by material name) — matters for the byte-identical
             // round-trip guarantee.
-            use std::collections::BTreeMap;
             let mut by_material: BTreeMap<(bool, String), Vec<u32>> = BTreeMap::new();
             for (entity, assignment) in materials.assignments() {
                 let Some(elem_step) = element_step.get(entity) else {

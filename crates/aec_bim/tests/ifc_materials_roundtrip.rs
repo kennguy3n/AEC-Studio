@@ -290,3 +290,59 @@ END-ISO-10303-21;
     assert_eq!(snap.stats.elements, 1);
     assert_eq!(snap.stats.spatial_nodes, 4);
 }
+
+#[test]
+fn reader_follows_material_layer_set_usage_indirection() {
+    // Revit / ArchiCAD bind walls / slabs / roofs to layer-sets
+    // through an `IfcMaterialLayerSetUsage` wrapper that carries
+    // orientation + offset metadata. The reader must hop through
+    // the usage to reach the underlying `IfcMaterialLayerSet`.
+    //
+    // STEP graph here:
+    //   #11 IfcMaterial 'Concrete'
+    //   #12 IfcMaterialLayer(#11, 200mm)
+    //   #13 IfcMaterialLayerSet((#12), 'Concrete Slab 200')
+    //   #14 IfcMaterialLayerSetUsage(#13, AXIS2, POSITIVE, 0.0)
+    //   #15 IfcWall
+    //   #16 IfcRelContainedInSpatialStructure
+    //   #17 IfcRelAssociatesMaterial(elem=#15, RelatingMaterial=#14)
+    let body = "\
+ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('test'),'2;1');
+FILE_NAME('t.ifc','2026-05-20T00:00:00',(''),(''),'','','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1 = IFCOWNERHISTORY($,$,$,.NOCHANGE.,$,$,$,1747699200);
+#2 = IFCPROJECT('00000000000000000000a1',#1,$,'P',$,$,$,$,$);
+#3 = IFCSITE('00000000000000000000a2',#1,$,'S',$,$,$,$);
+#4 = IFCBUILDING('00000000000000000000a3',#1,$,'B',$,$,$,$);
+#5 = IFCBUILDINGSTOREY('00000000000000000000a4',#1,$,'L1',$,$,$,$);
+#6 = IFCRELAGGREGATES('00000000000000000000a5',#1,$,$,#2,(#3));
+#7 = IFCRELAGGREGATES('00000000000000000000a6',#1,$,$,#3,(#4));
+#8 = IFCRELAGGREGATES('00000000000000000000a7',#1,$,$,#4,(#5));
+#11 = IFCMATERIAL('Concrete',$,$);
+#12 = IFCMATERIALLAYER(#11,0.2,.F.,$,$,$,$);
+#13 = IFCMATERIALLAYERSET((#12),'Concrete Slab 200',$);
+#14 = IFCMATERIALLAYERSETUSAGE(#13,.AXIS2.,.POSITIVE.,0.0,$);
+#15 = IFCWALL('00000000000000000000a8',#1,$,'IfcWall::ent_01hx5sabwall0000000000000000','Wall',$,$,$);
+#16 = IFCRELCONTAINEDINSPATIALSTRUCTURE('00000000000000000000a9',#1,$,$,(#15),#5);
+#17 = IFCRELASSOCIATESMATERIAL('00000000000000000000aa',#1,$,$,(#15),#14);
+ENDSEC;
+END-ISO-10303-21;
+";
+    let snap = IfcReader::from_string(body).expect("follow IfcMaterialLayerSetUsage indirection");
+    assert_eq!(snap.materials.material_count(), 1);
+    assert_eq!(snap.materials.layer_set_count(), 1);
+    // The usage indirection MUST resolve back to the underlying
+    // layer-set so the assignment lands on the wall.
+    assert_eq!(snap.stats.material_assignments, 1);
+    let set = snap
+        .materials
+        .layer_set("Concrete Slab 200")
+        .expect("layer-set recovered through usage");
+    assert_eq!(set.layers.len(), 1);
+    assert_eq!(set.layers[0].material_name, "Concrete");
+    assert!((set.layers[0].thickness_m - 0.2).abs() < 1e-12);
+}
