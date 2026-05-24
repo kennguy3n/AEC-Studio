@@ -1383,6 +1383,24 @@ function ensureGraph(graphs: Map<string, InProcessGraph>, projectPath: string): 
  * fallback doesn't fully model — vitests that need richer semantics
  * either load the `.node` artefact or stub `commandApply` directly.
  */
+/**
+ * Explicit kind map for the create-side tools. Each entry maps a
+ * `design.*` tool name to the entity `kind` the Rust engine writes
+ * into the graph (see `aec_command::commands::*::to_delta()`). Using
+ * a literal map rather than a prefix-stripping regex makes this
+ * trip-wired: a future `design.update_*` or `design.draw_*` would not
+ * silently land in this branch.
+ */
+const CREATE_TOOL_KIND_MAP: Record<string, string> = {
+  "design.create_wall": "wall",
+  "design.create_room": "room",
+  "design.create_floor": "floor",
+  "design.place_door": "door",
+  "design.place_window": "window",
+  "design.add_light": "light",
+  "design.save_camera": "camera",
+};
+
 function computeForwardDeltas(graph: InProcessGraph, command: Command): EntityDelta[] {
   const args = command.arguments as Record<string, unknown> | undefined;
   switch (command.tool) {
@@ -1394,7 +1412,10 @@ function computeForwardDeltas(graph: InProcessGraph, command: Command): EntityDe
     case "design.add_light":
     case "design.save_camera": {
       const entityId = (args?.entity_id as string | undefined) ?? randomId();
-      const kind = command.tool.split(".").pop()!.replace(/^(create_|place_|add_|save_)/, "");
+      const kind = CREATE_TOOL_KIND_MAP[command.tool];
+      if (!kind) {
+        throw new Error(`commandApply (in-process): kind map missing entry for ${command.tool}`);
+      }
       return [
         {
           kind: "create",

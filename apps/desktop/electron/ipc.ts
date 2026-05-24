@@ -294,12 +294,14 @@ export function registerIpcHandlers(): void {
   ipcMain.handle("command:apply", async (_e, { projectPath, command }) => {
     assertString(projectPath, "projectPath");
     assertObject(command, "command");
-    assertString(
-      (command as Record<string, unknown>).command_id as unknown,
-      "command.command_id",
-    );
-    assertString((command as Record<string, unknown>).tool as unknown, "command.tool");
-    assertString((command as Record<string, unknown>).scope as unknown, "command.scope");
+    const c = command as Record<string, unknown>;
+    assertString(c.command_id as unknown, "command.command_id");
+    assertString(c.tool as unknown, "command.tool");
+    // The envelope's `scope` must be one of the five workflow scopes so
+    // an invalid value (e.g. a renderer typo or stale call site) fails
+    // fast at the IPC boundary rather than as an opaque serde error on
+    // the Rust side or as a silent accept by the in-process fallback.
+    assertScope(c.scope, "command.scope");
     return getBridge().commandApply(
       projectPath,
       command as unknown as import("./bridge").Command,
@@ -355,13 +357,14 @@ function assertObject(
  * boundary rather than as a deserialisation error on the Rust
  * side.
  */
-function assertScope(
+export function assertScope(
   value: unknown,
+  field: string = "activeScope",
 ): asserts value is import("./bridge").CommandScope {
   const allowed = ["design", "draft", "bim", "render", "deliver"] as const;
   if (typeof value !== "string" || !allowed.includes(value as typeof allowed[number])) {
     throw new IpcValidationError(
-      `activeScope must be one of ${allowed.join(" / ")} (got: ${String(value)})`,
+      `${field} must be one of ${allowed.join(" / ")} (got: ${String(value)})`,
     );
   }
 }

@@ -3,7 +3,7 @@
 //! redoes it.
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, Transaction};
 use serde::{Deserialize, Serialize};
 
 use aec_core::types::CommandId;
@@ -65,6 +65,14 @@ impl UndoRedoJournal {
         self.undo.pop()
     }
 
+    /// Read-only peek at the top of the undo stack. Used by the
+    /// persistent path to validate the next undo against the current
+    /// graph state **before** taking the entry off the stack, so a
+    /// validation failure leaves the journal completely unchanged.
+    pub fn peek_undo(&self) -> Option<&JournalEntry> {
+        self.undo.last()
+    }
+
     /// Push an entry back onto the undo stack — used after
     /// [`Self::take_undo`] when the replay failed and the graph was
     /// rolled back. The entry returns to the exact position it occupied
@@ -83,6 +91,11 @@ impl UndoRedoJournal {
     /// Symmetric counterpart to [`Self::take_undo`] for redo.
     pub fn take_redo(&mut self) -> Option<JournalEntry> {
         self.redo.pop()
+    }
+
+    /// Symmetric counterpart to [`Self::peek_undo`] for redo.
+    pub fn peek_redo(&self) -> Option<&JournalEntry> {
+        self.redo.last()
     }
 
     /// Symmetric counterpart to [`Self::restore_undo`] for redo.
@@ -159,6 +172,17 @@ impl UndoRedoJournal {
     /// command).
     pub fn persist_record(conn: &mut Connection, entry: &JournalEntry) -> CommandResult<()> {
         let tx = conn.transaction()?;
+        Self::persist_record_in_tx(&tx, entry)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// SQL-only variant of [`Self::persist_record`] that operates inside
+    /// an externally-managed transaction so the engine can combine the
+    /// entity-delta writes and the journal record into a single atomic
+    /// commit. Callers are responsible for calling `tx.commit()` (or
+    /// dropping `tx` to roll back) themselves.
+    pub fn persist_record_in_tx(tx: &Transaction, entry: &JournalEntry) -> CommandResult<()> {
         tx.execute("DELETE FROM undo_journal WHERE superseded = 1", params![])?;
         let forward = serde_json::to_string(&entry.forward)?;
         let inverse = serde_json::to_string(&entry.inverse)?;
@@ -172,14 +196,22 @@ impl UndoRedoJournal {
                 inverse,
             ],
         )?;
-        tx.commit()?;
         Ok(())
     }
 
     /// Move the top undo row to the redo stack (`superseded = 1`).
     /// Called after a successful `undo`.
     pub fn persist_undo(conn: &mut Connection, command_id: &CommandId) -> CommandResult<()> {
-        let n = conn.execute(
+        let tx = conn.transaction()?;
+        Self::persist_undo_in_tx(&tx, command_id)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// SQL-only variant of [`Self::persist_undo`]. See
+    /// [`Self::persist_record_in_tx`] for the rationale.
+    pub fn persist_undo_in_tx(tx: &Transaction, command_id: &CommandId) -> CommandResult<()> {
+        let n = tx.execute(
             "UPDATE undo_journal SET superseded = 1 \
              WHERE seq = (SELECT MAX(seq) FROM undo_journal WHERE command_id = ?1 AND superseded = 0)",
             params![command_id.to_string()],
@@ -195,7 +227,16 @@ impl UndoRedoJournal {
     /// Move the top redo row back to the undo stack (`superseded = 0`).
     /// Called after a successful `redo`.
     pub fn persist_redo(conn: &mut Connection, command_id: &CommandId) -> CommandResult<()> {
-        let n = conn.execute(
+        let tx = conn.transaction()?;
+        Self::persist_redo_in_tx(&tx, command_id)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// SQL-only variant of [`Self::persist_redo`]. See
+    /// [`Self::persist_record_in_tx`] for the rationale.
+    pub fn persist_redo_in_tx(tx: &Transaction, command_id: &CommandId) -> CommandResult<()> {
+        let n = tx.execute(
             "UPDATE undo_journal SET superseded = 0 \
              WHERE seq = (SELECT MAX(seq) FROM undo_journal WHERE command_id = ?1 AND superseded = 1)",
             params![command_id.to_string()],

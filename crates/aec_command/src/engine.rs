@@ -253,117 +253,142 @@ impl CommandEngine {
     }
 
     /// Execute a command and persist the resulting deltas and journal
-    /// entry to the connection. The in-memory state and the on-disk
-    /// state advance in lock-step — a failure in either leaves both
-    /// rolled back via [`crate::commands::ProjectGraph::persist_delta`]'s
-    /// inverse-apply.
+    /// entry to the connection.
+    ///
+    /// The pipeline is **all-or-nothing**:
+    /// 1. Compute the forward deltas (pure, no mutation).
+    /// 2. Validate the deltas against a clone of the graph so a
+    ///    multi-delta command is checked end-to-end. Any failure here
+    ///    returns immediately with both layers untouched.
+    /// 3. Open a single SQL transaction; write every entity delta and
+    ///    the journal entry inside it. If anything in the transaction
+    ///    fails (or `commit()` itself fails) the tx is dropped and the
+    ///    on-disk state is rolled back automatically.
+    /// 4. **Only after** `commit()` succeeds do we mutate the in-memory
+    ///    graph + journal. Because step 2 validated the deltas against
+    ///    the current state, the in-memory apply is guaranteed to
+    ///    succeed.
+    ///
+    /// Earlier iterations split entity writes and journal writes across
+    /// separate transactions, which left a window where a `persist_undo`
+    /// failure after a successful entity apply could leave the journal
+    /// pointing at the wrong stack. The single-transaction shape closes
+    /// that window.
     pub fn execute_persistent(
         &mut self,
         cmd: Command,
         conn: &mut rusqlite::Connection,
     ) -> Result<CommandResult> {
         let deltas = self.compute_deltas(&cmd.kind)?;
-        // Persist each delta one at a time so the in-memory graph and
-        // the SQL table advance together. If the n-th delta fails we
-        // unwind the first n-1 via their inverses on both sides.
-        let mut applied: Vec<EntityDelta> = Vec::with_capacity(deltas.len());
+        self.graph.validate_all(&deltas)?;
+        let inverse: Vec<EntityDelta> = deltas.iter().rev().map(EntityDelta::invert).collect();
+        let entry = JournalEntry {
+            command_id: cmd.command_id.clone(),
+            applied_at: cmd.ts,
+            forward: deltas.clone(),
+            inverse,
+        };
+        let tx = conn.transaction()?;
         for d in &deltas {
-            if let Err(err) = self.graph.persist_delta(conn, d) {
-                for done in applied.iter().rev() {
-                    // Inverse apply on both layers. A failure here would
-                    // leave the system in an inconsistent state; we
-                    // log it via the surfacing error but continue so we
-                    // unwind as much as possible.
-                    let _ = self.graph.persist_delta(conn, &done.invert());
-                }
-                return Err(err);
-            }
-            applied.push(d.clone());
+            crate::commands::ProjectGraph::persist_delta_in_tx(&tx, d)?;
         }
-        let inverse: Vec<EntityDelta> = applied.iter().rev().map(EntityDelta::invert).collect();
+        crate::journal::UndoRedoJournal::persist_record_in_tx(&tx, &entry)?;
+        tx.commit()?;
+        // SQL is committed atomically. Now mirror the changes in memory.
+        // The applies cannot fail because validate_all succeeded against
+        // the same starting state, and the engine holds a write lock
+        // (see BridgeService's RwLock) so no concurrent mutation can
+        // have invalidated the validation.
+        for d in &deltas {
+            self.graph
+                .apply(d)
+                .expect("validated above; apply cannot fail");
+        }
         let envelope = self.audit.extend(
             &cmd.command_id,
             &serde_json::to_value(&cmd).unwrap_or(serde_json::Value::Null),
         );
-        let entry = JournalEntry {
-            command_id: cmd.command_id.clone(),
-            applied_at: cmd.ts,
-            forward: applied.clone(),
-            inverse,
-        };
-        crate::journal::UndoRedoJournal::persist_record(conn, &entry)?;
         self.journal.record(entry);
         Ok(CommandResult {
             command_id: cmd.command_id,
-            applied,
+            applied: deltas,
             audit: envelope,
         })
     }
 
-    /// Persistent counterpart to [`Self::undo`]. Mirrors the in-memory
-    /// two-phase journal mutation: detach → replay inverse → commit, or
-    /// restore on replay failure.
+    /// Persistent counterpart to [`Self::undo`]. Same single-transaction
+    /// validate → SQL → commit → in-memory pipeline as
+    /// [`Self::execute_persistent`]: peek the top entry without
+    /// removing it, validate the inverse deltas, write everything in
+    /// one tx, commit, and only then move the in-memory journal stacks.
     pub fn undo_persistent(&mut self, conn: &mut rusqlite::Connection) -> Result<CommandResult> {
         let entry = self
             .journal
-            .take_undo()
-            .ok_or(CommandError::NothingToUndo)?;
-        // Persist each inverse delta on both layers.
-        let mut applied: Vec<EntityDelta> = Vec::with_capacity(entry.inverse.len());
+            .peek_undo()
+            .ok_or(CommandError::NothingToUndo)?
+            .clone();
+        self.graph.validate_all(&entry.inverse)?;
+        let tx = conn.transaction()?;
         for d in &entry.inverse {
-            if let Err(err) = self.graph.persist_delta(conn, d) {
-                // Roll back the inverses we already applied.
-                for done in applied.iter().rev() {
-                    let _ = self.graph.persist_delta(conn, &done.invert());
-                }
-                self.journal.restore_undo(entry);
-                return Err(err);
-            }
-            applied.push(d.clone());
+            crate::commands::ProjectGraph::persist_delta_in_tx(&tx, d)?;
         }
+        crate::journal::UndoRedoJournal::persist_undo_in_tx(&tx, &entry.command_id)?;
+        tx.commit()?;
+        for d in &entry.inverse {
+            self.graph
+                .apply(d)
+                .expect("validated above; apply cannot fail");
+        }
+        let taken = self
+            .journal
+            .take_undo()
+            .expect("peeked above; take_undo cannot return None");
+        self.journal.commit_undone(taken.clone());
         let envelope = self.audit.extend(
-            &entry.command_id,
-            &serde_json::json!({"undo": entry.command_id.as_str()}),
+            &taken.command_id,
+            &serde_json::json!({"undo": taken.command_id.as_str()}),
         );
-        let result = CommandResult {
-            command_id: entry.command_id.clone(),
-            applied,
+        Ok(CommandResult {
+            command_id: taken.command_id,
+            applied: taken.inverse,
             audit: envelope,
-        };
-        crate::journal::UndoRedoJournal::persist_undo(conn, &entry.command_id)?;
-        self.journal.commit_undone(entry);
-        Ok(result)
+        })
     }
 
-    /// Persistent counterpart to [`Self::redo`].
+    /// Persistent counterpart to [`Self::redo`]. Mirrors
+    /// [`Self::undo_persistent`].
     pub fn redo_persistent(&mut self, conn: &mut rusqlite::Connection) -> Result<CommandResult> {
         let entry = self
             .journal
-            .take_redo()
-            .ok_or(CommandError::NothingToRedo)?;
-        let mut applied: Vec<EntityDelta> = Vec::with_capacity(entry.forward.len());
+            .peek_redo()
+            .ok_or(CommandError::NothingToRedo)?
+            .clone();
+        self.graph.validate_all(&entry.forward)?;
+        let tx = conn.transaction()?;
         for d in &entry.forward {
-            if let Err(err) = self.graph.persist_delta(conn, d) {
-                for done in applied.iter().rev() {
-                    let _ = self.graph.persist_delta(conn, &done.invert());
-                }
-                self.journal.restore_redo(entry);
-                return Err(err);
-            }
-            applied.push(d.clone());
+            crate::commands::ProjectGraph::persist_delta_in_tx(&tx, d)?;
         }
+        crate::journal::UndoRedoJournal::persist_redo_in_tx(&tx, &entry.command_id)?;
+        tx.commit()?;
+        for d in &entry.forward {
+            self.graph
+                .apply(d)
+                .expect("validated above; apply cannot fail");
+        }
+        let taken = self
+            .journal
+            .take_redo()
+            .expect("peeked above; take_redo cannot return None");
+        self.journal.commit_redone(taken.clone());
         let envelope = self.audit.extend(
-            &entry.command_id,
-            &serde_json::json!({"redo": entry.command_id.as_str()}),
+            &taken.command_id,
+            &serde_json::json!({"redo": taken.command_id.as_str()}),
         );
-        let result = CommandResult {
-            command_id: entry.command_id.clone(),
-            applied,
+        Ok(CommandResult {
+            command_id: taken.command_id,
+            applied: taken.forward,
             audit: envelope,
-        };
-        crate::journal::UndoRedoJournal::persist_redo(conn, &entry.command_id)?;
-        self.journal.commit_redone(entry);
-        Ok(result)
+        })
     }
 }
 
@@ -638,5 +663,147 @@ mod tests {
         let res = e.execute(cmd).unwrap();
         assert!(res.applied.is_empty()); // no graph delta but audit envelope still emitted
         assert!(res.audit.hash.starts_with("blake3:"));
+    }
+
+    // -------- persistent-path rollback regression tests --------
+
+    fn open_in_memory_persistent_db() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        // Mirror the persistent schema that `aec_core::db::open_encrypted`
+        // installs. We only need the columns the engine touches.
+        conn.execute_batch(
+            "CREATE TABLE entities (
+                id          TEXT PRIMARY KEY,
+                kind        TEXT NOT NULL,
+                parent_id   TEXT,
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL,
+                body        TEXT NOT NULL
+            );
+            CREATE TABLE undo_journal (
+                seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+                command_id  TEXT NOT NULL,
+                applied_at  TEXT NOT NULL,
+                forward     TEXT NOT NULL,
+                inverse     TEXT NOT NULL,
+                superseded  INTEGER NOT NULL DEFAULT 0
+            );",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn execute_persistent_validation_failure_leaves_both_layers_untouched() {
+        // Pre-condition: a wall already in the DB. A second CreateWall
+        // with the **same** entity_id is a validation error — execute_persistent
+        // must reject it before opening any SQL transaction, so the
+        // entities row count stays at exactly 1 and the journal at 0.
+        let mut conn = open_in_memory_persistent_db();
+        let mut e = CommandEngine::open(&conn, Scope::Design).unwrap();
+        let w = wall_a();
+        let cmd = Command::user(CommandKind::CreateWall(w.clone()));
+        e.execute_persistent(cmd, &mut conn).unwrap();
+        assert_eq!(e.graph().len(), 1);
+
+        // Second create with the same entity_id.
+        let duplicate = Command::user(CommandKind::CreateWall(w));
+        let err = e.execute_persistent(duplicate, &mut conn).unwrap_err();
+        assert!(matches!(err, CommandError::EntityAlreadyExists(_)));
+
+        // Neither layer mutated: in-memory still 1 entity + 1 journal entry,
+        // SQL still 1 row + 1 journal record.
+        assert_eq!(e.graph().len(), 1);
+        assert_eq!(e.undo_len(), 1);
+        let entity_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entities", [], |r| r.get(0))
+            .unwrap();
+        let journal_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM undo_journal", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(entity_count, 1);
+        assert_eq!(journal_count, 1);
+    }
+
+    #[test]
+    fn undo_persistent_validation_failure_leaves_journal_untouched() {
+        // Persistent undo replays the inverse deltas; if the in-memory
+        // graph already lost the entity (e.g., schema drift or external
+        // edit), the validation must fail and the journal entry must
+        // remain on the undo stack — exactly mirroring the in-memory
+        // `failed_undo_keeps_entry_on_undo_stack` invariant.
+        let mut conn = open_in_memory_persistent_db();
+        let mut e = CommandEngine::open(&conn, Scope::Design).unwrap();
+        let w = wall_a();
+        let wall_id = w.entity_id.clone();
+        e.execute_persistent(Command::user(CommandKind::CreateWall(w)), &mut conn)
+            .unwrap();
+        assert_eq!(e.undo_len(), 1);
+
+        // Externally remove the entity from the in-memory graph so the
+        // inverse Delete fails validation. (We don't touch the DB so
+        // the row stays — that's fine for the validation test.)
+        let record = e.graph().get(&wall_id).cloned().unwrap();
+        e.graph_mut()
+            .apply(&crate::commands::EntityDelta::Delete { record })
+            .unwrap();
+
+        let err = e.undo_persistent(&mut conn).unwrap_err();
+        assert!(matches!(err, CommandError::EntityNotFound(_)));
+        // Journal entry remains on undo (peek-based: never taken).
+        assert_eq!(e.undo_len(), 1);
+        assert_eq!(e.redo_len(), 0);
+        // SQL journal record's `superseded` flag is still 0.
+        let superseded: i64 = conn
+            .query_row("SELECT superseded FROM undo_journal", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(superseded, 0);
+    }
+
+    #[test]
+    fn persistent_round_trip_executes_undoes_and_redoes() {
+        let mut conn = open_in_memory_persistent_db();
+        let mut e = CommandEngine::open(&conn, Scope::Design).unwrap();
+        let w = wall_a();
+        let wall_id = w.entity_id.clone();
+        e.execute_persistent(Command::user(CommandKind::CreateWall(w)), &mut conn)
+            .unwrap();
+        assert_eq!(e.graph().len(), 1);
+
+        e.undo_persistent(&mut conn).unwrap();
+        assert_eq!(e.graph().len(), 0);
+        assert_eq!(e.undo_len(), 0);
+        assert_eq!(e.redo_len(), 1);
+        let superseded: i64 = conn
+            .query_row("SELECT superseded FROM undo_journal", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(superseded, 1);
+
+        e.redo_persistent(&mut conn).unwrap();
+        assert_eq!(e.graph().len(), 1);
+        assert!(e.graph().contains(&wall_id));
+        assert_eq!(e.undo_len(), 1);
+        assert_eq!(e.redo_len(), 0);
+    }
+
+    #[test]
+    fn persistent_apply_survives_engine_reopen() {
+        // The point of the persistent path: after we drop the engine the
+        // state survives. Reopening from the same connection rebuilds an
+        // engine whose graph + journal match the pre-drop state.
+        let mut conn = open_in_memory_persistent_db();
+        let wall_id = {
+            let mut e = CommandEngine::open(&conn, Scope::Design).unwrap();
+            let w = wall_a();
+            let id = w.entity_id.clone();
+            e.execute_persistent(Command::user(CommandKind::CreateWall(w)), &mut conn)
+                .unwrap();
+            id
+        };
+        let e2 = CommandEngine::open(&conn, Scope::Design).unwrap();
+        assert_eq!(e2.graph().len(), 1);
+        assert!(e2.graph().contains(&wall_id));
+        assert_eq!(e2.undo_len(), 1);
+        assert_eq!(e2.redo_len(), 0);
     }
 }

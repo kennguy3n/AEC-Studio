@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 
 use chrono::Utc;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, Transaction};
 use serde::{Deserialize, Serialize};
 
 use aec_core::types::EntityId;
@@ -135,20 +135,54 @@ impl ProjectGraph {
         Ok(Self { entities })
     }
 
-    /// Apply a single delta to the in-memory graph **and** persist it to
-    /// the `entities` table in a single SQL transaction. If the in-memory
-    /// apply fails the transaction is rolled back; if the SQL commit
-    /// fails the in-memory graph is rolled back via the inverse delta so
-    /// the two layers stay in lock-step.
-    pub fn persist_delta(
-        &mut self,
-        conn: &mut Connection,
-        delta: &EntityDelta,
-    ) -> CommandResult<()> {
-        // Apply to the in-memory graph first so we get the validation
-        // (duplicate-create, not-found, etc.) before touching SQL.
-        self.apply(delta)?;
-        let tx = conn.transaction()?;
+    /// Read-only validation: would this delta apply cleanly against the
+    /// current in-memory state? Used by the persistent execution path to
+    /// detect duplicate-create / not-found-update / not-found-delete
+    /// **before** opening the SQL transaction, so a validation failure
+    /// leaves both layers untouched.
+    pub fn validate(&self, delta: &EntityDelta) -> CommandResult<()> {
+        match delta {
+            EntityDelta::Create { record } => {
+                if self.entities.contains_key(&record.id) {
+                    return Err(CommandError::EntityAlreadyExists(record.id.to_string()));
+                }
+            }
+            EntityDelta::Update { id, .. } => {
+                if !self.entities.contains_key(id) {
+                    return Err(CommandError::EntityNotFound(id.to_string()));
+                }
+            }
+            EntityDelta::Delete { record } => {
+                if !self.entities.contains_key(&record.id) {
+                    return Err(CommandError::EntityNotFound(record.id.to_string()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate a sequence of deltas as a unit. Walks a shadow copy of
+    /// the entity map so the n-th delta is checked against the state
+    /// after applying the first n-1 — necessary for multi-delta commands
+    /// where e.g. a `Create` followed by an `Update` on the same id is
+    /// valid even though the second `Update` alone wouldn't be against
+    /// the pre-state.
+    pub fn validate_all(&self, deltas: &[EntityDelta]) -> CommandResult<()> {
+        let mut shadow = self.clone();
+        for d in deltas {
+            shadow.apply(d)?;
+        }
+        Ok(())
+    }
+
+    /// SQL-only persist of a single delta inside an externally-managed
+    /// transaction. Does **not** mutate the in-memory state — the
+    /// caller is responsible for calling [`Self::apply`] after the
+    /// transaction has been committed. This split makes
+    /// validate → SQL → commit → in-memory an all-or-nothing pipeline:
+    /// if SQL fails (or the transaction is dropped without commit), the
+    /// in-memory graph is never touched.
+    pub fn persist_delta_in_tx(tx: &Transaction, delta: &EntityDelta) -> CommandResult<()> {
         let now = Utc::now().to_rfc3339();
         match delta {
             EntityDelta::Create { record } => {
@@ -185,17 +219,27 @@ impl ProjectGraph {
                 }
             }
         }
-        match tx.commit() {
-            Ok(()) => Ok(()),
-            Err(err) => {
-                // Roll back the in-memory mutation so the two layers stay
-                // in lock-step. `delta.invert()` always succeeds for the
-                // shapes we just applied (Create has a valid record,
-                // Update has both before+after, Delete has a valid record).
-                let _ = self.apply(&delta.invert());
-                Err(err.into())
-            }
-        }
+        Ok(())
+    }
+
+    /// Convenience wrapper that opens its own transaction. Kept for
+    /// callers that want a single self-contained persist; the engine
+    /// uses [`Self::persist_delta_in_tx`] directly so it can combine
+    /// entity writes and journal writes into one atomic commit.
+    pub fn persist_delta(
+        &mut self,
+        conn: &mut Connection,
+        delta: &EntityDelta,
+    ) -> CommandResult<()> {
+        self.validate(delta)?;
+        let tx = conn.transaction()?;
+        Self::persist_delta_in_tx(&tx, delta)?;
+        tx.commit()?;
+        // Only mutate in-memory after the commit succeeds. If the commit
+        // fails the `?` above returns early and the graph is untouched.
+        self.apply(delta)
+            .expect("validated above; apply cannot fail");
+        Ok(())
     }
 
     /// Apply a single delta. The returned bool indicates whether the
