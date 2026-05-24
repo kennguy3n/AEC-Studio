@@ -1438,6 +1438,84 @@ END-ISO-10303-21;\n";
     }
 
     #[test]
+    fn bim_attach_ifc_handles_empty_guid_spatial_nodes_without_fk_violation() {
+        // Regression for Devin Review round 4 BUG_0001: a spatial
+        // node with an empty-string `IfcRoot.GlobalId` ('' in the
+        // STEP literal) used to flow through the bridge as
+        // `Some("")` rather than `None`. The reader synthesises a
+        // fresh non-deterministic `EntityId` for every parse of a
+        // GUID-less row, but the `bim_cache.global_id` index would
+        // alias all `Some("")` rows together on lookup. On the
+        // second attach of the same file, the new (random) EntityId
+        // for the empty-GUID site would never be inserted into
+        // `entities` (the dedup path took the `Unchanged` / `Updated`
+        // branch and did `UPDATE WHERE id = <new_random>`, matching
+        // zero rows). Any child whose `parent_id` referenced that
+        // new EntityId then violated the `entities.parent_id`
+        // foreign-key.
+        //
+        // Test shape: an IFC with `IfcProject` (real GUID) →
+        // `IfcSite` (EMPTY GUID, `''`) → `IfcBuilding` (real GUID),
+        // attached twice. The second attach must succeed. Empty-GUID
+        // sites get fresh EntityIds per parse and always take the
+        // `Inserted` branch, so children's `parent_id` always points
+        // at a row we just inserted.
+        let (mut s, _g) = service();
+        let project = s
+            .project_create_from_template("interior.apartment", "EmptyGuid")
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let ifc_path = tmp.path().join("empty-guid.ifc");
+        let body = b"ISO-10303-21;\n\
+HEADER;\n\
+FILE_DESCRIPTION(('empty-guid'),'2;1');\n\
+FILE_NAME('e.ifc','2026-05-20T00:00:00',(''),(''),'','','');\n\
+FILE_SCHEMA(('IFC4'));\n\
+ENDSEC;\n\
+DATA;\n\
+#1 = IFCOWNERHISTORY($,$,$,.NOCHANGE.,$,$,$,1747699200);\n\
+#2 = IFCPROJECT('00000000000000000000a1',#1,'P','P',$,$,$,$,$);\n\
+#3 = IFCSITE('',#1,$,'NoGuidSite',$,$,$,$,$);\n\
+#4 = IFCBUILDING('00000000000000000000a4',#1,$,'B',$,$,$,$,$);\n\
+#5 = IFCRELAGGREGATES('00000000000000000000a5',#1,$,$,#2,(#3));\n\
+#6 = IFCRELAGGREGATES('00000000000000000000a6',#1,$,$,#3,(#4));\n\
+ENDSEC;\n\
+END-ISO-10303-21;\n";
+        std::fs::write(&ifc_path, body).unwrap();
+
+        let first = s
+            .bim_attach_ifc(&project.path, ifc_path.to_str().unwrap())
+            .expect("first attach must succeed");
+        assert!(
+            first.spatial_nodes_inserted >= 3,
+            "expected >=3 (project + site + building) on first attach; got {}",
+            first.spatial_nodes_inserted
+        );
+        // The whole point: re-attach must NOT raise an
+        // FOREIGN KEY constraint failed error. The empty-GUID site
+        // takes the `Inserted` branch on every attach, but so does
+        // every other GUID-less row, so the bridge call should
+        // return `Ok(_)` even though it inserts a fresh EntityId
+        // for the site.
+        let second = s
+            .bim_attach_ifc(&project.path, ifc_path.to_str().unwrap())
+            .expect("re-attach with an empty-GUID spatial node must succeed (no FK violation)");
+        // The site row is GUID-less, so it can't dedupe on
+        // `bim_cache.global_id` — it's `Inserted` again. The two
+        // GUID-bearing rows (project + building) still dedupe.
+        assert!(
+            second.spatial_nodes_unchanged >= 2,
+            "project + building must dedupe on re-attach; got {} unchanged",
+            second.spatial_nodes_unchanged
+        );
+        assert!(
+            second.spatial_nodes_inserted >= 1,
+            "the GUID-less site must take the always-insert path; got {} inserted",
+            second.spatial_nodes_inserted
+        );
+    }
+
+    #[test]
     fn bim_attach_ifc_invalidates_engine_status_cache() {
         // After the attach, the engine-status cache entry for the
         // project must be gone so a subsequent

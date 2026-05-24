@@ -199,11 +199,31 @@ pub(crate) fn attach_snapshot(
         let Some(node) = snapshot.project.get(node_id) else {
             continue;
         };
-        let guid = node.ifc_guid.as_deref().or_else(|| {
-            // Fall back to the snapshot's separate guid map (the reader
-            // populates it pre-`set_ifc_guid`, so cover both paths).
-            snapshot.guid_by_entity.get(node_id).map(String::as_str)
-        });
+        // Resolve the IFC `GlobalId` of this spatial node from the
+        // two paths the reader can populate (the spatial-node field
+        // and the separate `guid_by_entity` map, depending on whether
+        // the reader reached `set_ifc_guid` before or after the
+        // spatial-tree build). Treat an empty-string GUID as `None`:
+        // the IFC4 schema requires `IfcRoot.GlobalId` to be a
+        // non-empty 22-char base64, but defective IFC2x3 exports may
+        // emit `''`. If we propagated `Some("")` into `upsert_entity`,
+        // every empty-GUID row across the file would alias on the
+        // `bim_cache.global_id = ''` lookup — the second such row
+        // would hit the dedup hash compare against the first, follow
+        // the `Unchanged` / `Updated` branch with a fresh
+        // non-deterministic `EntityId` (the reader synthesises one
+        // per parse for GUID-less rows), and the matching `UPDATE
+        // entities WHERE id = ?` would no-op. Children that
+        // referenced the new entity id as `parent_id` would then
+        // violate the `entities.parent_id` foreign-key. Filtering
+        // here forces the GUID-less path to always take the
+        // `Inserted` branch — orphan rows accumulate slowly on the
+        // rare defective-file case but FK integrity holds.
+        let guid = node
+            .ifc_guid
+            .as_deref()
+            .or_else(|| snapshot.guid_by_entity.get(node_id).map(String::as_str))
+            .filter(|g| !g.is_empty());
         let body = BimSpatialBody {
             ifc_guid: guid.map(str::to_owned),
             ifc_class: node.class.ifc_tag().to_owned(),
@@ -269,7 +289,16 @@ pub(crate) fn attach_snapshot(
                 Some(a) => (a.class.clone(), a.confidence),
                 None => (IfcClass::Other("Unknown".into()), 0.0),
             };
-            let guid = snapshot.guid_by_entity.get(element_id).map(String::as_str);
+            // Same empty-string-as-`None` filter as the spatial-node
+            // path: an `Some("")` propagated into `upsert_entity`
+            // would alias all GUID-less elements on the
+            // `bim_cache.global_id = ''` lookup and cause the
+            // re-attach FK violation described above.
+            let guid = snapshot
+                .guid_by_entity
+                .get(element_id)
+                .map(String::as_str)
+                .filter(|g| !g.is_empty());
             let body = BimElementBody {
                 ifc_guid: guid.map(str::to_owned),
                 ifc_class: class.ifc_tag().to_owned(),

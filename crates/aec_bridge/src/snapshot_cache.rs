@@ -52,12 +52,14 @@
 //!   the architectural model, an MEP federation, a structural model,
 //!   and one reference file from a consultant. Above 4, LRU eviction
 //!   reclaims the least-recently-used entry.
-//! * **TTL** ([`SNAPSHOT_CACHE_TTL`] = 60 s). A two-minute Slack window
-//!   between preview and attach is well above the usual interaction
-//!   pattern (the user clicks Attach a few seconds after the preview
-//!   pane shows the counts). 60 s gives them a generous read of the
-//!   preview without retaining stale parse-state once they walk away.
-//!   Idle eviction happens on every [`SnapshotCache::get`] /
+//! * **TTL** ([`SNAPSHOT_CACHE_TTL`] = 300 s, i.e. 5 minutes). The grace
+//!   window between the preview pane appearing and the user clicking
+//!   Attach. 5 minutes covers the realistic "user steps away to read
+//!   the preview counts / sip coffee / answer Slack" case without
+//!   retaining stale parse-state forever. Memory is bounded by the
+//!   LRU [`SNAPSHOT_CACHE_CAPACITY`] (4 entries) regardless of TTL, so
+//!   the TTL is purely an idle-eviction safety net, not a working-set
+//!   ceiling. Idle eviction happens on every [`SnapshotCache::get`] /
 //!   [`SnapshotCache::insert`] call so an idle process eventually drops
 //!   memory back without needing a sweeper thread.
 //!
@@ -101,7 +103,7 @@ use aec_bim::ifc::IfcSnapshot;
 /// Default time-to-live for a cached snapshot. Production callers use
 /// [`SnapshotCache::new`] which wires this; tests can use
 /// [`SnapshotCache::with_config`] for short TTLs.
-pub(crate) const SNAPSHOT_CACHE_TTL: Duration = Duration::from_secs(60);
+pub(crate) const SNAPSHOT_CACHE_TTL: Duration = Duration::from_secs(300);
 
 /// Maximum number of cached snapshots before LRU eviction kicks in.
 /// See module docs for the sizing rationale.
