@@ -1637,6 +1637,247 @@ END-ISO-10303-21;\n";
     }
 
     #[test]
+    fn bim_attach_ifc_replaces_stale_contained_in_relation_on_element_reparent() {
+        // Regression for Devin Review BUG_0001 on 0e5fc84: the
+        // `bim/contained_in` relation persisted at
+        // `bim_attach.rs:374-384` used to be a bare `INSERT OR IGNORE`.
+        // That statement dedupes on the exact `(kind, from_id, to_id)`
+        // tuple — fine for an unchanged re-attach, but the unique key
+        // does NOT match when an element's storey changes between
+        // attaches. The new edge `(wall_id, storey_b)` inserts
+        // alongside the old `(wall_id, storey_a)` instead of replacing
+        // it, leaving the `relations` table — documented as the index
+        // the future `bim_detach_*` flow walks — claiming the same
+        // element has TWO spatial parents.
+        //
+        // The fix wraps the INSERT with a per-element DELETE of all
+        // prior `bim/contained_in` edges pointing OUT of the element,
+        // so the relations projection always matches the authoritative
+        // `entities.parent_id` graph (which the `geom_hash` dedup
+        // already keeps correct via the `Updated` branch — the parent
+        // is folded into the hash).
+        //
+        // The fixtures: pass-1 puts the wall under storey-L1; pass-2
+        // re-parents the same wall (same EntityId/GUID) onto a NEW
+        // storey-L2 (different EntityId/GUID). Project/site/building
+        // keep their EntityIds across both passes so they dedupe on
+        // `bim_cache`. After re-attach there must be EXACTLY ONE
+        // `bim/contained_in` row for the wall — pointing at the L2
+        // storey, not the stale L1 row. Under the OLD `INSERT OR
+        // IGNORE` we'd see two.
+        //
+        // Note: we generate both STEP fixtures via `IfcWriter` rather
+        // than authoring them by hand, because the reader requires
+        // each element row's Name field to carry the writer-emitted
+        // `{IfcTag}::{EntityId}` encoding so it can recover the eid.
+        // Synthesising the writer's output is the easiest way to
+        // guarantee that contract holds.
+        use aec_bim::classification::ClassificationStore;
+        use aec_bim::ifc::IfcWriter;
+        use aec_bim::properties::PropertyStore;
+        use aec_bim::spatial::Project;
+        use aec_bim::IfcClass;
+
+        let (mut s, _g) = service();
+        let project_pkg = s
+            .project_create_from_template("interior.apartment", "ReparentRelation")
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let ifc_path = tmp.path().join("reparent.ifc");
+
+        // Deterministic spatial-node IDs so the matching IfcReader
+        // produces the same `EntityId`s on every parse (via
+        // `EntityId::from_guid_seed`, which the reader uses for
+        // GUID-bearing spatial rows).
+        let project_id =
+            aec_core::types::EntityId::from_guid_seed("00000000000000000000a1");
+        let site_id =
+            aec_core::types::EntityId::from_guid_seed("00000000000000000000a2");
+        let building_id =
+            aec_core::types::EntityId::from_guid_seed("00000000000000000000a3");
+        let storey_l1_id =
+            aec_core::types::EntityId::from_guid_seed("00000000000000000000a4");
+        let storey_l2_id =
+            aec_core::types::EntityId::from_guid_seed("00000000000000000000bd");
+        let wall_id = aec_core::types::EntityId::from_string(
+            "ent_aabbccddeeff00112233445566778899",
+        )
+        .unwrap();
+
+        // Helper: build a Project graph with the given storey-id and
+        // serialize to STEP via `IfcWriter`.
+        let build_step = |storey_id: &aec_core::types::EntityId, storey_name: &str| -> String {
+            let mut project_graph = Project {
+                root: project_id.clone(),
+                nodes: std::collections::HashMap::new(),
+            };
+            project_graph.nodes.insert(
+                project_id.clone(),
+                aec_bim::spatial::SpatialNode {
+                    id: project_id.clone(),
+                    ifc_guid: Some("00000000000000000000a1".into()),
+                    class: IfcClass::IfcProject,
+                    name: "P".into(),
+                    children: vec![site_id.clone()],
+                    elements: Vec::new(),
+                },
+            );
+            project_graph.nodes.insert(
+                site_id.clone(),
+                aec_bim::spatial::SpatialNode {
+                    id: site_id.clone(),
+                    ifc_guid: Some("00000000000000000000a2".into()),
+                    class: IfcClass::IfcSite,
+                    name: "S".into(),
+                    children: vec![building_id.clone()],
+                    elements: Vec::new(),
+                },
+            );
+            project_graph.nodes.insert(
+                building_id.clone(),
+                aec_bim::spatial::SpatialNode {
+                    id: building_id.clone(),
+                    ifc_guid: Some("00000000000000000000a3".into()),
+                    class: IfcClass::IfcBuilding,
+                    name: "B".into(),
+                    children: vec![storey_id.clone()],
+                    elements: Vec::new(),
+                },
+            );
+            project_graph.nodes.insert(
+                storey_id.clone(),
+                aec_bim::spatial::SpatialNode {
+                    id: storey_id.clone(),
+                    ifc_guid: Some(match storey_name {
+                        "L1" => "00000000000000000000a4".into(),
+                        _ => "00000000000000000000bd".into(),
+                    }),
+                    class: IfcClass::IfcBuildingStorey,
+                    name: storey_name.into(),
+                    children: Vec::new(),
+                    elements: vec![wall_id.clone()],
+                },
+            );
+            let mut classification = ClassificationStore::new();
+            classification.assign_manual(wall_id.clone(), IfcClass::IfcWall);
+            let properties = PropertyStore::default();
+            IfcWriter::to_string(&project_graph, &classification, &properties)
+        };
+
+        // Pass 1: wall under storey-L1.
+        std::fs::write(&ifc_path, build_step(&storey_l1_id, "L1")).unwrap();
+        let first = s
+            .bim_attach_ifc(&project_pkg.path, ifc_path.to_str().unwrap())
+            .expect("first attach must succeed");
+        assert!(
+            first.elements_inserted >= 1,
+            "first attach must insert the wall; got {} elements",
+            first.elements_inserted
+        );
+
+        // Sanity: pass-1 produced exactly one `bim/contained_in` row
+        // for the wall, pointing at L1.
+        let pkg = aec_core::package::ProjectPackage::open_with_master_key(
+            std::path::Path::new(&project_pkg.path),
+            &[42u8; 32],
+        )
+        .unwrap();
+        {
+            let conn = pkg.open_database(&[42u8; 32]).unwrap();
+            let after_pass1: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM relations \
+                     WHERE kind = 'bim/contained_in' AND from_id = ?1",
+                    rusqlite::params![wall_id.as_str()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                after_pass1, 1,
+                "first attach must produce exactly one `bim/contained_in` row for the wall"
+            );
+            let parent_after_pass1: String = conn
+                .query_row(
+                    "SELECT to_id FROM relations \
+                     WHERE kind = 'bim/contained_in' AND from_id = ?1",
+                    rusqlite::params![wall_id.as_str()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                parent_after_pass1,
+                storey_l1_id.as_str(),
+                "pass-1 must point the wall at storey L1"
+            );
+        }
+        drop(pkg);
+
+        // Pass 2: same wall (same EntityId) re-parented onto storey-L2.
+        std::fs::write(&ifc_path, build_step(&storey_l2_id, "L2")).unwrap();
+        let second = s
+            .bim_attach_ifc(&project_pkg.path, ifc_path.to_str().unwrap())
+            .expect("re-attach with re-parented wall must succeed");
+        // The wall's `entities.parent_id` flipped, which folds into
+        // `geom_hash` — so it MUST land on `Updated`, not `Unchanged`.
+        assert!(
+            second.elements_updated >= 1,
+            "re-parented wall must take the Updated dedup branch; got {} updated",
+            second.elements_updated
+        );
+
+        // The contract: exactly ONE `bim/contained_in` row for the
+        // wall, pointing at the NEW storey. Under the old
+        // `INSERT OR IGNORE` we'd see two (one stale L1, one new L2).
+        let pkg = aec_core::package::ProjectPackage::open_with_master_key(
+            std::path::Path::new(&project_pkg.path),
+            &[42u8; 32],
+        )
+        .unwrap();
+        let conn = pkg.open_database(&[42u8; 32]).unwrap();
+        let after_pass2: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM relations \
+                 WHERE kind = 'bim/contained_in' AND from_id = ?1",
+                rusqlite::params![wall_id.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            after_pass2, 1,
+            "re-attach with a re-parented wall must leave exactly one `bim/contained_in` \
+             row for the wall (the OLD `INSERT OR IGNORE` would leave two)"
+        );
+        let parent_after_pass2: String = conn
+            .query_row(
+                "SELECT to_id FROM relations \
+                 WHERE kind = 'bim/contained_in' AND from_id = ?1",
+                rusqlite::params![wall_id.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            parent_after_pass2,
+            storey_l2_id.as_str(),
+            "re-attach must point the wall at the NEW storey, not the stale L1"
+        );
+
+        // Defense-in-depth: the stale (wall, L1) row is gone
+        // specifically, not just absent from a SELECT-by-current-parent.
+        let stale_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM relations \
+                 WHERE kind = 'bim/contained_in' AND from_id = ?1 AND to_id = ?2",
+                rusqlite::params![wall_id.as_str(), storey_l1_id.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stale_rows, 0,
+            "no stale `(wall, storey-L1)` row may remain after the wall is re-parented"
+        );
+    }
+
+    #[test]
     fn bim_attach_ifc_invalidates_engine_status_cache() {
         // After the attach, the engine-status cache entry for the
         // project must be gone so a subsequent

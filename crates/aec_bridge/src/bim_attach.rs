@@ -335,13 +335,47 @@ pub(crate) fn attach_snapshot(
             // "bim/contained_in"` without leaning on the
             // entities-table hierarchy (which may carry non-BIM
             // children, e.g. user-added annotations).
-            // `INSERT OR IGNORE` returns 0 when the unique constraint
-            // on (kind, from_id, to_id) fires (i.e. the relation
-            // already existed from a previous attach). Reflect that
-            // truth in the renderer-facing counter rather than
-            // bumping it unconditionally — otherwise on every
-            // re-attach we'd report e.g. "5 relations inserted"
-            // when in fact 0 new rows were created.
+            //
+            // Before INSERTing the current parent edge, DELETE every
+            // prior `bim/contained_in` edge that points OUT of this
+            // element. A bare `INSERT OR IGNORE` would only dedupe on
+            // the exact `(kind, from_id, to_id)` tuple — fine for an
+            // unchanged re-attach, but disastrous for a re-parent.
+            // When an element moves from storey A to storey B between
+            // attaches, the prior `(element_id, A)` row stays and the
+            // new `(element_id, B)` row INSERTs alongside it, so the
+            // `relations` table — documented above as the index the
+            // future `bim_detach_*` flow walks — would see TWO
+            // spatial parents per element. The dedup `geom_hash`
+            // *does* catch the re-parent on `entities.parent_id` (the
+            // parent is folded into the hash; see `upsert_entity`'s
+            // `geom_input` composition), so the authoritative
+            // parent-child graph in `entities` is accurate, but the
+            // `relations` projection would diverge from it. Wiping
+            // the prior edge here keeps both projections coherent.
+            //
+            // We DELETE-then-INSERT (rather than UPDATE) for two
+            // reasons:
+            //   1. An element may have had its `bim/contained_in`
+            //      edge inserted from outside this attach (e.g. a
+            //      future authoring tool that creates non-BIM
+            //      containment markers). The blanket DELETE WHERE
+            //      kind='bim/contained_in' AND from_id=? scope leaves
+            //      every other relation kind on this entity untouched.
+            //   2. `relations` has no surrogate id we can UPDATE
+            //      against — the natural key is `(kind, from_id,
+            //      to_id)` and changing `to_id` is exactly the
+            //      change we're effecting, so DELETE + INSERT is the
+            //      cleanest expression.
+            //
+            // The counter reflects the new INSERT only: if the prior
+            // DELETE wiped a stale edge, that's a *fix*, not a "row
+            // inserted" — the count of net new edges is still 1.
+            tx.execute(
+                "DELETE FROM relations \
+                 WHERE kind = 'bim/contained_in' AND from_id = ?1",
+                params![element_id.as_str()],
+            )?;
             let rows_changed = tx.execute(
                 "INSERT OR IGNORE INTO relations(kind, from_id, to_id) \
                  VALUES ('bim/contained_in', ?1, ?2)",
