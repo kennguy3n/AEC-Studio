@@ -100,11 +100,15 @@ impl EntityId {
     ///   even if their seeds happen to overlap.
     pub fn from_guid_seed(seed: &str) -> Self {
         // Fixed AEC Studio namespace UUID for IFC-derived entities.
-        // Generated once with `uuidgen` and pinned here forever; if
-        // this constant changes, all previously-attached BIM
-        // snapshots will lose dedup continuity (they'd be reported
-        // as `inserted` on the next re-attach, with the old rows
-        // orphaned). Treat as load-bearing.
+        // Derivation: the first 4 bytes spell "aec5" (≈ "AEC Studio")
+        // followed by 12 random bytes generated once with `uuidgen`.
+        // The literal is pinned here forever; if this constant changes,
+        // all previously-attached BIM snapshots will lose dedup
+        // continuity (they'd be reported as `inserted` on the next
+        // re-attach, with the old rows orphaned), so the test
+        // `entity_id_from_guid_seed_namespace_pin` asserts the exact
+        // UUIDv5 output for a known seed to catch accidental drift.
+        // Treat as load-bearing.
         const NAMESPACE: Uuid = Uuid::from_u128(0xaec5_70d1_0fc4_4ec8_a2ed_cb44_9d4f_1e55_u128);
         let uuid = Uuid::new_v5(&NAMESPACE, seed.as_bytes());
         Self(format!("ent_{}", uuid.simple()))

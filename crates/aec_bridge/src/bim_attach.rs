@@ -224,6 +224,7 @@ pub(crate) fn attach_snapshot(
             &now,
             &node.class,
             &snapshot.properties,
+            &snapshot.materials,
         )?;
         match outcome {
             UpsertOutcome::Inserted => counts.spatial_nodes_inserted += 1,
@@ -255,12 +256,17 @@ pub(crate) fn attach_snapshot(
                 // RelContainedIn relations). First parent wins.
                 continue;
             }
-            let assignment = snapshot
-                .classification
-                .iter()
-                .find(|(eid, _)| *eid == element_id);
+            // Use the `ClassificationStore::get` O(1) entry-id lookup
+            // instead of `.iter().find(|...|)`. The latter is O(N) per
+            // element, which on a typical Revit MEP federation (12 000+
+            // elements) makes the spatial-tree walk O(N²) and turns
+            // attach into a tens-of-seconds operation rather than
+            // sub-second. The classification store is backed by a
+            // `BTreeMap` keyed on `EntityId`, so `.get` is
+            // O(log N) and the whole walk is O(N log N).
+            let assignment = snapshot.classification.get(element_id);
             let (class, confidence) = match assignment {
-                Some((_, a)) => (a.class.clone(), a.confidence),
+                Some(a) => (a.class.clone(), a.confidence),
                 None => (IfcClass::Other("Unknown".into()), 0.0),
             };
             let guid = snapshot.guid_by_entity.get(element_id).map(String::as_str);
@@ -284,6 +290,7 @@ pub(crate) fn attach_snapshot(
                 &now,
                 &class,
                 &snapshot.properties,
+                &snapshot.materials,
             )?;
             match outcome {
                 UpsertOutcome::Inserted => counts.elements_inserted += 1,
@@ -299,12 +306,19 @@ pub(crate) fn attach_snapshot(
             // "bim/contained_in"` without leaning on the
             // entities-table hierarchy (which may carry non-BIM
             // children, e.g. user-added annotations).
-            tx.execute(
+            // `INSERT OR IGNORE` returns 0 when the unique constraint
+            // on (kind, from_id, to_id) fires (i.e. the relation
+            // already existed from a previous attach). Reflect that
+            // truth in the renderer-facing counter rather than
+            // bumping it unconditionally — otherwise on every
+            // re-attach we'd report e.g. "5 relations inserted"
+            // when in fact 0 new rows were created.
+            let rows_changed = tx.execute(
                 "INSERT OR IGNORE INTO relations(kind, from_id, to_id) \
                  VALUES ('bim/contained_in', ?1, ?2)",
                 params![element_id.as_str(), spatial_id.as_str()],
             )?;
-            counts.relations_inserted += 1;
+            counts.relations_inserted += rows_changed as u64;
         }
     }
 
@@ -320,20 +334,26 @@ pub(crate) fn attach_snapshot(
     //   1. Every spatial node we just visited (`bfs_order`).
     //   2. Every element we just visited (`seen_elements`).
     //   3. Every entity the snapshot's `PropertyStore` carries.
+    //   4. Every entity the snapshot's `MaterialStore` has an
+    //      assignment for.
     //
     // (3) defends against a future reader change that adds Psets to
     // entities outside the spatial tree (e.g. type-object properties
-    // from `IfcRelDefinesByType`). Without it, `write_psets` would
-    // hit a primary-key conflict on the bare `INSERT INTO components`
-    // (no ON CONFLICT clause) the first time such a row showed up
-    // after a prior attach. Wiping them here keeps the SQL contract
-    // sound regardless of how the reader's property graph evolves.
+    // from `IfcRelDefinesByType`). (4) is the symmetric guard for
+    // material assignments — if a future reader change starts
+    // creating material assignments for entities that aren't in the
+    // tree, `write_materials` would otherwise hit a primary-key
+    // conflict on the bare `INSERT INTO components` after a prior
+    // attach. Wiping them here keeps the SQL contract sound
+    // regardless of how the reader's property and material graphs
+    // evolve.
     let mut touched_entities: HashSet<EntityId> = HashSet::new();
     for (_, id) in &bfs_order {
         touched_entities.insert(id.clone());
     }
     touched_entities.extend(seen_elements.iter().cloned());
     touched_entities.extend(snapshot.properties.iter().map(|(id, _)| id.clone()));
+    touched_entities.extend(snapshot.materials.assignments().map(|(id, _)| id.clone()));
     for entity_id in &touched_entities {
         tx.execute(
             "DELETE FROM components WHERE entity_id = ?1 AND kind LIKE 'bim/%'",
@@ -368,26 +388,62 @@ fn upsert_entity(
     now_rfc3339: &str,
     class: &IfcClass,
     properties: &PropertyStore,
+    materials: &MaterialStore,
 ) -> Result<UpsertOutcome, BridgeServiceError> {
-    let geom_hash = blake3_hex(body_json.as_bytes());
+    // `geom_hash` is the hash of the entity's identity-and-position
+    // signature. Compose it from:
+    //   * the entity's `parent_id` (the storey containment / spatial
+    //     parentage; folding it in here means a re-parent flips
+    //     `geom_hash`, so a wall moved from "Ground Floor" to "First
+    //     Floor" is correctly classified as `Updated` instead of
+    //     silently retaining its stale `parent_id` on `Unchanged`).
+    //   * the entity body JSON (guid, IFC class, schema, source path,
+    //     etc.).
+    // The hash input format is `parent={parent_id}\nbody={body_json}`
+    // (NUL-terminated parent for unambiguity if the body itself
+    // happens to contain `body=...`).
+    let mut geom_input = Vec::with_capacity(body_json.len() + 64);
+    geom_input.extend_from_slice(b"parent=");
+    geom_input.extend_from_slice(parent_id.map_or("", EntityId::as_str).as_bytes());
+    geom_input.push(0);
+    geom_input.extend_from_slice(b"body=");
+    geom_input.extend_from_slice(body_json.as_bytes());
+    let geom_hash = blake3_hex(&geom_input);
     let class_hash = blake3_hex(class.ifc_tag().as_bytes());
-    // Compute the per-entity Pset/Qto hash by serialising the entity's
-    // `ElementProperties` (a struct of two `BTreeMap`s — Psets and
-    // Qtos — deterministically ordered) into JSON and hashing the
-    // bytes. This makes the dedup check sensitive to Pset / Qto
-    // changes (e.g. a wall's `LoadBearing` flag flipping) so a
-    // re-attach that only touches Psets is correctly classified as
-    // `Updated`, not `Unchanged`. An entity with no properties hashes
-    // the empty `ElementProperties::default()`, so the value is
-    // stable across attaches that don't attach Psets at all.
-    let pset_hash = match properties.get(entity_id) {
-        Some(ep) => blake3_hex(
+    // Compute the per-entity "components" hash by deterministically
+    // serialising and hashing every annotation the entity carries
+    // — Psets, Qtos, and (since round 2 of Devin Review) the
+    // material assignment. The column on `bim_cache` is still named
+    // `pset_hash` for schema continuity, but conceptually it covers
+    // every per-entity component bucket that `attach_snapshot`
+    // wipes-and-rewrites. Including the material assignment makes a
+    // re-attach that flips a wall's material from `Concrete` to
+    // `Steel` (without touching geometry or Psets) correctly classify
+    // as `Updated`, so the renderer-facing summary metrics aren't
+    // misleading.
+    //
+    // Format:
+    //   `props={serde-json of ElementProperties (or empty)}\0
+    //    material={serde-json of MaterialAssignment (or empty)}`
+    let mut pset_input = Vec::new();
+    pset_input.extend_from_slice(b"props=");
+    if let Some(ep) = properties.get(entity_id) {
+        pset_input.extend_from_slice(
             serde_json::to_string(ep)
                 .map_err(|e| BridgeServiceError::Bim(e.to_string()))?
                 .as_bytes(),
-        ),
-        None => blake3_hex(b""),
-    };
+        );
+    }
+    pset_input.push(0);
+    pset_input.extend_from_slice(b"material=");
+    if let Some(ma) = materials.assignment(entity_id) {
+        pset_input.extend_from_slice(
+            serde_json::to_string(ma)
+                .map_err(|e| BridgeServiceError::Bim(e.to_string()))?
+                .as_bytes(),
+        );
+    }
+    let pset_hash = blake3_hex(&pset_input);
 
     // Look up the bim_cache row by GUID first (most common: file has
     // GUIDs and the dedup index hits). Fall back to entity_id only

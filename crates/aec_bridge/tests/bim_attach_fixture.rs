@@ -182,4 +182,43 @@ fn small_office_fixture_attaches_into_project_graph() {
         pset_attach.elements_updated >= 1,
         "Pset-only change must produce at least one Updated element, got {pset_attach:?}",
     );
+
+    // 5. Re-parent only: move wall #50 from Ground Floor (#5) to
+    //    First Floor (#6) by rewriting the two
+    //    `IfcRelContainedInSpatialStructure` rows. The wall's body
+    //    (guid, IFC class), Psets, and material assignment are all
+    //    unchanged — only its containment moves. The dedup
+    //    classifier must catch this and report the wall as
+    //    `Updated` rather than `Unchanged`; otherwise the
+    //    `entities.parent_id` column would silently retain the
+    //    stale Ground-Floor parent.
+    //
+    //    Pre-fix the `geom_hash` was computed over `body_json` only
+    //    and did NOT cover `parent_id`, so the Unchanged branch
+    //    fired and the stale parentage persisted in SQL. Post-fix
+    //    `parent_id` is folded into `geom_hash`, so the re-parent
+    //    flips the hash and lifts the row from Unchanged →
+    //    Updated, which then runs `UPDATE entities SET parent_id =
+    //    ?1 …`.
+    let reparented = std::str::from_utf8(FIXTURE_BYTES)
+        .unwrap()
+        .replace(
+            "IFCRELCONTAINEDINSPATIALSTRUCTURE('00000000000000000000d1',#1,$,$,(#50,#51,#54),#5);",
+            "IFCRELCONTAINEDINSPATIALSTRUCTURE('00000000000000000000d1',#1,$,$,(#51,#54),#5);",
+        )
+        .replace(
+            "IFCRELCONTAINEDINSPATIALSTRUCTURE('00000000000000000000d2',#1,$,$,(#52,#53),#6);",
+            "IFCRELCONTAINEDINSPATIALSTRUCTURE('00000000000000000000d2',#1,$,$,(#50,#52,#53),#6);",
+        );
+    let reparented_path = ifc_dir.path().join("small_office_reparented.ifc");
+    std::fs::write(&reparented_path, reparented.as_bytes()).unwrap();
+    let reparented_path_str = reparented_path.to_string_lossy().into_owned();
+    let reparent_attach = s
+        .bim_attach_ifc(&project.path, &reparented_path_str)
+        .unwrap();
+    assert!(
+        reparent_attach.elements_updated >= 1,
+        "Re-parent (parent_id change with otherwise-identical body) must \
+         produce at least one Updated element, got {reparent_attach:?}",
+    );
 }
