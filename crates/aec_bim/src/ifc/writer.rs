@@ -926,18 +926,33 @@ fn format_real(x: f64) -> String {
 /// fuzz-match nearby offsets together because that would change the
 /// output behaviour silently and IFC round-trip determinism matters
 /// more than a few bytes saved in the STEP file.
+/// Type-level enforcement of the IFC4 "all-three-mandatory" contract:
+/// each field is non-optional, so it's impossible to construct a
+/// `LayerSetUsageKey` (and thus impossible to emit an
+/// `IfcMaterialLayerSetUsage` STEP entity) without a complete set
+/// of orientation metadata. The all-or-none guard in
+/// [`Self::from_property_store`] is the single gate — failure to
+/// recover any one field returns `None` and the writer falls back
+/// to a direct `IfcMaterialLayerSet` ref.
+///
+/// (Earlier versions of this struct stored each field as `Option<...>`
+/// and let the `step_*` accessors emit `$` for missing values.
+/// That allowed the writer to produce schema-invalid wrappers like
+/// `IFCMATERIALLAYERSETUSAGE(#13,.AXIS2.,$,$,$)` whenever a partial
+/// Pset slipped through. Tightening the type makes that mistake
+/// unrepresentable.)
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct LayerSetUsageKey {
     /// STEP enum literal for `LayerSetDirection` (e.g. `.AXIS2.` for
-    /// walls). `None` when the source Pset didn't have a direction
-    /// entry, in which case the writer emits `$`.
-    direction: Option<String>,
+    /// walls).
+    direction: String,
     /// STEP enum literal for `DirectionSense` (`.POSITIVE.` /
-    /// `.NEGATIVE.`). `None` → `$` on emission.
-    sense: Option<String>,
+    /// `.NEGATIVE.`).
+    sense: String,
     /// IEEE-754 bit pattern of `OffsetFromReferenceLine` in metres.
-    /// `None` → `$` on emission.
-    offset_bits: Option<u64>,
+    /// `f64` is rehydrated via [`f64::from_bits`] on emission. The
+    /// bit-pattern form is what makes the struct `Hash + Ord`.
+    offset_bits: u64,
 }
 
 impl LayerSetUsageKey {
@@ -1010,32 +1025,27 @@ impl LayerSetUsageKey {
             .and_then(length_value)
             .map(f64::to_bits)?;
         Some(LayerSetUsageKey {
-            direction: Some(direction),
-            sense: Some(sense),
-            offset_bits: Some(offset_bits),
+            direction,
+            sense,
+            offset_bits,
         })
     }
 
-    /// Emit the STEP literal for `LayerSetDirection`, or `$` when
-    /// the field is missing in the source Pset.
+    /// Emit the STEP literal for `LayerSetDirection`.
     fn step_direction(&self) -> String {
-        self.direction.clone().unwrap_or_else(|| "$".to_string())
+        self.direction.clone()
     }
 
-    /// Emit the STEP literal for `DirectionSense`, or `$` when the
-    /// field is missing.
+    /// Emit the STEP literal for `DirectionSense`.
     fn step_sense(&self) -> String {
-        self.sense.clone().unwrap_or_else(|| "$".to_string())
+        self.sense.clone()
     }
 
-    /// Emit the STEP literal for `OffsetFromReferenceLine`, or `$`
-    /// when the field is missing. Reuses [`format_real`] so the
-    /// offset goes through the same canonical real-literal formatter
-    /// as material-layer thickness.
+    /// Emit the STEP literal for `OffsetFromReferenceLine`. Reuses
+    /// [`format_real`] so the offset goes through the same canonical
+    /// real-literal formatter as material-layer thickness.
     fn step_offset(&self) -> String {
-        self.offset_bits
-            .map(f64::from_bits)
-            .map_or_else(|| "$".to_string(), format_real)
+        format_real(f64::from_bits(self.offset_bits))
     }
 
     /// Per-usage tag mixed into the `derive_guid_from_str` seed so
@@ -1045,13 +1055,7 @@ impl LayerSetUsageKey {
     /// and any conformance checker (Solibri, IFC4-validators) would
     /// flag the duplicate.
     fn guid_suffix(&self) -> String {
-        format!(
-            "{}|{}|{}",
-            self.direction.as_deref().unwrap_or("$"),
-            self.sense.as_deref().unwrap_or("$"),
-            self.offset_bits
-                .map_or_else(|| "$".to_string(), |b| b.to_string()),
-        )
+        format!("{}|{}|{}", self.direction, self.sense, self.offset_bits)
     }
 }
 
