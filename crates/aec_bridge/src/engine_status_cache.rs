@@ -78,23 +78,45 @@ pub(crate) struct CachedConn {
 }
 
 impl CachedConn {
-    /// Run `f` with mutable access to the cached connection. Updates
-    /// `last_used` atomically with the access so the idle-eviction
-    /// pass observes the call.
+    /// Run `f` with mutable access to the cached connection. Stamps
+    /// `last_used` to `Instant::now()` **after** `f` returns so the
+    /// idle-eviction sweep observes the time the access *completed*,
+    /// not the time it started.
     ///
-    /// The inner mutex is held for the duration of `f`, matching
-    /// `rusqlite`'s requirement that a `Connection` only serve one
-    /// query at a time.
+    /// The inner mutex on `conn` is held for the duration of `f`,
+    /// matching `rusqlite`'s requirement that a `Connection` only
+    /// serve one query at a time.
+    ///
+    /// **Why stamp after, not before?** Semantically "last used"
+    /// should mean "last completed use". A query that runs near the
+    /// TTL boundary (e.g. a slow large `audit_chain` mirror read)
+    /// must not be evicted by a concurrent `evict_stale` sweep that
+    /// only sees a stale `last_used` from when the query *started*.
+    /// The cost is one extra `last_used` lock acquire after the
+    /// connection is released (~a handful of nanoseconds), which is
+    /// negligible against any plausible SQL query latency.
+    ///
+    /// **Panic semantics.** If `f` panics, `last_used` is not
+    /// updated; the entry retains its prior `last_used` and will be
+    /// evicted on the normal TTL schedule. The connection lock
+    /// poisons but is held only inside this method, so it doesn't
+    /// leak (the `Arc<CachedConn>` will be dropped by the caller
+    /// once it unwinds).
     pub(crate) fn with_conn<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&mut Connection) -> R,
     {
-        let mut conn = self.conn.lock().expect("cached connection mutex poisoned");
+        let result = {
+            let mut conn = self.conn.lock().expect("cached connection mutex poisoned");
+            f(&mut conn)
+        };
+        // Release `conn` *before* taking `last_used` so another
+        // thread can be parked on `conn` while we briefly stamp.
         *self
             .last_used
             .lock()
             .expect("cached connection last_used mutex poisoned") = Instant::now();
-        f(&mut conn)
+        result
     }
 }
 
@@ -552,6 +574,77 @@ mod tests {
             cache.len(),
             1,
             "cache must hold exactly one entry for the key"
+        );
+    }
+
+    #[test]
+    fn with_conn_stamps_last_used_after_f_completes() {
+        // `with_conn` must update `last_used` *after* `f` returns so
+        // a long-running query near the TTL boundary doesn't get
+        // evicted by a concurrent sweep that only sees a stale
+        // start-time `last_used`. Verify the post-f stamp is strictly
+        // later than a marker captured during `f`.
+        let cache = Arc::new(EngineStatusCache::new());
+        let key = PathBuf::from("/tmp/with-conn-stamp-after");
+        let entry = cache
+            .get_or_open::<_, rusqlite::Error>(&key, || Ok(in_memory_conn()))
+            .unwrap();
+
+        let mid_f_marker = entry.with_conn(|_c| {
+            let marker = Instant::now();
+            // Simulate a query that takes noticeable wall-clock time.
+            thread::sleep(Duration::from_millis(15));
+            marker
+        });
+
+        let last_used_after = *entry
+            .last_used
+            .lock()
+            .expect("cached connection last_used mutex poisoned");
+
+        assert!(
+            last_used_after > mid_f_marker,
+            "last_used must be stamped after f completes, not before \
+             (last_used={last_used_after:?}, mid-f marker={mid_f_marker:?})"
+        );
+    }
+
+    #[test]
+    fn with_conn_does_not_advance_last_used_on_panic() {
+        // Documented panic semantics: if `f` panics, `last_used` is
+        // not updated. Verify by capturing the pre-panic stamp,
+        // catching a panic from `f`, then asserting `last_used` has
+        // not advanced.
+        let cache = Arc::new(EngineStatusCache::new());
+        let key = PathBuf::from("/tmp/with-conn-panic");
+        let entry = cache
+            .get_or_open::<_, rusqlite::Error>(&key, || Ok(in_memory_conn()))
+            .unwrap();
+
+        let before = *entry
+            .last_used
+            .lock()
+            .expect("cached connection last_used mutex poisoned");
+
+        // Sleep just enough that any post-f stamp would observably
+        // advance the timestamp.
+        thread::sleep(Duration::from_millis(10));
+
+        let entry_for_panic = entry.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            entry_for_panic.with_conn(|_c| -> () { panic!("simulated query panic") });
+        }));
+        assert!(result.is_err(), "test fixture: f must panic");
+
+        let after = *entry
+            .last_used
+            .lock()
+            .expect("cached connection last_used mutex poisoned");
+
+        assert_eq!(
+            before, after,
+            "panic in f must leave last_used unchanged \
+             (was {before:?}, became {after:?})"
         );
     }
 }

@@ -260,6 +260,19 @@ impl BridgeService {
     }
 
     /// Create a new project on disk from a template.
+    ///
+    /// After a successful create, invalidates any engine-status cache
+    /// entry that *might* exist for the new project's path. In the
+    /// common case [`ProjectPackage::create`] fails with
+    /// `AlreadyExists` if the path is occupied, so no cache entry can
+    /// exist at that path. The invalidation covers the edge case
+    /// where the project directory was removed externally (e.g.
+    /// `rm -rf` while the bridge was running) and a new project is
+    /// created at the same slug — without it, the next status poll
+    /// would serve a stale connection bound to the deleted file.
+    /// Keeping the rule "every mutating endpoint calls
+    /// `invalidate_status_cache_for`" without exception also makes
+    /// the architectural contract easier to audit.
     pub fn project_create_from_template(
         &mut self,
         template_key: &str,
@@ -284,6 +297,14 @@ impl BridgeService {
             Some(template.template_id.clone()),
             &self.master_key,
         )?;
+        // Drop any stale cache entry for this path before publishing
+        // the new project to the recents store. `root` is a `PathBuf`
+        // and the cache key is derived via `cache_key` (which goes
+        // through `canonicalize`); pass the str form through the
+        // standard helper so it shares the same canonicalisation
+        // failure handling as the other mutating endpoints.
+        let root_str = root.to_string_lossy();
+        self.invalidate_status_cache_for(&root_str);
         let summary: ProjectSummary = pkg.summary().into();
         let core_summary = pkg.summary();
         self.recents.record(&core_summary)?;

@@ -22,13 +22,25 @@ use crate::service::{BridgeConfig, BridgeService};
 /// this once at startup; every subsequent call goes through one of the
 /// three `with_service*` helpers.
 ///
-/// Stored under [`RwLock`] (not [`std::sync::Mutex`]) so the read-only
-/// endpoints can run concurrently. Concretely: an Electron status-pane
-/// poll of [`project_engine_status`] and a `runtime_status` refresh
-/// taken from a renderer thread no longer serialize against each other,
-/// nor do they block a concurrent [`project_save`] from making
-/// progress (each takes a read lock; the writer-side mutating endpoint
-/// holds the write lock for the duration of the SQLCipher write).
+/// Stored under [`RwLock`] (not [`std::sync::Mutex`]) so the *read-only*
+/// endpoints can run concurrently *with each other*. Concretely: an
+/// Electron status-pane poll of [`project_engine_status`], a
+/// `runtime_status` refresh from a renderer thread, and a
+/// `project_list_recents` call from the Home page no longer serialize
+/// against each other — each takes the read side of the lock and they
+/// proceed in parallel.
+///
+/// **What this does NOT do:** it does *not* let read-only endpoints
+/// run concurrently with mutating endpoints. The writer-side
+/// [`with_service`] still acquires exclusive access for
+/// `project_open` / `project_save` / `project_audit_sync` /
+/// `project_create_from_template`, blocking until every outstanding
+/// reader releases. A mid-poll status read therefore still excludes
+/// a `Cmd-S` triggered `project_save` for its duration and vice
+/// versa. Given the per-call latency budgets (~50 µs for a cache-hit
+/// `project_engine_status`, ~1 ms for a `project_save`) this is
+/// already a substantial win over the previous `Mutex` which
+/// serialized *all* endpoints against each other.
 static SERVICE: RwLock<Option<BridgeService>> = RwLock::new(None);
 
 /// Run `f` with **mutable** access to the bridge singleton, converting
@@ -252,11 +264,17 @@ pub fn project_engine_status(path: String) -> Result<EngineStatusJs> {
     // `project_engine_status` is `&self` on `BridgeService`, so the
     // bridge singleton only needs a *read* lock for the duration of
     // the call. Using `with_service_ref_fallible` instead of
-    // `with_service` is what allows the renderer's status pane to
-    // poll without blocking concurrent mutating endpoints — e.g. a
-    // `project_save` triggered by Cmd-S can run while the status pane
-    // is mid-poll, with the cache invalidation in `project_save`
-    // ensuring the next poll observes the post-save state.
+    // `with_service` lets *concurrent reads* run in parallel —
+    // multiple renderer threads polling status, the Home page
+    // refreshing the recents list, and a `runtime_status` ping all
+    // proceed without serializing against each other.
+    //
+    // It does NOT make the status read concurrent with `project_save`
+    // or any other mutating endpoint — those acquire the write side
+    // and the lock contract excludes readers for the writer's
+    // duration (and vice versa). The cache invalidation that
+    // `project_save` performs under its write guard ensures the next
+    // status read after the save observes the post-save state.
     with_service_ref_fallible(|svc| svc.project_engine_status(&path)).map(Into::into)
 }
 
