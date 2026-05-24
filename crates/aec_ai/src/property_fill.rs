@@ -148,6 +148,18 @@ fn property_value_to_json(v: &PropertyValue) -> serde_json::Value {
     match v {
         PropertyValue::Text(s) | PropertyValue::Label(s) => serde_json::Value::String(s.clone()),
         PropertyValue::Boolean(b) => serde_json::Value::Bool(*b),
+        // IfcLogical is tri-state; the two-valued `Bool` JSON shape
+        // can't carry the `.U.` (unknown) case. Emit as a tagged
+        // object so reviewers see the explicit tri-state rather than
+        // a silent coercion of `.U.` → `false`. The `bool` field is
+        // populated only for the True/False cases (via
+        // [`LogicalValue::as_optional_bool`]); for `Unknown` the
+        // `bool` field is `null` and the `logical` discriminator
+        // makes the distinction unambiguous.
+        PropertyValue::Logical(v) => serde_json::json!({
+            "logical": v.as_step_literal(),
+            "bool": v.as_optional_bool(),
+        }),
         PropertyValue::Integer(i) => serde_json::Value::Number((*i).into()),
         PropertyValue::Real(f)
         | PropertyValue::Length(f)

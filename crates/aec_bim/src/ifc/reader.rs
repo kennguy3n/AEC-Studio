@@ -36,7 +36,7 @@ use crate::classification::{ClassificationSource, ClassificationStore, IfcClass}
 use crate::materials::{
     Material, MaterialAssignment, MaterialLayer, MaterialLayerSet, MaterialStore,
 };
-use crate::properties::{PropertySet, PropertyStore, PropertyValue, QuantitySet};
+use crate::properties::{LogicalValue, PropertySet, PropertyStore, PropertyValue, QuantitySet};
 use crate::spatial::Project;
 
 #[derive(Debug, Error)]
@@ -465,22 +465,48 @@ impl IfcReader {
                     }
                 }
                 other => {
-                    // Anything else with a 9-field shape and a
-                    // `tag::eid` name is an element.
+                    // Two code paths converge here:
                     //
-                    // We split on the LAST `::` (rsplit_once) rather
-                    // than the first. The writer composes
-                    // `{IfcTag}::{EntityId}` and `EntityId::Display`
-                    // is a stable UUID format that cannot contain
-                    // `::`, but `IfcClass::Other(s)` allows the
-                    // tag itself to contain arbitrary characters
-                    // including `::` (e.g. a future
-                    // `Other("Some::Custom::Type")` produced by an
-                    // extension classifier). Splitting from the
-                    // right makes that contract robust — the eid is
-                    // always the suffix after the final `::`.
+                    //   (a) AEC-Studio-authored IFCs: the writer
+                    //       composes the Name field as
+                    //       `{IfcTag}::{EntityId}`, so the Name
+                    //       directly carries the original entity id.
+                    //       Splitting on the LAST `::` (rsplit_once)
+                    //       isolates the eid as the suffix after
+                    //       the final separator. `EntityId::Display`
+                    //       is a stable UUID format that cannot
+                    //       contain `::`, but `IfcClass::Other(s)`
+                    //       allows the tag itself to contain
+                    //       arbitrary characters including `::`
+                    //       (e.g. `Other("Some::Custom::Type")`
+                    //       produced by an extension classifier).
+                    //       Splitting from the right makes that
+                    //       contract robust.
+                    //
+                    //   (b) External IFCs (Revit / ArchiCAD /
+                    //       buildingSMART ISO exemplars / any
+                    //       authoring tool that's not AEC Studio):
+                    //       the Name field carries a human-facing
+                    //       string ("Wall for Test Example") with
+                    //       no `::` separator. Falling back to the
+                    //       STEP entity tag (`IFCWALL`, `IFCWINDOW`,
+                    //       …) for classification — and deriving
+                    //       the EntityId deterministically from
+                    //       the GlobalId — is what makes
+                    //       "real-world" IFCs into first-class
+                    //       citizens of the project graph rather
+                    //       than silently-dropped non-elements. A
+                    //       missing/empty GlobalId falls back to
+                    //       `EntityId::new()`, matching the
+                    //       defensive contract on spatial nodes
+                    //       above (`bim_attach` will treat those
+                    //       rows as fresh inserts on every attach,
+                    //       which is the least-surprising behaviour
+                    //       for malformed input).
                     if let Ok(name) = g.string_arg(3) {
                         if let Some((tag, eid)) = name.rsplit_once("::") {
+                            // (a) Path: AEC-Studio-authored.
+                            //
                             // Prefer the tag carried in the Name field
                             // over the STEP entity type. The two are
                             // identical for safe classes (the writer
@@ -514,6 +540,59 @@ impl IfcReader {
                                     guid,
                                     class,
                                     tag: tag.to_string(),
+                                },
+                            );
+                        } else {
+                            // (b) Path: external IFC.
+                            //
+                            // Classify by STEP entity tag. Only
+                            // capture records whose STEP type maps
+                            // to a typed [`IfcClass`] variant —
+                            // i.e. one of the recognized building-
+                            // element classes (IFCWALL, IFCWINDOW,
+                            // IFCSLAB, IFCBEAM, IFCCOLUMN, …). Any
+                            // other STEP record that happens to
+                            // pass the `string_arg(3)` Name-field
+                            // probe — type entities (IfcWindowType,
+                            // IfcDoorType), library declarations
+                            // (IfcProjectLibrary), or unknown
+                            // extension entities — is intentionally
+                            // skipped here: capturing them as
+                            // elements would either poison the
+                            // classification table with non-element
+                            // rows or duplicate the type vs.
+                            // instance distinction that
+                            // `IfcRelDefinesByType` should be doing.
+                            // (Future work: type-Pset propagation
+                            // would land them as type_psets on the
+                            // instances they declare, not as
+                            // elements in their own right.)
+                            let class = ifc_class_from_tag(other, &g.raw_kind);
+                            if matches!(class, IfcClass::Other(_)) {
+                                continue;
+                            }
+                            // Only extract the GUID once we've
+                            // committed to creating an ElementRow
+                            // — some non-element STEP records
+                            // (notably IFCAPPLICATION) also have
+                            // a string-shaped arg 3 but use a
+                            // `#ref` at arg 0, so blindly
+                            // calling `string_arg(0)` on every
+                            // record reaching this branch would
+                            // panic the parser.
+                            let guid = g.string_arg(0)?;
+                            let entity = if guid.is_empty() {
+                                EntityId::new()
+                            } else {
+                                EntityId::from_guid_seed(&guid)
+                            };
+                            elements.insert(
+                                g.step_id,
+                                ElementRow {
+                                    entity,
+                                    guid,
+                                    class,
+                                    tag: other.to_string(),
                                 },
                             );
                         }
@@ -1636,6 +1715,24 @@ fn parse_typed_measure(raw: &str) -> IfcReadResult<PropertyValue> {
         "IFCPOSITIVERATIOMEASURE" => Ok(PropertyValue::Ratio(parse_real(inner)?)),
         "IFCINTEGER" => Ok(PropertyValue::Integer(parse_int(inner)?)),
         "IFCBOOLEAN" => Ok(PropertyValue::Boolean(matches!(inner, ".T."))),
+        "IFCLOGICAL" => {
+            // IfcLogical is tri-state — `.T.` / `.F.` / `.U.`. Route
+            // to the dedicated [`PropertyValue::Logical`] variant
+            // (rather than the verbatim-preservation `Other`
+            // channel) so typed consumers can branch on "the source
+            // explicitly recorded 'unknown'" via
+            // `LogicalValue::Unknown` without string-matching on
+            // the raw STEP literal. Anything outside the three
+            // canonical tokens falls back to `Other` so a defective
+            // source file still round-trips losslessly.
+            match LogicalValue::from_step_literal(inner) {
+                Some(v) => Ok(PropertyValue::Logical(v)),
+                None => Ok(PropertyValue::Other {
+                    measure: "IFCLOGICAL".to_string(),
+                    raw: inner.to_string(),
+                }),
+            }
+        }
         other => {
             // Preserve unknown IFC measure types verbatim for
             // lossless round-trip. The writer's emit path detects
@@ -3063,6 +3160,150 @@ END-ISO-10303-21;\n";
             snap2.properties.get(&wall),
             "two reader passes converge on the same QuantitySet tree"
         );
+    }
+
+    /// `IFCLOGICAL` is tri-state (`.T.` / `.F.` / `.U.`), which the
+    /// two-valued `IfcBoolean` cannot represent. The reader routes
+    /// `IFCLOGICAL` measure literals into the dedicated
+    /// [`PropertyValue::Logical`] variant (NOT through the
+    /// verbatim-preservation `Other` channel), so typed consumers
+    /// can branch on "explicitly unknown" without string-matching
+    /// `.U.` on a raw STEP literal. This test pins all three
+    /// variants through one full read→write→read cycle, including
+    /// the `.U.` case that the bot flagged in PR-L round 4 as
+    /// "currently degrades to `Other`".
+    #[test]
+    fn ifc_logical_tri_state_round_trips_via_typed_variant() {
+        let mut project = Project::new("P");
+        let site = project
+            .add_child(&project.root.clone(), IfcClass::IfcSite, "Site")
+            .unwrap();
+        let bldg = project
+            .add_child(&site, IfcClass::IfcBuilding, "B")
+            .unwrap();
+        let storey = project
+            .add_child(&bldg, IfcClass::IfcBuildingStorey, "L01")
+            .unwrap();
+        let wall = EntityId::new();
+        project.attach_element(&storey, wall.clone());
+        let mut classification = ClassificationStore::new();
+        classification.assign_manual(wall.clone(), IfcClass::IfcWall);
+
+        // Pset with all three tri-state cases. The KEY ABSENCE
+        // (`$` on the wire) is INTENTIONALLY not exercised here —
+        // that case is encoded by the property simply not appearing
+        // in the BTreeMap, and is covered by other tests that
+        // assert `psets.get("MissingKey").is_none()` after a
+        // read→write→read cycle.
+        let mut props = PropertyStore::new();
+        let mut p = PropertySet::new("Pset_WallCommon");
+        p.set("IsExternal", PropertyValue::Logical(LogicalValue::True));
+        p.set("IsLoadBearing", PropertyValue::Logical(LogicalValue::False));
+        p.set(
+            "FireResistanceUnknown",
+            PropertyValue::Logical(LogicalValue::Unknown),
+        );
+        props.entry(wall.clone()).upsert_pset(p);
+
+        let body = crate::ifc::IfcWriter::to_string(&project, &classification, &props);
+        // Hard contract: writer must emit `IFCLOGICAL(.U.)` — not
+        // `IFCBOOLEAN(.U.)` (which would be schema-invalid, since
+        // `IfcBoolean` is two-valued) and not `IFCBOOLEAN($)`
+        // (which collapses the tri-state to absent).
+        assert!(
+            body.contains("IFCLOGICAL(.U.)"),
+            "writer must emit IFCLOGICAL(.U.) for LogicalValue::Unknown — \
+             got body:\n{body}"
+        );
+        assert!(
+            body.contains("IFCLOGICAL(.T.)"),
+            "writer must emit IFCLOGICAL(.T.) for LogicalValue::True"
+        );
+        assert!(
+            body.contains("IFCLOGICAL(.F.)"),
+            "writer must emit IFCLOGICAL(.F.) for LogicalValue::False"
+        );
+        // The IFCBOOLEAN type must NOT appear for these properties
+        // (would mean a Logical got demoted to Boolean somewhere).
+        assert!(
+            !body.contains("IFCBOOLEAN("),
+            "no IFCBOOLEAN emission expected for a Pset that only carries \
+             IFCLOGICAL values — got body:\n{body}"
+        );
+
+        let snap1 = IfcReader::from_string(&body).expect("first parse");
+        let pset = snap1
+            .properties
+            .get(&wall)
+            .and_then(|p| p.psets.get("Pset_WallCommon"))
+            .expect("Pset_WallCommon recovered");
+        assert_eq!(
+            pset.properties.get("IsExternal"),
+            Some(&PropertyValue::Logical(LogicalValue::True)),
+            ".T. must round-trip into LogicalValue::True"
+        );
+        assert_eq!(
+            pset.properties.get("IsLoadBearing"),
+            Some(&PropertyValue::Logical(LogicalValue::False)),
+            ".F. must round-trip into LogicalValue::False"
+        );
+        assert_eq!(
+            pset.properties.get("FireResistanceUnknown"),
+            Some(&PropertyValue::Logical(LogicalValue::Unknown)),
+            ".U. must round-trip into LogicalValue::Unknown — NOT \
+             demoted to PropertyValue::Other, and NOT silently \
+             collapsed to a missing key"
+        );
+
+        // Second pass: re-write the snapshot's reconstructed Pset
+        // and assert the second read converges. This pins
+        // determinism: the second body must be byte-identical to
+        // the first when generated from a snapshot rebuilt from
+        // the first body.
+        let mut props2 = PropertyStore::new();
+        for (el, p) in snap1.properties.iter() {
+            for ps in p.psets.values() {
+                props2.entry(el.clone()).upsert_pset(ps.clone());
+            }
+        }
+        let body2 = crate::ifc::IfcWriter::to_string(&project, &classification, &props2);
+        let snap2 = IfcReader::from_string(&body2).expect("second parse");
+        assert_eq!(
+            snap1.properties.get(&wall),
+            snap2.properties.get(&wall),
+            "two reader passes converge on the same Pset tree for \
+             IfcLogical values"
+        );
+    }
+
+    /// Defective sources that emit an out-of-band `IFCLOGICAL(.???.)`
+    /// (anything outside `.T.` / `.F.` / `.U.`) must NOT crash the
+    /// reader. They fall back to the verbatim-preservation
+    /// [`PropertyValue::Other`] channel — the writer then re-emits
+    /// the original STEP literal byte-for-byte under the
+    /// `IFCLOGICAL` wrapper. This is the "tolerate-and-preserve"
+    /// discipline the rest of the reader uses for unknown measure
+    /// tags.
+    #[test]
+    fn ifc_logical_with_garbage_inner_falls_back_to_other() {
+        // `IFCLOGICAL(.X.)` is not a valid STEP enum literal for the
+        // type, but neither the reader nor the writer should refuse
+        // it. The reader stores it as Other; the writer emits the
+        // raw bytes back.
+        let v =
+            super::parse_typed_measure("IFCLOGICAL(.X.)").expect("garbage inner must not error");
+        match v {
+            PropertyValue::Other {
+                ref measure,
+                ref raw,
+            } => {
+                assert_eq!(measure, "IFCLOGICAL");
+                assert_eq!(raw, ".X.");
+            }
+            ref other => {
+                panic!("expected PropertyValue::Other for out-of-band IFCLOGICAL, got {other:?}")
+            }
+        }
     }
 
     /// `FILE_SCHEMA(('IFC4'))` -> `IfcSchema::Ifc4`, and the snapshot

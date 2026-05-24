@@ -825,6 +825,7 @@ fn serialize_property_value(v: &PropertyValue) -> (String, String) {
             if *b { ".T." } else { ".F." }.to_string(),
             "IFCBOOLEAN".to_string(),
         ),
+        PropertyValue::Logical(v) => (v.as_step_literal().to_string(), "IFCLOGICAL".to_string()),
         PropertyValue::Other { measure, raw } => (raw.clone(), measure.to_ascii_uppercase()),
     }
 }
