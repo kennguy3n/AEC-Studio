@@ -339,6 +339,49 @@ pub fn bim_import_ifc(path: String) -> Result<BimImportSummaryJs> {
     with_service_ref_fallible(|svc| svc.bim_import_ifc(&path)).map(Into::into)
 }
 
+/// JS-facing cheap file-size check. Mirrors the renderer's
+/// `BimFileSizeCheck` interface in `apps/desktop/electron/bridge.ts`.
+///
+/// `file_size_bytes` and `threshold_bytes` use the
+/// JS-safe-integer-friendly `BigInt` shape via napi's `BigInt`
+/// type to avoid the f64-precision-cliff at 2^53 bytes (≈ 9 PB);
+/// any realistic IFC file is many orders of magnitude below
+/// that, but the type discipline matches the renderer's expected
+/// numeric handling and removes one class of "u64 silently
+/// truncated to JS Number" footgun.
+#[napi(object)]
+pub struct BimFileSizeCheckJs {
+    pub path: String,
+    pub file_size_bytes: BigInt,
+    pub large_file_warning: bool,
+    pub threshold_bytes: BigInt,
+}
+
+impl From<crate::service::BimFileSizeCheck> for BimFileSizeCheckJs {
+    fn from(r: crate::service::BimFileSizeCheck) -> Self {
+        Self {
+            path: r.path,
+            file_size_bytes: BigInt::from(r.file_size_bytes),
+            large_file_warning: r.large_file_warning,
+            threshold_bytes: BigInt::from(r.threshold_bytes),
+        }
+    }
+}
+
+/// Cheap pre-parse stat of an `.ifc` file. The renderer's
+/// file-picker UI calls this *before* invoking `bim_import_ifc`
+/// so it can show a confirm dialog ("This file is 412 MB; parsing
+/// may take a while — continue?") on large files *before* the
+/// user commits to the multi-second parse path.
+///
+/// One `fs::metadata` + one `fs::canonicalize` — no file read,
+/// no parse, no allocation beyond the canonicalised path.
+/// Routed through `with_service_ref_fallible` (read-only).
+#[napi]
+pub fn bim_check_file_size(path: String) -> Result<BimFileSizeCheckJs> {
+    with_service_ref_fallible(|svc| svc.bim_check_file_size(&path)).map(Into::into)
+}
+
 /// JS-facing CPU descriptor. Mirrors `RuntimeStatus["cpu"]` in
 /// `apps/desktop/electron/bridge.ts`.
 #[napi(object)]

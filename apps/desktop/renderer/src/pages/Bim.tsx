@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { aec } from "../api/aec";
+import { importIfcWithSizeGuard } from "../api/bim-import";
 import {
   SpatialTree,
   SpatialNode,
@@ -79,13 +80,23 @@ export function Bim() {
     try {
       switch (action) {
         case "importIfc": {
-          const out = (await aec.bim.importIfc(
+          // Run through the size-guarded helper so a multi-hundred-MB
+          // IFC file surfaces a confirm dialog *before* the bridge
+          // commits to the (several-seconds) STEP-21 parse. See
+          // `bim-import.ts` for the contract.
+          const outcome = await importIfcWithSizeGuard(
             "demo://project.ifc",
-          )) as { imported: number };
-          // Keep the demo tree if the IPC fake didn't deliver anything.
-          if (out.imported > 0) {
-            setRoot(DEMO_ROOT);
+          );
+          if (outcome.kind === "imported") {
+            const result = outcome.result as { imported: number };
+            // Keep the demo tree if the IPC fake didn't deliver anything.
+            if (result.imported > 0) {
+              setRoot(DEMO_ROOT);
+            }
           }
+          // "cancelled-by-user" / "failed" outcomes are no-ops on
+          // the demo tree — a future PR will surface them as a
+          // toast or status-pane note.
           break;
         }
         case "exportIfc":

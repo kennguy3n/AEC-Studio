@@ -137,6 +137,12 @@ export function rendererInProcessBackend(): AecApi {
     },
     bim: {
       importIfc: async () => ({ imported: 0 }),
+      checkFileSize: async (path) => ({
+        path,
+        fileSizeBytes: 0,
+        largeFileWarning: false,
+        thresholdBytes: 100 * 1024 * 1024,
+      }),
       exportIfc: async (p) => ({ exported: true, path: p }),
       classify: async () => ({ classified: 0 }),
       setProperty: async () => ({ ok: true }),
