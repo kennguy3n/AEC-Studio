@@ -54,9 +54,31 @@ describe("bridge catalogue", () => {
    * to bring it back into lockstep.
    */
   it("BUILT_IN_PRESET_IDS matches the native RenderPresetStore", () => {
-    const fixturePath = path.resolve(
-      __dirname,
-      "../../../../../crates/aec_render/tests/preset_ids.json",
+    // Resolve the fixture relative to the Cargo workspace root rather
+    // than relying on a brittle `../../../../../` traversal. The
+    // workspace root is the nearest ancestor of `__dirname` that
+    // contains `Cargo.toml`. This stays correct if either this test
+    // file or the fixture file is ever moved within the workspace —
+    // the only assumption is that both live under the same Cargo
+    // workspace, which is enforced by every other Rust integration
+    // test in the repo. Mirrors the Rust side's
+    // `env!("CARGO_MANIFEST_DIR")` discipline.
+    let workspaceRoot = __dirname;
+    while (!fs.existsSync(path.join(workspaceRoot, "Cargo.toml"))) {
+      const parent = path.dirname(workspaceRoot);
+      if (parent === workspaceRoot) {
+        throw new Error(
+          `could not locate Cargo workspace root walking up from ${__dirname}`,
+        );
+      }
+      workspaceRoot = parent;
+    }
+    const fixturePath = path.join(
+      workspaceRoot,
+      "crates",
+      "aec_render",
+      "tests",
+      "preset_ids.json",
     );
     const expectedSorted = JSON.parse(
       fs.readFileSync(fixturePath, "utf-8"),

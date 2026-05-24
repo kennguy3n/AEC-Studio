@@ -1375,8 +1375,20 @@ export function inProcessBackend(): BridgeBackend {
       return [...jobs];
     },
     async renderCancelJob(jobId) {
+      // Reject unknown job ids the same way the native side
+      // (`BridgeService::render_cancel_job`) does — it throws
+      // `BridgeServiceError::Core("unknown render job ...")` which
+      // surfaces as a JS error through the napi adapter. Silently
+      // returning `{ cancelled: true }` here would let a renderer-
+      // side stale-jobId bug pass dev/Vitest only to throw in
+      // production once the `.node` artefact is loaded — same
+      // dev/prod-parity hazard the preset-validation guards above
+      // exist to prevent.
       const j = jobs.find((x) => x.jobId === jobId);
-      if (j) j.status = "cancelled";
+      if (!j) {
+        throw new Error(`unknown render job \`${jobId}\``);
+      }
+      j.status = "cancelled";
       return { cancelled: true };
     },
     async renderApplyPreset(params) {
@@ -1393,6 +1405,18 @@ export function inProcessBackend(): BridgeBackend {
       return { ok: true };
     },
     async renderDiagnose(jobId) {
+      // Same dev/prod parity guard as `renderCancelJob` above: the
+      // native side (`BridgeService::render_diagnose`) throws
+      // `BridgeServiceError::Core("unknown render job ...")` for an
+      // unknown job id. Silently returning empty suggestions would
+      // let a renderer-side stale-jobId bug pass dev/Vitest only to
+      // throw in production. The Doctor panel today only diagnoses
+      // jobs it just listed, so the gap is low-risk, but the same
+      // class of bug as the cancel parity gap.
+      const j = jobs.find((x) => x.jobId === jobId);
+      if (!j) {
+        throw new Error(`unknown render job \`${jobId}\``);
+      }
       return { jobId, suggestions: [] };
     },
     async renderCheckMaterials() {
