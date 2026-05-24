@@ -98,7 +98,16 @@ pub fn stratified_jitter(sample_index: u32, pixel_seed: [f32; 2]) -> (f32, f32) 
     // 0.0 and would put every pixel's first sample at the top-left
     // pixel corner — visible as a sub-pixel bias on small sample
     // counts).
-    let i = sample_index + 1;
+    //
+    // `saturating_add` instead of `+ 1` so the function is total: a
+    // pathological caller (or some future debug harness) passing
+    // `u32::MAX` doesn't panic in debug and doesn't wrap to 0 (which
+    // would re-introduce the corner-bias the +1 was added to avoid).
+    // At u32::MAX it pins to u32::MAX and the Halton(u32::MAX, _) is
+    // a perfectly valid sample. Reaching this requires ~4 G samples
+    // per pixel, far beyond any preset (max is 1024 spp), so the
+    // saturation is defense-in-depth, not load-bearing.
+    let i = sample_index.saturating_add(1);
     let h1 = halton(i, 2);
     let h2 = halton(i, 3);
     let jx = (h1 + pixel_seed[0]).fract();
@@ -386,6 +395,29 @@ mod tests {
             nc > na && nc > nb,
             "two passes with advancing index must cover more cells than either alone: \
              pass_a={na}, pass_b={nb}, combined={nc}"
+        );
+    }
+
+    #[test]
+    fn stratified_jitter_saturates_at_u32_max_instead_of_panicking() {
+        // Defence-in-depth: a pathological caller feeding `u32::MAX`
+        // must not panic in debug and must not wrap to 0 (which would
+        // collapse the sample onto the top-left corner of the pixel,
+        // re-introducing the bias the `+ 1` was added to avoid).
+        // saturating_add pins the index at u32::MAX which is still a
+        // valid Halton input.
+        let seed = pixel_rotation_seed(0, 0);
+        let (jx, jy) = stratified_jitter(u32::MAX, seed);
+        assert!(jx.is_finite() && (0.0..1.0).contains(&jx));
+        assert!(jy.is_finite() && (0.0..1.0).contains(&jy));
+        // And one off the boundary should not produce the same sample —
+        // i.e. saturating_add(u32::MAX) and saturating_add(u32::MAX-1)
+        // both saturate to u32::MAX, so they're identical, but
+        // u32::MAX-2 should still differ.
+        let (jx_a, jy_a) = stratified_jitter(u32::MAX - 2, seed);
+        assert!(
+            (jx_a - jx).abs() > 1e-6 || (jy_a - jy).abs() > 1e-6,
+            "samples below the saturation boundary must differ from the saturated one"
         );
     }
 }
