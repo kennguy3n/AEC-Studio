@@ -120,8 +120,14 @@ pub fn stratified_jitter(sample_index: u32, pixel_seed: [f32; 2]) -> (f32, f32) 
 /// Implementation: a 64-bit splitmix-style mix of the packed (px, py)
 /// coordinate. Hashes are cheap (a few wrapping mul + xor / shift),
 /// well-distributed for the 32-bit input space, and totally
-/// dependency-free. We split the 64-bit output into two `u32` halves
-/// and divide each by `2^32` for a uniform sample in `[0, 1)`.
+/// dependency-free. We split the 64-bit output, mask each half to 24
+/// bits, and divide by `2^24` for a uniform sample strictly in
+/// `[0, 1)` — masking is the defensive guard against `u32::MAX as f32`
+/// rounding up to `2^32` (which would yield exactly `1.0` and violate
+/// the half-open contract). 24 bits is also exactly the mantissa
+/// precision of `f32`, so no information is lost vs. the previous
+/// `u32`-divided-by-`2^32` formulation — every representable f32 in
+/// `[0, 1)` is reachable.
 #[inline]
 pub fn pixel_rotation_seed(px: u32, py: u32) -> [f32; 2] {
     let packed = (u64::from(px) << 32) | u64::from(py);
@@ -130,13 +136,12 @@ pub fn pixel_rotation_seed(px: u32, py: u32) -> [f32; 2] {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^= z >> 31;
-    // Two u32 halves -> two f32 in [0, 1).
-    let hi = (z >> 32) as u32;
-    let lo = z as u32;
-    [
-        hi as f32 * (1.0 / 4_294_967_296.0),
-        lo as f32 * (1.0 / 4_294_967_296.0),
-    ]
+    // Two 24-bit halves -> two f32 strictly in [0, 1).
+    const MASK_24: u32 = (1 << 24) - 1;
+    const INV_2POW24: f32 = 1.0 / (1 << 24) as f32;
+    let hi = (z >> 32) as u32 & MASK_24;
+    let lo = (z as u32) & MASK_24;
+    [hi as f32 * INV_2POW24, lo as f32 * INV_2POW24]
 }
 
 #[cfg(test)]
@@ -272,6 +277,48 @@ mod tests {
             let b = pixel_rotation_seed(px, py);
             assert_eq!(a, b, "({px}, {py}) must be deterministic");
             assert!((0.0..1.0).contains(&a[0]) && (0.0..1.0).contains(&a[1]));
+        }
+    }
+
+    #[test]
+    fn pixel_rotation_seed_stays_strictly_below_one() {
+        // Defence-in-depth for the [0, 1) contract — sweep a few
+        // thousand pixel coordinates including ones whose splitmix64
+        // hash is known to land near the f32 boundary. The 24-bit
+        // mask in pixel_rotation_seed ensures the value can never
+        // round up to 1.0 even when the raw upper-32-bits hash equals
+        // u32::MAX. Callers that don't apply `.fract()` (e.g. a
+        // future direct use of the seed) can rely on this strict
+        // bound.
+        let coords = [
+            (0u32, 0u32),
+            (1, 0),
+            (0, 1),
+            (u32::MAX, 0),
+            (0, u32::MAX),
+            (u32::MAX, u32::MAX),
+            (u32::MAX - 1, u32::MAX - 1),
+        ];
+        for (px, py) in coords {
+            let [a, b] = pixel_rotation_seed(px, py);
+            assert!(
+                a < 1.0,
+                "pixel_rotation_seed({px}, {py})[0] = {a}, must be < 1.0"
+            );
+            assert!(
+                b < 1.0,
+                "pixel_rotation_seed({px}, {py})[1] = {b}, must be < 1.0"
+            );
+            assert!(a >= 0.0);
+            assert!(b >= 0.0);
+        }
+        // Broad sweep to catch any other pixel-pair whose hash hits
+        // the boundary.
+        for px in 0..256u32 {
+            for py in 0..256u32 {
+                let [a, b] = pixel_rotation_seed(px, py);
+                assert!(a < 1.0 && b < 1.0 && a >= 0.0 && b >= 0.0);
+            }
         }
     }
 

@@ -31,7 +31,8 @@ use rayon::prelude::*;
 use crate::bvh::{BuilderTriangle, Bvh};
 use crate::intersect::{any_hit, closest_hit, geom_normal, Ray, ShadingTriangle};
 use crate::light_sampling::{
-    environment_radiance, is_delta, nee_sum_pdf, power_heuristic, sample_light, NativeLight,
+    area_light_contains_world_point, environment_radiance, is_delta, light_pdf, power_heuristic,
+    sample_light, NativeLight,
 };
 use crate::lighting::SkyParams;
 use crate::material::{eval_bsdf, pdf_bsdf, sample_bsdf, PathTraceMaterial};
@@ -543,43 +544,54 @@ pub fn fill_first_hit_aux(
     let aspect = config.width as f32 / config.height.max(1) as f32;
     let half_h = focal_to_half_height(camera.focal_length_mm).max(1e-4);
     let half_w = half_h * aspect;
+    let width = config.width;
+    let height = config.height;
+    let projection = config.projection;
 
-    for py in 0..config.height {
-        for px in 0..config.width {
-            let i = (py * config.width + px) as usize;
+    // Borrow the three aux channels out of `buffer` and zip them with
+    // the per-pixel radiance sample-count (read-only, parallel-safe).
+    // The aux loop is embarrassingly parallel — each pixel's first-hit
+    // ray is independent — and at 4K (≈ 8.3 M pixels) the BVH walk
+    // alone dominates over Rayon's per-iteration overhead. We chunk
+    // along scanlines so the cache pattern matches the radiance pass.
+    //
+    // Safe to unwrap: we just inserted these above.
+    let pixels: &[[f32; 4]] = &buffer.pixels;
+    let albedo = buffer.albedo.as_mut().unwrap();
+    let normal = buffer.normal.as_mut().unwrap();
+    let depth = buffer.depth.as_mut().unwrap();
+    albedo
+        .par_iter_mut()
+        .zip(normal.par_iter_mut())
+        .zip(depth.par_iter_mut())
+        .enumerate()
+        .for_each(|(i, ((alb_px, nrm_px), depth_px))| {
+            let px = (i as u32) % width;
+            let py = (i as u32) / width;
             // Sample-count scale so that `average_*` helpers recover
             // the per-pixel first-hit value: `aux_sum / samples = aux`.
             // Use `max(1.0)` to defend against an uninitialised
             // `pixels[i][3]` (e.g. GPU returned an empty buffer on
             // cancel) — division would otherwise blow up.
-            let scale = buffer.pixels[i][3].max(1.0);
-            let dir_world = match config.projection {
+            let scale = pixels[i][3].max(1.0);
+            let dir_world = match projection {
                 CameraProjection::Perspective => {
-                    let nx = (px as f32 + 0.5) / config.width as f32 * 2.0 - 1.0;
-                    let ny = 1.0 - (py as f32 + 0.5) / config.height as f32 * 2.0;
+                    let nx = (px as f32 + 0.5) / width as f32 * 2.0 - 1.0;
+                    let ny = 1.0 - (py as f32 + 0.5) / height as f32 * 2.0;
                     let dir_view = Vec3::new(nx * half_w, ny * half_h, -1.0).normalize();
                     view.basis * dir_view
                 }
-                CameraProjection::Equirectangular => equirectangular_dir(
-                    px as f32 + 0.5,
-                    py as f32 + 0.5,
-                    config.width,
-                    config.height,
-                    &view,
-                ),
+                CameraProjection::Equirectangular => {
+                    equirectangular_dir(px as f32 + 0.5, py as f32 + 0.5, width, height, &view)
+                }
             };
             let ray = Ray::new(view.origin, dir_world);
             let aux = compute_first_hit_aux(scene, &ray);
             let (a, nrm, d) = aux.to_triplet(dir_world);
-            // Safe to unwrap: we just inserted these above.
-            let albedo = buffer.albedo.as_mut().unwrap();
-            let normal = buffer.normal.as_mut().unwrap();
-            let depth = buffer.depth.as_mut().unwrap();
-            albedo[i] = [a[0] * scale, a[1] * scale, a[2] * scale];
-            normal[i] = [nrm[0] * scale, nrm[1] * scale, nrm[2] * scale];
-            depth[i] = d * scale;
-        }
-    }
+            *alb_px = [a[0] * scale, a[1] * scale, a[2] * scale];
+            *nrm_px = [nrm[0] * scale, nrm[1] * scale, nrm[2] * scale];
+            *depth_px = d * scale;
+        });
 }
 
 /// Compute the first-hit aux features for a single primary ray. Used
@@ -1187,73 +1199,82 @@ fn equirectangular_dir(px: f32, py: f32, width: u32, height: u32, view: &ViewFra
     (view.basis * dir_view).normalize_or_zero()
 }
 
-/// Sum the radiance from analytic lights (sun, area) whose support
-/// contains `ray.dir`. Used by `trace_path` to add direct visibility of
-/// these lights for rays that escape the scene without hitting any
-/// triangle — without this, looking straight at a sun would render
-/// only the sky background.
+/// Radiance from a single analytic light whose geometric support
+/// contains the direction of `ray` (escape-ray case). Returns
+/// `Vec3::ZERO` when the ray does not intersect the light's support
+/// or when the light has no geometric surface (point / IES — these
+/// have zero solid angle and their illumination flows entirely
+/// through NEE).
 ///
-/// Point/IES lights are intentionally excluded: they are point delta
-/// emitters with zero solid angle, so a ray can never "hit" one.
-fn direct_visible_lights(lights: &[NativeLight], ray: &Ray) -> Vec3 {
-    let mut total = Vec3::ZERO;
-    for light in lights {
-        match light {
-            NativeLight::Sun {
-                direction,
-                radiance,
-                angular_radius_rad,
-            } => {
-                // The sun's apparent direction is `-direction` (the
-                // direction light *comes from*). A primary ray points
-                // away from the camera; it "hits" the sun if its
-                // direction lies inside the sun's angular cone.
-                let to_sun = -*direction;
-                let cos_cone = angular_radius_rad.cos();
-                let cos_angle = ray.dir.normalize_or_zero().dot(to_sun.normalize_or_zero());
-                if cos_angle >= cos_cone {
-                    total += *radiance;
-                }
-            }
-            NativeLight::Area {
-                position,
-                normal,
-                u_axis,
-                v_axis,
-                width,
-                height,
-                radiance,
-            } => {
-                // Ray-plane intersection: solve t such that the ray
-                // crosses the plane defined by `position`/`normal`,
-                // then check the (u, v) hit point is inside the
-                // rectangle. The area light is two-sided so the dot
-                // product sign is irrelevant.
-                let denom = normal.dot(ray.dir);
-                if denom.abs() < 1e-6 {
-                    continue;
-                }
-                let t = (*position - ray.origin).dot(*normal) / denom;
-                if t < ray.t_min || t > ray.t_max {
-                    continue;
-                }
-                let hit_pt = ray.origin + ray.dir * t;
-                let local = hit_pt - *position;
-                let u = local.dot(*u_axis);
-                let v = local.dot(*v_axis);
-                if u.abs() <= *width * 0.5 && v.abs() <= *height * 0.5 {
-                    total += *radiance;
-                }
-            }
-            NativeLight::Point { .. } | NativeLight::Ies { .. } => {
-                // Delta luminaires have zero solid angle; a ray cannot
-                // intersect them in the geometric sense, so they
-                // contribute nothing to direct-miss visibility. Their
-                // illumination flows entirely through NEE.
+/// This is the per-light variant of the old `direct_visible_lights`
+/// sum. We expose the per-light shape so [`trace_path`] can MIS-pair
+/// each contributing light's radiance with that same light's NEE pdf,
+/// preserving the per-light symmetric partition
+/// `w_NEE(p_i, p_b) + w_BSDF(p_b, p_i) = 1`. Summing radiances and
+/// using `nee_sum_pdf` on the BSDF side collapses the partition and
+/// under-counts overlapping non-delta lights by 1−Σ(p_i/Σp)·… in the
+/// power heuristic (~30 % loss for two coincident equal-pdf area
+/// lights).
+fn visible_light_radiance(light: &NativeLight, ray: &Ray) -> Vec3 {
+    match light {
+        NativeLight::Sun {
+            direction,
+            radiance,
+            angular_radius_rad,
+        } => {
+            // The sun's apparent direction is `-direction` (the
+            // direction light *comes from*). A primary ray points
+            // away from the camera; it "hits" the sun if its
+            // direction lies inside the sun's angular cone.
+            let to_sun = -*direction;
+            let cos_cone = angular_radius_rad.cos();
+            let cos_angle = ray.dir.normalize_or_zero().dot(to_sun.normalize_or_zero());
+            if cos_angle >= cos_cone {
+                *radiance
+            } else {
+                Vec3::ZERO
             }
         }
+        NativeLight::Area {
+            position,
+            normal,
+            u_axis,
+            v_axis,
+            width,
+            height,
+            radiance,
+        } => {
+            // Ray-plane intersection: solve t such that the ray
+            // crosses the plane defined by `position`/`normal`,
+            // then check the (u, v) hit point is inside the
+            // rectangle. The area light is two-sided so the dot
+            // product sign is irrelevant.
+            let denom = normal.dot(ray.dir);
+            if denom.abs() < 1e-6 {
+                return Vec3::ZERO;
+            }
+            let t = (*position - ray.origin).dot(*normal) / denom;
+            if t < ray.t_min || t > ray.t_max {
+                return Vec3::ZERO;
+            }
+            let hit_pt = ray.origin + ray.dir * t;
+            let local = hit_pt - *position;
+            let u = local.dot(*u_axis);
+            let v = local.dot(*v_axis);
+            if u.abs() <= *width * 0.5 && v.abs() <= *height * 0.5 {
+                *radiance
+            } else {
+                Vec3::ZERO
+            }
+        }
+        NativeLight::Point { .. } | NativeLight::Ies { .. } => {
+            // Delta luminaires have zero solid angle; a ray cannot
+            // intersect them in the geometric sense, so they
+            // contribute nothing to direct-miss visibility. Their
+            // illumination flows entirely through NEE.
+            Vec3::ZERO
+        }
     }
-    total
 }
 
 fn trace_path(
@@ -1300,22 +1321,43 @@ fn trace_path(
             // `last_was_specular` gate did the drop and silently
             // crushed variance reduction on geometry that sees a
             // light along a glossy direction).
-            let analytic = direct_visible_lights(&scene.lights, &ray);
-            if analytic.length_squared() > 0.0 {
+            // Per-light symmetric MIS for BSDF-found emitters: iterate
+            // every non-delta light and pair the light's OWN NEE pdf
+            // with the BSDF pdf. This preserves the per-light partition
+            // `w_NEE(p_i, p_b) + w_BSDF(p_b, p_i) = 1`, even when two
+            // or more lights overlap in solid-angle support from this
+            // shading point (e.g. a finite-cone sun seen through an
+            // area light). Using the summed `nee_sum_pdf` here would
+            // make every overlapping light's BSDF-side weight
+            // p_b²/(p_b²+(Σp_i)²) instead of p_b²/(p_b²+p_i²),
+            // collapsing the partition and losing ~30 % of each
+            // light's energy in regions of overlap.
+            for light in &scene.lights {
+                if is_delta(light) {
+                    continue;
+                }
+                let light_radiance = visible_light_radiance(light, &ray);
+                if light_radiance.length_squared() == 0.0 {
+                    continue;
+                }
                 let mis_w = if last_was_specular {
                     1.0
                 } else {
-                    let nee_pdf = nee_sum_pdf(&scene.lights, prev_hit_pos, ray.dir);
-                    if nee_pdf > 0.0 {
-                        power_heuristic(prev_bsdf_pdf, nee_pdf)
+                    let p = light_pdf(light, prev_hit_pos, ray.dir);
+                    if p > 0.0 {
+                        power_heuristic(prev_bsdf_pdf, p)
                     } else {
-                        // No NEE sampler covers this direction — the
-                        // BSDF strategy is the only one that could
-                        // have produced it, so it gets full weight.
+                        // The light's geometric support covers
+                        // `ray.dir` (we got non-zero radiance above)
+                        // but its NEE pdf evaluates to zero — e.g. an
+                        // area light hit on its back face, where
+                        // `light_pdf` returns 0 by convention. NEE
+                        // never samples this direction, so the BSDF
+                        // strategy takes full weight.
                         1.0
                     }
                 };
-                radiance += throughput * analytic * mis_w;
+                radiance += throughput * light_radiance * mis_w;
             }
             if bounce == 0 {
                 aux = Some(FirstHitAux::Miss);
@@ -1372,21 +1414,54 @@ fn trace_path(
         //   strategy is the only one that could have produced the hit.
         // * Bounce ≥ 1 after a diffuse / glossy event: both BSDF and
         //   NEE could have produced this direction. Use the power
-        //   heuristic to combine. If `nee_sum_pdf` returns 0 (the
-        //   emitter is not in `scene.lights` — e.g. a mesh with a
+        //   heuristic to combine, pairing the owning light's pdf with
+        //   the BSDF pdf (see per-light symmetric MIS above). If no
+        //   analytic light claims this emissive surface — a mesh with
         //   non-zero emissive material that the scene converter did
-        //   *not* register as an analytic light), MIS weight is 1.0
-        //   and BSDF takes the full contribution (no double-count
-        //   because NEE never sampled it).
+        //   *not* register as a `NativeLight` — MIS weight is 1.0 and
+        //   BSDF takes the full contribution (no double-count because
+        //   NEE never sampled it).
         if mat.emissive.length_squared() > 0.0 {
             let mis_w = if last_was_specular {
                 1.0
             } else {
-                let nee_pdf = nee_sum_pdf(&scene.lights, prev_hit_pos, ray.dir);
-                if nee_pdf > 0.0 {
-                    power_heuristic(prev_bsdf_pdf, nee_pdf)
-                } else {
-                    1.0
+                // Per-light symmetric MIS: find the analytic area
+                // light (if any) whose rectangle contains `hit_pos`,
+                // then pair THAT light's pdf with the BSDF pdf. For
+                // overlapping lights only the first matching one
+                // "owns" this hit — its pdf alone goes in the
+                // denominator so the partition
+                // `w_NEE(p_i, p_b) + w_BSDF(p_b, p_i) = 1` holds per
+                // light. If no analytic light claims this emissive
+                // surface (mesh with non-zero `mat.emissive` but the
+                // scene converter did *not* register it as an
+                // analytic light), MIS weight is 1.0 — BSDF takes
+                // full contribution because NEE never sampled it.
+                //
+                // Sun lights cannot "own" a surface hit: Sun has no
+                // geometric surface in scene.triangles, only an
+                // angular cone for the miss branch above.
+                // `area_light_contains_world_point` correctly
+                // returns false for non-Area variants.
+                let owning = scene
+                    .lights
+                    .iter()
+                    .find(|l| area_light_contains_world_point(l, hit_pos));
+                match owning {
+                    Some(light) => {
+                        let p = light_pdf(light, prev_hit_pos, ray.dir);
+                        if p > 0.0 {
+                            power_heuristic(prev_bsdf_pdf, p)
+                        } else {
+                            // Owning light's NEE pdf is zero in this
+                            // direction (e.g. back-face hit on a
+                            // one-sided area light). NEE never
+                            // samples this direction — BSDF takes
+                            // full weight.
+                            1.0
+                        }
+                    }
+                    None => 1.0,
                 }
             };
             radiance += throughput * mat.emissive * mis_w;
@@ -1436,8 +1511,9 @@ fn trace_path(
 
         ray = Ray::new(hit_pos, sample.direction);
         // Remember where this BSDF sample was taken from, so the next
-        // iteration can compute `nee_sum_pdf` from the same shading
-        // point when MIS-combining a BSDF-found emitter contribution.
+        // iteration can compute the owning light's NEE pdf from the
+        // same shading point when MIS-combining a BSDF-found emitter
+        // contribution.
         prev_hit_pos = hit_pos;
     }
 

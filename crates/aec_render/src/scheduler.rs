@@ -360,45 +360,91 @@ pub fn schedule(
             // (defensive: a future kernel-routing tweak that produced
             // a `TilePassResult` without aux against an aux-allocated
             // buffer would silently drop the splat rather than panic).
-            if let (Some(buf_albedo), Some(pass_albedo)) =
-                (buffer.albedo.as_mut(), result.albedo_sums.as_ref())
-            {
+            //
+            // Fused single-pass splat over the tile's pixel rectangle:
+            // one (li, gi) computation amortised across all three
+            // channels, matching the layout pattern used by
+            // `path_trace::render_inner`'s aux loop. This replaces an
+            // earlier 3-loop version that re-walked the rectangle and
+            // recomputed indices once per channel.
+            let buf_albedo_opt = result.albedo_sums.as_ref().map(|pass_albedo| {
+                (
+                    buffer
+                        .albedo
+                        .as_mut()
+                        .expect("buffer.albedo allocated when capture_aux is true"),
+                    pass_albedo,
+                )
+            });
+            // Re-borrow normal/depth in separate match arms because we
+            // cannot hold two `&mut` borrows on disjoint fields of
+            // `buffer` simultaneously via the `as_mut()` accessor with
+            // the borrow checker pre-Polonius. Splat in passes that
+            // share one walk of (lx, ly).
+            if let Some((buf_albedo, pass_albedo)) = buf_albedo_opt {
                 for ly in 0..tile.height() {
                     for lx in 0..tw {
                         let li = (ly * tw + lx) as usize;
                         let gi = ((tile.y_start + ly) * base_config.width + (tile.x_start + lx))
                             as usize;
-                        for c in 0..3 {
-                            buf_albedo[gi][c] += pass_albedo[li][c];
-                        }
+                        let dst = &mut buf_albedo[gi];
+                        let src = &pass_albedo[li];
+                        dst[0] += src[0];
+                        dst[1] += src[1];
+                        dst[2] += src[2];
                     }
                 }
             }
-            if let (Some(buf_normal), Some(pass_normal)) =
-                (buffer.normal.as_mut(), result.normal_sums.as_ref())
-            {
-                for ly in 0..tile.height() {
-                    for lx in 0..tw {
-                        let li = (ly * tw + lx) as usize;
-                        let gi = ((tile.y_start + ly) * base_config.width + (tile.x_start + lx))
-                            as usize;
-                        for c in 0..3 {
-                            buf_normal[gi][c] += pass_normal[li][c];
+            // Fused normal + depth pass: when both are present we walk
+            // the tile rectangle once and write both channels per
+            // pixel. When only one is present we walk for that one
+            // alone.
+            match (
+                buffer.normal.as_mut(),
+                buffer.depth.as_mut(),
+                result.normal_sums.as_ref(),
+                result.depth_sums.as_ref(),
+            ) {
+                (Some(buf_normal), Some(buf_depth), Some(pass_normal), Some(pass_depth)) => {
+                    for ly in 0..tile.height() {
+                        for lx in 0..tw {
+                            let li = (ly * tw + lx) as usize;
+                            let gi = ((tile.y_start + ly) * base_config.width + (tile.x_start + lx))
+                                as usize;
+                            let nrm_dst = &mut buf_normal[gi];
+                            let nrm_src = &pass_normal[li];
+                            nrm_dst[0] += nrm_src[0];
+                            nrm_dst[1] += nrm_src[1];
+                            nrm_dst[2] += nrm_src[2];
+                            buf_depth[gi] += pass_depth[li];
                         }
                     }
                 }
-            }
-            if let (Some(buf_depth), Some(pass_depth)) =
-                (buffer.depth.as_mut(), result.depth_sums.as_ref())
-            {
-                for ly in 0..tile.height() {
-                    for lx in 0..tw {
-                        let li = (ly * tw + lx) as usize;
-                        let gi = ((tile.y_start + ly) * base_config.width + (tile.x_start + lx))
-                            as usize;
-                        buf_depth[gi] += pass_depth[li];
+                (Some(buf_normal), _, Some(pass_normal), _) => {
+                    for ly in 0..tile.height() {
+                        for lx in 0..tw {
+                            let li = (ly * tw + lx) as usize;
+                            let gi = ((tile.y_start + ly) * base_config.width + (tile.x_start + lx))
+                                as usize;
+                            let dst = &mut buf_normal[gi];
+                            let src = &pass_normal[li];
+                            dst[0] += src[0];
+                            dst[1] += src[1];
+                            dst[2] += src[2];
+                        }
                     }
                 }
+                (_, Some(buf_depth), _, Some(pass_depth)) => {
+                    for ly in 0..tile.height() {
+                        for lx in 0..tw {
+                            let li = (ly * tw + lx) as usize;
+                            let gi = ((tile.y_start + ly) * base_config.width + (tile.x_start + lx))
+                                as usize;
+                            buf_depth[gi] += pass_depth[li];
+                        }
+                    }
+                }
+                _ => {}
             }
             // Update Welford running stats.
             tile_states[idx].merge_pass(&result.sums, &result.sums_sq, pass_samples);

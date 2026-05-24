@@ -398,6 +398,51 @@ pub fn is_delta(light: &NativeLight) -> bool {
     }
 }
 
+/// Test whether `light`'s analytic surface contains the world-space
+/// point `world_pos`. Used by the BSDF-found-emitter branch of the
+/// path tracer to identify which (if any) analytic light "owns" a
+/// hit on an emissive triangle, so per-light symmetric MIS can pair
+/// THAT light's pdf with the BSDF pdf — matching the per-light NEE
+/// MIS weight on the other side of the partition.
+///
+/// Only [`NativeLight::Area`] has a sample-able surface; Sun and the
+/// delta lights ([`NativeLight::Point`] / [`NativeLight::Ies`]) have
+/// no geometric surface in this measure and return `false`. The Sun
+/// is "hit" via its angular cone test, not by surface containment —
+/// callers handle the miss-branch (escape-ray) case separately.
+///
+/// The containment test is the same plane-projection logic as
+/// [`light_pdf`] / [`sample_light`]: project `world_pos` onto the
+/// rectangle's `(u_axis, v_axis)` frame relative to `position`, then
+/// check against the half-extents. A point that lies on the
+/// rectangle's plane within ε is treated as containing the point —
+/// matching the precision used by the path tracer's hit-position
+/// reconstruction.
+pub fn area_light_contains_world_point(light: &NativeLight, world_pos: Vec3) -> bool {
+    let NativeLight::Area {
+        position,
+        normal,
+        u_axis,
+        v_axis,
+        width,
+        height,
+        ..
+    } = light
+    else {
+        return false;
+    };
+    let local = world_pos - *position;
+    // Out-of-plane distance — the hit point should lie on (or very
+    // near) the light's plane. Anything farther than ε is a different
+    // surface that happens to be in front of / behind the light.
+    if local.dot(*normal).abs() > 1e-2 {
+        return false;
+    }
+    let u = local.dot(*u_axis);
+    let v = local.dot(*v_axis);
+    u.abs() <= *width * 0.5 && v.abs() <= *height * 0.5
+}
+
 fn orthonormal_basis(n: Vec3) -> (Vec3, Vec3) {
     let sign = if n.z >= 0.0 { 1.0 } else { -1.0 };
     let a = -1.0 / (sign + n.z);
@@ -756,5 +801,104 @@ mod tests {
         };
         let lights = vec![point];
         assert_eq!(nee_sum_pdf(&lights, Vec3::ZERO, Vec3::Y), 0.0);
+    }
+
+    #[test]
+    fn area_light_contains_world_point_accepts_inside_and_rejects_outside() {
+        // 2×2 m rectangle at y=5, facing -Y, with the X/Z axes spanning
+        // the surface.
+        let light = NativeLight::Area {
+            position: Vec3::new(0.0, 5.0, 0.0),
+            normal: Vec3::NEG_Y,
+            u_axis: Vec3::X,
+            v_axis: Vec3::Z,
+            width: 2.0,
+            height: 2.0,
+            radiance: Vec3::splat(10.0),
+        };
+        // Centre of the rectangle (in-plane, inside extents).
+        assert!(area_light_contains_world_point(
+            &light,
+            Vec3::new(0.0, 5.0, 0.0)
+        ));
+        // Inside extents, at a corner.
+        assert!(area_light_contains_world_point(
+            &light,
+            Vec3::new(1.0, 5.0, 1.0)
+        ));
+        // Outside extents (X = 1.5 > half-width 1.0).
+        assert!(!area_light_contains_world_point(
+            &light,
+            Vec3::new(1.5, 5.0, 0.0)
+        ));
+        // Off-plane (y = 4.5, distance 0.5 from plane).
+        assert!(!area_light_contains_world_point(
+            &light,
+            Vec3::new(0.0, 4.5, 0.0)
+        ));
+    }
+
+    #[test]
+    fn area_light_contains_world_point_returns_false_for_non_area_lights() {
+        // Per-light symmetric MIS uses this predicate to identify which
+        // light "owns" a BSDF hit on an emissive triangle. Sun / Point
+        // / IES have no triangulated surface — they must always return
+        // false so the BSDF-found branch falls through to the
+        // unowned-emissive case (MIS weight 1.0) rather than incorrectly
+        // crediting a non-Area light's pdf.
+        let sun = NativeLight::Sun {
+            direction: Vec3::new(0.0, -1.0, 0.0),
+            radiance: Vec3::splat(1.0),
+            angular_radius_rad: 0.05,
+        };
+        let point = NativeLight::Point {
+            position: Vec3::new(0.0, 5.0, 0.0),
+            intensity: Vec3::splat(100.0),
+        };
+        let ies = NativeLight::Ies {
+            position: Vec3::new(0.0, 3.0, 0.0),
+            forward: Vec3::NEG_Y,
+            up: Vec3::Z,
+            profile: IesProfile::test_isotropic(1000.0),
+            intensity_scale: 1.0,
+            color: Vec3::ONE,
+        };
+        for light in [&sun, &point, &ies] {
+            assert!(!area_light_contains_world_point(
+                light,
+                Vec3::new(0.0, 5.0, 0.0)
+            ));
+        }
+    }
+
+    #[test]
+    fn area_light_contains_world_point_is_per_light_mis_owner_test() {
+        // Two overlapping area lights at the same position: each
+        // light's containment test must accept its OWN rectangle
+        // independently. The path tracer's BSDF-found branch iterates
+        // these and picks the first matching one as the "owner" — so
+        // both passing the test means the partition is per-light, not
+        // summed.
+        let a = NativeLight::Area {
+            position: Vec3::new(0.0, 5.0, 0.0),
+            normal: Vec3::NEG_Y,
+            u_axis: Vec3::X,
+            v_axis: Vec3::Z,
+            width: 2.0,
+            height: 2.0,
+            radiance: Vec3::splat(10.0),
+        };
+        let b = NativeLight::Area {
+            position: Vec3::new(0.0, 5.0, 0.0),
+            normal: Vec3::NEG_Y,
+            u_axis: Vec3::X,
+            v_axis: Vec3::Z,
+            width: 2.0,
+            height: 2.0,
+            radiance: Vec3::splat(5.0),
+        };
+        let p = Vec3::new(0.5, 5.0, 0.5);
+        assert!(area_light_contains_world_point(&a, p));
+        assert!(area_light_contains_world_point(&b, p));
     }
 }
