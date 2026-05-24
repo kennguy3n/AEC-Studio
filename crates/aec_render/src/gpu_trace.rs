@@ -739,10 +739,24 @@ pub fn render_or_fallback(
     config: &PathTraceConfig,
     progress: Option<ProgressFn>,
     cancel: Option<CancelToken>,
+    capture_aux: bool,
 ) -> AccumulationBuffer {
     match GpuPathTracer::try_new() {
+        // The GPU path does not yet emit first-hit aux buffers (would
+        // require new bindings + a GBuffer pass in the WGSL kernel).
+        // When the caller asked for aux but the GPU path was selected,
+        // we silently drop aux for now: the bilateral kernel in
+        // `final_render::encode_srgb8` handles `None` aux as a
+        // luminance-only fallback. A future PR will plumb aux through
+        // the GPU compute kernel.
         Ok(tracer) => tracer.render(scene, camera, config, progress, cancel),
-        Err(_) => crate::path_trace::render(scene, camera, config, progress, cancel),
+        Err(_) => {
+            if capture_aux {
+                crate::path_trace::render_with_aux(scene, camera, config, progress, cancel)
+            } else {
+                crate::path_trace::render(scene, camera, config, progress, cancel)
+            }
+        }
     }
 }
 
@@ -871,7 +885,7 @@ mod tests {
             adaptive_threshold: 0.0,
             projection: crate::path_trace::CameraProjection::Perspective,
         };
-        let buf = render_or_fallback(&scene, &camera, &cfg, None, None);
+        let buf = render_or_fallback(&scene, &camera, &cfg, None, None, false);
         assert_eq!(buf.width, 16);
         assert_eq!(buf.height, 12);
         assert_eq!(buf.pixels.len(), 16 * 12);
@@ -904,7 +918,7 @@ mod tests {
         };
         let token = CancelToken::new();
         token.cancel();
-        let buf = render_or_fallback(&scene, &camera, &cfg, None, Some(token));
+        let buf = render_or_fallback(&scene, &camera, &cfg, None, Some(token), false);
         // Even cancelled, the buffer is allocated with the requested
         // dimensions.
         assert_eq!(buf.width, 16);
@@ -1187,7 +1201,7 @@ mod tests {
                     adaptive_threshold: 0.0,
                     projection: crate::path_trace::CameraProjection::Perspective,
                 };
-                let buf = render_or_fallback(&scene, &camera, &cfg, None, None);
+                let buf = render_or_fallback(&scene, &camera, &cfg, None, None, false);
                 assert_eq!(buf.pixels.len(), 48);
             }
             Err(e) => panic!("unexpected error: {e:?}"),

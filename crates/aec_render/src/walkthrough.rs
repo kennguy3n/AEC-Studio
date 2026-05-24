@@ -202,7 +202,18 @@ impl WalkthroughPipeline {
                 ..template
             };
 
-            let buffer = render_or_fallback(&pt_scene, &camera, &config, None, cancel.clone());
+            // Walkthrough frames inherit the still-frame aux convention:
+            // when the preset asks for denoising, render with first-hit
+            // aux feature buffers so the bilateral kernel in
+            // `encode_srgb8` gets albedo / normal / depth guidance.
+            let buffer = render_or_fallback(
+                &pt_scene,
+                &camera,
+                &config,
+                None,
+                cancel.clone(),
+                preset.config.denoise,
+            );
             if let Some(c) = cancel.as_ref() {
                 if c.is_cancelled() {
                     return Err(WalkthroughError::Cancelled(frame));

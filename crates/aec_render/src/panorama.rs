@@ -129,7 +129,13 @@ impl PanoramaPipeline {
         config.height = height;
 
         let start = Instant::now();
-        let buffer = render_or_fallback(&pt_scene, camera, &config, None, cancel.clone());
+        // Panorama / equirectangular path: aux feature buffers (albedo /
+        // normal / depth) are not currently used for denoising of
+        // panoramas because the equirectangular projection produces
+        // strong pole distortion that the bilateral kernel handles
+        // best with luminance-only filtering. If denoising of panoramas
+        // becomes critical, a future PR can opt this path into aux too.
+        let buffer = render_or_fallback(&pt_scene, camera, &config, None, cancel.clone(), false);
         let elapsed = start.elapsed();
         if let Some(token) = &cancel {
             if token.is_cancelled() {
