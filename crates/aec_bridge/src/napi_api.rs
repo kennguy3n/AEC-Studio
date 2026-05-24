@@ -602,6 +602,83 @@ pub fn project_graph_list(
         .map(|rs| rs.into_iter().map(Into::into).collect())
 }
 
+/// JS-facing renderer-side query parameters for
+/// [`design_list_assets`]. Mirrors the `DesignAssetQuery` shape the
+/// renderer passes through `designListAssets(query)` in
+/// `apps/desktop/electron/bridge.ts`.
+///
+/// All fields are optional so the renderer can call this with an
+/// empty object (`{}`) and get the seed library back. Field-name
+/// alignment (snake_case here → camelCase on the JS side via
+/// `#[napi(object)]`) is by convention:
+///
+/// * `search` → renderer's case-insensitive name substring.
+/// * `tags` → AND-matched tag list. Empty / missing falls through
+///   to "no filter".
+/// * `style_tags` → AND-matched style-tag list. Same semantics.
+/// * `limit` → cap on result-set size. `None` falls through to the
+///   bridge default (24, matching the asset-browser grid page).
+#[napi(object)]
+pub struct DesignListAssetsQueryJs {
+    pub search: Option<String>,
+    pub tags: Option<Vec<String>>,
+    pub style_tags: Option<Vec<String>>,
+    pub limit: Option<u32>,
+}
+
+/// JS-facing asset-browser card. Mirrors `AssetSummary` in
+/// `apps/desktop/electron/bridge.ts`.
+///
+/// `thumbnail_data_uri` is intentionally `Option<String>` (not
+/// `String`) so the renderer can distinguish "no thumbnail yet"
+/// (placeholder card) from "thumbnail is an empty data URI" (which
+/// would be a real-world bug worth surfacing). The PR-U seed library
+/// is `None` for every demo asset — real thumbnail wiring lands in a
+/// follow-up.
+#[napi(object)]
+pub struct AssetSummaryJs {
+    pub asset_id: String,
+    pub name: String,
+    pub tags: Vec<String>,
+    pub style_tags: Vec<String>,
+    pub vendor: Option<String>,
+    pub thumbnail_data_uri: Option<String>,
+}
+
+impl From<crate::service::AssetSummary> for AssetSummaryJs {
+    fn from(s: crate::service::AssetSummary) -> Self {
+        Self {
+            asset_id: s.asset_id,
+            name: s.name,
+            tags: s.tags,
+            style_tags: s.style_tags,
+            vendor: s.vendor,
+            thumbnail_data_uri: s.thumbnail_data_uri,
+        }
+    }
+}
+
+/// List assets from the global asset library matching `query`.
+/// Read-only; routes through `with_service_ref_fallible` so it can
+/// run concurrently with other read-side endpoints (`runtime_status`,
+/// `project_engine_status`, etc).
+///
+/// The DB is lazy-opened inside [`crate::asset_state::AssetState`] on
+/// the first call of this endpoint, so a bridge boot that never
+/// touches the asset browser pays zero SQLite open + schema-bootstrap
+/// + seed cost.
+#[napi]
+pub fn design_list_assets(query: DesignListAssetsQueryJs) -> Result<Vec<AssetSummaryJs>> {
+    let q = crate::service::AssetListQuery {
+        search: query.search,
+        tags: query.tags.unwrap_or_default(),
+        style_tags: query.style_tags.unwrap_or_default(),
+        limit: query.limit,
+    };
+    with_service_ref_fallible(|svc| svc.design_list_assets(&q))
+        .map(|rows| rows.into_iter().map(Into::into).collect())
+}
+
 fn parse_scope(s: &str) -> Result<aec_core::types::Scope> {
     match s {
         "design" => Ok(aec_core::types::Scope::Design),

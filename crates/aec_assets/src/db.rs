@@ -218,9 +218,21 @@ impl AssetDatabase {
         Ok(n > 0)
     }
 
-    /// Run a query and return matching metadata. The query is SQL-side for
-    /// vendor + name + license + indexed columns; tag/style-tag filters are
-    /// applied in Rust (small libraries).
+    /// Run a query and return matching metadata. All predicates —
+    /// `name_contains`, `vendor_id`, `tags`, and `style_tags` — are
+    /// expressed in SQL so the `LIMIT` clause composes correctly: a
+    /// tag-filtered query on a 10k-row library returns the top-N
+    /// **matches**, not the top-N rows pre-filter.
+    ///
+    /// Tag / style-tag predicates use SQLite's `json_each` table-valued
+    /// function (always available in the bundled-sqlcipher-vendored-
+    /// openssl build we link against) to walk the JSON-encoded
+    /// `tags` / `style_tags` columns. Each requested tag becomes one
+    /// `EXISTS (SELECT 1 FROM json_each(assets.<col>) WHERE value = ?)`
+    /// subclause so the AND semantics match the renderer's
+    /// `filterAssets` in-process fallback. The doc on
+    /// [`AssetQuery::tags`] / [`AssetQuery::style_tags`] pins this
+    /// AND-vs-OR contract.
     pub fn query(&self, q: &AssetQuery) -> AssetResult<Vec<AssetMetadata>> {
         // Build a heterogeneously-typed parameter list. The earlier
         // implementation stuffed every binding (including LIMIT) into a
@@ -249,6 +261,26 @@ impl AssetDatabase {
             sql.push_str(" AND vendor_id = ?");
             bindings.push(Box::new(vendor.clone()));
         }
+        // Push tag / style-tag filtering into SQL so `LIMIT` applies
+        // after the filter, not before. The pre-fix path bound `LIMIT`
+        // to the user-supplied page size, fetched up to N rows ordered
+        // by `created_at DESC`, then `.retain()`-filtered the in-memory
+        // result — which silently dropped matches outside the top-N
+        // by creation date. Matches the in-process `filterAssets`
+        // fallback in `apps/desktop/electron/bridge.ts` exactly:
+        // "filter first, slice last".
+        for tag in &q.tags {
+            sql.push_str(
+                " AND EXISTS (SELECT 1 FROM json_each(assets.tags) WHERE json_each.value = ?)",
+            );
+            bindings.push(Box::new(tag.clone()));
+        }
+        for style_tag in &q.style_tags {
+            sql.push_str(
+                " AND EXISTS (SELECT 1 FROM json_each(assets.style_tags) WHERE json_each.value = ?)",
+            );
+            bindings.push(Box::new(style_tag.clone()));
+        }
         sql.push_str(" ORDER BY created_at DESC LIMIT ?");
         // Bind LIMIT as a typed i64 — not as a String — so SQLite gets an
         // INTEGER value, not text it has to coerce. `u32 -> i64` is
@@ -258,19 +290,12 @@ impl AssetDatabase {
 
         let mut stmt = self.conn.prepare(&sql)?;
         let params_iter: Vec<&dyn rusqlite::ToSql> = bindings.iter().map(AsRef::as_ref).collect();
-        let mut rows = stmt
+        let rows = stmt
             .query_map(
                 rusqlite::params_from_iter(params_iter.iter().copied()),
                 row_to_metadata,
             )?
             .collect::<Result<Vec<_>, _>>()?;
-        // Apply tag/style-tag filters in Rust.
-        rows.retain(|m| {
-            q.tags.iter().all(|tag| m.tags.iter().any(|t| t == tag))
-                && q.style_tags
-                    .iter()
-                    .all(|tag| m.style_tags.iter().any(|t| t == tag))
-        });
         Ok(rows)
     }
 }
@@ -402,6 +427,107 @@ mod tests {
         db.upsert_metadata(&b, &chain).unwrap();
         let q = AssetQuery {
             tags: vec!["sofa".into()],
+            ..AssetQuery::default()
+        };
+        let res = db.query(&q).unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].asset_id, "a1");
+    }
+
+    #[test]
+    fn query_tag_filter_composes_with_limit() {
+        // Regression test for the pre-fix bug where `LIMIT` was
+        // applied as a SQL clause **before** the in-Rust tag
+        // `.retain()` filter ran. With `LIMIT 3` and a tag-filtered
+        // query against a 5-row library where the 3 newest rows are
+        // *untagged* and the 2 oldest are tagged, the old path would
+        // return zero results — the SQL returned the 3 newest rows,
+        // then `.retain()` filtered them all out. The fix pushes the
+        // tag predicate into SQL so `LIMIT` only applies to the
+        // already-filtered set; we now correctly return both tagged
+        // rows. Mirrors the renderer's in-process `filterAssets`
+        // semantics (filter first, slice last).
+        let mut db = AssetDatabase::open_in_memory().unwrap();
+        let chain = LodChain::from_ratios(1000, &[]);
+        // Insert 5 assets. Newer rows have no `sofa` tag, older rows
+        // do. The default `ORDER BY created_at DESC` would surface
+        // the untagged rows first.
+        for i in 0..5 {
+            let mut m = sample(&format!("a{i}"));
+            // Tag only the two oldest (`a0`, `a1`).
+            m.tags = if i < 2 {
+                vec!["sofa".into()]
+            } else {
+                vec!["chair".into()]
+            };
+            db.upsert_metadata(&m, &chain).unwrap();
+            // Force monotonically increasing `created_at` so the
+            // ORDER BY is deterministic on hosts where the test runs
+            // faster than the timestamp clock resolution.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let q = AssetQuery {
+            tags: vec!["sofa".into()],
+            limit: Some(3),
+            ..AssetQuery::default()
+        };
+        let res = db.query(&q).unwrap();
+        assert_eq!(
+            res.len(),
+            2,
+            "tag filter must compose with LIMIT — pre-fix path returned 0 here",
+        );
+        let mut ids: Vec<&str> = res.iter().map(|m| m.asset_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["a0", "a1"]);
+    }
+
+    #[test]
+    fn query_filters_by_style_tag() {
+        // Style-tag filter mirrors the `tags` filter end-to-end —
+        // pin the AND semantics for `style_tags` separately so the
+        // SQL clause for `assets.style_tags` doesn't regress
+        // independently.
+        let mut db = AssetDatabase::open_in_memory().unwrap();
+        let chain = LodChain::from_ratios(1000, &[]);
+        let mut a = sample("a1");
+        a.style_tags = vec!["industrial".into()];
+        let mut b = sample("a2");
+        b.style_tags = vec!["scandinavian".into()];
+        db.upsert_metadata(&a, &chain).unwrap();
+        db.upsert_metadata(&b, &chain).unwrap();
+        let q = AssetQuery {
+            style_tags: vec!["industrial".into()],
+            ..AssetQuery::default()
+        };
+        let res = db.query(&q).unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].asset_id, "a1");
+    }
+
+    #[test]
+    fn query_combined_tag_filters_intersect() {
+        // Two `tags` and one `style_tags` predicate must AND: only
+        // rows that satisfy **all** subclauses return. Pins the
+        // bot-flagged contract on `AssetListQuery::tags` /
+        // `style_tags`.
+        let mut db = AssetDatabase::open_in_memory().unwrap();
+        let chain = LodChain::from_ratios(1000, &[]);
+        let mut a = sample("a1");
+        a.tags = vec!["sofa".into(), "furniture".into()];
+        a.style_tags = vec!["scandinavian".into()];
+        let mut b = sample("a2");
+        b.tags = vec!["sofa".into()];
+        b.style_tags = vec!["industrial".into()];
+        let mut c = sample("a3");
+        c.tags = vec!["chair".into(), "furniture".into()];
+        c.style_tags = vec!["scandinavian".into()];
+        db.upsert_metadata(&a, &chain).unwrap();
+        db.upsert_metadata(&b, &chain).unwrap();
+        db.upsert_metadata(&c, &chain).unwrap();
+        let q = AssetQuery {
+            tags: vec!["sofa".into(), "furniture".into()],
+            style_tags: vec!["scandinavian".into()],
             ..AssetQuery::default()
         };
         let res = db.query(&q).unwrap();

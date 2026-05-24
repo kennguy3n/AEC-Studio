@@ -1006,6 +1006,15 @@ interface NativeApi {
   bim_validate(ifc_path: string): unknown;
   bim_diff(before_path: string, after_path: string): unknown;
   bim_generate_schedule(ifc_path: string, kind: string, out_path: string): unknown;
+  // Asset library wired in PR-U. The napi side narrows the loosely-
+  // typed `Record<string, unknown>` query to the four documented
+  // fields; unknown extra keys are silently dropped by napi-rs.
+  design_list_assets(query: {
+    search?: string;
+    tags?: string[];
+    styleTags?: string[];
+    limit?: number;
+  }): unknown;
 }
 
 /**
@@ -1076,6 +1085,12 @@ export const NATIVE_WIRED_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   "bimValidate",
   "bimDiff",
   "bimGenerateSchedule",
+  // Asset library wired in PR-U. `designListAssets` routes through
+  // a real `aec_assets::AssetDatabase` (`<state_dir>/asset_library/
+  // assets.sqlite`) with first-open seeding of the 4 demo assets the
+  // in-process fallback used to ship, so dev/prod browsing renders
+  // identical cards. See `crates/aec_bridge/src/asset_state.rs`.
+  "designListAssets",
 ];
 
 /**
@@ -1096,7 +1111,6 @@ export const NATIVE_FALLBACK_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   "designPaintMaterial",
   "designSetLighting",
   "designSaveCamera",
-  "designListAssets",
   "draftDrawPrimitive",
   "draftEditTool",
   "draftCreateSheet",
@@ -1302,6 +1316,23 @@ function adaptNative(n: NativeApi): BridgeBackend {
         params.kind,
         params.outPath,
       ) as BimScheduleSummary,
+    // PR-U: asset library backed by `aec_assets::AssetDatabase`.
+    // `query` is `Record<string, unknown>` on the BridgeBackend
+    // interface so the renderer can pass arbitrary extra filter
+    // shapes; on the napi side we narrow it to the four documented
+    // fields (`search`, `tags`, `styleTags`, `limit`) and pass the
+    // rest through opaquely (the napi struct silently ignores
+    // unknown fields). Anything else stays in the renderer-side
+    // filter path for forward-compat.
+    designListAssets: async (query) =>
+      n.design_list_assets({
+        search: typeof query.search === "string" ? (query.search as string) : undefined,
+        tags: Array.isArray(query.tags) ? (query.tags as string[]) : undefined,
+        styleTags: Array.isArray(query.styleTags)
+          ? (query.styleTags as string[])
+          : undefined,
+        limit: typeof query.limit === "number" ? (query.limit as number) : undefined,
+      }) as AssetSummary[],
   };
   // Self-check 0: the two catalogues must be *disjoint*. A method
   // listed in both `NATIVE_WIRED_METHODS` and `NATIVE_FALLBACK_METHODS`
