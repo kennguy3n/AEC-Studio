@@ -33,6 +33,9 @@ use thiserror::Error;
 use aec_core::types::EntityId;
 
 use crate::classification::{ClassificationSource, ClassificationStore, IfcClass};
+use crate::materials::{
+    Material, MaterialAssignment, MaterialLayer, MaterialLayerSet, MaterialStore,
+};
 use crate::properties::{PropertySet, PropertyStore, PropertyValue, QuantitySet};
 use crate::spatial::Project;
 
@@ -96,6 +99,20 @@ impl IfcSchema {
     }
 }
 
+/// `Display` renders the canonical STEP token — `"IFC2X3"`, `"IFC4"`,
+/// `"IFC4X3"`. This is the load-bearing contract that downstream
+/// consumers (the bridge `BimImportSummary`, the renderer's "Import
+/// BIM" panel) match on, so it cannot drift with enum-variant
+/// renaming. Use this in `format!("{}")` over `format!("{:?}")` —
+/// the `Debug` form would render the Rust variant name (`"Ifc4"`)
+/// which is convenient for logs but a fragile contract for any
+/// non-debug caller.
+impl std::fmt::Display for IfcSchema {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_step_literal())
+    }
+}
+
 /// Lightweight stats returned alongside the snapshot, useful for
 /// assertions in roundtrip tests.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -106,6 +123,13 @@ pub struct IfcReadStats {
     pub qsets: usize,
     pub aggregations: usize,
     pub containments: usize,
+    /// `IfcMaterial` instances recovered from the file.
+    pub materials: usize,
+    /// `IfcMaterialLayerSet` instances recovered.
+    pub material_layer_sets: usize,
+    /// `IfcRelAssociatesMaterial` element-to-material bindings
+    /// recovered.
+    pub material_assignments: usize,
     /// Number of `#N = TYPE(...)` entity instances the tokenizer
     /// observed before the modeled-entity filter. Useful as a
     /// sanity-check when feeding an external IFC file: the value
@@ -124,6 +148,12 @@ pub struct IfcSnapshot {
     pub project: Project,
     pub classification: ClassificationStore,
     pub properties: PropertyStore,
+    /// Material library — `IfcMaterial` definitions, layer-set
+    /// composites, and per-element `IfcRelAssociatesMaterial`
+    /// bindings recovered from the file. Empty when the source IFC
+    /// carried no material entities (rare in practice — most
+    /// authoring tools emit them by default).
+    pub materials: MaterialStore,
     /// GUID per spatial node (Project/Site/Building/Storey/Space) and
     /// per building element, keyed on the original `EntityId`.
     pub guid_by_entity: HashMap<EntityId, String>,
@@ -166,6 +196,25 @@ impl IfcReader {
         let mut qsets: HashMap<u32, QsetRow> = HashMap::new();
         let mut prop_values: HashMap<u32, PropRow> = HashMap::new();
         let mut qty_values: HashMap<u32, QtyRow> = HashMap::new();
+        // Material library — three index tables resolved together in
+        // the second pass. `materials_step` keys on the STEP id
+        // returning the material name (the load-bearing identity);
+        // `material_layers_step` returns the parent material name +
+        // thickness so a layer-set can rebuild the ordered layer
+        // stack; `material_layer_sets_step` returns the
+        // `MaterialLayerSet` keyed by STEP id, populated *after*
+        // the second pass resolves layer refs.
+        let mut materials_step: HashMap<u32, Material> = HashMap::new();
+        let mut material_layers_step: HashMap<u32, MaterialLayer> = HashMap::new();
+        let mut material_layer_sets_step: HashMap<u32, (String, Option<String>, Vec<u32>)> =
+            HashMap::new();
+        // `IfcMaterialLayerSetUsage` indirection: maps a usage STEP id to
+        // the underlying `IfcMaterialLayerSet` STEP id. Revit and ArchiCAD
+        // bind walls / slabs / roofs to layer-sets through this wrapper
+        // (carrying orientation + offset metadata), so an
+        // `IfcRelAssociatesMaterial` whose `RelatingMaterial` is a usage
+        // must be followed one hop to reach the real set.
+        let mut material_layer_set_usage_step: HashMap<u32, u32> = HashMap::new();
 
         for g in &groups {
             match g.kind.as_str() {
@@ -243,8 +292,121 @@ impl IfcReader {
                 }
                 "IFCRELAGGREGATES"
                 | "IFCRELCONTAINEDINSPATIALSTRUCTURE"
-                | "IFCRELDEFINESBYPROPERTIES" => {
+                | "IFCRELDEFINESBYPROPERTIES"
+                | "IFCRELASSOCIATESMATERIAL" => {
                     // Handled in the second pass.
+                }
+                "IFCMATERIAL" => {
+                    // IFC4 form: IFCMATERIAL('Name','Description','Category')
+                    // IFC2x3 form: IFCMATERIAL('Name') — accept either by
+                    // positional argument count.
+                    let name = g.string_arg(0)?;
+                    let description = optional_string_arg(g, 1)?;
+                    let category = optional_string_arg(g, 2)?;
+                    if !name.is_empty() {
+                        materials_step.insert(
+                            g.step_id,
+                            Material {
+                                name,
+                                description,
+                                category,
+                            },
+                        );
+                    }
+                }
+                "IFCMATERIALLAYER" => {
+                    // IFC4 form:
+                    //   IFCMATERIALLAYER(#Material, LayerThickness,
+                    //                    IsVentilated, 'Name',
+                    //                    'Description', 'Category',
+                    //                    Priority)
+                    // IFC2x3 form (3-arg):
+                    //   IFCMATERIALLAYER(#Material, LayerThickness, IsVentilated)
+                    //
+                    // `Material` is declared `OPTIONAL IfcMaterial` —
+                    // a `$` literal represents an air-gap layer
+                    // (legitimate in real-world Revit / ArchiCAD wall
+                    // assemblies). Hard-failing on `$` would refuse
+                    // the whole file, violating the tolerate-and-skip
+                    // contract. We drop the layer entirely when the
+                    // ref is absent — the sentinel resolves to no
+                    // material on stage-2, so emitting it would just
+                    // be filtered there anyway, and dropping here
+                    // avoids a `__ref:0` ghost-id collision risk.
+                    let Some(material_ref) = optional_ref_arg(g, 0)? else {
+                        continue;
+                    };
+                    let thickness = g
+                        .args
+                        .get(1)
+                        .and_then(|a| parse_step_real(a))
+                        .ok_or_else(|| Self::malformed(g, "expected LayerThickness real"))?;
+                    let is_ventilated = parse_optional_bool(g.args.get(2).map(String::as_str));
+                    let name = optional_string_arg(g, 3)?;
+                    let description = optional_string_arg(g, 4)?;
+                    let category = optional_string_arg(g, 5)?;
+                    let priority = g.args.get(6).and_then(|a| {
+                        if a == "$" {
+                            None
+                        } else {
+                            a.parse::<i32>().ok()
+                        }
+                    });
+                    // Stash the material ref as a sentinel name; the
+                    // second pass replaces it with the resolved name.
+                    let sentinel_material_name = format!("__ref:{material_ref}");
+                    material_layers_step.insert(
+                        g.step_id,
+                        MaterialLayer {
+                            material_name: sentinel_material_name,
+                            thickness_m: thickness,
+                            is_ventilated,
+                            name,
+                            description,
+                            category,
+                            priority,
+                        },
+                    );
+                }
+                "IFCMATERIALLAYERSET" => {
+                    // IFCMATERIALLAYERSET((#L1,#L2,...), 'Name', 'Description')
+                    //
+                    // `LayerSetName` is declared `OPTIONAL IfcLabel`
+                    // — IfcOpenShell / Tekla / scripted exporters
+                    // commonly emit `$` here, and hard-rejecting it
+                    // would refuse the whole file. Skip the layer-set
+                    // when the name is absent / empty because the
+                    // downstream `MaterialAssignment::LayerSet(String)`
+                    // representation in `MaterialStore` is keyed by
+                    // name — an unnameable set has no addressable
+                    // identity and can't be re-bound to elements.
+                    let layer_refs = g.ref_list_arg(0)?;
+                    let name = optional_string_arg(g, 1)?;
+                    let description = optional_string_arg(g, 2)?;
+                    if let Some(name) = name.filter(|n| !n.is_empty()) {
+                        material_layer_sets_step.insert(g.step_id, (name, description, layer_refs));
+                    }
+                }
+                "IFCMATERIALLAYERSETUSAGE" => {
+                    // IFC4 form:
+                    //   IFCMATERIALLAYERSETUSAGE(#ForLayerSet,
+                    //                            LayerSetDirection,
+                    //                            DirectionSense,
+                    //                            OffsetFromReferenceLine,
+                    //                            ReferenceExtent)
+                    //
+                    // Orientation / offset metadata is intentionally
+                    // dropped here — AEC Studio's project graph stores
+                    // material assignments without per-wall layer
+                    // direction (the LayerSetDirection / DirectionSense
+                    // fields are reconstructed on export from element
+                    // geometry). What we DO need is the `ForLayerSet`
+                    // ref so a downstream `IfcRelAssociatesMaterial`
+                    // pointing at this usage can be followed through to
+                    // the underlying `IfcMaterialLayerSet`.
+                    if let Ok(layer_set_ref) = g.ref_arg(0) {
+                        material_layer_set_usage_step.insert(g.step_id, layer_set_ref);
+                    }
                 }
                 other => {
                     // Anything else with a 9-field shape and a
@@ -311,6 +473,8 @@ impl IfcReader {
         let mut agg: Vec<(u32, Vec<u32>)> = Vec::new();
         let mut contains: Vec<(u32, Vec<u32>)> = Vec::new();
         let mut defines_pset: Vec<(Vec<u32>, u32)> = Vec::new();
+        // IFCRELASSOCIATESMATERIAL(GUID,#owner,$,$,(#elems…),#material_or_set)
+        let mut associates_material: Vec<(Vec<u32>, u32)> = Vec::new();
         for g in &groups {
             match g.kind.as_str() {
                 "IFCRELAGGREGATES" => {
@@ -327,6 +491,11 @@ impl IfcReader {
                     let elems = g.ref_list_arg(4)?;
                     let pset_ref = g.ref_arg(5)?;
                     defines_pset.push((elems, pset_ref));
+                }
+                "IFCRELASSOCIATESMATERIAL" => {
+                    let elems = g.ref_list_arg(4)?;
+                    let mat_ref = g.ref_arg(5)?;
+                    associates_material.push((elems, mat_ref));
                 }
                 _ => {}
             }
@@ -495,6 +664,107 @@ impl IfcReader {
             }
         }
 
+        // ---- Rebuild MaterialStore ----
+        //
+        // Materials populate `MaterialStore` in two stages:
+        //   1. Insert each `IfcMaterial` definition keyed on its
+        //      load-bearing `Name`.
+        //   2. Resolve every `IfcMaterialLayerSet`'s ordered layer
+        //      references by walking back through the
+        //      `IfcMaterialLayer` table, replacing the per-layer
+        //      `__ref:<step_id>` sentinel material-name with the
+        //      real `IfcMaterial.Name` pulled from the resolved
+        //      material STEP id. A layer whose material ref points
+        //      at an unmodeled / unknown row is silently dropped from
+        //      the layer set — same tolerate-and-skip discipline
+        //      that `IfcRelDefinesByProperties` uses for unknown
+        //      pset targets.
+        //   3. Walk each `IfcRelAssociatesMaterial` row and bind the
+        //      named material (single) or layer-set (composite) to
+        //      every referenced element.
+        let mut materials_store = MaterialStore::new();
+        // Stage 1: materials
+        for mat in materials_step.values() {
+            materials_store.upsert_material(mat.clone());
+        }
+        // Stage 2: layer sets
+        for (set_name, set_description, layer_refs) in material_layer_sets_step.values() {
+            let mut set = MaterialLayerSet::new(set_name.clone());
+            set.description.clone_from(set_description);
+            for layer_step in layer_refs {
+                let Some(layer) = material_layers_step.get(layer_step) else {
+                    continue;
+                };
+                // Resolve the layer's "__ref:<step>" sentinel back to
+                // the real material name.
+                let sentinel = &layer.material_name;
+                let resolved_name = sentinel
+                    .strip_prefix("__ref:")
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .and_then(|step| materials_step.get(&step))
+                    .map(|m| m.name.clone());
+                let Some(resolved_name) = resolved_name else {
+                    continue;
+                };
+                let mut resolved = layer.clone();
+                resolved.material_name = resolved_name;
+                set.layers.push(resolved);
+            }
+            // Symmetric to the writer at writer.rs ≈490 — IFC4
+            // `IfcMaterialLayerSet.MaterialLayers` is `LIST [1:?]`,
+            // so an empty layer-set is structurally invalid. Skip
+            // the upsert to keep the in-memory `MaterialStore`
+            // schema-conformant for downstream consumers (BoQ,
+            // drawing generation) that might not anticipate it.
+            if set.layers.is_empty() {
+                continue;
+            }
+            materials_store.upsert_layer_set(set);
+        }
+        // Stage 3: assignments
+        //
+        // `IfcRelAssociatesMaterial.RelatingMaterial` is a select that
+        // can target an `IfcMaterial`, an `IfcMaterialLayerSet`, an
+        // `IfcMaterialLayerSetUsage` (the Revit / ArchiCAD case),
+        // an `IfcMaterialProfileSet`, or an `IfcMaterialConstituentSet`.
+        // We resolve the first three; the last two fall through the
+        // tolerate-and-skip path per the module contract.
+        let mut material_assignment_count = 0usize;
+        for (elem_steps, mat_ref) in &associates_material {
+            // Hop through `IfcMaterialLayerSetUsage` to its `ForLayerSet`
+            // ref before any other lookup. Real-world exports almost
+            // always go through the usage indirection.
+            let effective_ref = material_layer_set_usage_step
+                .get(mat_ref)
+                .copied()
+                .unwrap_or(*mat_ref);
+            let assignment_opt = if let Some(mat) = materials_step.get(&effective_ref) {
+                Some(MaterialAssignment::Single(mat.name.clone()))
+            } else if let Some((set_name, _, _)) = material_layer_sets_step.get(&effective_ref) {
+                Some(MaterialAssignment::LayerSet(set_name.clone()))
+            } else {
+                None
+            };
+            let Some(assignment) = assignment_opt else {
+                // Unmodeled material reference (e.g.
+                // `IfcMaterialProfileSet` / `IfcMaterialConstituentSet`
+                // — not yet handled). Skip per the tolerate-and-skip
+                // contract.
+                continue;
+            };
+            for elem_step in elem_steps {
+                let entity_opt = elements
+                    .get(elem_step)
+                    .map(|el| el.entity.clone())
+                    .or_else(|| spatial.get(elem_step).map(|sp| sp.entity.clone()));
+                if let Some(entity) = entity_opt {
+                    if materials_store.assign_to_element(entity, assignment.clone()) {
+                        material_assignment_count += 1;
+                    }
+                }
+            }
+        }
+
         // ---- Build GUID map ----
         let mut guid_by_entity: HashMap<EntityId, String> = HashMap::new();
         for row in spatial.values() {
@@ -513,6 +783,9 @@ impl IfcReader {
             qsets: qset_count,
             aggregations,
             containments,
+            materials: materials_store.material_count(),
+            material_layer_sets: materials_store.layer_set_count(),
+            material_assignments: material_assignment_count,
             records_seen: groups.len(),
         };
 
@@ -523,6 +796,7 @@ impl IfcReader {
             project,
             classification,
             properties: props,
+            materials: materials_store,
             guid_by_entity,
             element_parent,
             schema,
@@ -1462,6 +1736,82 @@ pub(crate) fn parse_step_real(s: &str) -> Option<f64> {
 fn parse_int(s: &str) -> IfcReadResult<i64> {
     s.parse::<i64>()
         .map_err(|e| IfcReadError::Malformed(format!("int parse: {e}")))
+}
+
+/// Decode a single-quoted string argument at `idx`, returning `None`
+/// when the slot holds the STEP "no value" sentinel `$`. Used by the
+/// material reader for `Description` / `Category` slots that authoring
+/// tools commonly leave empty.
+///
+/// Distinct from [`StepRecord::string_arg`] which hard-rejects `$`.
+/// IFC4 optional string fields (`IfcMaterial.Description`,
+/// `IfcMaterial.Category`, etc.) are routinely emitted as `$` so the
+/// reader must treat them as `Option`, not an error.
+fn optional_string_arg(g: &StepRecord, idx: usize) -> IfcReadResult<Option<String>> {
+    let Some(raw) = g.args.get(idx) else {
+        return Ok(None);
+    };
+    let s = raw.trim();
+    if s == "$" || s.is_empty() {
+        return Ok(None);
+    }
+    if !(s.starts_with('\'') && s.ends_with('\'')) {
+        return Err(IfcReadError::Malformed(format!(
+            "expected quoted string at arg {idx} of {} but got '{s}'",
+            g.kind
+        )));
+    }
+    Ok(Some(unescape_step_string(&s[1..s.len() - 1])))
+}
+
+/// Decode an entity reference (`#N`) argument at `idx`, returning
+/// `None` when the slot holds the STEP "no value" sentinel `$` (or
+/// the arg is absent entirely). Used by the material reader for
+/// optional ref slots — IFC4 declares both
+/// `IfcMaterialLayer.Material` and (via select promotion) several
+/// `IfcRelAssociatesMaterial.RelatingMaterial` paths as carrying
+/// genuinely optional STEP refs that real-world authoring tools
+/// emit as `$` when a layer is e.g. an air gap.
+///
+/// Distinct from [`StepRecord::ref_arg`] which hard-rejects `$` and
+/// is correct for `MANDATORY` ref slots (`IfcOwnerHistory`,
+/// `IfcRelAssociates.RelatingProcess`, etc.).
+fn optional_ref_arg(g: &StepRecord, idx: usize) -> IfcReadResult<Option<u32>> {
+    let Some(raw) = g.args.get(idx) else {
+        return Ok(None);
+    };
+    let s = raw.trim();
+    if s == "$" || s.is_empty() {
+        return Ok(None);
+    }
+    if !s.starts_with('#') {
+        return Err(IfcReadError::Malformed(format!(
+            "expected #N reference at arg {idx} of {} but got '{s}'",
+            g.kind
+        )));
+    }
+    let id: u32 = s[1..].parse().map_err(|_| {
+        IfcReadError::Malformed(format!(
+            "expected #<u32> at arg {idx} of {} but got '{s}'",
+            g.kind
+        ))
+    })?;
+    Ok(Some(id))
+}
+
+/// Decode an IFC LOGICAL field (`.T.` / `.F.` / `.U.` / `$`).
+///
+/// Returns `Some(true)`/`Some(false)` for `.T.`/`.F.`, and `None` for
+/// `.U.` (UNKNOWN — IFC4 `IfcLogical` distinguishes this from
+/// `IfcBoolean`) or absent (`$`). Used for
+/// `IfcMaterialLayer.IsVentilated`.
+fn parse_optional_bool(raw: Option<&str>) -> Option<bool> {
+    let s = raw?.trim();
+    match s {
+        ".T." | ".TRUE." => Some(true),
+        ".F." | ".FALSE." => Some(false),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -2635,6 +2985,30 @@ END-ISO-10303-21;\n"
             let snap = IfcReader::from_string(&body).expect("IFC4x3 token parses");
             assert_eq!(snap.schema, IfcSchema::Ifc4x3, "token = {token}");
         }
+    }
+
+    /// Pin every `IfcSchema` variant's wire-format token to its
+    /// canonical STEP literal. The `BimImportSummary.schema` field
+    /// (and the TS renderer that match on it) consume the output of
+    /// `Display` / `as_step_literal`, NOT the result of an IFC
+    /// round-trip — so a drift here (e.g. someone changing
+    /// `IfcSchema::Ifc4 => "IFC4"` to `=> "Ifc4"`) would slip past
+    /// the existing round-trip tests (`from_step_literal`
+    /// case-folds on input) yet silently break the renderer's
+    /// match. The exhaustive `match` in `as_step_literal` catches
+    /// missing variants at compile time; this test catches token
+    /// string drift at test time.
+    #[test]
+    fn as_step_literal_pins_canonical_tokens() {
+        assert_eq!(IfcSchema::Ifc2x3.as_step_literal(), "IFC2X3");
+        assert_eq!(IfcSchema::Ifc4.as_step_literal(), "IFC4");
+        assert_eq!(IfcSchema::Ifc4x3.as_step_literal(), "IFC4X3");
+        // `Display` MUST agree with `as_step_literal` — the service
+        // layer's `snapshot.schema.to_string()` goes through `Display`
+        // not `as_step_literal` directly.
+        assert_eq!(IfcSchema::Ifc2x3.to_string(), "IFC2X3");
+        assert_eq!(IfcSchema::Ifc4.to_string(), "IFC4");
+        assert_eq!(IfcSchema::Ifc4x3.to_string(), "IFC4X3");
     }
 
     /// `FILE_SCHEMA(('IFCXX'))` for an unknown schema literal must

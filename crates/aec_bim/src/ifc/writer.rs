@@ -22,7 +22,7 @@
 //!     deterministically derived from the `EntityId` via
 //!     [`super::compress_entity_id_to_guid`]).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 
 use thiserror::Error;
@@ -30,6 +30,7 @@ use thiserror::Error;
 use aec_core::types::EntityId;
 
 use crate::classification::{ClassificationStore, IfcClass};
+use crate::materials::{MaterialAssignment, MaterialStore};
 use crate::properties::{PropertyStore, PropertyValue};
 use crate::spatial::Project;
 
@@ -70,10 +71,41 @@ impl StepBuf {
 }
 
 impl IfcWriter {
+    /// Serialise the project + classification + property graph to an
+    /// IFC4 STEP byte stream. The material library is omitted — use
+    /// [`IfcWriter::to_string_with_materials`] when the caller wants
+    /// `IfcMaterial` / `IfcMaterialLayerSet` / `IfcRelAssociatesMaterial`
+    /// records in the output. This 3-arg entry stays exactly as-is
+    /// for the test suite and existing call-sites that don't care
+    /// about materials.
     pub fn to_string(
         project: &Project,
         classification: &ClassificationStore,
         properties: &PropertyStore,
+    ) -> String {
+        Self::to_string_with_materials(
+            project,
+            classification,
+            properties,
+            &MaterialStore::default(),
+        )
+    }
+
+    /// Serialise project + classification + properties + materials
+    /// to an IFC4 STEP byte stream.
+    ///
+    /// Materials are emitted in dependency order so the STEP cross-
+    /// reference graph is satisfiable on a single forward pass:
+    /// `IfcMaterial` → `IfcMaterialLayer` → `IfcMaterialLayerSet`
+    /// → `IfcRelAssociatesMaterial`. Element step ids are pulled
+    /// from the same `element_step` map that already drives Pset
+    /// rels, so the rel target list always references previously-
+    /// emitted entities.
+    pub fn to_string_with_materials(
+        project: &Project,
+        classification: &ClassificationStore,
+        properties: &PropertyStore,
+        materials: &MaterialStore,
     ) -> String {
         let mut buf = StepBuf::new();
 
@@ -397,17 +429,195 @@ DATA;\n";
             }
         }
 
+        // ---- Material library + IFCRELASSOCIATESMATERIAL ----
+        //
+        // Skip the whole section when the store is empty so the 3-arg
+        // `to_string` path produces byte-identical output to the
+        // pre-materials writer (and existing golden / regression tests
+        // stay passing).
+        if !materials.is_empty() {
+            // Emit each `IfcMaterial` first so layer-set layers and
+            // direct assignments can reference them.
+            let mut material_step: HashMap<String, u32> = HashMap::new();
+            for (name, mat) in materials.materials() {
+                let step = buf.alloc();
+                material_step.insert(name.clone(), step);
+                let desc = step_optional_quoted(mat.description.as_deref());
+                let cat = step_optional_quoted(mat.category.as_deref());
+                buf.write_line(
+                    step,
+                    format!(
+                        "IFCMATERIAL('{name}',{desc},{cat})",
+                        name = escape_step_string(name),
+                    ),
+                );
+            }
+            // For each layer-set, emit all layers, then the set.
+            // The same `Material` can be referenced from multiple
+            // layers — the writer simply reuses the step id from the
+            // `material_step` map. A layer whose `material_name`
+            // doesn't resolve in the store is silently skipped
+            // (matches the reader's tolerate-and-skip discipline).
+            let mut layer_set_step: HashMap<String, u32> = HashMap::new();
+            for (set_name, set) in materials.layer_sets() {
+                let mut layer_step_ids: Vec<u32> = Vec::with_capacity(set.layers.len());
+                for layer in &set.layers {
+                    let Some(mat_step) = material_step.get(&layer.material_name) else {
+                        continue;
+                    };
+                    let lid = buf.alloc();
+                    layer_step_ids.push(lid);
+                    let vent = match layer.is_ventilated {
+                        Some(true) => ".T.",
+                        Some(false) => ".F.",
+                        None => ".U.",
+                    };
+                    let name_lit = step_optional_quoted(layer.name.as_deref());
+                    let desc_lit = step_optional_quoted(layer.description.as_deref());
+                    let cat_lit = step_optional_quoted(layer.category.as_deref());
+                    let prio_lit = layer
+                        .priority
+                        .map_or_else(|| "$".to_string(), |p| p.to_string());
+                    buf.write_line(
+                        lid,
+                        format!(
+                            "IFCMATERIALLAYER(#{mat},{thickness},{vent},{name_lit},{desc_lit},{cat_lit},{prio_lit})",
+                            mat = mat_step,
+                            thickness = format_real(layer.thickness_m),
+                        ),
+                    );
+                }
+                // IFC4 `IfcMaterialLayerSet.MaterialLayers` is
+                // `LIST [1:?]` — emitting a set with zero resolved
+                // layers would produce a schema-invalid `(())` literal.
+                // Drop the set entirely: any `MaterialAssignment::LayerSet`
+                // bound to this name will then cascade into the
+                // tolerate-and-skip path below.
+                if layer_step_ids.is_empty() {
+                    continue;
+                }
+                let sid = buf.alloc();
+                layer_set_step.insert(set_name.clone(), sid);
+                let desc_lit = step_optional_quoted(set.description.as_deref());
+                buf.write_line(
+                    sid,
+                    format!(
+                        "IFCMATERIALLAYERSET(({layers}),'{name}',{desc_lit})",
+                        layers = layer_step_ids
+                            .iter()
+                            .map(|p| format!("#{p}"))
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        name = escape_step_string(set_name),
+                    ),
+                );
+            }
+            // Group element ↔ material bindings by the material /
+            // layer-set side so we emit one `IfcRelAssociatesMaterial`
+            // per material with a list of associated elements (rather
+            // than one rel per element). This mirrors how authoring
+            // tools (Revit, ArchiCAD) emit the relation and keeps the
+            // STEP file small.
+            //
+            // BTreeMap so iteration is deterministic (alphabetical
+            // by material name) — matters for the byte-identical
+            // round-trip guarantee.
+            let mut by_material: BTreeMap<(bool, String), Vec<u32>> = BTreeMap::new();
+            for (entity, assignment) in materials.assignments() {
+                // Per IFC4 schema, `IfcRelAssociatesMaterial.RelatedObjects`
+                // is `SET[1:?] OF IfcObjectDefinition` — same supertype
+                // that `IfcRelDefinesByProperties.RelatedObjects` uses
+                // (see Pset path at line ~336). Both element subtypes
+                // and spatial-structure subtypes (`IfcSpace`,
+                // `IfcBuildingStorey`, …) can carry a material binding;
+                // notably a `Pset_SpaceCommon`-tagged `IfcSpace` can
+                // own an `IfcMaterial` for the dominant floor finish.
+                // The reader already accepts both element_step and
+                // spatial_step targets — the writer must mirror that or
+                // round-tripping a Revit / ArchiCAD-authored file
+                // silently drops space ↔ material bindings.
+                let Some(elem_step) = element_step
+                    .get(entity)
+                    .or_else(|| spatial_step.get(entity))
+                else {
+                    continue;
+                };
+                let key = match assignment {
+                    MaterialAssignment::Single(name) => (false, name.clone()),
+                    MaterialAssignment::LayerSet(name) => (true, name.clone()),
+                };
+                by_material.entry(key).or_default().push(*elem_step);
+            }
+            for ((is_layer_set, name), elem_steps) in by_material {
+                let mat_ref = if is_layer_set {
+                    layer_set_step.get(&name).copied()
+                } else {
+                    material_step.get(&name).copied()
+                };
+                let Some(mat_ref) = mat_ref else {
+                    continue;
+                };
+                let rel = buf.alloc();
+                let rel_guid = derive_guid_from_str(&format!(
+                    "rel-mat::{kind}::{name}",
+                    kind = if is_layer_set { "set" } else { "single" },
+                ));
+                buf.write_line(
+                    rel,
+                    format!(
+                        "IFCRELASSOCIATESMATERIAL('{rel_guid}',#{owner},$,$,({elems}),#{mat})",
+                        owner = owner_history,
+                        elems = elem_steps
+                            .iter()
+                            .map(|p| format!("#{p}"))
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        mat = mat_ref,
+                    ),
+                );
+            }
+        }
+
         buf.inner.extend_from_slice(b"ENDSEC;\nEND-ISO-10303-21;\n");
         String::from_utf8(buf.inner).expect("IFC writer emits ASCII only")
     }
 
+    /// Stream the project + classification + property graph to a
+    /// `Write` sink. Materials are omitted — see
+    /// [`IfcWriter::write_with_materials`] for the 5-arg streaming
+    /// counterpart.
+    ///
+    /// The 4-arg signature stays as-is for existing callers (asset
+    /// export, journey tests). New code that needs material data in
+    /// the output should use `write_with_materials`.
     pub fn write<W: Write>(
         w: &mut W,
         project: &Project,
         classification: &ClassificationStore,
         properties: &PropertyStore,
     ) -> Result<(), IfcWriteError> {
-        let s = Self::to_string(project, classification, properties);
+        Self::write_with_materials(
+            w,
+            project,
+            classification,
+            properties,
+            &MaterialStore::default(),
+        )
+    }
+
+    /// Stream the project + classification + property + material
+    /// library to a `Write` sink. Symmetric to
+    /// [`IfcWriter::to_string_with_materials`] but emits to a
+    /// `Write` sink rather than materialising the full STEP body in
+    /// memory.
+    pub fn write_with_materials<W: Write>(
+        w: &mut W,
+        project: &Project,
+        classification: &ClassificationStore,
+        properties: &PropertyStore,
+        materials: &MaterialStore,
+    ) -> Result<(), IfcWriteError> {
+        let s = Self::to_string_with_materials(project, classification, properties, materials);
         w.write_all(s.as_bytes())?;
         Ok(())
     }
@@ -613,6 +823,17 @@ fn serialize_quantity_value(v: &PropertyValue) -> (String, String) {
         // as IfcQuantityCount(0) so the file still parses.
         _ => ("0".into(), "IFCQUANTITYCOUNT".to_string()),
     }
+}
+
+/// Render an optional UTF-8 string as a STEP literal. `None` →
+/// `"$"` (the IFC sentinel for "value omitted"); `Some(s)` →
+/// `"'…escaped…'"` so embedded quotes / backslashes stay
+/// well-formed.
+fn step_optional_quoted(s: Option<&str>) -> String {
+    s.map_or_else(
+        || "$".to_string(),
+        |t| format!("'{}'", escape_step_string(t)),
+    )
 }
 
 fn format_real(x: f64) -> String {

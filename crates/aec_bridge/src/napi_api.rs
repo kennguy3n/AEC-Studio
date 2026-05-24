@@ -283,6 +283,62 @@ pub fn project_audit_sync(path: String) -> Result<u32> {
     with_service(|svc| svc.project_audit_sync(&path)).map(|n| n.min(u32::MAX as u64) as u32)
 }
 
+/// JS-facing parse-only IFC import summary. Mirrors the renderer's
+/// `BimImportSummary` interface in `apps/desktop/electron/bridge.ts`.
+///
+/// Numeric fields are sized as `u32` to match the renderer's status-pane
+/// formatting — no real-world IFC file produces > 4B entities of any
+/// individual kind, and overflow is saturating-clamped at `u32::MAX`
+/// for safety rather than panicking.
+#[napi(object)]
+pub struct BimImportSummaryJs {
+    pub path: String,
+    pub schema: String,
+    pub spatial_nodes: u32,
+    pub elements: u32,
+    pub psets: u32,
+    pub qsets: u32,
+    pub aggregations: u32,
+    pub containments: u32,
+    pub materials: u32,
+    pub material_layer_sets: u32,
+    pub material_assignments: u32,
+    pub records_seen: u32,
+}
+
+impl From<crate::service::BimImportSummary> for BimImportSummaryJs {
+    fn from(r: crate::service::BimImportSummary) -> Self {
+        let clamp = |n: u64| n.min(u32::MAX as u64) as u32;
+        Self {
+            path: r.path,
+            schema: r.schema,
+            spatial_nodes: clamp(r.spatial_nodes),
+            elements: clamp(r.elements),
+            psets: clamp(r.psets),
+            qsets: clamp(r.qsets),
+            aggregations: clamp(r.aggregations),
+            containments: clamp(r.containments),
+            materials: clamp(r.materials),
+            material_layer_sets: clamp(r.material_layer_sets),
+            material_assignments: clamp(r.material_assignments),
+            records_seen: clamp(r.records_seen),
+        }
+    }
+}
+
+/// Parse an `.ifc` file from disk and return a structured import
+/// summary. The renderer uses this for the "Import BIM" preview
+/// panel — the file is NOT yet folded into the active project
+/// (that's the `bim_attach_*` follow-up in PR-L).
+///
+/// Routed through `with_service_ref_fallible` (read-only) so a
+/// long IFC parse on a renderer worker thread doesn't block
+/// status polls.
+#[napi]
+pub fn bim_import_ifc(path: String) -> Result<BimImportSummaryJs> {
+    with_service_ref_fallible(|svc| svc.bim_import_ifc(&path)).map(Into::into)
+}
+
 /// JS-facing CPU descriptor. Mirrors `RuntimeStatus["cpu"]` in
 /// `apps/desktop/electron/bridge.ts`.
 #[napi(object)]

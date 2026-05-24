@@ -33,6 +33,17 @@ pub enum BridgeServiceError {
     Audit(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// IFC (BIM) reader / writer failure. Carries the parser's own
+    /// error message verbatim so the renderer can show the user
+    /// which STEP entity / line failed.
+    #[error("bim: {0}")]
+    Bim(String),
+}
+
+impl From<aec_bim::ifc::IfcReadError> for BridgeServiceError {
+    fn from(e: aec_bim::ifc::IfcReadError) -> Self {
+        Self::Bim(e.to_string())
+    }
 }
 
 impl From<aec_audit::AuditError> for BridgeServiceError {
@@ -121,6 +132,48 @@ pub struct EngineStatusReport {
     /// `0` so the renderer can render the full set without a
     /// post-process step.
     pub audit_chain_by_scope: std::collections::BTreeMap<String, u64>,
+}
+
+/// Parse-only summary of a BIM (IFC) import. Returned by
+/// [`BridgeService::bim_import_ifc`] and rendered as a preview on
+/// the Import panel before the user commits the file into the
+/// active project.
+///
+/// Field naming matches the renderer's `BimImportSummary` TS
+/// interface 1:1 — drift here is a runtime bug surfacing as
+/// `undefined` on a status pane.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BimImportSummary {
+    /// Canonical absolute path to the IFC file (`std::fs::canonicalize`
+    /// applied to whatever the user pointed at). The TS renderer
+    /// displays this verbatim, and downstream consumers (the future
+    /// PR-L snapshot cache, dedup helpers) key on it — so callers can
+    /// trust the value is symlink-resolved and free of `./` / `..`
+    /// segments. On Windows the result is the verbatim `\\?\C:\...`
+    /// form per the platform's canonicalisation rules.
+    pub path: String,
+    /// IFC schema version recovered from `FILE_SCHEMA`, rendered
+    /// via the `IfcSchema` enum's `Display` impl — the canonical
+    /// STEP token (`"IFC2X3"` / `"IFC4"` / `"IFC4X3"`). The TS
+    /// `BimImportSummary` interface matches on these tokens, so do
+    /// NOT switch back to `format!("{:?}")` (which would leak the
+    /// Rust variant names `"Ifc4"` / `"Ifc2x3"` and break the
+    /// renderer's match).
+    pub schema: String,
+    pub spatial_nodes: u64,
+    pub elements: u64,
+    pub psets: u64,
+    pub qsets: u64,
+    pub aggregations: u64,
+    pub containments: u64,
+    /// `IfcMaterial` definitions recovered from the file.
+    pub materials: u64,
+    /// `IfcMaterialLayerSet` composites recovered.
+    pub material_layer_sets: u64,
+    /// `IfcRelAssociatesMaterial` element-to-material bindings.
+    pub material_assignments: u64,
+    /// Total STEP records the reader walked (records_seen).
+    pub records_seen: u64,
 }
 
 /// Hardware-status snapshot. The shape mirrors the TypeScript
@@ -483,6 +536,83 @@ impl BridgeService {
         })
     }
 
+    /// Read an `.ifc` file from disk and return a structured import
+    /// summary the renderer can show on its "Import BIM" panel.
+    ///
+    /// This is a *parse-only* operation: nothing is written into the
+    /// active project. The renderer uses the returned counts to render
+    /// a preview ("123 walls, 45 slabs, …"), and a follow-up
+    /// `bim_attach_*` call (PR-L) will actually fold the parsed model
+    /// into the project's authoring graph. Splitting the parse from
+    /// the attach keeps the parse path safely re-runnable on bad
+    /// files without polluting project state.
+    ///
+    /// **Schema support**: IFC2x3 and IFC4 (both base and `IFC4X3`
+    /// when found in `FILE_SCHEMA`; IFC4x3-specific entities still
+    /// flow through the tolerate-and-skip discipline). Material
+    /// library coverage includes `IfcMaterial`,
+    /// `IfcMaterialLayerSet`, and `IfcRelAssociatesMaterial`;
+    /// `IfcMaterialProfileSet` and `IfcMaterialConstituentSet` are
+    /// silently skipped per the module-level contract.
+    pub fn bim_import_ifc(&self, path: &str) -> Result<BimImportSummary, BridgeServiceError> {
+        // Defer `&self` to `&BridgeService` not `&mut` so this can
+        // run through `with_service_ref_fallible` alongside other
+        // read-only endpoints — IFC parsing is CPU-bound but doesn't
+        // touch project state, so it doesn't need exclusive access.
+        //
+        // ISO 10303-21 formally restricts STEP-21 files to ASCII,
+        // but real-world IFC exports — especially CJK-locale dumps
+        // from older ArchiCAD / Revit and IfcOpenShell-scripted
+        // pipelines — sometimes leak raw Windows-1252 or Shift-JIS
+        // bytes into `IfcLabel` / `IfcText` string literals. Reading
+        // through `read_to_string` would reject any such file with an
+        // `InvalidData` IO error before the parser ever runs, which
+        // makes the "Import BIM" panel useless for users with legacy
+        // files. Switch to a byte read + lossy UTF-8 decode: invalid
+        // sequences are replaced with U+FFFD (REPLACEMENT CHARACTER)
+        // inside the string literal so the structural STEP grammar
+        // (entity-type keywords, `#N` refs, `,` / `;` / `'`
+        // delimiters — all ASCII by spec) is preserved and the
+        // tolerate-and-skip parse path can proceed. The U+FFFD only
+        // surfaces in the user-visible string fields (material name,
+        // pset values), which is a strict improvement over outright
+        // failing the import.
+        let bytes = std::fs::read(Path::new(path))?;
+        let body = String::from_utf8_lossy(&bytes).into_owned();
+        // Canonicalise after the read succeeds so a non-existent path
+        // surfaces as the same `Io` error the read itself would have
+        // produced (rather than two different code paths for missing
+        // file). `cache_key` at line ≈249 follows the same pattern
+        // for the engine-status cache. The renderer-facing
+        // `BimImportSummary.path` field documents this canonical form
+        // so downstream consumers (PR-L snapshot cache, dedup) can
+        // trust it.
+        let canonical_path = std::fs::canonicalize(Path::new(path))?
+            .to_string_lossy()
+            .into_owned();
+        let snapshot = aec_bim::ifc::IfcReader::from_string(&body)?;
+        Ok(BimImportSummary {
+            path: canonical_path,
+            // `Display` returns the canonical STEP token
+            // (`"IFC2X3"` / `"IFC4"` / `"IFC4X3"`) — a stable
+            // contract for the renderer's "Import BIM" panel.
+            // The `Debug` form would render the Rust variant name
+            // (`"Ifc4"`), which is fragile against enum-variant
+            // renaming.
+            schema: snapshot.schema.to_string(),
+            spatial_nodes: snapshot.stats.spatial_nodes as u64,
+            elements: snapshot.stats.elements as u64,
+            psets: snapshot.stats.psets as u64,
+            qsets: snapshot.stats.qsets as u64,
+            aggregations: snapshot.stats.aggregations as u64,
+            containments: snapshot.stats.containments as u64,
+            materials: snapshot.stats.materials as u64,
+            material_layer_sets: snapshot.stats.material_layer_sets as u64,
+            material_assignments: snapshot.stats.material_assignments as u64,
+            records_seen: snapshot.stats.records_seen as u64,
+        })
+    }
+
     /// Return the recents list (most-recent first), in the API shape.
     pub fn project_list_recents(&self) -> Result<Vec<ProjectSummary>, BridgeServiceError> {
         Ok(self
@@ -823,6 +953,108 @@ mod tests {
             s.__engine_status_cache_len(),
             1,
             "canonicalisation must collapse non-canonical paths to the same cache entry"
+        );
+    }
+
+    #[test]
+    fn bim_import_ifc_tolerates_non_utf8_bytes() {
+        // ISO 10303-21 is formally ASCII, but real-world IFC exports
+        // — especially CJK-locale ArchiCAD / IfcOpenShell-scripted
+        // pipelines — sometimes carry raw Windows-1252 / Shift-JIS
+        // bytes inside `IfcLabel` / `IfcText` literals. `bim_import_ifc`
+        // must lossy-decode rather than refusing the file with an IO
+        // error: the STEP grammar (entity keywords, `#N` refs, `,` /
+        // `;` / `'` delimiters) is pure ASCII by spec, so the
+        // structural parse can still proceed.
+        let (s, _g) = service();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("non_utf8.ifc");
+
+        // Build a minimal valid IFC2x3 graph with a single non-UTF-8
+        // byte (0x9F, a Windows-1252 codepoint that is invalid UTF-8)
+        // embedded in the project name. `read_to_string` would reject
+        // this with `InvalidData`; `read` + `from_utf8_lossy` should
+        // accept it and surface U+FFFD in the project name.
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(
+            b"ISO-10303-21;\n\
+HEADER;\n\
+FILE_DESCRIPTION(('test'),'2;1');\n\
+FILE_NAME('t.ifc','2026-05-20T00:00:00',(''),(''),'','','');\n\
+FILE_SCHEMA(('IFC2X3'));\n\
+ENDSEC;\n\
+DATA;\n\
+#1 = IFCOWNERHISTORY($,$,$,.NOCHANGE.,$,$,$,1747699200);\n\
+#2 = IFCPROJECT('00000000000000000000a1',#1,'Latin1-",
+        );
+        body.push(0x9F);
+        body.extend_from_slice(
+            b"','P',$,$,$,$,$);\n\
+ENDSEC;\n\
+END-ISO-10303-21;\n",
+        );
+        std::fs::write(&path, &body).unwrap();
+
+        // Pre-fix this returned `Err(BridgeServiceError::Io(_))` on
+        // stable Rust because `String::from_utf8` rejects the 0x9F
+        // byte. Post-fix we get a real summary back.
+        let summary = s
+            .bim_import_ifc(path.to_str().unwrap())
+            .expect("non-UTF-8 IFC file must parse via lossy decode");
+        assert_eq!(summary.schema, "IFC2X3");
+        // The project entity parsed (spatial_nodes >= 1 means the
+        // structural parse survived the lossy-decoded byte).
+        assert!(summary.spatial_nodes >= 1);
+    }
+
+    #[test]
+    fn bim_import_ifc_returns_canonical_path() {
+        // The `BimImportSummary.path` doc commits to "Canonical
+        // absolute path" — verify the implementation honours that by
+        // pointing the importer at a non-canonical form (a `./`
+        // segment) and asserting the returned path matches
+        // `std::fs::canonicalize` on the same input. The future PR-L
+        // snapshot cache will key on this field, so the contract has
+        // to hold up.
+        let (s, _g) = service();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("canonical.ifc");
+        let body = b"ISO-10303-21;\n\
+HEADER;\n\
+FILE_DESCRIPTION(('test'),'2;1');\n\
+FILE_NAME('t.ifc','2026-05-20T00:00:00',(''),(''),'','','');\n\
+FILE_SCHEMA(('IFC4'));\n\
+ENDSEC;\n\
+DATA;\n\
+#1 = IFCOWNERHISTORY($,$,$,.NOCHANGE.,$,$,$,1747699200);\n\
+#2 = IFCPROJECT('00000000000000000000a1',#1,'P','P',$,$,$,$,$);\n\
+ENDSEC;\n\
+END-ISO-10303-21;\n";
+        std::fs::write(&path, body).unwrap();
+
+        // Build a non-canonical path with a `./` segment so the input
+        // and the canonical form differ on every platform.
+        let parent = tmp.path();
+        let file_name = path.file_name().unwrap();
+        let non_canonical: PathBuf = parent.join(".").join(file_name);
+        let summary = s
+            .bim_import_ifc(non_canonical.to_str().unwrap())
+            .expect("valid IFC body must parse");
+
+        let expected = std::fs::canonicalize(&non_canonical)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            summary.path, expected,
+            "BimImportSummary.path must be canonicalised per the docstring contract"
+        );
+        // Sanity: the canonical form does NOT include the `/./`
+        // segment we injected (proves canonicalize actually ran).
+        assert!(
+            !summary.path.contains("/./") && !summary.path.contains("\\.\\"),
+            "canonical path must not contain '.' segments: {}",
+            summary.path
         );
     }
 }
