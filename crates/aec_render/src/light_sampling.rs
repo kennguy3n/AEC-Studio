@@ -249,6 +249,111 @@ pub fn environment_radiance(sky: &SkyParams, _direction: Vec3) -> Vec3 {
     base * sky.strength
 }
 
+/// Solid-angle pdf the NEE sampler would have produced for `direction`
+/// from `shading_point`, given `light`. Inverse of [`sample_light`].
+///
+/// This is the missing half of MIS. When a BSDF sample at bounce
+/// `N > 0` lands on an emitter (whether an analytic [`NativeLight`] or
+/// a surface with a non-zero `mat.emissive`), we want to combine the
+/// BSDF and NEE estimators via the power heuristic rather than
+/// dropping the contribution outright. To do that we need the pdf
+/// each strategy would have assigned to the same direction. This
+/// returns the NEE side; the BSDF side is `prev_bsdf_pdf`.
+///
+/// Returns `0.0` when:
+/// * `light` cannot generate `direction` from `shading_point` (e.g.
+///   the area light's rectangle is on the other side, or `direction`
+///   is outside the sun's angular cone),
+/// * `light` is a delta luminaire ([`NativeLight::Point`] /
+///   [`NativeLight::Ies`]): they have zero solid-angle support, so
+///   no BSDF sample can ever land on them and MIS is vacuous.
+///
+/// For non-zero results the return value is in steradian⁻¹ and is
+/// directly comparable to a BSDF pdf in the same measure.
+pub fn light_pdf(light: &NativeLight, shading_point: Vec3, direction: Vec3) -> f32 {
+    match light {
+        NativeLight::Sun {
+            direction: sun_dir,
+            angular_radius_rad,
+            ..
+        } => {
+            let to_sun = (-*sun_dir).normalize_or_zero();
+            let cos_alpha = angular_radius_rad.cos();
+            let cos_angle = direction.normalize_or_zero().dot(to_sun);
+            if cos_angle >= cos_alpha {
+                if cos_alpha >= 1.0 {
+                    // Degenerate point-sun: delta-like, no MIS support.
+                    0.0
+                } else {
+                    1.0 / (2.0 * PI * (1.0 - cos_alpha))
+                }
+            } else {
+                0.0
+            }
+        }
+        NativeLight::Area {
+            position,
+            normal,
+            u_axis,
+            v_axis,
+            width,
+            height,
+            ..
+        } => {
+            // Intersect the ray (shading_point, direction) with the
+            // area-light plane and check the hit is inside the rect.
+            let denom = normal.dot(direction);
+            if denom.abs() < 1e-6 {
+                return 0.0;
+            }
+            let t = (*position - shading_point).dot(*normal) / denom;
+            if t <= 1e-4 {
+                return 0.0;
+            }
+            let hit_pt = shading_point + direction * t;
+            let local = hit_pt - *position;
+            let u = local.dot(*u_axis);
+            let v = local.dot(*v_axis);
+            if u.abs() > *width * 0.5 || v.abs() > *height * 0.5 {
+                return 0.0;
+            }
+            // Same area→solid-angle conversion as `sample_light`.
+            let dist_sq = (hit_pt - shading_point).length_squared().max(1e-12);
+            let cos_at_light = (-direction).dot(*normal).max(0.0);
+            if cos_at_light <= 0.0 {
+                return 0.0;
+            }
+            let area = width * height;
+            dist_sq / (cos_at_light * area)
+        }
+        NativeLight::Point { .. } | NativeLight::Ies { .. } => 0.0,
+    }
+}
+
+/// Sum of [`light_pdf`] across `lights`. The integrator's NEE loop in
+/// [`crate::path_trace::trace_path`] iterates *every* non-delta light
+/// at every bounce (no random light picking), so each light's pdf is
+/// already unconditional in steradian⁻¹ — the combined NEE estimator's
+/// pdf for direction `d` is therefore the straight sum. For two
+/// non-overlapping lights only one term is non-zero at any direction
+/// (the other rectangle/cone test fails); for overlapping support the
+/// sum is the genuine combined pdf and MIS still produces an unbiased
+/// estimator.
+///
+/// Delta lights ([`NativeLight::Point`] / [`NativeLight::Ies`]) are
+/// excluded — they have zero solid-angle measure, no BSDF sample can
+/// land on them, and MIS is undefined.
+pub fn nee_sum_pdf(lights: &[NativeLight], shading_point: Vec3, direction: Vec3) -> f32 {
+    let mut total = 0.0_f32;
+    for light in lights {
+        if matches!(light, NativeLight::Point { .. } | NativeLight::Ies { .. }) {
+            continue;
+        }
+        total += light_pdf(light, shading_point, direction);
+    }
+    total
+}
+
 /// MIS power heuristic (β = 2). Standard for offline path tracers.
 #[inline]
 pub fn power_heuristic(pdf_a: f32, pdf_b: f32) -> f32 {
@@ -430,5 +535,131 @@ mod tests {
             height: 1.0,
             radiance: Vec3::ONE,
         }));
+    }
+
+    // ---- light_pdf inverse of sample_light --------------------------
+
+    #[test]
+    fn light_pdf_matches_sample_light_for_area_light() {
+        // Round-trip: take a sample direction from sample_light, feed it
+        // into light_pdf, and the returned pdf must match within
+        // floating-point tolerance. This is the MIS invariant.
+        let l = NativeLight::Area {
+            position: Vec3::new(0.0, 5.0, 0.0),
+            normal: Vec3::NEG_Y,
+            u_axis: Vec3::X,
+            v_axis: Vec3::Z,
+            width: 2.0,
+            height: 2.0,
+            radiance: Vec3::splat(10.0),
+        };
+        let shading_point = Vec3::ZERO;
+        let s = sample_light(&l, shading_point, [0.3, 0.7]).unwrap();
+        let p = light_pdf(&l, shading_point, s.direction);
+        assert!(
+            (p - s.pdf).abs() < 1e-3,
+            "round-trip pdf mismatch: sample={} pdf-fn={}",
+            s.pdf,
+            p
+        );
+    }
+
+    #[test]
+    fn light_pdf_returns_zero_outside_area_light_support() {
+        // Direction misses the rectangle → pdf must be 0 so MIS
+        // collapses to "BSDF only" for that direction.
+        let l = NativeLight::Area {
+            position: Vec3::new(0.0, 5.0, 0.0),
+            normal: Vec3::NEG_Y,
+            u_axis: Vec3::X,
+            v_axis: Vec3::Z,
+            width: 0.5,
+            height: 0.5,
+            radiance: Vec3::splat(10.0),
+        };
+        // Direction +Y from origin hits the centre of the light: in.
+        assert!(light_pdf(&l, Vec3::ZERO, Vec3::Y) > 0.0);
+        // Direction at 60° lateral misses a 0.5-m rectangle 5 m up:
+        // hit point ~8.66 m laterally, well outside the 0.25 m extent.
+        let off_dir = Vec3::new(0.866, 0.5, 0.0).normalize();
+        assert_eq!(light_pdf(&l, Vec3::ZERO, off_dir), 0.0);
+        // Backward direction (away from the light) misses entirely.
+        assert_eq!(light_pdf(&l, Vec3::ZERO, Vec3::NEG_Y), 0.0);
+    }
+
+    #[test]
+    fn light_pdf_returns_zero_for_delta_lights() {
+        // No BSDF sample can ever land on a delta light, so its NEE
+        // pdf in solid-angle measure must be 0 (MIS collapses to BSDF
+        // weight 1.0).
+        let point = NativeLight::Point {
+            position: Vec3::new(0.0, 5.0, 0.0),
+            intensity: Vec3::splat(100.0),
+        };
+        assert_eq!(light_pdf(&point, Vec3::ZERO, Vec3::Y), 0.0);
+        let profile = IesProfile::test_isotropic(1000.0);
+        let ies = NativeLight::Ies {
+            position: Vec3::new(0.0, 3.0, 0.0),
+            forward: Vec3::NEG_Y,
+            up: Vec3::Z,
+            profile,
+            intensity_scale: 1.0,
+            color: Vec3::ONE,
+        };
+        assert_eq!(light_pdf(&ies, Vec3::ZERO, Vec3::Y), 0.0);
+    }
+
+    #[test]
+    fn light_pdf_matches_sample_light_for_sun_inside_cone() {
+        let l = NativeLight::Sun {
+            direction: Vec3::new(0.0, -1.0, 0.0),
+            radiance: Vec3::splat(1.0),
+            angular_radius_rad: 0.05,
+        };
+        let s = sample_light(&l, Vec3::ZERO, [0.5, 0.5]).unwrap();
+        let p = light_pdf(&l, Vec3::ZERO, s.direction);
+        assert!(
+            (p - s.pdf).abs() / s.pdf < 1e-3,
+            "sun pdf mismatch: sample={} pdf-fn={}",
+            s.pdf,
+            p
+        );
+        // Outside the cone the pdf is 0.
+        let outside = Vec3::new(1.0, 0.0, 0.0); // perpendicular to sun
+        assert_eq!(light_pdf(&l, Vec3::ZERO, outside), 0.0);
+    }
+
+    #[test]
+    fn nee_sum_pdf_sums_non_delta_lights_and_skips_delta() {
+        let area = NativeLight::Area {
+            position: Vec3::new(0.0, 5.0, 0.0),
+            normal: Vec3::NEG_Y,
+            u_axis: Vec3::X,
+            v_axis: Vec3::Z,
+            width: 2.0,
+            height: 2.0,
+            radiance: Vec3::splat(10.0),
+        };
+        let point = NativeLight::Point {
+            position: Vec3::new(0.0, 5.0, 0.0),
+            intensity: Vec3::splat(100.0),
+        };
+        let lights = vec![area.clone(), point];
+        // Direction toward both lights.
+        let dir = Vec3::Y;
+        // Sum equals just the area light's pdf (point excluded).
+        let sum = nee_sum_pdf(&lights, Vec3::ZERO, dir);
+        let area_only = light_pdf(&area, Vec3::ZERO, dir);
+        assert!((sum - area_only).abs() < 1e-6);
+    }
+
+    #[test]
+    fn nee_sum_pdf_is_zero_when_only_delta_lights_present() {
+        let point = NativeLight::Point {
+            position: Vec3::new(0.0, 5.0, 0.0),
+            intensity: Vec3::splat(100.0),
+        };
+        let lights = vec![point];
+        assert_eq!(nee_sum_pdf(&lights, Vec3::ZERO, Vec3::Y), 0.0);
     }
 }

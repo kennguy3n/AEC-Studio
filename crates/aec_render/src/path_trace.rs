@@ -31,7 +31,7 @@ use rayon::prelude::*;
 use crate::bvh::{BuilderTriangle, Bvh};
 use crate::intersect::{any_hit, closest_hit, geom_normal, Ray, ShadingTriangle};
 use crate::light_sampling::{
-    environment_radiance, is_delta, power_heuristic, sample_light, NativeLight,
+    environment_radiance, is_delta, nee_sum_pdf, power_heuristic, sample_light, NativeLight,
 };
 use crate::lighting::SkyParams;
 use crate::material::{eval_bsdf, pdf_bsdf, sample_bsdf, PathTraceMaterial};
@@ -1071,28 +1071,57 @@ fn trace_path(
     let mut radiance = Vec3::ZERO;
     let mut throughput = Vec3::ONE;
     let mut ray = ray_in;
+    // `last_was_specular = true` on the primary ray means "no prior
+    // BSDF sample to MIS-combine with" — the visible-emitter and
+    // env-hit branches treat that as MIS weight = 1.0, matching the
+    // "primary ray sees emitters directly" convention.
     let mut last_was_specular = true;
     let mut prev_bsdf_pdf = 1.0_f32;
+    // World-space position of the *previous* surface interaction (the
+    // hit point we last sampled a BSDF from). Used to recompute the
+    // NEE-side pdf that would have produced `ray.dir` from that
+    // position when a BSDF sample lands on an emitter at a later
+    // bounce (BSDF-side MIS combine).
+    let mut prev_hit_pos = ray.origin;
     let mut aux: Option<FirstHitAux> = None;
 
     for bounce in 0..config.max_bounces {
         let hit = closest_hit(&scene.bvh, &scene.triangles, &ray);
         let Some(hit) = hit else {
             let env = environment_radiance(&scene.sky, ray.dir);
+            // The environment background itself is not currently
+            // sampled by NEE (there is no sky-light sampler), so its
+            // contribution always has MIS weight 1.0 regardless of
+            // `last_was_specular`. A future PR adding an environment
+            // sampler would change this branch to a power-heuristic
+            // combine like the emitter branch below.
             radiance += throughput * env;
-            // Cycles parity: a ray that escapes the scene also sees any
-            // analytic light whose support contains `ray.dir`. Without
-            // this branch a panorama or a "shoot ray at the sky"
-            // primary ray would never observe the sun disk, only the
-            // diffuse sky background. Sun lights are evaluated as a
-            // delta-cone test; area lights as a ray-rectangle test.
-            // Direct-lighting NEE already accounts for these analytic
-            // lights inside the bouncing loop, so we skip the analytic
-            // contribution on rays that came from a BSDF sample to
-            // avoid double-counting (`last_was_specular` is true for
-            // the primary ray and for rays after specular bounces).
-            if last_was_specular {
-                radiance += throughput * direct_visible_lights(&scene.lights, &ray);
+            // A ray that escapes the scene can also "hit" an analytic
+            // light whose support contains `ray.dir` — the visible
+            // sun disk or a panel light seen edge-on. NEE samples
+            // those lights at every shading point, so when a BSDF
+            // sample at bounce ≥ 1 happens to land on one we must
+            // MIS-combine the BSDF and NEE estimators rather than
+            // dropping the contribution outright (the old
+            // `last_was_specular` gate did the drop and silently
+            // crushed variance reduction on geometry that sees a
+            // light along a glossy direction).
+            let analytic = direct_visible_lights(&scene.lights, &ray);
+            if analytic.length_squared() > 0.0 {
+                let mis_w = if last_was_specular {
+                    1.0
+                } else {
+                    let nee_pdf = nee_sum_pdf(&scene.lights, prev_hit_pos, ray.dir);
+                    if nee_pdf > 0.0 {
+                        power_heuristic(prev_bsdf_pdf, nee_pdf)
+                    } else {
+                        // No NEE sampler covers this direction — the
+                        // BSDF strategy is the only one that could
+                        // have produced it, so it gets full weight.
+                        1.0
+                    }
+                };
+                radiance += throughput * analytic * mis_w;
             }
             if bounce == 0 {
                 aux = Some(FirstHitAux::Miss);
@@ -1136,10 +1165,37 @@ fn trace_path(
             });
         }
 
-        // Self-emission: only contribute on bounce 0 OR if we just took
-        // a specular bounce (no NEE was attempted).
-        if last_was_specular {
-            radiance += throughput * mat.emissive;
+        // Self-emission on a surface hit. Three regimes:
+        //
+        // * Bounce 0: `last_was_specular = true` (primary ray), so MIS
+        //   weight is 1.0 — there is no prior BSDF sample to combine
+        //   with. This is the "visible emitter" term and matches the
+        //   camera-rays-see-emitters convention every PBR renderer
+        //   uses.
+        // * Bounce ≥ 1 after a specular event: MIS weight is also 1.0,
+        //   because a delta BSDF cannot be sampled by NEE (NEE has no
+        //   way to pick the exact mirror direction), so the BSDF
+        //   strategy is the only one that could have produced the hit.
+        // * Bounce ≥ 1 after a diffuse / glossy event: both BSDF and
+        //   NEE could have produced this direction. Use the power
+        //   heuristic to combine. If `nee_sum_pdf` returns 0 (the
+        //   emitter is not in `scene.lights` — e.g. a mesh with a
+        //   non-zero emissive material that the scene converter did
+        //   *not* register as an analytic light), MIS weight is 1.0
+        //   and BSDF takes the full contribution (no double-count
+        //   because NEE never sampled it).
+        if mat.emissive.length_squared() > 0.0 {
+            let mis_w = if last_was_specular {
+                1.0
+            } else {
+                let nee_pdf = nee_sum_pdf(&scene.lights, prev_hit_pos, ray.dir);
+                if nee_pdf > 0.0 {
+                    power_heuristic(prev_bsdf_pdf, nee_pdf)
+                } else {
+                    1.0
+                }
+            };
+            radiance += throughput * mat.emissive * mis_w;
         }
 
         // Next-event estimation for each light.
@@ -1185,12 +1241,11 @@ fn trace_path(
         }
 
         ray = Ray::new(hit_pos, sample.direction);
+        // Remember where this BSDF sample was taken from, so the next
+        // iteration can compute `nee_sum_pdf` from the same shading
+        // point when MIS-combining a BSDF-found emitter contribution.
+        prev_hit_pos = hit_pos;
     }
-
-    // Silence unused warning when last_was_specular ends specular but no
-    // further bounce happens — we still want the prev_bsdf_pdf available
-    // for callers that may extend this loop with environment MIS.
-    let _ = prev_bsdf_pdf;
 
     // If max_bounces == 0 (a degenerate but valid config), neither the
     // hit nor the miss branch above ran — fall back to Miss so the aux
@@ -1683,6 +1738,172 @@ mod tests {
                 "averaged normal must be unit (or zero for un-touched pixels); got len={len}"
             );
         }
+    }
+
+    // ---- BSDF-found emitter MIS (correctness) -----------------------
+
+    #[test]
+    fn bsdf_sample_lands_on_emissive_geometry_without_double_counting() {
+        // Build a scene where an emissive *material* is on a piece of
+        // geometry that is NOT registered as an analytic light. The
+        // pre-MIS code dropped this contribution whenever
+        // `last_was_specular = false` (i.e. after a diffuse bounce).
+        // With MIS combining, a BSDF sample at bounce ≥ 1 that lands
+        // on the emissive material must contribute (MIS weight 1.0
+        // because no NEE sampler covers it), and the result must be
+        // strictly positive even without any direct lighting.
+        let mut scene = RenderScene::new();
+        // Diffuse floor at y=0.
+        scene.push_mesh(SerializedMesh {
+            id: "floor".into(),
+            indices: vec![0, 1, 2, 0, 2, 3],
+            positions: vec![
+                [-2.0, 0.0, -2.0],
+                [2.0, 0.0, -2.0],
+                [2.0, 0.0, 2.0],
+                [-2.0, 0.0, 2.0],
+            ],
+            normals: vec![[0.0, 1.0, 0.0]; 4],
+            uvs: vec![[0.0, 0.0]; 4],
+            material_id: Some("diffuse".into()),
+            transform: identity_matrix(),
+        });
+        // Emissive ceiling at y=4, pointing down.
+        scene.push_mesh(SerializedMesh {
+            id: "ceiling".into(),
+            indices: vec![0, 1, 2, 0, 2, 3],
+            positions: vec![
+                [-2.0, 4.0, -2.0],
+                [-2.0, 4.0, 2.0],
+                [2.0, 4.0, 2.0],
+                [2.0, 4.0, -2.0],
+            ],
+            normals: vec![[0.0, -1.0, 0.0]; 4],
+            uvs: vec![[0.0, 0.0]; 4],
+            material_id: Some("emissive".into()),
+            transform: identity_matrix(),
+        });
+        // Diffuse material + emissive material. No analytic lights:
+        // illumination must flow purely via BSDF-bounce-then-emissive.
+        let mut diffuse = PathTraceMaterial::default_grey();
+        diffuse.base_color = Vec3::new(0.7, 0.7, 0.7);
+        let mut emissive = PathTraceMaterial::default_grey();
+        emissive.emissive = Vec3::splat(20.0);
+        let mat_table = vec![diffuse, emissive];
+        let pt = PathTraceScene::from_render_scene(
+            &scene,
+            mat_table,
+            |id| match id {
+                "diffuse" => Some(0),
+                "emissive" => Some(1),
+                _ => None,
+            },
+            SkyParams {
+                strength: 0.0,
+                color: [0.0; 3],
+                turbidity: 2.0,
+            },
+        );
+        // Camera looks at the floor; first-hit is the floor; bounce 1
+        // sample may land on the emissive ceiling.
+        let camera = RenderCamera {
+            id: "c".into(),
+            position_mm: [0.0, 2000.0, 3000.0],
+            target_mm: [0.0, 0.0, 0.0],
+            focal_length_mm: 35.0,
+            exposure_ev: 0.0,
+            white_balance_k: 5500.0,
+            aperture_f: 4.0,
+        };
+        let cfg = PathTraceConfig {
+            width: 16,
+            height: 16,
+            // Many samples so at least some bounces hit the ceiling.
+            samples_per_pixel: 64,
+            max_bounces: 3,
+            tile_size: 16,
+            russian_roulette_min_bounces: 3,
+            adaptive_threshold: 0.0,
+            projection: CameraProjection::Perspective,
+        };
+        let buf = render(&pt, &camera, &cfg, None, None);
+        let avg = buf.average_rgb();
+        let max_lum = avg
+            .iter()
+            .map(|p| p[0] + p[1] + p[2])
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_lum > 0.0,
+            "BSDF-sampled emissive ceiling must illuminate the floor; got max_lum {max_lum}. \
+             Pre-MIS regression: the `last_was_specular` gate dropped this contribution."
+        );
+    }
+
+    #[test]
+    fn primary_ray_seeing_emissive_surface_contributes_full_radiance() {
+        // Direct visibility of an emissive surface (bounce 0) must
+        // produce the full emissive radiance, with no NEE weighting.
+        // This pins the camera-rays-see-emitters contract.
+        let mut scene = RenderScene::new();
+        scene.push_mesh(SerializedMesh {
+            id: "panel".into(),
+            indices: vec![0, 1, 2, 0, 2, 3],
+            positions: vec![
+                [-1.0, -1.0, 0.0],
+                [1.0, -1.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [-1.0, 1.0, 0.0],
+            ],
+            normals: vec![[0.0, 0.0, 1.0]; 4],
+            uvs: vec![[0.0, 0.0]; 4],
+            material_id: Some("emissive".into()),
+            transform: identity_matrix(),
+        });
+        let mut emissive = PathTraceMaterial::default_grey();
+        emissive.emissive = Vec3::new(5.0, 0.0, 0.0); // pure red
+        let pt = PathTraceScene::from_render_scene(
+            &scene,
+            vec![emissive],
+            |id| if id == "emissive" { Some(0) } else { None },
+            SkyParams {
+                strength: 0.0,
+                color: [0.0; 3],
+                turbidity: 2.0,
+            },
+        );
+        let camera = RenderCamera {
+            id: "c".into(),
+            position_mm: [0.0, 0.0, 3000.0],
+            target_mm: [0.0, 0.0, 0.0],
+            focal_length_mm: 35.0,
+            exposure_ev: 0.0,
+            white_balance_k: 5500.0,
+            aperture_f: 4.0,
+        };
+        let cfg = PathTraceConfig {
+            width: 16,
+            height: 16,
+            samples_per_pixel: 2,
+            max_bounces: 1,
+            tile_size: 16,
+            russian_roulette_min_bounces: 3,
+            adaptive_threshold: 0.0,
+            projection: CameraProjection::Perspective,
+        };
+        let buf = render(&pt, &camera, &cfg, None, None);
+        let avg = buf.average_rgb();
+        // Centre pixel must record red ≥ ~5.0 (or close to it, allowing
+        // for tone-map-free linear radiance accumulation).
+        let centre = avg[(cfg.height * cfg.width / 2 + cfg.width / 2) as usize];
+        assert!(
+            centre[0] > 4.0,
+            "primary ray must see full emissive radiance; got centre red {}",
+            centre[0]
+        );
+        assert!(
+            centre[1] < 0.5 && centre[2] < 0.5,
+            "primary ray must not bleed into green/blue; got centre {centre:?}"
+        );
     }
 
     #[test]
