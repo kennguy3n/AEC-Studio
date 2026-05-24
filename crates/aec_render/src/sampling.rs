@@ -82,6 +82,16 @@ fn halton(index: u32, base: u32) -> f32 {
 ///
 /// Returns `(jx, jy)` both in `[0, 1)` — drop-in replacement for the
 /// previous `(rng.f32(), rng.f32())` pair.
+///
+/// For progressive / multi-pass rendering, `sample_index` should be the
+/// *global* index of the sample within the per-pixel sequence (i.e.
+/// `samples_so_far + s` where `samples_so_far` is the number of samples
+/// the tile has already taken in previous passes and `s` is the
+/// within-pass index). Together with a deterministic `pixel_seed` (see
+/// [`pixel_rotation_seed`]) this gives every pixel a single coherent
+/// Cranley-Patterson-rotated Halton sequence of length
+/// `total_samples`, not K independent shifted sequences of length
+/// `samples_per_pass`.
 #[inline]
 pub fn stratified_jitter(sample_index: u32, pixel_seed: [f32; 2]) -> (f32, f32) {
     // +1 so we never evaluate Halton at index 0 (which is exactly
@@ -94,6 +104,39 @@ pub fn stratified_jitter(sample_index: u32, pixel_seed: [f32; 2]) -> (f32, f32) 
     let jx = (h1 + pixel_seed[0]).fract();
     let jy = (h2 + pixel_seed[1]).fract();
     (jx, jy)
+}
+
+/// Deterministic Cranley-Patterson rotation seed for the pixel at
+/// `(px, py)`. Returns a pseudo-random `[f32; 2]` in `[0, 1)^2`.
+///
+/// "Deterministic" is the load-bearing word: across multiple
+/// progressive passes the same pixel must get the *same* rotation so
+/// the Halton indices from successive passes form a single coherent
+/// low-discrepancy sequence. If the rotation changed per pass, the K
+/// passes would produce K independent shifted Halton sequences (each
+/// O(log²N/N) within itself but with no cross-pass correlation
+/// benefit), which is what the previous RNG-drawn `pixel_seed` did.
+///
+/// Implementation: a 64-bit splitmix-style mix of the packed (px, py)
+/// coordinate. Hashes are cheap (a few wrapping mul + xor / shift),
+/// well-distributed for the 32-bit input space, and totally
+/// dependency-free. We split the 64-bit output into two `u32` halves
+/// and divide each by `2^32` for a uniform sample in `[0, 1)`.
+#[inline]
+pub fn pixel_rotation_seed(px: u32, py: u32) -> [f32; 2] {
+    let packed = (u64::from(px) << 32) | u64::from(py);
+    // splitmix64 (Vigna, 2014).
+    let mut z = packed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    // Two u32 halves -> two f32 in [0, 1).
+    let hi = (z >> 32) as u32;
+    let lo = z as u32;
+    [
+        hi as f32 * (1.0 / 4_294_967_296.0),
+        lo as f32 * (1.0 / 4_294_967_296.0),
+    ]
 }
 
 #[cfg(test)]
@@ -215,6 +258,87 @@ mod tests {
             "Halton coverage {} must beat or tie pure-random {}",
             halton_filled,
             random_filled
+        );
+    }
+
+    #[test]
+    fn pixel_rotation_seed_is_deterministic_across_calls() {
+        // Load-bearing property for progressive rendering: the same
+        // pixel must always get the same rotation across multiple
+        // passes so the Halton index advance forms a single coherent
+        // shifted sequence.
+        for (px, py) in [(0, 0), (1, 0), (0, 1), (12345, 6789), (u32::MAX, u32::MAX)] {
+            let a = pixel_rotation_seed(px, py);
+            let b = pixel_rotation_seed(px, py);
+            assert_eq!(a, b, "({px}, {py}) must be deterministic");
+            assert!((0.0..1.0).contains(&a[0]) && (0.0..1.0).contains(&a[1]));
+        }
+    }
+
+    #[test]
+    fn pixel_rotation_seed_decorrelates_neighbouring_pixels() {
+        // Adjacent pixels must get visibly different rotations,
+        // otherwise the Cranley-Patterson decorrelation doesn't
+        // actually decorrelate anything across the image. Splitmix64
+        // gives well-distributed output for any input increment, so
+        // any pair of neighbours should differ by > 0.1 on at least
+        // one axis (very loose lower bound).
+        let mut min_dist = f32::INFINITY;
+        for px in 0..16u32 {
+            for py in 0..16u32 {
+                let here = pixel_rotation_seed(px, py);
+                if px + 1 < 16 {
+                    let east = pixel_rotation_seed(px + 1, py);
+                    let dx = (here[0] - east[0]).abs();
+                    let dy = (here[1] - east[1]).abs();
+                    min_dist = min_dist.min(dx.max(dy));
+                }
+            }
+        }
+        assert!(
+            min_dist > 0.01,
+            "neighbouring-pixel rotation distance too small ({min_dist})"
+        );
+    }
+
+    #[test]
+    fn stratified_jitter_progressive_index_yields_coherent_low_discrepancy() {
+        // Two passes of 4 samples each, with samples_so_far threaded
+        // through, must cover the 4x4 stratification grid better than
+        // either pass alone. This pins the progressive-rendering
+        // contract: passes advance the index rather than restart it.
+        const GRID: usize = 4;
+        let seed = pixel_rotation_seed(7, 11);
+        let mut combined = [[false; GRID]; GRID];
+        let mut pass_a = [[false; GRID]; GRID];
+        let mut pass_b = [[false; GRID]; GRID];
+        let mark = |cells: &mut [[bool; GRID]; GRID], jx: f32, jy: f32| {
+            let cx = ((jx * GRID as f32) as usize).min(GRID - 1);
+            let cy = ((jy * GRID as f32) as usize).min(GRID - 1);
+            cells[cx][cy] = true;
+        };
+        // Pass A: indices 0..4 with samples_so_far=0.
+        for s in 0..4u32 {
+            let (jx, jy) = stratified_jitter(s, seed);
+            mark(&mut pass_a, jx, jy);
+            mark(&mut combined, jx, jy);
+        }
+        // Pass B: indices 4..8 (samples_so_far=4 + s). Same seed —
+        // the rotation must be the same for the Halton advance to
+        // accumulate low-discrepancy benefit.
+        for s in 0..4u32 {
+            let (jx, jy) = stratified_jitter(4 + s, seed);
+            mark(&mut pass_b, jx, jy);
+            mark(&mut combined, jx, jy);
+        }
+        let count = |c: &[[bool; GRID]; GRID]| c.iter().flatten().filter(|b| **b).count();
+        let na = count(&pass_a);
+        let nb = count(&pass_b);
+        let nc = count(&combined);
+        assert!(
+            nc > na && nc > nb,
+            "two passes with advancing index must cover more cells than either alone: \
+             pass_a={na}, pass_b={nb}, combined={nc}"
         );
     }
 }

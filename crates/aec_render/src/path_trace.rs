@@ -649,12 +649,20 @@ impl FirstHitAux {
 /// will denoise the output with a feature-guided kernel should call
 /// [`render_tile_pass_with_aux`] and accumulate the aux sums into an
 /// [`AccumulationBuffer::new_with_aux`] target.
+///
+/// `samples_so_far` is the number of samples per pixel this tile has
+/// already accumulated in previous passes (0 for the first pass). It's
+/// fed into the stratified-jitter sample index so the Halton sequence
+/// advances *across* passes rather than restarting — i.e. K passes of
+/// N samples each form a single coherent length-`K*N` low-discrepancy
+/// sequence per pixel, not K independent length-N sequences.
 pub fn render_tile_pass(
     scene: &PathTraceScene,
     camera: &RenderCamera,
     config: &PathTraceConfig,
     tile: Tile,
     samples_this_pass: u32,
+    samples_so_far: u32,
     rng_seed: u64,
 ) -> TilePassResult {
     render_tile_pass_inner(
@@ -663,6 +671,7 @@ pub fn render_tile_pass(
         config,
         tile,
         samples_this_pass,
+        samples_so_far,
         rng_seed,
         false,
     )
@@ -676,6 +685,7 @@ pub fn render_tile_pass_with_aux(
     config: &PathTraceConfig,
     tile: Tile,
     samples_this_pass: u32,
+    samples_so_far: u32,
     rng_seed: u64,
 ) -> TilePassResult {
     render_tile_pass_inner(
@@ -684,6 +694,7 @@ pub fn render_tile_pass_with_aux(
         config,
         tile,
         samples_this_pass,
+        samples_so_far,
         rng_seed,
         true,
     )
@@ -695,6 +706,7 @@ fn render_tile_pass_inner(
     config: &PathTraceConfig,
     tile: Tile,
     samples_this_pass: u32,
+    samples_so_far: u32,
     rng_seed: u64,
     capture_aux: bool,
 ) -> TilePassResult {
@@ -727,18 +739,21 @@ fn render_tile_pass_inner(
             let mut alb_accum = [0.0_f32; 3];
             let mut nrm_accum = [0.0_f32; 3];
             let mut dep_accum = 0.0_f32;
-            // Per-pixel Cranley-Patterson rotation (see render_tile for
-            // the rationale). `samples_this_pass` is the per-pass
-            // sample count, not the running total across passes —
-            // schedulers that run multiple passes will re-seed each
-            // pass's rotation via `rng_seed`, which is correct
-            // because the Halton sequence is re-anchored per pass
-            // anyway.
-            let pixel_seed = [rng.f32(), rng.f32()];
+            let px = tile.x_start + lx as u32;
+            let py = tile.y_start + ly as u32;
+            // Per-pixel Cranley-Patterson rotation. Drawn deterministically
+            // from pixel coordinates (not from `rng`!) so the rotation is
+            // the *same* across multiple progressive passes — that is
+            // what lets the Halton index advance from `samples_so_far` to
+            // `samples_so_far + samples_this_pass` form a single coherent
+            // shifted low-discrepancy sequence per pixel. If the rotation
+            // changed per pass (the previous `[rng.f32(), rng.f32()]`
+            // approach), each pass would produce an independently-shifted
+            // sequence and the multi-pass renders would lose the
+            // O(log²N/N) cross-pass convergence benefit.
+            let pixel_seed = crate::sampling::pixel_rotation_seed(px, py);
             for s in 0..samples_this_pass {
-                let px = tile.x_start + lx as u32;
-                let py = tile.y_start + ly as u32;
-                let (jx, jy) = crate::sampling::stratified_jitter(s, pixel_seed);
+                let (jx, jy) = crate::sampling::stratified_jitter(samples_so_far + s, pixel_seed);
                 let dir_world = match config.projection {
                     CameraProjection::Perspective => {
                         let nx = (px as f32 + jx) / config.width as f32 * 2.0 - 1.0;
@@ -1936,7 +1951,8 @@ mod tests {
             x_end: cfg.width,
             y_end: cfg.height,
         };
-        let pass = render_tile_pass_with_aux(&pt, &aux_test_camera(), &cfg, tile, 4, 0xDEAD_BEEF);
+        let pass =
+            render_tile_pass_with_aux(&pt, &aux_test_camera(), &cfg, tile, 4, 0, 0xDEAD_BEEF);
         assert!(pass.albedo_sums.is_some());
         assert!(pass.normal_sums.is_some());
         assert!(pass.depth_sums.is_some());
@@ -1949,7 +1965,7 @@ mod tests {
             "expected at least one pixel summing to floor base_color × samples"
         );
         // Without aux capture, the legacy entry point still returns None.
-        let pass_no_aux = render_tile_pass(&pt, &aux_test_camera(), &cfg, tile, 4, 0xDEAD_BEEF);
+        let pass_no_aux = render_tile_pass(&pt, &aux_test_camera(), &cfg, tile, 4, 0, 0xDEAD_BEEF);
         assert!(pass_no_aux.albedo_sums.is_none());
         assert!(pass_no_aux.normal_sums.is_none());
         assert!(pass_no_aux.depth_sums.is_none());

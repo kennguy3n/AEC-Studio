@@ -137,7 +137,7 @@ fn bench_single_tile_perspective(c: &mut Criterion) {
     };
     c.bench_function("path_trace_single_tile_perspective", |b| {
         b.iter(|| {
-            let r = render_tile_pass(black_box(&pt), &camera, &config, tile, 1, 0xDEAD_BEEF);
+            let r = render_tile_pass(black_box(&pt), &camera, &config, tile, 1, 0, 0xDEAD_BEEF);
             black_box(r);
         });
     });
@@ -165,7 +165,7 @@ fn bench_single_tile_panorama(c: &mut Criterion) {
     };
     c.bench_function("path_trace_single_tile_panorama", |b| {
         b.iter(|| {
-            let r = render_tile_pass(black_box(&pt), &camera, &config, tile, 1, 0xDEAD_BEEF);
+            let r = render_tile_pass(black_box(&pt), &camera, &config, tile, 1, 0, 0xDEAD_BEEF);
             black_box(r);
         });
     });

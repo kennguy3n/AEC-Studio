@@ -250,11 +250,29 @@ pub fn schedule(
                 if cancel_ref.is_some_and(CancelToken::is_cancelled) {
                     return (idx, None);
                 }
-                let tile = tile_states[idx].tile;
+                let state = &tile_states[idx];
+                let tile = state.tile;
+                let samples_so_far = state.samples;
                 let seed = pass_seed_base
                     ^ u64::from(tile.x_start).wrapping_mul(0x9E37_79B1_7F4A_7C15)
                     ^ u64::from(tile.y_start).wrapping_mul(0xBB67_AE85_84CA_A73B);
-                let result = render_tile_pass(scene, camera, base_config, tile, pass_samples, seed);
+                // Pass `samples_so_far` so the Halton index advances
+                // contiguously across passes — see render_tile_pass docs.
+                // Adaptive convergence may stop sampling some tiles
+                // early, so per-tile sample counters drift from the
+                // global `samples_done` (which is the same for all
+                // tiles in a pass). The per-tile `state.samples` is
+                // therefore the load-bearing value here, not the
+                // global `samples_done`.
+                let result = render_tile_pass(
+                    scene,
+                    camera,
+                    base_config,
+                    tile,
+                    pass_samples,
+                    samples_so_far,
+                    seed,
+                );
                 (idx, Some(result))
             })
             .collect();

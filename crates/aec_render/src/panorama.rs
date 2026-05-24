@@ -293,7 +293,7 @@ mod tests {
             x_end: config.width,
             y_end: config.height,
         };
-        let result = render_tile_pass(&scene, &camera, &config, tile, 4, 0xC0FFEE);
+        let result = render_tile_pass(&scene, &camera, &config, tile, 4, 0, 0xC0FFEE);
         assert_eq!(result.sums.len() as u32, config.width * config.height);
         for px in &result.sums {
             // Every pixel must produce *some* radiance — at minimum the
@@ -459,7 +459,7 @@ mod tests {
             x_end: 8,
             y_end: 4,
         };
-        let result = render_tile_pass(&scene, &camera, &config, tile, 4, 0xBEEF);
+        let result = render_tile_pass(&scene, &camera, &config, tile, 4, 0, 0xBEEF);
         // The panorama mapping at v=0 (top row) points toward +Y; sun
         // direction is `Vec3::new(0, -1, 0)` so the apparent sun is at
         // +Y, which lands on the top row. The top row must therefore

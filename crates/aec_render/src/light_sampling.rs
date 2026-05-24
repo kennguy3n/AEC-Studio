@@ -340,13 +340,17 @@ pub fn light_pdf(light: &NativeLight, shading_point: Vec3, direction: Vec3) -> f
 /// sum is the genuine combined pdf and MIS still produces an unbiased
 /// estimator.
 ///
-/// Delta lights ([`NativeLight::Point`] / [`NativeLight::Ies`]) are
-/// excluded — they have zero solid-angle measure, no BSDF sample can
-/// land on them, and MIS is undefined.
+/// Delta lights are excluded — they have zero solid-angle measure, no
+/// BSDF sample can land on them, and MIS is undefined. The exclusion
+/// uses [`is_delta`] as the single source of truth so the BSDF-found
+/// branch ([`crate::path_trace::trace_path`]) and the NEE branch agree
+/// on the partition. A [`NativeLight::Sun`] with `angular_radius_rad ==
+/// 0` collapses to a true delta and is therefore excluded; for any
+/// finite cone Sun is treated as a regular sample-able light.
 pub fn nee_sum_pdf(lights: &[NativeLight], shading_point: Vec3, direction: Vec3) -> f32 {
     let mut total = 0.0_f32;
     for light in lights {
-        if matches!(light, NativeLight::Point { .. } | NativeLight::Ies { .. }) {
+        if is_delta(light) {
             continue;
         }
         total += light_pdf(light, shading_point, direction);
@@ -367,12 +371,31 @@ pub fn power_heuristic(pdf_a: f32, pdf_b: f32) -> f32 {
     }
 }
 
-/// Test whether `light` is a delta light (no MIS weight against BSDF).
+/// Test whether `light` is a delta light — i.e. has zero solid-angle
+/// measure so no BSDF sample can ever land on it and MIS combining is
+/// undefined. The NEE branch of [`crate::path_trace::trace_path`] uses
+/// this to short-circuit MIS to weight 1.0, and [`nee_sum_pdf`] uses
+/// the same predicate to exclude these lights from the BSDF-found
+/// branch's pdf sum — so the two sides of MIS use a single source of
+/// truth and the combined weights partition correctly.
+///
+/// [`NativeLight::Sun`] is a delta light *only* when its
+/// `angular_radius_rad` is zero. For any positive cone radius the sun
+/// has a finite solid-angle pdf `1/(2π(1−cosα))` (see
+/// [`sample_light`] / [`light_pdf`]) and is a regular sample-able
+/// light, not delta. Classifying a finite-cone Sun as delta would
+/// give MIS weight 1.0 on the NEE side while the BSDF-found branch
+/// adds a non-zero `power_heuristic(bsdf_pdf, nee_pdf)` for any
+/// direction inside the cone — the weights would sum to >1 and the
+/// integrator would gain energy.
 pub fn is_delta(light: &NativeLight) -> bool {
-    matches!(
-        light,
-        NativeLight::Point { .. } | NativeLight::Ies { .. } | NativeLight::Sun { .. }
-    )
+    match light {
+        NativeLight::Point { .. } | NativeLight::Ies { .. } => true,
+        NativeLight::Sun {
+            angular_radius_rad, ..
+        } => *angular_radius_rad <= 0.0,
+        NativeLight::Area { .. } => false,
+    }
 }
 
 fn orthonormal_basis(n: Vec3) -> (Vec3, Vec3) {
@@ -535,6 +558,78 @@ mod tests {
             height: 1.0,
             radiance: Vec3::ONE,
         }));
+    }
+
+    #[test]
+    fn sun_with_finite_cone_is_not_delta_so_mis_partition_balances() {
+        // A sun with a real angular radius (0.00465 rad ≈ real solar
+        // disc; 0.05 rad ≈ stylised soft sun) is sample-able and has
+        // a finite cone pdf. Classifying it as delta would give MIS
+        // weight 1.0 on the NEE side while the BSDF-found branch
+        // independently contributes a non-zero power_heuristic for
+        // any direction inside the cone, causing the combined MIS
+        // weights to exceed 1 (energy gain). The fix is to treat
+        // such a sun as a regular sample-able light.
+        let real_sun = NativeLight::Sun {
+            direction: Vec3::new(0.0, -1.0, 0.0),
+            radiance: Vec3::splat(1.0),
+            angular_radius_rad: 0.00465,
+        };
+        let stylised_sun = NativeLight::Sun {
+            direction: Vec3::new(0.0, -1.0, 0.0),
+            radiance: Vec3::splat(1.0),
+            angular_radius_rad: 0.05,
+        };
+        assert!(!is_delta(&real_sun));
+        assert!(!is_delta(&stylised_sun));
+    }
+
+    #[test]
+    fn sun_with_zero_cone_collapses_to_delta() {
+        // angular_radius_rad == 0 is the degenerate-cone delta-like
+        // sun. `light_pdf` already returns 0 here (cos_alpha >= 1.0
+        // branch), and `sample_light` returns pdf=1.0 by delta
+        // convention. `is_delta` must classify this as delta so the
+        // NEE side uses weight 1.0 and `nee_sum_pdf` excludes it
+        // from the BSDF-found branch's sum — keeping the two sides
+        // of MIS consistent.
+        let point_sun = NativeLight::Sun {
+            direction: Vec3::new(0.0, -1.0, 0.0),
+            radiance: Vec3::splat(1.0),
+            angular_radius_rad: 0.0,
+        };
+        assert!(is_delta(&point_sun));
+        assert!(
+            light_pdf(&point_sun, Vec3::ZERO, Vec3::Y).abs() < 1e-9,
+            "degenerate-cone Sun must have zero NEE pdf"
+        );
+    }
+
+    #[test]
+    fn nee_sum_pdf_excludes_sun_when_it_is_delta_but_includes_finite_cone_sun() {
+        let to_sun = Vec3::Y;
+        let real_sun = NativeLight::Sun {
+            direction: -to_sun,
+            radiance: Vec3::splat(1.0),
+            angular_radius_rad: 0.05,
+        };
+        let point_sun = NativeLight::Sun {
+            direction: -to_sun,
+            radiance: Vec3::splat(1.0),
+            angular_radius_rad: 0.0,
+        };
+        // Finite-cone Sun contributes a non-zero pdf along the cone axis.
+        let p_real = nee_sum_pdf(std::slice::from_ref(&real_sun), Vec3::ZERO, to_sun);
+        assert!(p_real > 0.0, "finite-cone sun must contribute NEE pdf");
+        // Degenerate-cone Sun must NOT contribute — otherwise the
+        // BSDF-found branch would add a non-zero combine while the
+        // NEE side uses weight 1.0 (delta short-circuit), inflating
+        // the total MIS weight above 1.
+        let p_point = nee_sum_pdf(std::slice::from_ref(&point_sun), Vec3::ZERO, to_sun);
+        assert!(
+            p_point.abs() < 1e-9,
+            "delta sun must be excluded from nee_sum_pdf (got {p_point})"
+        );
     }
 
     // ---- light_pdf inverse of sample_light --------------------------
