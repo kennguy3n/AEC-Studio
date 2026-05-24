@@ -65,11 +65,23 @@ pub enum BridgeServiceError {
     /// can surface "entity X not found", "scope mismatch", etc.
     #[error("command: {0}")]
     Command(String),
+    /// Export-layer failure (PDF / DXF / IFC / glTF / ZIP). Carries
+    /// the underlying `aec_export::ProjectExportError` display
+    /// verbatim so the renderer can show which format failed and
+    /// (e.g. for invalid layer names) what the user supplied.
+    #[error("export: {0}")]
+    Export(String),
 }
 
 impl From<aec_command::error::CommandError> for BridgeServiceError {
     fn from(e: aec_command::error::CommandError) -> Self {
         Self::Command(e.to_string())
+    }
+}
+
+impl From<aec_export::ProjectExportError> for BridgeServiceError {
+    fn from(e: aec_export::ProjectExportError) -> Self {
+        Self::Export(e.to_string())
     }
 }
 
@@ -481,6 +493,89 @@ pub struct RenderApplyPresetResult {
     /// renderer can keep its dropdown selection consistent with the
     /// engine.
     pub active_preset_id: String,
+}
+
+/// Result of a successful [`BridgeService::export_pdf`] call.
+///
+/// `pages` reflects the printpdf page count, which `aec_export`
+/// constructs deterministically (one cover + one overview page when
+/// no body lines are supplied, growing as the body is paginated). The
+/// renderer's preview pane uses this to show "Exported 4 pages" on
+/// success.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportPdfResult {
+    pub out_path: String,
+    pub pages: u32,
+}
+
+/// Result of a successful [`BridgeService::export_dxf`] call. Just
+/// the canonicalised output path — the renderer's preview pane reads
+/// the file size from disk if it wants to show "Exported (12 KB)".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportDxfResult {
+    pub out_path: String,
+}
+
+/// Result of a successful [`BridgeService::export_ifc`] call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportIfcResult {
+    pub out_path: String,
+}
+
+/// Result of a successful [`BridgeService::export_gltf`] call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportGltfResult {
+    pub out_path: String,
+}
+
+/// Result of a successful [`BridgeService::export_proposal_pack`]
+/// call. Distinct from `ExportPdfResult` so a future enhancement
+/// (e.g. surfacing the manifest hash, branding info, asset count)
+/// doesn't have to widen the simple PDF return shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportProposalPackResult {
+    pub out_path: String,
+}
+
+/// Per-archetype inventory flags for
+/// [`BridgeService::deliver_build_pack`]. Mirrors the renderer's
+/// `BridgeBackend.deliverBuildPack` request shape so the bridge call
+/// site can forward the JS params through unchanged. Grouped into a
+/// struct (rather than five `bool` parameters) so clippy is happy
+/// about `fn_params_excessive_bools` and the call sites read as
+/// `options.include_renders` rather than positional booleans.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliverPackInventoryFlags {
+    pub include_renders: bool,
+    pub include_sheets: bool,
+    pub include_ifc: bool,
+    pub include_boq: bool,
+    pub include_proposal: bool,
+}
+
+/// Typed params for [`BridgeService::deliver_build_pack`]. The
+/// service method takes this rather than positional arguments so
+/// adding a new flag (e.g. `include_validation_report`) doesn't
+/// break every call site.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliverBuildPackParams {
+    pub out_path: String,
+    pub kind: String,
+    pub project_name: String,
+    pub options: DeliverPackInventoryFlags,
+}
+
+/// Result of a successful [`BridgeService::deliver_build_pack`]
+/// call. Mirrors the renderer's `DeliverPackResult` TS interface
+/// (`apps/desktop/electron/bridge.ts`) — `contents` is the list of
+/// files inside the ZIP and `total_bytes` is the sum of their
+/// payload sizes (manifest excluded so the figure matches what the
+/// renderer preview pane shows pre-archive).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliverPackResult {
+    pub out_path: String,
+    pub contents: Vec<String>,
+    pub total_bytes: u64,
 }
 
 /// Hardware-status snapshot. The shape mirrors the TypeScript
@@ -1270,6 +1365,126 @@ impl BridgeService {
             components_inserted: counts.components_inserted,
             relations_inserted: counts.relations_inserted,
             cache_rows: counts.cache_rows,
+        })
+    }
+
+    /// Export a multi-page summary PDF for `project_name` to
+    /// `out_path`. Delegates to
+    /// [`aec_export::write_project_pdf`] — the output is a real
+    /// printpdf-serialised file (starts with `%PDF-`).
+    ///
+    /// Routed as `&self` because the export crate is stateless and
+    /// any future caching (e.g. memoising rendered cover pages) will
+    /// live behind interior mutability rather than on the bridge
+    /// service. Mirrors the same pattern as
+    /// [`Self::bim_check_file_size`] and
+    /// [`Self::bim_attach_ifc`] so the napi layer can route through
+    /// `with_service_ref_fallible` and concurrent status polls are
+    /// not blocked by long PDF assemblies.
+    pub fn export_pdf(
+        &self,
+        out_path: &str,
+        project_name: &str,
+        body_lines: &[String],
+    ) -> Result<ExportPdfResult, BridgeServiceError> {
+        let res = aec_export::write_project_pdf(Path::new(out_path), project_name, body_lines)?;
+        Ok(ExportPdfResult {
+            out_path: res.out_path.to_string_lossy().into_owned(),
+            pages: res.pages,
+        })
+    }
+
+    /// Export a real DXF (R2013 / AC1027 ASCII) drawing to
+    /// `out_path`. `walls_mm` are emitted as `LINE` entities on
+    /// layer `WALLS`; a title block is added on layer `TITLE`. See
+    /// [`aec_export::write_project_dxf`] for the grammar pins.
+    pub fn export_dxf(
+        &self,
+        out_path: &str,
+        project_name: &str,
+        walls_mm: &[(f64, f64, f64, f64)],
+    ) -> Result<ExportDxfResult, BridgeServiceError> {
+        let res = aec_export::write_project_dxf(Path::new(out_path), project_name, walls_mm)?;
+        Ok(ExportDxfResult {
+            out_path: res.out_path.to_string_lossy().into_owned(),
+        })
+    }
+
+    /// Export a real ISO-10303-21 IFC4 STEP file with the supplied
+    /// storey names (defaults to a single `Ground` storey when
+    /// `storey_names` is empty). See [`aec_export::write_project_ifc`].
+    pub fn export_ifc(
+        &self,
+        out_path: &str,
+        project_name: &str,
+        storey_names: &[String],
+    ) -> Result<ExportIfcResult, BridgeServiceError> {
+        let res = aec_export::write_project_ifc(Path::new(out_path), project_name, storey_names)?;
+        Ok(ExportIfcResult {
+            out_path: res.out_path.to_string_lossy().into_owned(),
+        })
+    }
+
+    /// Export a minimal-but-valid glTF 2.0 JSON file. See
+    /// [`aec_export::write_project_gltf`] — the output passes a
+    /// minimum-schema check (`asset.version == "2.0"`, non-empty
+    /// `scenes` and `nodes`).
+    pub fn export_gltf(
+        &self,
+        out_path: &str,
+        project_name: &str,
+    ) -> Result<ExportGltfResult, BridgeServiceError> {
+        let res = aec_export::write_project_gltf(Path::new(out_path), project_name)?;
+        Ok(ExportGltfResult {
+            out_path: res.out_path.to_string_lossy().into_owned(),
+        })
+    }
+
+    /// Export a real client-facing proposal PDF via
+    /// [`aec_export::write_proposal_pack`]. The output is a
+    /// printpdf-serialised file with the `aec_export::proposal`
+    /// branding + asset scaffolding pre-applied.
+    pub fn export_proposal_pack(
+        &self,
+        out_path: &str,
+        project_name: &str,
+        client_name: &str,
+    ) -> Result<ExportProposalPackResult, BridgeServiceError> {
+        let res = aec_export::write_proposal_pack(Path::new(out_path), project_name, client_name)?;
+        Ok(ExportProposalPackResult {
+            out_path: res.out_path.to_string_lossy().into_owned(),
+        })
+    }
+
+    /// Build a contractor deliverable ZIP archive at `out_path`.
+    /// Kind + options control the inventory; see
+    /// [`aec_export::write_deliver_pack`] for the per-kind asset
+    /// list. The returned `contents` matches the inventory the
+    /// renderer preview pane shows pre-archive, and `total_bytes` is
+    /// the sum of payload sizes (manifest excluded).
+    pub fn deliver_build_pack(
+        &self,
+        params: DeliverBuildPackParams,
+    ) -> Result<DeliverPackResult, BridgeServiceError> {
+        let DeliverBuildPackParams {
+            out_path,
+            kind,
+            project_name,
+            options,
+        } = params;
+        let kind = aec_export::DeliverPackKind::parse(&kind)?;
+        let opts = aec_export::DeliverPackOptions {
+            include_renders: options.include_renders,
+            include_sheets: options.include_sheets,
+            include_ifc: options.include_ifc,
+            include_boq: options.include_boq,
+            include_proposal: options.include_proposal,
+        };
+        let res = aec_export::write_deliver_pack(Path::new(&out_path), kind, &opts, &project_name)?;
+        Ok(DeliverPackResult {
+            out_path: res.out_path.to_string_lossy().into_owned(),
+            contents: res.contents,
+            total_bytes: res.total_bytes,
         })
     }
 

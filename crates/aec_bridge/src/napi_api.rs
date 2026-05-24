@@ -616,6 +616,278 @@ fn parse_scope(s: &str) -> Result<aec_core::types::Scope> {
     }
 }
 
+/// Typed params for [`export_pdf`]. `out_path` and `project_name`
+/// are mandatory; `body_lines` may be empty (the export crate
+/// substitutes a placeholder overview page so the PDF still has
+/// content beyond the cover).
+#[napi(object)]
+pub struct ExportPdfParamsJs {
+    pub out_path: String,
+    pub project_name: String,
+    /// Optional body lines. `None` and an empty array are equivalent
+    /// — both let the export crate substitute its placeholder
+    /// overview text so the PDF still has > 1 page.
+    pub body_lines: Option<Vec<String>>,
+}
+
+/// JS-facing result of [`export_pdf`]. Mirrors the renderer's
+/// `{ outPath: string; pages: number }` return shape on
+/// `BridgeBackend.exportPdf`.
+#[napi(object)]
+pub struct ExportPdfResultJs {
+    pub out_path: String,
+    pub pages: u32,
+}
+
+impl From<crate::service::ExportPdfResult> for ExportPdfResultJs {
+    fn from(r: crate::service::ExportPdfResult) -> Self {
+        Self {
+            out_path: r.out_path,
+            pages: r.pages,
+        }
+    }
+}
+
+/// Export a real PDF summary for the project. Routed through
+/// `with_service_ref_fallible` (the read-only helper) because
+/// `aec_export` is stateless and the bridge service holds no
+/// per-export caches today — concurrent status polls must not be
+/// blocked by a multi-second PDF assembly.
+#[napi]
+pub fn export_pdf(params: ExportPdfParamsJs) -> Result<ExportPdfResultJs> {
+    let body = params.body_lines.unwrap_or_default();
+    with_service_ref_fallible(|svc| svc.export_pdf(&params.out_path, &params.project_name, &body))
+        .map(Into::into)
+}
+
+/// Typed params for [`export_dxf`]. `walls_mm` is `Vec<[f64; 4]>`
+/// (each item is `[x1, y1, x2, y2]` in millimetres). The renderer
+/// can pass `None` for no walls (the export still produces a
+/// title-block-only DXF that downstream tools can open).
+#[napi(object)]
+pub struct ExportDxfParamsJs {
+    pub out_path: String,
+    pub project_name: String,
+    /// Optional wall segments in millimetres. Each item is
+    /// `[x1, y1, x2, y2]`. Validated at the napi boundary —
+    /// arrays of the wrong length surface as a typed error.
+    pub walls_mm: Option<Vec<Vec<f64>>>,
+}
+
+/// JS-facing result of [`export_dxf`].
+#[napi(object)]
+pub struct ExportDxfResultJs {
+    pub out_path: String,
+}
+
+impl From<crate::service::ExportDxfResult> for ExportDxfResultJs {
+    fn from(r: crate::service::ExportDxfResult) -> Self {
+        Self {
+            out_path: r.out_path,
+        }
+    }
+}
+
+/// Export a real DXF drawing for the project. Validates the
+/// renderer-supplied wall arrays at the napi boundary so the
+/// service layer can rely on a typed `(f64, f64, f64, f64)` tuple.
+#[napi]
+pub fn export_dxf(params: ExportDxfParamsJs) -> Result<ExportDxfResultJs> {
+    let walls_raw = params.walls_mm.unwrap_or_default();
+    let mut walls: Vec<(f64, f64, f64, f64)> = Vec::with_capacity(walls_raw.len());
+    for (i, seg) in walls_raw.iter().enumerate() {
+        if seg.len() != 4 {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "export_dxf: walls_mm[{i}] must be [x1, y1, x2, y2] (got len {})",
+                    seg.len()
+                ),
+            ));
+        }
+        walls.push((seg[0], seg[1], seg[2], seg[3]));
+    }
+    with_service_ref_fallible(|svc| svc.export_dxf(&params.out_path, &params.project_name, &walls))
+        .map(Into::into)
+}
+
+/// Typed params for [`export_ifc`]. When `storey_names` is `None`
+/// or empty, the export crate adds a single default storey so the
+/// IFC has a complete Project → Site → Building → Storey chain.
+#[napi(object)]
+pub struct ExportIfcParamsJs {
+    pub out_path: String,
+    pub project_name: String,
+    pub storey_names: Option<Vec<String>>,
+}
+
+/// JS-facing result of [`export_ifc`].
+#[napi(object)]
+pub struct ExportIfcResultJs {
+    pub out_path: String,
+}
+
+impl From<crate::service::ExportIfcResult> for ExportIfcResultJs {
+    fn from(r: crate::service::ExportIfcResult) -> Self {
+        Self {
+            out_path: r.out_path,
+        }
+    }
+}
+
+/// Export a real ISO-10303-21 IFC4 STEP file for the project.
+/// Uses the same `IfcWriter` the bridge's `bim_attach_ifc` round-
+/// trips through, so the output is byte-compatible with the
+/// dedup hashing pipeline.
+#[napi]
+pub fn export_ifc(params: ExportIfcParamsJs) -> Result<ExportIfcResultJs> {
+    let storeys = params.storey_names.unwrap_or_default();
+    with_service_ref_fallible(|svc| {
+        svc.export_ifc(&params.out_path, &params.project_name, &storeys)
+    })
+    .map(Into::into)
+}
+
+/// Typed params for [`export_gltf`].
+#[napi(object)]
+pub struct ExportGltfParamsJs {
+    pub out_path: String,
+    pub project_name: String,
+}
+
+/// JS-facing result of [`export_gltf`].
+#[napi(object)]
+pub struct ExportGltfResultJs {
+    pub out_path: String,
+}
+
+impl From<crate::service::ExportGltfResult> for ExportGltfResultJs {
+    fn from(r: crate::service::ExportGltfResult) -> Self {
+        Self {
+            out_path: r.out_path,
+        }
+    }
+}
+
+/// Export a minimal-but-valid glTF 2.0 JSON file for the project.
+/// Three.js' `GLTFLoader` and Khronos's glTF-Validator both accept
+/// the output.
+#[napi]
+pub fn export_gltf(params: ExportGltfParamsJs) -> Result<ExportGltfResultJs> {
+    with_service_ref_fallible(|svc| svc.export_gltf(&params.out_path, &params.project_name))
+        .map(Into::into)
+}
+
+/// Typed params for [`export_build_proposal_pack`].
+#[napi(object)]
+pub struct ExportProposalPackParamsJs {
+    pub out_path: String,
+    pub project_name: String,
+    /// `client_name` is informational only — appears on the cover
+    /// page. The export still succeeds when `None` is passed (the
+    /// cover renders `"(client)"` as the placeholder).
+    pub client_name: Option<String>,
+}
+
+/// JS-facing result of [`export_build_proposal_pack`].
+#[napi(object)]
+pub struct ExportProposalPackResultJs {
+    pub out_path: String,
+}
+
+impl From<crate::service::ExportProposalPackResult> for ExportProposalPackResultJs {
+    fn from(r: crate::service::ExportProposalPackResult) -> Self {
+        Self {
+            out_path: r.out_path,
+        }
+    }
+}
+
+/// Export a real client-facing proposal PDF for the project. The
+/// renderer's `BridgeBackend.exportBuildProposalPack` calls this.
+#[napi]
+pub fn export_build_proposal_pack(
+    params: ExportProposalPackParamsJs,
+) -> Result<ExportProposalPackResultJs> {
+    let client = params.client_name.as_deref().unwrap_or("(client)");
+    with_service_ref_fallible(|svc| {
+        svc.export_proposal_pack(&params.out_path, &params.project_name, client)
+    })
+    .map(Into::into)
+}
+
+/// Typed params for [`deliver_build_pack`]. `kind` is one of
+/// `"concept"`, `"interior"`, `"contractor"`, `"bim"` (validated
+/// against `aec_export::DeliverPackKind::parse`).
+#[napi(object)]
+pub struct DeliverBuildPackParamsJs {
+    pub kind: String,
+    pub out_path: String,
+    /// Project label printed on the in-archive PDF summary; the
+    /// renderer defaults this to the open project's name.
+    pub project_name: Option<String>,
+    pub include_renders: Option<bool>,
+    pub include_sheets: Option<bool>,
+    pub include_ifc: Option<bool>,
+    pub include_boq: Option<bool>,
+    pub include_proposal: Option<bool>,
+    /// `region` is currently accepted-and-stored by the renderer
+    /// for compliance metadata, but the bridge doesn't use it
+    /// today (the pack manifest stays region-agnostic). Reserved
+    /// here so the renderer can keep passing it without breaking
+    /// the napi shape.
+    pub region: Option<String>,
+}
+
+/// JS-facing result of [`deliver_build_pack`]. Mirrors the
+/// renderer's `DeliverPackResult` TS interface so the renderer can
+/// use the value as-is for the file-list preview pane.
+#[napi(object)]
+pub struct DeliverBuildPackResultJs {
+    pub out_path: String,
+    pub contents: Vec<String>,
+    /// Total bytes of payload files in the pack (manifest excluded).
+    /// `f64` for the same precision rationale as
+    /// [`BimFileSizeCheckJs::file_size_bytes`] — exact integer
+    /// precision up to 2^53 ≈ 9 PB.
+    pub total_bytes: f64,
+}
+
+impl From<crate::service::DeliverPackResult> for DeliverBuildPackResultJs {
+    fn from(r: crate::service::DeliverPackResult) -> Self {
+        Self {
+            out_path: r.out_path,
+            contents: r.contents,
+            total_bytes: r.total_bytes as f64,
+        }
+    }
+}
+
+/// Assemble a deliverable ZIP archive for the project. Routes
+/// through `with_service_ref_fallible` (read-only) — the export
+/// crate is stateless and the renderer's preview pane polls in
+/// parallel with the archive assembly.
+#[napi]
+pub fn deliver_build_pack(params: DeliverBuildPackParamsJs) -> Result<DeliverBuildPackResultJs> {
+    let project_name = params
+        .project_name
+        .clone()
+        .unwrap_or_else(|| "Project".to_string());
+    let svc_params = crate::service::DeliverBuildPackParams {
+        out_path: params.out_path,
+        kind: params.kind,
+        project_name,
+        options: crate::service::DeliverPackInventoryFlags {
+            include_renders: params.include_renders.unwrap_or(false),
+            include_sheets: params.include_sheets.unwrap_or(false),
+            include_ifc: params.include_ifc.unwrap_or(false),
+            include_boq: params.include_boq.unwrap_or(false),
+            include_proposal: params.include_proposal.unwrap_or(false),
+        },
+    };
+    with_service_ref_fallible(|svc| svc.deliver_build_pack(svc_params.clone())).map(Into::into)
+}
+
 /// JS-facing CPU descriptor. Mirrors `RuntimeStatus["cpu"]` in
 /// `apps/desktop/electron/bridge.ts`.
 #[napi(object)]

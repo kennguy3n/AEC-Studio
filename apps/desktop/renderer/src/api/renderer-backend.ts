@@ -264,11 +264,32 @@ export function rendererInProcessBackend(): AecApi {
       runtimeStatus: async () => ({ state: "idle", lastError: null }),
     },
     export: {
-      exportPdf: async () => ({ outPath: "/exports/out.pdf", pages: 4 }),
-      exportDxf: async () => ({ outPath: "/exports/out.dxf" }),
-      exportIfc: async () => ({ outPath: "/exports/out.ifc" }),
-      exportGltf: async () => ({ outPath: "/exports/out.gltf" }),
-      buildProposalPack: async () => ({ outPath: "/exports/proposal.pdf" }),
+      // Vitest fallback for the export IPC namespace. Mirrors the
+      // shape of the in-process backend in
+      // `apps/desktop/electron/bridge.ts` so renderer tests see the
+      // same `{ outPath, pages? }` shape they get when Electron is
+      // loaded. Honours the caller-supplied `outPath` so the renderer
+      // can assert on the path it requested, falling back to a fixed
+      // sentinel path when the renderer didn't supply one. Page count
+      // (`exportPdf`) is pinned at `2` to match
+      // `aec_export::write_project_pdf` (1 cover + 1 overview); the
+      // electron-side in-process fallback uses the same value.
+      exportPdf: async (params) => ({
+        outPath: readOutPath(params, "/exports/out.pdf"),
+        pages: 2,
+      }),
+      exportDxf: async (params) => ({
+        outPath: readOutPath(params, "/exports/out.dxf"),
+      }),
+      exportIfc: async (params) => ({
+        outPath: readOutPath(params, "/exports/out.ifc"),
+      }),
+      exportGltf: async (params) => ({
+        outPath: readOutPath(params, "/exports/out.gltf"),
+      }),
+      buildProposalPack: async (params) => ({
+        outPath: readOutPath(params, "/exports/proposal.pdf"),
+      }),
     },
     deliver: deliverMock(newId),
     command: commandMock(),
@@ -291,6 +312,18 @@ export function rendererInProcessBackend(): AecApi {
       }),
     },
   };
+}
+
+/**
+ * Read the `outPath` field from a renderer-supplied
+ * `Record<string, unknown>` params object, falling back to a fixed
+ * default when it's missing or not a string. Used by the vitest
+ * fallback for the export IPC namespace so renderer tests see the
+ * `outPath` they passed in (rather than always a fixed sentinel).
+ */
+function readOutPath(params: Record<string, unknown>, fallback: string): string {
+  const v = params.outPath;
+  return typeof v === "string" ? v : fallback;
 }
 
 /**

@@ -782,6 +782,16 @@ interface NativeApi {
   render_apply_preset(preset_id: string): unknown;
   render_diagnose(job_id: string): unknown;
   render_check_materials(): unknown;
+  // Export domain — wired in PR-S. Each takes a typed params object
+  // (`#[napi(object)]` struct in `napi_api.rs`) so the renderer can
+  // pass the same `Record<string, unknown>` shape it already uses
+  // for the in-process fallback.
+  export_pdf(params: Record<string, unknown>): unknown;
+  export_dxf(params: Record<string, unknown>): unknown;
+  export_ifc(params: Record<string, unknown>): unknown;
+  export_gltf(params: Record<string, unknown>): unknown;
+  export_build_proposal_pack(params: Record<string, unknown>): unknown;
+  deliver_build_pack(params: Record<string, unknown>): unknown;
 }
 
 /**
@@ -833,6 +843,18 @@ export const NATIVE_WIRED_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   "renderApplyPreset",
   "renderDiagnose",
   "renderCheckMaterials",
+  // Export + deliver domain wired in PR-S. Each delegates to a real
+  // `#[napi]` export in `crates/aec_bridge/src/napi_api.rs` that
+  // routes through `aec_export::write_*`. Output files are real
+  // bytes (PDF passes `%PDF` magic check, DXF is AC1027 ASCII,
+  // IFC is ISO-10303-21 STEP, glTF is glTF 2.0 JSON, deliver pack
+  // is a real ZIP archive with `manifest.json`).
+  "exportPdf",
+  "exportDxf",
+  "exportIfc",
+  "exportGltf",
+  "exportBuildProposalPack",
+  "deliverBuildPack",
 ];
 
 /**
@@ -872,15 +894,9 @@ export const NATIVE_FALLBACK_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   "aiRejectDiff",
   "aiCancelJob",
   "aiRuntimeStatus",
-  "exportPdf",
-  "exportDxf",
-  "exportIfc",
-  "exportGltf",
-  "exportBuildProposalPack",
   "deliverCreateRevision",
   "deliverListRevisions",
   "deliverCompareRevisions",
-  "deliverBuildPack",
 ];
 
 /**
@@ -1039,6 +1055,23 @@ function adaptNative(n: NativeApi): BridgeBackend {
           fix: string | null;
         }>;
       },
+    // Export + deliver — typed params struct on the Rust side
+    // (`ExportPdfParamsJs` etc.), so we forward the renderer's
+    // `Record<string, unknown>` verbatim. The N-API layer applies
+    // strict field validation (missing `out_path` / wrong types
+    // surface as `napi::Error` with `Status::InvalidArg`).
+    exportPdf: async (params) =>
+      n.export_pdf(params) as { outPath: string; pages: number },
+    exportDxf: async (params) =>
+      n.export_dxf(params) as { outPath: string },
+    exportIfc: async (params) =>
+      n.export_ifc(params) as { outPath: string },
+    exportGltf: async (params) =>
+      n.export_gltf(params) as { outPath: string },
+    exportBuildProposalPack: async (params) =>
+      n.export_build_proposal_pack(params) as { outPath: string },
+    deliverBuildPack: async (params) =>
+      n.deliver_build_pack(params) as DeliverPackResult,
   };
   // Self-check: the two catalogues above must, together, reference every
   // method on the in-process backend. We throw rather than warn so a new
@@ -1457,20 +1490,34 @@ export function inProcessBackend(): BridgeBackend {
       return { state: "idle", lastError: null };
     },
 
-    async exportPdf(_p) {
-      return { outPath: "/exports/out.pdf", pages: 4 };
+    async exportPdf(params) {
+      // In-process fallback mirrors the native `export_pdf` napi
+      // return shape so renderer tests can exercise the full call
+      // path. Honours `params.outPath` when supplied (rather than a
+      // fixed path) so the renderer can pass through the same value
+      // it shows in the UI, and reports a deterministic page count
+      // of 2 (cover + overview) to match the behaviour of
+      // `aec_export::write_project_pdf` (1 cover + 1 overview,
+      // regardless of body length; Phase 11 will add pagination on
+      // long bodies and both sides will move together).
+      const outPath = optionalStringField(params, "outPath") ?? "/exports/out.pdf";
+      return { outPath, pages: 2 };
     },
-    async exportDxf(_p) {
-      return { outPath: "/exports/out.dxf" };
+    async exportDxf(params) {
+      const outPath = optionalStringField(params, "outPath") ?? "/exports/out.dxf";
+      return { outPath };
     },
-    async exportIfc(_p) {
-      return { outPath: "/exports/out.ifc" };
+    async exportIfc(params) {
+      const outPath = optionalStringField(params, "outPath") ?? "/exports/out.ifc";
+      return { outPath };
     },
-    async exportGltf(_p) {
-      return { outPath: "/exports/out.gltf" };
+    async exportGltf(params) {
+      const outPath = optionalStringField(params, "outPath") ?? "/exports/out.gltf";
+      return { outPath };
     },
-    async exportBuildProposalPack(_p) {
-      return { outPath: "/exports/proposal.pdf" };
+    async exportBuildProposalPack(params) {
+      const outPath = optionalStringField(params, "outPath") ?? "/exports/proposal.pdf";
+      return { outPath };
     },
 
     async deliverCreateRevision(params) {
@@ -1983,6 +2030,24 @@ export function applyDeltas(graph: InProcessGraph, deltas: EntityDelta[]): Entit
     }
   }
   return inverse;
+}
+
+/**
+ * Read an optional `string` field from a renderer-supplied
+ * `Record<string, unknown>` params object. Returns `null` if the
+ * field is absent or not a string — the caller picks a default.
+ *
+ * The native side has its own (stricter) typed-params validation
+ * via `#[napi(object)]` structs; this helper is purely for the
+ * in-process fallback where the renderer talks `Record<string,
+ * unknown>` directly to the TS layer.
+ */
+function optionalStringField(
+  params: Record<string, unknown>,
+  key: string,
+): string | null {
+  const v = params[key];
+  return typeof v === "string" ? v : null;
 }
 
 function inProcessEngineStatus(): EngineStatus {

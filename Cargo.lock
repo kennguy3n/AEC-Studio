@@ -162,6 +162,7 @@ dependencies = [
 name = "aec_export"
 version = "0.1.0"
 dependencies = [
+ "aec_bim",
  "aec_cad",
  "aec_core",
  "aec_materials",

@@ -12,6 +12,7 @@ pub mod interior_pack;
 pub mod pdf;
 pub mod pdf_sheet;
 pub mod plot_style;
+pub mod project_export;
 pub mod proposal;
 pub mod schedule;
 pub mod svg_export;
@@ -31,6 +32,12 @@ pub use interior_pack::{InteriorPack, InteriorPackError, InteriorRender};
 pub use pdf::{PdfBuilder, PdfBuilderError};
 pub use pdf_sheet::SheetPdfBuilder;
 pub use plot_style::{PlotStyle, PlotStyleTable};
+pub use project_export::{
+    write_deliver_pack, write_project_dxf, write_project_gltf, write_project_ifc,
+    write_project_pdf, write_proposal_pack, DeliverPackKind, DeliverPackOptions,
+    ProjectExportError, WriteDeliverPackResult, WriteProjectDxfResult, WriteProjectGltfResult,
+    WriteProjectIfcResult, WriteProjectPdfResult, WriteProposalPackResult,
+};
 pub use proposal::{
     ProposalAssets, ProposalBranding, ProposalPack, ProposalPageOrder, RenderAttachment,
 };
