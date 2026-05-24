@@ -1222,7 +1222,21 @@ impl RevolvedAreaSolid {
 /// **Validity**: requires at least 2 vertices on the path. A path
 /// of 2 collinear vertices becomes a straight cylinder; a path of
 /// N vertices produces N-1 cylindrical segments stitched into a
-/// continuous tube.
+/// continuous tube. Consecutive coincident vertices are coalesced
+/// before the parallel-transport frame is built (so duplicated
+/// joints in real-world Revit / IfcOpenShell exports don't collapse
+/// the frame).
+///
+/// **180° hairpin limitation**: if two consecutive tangents are
+/// nearly antiparallel, the parallel-transport projection collapses
+/// the local frame and the tessellator emits degenerate (zero-area)
+/// triangles at that joint instead of recovering a clean frame. This
+/// is an accepted limitation rather than a bug — IFC4
+/// `IfcSweptDiskSolid.Directrix` polylines never legitimately
+/// contain 180° hairpins (they'd describe a self-intersecting tube),
+/// and recovering with a fresh `pick_perpendicular` would introduce
+/// a visible frame discontinuity at the joint that's worse than the
+/// invisible degenerate triangles.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SweptDiskSolid {
     /// 3D polyline the disk is swept along.
