@@ -727,11 +727,18 @@ fn render_tile_pass_inner(
             let mut alb_accum = [0.0_f32; 3];
             let mut nrm_accum = [0.0_f32; 3];
             let mut dep_accum = 0.0_f32;
+            // Per-pixel Cranley-Patterson rotation (see render_tile for
+            // the rationale). `samples_this_pass` is the per-pass
+            // sample count, not the running total across passes —
+            // schedulers that run multiple passes will re-seed each
+            // pass's rotation via `rng_seed`, which is correct
+            // because the Halton sequence is re-anchored per pass
+            // anyway.
+            let pixel_seed = [rng.f32(), rng.f32()];
             for s in 0..samples_this_pass {
                 let px = tile.x_start + lx as u32;
                 let py = tile.y_start + ly as u32;
-                let jx = rng.f32();
-                let jy = rng.f32();
+                let (jx, jy) = crate::sampling::stratified_jitter(s, pixel_seed);
                 let dir_world = match config.projection {
                     CameraProjection::Perspective => {
                         let nx = (px as f32 + jx) / config.width as f32 * 2.0 - 1.0;
@@ -864,11 +871,16 @@ fn render_tile(
             let mut alb_accum = [0.0_f32; 3];
             let mut nrm_accum = [0.0_f32; 3];
             let mut dep_accum = 0.0_f32;
-            for _ in 0..config.samples_per_pixel {
+            // Per-pixel Cranley-Patterson rotation: one random offset
+            // shared by all of this pixel's samples. Decorrelates the
+            // Halton sequence between pixels so the image doesn't
+            // show a global pattern, while preserving the low-
+            // discrepancy property within each pixel.
+            let pixel_seed = [rng.f32(), rng.f32()];
+            for s in 0..config.samples_per_pixel {
                 let px = tile.x_start + lx as u32;
                 let py = tile.y_start + ly as u32;
-                let jx = rng.f32();
-                let jy = rng.f32();
+                let (jx, jy) = crate::sampling::stratified_jitter(s, pixel_seed);
                 let dir_world = match config.projection {
                     CameraProjection::Perspective => {
                         let nx = (px as f32 + jx) / config.width as f32 * 2.0 - 1.0;

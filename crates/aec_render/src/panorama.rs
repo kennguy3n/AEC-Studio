@@ -407,9 +407,17 @@ mod tests {
     #[test]
     fn equirectangular_dir_test_via_two_distinct_pixels() {
         // Verify two different pixels yield different world-space
-        // directions. We do this indirectly by rendering a 4x2 image of
-        // an empty scene with a custom-tinted sky and checking that the
-        // left edge and right edge produce visibly different radiance.
+        // directions. Render a panorama where the sun is large enough
+        // that stratified jitter will see it at the equator but not at
+        // the zenith, and check that the two regions differ in radiance.
+        //
+        // (We deliberately do *not* compare bit-identical pixel sums
+        // here: with low-discrepancy jitter [stratified Halton(2,3)],
+        // every pixel's per-sample directions cluster on the same
+        // unit-square Halton points, so two pixels seeing the same
+        // uniform sky background reliably produce identical radiance.
+        // The brittleness of an exact-sum comparison was a property of
+        // the prior pure-random ray-gen, not a feature.)
         let mut scene = PathTraceScene {
             bvh: crate::bvh::Bvh::build(&[]),
             triangles: Vec::new(),
@@ -419,14 +427,13 @@ mod tests {
             lights: Vec::new(),
             sky: crate::lighting::SkyParams::default(),
         };
-        // Aim the sun at a specific direction so the panorama has a
-        // bright spot at known longitude.
+        // Large sun (~17° angular radius) so even a 2-sample pixel at
+        // the equator reliably hits it; tiny suns are too brittle.
         scene.lights.push(crate::light_sampling::NativeLight::Sun {
             direction: Vec3::new(0.0, -1.0, 0.0).normalize(),
             radiance: Vec3::splat(10.0),
-            angular_radius_rad: 0.05,
+            angular_radius_rad: 0.3,
         });
-        // No geometry, just sky+sun visible.
         let camera = RenderCamera {
             id: "c".into(),
             position_mm: [0.0, 0.0, 0.0],
@@ -439,7 +446,7 @@ mod tests {
         let config = PathTraceConfig {
             width: 8,
             height: 4,
-            samples_per_pixel: 2,
+            samples_per_pixel: 4,
             max_bounces: 1,
             tile_size: 8,
             russian_roulette_min_bounces: 3,
@@ -452,16 +459,25 @@ mod tests {
             x_end: 8,
             y_end: 4,
         };
-        let result = render_tile_pass(&scene, &camera, &config, tile, 2, 0xBEEF);
-        // Top row (closer to zenith) should differ from the bottom row
-        // (closer to the sun pointing -Y). At minimum the per-channel
-        // sums must not be bit-identical, which would mean the ray-gen
-        // ignored pixel coordinates entirely. Sums share the same
-        // sample count so we can compare them directly without
-        // averaging.
-        let first = result.sums[0];
-        let last = result.sums[result.sums.len() - 1];
-        let differs = (0..3).any(|c| (first[c] - last[c]).abs() > 1e-4);
-        assert!(differs, "equirectangular pixels must vary across image");
+        let result = render_tile_pass(&scene, &camera, &config, tile, 4, 0xBEEF);
+        // The panorama mapping at v=0 (top row) points toward +Y; sun
+        // direction is `Vec3::new(0, -1, 0)` so the apparent sun is at
+        // +Y, which lands on the top row. The top row must therefore
+        // be measurably brighter than the bottom row, proving (a)
+        // pixel coordinates affect ray direction and (b) the mapping
+        // is the documented centre-forward convention.
+        let top_row_lum: f32 = (0..8)
+            .map(|x| result.sums[x][0] + result.sums[x][1] + result.sums[x][2])
+            .sum();
+        let bottom_row_lum: f32 = (0..8)
+            .map(|x| {
+                let i = 3 * 8 + x;
+                result.sums[i][0] + result.sums[i][1] + result.sums[i][2]
+            })
+            .sum();
+        assert!(
+            top_row_lum > bottom_row_lum + 1.0,
+            "equirectangular pixels must vary across image: top {top_row_lum}, bottom {bottom_row_lum}"
+        );
     }
 }

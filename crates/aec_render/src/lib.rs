@@ -27,6 +27,7 @@ pub mod path_trace;
 pub mod preset;
 pub mod preview;
 pub mod queue;
+pub mod sampling;
 pub mod scene;
 pub mod scheduler;
 pub mod walkthrough;
