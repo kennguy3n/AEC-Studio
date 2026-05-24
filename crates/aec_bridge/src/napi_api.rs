@@ -198,7 +198,15 @@ pub fn project_save(path: String) -> Result<ProjectSummaryJs> {
 
 #[napi]
 pub fn project_list_recents() -> Result<Vec<ProjectSummaryJs>> {
-    with_service(|svc| svc.project_list_recents()).map(|v| v.into_iter().map(Into::into).collect())
+    // `project_list_recents` is `&self` on `BridgeService` (it just
+    // reads the in-memory recents store), so the bridge singleton
+    // only needs a *read* lock for the duration of the call. Using
+    // `with_service_ref_fallible` instead of `with_service` lets the
+    // Home page's recents list run concurrently with status-pane
+    // polls and with each other — only the mutating endpoints
+    // (project_open / save / sync / create) exclude these reads.
+    with_service_ref_fallible(|svc| svc.project_list_recents())
+        .map(|v| v.into_iter().map(Into::into).collect())
 }
 
 /// JS-facing engine status. Field names map directly to the TS

@@ -123,6 +123,25 @@ impl EngineStatusCache {
     /// stale; otherwise call `open` to produce a fresh one, insert it,
     /// and return it.
     ///
+    /// Uses a **double-checked locking** pattern so the cache mutex is
+    /// **not held during `open()`**. This matters on cold start: two
+    /// concurrent first-polls for *different* projects each take the
+    /// cache lock briefly, miss, release the lock, run their open
+    /// concurrently, then briefly re-acquire to insert. Without DCL
+    /// the second project's open would serialize behind the first
+    /// project's ~0.8–1.2 ms key derive + PRAGMA cipher + migration
+    /// walk.
+    ///
+    /// **Race semantics on the same key.** If two threads both miss
+    /// the cache for the same path, both will run `open()` (one of
+    /// the resulting connections is wasted). On the second insert,
+    /// the loser observes the winner's already-inserted entry and
+    /// returns that one; its own freshly-opened connection drops
+    /// cleanly via `Arc`. This is a deliberate trade-off: the
+    /// alternative is a per-key lock (overkill for an O(few) cache),
+    /// and a wasted ~1 ms open on a rare race is cheaper than the
+    /// global serialization the previous design imposed.
+    ///
     /// The returned [`Arc`] keeps the entry alive across the cache
     /// lock release — the caller can run queries against it without
     /// holding the cache lock, so concurrent calls for *other* paths
@@ -131,24 +150,43 @@ impl EngineStatusCache {
     where
         F: FnOnce() -> Result<Connection, E>,
     {
+        // Phase 1: hot-path lookup under the cache lock.
+        {
+            let mut cache = self.entries.lock().expect("cache mutex poisoned");
+            self.evict_stale(&mut cache);
+            if let Some(entry) = cache.get(key) {
+                *entry
+                    .last_used
+                    .lock()
+                    .expect("cached connection last_used mutex poisoned") = Instant::now();
+                return Ok(entry.clone());
+            }
+        }
+
+        // Phase 2: open WITHOUT holding the cache lock. This is the
+        // expensive operation (BLAKE3 key derive + PRAGMA cipher +
+        // migration registry walk) and we deliberately let it run
+        // concurrently with other readers / other-key cold opens.
+        let conn = open()?;
+        let new_entry = Arc::new(CachedConn {
+            conn: Mutex::new(conn),
+            last_used: Mutex::new(Instant::now()),
+        });
+
+        // Phase 3: re-acquire the cache lock and check again. If
+        // another thread inserted while we were opening, their entry
+        // wins (our connection drops with the `new_entry` Arc when
+        // it goes out of scope on the return path).
         let mut cache = self.entries.lock().expect("cache mutex poisoned");
-        self.evict_stale(&mut cache);
         if let Some(entry) = cache.get(key) {
-            // Hot path: refresh last_used so we don't churn the entry
-            // out on the next eviction sweep.
             *entry
                 .last_used
                 .lock()
                 .expect("cached connection last_used mutex poisoned") = Instant::now();
             return Ok(entry.clone());
         }
-        let conn = open()?;
-        let entry = Arc::new(CachedConn {
-            conn: Mutex::new(conn),
-            last_used: Mutex::new(Instant::now()),
-        });
-        cache.insert(key.to_path_buf(), entry.clone());
-        Ok(entry)
+        cache.insert(key.to_path_buf(), new_entry.clone());
+        Ok(new_entry)
     }
 
     /// Drop the cache entry for `key`, if any. Called by mutating
@@ -157,6 +195,26 @@ impl EngineStatusCache {
     pub(crate) fn invalidate(&self, key: &Path) {
         let mut cache = self.entries.lock().expect("cache mutex poisoned");
         cache.remove(key);
+    }
+
+    /// Drop **every** cached entry. Used as a safe fallback by the
+    /// mutating bridge endpoints when canonicalising the project
+    /// path fails (e.g. a transient `std::fs::canonicalize` error
+    /// between a successful open and the post-write invalidation):
+    /// rather than silently leaving a potentially-stale entry alive
+    /// until idle TTL eviction, blow the cache away so the next
+    /// status read for *any* project is guaranteed to observe a
+    /// fresh database state.
+    ///
+    /// In practice this path is essentially unreachable — the
+    /// canonicalisation only runs *after* a successful
+    /// [`aec_core::package::ProjectPackage::open_with_master_key`]
+    /// which proves the path exists — but we still want to be
+    /// correct in the face of NFS blips and similar weirdness rather
+    /// than serve stale data.
+    pub(crate) fn invalidate_all(&self) {
+        let mut cache = self.entries.lock().expect("cache mutex poisoned");
+        cache.clear();
     }
 
     /// How many connections are currently cached. Used by the
@@ -358,5 +416,142 @@ mod tests {
             .get_or_open::<_, rusqlite::Error>(&key, || Err(rusqlite::Error::QueryReturnedNoRows));
         assert!(result.is_err());
         assert_eq!(cache.len(), 0, "failed open must not leave a tombstone");
+    }
+
+    #[test]
+    fn invalidate_all_clears_every_entry() {
+        let cache = EngineStatusCache::new();
+        let _a = cache
+            .get_or_open::<_, rusqlite::Error>(Path::new("/tmp/inv-a"), || Ok(in_memory_conn()))
+            .unwrap();
+        let _b = cache
+            .get_or_open::<_, rusqlite::Error>(Path::new("/tmp/inv-b"), || Ok(in_memory_conn()))
+            .unwrap();
+        let _c = cache
+            .get_or_open::<_, rusqlite::Error>(Path::new("/tmp/inv-c"), || Ok(in_memory_conn()))
+            .unwrap();
+        assert_eq!(cache.len(), 3);
+
+        cache.invalidate_all();
+        assert_eq!(cache.len(), 0);
+
+        // After wiping, subsequent get_or_open must re-open from
+        // scratch — the cache has no memory of the previous entries.
+        let calls = Cell::new(0u32);
+        let _re = cache
+            .get_or_open::<_, rusqlite::Error>(Path::new("/tmp/inv-a"), || {
+                calls.set(calls.get() + 1);
+                Ok(in_memory_conn())
+            })
+            .unwrap();
+        assert_eq!(
+            calls.get(),
+            1,
+            "invalidate_all must force re-open on next access"
+        );
+    }
+
+    #[test]
+    fn get_or_open_does_not_hold_cache_lock_during_open() {
+        // The double-checked-locking refactor moved `open()` out of
+        // the cache-lock critical section so a slow cold open for
+        // project A no longer serializes a concurrent cold open for
+        // project B. Prove it: thread 1 holds an `open` callback open
+        // for ~50 ms; meanwhile thread 2 must be able to call
+        // `get_or_open` for a *different* key and complete promptly.
+        use std::sync::mpsc;
+
+        let cache = Arc::new(EngineStatusCache::new());
+        let (start_slow_tx, start_slow_rx) = mpsc::channel::<()>();
+        let (slow_inside_tx, slow_inside_rx) = mpsc::channel::<()>();
+        let (release_slow_tx, release_slow_rx) = mpsc::channel::<()>();
+
+        let cache_slow = cache.clone();
+        let slow = thread::spawn(move || {
+            start_slow_rx.recv().unwrap();
+            let _e = cache_slow
+                .get_or_open::<_, rusqlite::Error>(Path::new("/tmp/dcl-slow"), || {
+                    // Signal that we're now INSIDE the open callback.
+                    slow_inside_tx.send(()).unwrap();
+                    // Block until the test harness releases us.
+                    release_slow_rx.recv().unwrap();
+                    Ok(in_memory_conn())
+                })
+                .unwrap();
+        });
+
+        // Kick the slow thread off and wait until it's stuck inside
+        // its open callback (i.e. past phase 1's lock release).
+        start_slow_tx.send(()).unwrap();
+        slow_inside_rx.recv().unwrap();
+
+        // Now race a second cold open on a different key. If the
+        // cache lock were still held by the slow thread this call
+        // would block until release_slow_tx is signalled. With DCL
+        // it returns immediately.
+        let start = Instant::now();
+        let _fast = cache
+            .get_or_open::<_, rusqlite::Error>(Path::new("/tmp/dcl-fast"), || Ok(in_memory_conn()))
+            .unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(40),
+            "second cold open should not block on first cold open's `open()`; \
+             actually took {elapsed:?}"
+        );
+
+        // Release the slow thread so it can finish and join cleanly.
+        release_slow_tx.send(()).unwrap();
+        slow.join().unwrap();
+
+        assert_eq!(cache.len(), 2, "both cold opens must end up cached");
+    }
+
+    #[test]
+    fn same_key_concurrent_miss_settles_on_one_entry() {
+        // Per the documented race semantics: when two threads both
+        // miss the cache for the same key, both run `open()`, and the
+        // second insert observes the winner's entry and discards its
+        // own connection via Arc drop. Either way the cache ends up
+        // with exactly one entry for that key and the two returned
+        // Arcs point to the same `CachedConn`.
+        let cache = Arc::new(EngineStatusCache::new());
+        let key = Path::new("/tmp/dcl-race");
+
+        let cache_a = cache.clone();
+        let h_a = thread::spawn(move || {
+            cache_a
+                .get_or_open::<_, rusqlite::Error>(key, || {
+                    // Sleep so the other thread reliably races.
+                    thread::sleep(Duration::from_millis(10));
+                    Ok(in_memory_conn())
+                })
+                .unwrap()
+        });
+        let cache_b = cache.clone();
+        let h_b = thread::spawn(move || {
+            cache_b
+                .get_or_open::<_, rusqlite::Error>(key, || {
+                    thread::sleep(Duration::from_millis(10));
+                    Ok(in_memory_conn())
+                })
+                .unwrap()
+        });
+
+        let entry_a = h_a.join().unwrap();
+        let entry_b = h_b.join().unwrap();
+
+        // Critical invariant: both threads return Arcs pointing at
+        // the SAME cached CachedConn — the loser of the second-check
+        // race re-fetched the winner's entry.
+        assert!(
+            Arc::ptr_eq(&entry_a, &entry_b),
+            "same-key concurrent miss must settle on one cached entry, not two"
+        );
+        assert_eq!(
+            cache.len(),
+            1,
+            "cache must hold exactly one entry for the key"
+        );
     }
 }

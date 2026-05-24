@@ -203,6 +203,26 @@ impl BridgeService {
         Ok(std::fs::canonicalize(Path::new(path))?)
     }
 
+    /// Invalidate the engine-status cache entry for `path`. If
+    /// canonicalisation fails (a transient filesystem error or a
+    /// path that disappeared between the successful open and the
+    /// post-mutation invalidation), fall back to dropping every
+    /// cached connection. This guarantees the next status read can
+    /// never observe stale post-mutation state — the previous
+    /// behaviour was an `if let Ok(...)` silent-skip that would have
+    /// left a stale entry alive for up to `CACHE_TTL`.
+    ///
+    /// Used by every mutating endpoint: `project_open`,
+    /// `project_save`, `project_audit_sync`. Kept on `&self` (not
+    /// `&mut self`) so it composes inside the existing
+    /// `&mut self` method signatures without further borrow churn.
+    fn invalidate_status_cache_for(&self, path: &str) {
+        match Self::cache_key(path) {
+            Ok(key) => self.engine_status_cache.invalidate(&key),
+            Err(_) => self.engine_status_cache.invalidate_all(),
+        }
+    }
+
     /// Test-only accessor for the engine-status connection cache size.
     /// Lets unit AND integration tests in the same crate assert
     /// cache-hit / invalidation behavior without exposing the cache
@@ -286,9 +306,12 @@ impl BridgeService {
         // status-pane connection we'd cached pre-open would have a
         // stale prepared-statement cache against the old schema.
         // Drop it so the next `project_engine_status` re-opens.
-        if let Ok(key) = Self::cache_key(path) {
-            self.engine_status_cache.invalidate(&key);
-        }
+        // Fall back to `invalidate_all` if canonicalisation fails (a
+        // transient filesystem error between the successful open and
+        // here) so the cache can never serve stale post-migration
+        // state — see `EngineStatusCache::invalidate_all` for the
+        // full rationale.
+        self.invalidate_status_cache_for(path);
         let core_summary = pkg.summary();
         let summary: ProjectSummary = core_summary.clone().into();
         self.recents.record(&core_summary)?;
@@ -306,11 +329,11 @@ impl BridgeService {
         let mut pkg = ProjectPackage::open_with_master_key(path, &self.master_key)?;
         pkg.save()?;
         // The manifest just changed on disk; any cached status
-        // connection's view of `schema_version` is now stale. Invalidate
-        // so the next status read sees the post-save state.
-        if let Ok(key) = Self::cache_key(path) {
-            self.engine_status_cache.invalidate(&key);
-        }
+        // connection's view of `schema_version` is now stale.
+        // Invalidate so the next status read sees the post-save
+        // state. Falls back to `invalidate_all` on canonicalise
+        // failure (see `invalidate_status_cache_for`).
+        self.invalidate_status_cache_for(path);
         Ok(pkg.summary().into())
     }
 
@@ -344,10 +367,9 @@ impl BridgeService {
         // engine-status connection's `SELECT count(*)` and per-scope
         // counts would otherwise be evaluated against a stale snapshot
         // until idle eviction. Invalidate so the next status read picks
-        // up the synced rows immediately.
-        if let Ok(key) = Self::cache_key(path) {
-            self.engine_status_cache.invalidate(&key);
-        }
+        // up the synced rows immediately. Falls back to `invalidate_all`
+        // on canonicalise failure (see `invalidate_status_cache_for`).
+        self.invalidate_status_cache_for(path);
         Ok(n as u64)
     }
 
@@ -722,6 +744,38 @@ mod tests {
             s.__engine_status_cache_len(),
             0,
             "project_audit_sync must invalidate the engine-status cache entry"
+        );
+    }
+
+    #[test]
+    fn invalidate_status_cache_for_falls_back_when_canonicalize_fails() {
+        // Populate the cache with two entries, then call the
+        // invalidation helper with a path that cannot be canonicalised
+        // (does not exist on disk). The fallback `invalidate_all` must
+        // wipe the cache so a follow-up status read on EITHER project
+        // re-opens against the freshest on-disk state — this is what
+        // protects us against the silent-skip regression the previous
+        // `if let Ok(...)` implementation had.
+        let (mut s, _g) = service();
+        let a = s
+            .project_create_from_template("interior.apartment", "Cleared A")
+            .unwrap();
+        let b = s
+            .project_create_from_template("interior.apartment", "Cleared B")
+            .unwrap();
+        s.project_engine_status(&a.path).unwrap();
+        s.project_engine_status(&b.path).unwrap();
+        assert_eq!(s.__engine_status_cache_len(), 2);
+
+        // A bogus path under the same projects_dir parent. canonicalize
+        // will return an `Err` because the path does not exist.
+        let bogus = "/this/path/definitely/does/not/exist/project.aecstudio";
+        s.invalidate_status_cache_for(bogus);
+
+        assert_eq!(
+            s.__engine_status_cache_len(),
+            0,
+            "invalidate_status_cache_for must wipe the entire cache when canonicalize fails"
         );
     }
 
