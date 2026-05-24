@@ -2987,6 +2987,30 @@ END-ISO-10303-21;\n"
         }
     }
 
+    /// Pin every `IfcSchema` variant's wire-format token to its
+    /// canonical STEP literal. The `BimImportSummary.schema` field
+    /// (and the TS renderer that match on it) consume the output of
+    /// `Display` / `as_step_literal`, NOT the result of an IFC
+    /// round-trip — so a drift here (e.g. someone changing
+    /// `IfcSchema::Ifc4 => "IFC4"` to `=> "Ifc4"`) would slip past
+    /// the existing round-trip tests (`from_step_literal`
+    /// case-folds on input) yet silently break the renderer's
+    /// match. The exhaustive `match` in `as_step_literal` catches
+    /// missing variants at compile time; this test catches token
+    /// string drift at test time.
+    #[test]
+    fn as_step_literal_pins_canonical_tokens() {
+        assert_eq!(IfcSchema::Ifc2x3.as_step_literal(), "IFC2X3");
+        assert_eq!(IfcSchema::Ifc4.as_step_literal(), "IFC4");
+        assert_eq!(IfcSchema::Ifc4x3.as_step_literal(), "IFC4X3");
+        // `Display` MUST agree with `as_step_literal` — the service
+        // layer's `snapshot.schema.to_string()` goes through `Display`
+        // not `as_step_literal` directly.
+        assert_eq!(IfcSchema::Ifc2x3.to_string(), "IFC2X3");
+        assert_eq!(IfcSchema::Ifc4.to_string(), "IFC4");
+        assert_eq!(IfcSchema::Ifc4x3.to_string(), "IFC4X3");
+    }
+
     /// `FILE_SCHEMA(('IFCXX'))` for an unknown schema literal must
     /// fail with `MissingSection("FILE_SCHEMA")` so callers can
     /// surface a clear "unsupported schema" error rather than
