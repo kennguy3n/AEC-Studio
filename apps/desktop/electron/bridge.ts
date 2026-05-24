@@ -715,6 +715,21 @@ export interface BimDiffPropertyChange {
  * `key` is the join key built by `aec_bim::diff` — GUID first,
  * falling back to `class:name`. Field-for-field mirror of
  * `BimDiffElementChangeJs` in `crates/aec_bridge/src/napi_api.rs`.
+ *
+ * **Pair invariant**: `classBefore` and `classAfter` are produced
+ * by `aec_bim::diff::ElementDelta::class_changed: Option<(String,
+ * String)>` — either *both* are `null` (class didn't change) or
+ * *both* are non-null `string` (class changed from `classBefore`
+ * to `classAfter`). The mixed states `(null, string)` and
+ * `(string, null)` are unreachable by construction (see the
+ * `From<ElementDelta> for BimDiffElementChangeJs` impl in
+ * `crates/aec_bridge/src/napi_api.rs`). The same invariant
+ * applies to the `nameBefore` / `nameAfter` pair. Consumers
+ * should treat them as paired and do not need to defend against
+ * the impossible half-null states. The flat-field shape (rather
+ * than `classChange: { before; after } | null`) follows the
+ * `#[napi(object)]` convention of flat-by-default; this doc is
+ * the pin.
  */
 export interface BimDiffElementChange {
   key: string;

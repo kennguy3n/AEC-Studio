@@ -1042,6 +1042,19 @@ impl From<crate::service::BimDiffPropertyChange> for BimDiffPropertyChangeJs {
 /// JS-facing element-level change inside a `BimDiffSummary::modified`
 /// list. The `key` is the join key built by `aec_bim::diff` — GUID
 /// first, falling back to `class:name`.
+///
+/// **Pair invariant**: `class_before` and `class_after` come from
+/// `aec_bim::diff::ElementDelta::class_changed: Option<(String,
+/// String)>` via the `From` impl below, which splits the tuple so
+/// `#[napi(object)]` can serialise it (napi-rs `#[napi(object)]`
+/// doesn't carry nested `Option<#[napi(object)]>` cleanly). The
+/// split is purely an FFI shape concern: the two fields are
+/// *always* `(None, None)` or *always* `(Some(_), Some(_))` — the
+/// mixed states `(None, Some(_))` / `(Some(_), None)` are
+/// unreachable by construction. The same applies to `name_before`
+/// / `name_after`. The TS-side `BimDiffElementChange` interface in
+/// `apps/desktop/electron/bridge.ts` documents the same invariant
+/// for renderer consumers.
 #[napi(object)]
 pub struct BimDiffElementChangeJs {
     pub key: String,
