@@ -339,6 +339,57 @@ pub fn bim_import_ifc(path: String) -> Result<BimImportSummaryJs> {
     with_service_ref_fallible(|svc| svc.bim_import_ifc(&path)).map(Into::into)
 }
 
+/// JS-facing cheap file-size check. Mirrors the renderer's
+/// `BimFileSizeCheck` interface in `apps/desktop/electron/bridge.ts`.
+///
+/// `file_size_bytes` and `threshold_bytes` are exposed as `f64`
+/// (JS `number`) so the renderer can do arithmetic on them directly
+/// (`fileSizeBytes / (1024 * 1024)` for humanised MB strings,
+/// `fileSizeBytes >= thresholdBytes` for the large-file guard)
+/// without BigInt / Number incompatibility. `f64` has exact
+/// integer precision up to 2^53 ≈ 9 PB — well beyond any
+/// conceivable IFC file — and matches the TS interface declaration
+/// of `number` in `bridge.ts` and `preload.ts`.
+///
+/// Consistency: this deliberately follows the same pattern as
+/// [`BimImportSummaryJs`], which uses `u32` (safe `number`) for
+/// entity counts. When this method is wired to the native bridge
+/// (i.e. moved from `NATIVE_FALLBACK_METHODS` to
+/// `NATIVE_WIRED_METHODS`), the JS side receives `number`
+/// directly — no BigInt / Number coercion footgun.
+#[napi(object)]
+pub struct BimFileSizeCheckJs {
+    pub path: String,
+    pub file_size_bytes: f64,
+    pub large_file_warning: bool,
+    pub threshold_bytes: f64,
+}
+
+impl From<crate::service::BimFileSizeCheck> for BimFileSizeCheckJs {
+    fn from(r: crate::service::BimFileSizeCheck) -> Self {
+        Self {
+            path: r.path,
+            file_size_bytes: r.file_size_bytes as f64,
+            large_file_warning: r.large_file_warning,
+            threshold_bytes: r.threshold_bytes as f64,
+        }
+    }
+}
+
+/// Cheap pre-parse stat of an `.ifc` file. The renderer's
+/// file-picker UI calls this *before* invoking `bim_import_ifc`
+/// so it can show a confirm dialog ("This file is 412 MB; parsing
+/// may take a while — continue?") on large files *before* the
+/// user commits to the multi-second parse path.
+///
+/// One `fs::metadata` + one `fs::canonicalize` — no file read,
+/// no parse, no allocation beyond the canonicalised path.
+/// Routed through `with_service_ref_fallible` (read-only).
+#[napi]
+pub fn bim_check_file_size(path: String) -> Result<BimFileSizeCheckJs> {
+    with_service_ref_fallible(|svc| svc.bim_check_file_size(&path)).map(Into::into)
+}
+
 /// JS-facing CPU descriptor. Mirrors `RuntimeStatus["cpu"]` in
 /// `apps/desktop/electron/bridge.ts`.
 #[napi(object)]

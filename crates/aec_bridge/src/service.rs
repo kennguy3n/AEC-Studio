@@ -201,6 +201,38 @@ pub struct BimImportSummary {
     pub large_file_warning: bool,
 }
 
+/// Result of a successful [`BridgeService::bim_check_file_size`]
+/// call. Cheap (one `fs::metadata` + one `fs::canonicalize`) so
+/// the renderer can call it on every file the user picks without
+/// committing to the multi-second IFC parse path.
+///
+/// The renderer uses `large_file_warning` to decide whether to
+/// throw up a confirm dialog before invoking
+/// [`BridgeService::bim_import_ifc`]. The dialog renders
+/// `file_size_bytes` humanised ("412 MB") and `threshold_bytes`
+/// for context ("the 100 MB warn threshold").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BimFileSizeCheck {
+    /// Canonical absolute path of the file as stat'd. Matches
+    /// [`BimImportSummary::path`] canonicalisation rules so the
+    /// renderer can dedup pick → check → import sequences across
+    /// non-canonical inputs (`./foo.ifc` vs absolute).
+    pub path: String,
+    /// File size in bytes per `std::fs::metadata`.
+    pub file_size_bytes: u64,
+    /// `true` when `file_size_bytes >= threshold_bytes`. The
+    /// renderer should warn-and-confirm (not block) — a user
+    /// with a 500 MB MEP federation has a legitimate workflow
+    /// reason to proceed.
+    pub large_file_warning: bool,
+    /// The current warn threshold, surfaced verbatim so the
+    /// renderer can render the dialog body ("This file is
+    /// 412 MB, above the 100 MB warn threshold; parsing may
+    /// take a while — continue?") without re-importing the
+    /// constant.
+    pub threshold_bytes: u64,
+}
+
 /// Result of a successful [`BridgeService::bim_attach_ifc`] call.
 /// Counts how the snapshot was folded into the project graph so the
 /// renderer can show "Attached 3 storeys, 142 walls, 87 doors, ...".
@@ -611,6 +643,56 @@ impl BridgeService {
                 audit_chain_sql_count: sql_count as u64,
                 audit_chain_by_scope: by_scope,
             })
+        })
+    }
+
+    /// Stat an `.ifc` file at `path` and return a cheap size-only
+    /// summary. The renderer calls this *before* invoking
+    /// [`Self::bim_import_ifc`] so it can show a confirm dialog
+    /// ("This file is N MB; parsing may take a while — continue?")
+    /// on multi-hundred-MB MEP federations *before* the user
+    /// commits to a multi-second parse path. The cost is one
+    /// `std::fs::metadata` syscall — no file read, no parse, no
+    /// allocation beyond the canonicalised path string.
+    ///
+    /// The threshold is the same
+    /// [`BIM_IMPORT_LARGE_FILE_THRESHOLD_BYTES`] (100 MB) used by
+    /// [`BimImportSummary::large_file_warning`], so the
+    /// pre-parse warning (this function) and the post-parse
+    /// warning (the import summary) agree on what counts as
+    /// "large". The bridge does NOT enforce the warning — the
+    /// renderer is free to ignore it and call `bim_import_ifc`
+    /// anyway, in which case the import goes through with the
+    /// flag set on the summary. That matches the
+    /// [`BimImportSummary::large_file_warning`] doc comment
+    /// stating the flag is purely advisory.
+    pub fn bim_check_file_size(&self, path: &str) -> Result<BimFileSizeCheck, BridgeServiceError> {
+        // Order: canonicalize → metadata, matching the error-surface
+        // semantics of `bim_import_ifc` below (which calls
+        // `std::fs::read` first — and `read` follows symlinks and
+        // fails on dangling targets). Doing metadata-first would
+        // give a different error for a dangling symlink: `metadata`
+        // returns the link's own info (reporting the link size,
+        // **not** the would-be target size), and then `canonicalize`
+        // fails because the target doesn't exist. The renderer would
+        // see a "checkFileSize OK, importIfc not-found" sequence on
+        // the same path, which is surprising.
+        //
+        // Canonicalizing first surfaces dangling links as a single
+        // `Io(NotFound)` error from `canonicalize`, identical to what
+        // `bim_import_ifc` would produce from its `std::fs::read`
+        // call. Subsequent `metadata` then operates on the resolved
+        // path — single symlink resolution, single source of truth
+        // for "does this file exist" semantics.
+        let canonical_path_buf = std::fs::canonicalize(Path::new(path))?;
+        let metadata = std::fs::metadata(&canonical_path_buf)?;
+        let file_size_bytes = metadata.len();
+        let canonical_path = canonical_path_buf.to_string_lossy().into_owned();
+        Ok(BimFileSizeCheck {
+            path: canonical_path,
+            file_size_bytes,
+            large_file_warning: file_size_bytes >= BIM_IMPORT_LARGE_FILE_THRESHOLD_BYTES,
+            threshold_bytes: BIM_IMPORT_LARGE_FILE_THRESHOLD_BYTES,
         })
     }
 
@@ -1327,6 +1409,131 @@ END-ISO-10303-21;\n";
         assert!(
             expected_size < BIM_IMPORT_LARGE_FILE_THRESHOLD_BYTES,
             "fixture must be smaller than the warning threshold"
+        );
+    }
+
+    #[test]
+    fn bim_check_file_size_returns_stat_without_parsing() {
+        // The renderer calls `bim_check_file_size` before
+        // `bim_import_ifc` to surface a "this file is N MB —
+        // continue?" confirm dialog on large IFC files. The cheap
+        // path: one `fs::metadata` + one `fs::canonicalize`. No
+        // parse, no file read. Verify all four fields of the
+        // result.
+        let (s, _g) = service();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("size.ifc");
+        let body = fixture_ifc_body();
+        let expected_size = body.len() as u64;
+        std::fs::write(&path, &body).unwrap();
+        let check = s
+            .bim_check_file_size(path.to_str().unwrap())
+            .expect("stat must succeed for an existing file");
+        assert_eq!(check.file_size_bytes, expected_size);
+        assert!(
+            !check.large_file_warning,
+            "fixture is well below 100 MB; warning must be false"
+        );
+        assert_eq!(check.threshold_bytes, BIM_IMPORT_LARGE_FILE_THRESHOLD_BYTES);
+        // Canonical path must match what canonicalize returns.
+        let expected_canonical = std::fs::canonicalize(&path)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(check.path, expected_canonical);
+    }
+
+    #[test]
+    fn bim_check_file_size_threshold_matches_summary_flag() {
+        // Defense-in-depth: the `BimFileSizeCheck.threshold_bytes`
+        // field MUST match the constant the post-parse
+        // `BimImportSummary.large_file_warning` uses. If a future
+        // refactor splits them, the pre-parse warning and the
+        // post-parse warning would disagree on what counts as
+        // "large" and the renderer's UX would be incoherent. Pin
+        // the contract by reading both from the bridge for the
+        // same file and asserting they agree on the threshold.
+        let (s, _g) = service();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("threshold.ifc");
+        std::fs::write(&path, fixture_ifc_body()).unwrap();
+        let check = s
+            .bim_check_file_size(path.to_str().unwrap())
+            .expect("stat must succeed for an existing file");
+        let summary = s
+            .bim_import_ifc(path.to_str().unwrap())
+            .expect("import must succeed for valid fixture");
+        // Same file, same threshold.
+        assert_eq!(check.threshold_bytes, BIM_IMPORT_LARGE_FILE_THRESHOLD_BYTES);
+        // Same warning bit — both should be false here.
+        assert_eq!(
+            check.large_file_warning, summary.large_file_warning,
+            "pre-parse and post-parse warnings must agree"
+        );
+        // Same byte count.
+        assert_eq!(check.file_size_bytes, summary.file_size_bytes);
+    }
+
+    #[test]
+    fn bim_check_file_size_errors_on_missing_file() {
+        // Missing file → `Io` error so the renderer can show a
+        // "file not found" toast and the file-picker reopens to a
+        // valid path.
+        let (s, _g) = service();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("does-not-exist.ifc");
+        let err = s.bim_check_file_size(path.to_str().unwrap());
+        assert!(err.is_err(), "missing file must produce an error");
+    }
+
+    /// Dangling-symlink regression: `bim_check_file_size` and
+    /// `bim_import_ifc` must surface the **same** error on a dangling
+    /// symlink, so the renderer never sees a "checkFileSize OK,
+    /// importIfc not-found" sequence on the same path.
+    ///
+    /// Pre-fix the canonicalize was done **after** `metadata`, and
+    /// `metadata` on a symlink returns the link's own info (with
+    /// `is_file() = false` on the symlink itself but a small `len()`
+    /// reading the link target string). The "successful" stat would
+    /// return a tiny `file_size_bytes` and `large_file_warning =
+    /// false`, then `bim_import_ifc`'s `std::fs::read` would fail on
+    /// the same dangling target — a surprising UX. Post-fix the
+    /// canonicalize runs first, fails on the dangling target, and
+    /// both methods produce the same `Io(NotFound)` error.
+    #[cfg(unix)]
+    #[test]
+    fn bim_check_file_size_errors_on_dangling_symlink_like_bim_import_ifc() {
+        let (s, _g) = service();
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("does-not-exist-target.ifc");
+        let link = tmp.path().join("dangling-link.ifc");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+
+        let check_err = s.bim_check_file_size(link.to_str().unwrap());
+        let import_err = s.bim_import_ifc(link.to_str().unwrap());
+
+        assert!(
+            check_err.is_err(),
+            "bim_check_file_size on a dangling symlink must surface an error \
+             (matching bim_import_ifc's std::fs::read semantics) — got Ok: {:?}",
+            check_err,
+        );
+        assert!(
+            import_err.is_err(),
+            "bim_import_ifc on a dangling symlink must error",
+        );
+        // Defense-in-depth: both must be `Io` variant. We don't pin
+        // the exact ErrorKind because some platforms surface it as
+        // NotFound and others as InvalidInput.
+        assert!(
+            matches!(check_err, Err(BridgeServiceError::Io(_))),
+            "bim_check_file_size dangling-symlink error must be Io — got {:?}",
+            check_err,
+        );
+        assert!(
+            matches!(import_err, Err(BridgeServiceError::Io(_))),
+            "bim_import_ifc dangling-symlink error must be Io — got {:?}",
+            import_err,
         );
     }
 

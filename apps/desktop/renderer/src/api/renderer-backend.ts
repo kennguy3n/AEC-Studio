@@ -7,6 +7,7 @@
 import type { AecApi } from "../../../electron/preload";
 import { AI_TOOLS } from "../../../electron/ai-tools";
 import {
+  BIM_IMPORT_LARGE_FILE_THRESHOLD_BYTES,
   classifyTier,
   diffRevisionsInProcess,
   inProcessParsedForTool,
@@ -137,6 +138,12 @@ export function rendererInProcessBackend(): AecApi {
     },
     bim: {
       importIfc: async () => ({ imported: 0 }),
+      checkFileSize: async (path) => ({
+        path,
+        fileSizeBytes: 0,
+        largeFileWarning: false,
+        thresholdBytes: BIM_IMPORT_LARGE_FILE_THRESHOLD_BYTES,
+      }),
       exportIfc: async (p) => ({ exported: true, path: p }),
       classify: async () => ({ classified: 0 }),
       setProperty: async () => ({ ok: true }),

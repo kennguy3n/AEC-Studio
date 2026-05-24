@@ -38,11 +38,15 @@ pub fn generate_window_schedule(
             p.and_then(|e| e.get(pset, key))
                 .and_then(crate::properties::PropertyValue::as_real)
         };
+        // Use the centralised `as_bool` coercion so a Window's
+        // `IsExternal` carried as either `IFCBOOLEAN(.T.)` (IFC4
+        // `Pset_WindowCommon` schema) or `IFCLOGICAL(.T.)` (IFC2X3
+        // dialect / strict-`IfcLogical` exporters) is recognized.
+        // Without this, IFC2X3-vintage files with `IFCLOGICAL` would
+        // silently render the External column as empty.
         let pbool = |pset: &str, key: &str| {
-            p.and_then(|e| e.get(pset, key)).and_then(|v| match v {
-                crate::properties::PropertyValue::Boolean(b) => Some(*b),
-                _ => None,
-            })
+            p.and_then(|e| e.get(pset, key))
+                .and_then(crate::properties::PropertyValue::as_bool)
         };
         entries.push(WindowScheduleEntry {
             mark: pget("Pset_WindowCommon", "Reference"),
@@ -125,5 +129,85 @@ mod tests {
         assert_eq!(entries[0].mark, "W01");
         assert_eq!(entries[0].is_external, Some(true));
         assert_eq!(sheet.rows[0].cells.last().unwrap(), "Yes");
+    }
+
+    /// Regression: `IsExternal` carried as `IFCLOGICAL(.T.)` / `(.F.)`
+    /// (IFC2X3 dialect / strict-`IfcLogical` exporters) must render
+    /// as "Yes" / "No" — not blank. Pre-fix the `pbool` closure
+    /// pattern-matched only on `PropertyValue::Boolean`, so an
+    /// IFCLOGICAL-carried boolean would route to `PropertyValue::Logical`
+    /// and silently render as the empty string in the External
+    /// column. Post-fix the closure goes through `PropertyValue::as_bool`
+    /// which handles both `Boolean` and `Logical(True | False)`.
+    #[test]
+    fn window_schedule_renders_iflogical_is_external_as_yes_no_not_blank() {
+        use crate::properties::LogicalValue;
+
+        let mut store = ClassificationStore::default();
+        let mut props = PropertyStore::new();
+
+        // Window with IsExternal as IFCLOGICAL(.T.) — IFC2X3 dialect.
+        let id_logical_true = EntityId::new();
+        store.assign_manual(id_logical_true.clone(), IfcClass::IfcWindow);
+        let mut pwc_true = PropertySet::new("Pset_WindowCommon");
+        pwc_true.set("Reference", PropertyValue::Label("WL01".into()));
+        pwc_true.set("IsExternal", PropertyValue::Logical(LogicalValue::True));
+        props.entry(id_logical_true).upsert_pset(pwc_true);
+
+        // Window with IsExternal as IFCLOGICAL(.F.).
+        let id_logical_false = EntityId::new();
+        store.assign_manual(id_logical_false.clone(), IfcClass::IfcWindow);
+        let mut pwc_false = PropertySet::new("Pset_WindowCommon");
+        pwc_false.set("Reference", PropertyValue::Label("WL02".into()));
+        pwc_false.set("IsExternal", PropertyValue::Logical(LogicalValue::False));
+        props.entry(id_logical_false).upsert_pset(pwc_false);
+
+        // Window with IsExternal as IFCLOGICAL(.U.) — "we don't know
+        // if this is external". Must render as blank (the `Option<bool>`
+        // is `None`) — distinct from `.F.` ("No") and from "the slot
+        // wasn't there at all" (also blank, but semantically different
+        // — the IFC schema can't distinguish those two on the wire).
+        let id_logical_unknown = EntityId::new();
+        store.assign_manual(id_logical_unknown.clone(), IfcClass::IfcWindow);
+        let mut pwc_unknown = PropertySet::new("Pset_WindowCommon");
+        pwc_unknown.set("Reference", PropertyValue::Label("WL03".into()));
+        pwc_unknown.set("IsExternal", PropertyValue::Logical(LogicalValue::Unknown));
+        props.entry(id_logical_unknown).upsert_pset(pwc_unknown);
+
+        let (entries, sheet) = generate_window_schedule(&store, &props);
+        assert_eq!(
+            entries.len(),
+            3,
+            "all three windows must surface in the schedule"
+        );
+
+        // Entries are sorted by mark — WL01, WL02, WL03.
+        assert_eq!(entries[0].mark, "WL01");
+        assert_eq!(
+            entries[0].is_external,
+            Some(true),
+            "IFCLOGICAL(.T.) must project to Some(true) so the External column renders 'Yes'",
+        );
+        assert_eq!(sheet.rows[0].cells.last().unwrap(), "Yes");
+
+        assert_eq!(entries[1].mark, "WL02");
+        assert_eq!(
+            entries[1].is_external,
+            Some(false),
+            "IFCLOGICAL(.F.) must project to Some(false) so the External column renders 'No'",
+        );
+        assert_eq!(sheet.rows[1].cells.last().unwrap(), "No");
+
+        assert_eq!(entries[2].mark, "WL03");
+        assert_eq!(
+            entries[2].is_external, None,
+            "IFCLOGICAL(.U.) is recorded-unknown — must render as blank, NOT 'No'",
+        );
+        assert_eq!(
+            sheet.rows[2].cells.last().unwrap(),
+            "",
+            "the External column for .U. must be empty (Schedule consumers can decide \
+             whether to render that as a blank or a literal 'Unknown' badge in the UI)",
+        );
     }
 }

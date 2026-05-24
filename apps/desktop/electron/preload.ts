@@ -48,6 +48,19 @@ const api = {
   // ----- BIM -----
   bim: {
     importIfc: (path: string) => ipcRenderer.invoke("bim:importIfc", { path }),
+    /**
+     * Cheap pre-parse file-size check. The renderer's file-picker UI
+     * calls this before `importIfc` so it can warn-and-confirm on
+     * files at or above the 100 MB threshold without first paying
+     * the multi-second parse cost.
+     */
+    checkFileSize: (path: string) =>
+      ipcRenderer.invoke("bim:checkFileSize", { path }) as Promise<{
+        path: string;
+        fileSizeBytes: number;
+        largeFileWarning: boolean;
+        thresholdBytes: number;
+      }>,
     exportIfc: (path: string) => ipcRenderer.invoke("bim:exportIfc", { path }),
     classify: (params: Record<string, unknown>) =>
       ipcRenderer.invoke("bim:classify", params),

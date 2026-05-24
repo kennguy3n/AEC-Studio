@@ -94,6 +94,10 @@ export function registerIpcHandlers(): void {
     assertString(path, "path");
     return getBridge().bimImportIfc(path);
   });
+  ipcMain.handle("bim:checkFileSize", async (_e, { path }) => {
+    assertString(path, "path");
+    return getBridge().bimCheckFileSize(path);
+  });
   ipcMain.handle("bim:exportIfc", async (_e, { path }) => {
     assertString(path, "path");
     return getBridge().bimExportIfc(path);

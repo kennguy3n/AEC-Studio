@@ -13,6 +13,86 @@ use aec_core::types::EntityId;
 use crate::classification::IfcClass;
 use crate::ifc::reader::{parse_step_real, unescape_step_string};
 
+/// Tri-state logical value mirroring the IFC4 `IfcLogical` measure.
+///
+/// EXPRESS distinguishes three IFC primitive types that all look
+/// like "true / false" at first glance:
+///
+///   * `BOOLEAN` — strictly two-valued (`.T.` / `.F.`). The STEP
+///     literal `.U.` is **not** a valid `BOOLEAN` value, even though
+///     downstream-tool ergonomics sometimes blur the line.
+///   * `LOGICAL` — three-valued (`.T.` / `.F.` / `.U.`). The `.U.`
+///     variant means "unknown" in the Kleene-logic sense and is
+///     **distinct** from `$` ("not provided / no value") on an
+///     `IfcPropertySingleValue.NominalValue` slot. Some property
+///     keys are typed as `IfcLogical` precisely so the source can
+///     say "we don't know" (e.g. `IfcMaterialLayer.IsVentilated`,
+///     `Pset_DoorCommon.IsExternal` in older IFC2X3 dialects).
+///   * absent slot (`$`) — the source didn't fill in this property.
+///     Distinct from `.U.`: `.U.` means "we recorded that it's
+///     unknown"; `$` means "we didn't record anything". This
+///     distinction is preserved by the fact that `PropertyValue`
+///     entries live in a `BTreeMap<String, PropertyValue>` — `$`
+///     manifests as the key being absent, while `.U.` manifests as
+///     `PropertyValue::Logical(LogicalValue::Unknown)` being
+///     present.
+///
+/// Before this enum existed, `IFCLOGICAL(.U.)` rode through the
+/// generic [`PropertyValue::Other`] verbatim-preservation channel,
+/// which was lossless on the wire but invisible to typed consumers
+/// (BOQ, schedules, validators couldn't tell `.U.` apart from any
+/// other opaque measure). Promoting it to a first-class variant
+/// lets those consumers branch on "the source explicitly recorded
+/// 'unknown'" without string-matching on the raw STEP literal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogicalValue {
+    /// `.T.` — recorded as definitely true.
+    True,
+    /// `.F.` — recorded as definitely false.
+    False,
+    /// `.U.` — recorded as explicitly unknown. **Not** the same as
+    /// the property being absent from the Pset (which is `$` /
+    /// missing-key semantics).
+    Unknown,
+}
+
+impl LogicalValue {
+    /// STEP enum literal as it appears inside an `IFCLOGICAL(...)`
+    /// measure wrapper, including the surrounding dots.
+    pub fn as_step_literal(&self) -> &'static str {
+        match self {
+            Self::True => ".T.",
+            Self::False => ".F.",
+            Self::Unknown => ".U.",
+        }
+    }
+
+    /// Inverse of [`Self::as_step_literal`]. Returns `None` for any
+    /// other token (the caller decides whether to error or route to
+    /// the verbatim-preservation `Other` channel).
+    pub fn from_step_literal(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            ".T." => Some(Self::True),
+            ".F." => Some(Self::False),
+            ".U." => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+
+    /// Two-valued projection — `Some(true)` for `True`, `Some(false)`
+    /// for `False`, `None` for `Unknown`. Useful for legacy callers
+    /// that only care about the boolean projection and want to
+    /// degrade `.U.` to "absent".
+    pub fn as_optional_bool(&self) -> Option<bool> {
+        match self {
+            Self::True => Some(true),
+            Self::False => Some(false),
+            Self::Unknown => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum PropertyValue {
@@ -20,6 +100,12 @@ pub enum PropertyValue {
     Real(f64),
     Integer(i64),
     Boolean(bool),
+    /// IFC4 `IfcLogical` tri-state (`.T.` / `.F.` / `.U.`). Distinct
+    /// from [`PropertyValue::Boolean`] (two-valued, no `.U.`) and
+    /// from a missing Pset entry (`$` — encoded by the absence of
+    /// the key in the surrounding `BTreeMap`). See [`LogicalValue`]
+    /// for the full semantics.
+    Logical(LogicalValue),
     Length(f64),
     Area(f64),
     Volume(f64),
@@ -62,6 +148,7 @@ impl PropertyValue {
             Self::Real(_) => "IfcReal",
             Self::Integer(_) => "IfcInteger",
             Self::Boolean(_) => "IfcBoolean",
+            Self::Logical(_) => "IfcLogical",
             Self::Length(_) => "IfcLengthMeasure",
             Self::Area(_) => "IfcAreaMeasure",
             Self::Volume(_) => "IfcVolumeMeasure",
@@ -110,8 +197,49 @@ impl PropertyValue {
             // only allows `e`/`E`, but the wider IFC ecosystem still
             // ships archives that use `D`).
             Self::Other { raw, .. } => parse_step_real(raw),
-            // Non-numeric typed variants: Text, Boolean, Label.
-            Self::Text(_) | Self::Boolean(_) | Self::Label(_) => None,
+            // Non-numeric typed variants: Text, Boolean, Logical,
+            // Label. (Logical is tri-state, so even True/False are
+            // deliberately not coerced to 1.0/0.0 — a BOQ that
+            // arithmetically averaged a column of `.T.` / `.F.` /
+            // `.U.` values would silently treat `.U.` as 0, which
+            // is wrong. Callers that want a numeric coercion can
+            // pattern-match on `LogicalValue` directly.)
+            Self::Text(_) | Self::Boolean(_) | Self::Logical(_) | Self::Label(_) => None,
+        }
+    }
+
+    /// Boolean projection of any IFC primitive that semantically
+    /// carries a true/false value. Returns:
+    ///
+    /// * `Some(b)` for [`Self::Boolean`] — the strict two-valued
+    ///   `IfcBoolean` (`.T.` / `.F.`).
+    /// * `Some(true)` / `Some(false)` for
+    ///   [`Self::Logical`]`(LogicalValue::True | LogicalValue::False)`
+    ///   — the IFC4 `IfcLogical` tri-state when the source recorded
+    ///   a definite value. Uses [`LogicalValue::as_optional_bool`]
+    ///   so the two enums stay in sync.
+    /// * `None` for [`Self::Logical`]`(LogicalValue::Unknown)` —
+    ///   `.U.` means "we recorded this is unknown", which is **not**
+    ///   the same as `Some(false)`. Callers that want to demote
+    ///   `.U.` to `false` should do it explicitly with
+    ///   `.unwrap_or(false)`.
+    /// * `None` for every other variant.
+    ///
+    /// **Why this helper exists**: before [`Self::Logical`] was
+    /// promoted to a first-class variant, every `pbool` call-site
+    /// (schedules, BOQ, validators) used to pattern-match only on
+    /// `Boolean(b)`. After the promotion, the same call-sites would
+    /// silently treat a `.T.` / `.F.` carried as `IFCLOGICAL` (which
+    /// IFC2X3 dialects use for `Pset_DoorCommon.IsExternal` etc.) as
+    /// absent — a regression. Centralising the coercion contract on
+    /// `PropertyValue` (mirroring how [`Self::as_real`] already
+    /// handles `Integer` → `f64`) keeps every consumer in sync with
+    /// the typing.
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Boolean(b) => Some(*b),
+            Self::Logical(l) => l.as_optional_bool(),
+            _ => None,
         }
     }
 
@@ -404,6 +532,56 @@ mod tests {
         assert_eq!(
             PropertyValue::Label("hi".into()).as_text().as_deref(),
             Some("hi")
+        );
+    }
+
+    /// `as_bool` must recognise both the strict two-valued
+    /// `IfcBoolean` and the IFC4 `IfcLogical` tri-state — without
+    /// this, IFC2X3-vintage `IFCLOGICAL(.T.)` (used by some exporters
+    /// for `Pset_DoorCommon.IsExternal` and similar flags) would be
+    /// silently treated as absent by schedule / BOQ / validator
+    /// consumers, since the typed reader routes `.T.`/`.F.` carried
+    /// inside `IFCLOGICAL` to [`PropertyValue::Logical`] not to
+    /// [`PropertyValue::Boolean`]. `.U.` (recorded-unknown) must
+    /// surface as `None`, distinct from a definite `Some(false)`.
+    #[test]
+    fn as_bool_recognises_boolean_logical_true_false_but_not_unknown() {
+        // Strict IfcBoolean.
+        assert_eq!(PropertyValue::Boolean(true).as_bool(), Some(true));
+        assert_eq!(PropertyValue::Boolean(false).as_bool(), Some(false));
+        // Tri-state IfcLogical — definite values.
+        assert_eq!(
+            PropertyValue::Logical(LogicalValue::True).as_bool(),
+            Some(true),
+            "IFCLOGICAL(.T.) must project to Some(true) for schedule/BOQ consumers",
+        );
+        assert_eq!(
+            PropertyValue::Logical(LogicalValue::False).as_bool(),
+            Some(false),
+            "IFCLOGICAL(.F.) must project to Some(false)",
+        );
+        // Tri-state IfcLogical — explicit unknown.
+        assert_eq!(
+            PropertyValue::Logical(LogicalValue::Unknown).as_bool(),
+            None,
+            "IFCLOGICAL(.U.) is recorded-unknown, NOT the same as Some(false) — \
+             must surface as None so callers can choose to demote it via `.unwrap_or(false)`",
+        );
+        // Non-boolean variants.
+        assert_eq!(PropertyValue::Real(1.0).as_bool(), None);
+        assert_eq!(PropertyValue::Integer(0).as_bool(), None);
+        assert_eq!(PropertyValue::Text("true".into()).as_bool(), None);
+        assert_eq!(PropertyValue::Label("TRUE".into()).as_bool(), None);
+        assert_eq!(
+            PropertyValue::Other {
+                measure: "IFCBOOLEAN".into(),
+                raw: ".T.".into(),
+            }
+            .as_bool(),
+            None,
+            "Opaque `Other`-routed booleans deliberately do NOT round-trip via \
+             `as_bool` — the reader is expected to route recognised primitives \
+             to typed variants; `Other` is for measures we don't model",
         );
     }
 

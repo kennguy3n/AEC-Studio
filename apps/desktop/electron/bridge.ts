@@ -18,6 +18,18 @@ import * as path from "path";
 import { AI_TOOLS, type AiTool } from "./ai-tools";
 
 /**
+ * Renderer-side warning threshold for IFC files (100 MB). Mirrors
+ * the Rust constant `BIM_IMPORT_LARGE_FILE_THRESHOLD_BYTES` in
+ * `crates/aec_bridge/src/service.rs` exactly so the in-process JS
+ * fallback agrees with the native bridge on what counts as
+ * "large". If the Rust constant changes, update this one in
+ * lockstep — the bridge regression test
+ * `bim_check_file_size_threshold_matches_summary_flag` pins both
+ * values together.
+ */
+export const BIM_IMPORT_LARGE_FILE_THRESHOLD_BYTES = 100 * 1024 * 1024;
+
+/**
  * 16-hex random id helper used by the in-process backend for ids that
  * the renderer treats as opaque (revision ids, draft ids, …). Uses
  * Node's crypto so id collisions are vanishingly unlikely even when
@@ -87,6 +99,23 @@ export interface BridgeBackend {
   draftExportDxf(path: string): Promise<{ exported: true; path: string }>;
 
   bimImportIfc(path: string): Promise<{ imported: number }>;
+  /**
+   * Cheap pre-parse file-size check. The renderer's file-picker UI
+   * calls this *before* `bimImportIfc` so it can show a "this file
+   * is N MB; continue?" confirm dialog on large IFC files (e.g.
+   * 400 MB MEP federations) without first paying the multi-second
+   * parse cost. Cost: one `fs::metadata` + one `fs::canonicalize`
+   * — no file read.
+   *
+   * The `largeFileWarning` flag is advisory; the renderer is free
+   * to ignore it and call `bimImportIfc` anyway.
+   */
+  bimCheckFileSize(path: string): Promise<{
+    path: string;
+    fileSizeBytes: number;
+    largeFileWarning: boolean;
+    thresholdBytes: number;
+  }>;
   bimExportIfc(path: string): Promise<{ exported: true; path: string }>;
   bimClassify(params: Record<string, unknown>): Promise<{ classified: number }>;
   bimSetProperty(params: Record<string, unknown>): Promise<{ ok: true }>;
@@ -429,6 +458,7 @@ export const NATIVE_FALLBACK_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   "draftImportDxf",
   "draftExportDxf",
   "bimImportIfc",
+  "bimCheckFileSize",
   "bimExportIfc",
   "bimClassify",
   "bimSetProperty",
@@ -634,6 +664,19 @@ export function inProcessBackend(): BridgeBackend {
 
     async bimImportIfc(_path) {
       return { imported: 0 };
+    },
+    async bimCheckFileSize(_path) {
+      // In-process fallback used by Vitest. The Rust bridge runs
+      // `fs::metadata` on the real file; the JS-only fallback
+      // reports 0 bytes (well below threshold) so the
+      // file-picker UX doesn't spuriously warn during unit tests
+      // that don't exercise a real on-disk path.
+      return {
+        path: _path,
+        fileSizeBytes: 0,
+        largeFileWarning: false,
+        thresholdBytes: BIM_IMPORT_LARGE_FILE_THRESHOLD_BYTES,
+      };
     },
     async bimExportIfc(p) {
       return { exported: true, path: p };

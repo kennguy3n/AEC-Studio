@@ -36,7 +36,7 @@ use crate::classification::{ClassificationSource, ClassificationStore, IfcClass}
 use crate::materials::{
     Material, MaterialAssignment, MaterialLayer, MaterialLayerSet, MaterialStore,
 };
-use crate::properties::{PropertySet, PropertyStore, PropertyValue, QuantitySet};
+use crate::properties::{LogicalValue, PropertySet, PropertyStore, PropertyValue, QuantitySet};
 use crate::spatial::Project;
 
 #[derive(Debug, Error)]
@@ -230,7 +230,42 @@ impl IfcReader {
                 "IFCOWNERHISTORY" => {}
                 "IFCPROJECT" | "IFCSITE" | "IFCBUILDING" | "IFCBUILDINGSTOREY" | "IFCSPACE" => {
                     let class = ifc_class_from_tag(&g.kind, &g.raw_kind);
-                    let name = g.string_arg(3)?;
+                    // Display-name extraction with two-stage fallback:
+                    //
+                    //   1. Arg 3 (`IfcRoot.Description`) — AEC Studio's
+                    //      own writer convention: the display name
+                    //      ("Café", "Ground", "Site") is emitted here
+                    //      while arg 2 (`IfcRoot.Name`) is left as `$`.
+                    //      Path (a): preferred read.
+                    //
+                    //   2. Arg 2 (`IfcRoot.Name`) — IFC standard
+                    //      convention: Revit / ArchiCAD / Tekla /
+                    //      buildingSMART exemplars typically put the
+                    //      human-facing name here and leave Description
+                    //      as `$`. Path (b): fallback so external IFCs
+                    //      with `$` at arg 3 don't abort the whole
+                    //      parse with an `IfcReadError::Malformed`.
+                    //
+                    //   3. Empty string — both slots are `$` or
+                    //      malformed. The spatial node is still
+                    //      captured (so the project graph isn't
+                    //      missing nodes), just with no display label.
+                    //      The renderer's tree falls back to the IFC
+                    //      class label ("Site", "Building"…).
+                    //
+                    // Without this fallback chain the entire parse
+                    // would error on a real-world Revit export whose
+                    // `IFCBUILDING` has `$` at arg 3 — silently
+                    // collapsing the whole BIM workflow to "import
+                    // failed: missing arg 3 on IFCBUILDING". The
+                    // `string_arg(2)` probe is gated on the trim ==
+                    // "$" check inside `string_arg` itself: if arg 2
+                    // is `$` too, we land in the empty-string branch
+                    // and continue without erroring.
+                    let name = g
+                        .string_arg(3)
+                        .or_else(|_| g.string_arg(2))
+                        .unwrap_or_default();
                     // Spatial nodes are authored by the writer with the
                     // user-facing display name ("Café", "Ground"). They
                     // don't carry the `{tag}::{eid}` Name-field
@@ -465,58 +500,186 @@ impl IfcReader {
                     }
                 }
                 other => {
-                    // Anything else with a 9-field shape and a
-                    // `tag::eid` name is an element.
+                    // Two code paths converge here:
                     //
-                    // We split on the LAST `::` (rsplit_once) rather
-                    // than the first. The writer composes
-                    // `{IfcTag}::{EntityId}` and `EntityId::Display`
-                    // is a stable UUID format that cannot contain
-                    // `::`, but `IfcClass::Other(s)` allows the
-                    // tag itself to contain arbitrary characters
-                    // including `::` (e.g. a future
-                    // `Other("Some::Custom::Type")` produced by an
-                    // extension classifier). Splitting from the
-                    // right makes that contract robust — the eid is
-                    // always the suffix after the final `::`.
-                    if let Ok(name) = g.string_arg(3) {
-                        if let Some((tag, eid)) = name.rsplit_once("::") {
-                            // Prefer the tag carried in the Name field
-                            // over the STEP entity type. The two are
-                            // identical for safe classes (the writer
-                            // emits `{ifc_tag}::{eid}` and uses
-                            // `ifc_tag` as the STEP type), but for
-                            // `IfcClass::Other(s)` where `s` contains
-                            // STEP-unsafe chars like `(`, `)` or `'`,
-                            // the writer falls back to STEP type
-                            // `IfcBuildingElementProxy` and keeps the
-                            // original `s` only in the Name field.
-                            // Reading the class from the Name tag
-                            // therefore makes the round-trip lossless
-                            // even for arbitrary user-supplied
-                            // extension classifier strings. We pass
-                            // `tag` for both the case-normalised match
-                            // and the raw (case-preserving) fallback
-                            // so `Other("Some::Custom::Type")`
-                            // round-trips verbatim.
-                            let class = ifc_class_from_tag(tag, tag);
-                            let _ = other; // STEP type is informational
-                            let guid = g.string_arg(0)?;
-                            let entity = EntityId::from_string(eid).map_err(|e| {
-                                IfcReadError::Malformed(format!(
-                                    "embedded EntityId `{eid}` is invalid: {e}"
-                                ))
-                            })?;
-                            elements.insert(
-                                g.step_id,
-                                ElementRow {
-                                    entity,
-                                    guid,
-                                    class,
-                                    tag: tag.to_string(),
-                                },
-                            );
+                    //   (a) AEC-Studio-authored IFCs: the writer
+                    //       composes the Name field as
+                    //       `{IfcTag}::{EntityId}`, so the Name
+                    //       directly carries the original entity id.
+                    //       Splitting on the LAST `::` (rsplit_once)
+                    //       isolates the eid as the suffix after
+                    //       the final separator. `EntityId::Display`
+                    //       is a stable UUID format that cannot
+                    //       contain `::`, but `IfcClass::Other(s)`
+                    //       allows the tag itself to contain
+                    //       arbitrary characters including `::`
+                    //       (e.g. `Other("Some::Custom::Type")`
+                    //       produced by an extension classifier).
+                    //       Splitting from the right makes that
+                    //       contract robust.
+                    //
+                    //   (b) External IFCs (Revit / ArchiCAD /
+                    //       buildingSMART ISO exemplars / any
+                    //       authoring tool that's not AEC Studio):
+                    //       the Name field carries a human-facing
+                    //       string ("Wall for Test Example") with
+                    //       no `::` separator. Falling back to the
+                    //       STEP entity tag (`IFCWALL`, `IFCWINDOW`,
+                    //       …) for classification — and deriving
+                    //       the EntityId deterministically from
+                    //       the GlobalId — is what makes
+                    //       "real-world" IFCs into first-class
+                    //       citizens of the project graph rather
+                    //       than silently-dropped non-elements. A
+                    //       missing/empty GlobalId falls back to
+                    //       `EntityId::new()`, matching the
+                    //       defensive contract on spatial nodes
+                    //       above (`bim_attach` will treat those
+                    //       rows as fresh inserts on every attach,
+                    //       which is the least-surprising behaviour
+                    //       for malformed input).
+                    // First, try path (a) — AEC-Studio-authored.
+                    // The writer's `{tag}::{eid}` encoding lives at
+                    // arg 3 (`IfcRoot.Description`), so probe that
+                    // first. Path (a) is taken **only** when ALL
+                    // THREE conditions hold:
+                    //
+                    //   1. arg 3 is a quoted string (not `$`,
+                    //      not absent, not malformed).
+                    //   2. arg 3 contains a `::` separator that
+                    //      `rsplit_once` matches.
+                    //   3. The suffix after the final `::` parses
+                    //      as a valid [`EntityId`] (`ent_<uuid>`).
+                    //
+                    // The EntityId parse is folded into the
+                    // detection — not deferred — because external
+                    // IFC Descriptions can contain `::` for
+                    // human-prose reasons (e.g. Revit's
+                    // `"Partition :: Fire Rated"`, ArchiCAD's
+                    // `"MEP :: Duct"`). Without (3), those would
+                    // match (1) and (2), enter path (a), fail
+                    // `EntityId::from_string`, and propagate the
+                    // error via `?` — silently aborting the
+                    // entire file parse with
+                    // `IfcReadError::Malformed("embedded
+                    // EntityId `Fire Rated` is invalid: …")`
+                    // even though path (b) was designed to
+                    // handle exactly this case.
+                    //
+                    // Failing the EntityId parse here lands in
+                    // `None` → path (b) falls through and the
+                    // element gets captured by STEP tag the same
+                    // way any other external-IFC element would.
+                    let aec_authored = g.string_arg(3).ok().and_then(|name| {
+                        let (tag, eid_str) = name.rsplit_once("::")?;
+                        let entity = EntityId::from_string(eid_str).ok()?;
+                        Some((tag.to_string(), entity))
+                    });
+
+                    if let Some((tag, entity)) = aec_authored {
+                        // (a) Path: AEC-Studio-authored.
+                        //
+                        // Prefer the tag carried in the Name field
+                        // over the STEP entity type. The two are
+                        // identical for safe classes (the writer
+                        // emits `{ifc_tag}::{eid}` and uses
+                        // `ifc_tag` as the STEP type), but for
+                        // `IfcClass::Other(s)` where `s` contains
+                        // STEP-unsafe chars like `(`, `)` or `'`,
+                        // the writer falls back to STEP type
+                        // `IfcBuildingElementProxy` and keeps the
+                        // original `s` only in the Name field.
+                        // Reading the class from the Name tag
+                        // therefore makes the round-trip lossless
+                        // even for arbitrary user-supplied
+                        // extension classifier strings. We pass
+                        // `tag` for both the case-normalised match
+                        // and the raw (case-preserving) fallback
+                        // so `Other("Some::Custom::Type")`
+                        // round-trips verbatim.
+                        let class = ifc_class_from_tag(&tag, &tag);
+                        let _ = other; // STEP type is informational
+                        let guid = g.string_arg(0)?;
+                        elements.insert(
+                            g.step_id,
+                            ElementRow {
+                                entity,
+                                guid,
+                                class,
+                                tag,
+                            },
+                        );
+                    } else {
+                        // (b) Path: external IFC.
+                        //
+                        // Classify by STEP entity tag. Only
+                        // capture records whose STEP type maps
+                        // to a typed [`IfcClass`] variant —
+                        // i.e. one of the recognized building-
+                        // element classes (IFCWALL, IFCWINDOW,
+                        // IFCSLAB, IFCBEAM, IFCCOLUMN, …). Any
+                        // other STEP record reaching this branch
+                        // — type entities (IfcWindowType,
+                        // IfcDoorType), library declarations
+                        // (IfcProjectLibrary), application
+                        // metadata (IfcApplication), or unknown
+                        // extension entities — is intentionally
+                        // skipped here: capturing them as
+                        // elements would either poison the
+                        // classification table with non-element
+                        // rows or duplicate the type vs.
+                        // instance distinction that
+                        // `IfcRelDefinesByType` should be doing.
+                        // (Future work: type-Pset propagation
+                        // would land them as type_psets on the
+                        // instances they declare, not as
+                        // elements in their own right.)
+                        //
+                        // Critical: this branch fires unconditionally
+                        // when path (a) doesn't match — INCLUDING the
+                        // case where arg 3 (`IfcRoot.Description`) is
+                        // `$`. Real-world Revit / ArchiCAD exports
+                        // routinely put the meaningful identity at
+                        // arg 2 (`IfcRoot.Name`) and leave arg 3 as
+                        // `$`. Without unconditional fall-through,
+                        // every wall / window / slab in such a file
+                        // would be silently dropped on read. The
+                        // `IfcClass::Other(_)` filter below is what
+                        // keeps non-element records (`IFCAPPLICATION`,
+                        // unknown types) from being captured as
+                        // elements — including any record whose STEP
+                        // tag doesn't classify cleanly, regardless
+                        // of arg-3 state.
+                        let class = ifc_class_from_tag(other, &g.raw_kind);
+                        if matches!(class, IfcClass::Other(_)) {
+                            continue;
                         }
+                        // Only extract the GUID once we've
+                        // committed to creating an ElementRow
+                        // — some non-element STEP records
+                        // (notably IFCAPPLICATION) use a `#ref`
+                        // at arg 0 rather than a quoted GUID,
+                        // so blindly calling `string_arg(0)` on
+                        // every record reaching this branch
+                        // would panic the parser. The
+                        // `IfcClass::Other(_)` guard above
+                        // filters those out before we touch
+                        // arg 0.
+                        let guid = g.string_arg(0)?;
+                        let entity = if guid.is_empty() {
+                            EntityId::new()
+                        } else {
+                            EntityId::from_guid_seed(&guid)
+                        };
+                        elements.insert(
+                            g.step_id,
+                            ElementRow {
+                                entity,
+                                guid,
+                                class,
+                                tag: other.to_string(),
+                            },
+                        );
                     }
                 }
             }
@@ -1636,6 +1799,24 @@ fn parse_typed_measure(raw: &str) -> IfcReadResult<PropertyValue> {
         "IFCPOSITIVERATIOMEASURE" => Ok(PropertyValue::Ratio(parse_real(inner)?)),
         "IFCINTEGER" => Ok(PropertyValue::Integer(parse_int(inner)?)),
         "IFCBOOLEAN" => Ok(PropertyValue::Boolean(matches!(inner, ".T."))),
+        "IFCLOGICAL" => {
+            // IfcLogical is tri-state — `.T.` / `.F.` / `.U.`. Route
+            // to the dedicated [`PropertyValue::Logical`] variant
+            // (rather than the verbatim-preservation `Other`
+            // channel) so typed consumers can branch on "the source
+            // explicitly recorded 'unknown'" via
+            // `LogicalValue::Unknown` without string-matching on
+            // the raw STEP literal. Anything outside the three
+            // canonical tokens falls back to `Other` so a defective
+            // source file still round-trips losslessly.
+            match LogicalValue::from_step_literal(inner) {
+                Some(v) => Ok(PropertyValue::Logical(v)),
+                None => Ok(PropertyValue::Other {
+                    measure: "IFCLOGICAL".to_string(),
+                    raw: inner.to_string(),
+                }),
+            }
+        }
         other => {
             // Preserve unknown IFC measure types verbatim for
             // lossless round-trip. The writer's emit path detects
@@ -3065,6 +3246,150 @@ END-ISO-10303-21;\n";
         );
     }
 
+    /// `IFCLOGICAL` is tri-state (`.T.` / `.F.` / `.U.`), which the
+    /// two-valued `IfcBoolean` cannot represent. The reader routes
+    /// `IFCLOGICAL` measure literals into the dedicated
+    /// [`PropertyValue::Logical`] variant (NOT through the
+    /// verbatim-preservation `Other` channel), so typed consumers
+    /// can branch on "explicitly unknown" without string-matching
+    /// `.U.` on a raw STEP literal. This test pins all three
+    /// variants through one full read→write→read cycle, including
+    /// the `.U.` case that the bot flagged in PR-L round 4 as
+    /// "currently degrades to `Other`".
+    #[test]
+    fn ifc_logical_tri_state_round_trips_via_typed_variant() {
+        let mut project = Project::new("P");
+        let site = project
+            .add_child(&project.root.clone(), IfcClass::IfcSite, "Site")
+            .unwrap();
+        let bldg = project
+            .add_child(&site, IfcClass::IfcBuilding, "B")
+            .unwrap();
+        let storey = project
+            .add_child(&bldg, IfcClass::IfcBuildingStorey, "L01")
+            .unwrap();
+        let wall = EntityId::new();
+        project.attach_element(&storey, wall.clone());
+        let mut classification = ClassificationStore::new();
+        classification.assign_manual(wall.clone(), IfcClass::IfcWall);
+
+        // Pset with all three tri-state cases. The KEY ABSENCE
+        // (`$` on the wire) is INTENTIONALLY not exercised here —
+        // that case is encoded by the property simply not appearing
+        // in the BTreeMap, and is covered by other tests that
+        // assert `psets.get("MissingKey").is_none()` after a
+        // read→write→read cycle.
+        let mut props = PropertyStore::new();
+        let mut p = PropertySet::new("Pset_WallCommon");
+        p.set("IsExternal", PropertyValue::Logical(LogicalValue::True));
+        p.set("IsLoadBearing", PropertyValue::Logical(LogicalValue::False));
+        p.set(
+            "FireResistanceUnknown",
+            PropertyValue::Logical(LogicalValue::Unknown),
+        );
+        props.entry(wall.clone()).upsert_pset(p);
+
+        let body = crate::ifc::IfcWriter::to_string(&project, &classification, &props);
+        // Hard contract: writer must emit `IFCLOGICAL(.U.)` — not
+        // `IFCBOOLEAN(.U.)` (which would be schema-invalid, since
+        // `IfcBoolean` is two-valued) and not `IFCBOOLEAN($)`
+        // (which collapses the tri-state to absent).
+        assert!(
+            body.contains("IFCLOGICAL(.U.)"),
+            "writer must emit IFCLOGICAL(.U.) for LogicalValue::Unknown — \
+             got body:\n{body}"
+        );
+        assert!(
+            body.contains("IFCLOGICAL(.T.)"),
+            "writer must emit IFCLOGICAL(.T.) for LogicalValue::True"
+        );
+        assert!(
+            body.contains("IFCLOGICAL(.F.)"),
+            "writer must emit IFCLOGICAL(.F.) for LogicalValue::False"
+        );
+        // The IFCBOOLEAN type must NOT appear for these properties
+        // (would mean a Logical got demoted to Boolean somewhere).
+        assert!(
+            !body.contains("IFCBOOLEAN("),
+            "no IFCBOOLEAN emission expected for a Pset that only carries \
+             IFCLOGICAL values — got body:\n{body}"
+        );
+
+        let snap1 = IfcReader::from_string(&body).expect("first parse");
+        let pset = snap1
+            .properties
+            .get(&wall)
+            .and_then(|p| p.psets.get("Pset_WallCommon"))
+            .expect("Pset_WallCommon recovered");
+        assert_eq!(
+            pset.properties.get("IsExternal"),
+            Some(&PropertyValue::Logical(LogicalValue::True)),
+            ".T. must round-trip into LogicalValue::True"
+        );
+        assert_eq!(
+            pset.properties.get("IsLoadBearing"),
+            Some(&PropertyValue::Logical(LogicalValue::False)),
+            ".F. must round-trip into LogicalValue::False"
+        );
+        assert_eq!(
+            pset.properties.get("FireResistanceUnknown"),
+            Some(&PropertyValue::Logical(LogicalValue::Unknown)),
+            ".U. must round-trip into LogicalValue::Unknown — NOT \
+             demoted to PropertyValue::Other, and NOT silently \
+             collapsed to a missing key"
+        );
+
+        // Second pass: re-write the snapshot's reconstructed Pset
+        // and assert the second read converges. This pins
+        // determinism: the second body must be byte-identical to
+        // the first when generated from a snapshot rebuilt from
+        // the first body.
+        let mut props2 = PropertyStore::new();
+        for (el, p) in snap1.properties.iter() {
+            for ps in p.psets.values() {
+                props2.entry(el.clone()).upsert_pset(ps.clone());
+            }
+        }
+        let body2 = crate::ifc::IfcWriter::to_string(&project, &classification, &props2);
+        let snap2 = IfcReader::from_string(&body2).expect("second parse");
+        assert_eq!(
+            snap1.properties.get(&wall),
+            snap2.properties.get(&wall),
+            "two reader passes converge on the same Pset tree for \
+             IfcLogical values"
+        );
+    }
+
+    /// Defective sources that emit an out-of-band `IFCLOGICAL(.???.)`
+    /// (anything outside `.T.` / `.F.` / `.U.`) must NOT crash the
+    /// reader. They fall back to the verbatim-preservation
+    /// [`PropertyValue::Other`] channel — the writer then re-emits
+    /// the original STEP literal byte-for-byte under the
+    /// `IFCLOGICAL` wrapper. This is the "tolerate-and-preserve"
+    /// discipline the rest of the reader uses for unknown measure
+    /// tags.
+    #[test]
+    fn ifc_logical_with_garbage_inner_falls_back_to_other() {
+        // `IFCLOGICAL(.X.)` is not a valid STEP enum literal for the
+        // type, but neither the reader nor the writer should refuse
+        // it. The reader stores it as Other; the writer emits the
+        // raw bytes back.
+        let v =
+            super::parse_typed_measure("IFCLOGICAL(.X.)").expect("garbage inner must not error");
+        match v {
+            PropertyValue::Other {
+                ref measure,
+                ref raw,
+            } => {
+                assert_eq!(measure, "IFCLOGICAL");
+                assert_eq!(raw, ".X.");
+            }
+            ref other => {
+                panic!("expected PropertyValue::Other for out-of-band IFCLOGICAL, got {other:?}")
+            }
+        }
+    }
+
     /// `FILE_SCHEMA(('IFC4'))` -> `IfcSchema::Ifc4`, and the snapshot
     /// surfaces the detected schema verbatim. Asserts the writer's
     /// canonical AEC output is round-trip stable through the new
@@ -3608,6 +3933,191 @@ END-ISO-10303-21;\n";
             }
             other => panic!("expected Malformed error for NaN literal; got {other:?}"),
         }
+    }
+
+    /// Real-world Revit / ArchiCAD / Tekla exporters routinely
+    /// emit `IfcWall`, `IfcWindow`, `IfcSlab`, etc. with their
+    /// human-facing identity at arg 2 (`IfcRoot.Name`) and `$`
+    /// (not-provided) at arg 3 (`IfcRoot.Description`). Before
+    /// the BUG_0002 fix the reader probed arg 3 unconditionally
+    /// via `g.string_arg(3)?`, which propagated an
+    /// `IfcReadError::Malformed("expected quoted string at
+    /// arg 3 of IFCWALL but got '$'")` error up to the caller
+    /// — so the *entire* parse aborted on the first element
+    /// with `$` at arg 3, silently rendering every real-world
+    /// Revit export un-importable. Post-fix the reader falls
+    /// through to path (b) (classify by STEP tag, derive
+    /// EntityId from GlobalId) on any element whose arg 3
+    /// doesn't match the `{tag}::{eid}` AEC-Studio writer
+    /// encoding — including the `$` case — and the element is
+    /// captured.
+    ///
+    /// This is a minimum-fixture test: hand-rolled STEP with
+    /// just an `IfcProject`, `IfcSite`, and a single
+    /// `IfcWall` whose arg 2 is `'External Revit Wall'` and
+    /// whose arg 3 is `$`. The test asserts the wall is
+    /// captured (count == 1), classified as `IfcWall`, and
+    /// the EntityId is deterministically derived from the
+    /// GlobalId via `EntityId::from_guid_seed`.
+    #[test]
+    fn external_ifc_with_dollar_description_captures_elements_via_step_tag() {
+        let step = "\
+ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('External-style export'),'2;1');
+FILE_NAME('test.ifc','2024-01-01T00:00:00',(''),(''),'','','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('2vqOSiJTrEEvbbnEAh4Lay',$,'External Revit Project',$,$,$,$,(#2),#3);
+#2=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-5,#4,$);
+#3=IFCUNITASSIGNMENT((#5));
+#4=IFCAXIS2PLACEMENT3D(#6,$,$);
+#5=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#6=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCSITE('2vqOSiJTrEEvbbnEAh4Lb1',$,'External Revit Site',$,$,#4,$,$,.ELEMENT.,$,$,$,$,$);
+#100=IFCWALL('1bbU_VHpzCEvLPibG6XfX2',$,'External Revit Wall',$,$,#4,$,$,.NOTDEFINED.);
+ENDSEC;
+END-ISO-10303-21;
+";
+        let snap = IfcReader::from_string(step)
+            .expect("external IFC with `$` at arg 3 must parse without erroring");
+
+        // The wall is captured (path b fall-through).
+        let walls: Vec<_> = snap
+            .classification
+            .iter()
+            .filter(|(_, a)| matches!(a.class, IfcClass::IfcWall))
+            .collect();
+        assert_eq!(
+            walls.len(),
+            1,
+            "exactly one wall must be captured; got {walls:?}",
+        );
+
+        // EntityId is deterministically derived from GlobalId.
+        let (wall_id, _) = walls[0];
+        let expected = EntityId::from_guid_seed("1bbU_VHpzCEvLPibG6XfX2");
+        assert_eq!(
+            wall_id, &expected,
+            "external-IFC wall must use EntityId::from_guid_seed for re-attach dedup",
+        );
+    }
+
+    /// Companion spatial-node test for the same arg-2 / arg-3
+    /// fallback. Pre-fix the reader's spatial-node parser used
+    /// `g.string_arg(3)?` unconditionally, so a real-world
+    /// `IFCBUILDING('guid',$,'Office Building',$,...)` — with
+    /// the meaningful name at arg 2 and `$` at arg 3 — would
+    /// abort the whole parse with `expected quoted string at
+    /// arg 3 of IFCBUILDING but got '$'`. Post-fix the parser
+    /// tries arg 3 first (writer convention), falls back to
+    /// arg 2 (IFC standard convention), and finally to the
+    /// empty string. This test pins the fallback chain end-
+    /// to-end: an `IfcBuilding` with `$` at arg 3 and a real
+    /// name at arg 2 must be captured with the arg-2 string
+    /// as its display name.
+    #[test]
+    fn external_ifc_with_dollar_description_uses_arg2_name_on_spatial_nodes() {
+        let step = "\
+ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('External-style export'),'2;1');
+FILE_NAME('test.ifc','2024-01-01T00:00:00',(''),(''),'','','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('2vqOSiJTrEEvbbnEAh4Lay',$,'External Revit Project',$,$,$,$,(#2),#3);
+#2=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-5,#4,$);
+#3=IFCUNITASSIGNMENT((#5));
+#4=IFCAXIS2PLACEMENT3D(#6,$,$);
+#5=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#6=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCSITE('2vqOSiJTrEEvbbnEAh4Lb1',$,'External Revit Site',$,$,#4,$,$,.ELEMENT.,$,$,$,$,$);
+#20=IFCBUILDING('2vqOSiJTrEEvbbnEAh4Lb2',$,'Office Building',$,$,#4,$,$,.ELEMENT.,$,$,$);
+ENDSEC;
+END-ISO-10303-21;
+";
+        let snap = IfcReader::from_string(step)
+            .expect("external IFC spatial node with `$` at arg 3 must parse without erroring");
+
+        // The building was captured.
+        let building = snap
+            .project
+            .nodes
+            .iter()
+            .find(|(_, n)| matches!(n.class, IfcClass::IfcBuilding))
+            .expect("IfcBuilding must be present in the project graph");
+        // And it picked up the arg-2 name ("Office Building"),
+        // not arg 3 ("$" — which would render as empty).
+        assert_eq!(
+            building.1.name, "Office Building",
+            "spatial node must fall back to arg 2 when arg 3 is `$`",
+        );
+    }
+
+    /// Regression test for the path (a) → path (b) fallback's
+    /// EntityId-validation behaviour. An external IFC wall whose
+    /// `IfcRoot.Description` (arg 3) legitimately contains `::`
+    /// for human-prose reasons (e.g. Revit's
+    /// `"Partition :: Fire Rated"`, ArchiCAD's `"MEP :: Duct"`)
+    /// must not abort the parse: the `rsplit_once("::")` match
+    /// would trip the path (a) detection, and then
+    /// `EntityId::from_string("Fire Rated")` would fail with the
+    /// error propagated via `?`, killing the whole parse. The fix
+    /// folds the EntityId validation into the `aec_authored`
+    /// detection — a failed parse lands in `None` and path (b)
+    /// captures the wall by STEP tag the same way any other
+    /// external-IFC element would.
+    #[test]
+    fn external_ifc_with_double_colon_in_description_falls_through_to_path_b() {
+        let step = "\
+ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('External Revit export'),'2;1');
+FILE_NAME('test.ifc','2024-01-01T00:00:00',(''),(''),'','','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('2vqOSiJTrEEvbbnEAh4Lay',$,'External Revit Project',$,$,$,$,(#2),#3);
+#2=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-5,#4,$);
+#3=IFCUNITASSIGNMENT((#5));
+#4=IFCAXIS2PLACEMENT3D(#6,$,$);
+#5=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#6=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCSITE('2vqOSiJTrEEvbbnEAh4Lb1',$,'External Revit Site',$,$,#4,$,$,.ELEMENT.,$,$,$,$,$);
+#100=IFCWALL('1bbU_VHpzCEvLPibG6XfX2',$,'Partition Wall','Partition :: Fire Rated',$,#4,$,$,.NOTDEFINED.);
+ENDSEC;
+END-ISO-10303-21;
+";
+        let snap = IfcReader::from_string(step).expect(
+            "external IFC with `::` in Description (but invalid EntityId suffix) \
+             must parse without erroring — path (a) detection must validate \
+             the EntityId parse before committing to path (a)",
+        );
+
+        // The wall is captured (path b fall-through).
+        let walls: Vec<_> = snap
+            .classification
+            .iter()
+            .filter(|(_, a)| matches!(a.class, IfcClass::IfcWall))
+            .collect();
+        assert_eq!(
+            walls.len(),
+            1,
+            "exactly one wall must be captured; got {walls:?}",
+        );
+
+        // EntityId is deterministically derived from GlobalId (path
+        // b), NOT from the "Fire Rated" suffix in the Description.
+        let (wall_id, _) = walls[0];
+        let expected = EntityId::from_guid_seed("1bbU_VHpzCEvLPibG6XfX2");
+        assert_eq!(
+            wall_id, &expected,
+            "external-IFC wall whose Description has `::` must derive \
+             EntityId from GlobalId via path (b), not from the \
+             Description suffix",
+        );
     }
 
     /// Conversely, a HEADER section that legitimately declares
