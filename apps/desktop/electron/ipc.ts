@@ -98,6 +98,11 @@ export function registerIpcHandlers(): void {
     assertString(path, "path");
     return getBridge().bimCheckFileSize(path);
   });
+  ipcMain.handle("bim:attachIfc", async (_e, { projectPath, ifcPath }) => {
+    assertString(projectPath, "projectPath");
+    assertString(ifcPath, "ifcPath");
+    return getBridge().bimAttachIfc(projectPath, ifcPath);
+  });
   ipcMain.handle("bim:exportIfc", async (_e, { path }) => {
     assertString(path, "path");
     return getBridge().bimExportIfc(path);

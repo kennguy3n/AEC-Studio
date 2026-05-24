@@ -247,7 +247,7 @@ This document tracks AEC Studio's phased delivery from open-source foundation to
 
 ## Phase 9 — Native render & BIM engine
 
-**Status:** `IN PROGRESS` (PR1–PR4 merged; PR5 in review)
+**Status:** `DONE` (PR1–PR4 + PR5 + PR-A through PR-P merged; #9 #10 #11 #12 #13 #14–#38 #PR-P)
 
 **Goal:** Eliminate every external runtime dependency for rendering and IFC handling. Replace the Blender worker (EEVEE/Cycles via subprocess) and IfcOpenShell worker (Python subprocess) with native Rust implementations in-process, while preserving every user-facing capability (PBR preview, path-traced final, walkthrough, panorama, IFC2x3 / IFC4 / IFC4x3 import/export with GUID + Pset round-trip).
 
@@ -259,10 +259,17 @@ This document tracks AEC Studio's phased delivery from open-source foundation to
 | **PR2**: wgpu compute path tracer, bilateral denoiser, tile scheduler | `DONE` (#10 merged) |
 | **PR3**: PBR rasterization preview, Hosek-Wilkie sky shader, preview integration | `DONE` (#11 merged) |
 | **PR4**: Remove `BlenderWorker`, `blender_discovery`, `cycles.rs`, `eevee.rs`, `workers/blender/`; native `final_render`, `walkthrough`, `panorama` (equirectangular camera in path tracer) | `DONE` (#12 merged) |
-| **PR5 — Task 15**: Native IFC STEP parser with schema detection (IFC2x3 / IFC4 / IFC4x3), streaming iterator, multi-line records & comments, UTF-8 preservation | `DONE` |
-| **PR5 — Task 16**: Native IFC STEP writer with GUID preservation, deterministic numbering, verbatim unknown-Pset round-trip via `PropertyValue::Other` | `DONE` |
-| **PR5 — Task 17**: Native IFC geometry tessellator (IfcExtrudedAreaSolid, IfcFacetedBrep, RectangleProfile / CircleProfile / ArbitraryClosedProfile, IfcBooleanClippingResult) | `DONE` |
-| **PR5 — Task 18**: Delete `workers/ifc/`, remove `python-workers` CI job, audit and update all stale Blender/IfcOpenShell doc references | `DONE` |
+| **PR5 — Task 15**: Native IFC STEP parser with schema detection (IFC2x3 / IFC4 / IFC4x3), streaming iterator, multi-line records & comments, UTF-8 preservation | `DONE` (#13 merged) |
+| **PR5 — Task 16**: Native IFC STEP writer with GUID preservation, deterministic numbering, verbatim unknown-Pset round-trip via `PropertyValue::Other` | `DONE` (#13 merged) |
+| **PR5 — Task 17**: Native IFC geometry tessellator (IfcExtrudedAreaSolid, IfcFacetedBrep, RectangleProfile / CircleProfile / ArbitraryClosedProfile, IfcBooleanClippingResult) | `DONE` (#13 merged) |
+| **PR5 — Task 18**: Delete `workers/ifc/`, remove `python-workers` CI job, audit and update all stale Blender/IfcOpenShell doc references | `DONE` (#13 merged) |
+| **PR-A through PR-H5 — DWG codec**: R12 / R14 / R2000 / R2004 / R2007 / R2010 / R2013 / R2018 LibreDWG oracle conformance, OBJECT supertype, HANDSEED, R2007 entity round-trip, shared OBJECTS+HANDLES helpers | `DONE` (#19–#30 merged) |
+| **PR-I, PR-I.5 — bridge**: forward-only schema migrations, v2 audit_chain, RwLock singleton, `with_service_ref_fallible`, engine-status connection cache | `DONE` (#31, #32 merged) |
+| **PR-J — render fidelity**: aux feature buffers (albedo / normal / depth), MIS for BSDF-found emitters, stratified Halton(2,3) jitter | `DONE` (#33 merged) |
+| **PR-K — IFC material library + revolved/swept solids**: bridge N-API surface | `DONE` (#34 merged) |
+| **PR-L, PR-M, PR-N — `bim_attach_ifc` service layer**: snapshot cache, IfcMaterialLayerSetUsage round-trip, IFC4-mandatory-fields invariant unrepresentable in `LayerSetUsageKey` | `DONE` (#35, #36, #37 merged) |
+| **PR-O — IFC4 polish**: IfcLogical tri-state (true / false / unknown), real-world IFC4 fixture (`small_office.ifc` integration test), pre-parse `bim_check_file_size` guard with renderer confirm dialog | `DONE` (#38 merged) |
+| **PR-P — BIM wiring + Phase 9 closer**: `bim_attach_ifc` end-to-end (napi + IPC + electron-bridge + renderer), `IfcBuildingElementProxy` first-class variant for external Revit / ArchiCAD IFCs, `bim_import_ifc` / `bim_check_file_size` / `bim_attach_ifc` promoted from `NATIVE_FALLBACK_METHODS` to `NATIVE_WIRED_METHODS` | `DONE` |
 | Phase 6–9 documentation refresh (ARCHITECTURE.md, PROPOSAL.md, README.md, PHASES.md, this file) | `DONE` |
 
 ### Exit criteria
@@ -275,6 +282,11 @@ This document tracks AEC Studio's phased delivery from open-source foundation to
 - [x] Native STEP parser/writer round-trips GUIDs and all Psets (including unmodeled measure types via `PropertyValue::Other`).
 - [x] Documentation (ARCHITECTURE.md, PROPOSAL.md, README.md, PROGRESS.md, PHASES.md) reflects the in-process Rust engine throughout.
 - [x] CI workflow no longer installs Blender or IfcOpenShell (the `python-workers` job is gone).
+- [x] Native DWG codec passes the LibreDWG oracle gate for R12 / R14 / R2000 / R2004 / R2007 / R2010 / R2013 / R2018.
+- [x] `bim_import_ifc`, `bim_check_file_size`, and `bim_attach_ifc` are wired end-to-end through the N-API bridge (no longer in `NATIVE_FALLBACK_METHODS`).
+- [x] External IFC files from Revit / ArchiCAD with `IfcBuildingElementProxy` placeholder elements parse and are captured in the project graph (no silent drop in path-(b) element capture).
+- [x] `IfcLogicalValue` is a first-class tri-state (`True` / `False` / `Unknown`) distinct from `IfcBoolean`, with reader / writer / Pset codec round-trip coverage.
+- [x] Renderer-side file-picker calls `bim_check_file_size` before committing to the multi-second STEP parse, so users get a confirm dialog on files at or above the 100 MB warn threshold rather than a frozen UI.
 
 ---
 
@@ -373,6 +385,14 @@ AEC Studio's UI follows the **KChat design system** — primary accent `#7C3AED`
 ---
 
 ## Changelog
+
+### 2026-05-20 (Phase 9 — BIM wiring, proxy-element gap, doc closer, PR-P)
+
+- **`bim_attach_ifc` wired end-to-end** through the native bridge. New `BimAttachSummaryJs` and `bim_attach_ifc(project_path, ifc_path)` `#[napi]` exports in `crates/aec_bridge/src/napi_api.rs` (routed via `with_service_ref_fallible`, same locking pattern as `bim_import_ifc`); matching `BimAttachSummary` interface, `bim:attachIfc` IPC handler, and `preload.ts` / `bridge.ts` / renderer-side `bim-attach.ts` helper. The renderer's BIM toolbar gains an "Attach IFC" button; in production the IPC dispatches into the snapshot-cache-backed Rust service (a recent `bim_import_ifc` call on the same path serves the parse for free, reported as `parseCacheHit: true` in the result).
+- **`IfcBuildingElementProxy` promoted to a first-class `IfcClass` variant.** Pre-PR-P, external IFCs from Revit (custom families exported as proxies), ArchiCAD (MEP federations), and buildingSMART exemplars that used `IFCBUILDINGELEMENTPROXY` for "real building element but doesn't fit a precise IFC subtype" fell into the `IfcClass::Other(_)` arm and were silently dropped by the path-(b) `Other(_)` guard in `IfcReader::collect_elements_by_step_tag`. The new variant is recognised by `ifc_tag()`, `ifc_class_from_tag()`, and `is_building_element()`, so those elements now land in the project graph. Round-trip pinned by `ifc_building_element_proxy_roundtrips_as_first_class_variant`; path-(b) capture pinned by `external_ifc_captures_ifcbuildingelementproxy_via_path_b`.
+- **`bim_import_ifc`, `bim_check_file_size`, and `bim_attach_ifc` promoted from `NATIVE_FALLBACK_METHODS` to `NATIVE_WIRED_METHODS`** in `apps/desktop/electron/bridge.ts`. The `adaptNative` self-check throws on a method that appears in neither list, so this also pins the wiring contract at runtime. Closes the no-op size-guard Devin Review found in PR-O round 1 — the confirm dialog will now actually fire in the built app.
+- **PHASES.md + PROGRESS.md updated.** Phase 9 status flipped to `DONE`; the PR-A → PR-P timeline is reflected in the per-item table; four new Phase-9 exit criteria covering DWG oracle conformance, BIM-method wiring, proxy-element capture, and the renderer-side size guard are now checked.
+- **Tests.** New: `bim-attach.test.ts` (7), `ifc_building_element_proxy_roundtrips_as_first_class_variant`, `ifc_building_element_proxy_classifies_as_building_element`, `external_ifc_captures_ifcbuildingelementproxy_via_path_b`. Updated: `bim-import.test.ts` mocks now return the full `BimImportSummary` shape; `BimToolbar.test.tsx` covers the new `attachIfc` action; `ifc_class_other_roundtrips_through_writer_and_reader` switched to a synthetic `IfcAecStudioCustomComponent` identifier so it still pins the `Other(_)` round-trip after the proxy promotion. `cargo test --workspace` + `cargo clippy --workspace --all-targets -- -D warnings` + `cargo fmt --all --check` + `npm run -w apps/desktop test` (183 vitest) all green.
 
 ### 2026-05-20 (Phase 9 — native render & BIM engine, PRs #9–#13)
 

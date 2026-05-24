@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { aec } from "../api/aec";
 import { importIfcWithSizeGuard } from "../api/bim-import";
+import { attachIfcToProject } from "../api/bim-attach";
 import {
   SpatialTree,
   SpatialNode,
@@ -88,15 +89,40 @@ export function Bim() {
             "demo://project.ifc",
           );
           if (outcome.kind === "imported") {
-            const result = outcome.result as { imported: number };
-            // Keep the demo tree if the IPC fake didn't deliver anything.
-            if (result.imported > 0) {
+            // PR-P wired `bim_import_ifc` to the native bridge, so
+            // `outcome.result` is now a full `BimImportSummary`
+            // with entity counts. If the bridge actually parsed
+            // anything (i.e. we're running against a real file via
+            // the native path, not the all-zeros in-process
+            // fallback), refresh the demo tree. A future PR will
+            // replace the demo tree with a real one folded from
+            // the snapshot.
+            if (outcome.result.spatialNodes > 0 || outcome.result.elements > 0) {
               setRoot(DEMO_ROOT);
             }
           }
           // "cancelled-by-user" / "failed" outcomes are no-ops on
           // the demo tree — a future PR will surface them as a
           // toast or status-pane note.
+          break;
+        }
+        case "attachIfc": {
+          // Fold a previously-parsed IFC snapshot into the active
+          // project's SQLCipher DB. The bridge's in-process
+          // snapshot cache means an import → attach handoff on
+          // the same path does NOT re-parse the file
+          // (`parseCacheHit: true` in the result).
+          //
+          // The demo uses placeholder paths because the page-level
+          // project-picker UX isn't wired in this PR; a future PR
+          // will replace these with the currently-open project's
+          // path and a file-picker-supplied IFC path. The fallback
+          // backend will return all-zero counts here, so the demo
+          // tree stays untouched.
+          await attachIfcToProject(
+            "demo://project.aecstudio",
+            "demo://project.ifc",
+          );
           break;
         }
         case "exportIfc":

@@ -1,5 +1,6 @@
 export type BimAction =
   | "importIfc"
+  | "attachIfc"
   | "exportIfc"
   | "validate"
   | "classify"
@@ -9,6 +10,9 @@ export type BimAction =
 
 const ACTIONS: { id: BimAction; label: string }[] = [
   { id: "importIfc", label: "Import IFC" },
+  // PR-P: `Attach` runs `bim_attach_ifc` after a preview parse,
+  // folding the snapshot into the active project's SQLCipher DB.
+  { id: "attachIfc", label: "Attach IFC" },
   { id: "exportIfc", label: "Export IFC" },
   { id: "validate", label: "Validate" },
   { id: "classify", label: "Classify" },

@@ -47,7 +47,21 @@ const api = {
 
   // ----- BIM -----
   bim: {
-    importIfc: (path: string) => ipcRenderer.invoke("bim:importIfc", { path }),
+    importIfc: (path: string) =>
+      ipcRenderer.invoke("bim:importIfc", { path }) as Promise<{
+        path: string;
+        schema: string;
+        spatialNodes: number;
+        elements: number;
+        psets: number;
+        qsets: number;
+        aggregations: number;
+        containments: number;
+        materials: number;
+        materialLayerSets: number;
+        materialAssignments: number;
+        recordsSeen: number;
+      }>,
     /**
      * Cheap pre-parse file-size check. The renderer's file-picker UI
      * calls this before `importIfc` so it can warn-and-confirm on
@@ -60,6 +74,31 @@ const api = {
         fileSizeBytes: number;
         largeFileWarning: boolean;
         thresholdBytes: number;
+      }>,
+    /**
+     * Attach a parsed IFC snapshot into the active project's
+     * SQLCipher database. Counts are post-dedup: a re-attach of the
+     * same file with identical content reports `_unchanged` instead
+     * of `_inserted` / `_updated`.
+     *
+     * If the renderer just ran `importIfc(ifcPath)`, the bridge's
+     * in-process snapshot cache will serve the parse for free
+     * (`parseCacheHit: true`).
+     */
+    attachIfc: (projectPath: string, ifcPath: string) =>
+      ipcRenderer.invoke("bim:attachIfc", { projectPath, ifcPath }) as Promise<{
+        path: string;
+        projectPath: string;
+        parseCacheHit: boolean;
+        spatialNodesInserted: number;
+        spatialNodesUpdated: number;
+        spatialNodesUnchanged: number;
+        elementsInserted: number;
+        elementsUpdated: number;
+        elementsUnchanged: number;
+        componentsInserted: number;
+        relationsInserted: number;
+        cacheRows: number;
       }>,
     exportIfc: (path: string) => ipcRenderer.invoke("bim:exportIfc", { path }),
     classify: (params: Record<string, unknown>) =>
