@@ -1303,6 +1303,27 @@ function adaptNative(n: NativeApi): BridgeBackend {
         params.outPath,
       ) as BimScheduleSummary,
   };
+  // Self-check 0: the two catalogues must be *disjoint*. A method
+  // listed in both `NATIVE_WIRED_METHODS` and `NATIVE_FALLBACK_METHODS`
+  // would defeat self-check 2 (the function-reference comparison
+  // below): the fallback-wrapping loop creates a fresh closure for
+  // any method that's in `fallbackNames`, so `native[key] !==
+  // base[key]` even without a real native override — self-check 2
+  // would silently pass and the method would degrade to the
+  // in-process impl with the fallback debug trace, hiding the
+  // wiring gap. Pinned at vitest time by `bridge-catalogue.test.ts`'s
+  // "WIRED and FALLBACK lists are disjoint" test; pinned again here
+  // at runtime as defence-in-depth.
+  const fallbackSet = new Set<string>(NATIVE_FALLBACK_METHODS);
+  const overlap = NATIVE_WIRED_METHODS.filter((key) => fallbackSet.has(key));
+  if (overlap.length > 0 && process.env.AEC_BRIDGE_SKIP_SELFCHECK !== "1") {
+    throw new Error(
+      `[aec_bridge] BridgeBackend method(s) ${JSON.stringify(overlap)} declared in ` +
+        `both NATIVE_WIRED_METHODS and NATIVE_FALLBACK_METHODS \u2014 each method ` +
+        `must appear in exactly one list so self-check 2's function-reference ` +
+        `identity check can detect missing native overrides.`,
+    );
+  }
   // Self-check 1: the two catalogues above must, together, reference every
   // method on the in-process backend. We throw rather than warn so a new
   // BridgeBackend method that is forgotten in the declarations fails
