@@ -553,7 +553,26 @@ impl BridgeService {
         // run through `with_service_ref_fallible` alongside other
         // read-only endpoints — IFC parsing is CPU-bound but doesn't
         // touch project state, so it doesn't need exclusive access.
-        let body = std::fs::read_to_string(Path::new(path))?;
+        //
+        // ISO 10303-21 formally restricts STEP-21 files to ASCII,
+        // but real-world IFC exports — especially CJK-locale dumps
+        // from older ArchiCAD / Revit and IfcOpenShell-scripted
+        // pipelines — sometimes leak raw Windows-1252 or Shift-JIS
+        // bytes into `IfcLabel` / `IfcText` string literals. Reading
+        // through `read_to_string` would reject any such file with an
+        // `InvalidData` IO error before the parser ever runs, which
+        // makes the "Import BIM" panel useless for users with legacy
+        // files. Switch to a byte read + lossy UTF-8 decode: invalid
+        // sequences are replaced with U+FFFD (REPLACEMENT CHARACTER)
+        // inside the string literal so the structural STEP grammar
+        // (entity-type keywords, `#N` refs, `,` / `;` / `'`
+        // delimiters — all ASCII by spec) is preserved and the
+        // tolerate-and-skip parse path can proceed. The U+FFFD only
+        // surfaces in the user-visible string fields (material name,
+        // pset values), which is a strict improvement over outright
+        // failing the import.
+        let bytes = std::fs::read(Path::new(path))?;
+        let body = String::from_utf8_lossy(&bytes).into_owned();
         let snapshot = aec_bim::ifc::IfcReader::from_string(&body)?;
         Ok(BimImportSummary {
             path: path.to_string(),
@@ -918,5 +937,56 @@ mod tests {
             1,
             "canonicalisation must collapse non-canonical paths to the same cache entry"
         );
+    }
+
+    #[test]
+    fn bim_import_ifc_tolerates_non_utf8_bytes() {
+        // ISO 10303-21 is formally ASCII, but real-world IFC exports
+        // — especially CJK-locale ArchiCAD / IfcOpenShell-scripted
+        // pipelines — sometimes carry raw Windows-1252 / Shift-JIS
+        // bytes inside `IfcLabel` / `IfcText` literals. `bim_import_ifc`
+        // must lossy-decode rather than refusing the file with an IO
+        // error: the STEP grammar (entity keywords, `#N` refs, `,` /
+        // `;` / `'` delimiters) is pure ASCII by spec, so the
+        // structural parse can still proceed.
+        let (s, _g) = service();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("non_utf8.ifc");
+
+        // Build a minimal valid IFC2x3 graph with a single non-UTF-8
+        // byte (0x9F, a Windows-1252 codepoint that is invalid UTF-8)
+        // embedded in the project name. `read_to_string` would reject
+        // this with `InvalidData`; `read` + `from_utf8_lossy` should
+        // accept it and surface U+FFFD in the project name.
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(
+            b"ISO-10303-21;\n\
+HEADER;\n\
+FILE_DESCRIPTION(('test'),'2;1');\n\
+FILE_NAME('t.ifc','2026-05-20T00:00:00',(''),(''),'','','');\n\
+FILE_SCHEMA(('IFC2X3'));\n\
+ENDSEC;\n\
+DATA;\n\
+#1 = IFCOWNERHISTORY($,$,$,.NOCHANGE.,$,$,$,1747699200);\n\
+#2 = IFCPROJECT('00000000000000000000a1',#1,'Latin1-",
+        );
+        body.push(0x9F);
+        body.extend_from_slice(
+            b"','P',$,$,$,$,$);\n\
+ENDSEC;\n\
+END-ISO-10303-21;\n",
+        );
+        std::fs::write(&path, &body).unwrap();
+
+        // Pre-fix this returned `Err(BridgeServiceError::Io(_))` on
+        // stable Rust because `String::from_utf8` rejects the 0x9F
+        // byte. Post-fix we get a real summary back.
+        let summary = s
+            .bim_import_ifc(path.to_str().unwrap())
+            .expect("non-UTF-8 IFC file must parse via lossy decode");
+        assert_eq!(summary.schema, "IFC2X3");
+        // The project entity parsed (spatial_nodes >= 1 means the
+        // structural parse survived the lossy-decoded byte).
+        assert!(summary.spatial_nodes >= 1);
     }
 }

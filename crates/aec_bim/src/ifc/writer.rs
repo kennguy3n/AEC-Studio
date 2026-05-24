@@ -524,7 +524,22 @@ DATA;\n";
             // round-trip guarantee.
             let mut by_material: BTreeMap<(bool, String), Vec<u32>> = BTreeMap::new();
             for (entity, assignment) in materials.assignments() {
-                let Some(elem_step) = element_step.get(entity) else {
+                // Per IFC4 schema, `IfcRelAssociatesMaterial.RelatedObjects`
+                // is `SET[1:?] OF IfcObjectDefinition` — same supertype
+                // that `IfcRelDefinesByProperties.RelatedObjects` uses
+                // (see Pset path at line ~336). Both element subtypes
+                // and spatial-structure subtypes (`IfcSpace`,
+                // `IfcBuildingStorey`, …) can carry a material binding;
+                // notably a `Pset_SpaceCommon`-tagged `IfcSpace` can
+                // own an `IfcMaterial` for the dominant floor finish.
+                // The reader already accepts both element_step and
+                // spatial_step targets — the writer must mirror that or
+                // round-tripping a Revit / ArchiCAD-authored file
+                // silently drops space ↔ material bindings.
+                let Some(elem_step) = element_step
+                    .get(entity)
+                    .or_else(|| spatial_step.get(entity))
+                else {
                     continue;
                 };
                 let key = match assignment {

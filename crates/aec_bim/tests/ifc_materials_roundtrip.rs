@@ -346,3 +346,137 @@ END-ISO-10303-21;
     assert_eq!(set.layers[0].material_name, "Concrete");
     assert!((set.layers[0].thickness_m - 0.2).abs() < 1e-12);
 }
+
+#[test]
+fn reader_tolerates_air_gap_material_layer() {
+    // IFC4 `IfcMaterialLayer.Material` is `OPTIONAL IfcMaterial` —
+    // a `$` literal means the layer is an air gap (legitimate per
+    // schema, common in real Revit / ArchiCAD curtain walls). The
+    // reader must drop the air-gap layer rather than refuse the
+    // whole file. Other layers in the same set must survive.
+    //
+    // STEP graph: a 2-layer wall where layer 1 is concrete (200mm)
+    // and layer 2 is an air gap (50mm).
+    let body = "\
+ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('test'),'2;1');
+FILE_NAME('t.ifc','2026-05-20T00:00:00',(''),(''),'','','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1 = IFCOWNERHISTORY($,$,$,.NOCHANGE.,$,$,$,1747699200);
+#2 = IFCPROJECT('00000000000000000000a1',#1,$,'P',$,$,$,$,$);
+#3 = IFCSITE('00000000000000000000a2',#1,$,'S',$,$,$,$);
+#4 = IFCBUILDING('00000000000000000000a3',#1,$,'B',$,$,$,$);
+#5 = IFCBUILDINGSTOREY('00000000000000000000a4',#1,$,'L1',$,$,$,$);
+#6 = IFCRELAGGREGATES('00000000000000000000a5',#1,$,$,#2,(#3));
+#7 = IFCRELAGGREGATES('00000000000000000000a6',#1,$,$,#3,(#4));
+#8 = IFCRELAGGREGATES('00000000000000000000a7',#1,$,$,#4,(#5));
+#11 = IFCMATERIAL('Concrete',$,$);
+#12 = IFCMATERIALLAYER(#11,0.2,.F.,$,$,$,$);
+#13 = IFCMATERIALLAYER($,0.05,.T.,$,$,$,$);
+#14 = IFCMATERIALLAYERSET((#12,#13),'Wall Assembly',$);
+#15 = IFCWALL('00000000000000000000a8',#1,$,'IfcWall::ent_01hx5sabwall0000000000000000','Wall',$,$,$);
+#16 = IFCRELCONTAINEDINSPATIALSTRUCTURE('00000000000000000000a9',#1,$,$,(#15),#5);
+#17 = IFCRELASSOCIATESMATERIAL('00000000000000000000aa',#1,$,$,(#15),#14);
+ENDSEC;
+END-ISO-10303-21;
+";
+    let snap = IfcReader::from_string(body).expect("tolerate $ Material on IfcMaterialLayer");
+    assert_eq!(snap.materials.material_count(), 1);
+    assert_eq!(snap.materials.layer_set_count(), 1);
+    assert_eq!(snap.stats.material_assignments, 1);
+    let set = snap
+        .materials
+        .layer_set("Wall Assembly")
+        .expect("layer-set recovered with air-gap layer dropped");
+    // Concrete layer survives, air gap was dropped.
+    assert_eq!(set.layers.len(), 1);
+    assert_eq!(set.layers[0].material_name, "Concrete");
+}
+
+#[test]
+fn writer_emits_material_assignment_on_spatial_node() {
+    // IFC4 declares `IfcRelAssociatesMaterial.RelatedObjects` as
+    // `SET[1:?] OF IfcObjectDefinition` — both elements AND spatial
+    // structure subtypes (`IfcSpace`, `IfcBuildingStorey`, …) are
+    // legal targets. Revit's "Floor Finish" property on a space
+    // exports as an `IfcRelAssociatesMaterial` bound to the
+    // `IfcSpace`. The reader already accepts this (see
+    // material_assignments accumulation in stage-3); the writer
+    // must mirror it or round-trip silently drops the binding.
+    let mut project = Project::new("Spatial Material Test");
+    let site = project
+        .add_child(&project.root.clone(), IfcClass::IfcSite, "Site")
+        .unwrap();
+    let bldg = project
+        .add_child(&site, IfcClass::IfcBuilding, "B1")
+        .unwrap();
+    let storey = project
+        .add_child(&bldg, IfcClass::IfcBuildingStorey, "Ground")
+        .unwrap();
+    let space = project
+        .add_child(&storey, IfcClass::IfcSpace, "Lobby")
+        .unwrap();
+
+    let classification = ClassificationStore::new();
+    let properties = PropertyStore::new();
+    let mut materials = MaterialStore::new();
+    materials.upsert_material(Material::new("Polished Concrete"));
+    let assigned = materials.assign_to_element(
+        space.clone(),
+        MaterialAssignment::Single("Polished Concrete".into()),
+    );
+    assert!(assigned, "spatial-node material binding must succeed");
+
+    let s = IfcWriter::to_string_with_materials(&project, &classification, &properties, &materials);
+    let snapshot = IfcReader::from_string(&s).expect("read back spatial-material IFC");
+
+    // Material survives.
+    assert_eq!(snapshot.materials.material_count(), 1);
+    // KEY: the relation actually made it to the wire. Pre-fix this
+    // was 0 (writer dropped the assignment because `entity` was a
+    // spatial node, not in `element_step`).
+    assert_eq!(snapshot.stats.material_assignments, 1);
+}
+
+#[test]
+fn reader_tolerates_anonymous_material_layer_set() {
+    // IFC4 `IfcMaterialLayerSet.LayerSetName` is `OPTIONAL
+    // IfcLabel` — `$` is legitimate (IfcOpenShell / Tekla /
+    // scripted exporters routinely emit it). The reader must
+    // refuse to upsert the unnameable set (since the in-memory
+    // `MaterialStore` keys by name) but must NOT fail the whole
+    // parse — the file as a whole still loads, other layer sets
+    // and direct material assignments are unaffected.
+    let body = "\
+ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('test'),'2;1');
+FILE_NAME('t.ifc','2026-05-20T00:00:00',(''),(''),'','','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1 = IFCOWNERHISTORY($,$,$,.NOCHANGE.,$,$,$,1747699200);
+#2 = IFCPROJECT('00000000000000000000a1',#1,$,'P',$,$,$,$,$);
+#3 = IFCSITE('00000000000000000000a2',#1,$,'S',$,$,$,$);
+#4 = IFCBUILDING('00000000000000000000a3',#1,$,'B',$,$,$,$);
+#5 = IFCBUILDINGSTOREY('00000000000000000000a4',#1,$,'L1',$,$,$,$);
+#6 = IFCRELAGGREGATES('00000000000000000000a5',#1,$,$,#2,(#3));
+#7 = IFCRELAGGREGATES('00000000000000000000a6',#1,$,$,#3,(#4));
+#8 = IFCRELAGGREGATES('00000000000000000000a7',#1,$,$,#4,(#5));
+#11 = IFCMATERIAL('Concrete',$,$);
+#12 = IFCMATERIALLAYER(#11,0.2,.F.,$,$,$,$);
+#13 = IFCMATERIALLAYERSET((#12),$,$);
+#14 = IFCWALL('00000000000000000000a8',#1,$,'IfcWall::ent_01hx5sabwall0000000000000000','Wall',$,$,$);
+#15 = IFCRELCONTAINEDINSPATIALSTRUCTURE('00000000000000000000a9',#1,$,$,(#14),#5);
+ENDSEC;
+END-ISO-10303-21;
+";
+    let snap = IfcReader::from_string(body).expect("tolerate $ LayerSetName");
+    // Material survives; anonymous layer-set was dropped.
+    assert_eq!(snap.materials.material_count(), 1);
+    assert_eq!(snap.materials.layer_set_count(), 0);
+    assert_eq!(snap.stats.elements, 1);
+}

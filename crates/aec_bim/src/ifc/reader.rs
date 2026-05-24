@@ -322,10 +322,20 @@ impl IfcReader {
                     //                    Priority)
                     // IFC2x3 form (3-arg):
                     //   IFCMATERIALLAYER(#Material, LayerThickness, IsVentilated)
-                    // We accept either; missing optionals fall through
-                    // as `None`. The Material ref is resolved in the
-                    // second pass.
-                    let material_ref = g.ref_arg(0)?;
+                    //
+                    // `Material` is declared `OPTIONAL IfcMaterial` —
+                    // a `$` literal represents an air-gap layer
+                    // (legitimate in real-world Revit / ArchiCAD wall
+                    // assemblies). Hard-failing on `$` would refuse
+                    // the whole file, violating the tolerate-and-skip
+                    // contract. We drop the layer entirely when the
+                    // ref is absent — the sentinel resolves to no
+                    // material on stage-2, so emitting it would just
+                    // be filtered there anyway, and dropping here
+                    // avoids a `__ref:0` ghost-id collision risk.
+                    let Some(material_ref) = optional_ref_arg(g, 0)? else {
+                        continue;
+                    };
                     let thickness = g
                         .args
                         .get(1)
@@ -360,10 +370,20 @@ impl IfcReader {
                 }
                 "IFCMATERIALLAYERSET" => {
                     // IFCMATERIALLAYERSET((#L1,#L2,...), 'Name', 'Description')
+                    //
+                    // `LayerSetName` is declared `OPTIONAL IfcLabel`
+                    // — IfcOpenShell / Tekla / scripted exporters
+                    // commonly emit `$` here, and hard-rejecting it
+                    // would refuse the whole file. Skip the layer-set
+                    // when the name is absent / empty because the
+                    // downstream `MaterialAssignment::LayerSet(String)`
+                    // representation in `MaterialStore` is keyed by
+                    // name — an unnameable set has no addressable
+                    // identity and can't be re-bound to elements.
                     let layer_refs = g.ref_list_arg(0)?;
-                    let name = g.string_arg(1)?;
+                    let name = optional_string_arg(g, 1)?;
                     let description = optional_string_arg(g, 2)?;
-                    if !name.is_empty() {
+                    if let Some(name) = name.filter(|n| !n.is_empty()) {
                         material_layer_sets_step.insert(g.step_id, (name, description, layer_refs));
                     }
                 }
@@ -1742,6 +1762,41 @@ fn optional_string_arg(g: &StepRecord, idx: usize) -> IfcReadResult<Option<Strin
         )));
     }
     Ok(Some(unescape_step_string(&s[1..s.len() - 1])))
+}
+
+/// Decode an entity reference (`#N`) argument at `idx`, returning
+/// `None` when the slot holds the STEP "no value" sentinel `$` (or
+/// the arg is absent entirely). Used by the material reader for
+/// optional ref slots — IFC4 declares both
+/// `IfcMaterialLayer.Material` and (via select promotion) several
+/// `IfcRelAssociatesMaterial.RelatingMaterial` paths as carrying
+/// genuinely optional STEP refs that real-world authoring tools
+/// emit as `$` when a layer is e.g. an air gap.
+///
+/// Distinct from [`StepRecord::ref_arg`] which hard-rejects `$` and
+/// is correct for `MANDATORY` ref slots (`IfcOwnerHistory`,
+/// `IfcRelAssociates.RelatingProcess`, etc.).
+fn optional_ref_arg(g: &StepRecord, idx: usize) -> IfcReadResult<Option<u32>> {
+    let Some(raw) = g.args.get(idx) else {
+        return Ok(None);
+    };
+    let s = raw.trim();
+    if s == "$" || s.is_empty() {
+        return Ok(None);
+    }
+    if !s.starts_with('#') {
+        return Err(IfcReadError::Malformed(format!(
+            "expected #N reference at arg {idx} of {} but got '{s}'",
+            g.kind
+        )));
+    }
+    let id: u32 = s[1..].parse().map_err(|_| {
+        IfcReadError::Malformed(format!(
+            "expected #<u32> at arg {idx} of {} but got '{s}'",
+            g.kind
+        ))
+    })?;
+    Ok(Some(id))
 }
 
 /// Decode an IFC LOGICAL field (`.T.` / `.F.` / `.U.` / `$`).
