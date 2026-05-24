@@ -690,6 +690,15 @@ impl IfcReader {
                 resolved.material_name = resolved_name;
                 set.layers.push(resolved);
             }
+            // Symmetric to the writer at writer.rs ≈490 — IFC4
+            // `IfcMaterialLayerSet.MaterialLayers` is `LIST [1:?]`,
+            // so an empty layer-set is structurally invalid. Skip
+            // the upsert to keep the in-memory `MaterialStore`
+            // schema-conformant for downstream consumers (BoQ,
+            // drawing generation) that might not anticipate it.
+            if set.layers.is_empty() {
+                continue;
+            }
             materials_store.upsert_layer_set(set);
         }
         // Stage 3: assignments

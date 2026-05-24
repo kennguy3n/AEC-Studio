@@ -146,9 +146,13 @@ pub struct EngineStatusReport {
 pub struct BimImportSummary {
     /// Canonicalised path the user pointed at.
     pub path: String,
-    /// IFC schema version recovered from `FILE_SCHEMA`, formatted
-    /// as the `IfcSchema` enum's `Debug` impl (e.g. `"Ifc4"` /
-    /// `"Ifc2x3"`).
+    /// IFC schema version recovered from `FILE_SCHEMA`, rendered
+    /// via the `IfcSchema` enum's `Display` impl — the canonical
+    /// STEP token (`"IFC2X3"` / `"IFC4"` / `"IFC4X3"`). The TS
+    /// `BimImportSummary` interface matches on these tokens, so do
+    /// NOT switch back to `format!("{:?}")` (which would leak the
+    /// Rust variant names `"Ifc4"` / `"Ifc2x3"` and break the
+    /// renderer's match).
     pub schema: String,
     pub spatial_nodes: u64,
     pub elements: u64,

@@ -567,13 +567,42 @@ DATA;\n";
         String::from_utf8(buf.inner).expect("IFC writer emits ASCII only")
     }
 
+    /// Stream the project + classification + property graph to a
+    /// `Write` sink. Materials are omitted — see
+    /// [`IfcWriter::write_with_materials`] for the 5-arg streaming
+    /// counterpart.
+    ///
+    /// The 4-arg signature stays as-is for existing callers (asset
+    /// export, journey tests). New code that needs material data in
+    /// the output should use `write_with_materials`.
     pub fn write<W: Write>(
         w: &mut W,
         project: &Project,
         classification: &ClassificationStore,
         properties: &PropertyStore,
     ) -> Result<(), IfcWriteError> {
-        let s = Self::to_string(project, classification, properties);
+        Self::write_with_materials(
+            w,
+            project,
+            classification,
+            properties,
+            &MaterialStore::default(),
+        )
+    }
+
+    /// Stream the project + classification + property + material
+    /// library to a `Write` sink. Symmetric to
+    /// [`IfcWriter::to_string_with_materials`] but emits to a
+    /// `Write` sink rather than materialising the full STEP body in
+    /// memory.
+    pub fn write_with_materials<W: Write>(
+        w: &mut W,
+        project: &Project,
+        classification: &ClassificationStore,
+        properties: &PropertyStore,
+        materials: &MaterialStore,
+    ) -> Result<(), IfcWriteError> {
+        let s = Self::to_string_with_materials(project, classification, properties, materials);
         w.write_all(s.as_bytes())?;
         Ok(())
     }
