@@ -1309,11 +1309,30 @@ impl SweptDiskSolid {
                 // joint. Smoother than picking one or the other.
                 let incoming = normalize3(sub3(path[i], path[i - 1]));
                 let outgoing = normalize3(sub3(path[i + 1], path[i]));
-                [
+                let avg = [
                     incoming[0] + outgoing[0],
                     incoming[1] + outgoing[1],
                     incoming[2] + outgoing[2],
-                ]
+                ];
+                // If the incoming and outgoing edges are antiparallel
+                // (a ≈180° hairpin on the directrix) the average
+                // collapses to the zero vector and `normalize3` would
+                // emit `[0, 0, 0]`, which then poisons the frame at
+                // this joint and every downstream ring (zero-area
+                // triangles, NaN-free but visually missing). IFC4
+                // doesn't formally model hairpins on
+                // `IfcSweptDiskSolid.Directrix`, but real-world
+                // exporters occasionally emit reversal vertices
+                // (e.g. a U-shaped raceway folded back through floor
+                // plan compression). Fall back to the incoming
+                // tangent so the joint frame stays well-defined; the
+                // next segment then realigns naturally.
+                let avg_len_sq = avg[0] * avg[0] + avg[1] * avg[1] + avg[2] * avg[2];
+                if avg_len_sq < 1e-24 {
+                    incoming
+                } else {
+                    avg
+                }
             };
             tangents.push(normalize3(t));
         }
@@ -1327,8 +1346,21 @@ impl SweptDiskSolid {
             // Rotate `up` from the previous tangent to the current
             // tangent. Geometrically this projects `up` into the plane
             // perpendicular to the current tangent and renormalises.
-            up = project_perpendicular(up, *tangent);
-            up = normalize3(up);
+            let projected = project_perpendicular(up, *tangent);
+            let projected_norm = normalize3(projected);
+            // `project_perpendicular` collapses to the zero vector when
+            // the previous frame's `up` happens to be parallel to the
+            // new tangent — e.g. an L-bend that aligns the path's
+            // principal axis with the previous `up`, or a hairpin
+            // collapse propagated through the joint. Re-seed with a
+            // fresh perpendicular instead of normalising zero, so the
+            // frame stays orthonormal and downstream rings stay
+            // non-degenerate.
+            up = if projected_norm == [0.0, 0.0, 0.0] {
+                pick_perpendicular(*tangent)
+            } else {
+                projected_norm
+            };
             let right = cross3(*tangent, up);
             frames.push((up, right));
         }
@@ -2305,5 +2337,46 @@ mod tests {
         let mesh = solid.tessellate().expect("all-coincident");
         assert!(mesh.positions.is_empty());
         assert!(mesh.indices.is_empty());
+    }
+
+    /// A 3-vertex polyline whose outgoing edge reverses the incoming
+    /// edge (≈180° hairpin at the joint) used to collapse the
+    /// parallel-transport frame at the reversal vertex because the
+    /// averaged tangent (`incoming + outgoing`) was the zero vector.
+    /// After the hairpin-fallback fix the joint frame is well-defined
+    /// (falls back to the incoming tangent) and every ring vertex sits
+    /// at the path radius, not collapsed to the path center.
+    #[test]
+    fn swept_disk_hairpin_joint_emits_non_degenerate_ring() {
+        let solid = SweptDiskSolid {
+            path: vec![
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                // Reverse — outgoing edge antiparallel to incoming.
+                [0.0, 0.0, 0.0],
+            ],
+            radius_m: 0.2,
+            inner_radius_m: None,
+            segments: 12,
+        };
+        let mesh = solid.tessellate().expect("hairpin");
+        // 3 sections × 12 ring samples = 36 positions.
+        assert_eq!(mesh.positions.len(), 36);
+        // Joint ring sits at path[1] = (1, 0, 0). Every vertex on that
+        // ring must be at exactly `radius_m` from the joint center;
+        // the pre-fix code would emit the joint center for every
+        // vertex (collapsed ring) because the frame went to zero.
+        let r = 0.2_f64;
+        for k in 0..12 {
+            let p = mesh.positions[12 + k];
+            let dx = p[0] as f64 - 1.0;
+            let dy = p[1] as f64;
+            let dz = p[2] as f64;
+            let dist = (dx * dx + dy * dy + dz * dz).sqrt();
+            assert!(
+                (dist - r).abs() < 1e-5,
+                "joint ring vertex {k} at distance {dist} from joint center, expected {r}",
+            );
+        }
     }
 }
