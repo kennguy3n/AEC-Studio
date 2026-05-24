@@ -10,10 +10,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use aec_audit::AuditLog;
 use aec_core::config::ProjectSettings;
 use aec_core::package::{ProjectPackage, ProjectSummary as CoreProjectSummary};
 use aec_core::templates::TemplateLoader;
-use aec_core::types::ProjectId;
+use aec_core::types::{ProjectId, Scope};
 use aec_governor::profiler::{CpuProfile, GpuProfile, HardwareProfiler};
 use aec_governor::tier::HardwareTier;
 
@@ -27,8 +28,26 @@ pub enum BridgeServiceError {
     Recents(#[from] RecentsStoreError),
     #[error("template: {0}")]
     Template(String),
+    #[error("audit: {0}")]
+    Audit(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+}
+
+impl From<aec_audit::AuditError> for BridgeServiceError {
+    fn from(e: aec_audit::AuditError) -> Self {
+        Self::Audit(e.to_string())
+    }
+}
+
+impl From<rusqlite::Error> for BridgeServiceError {
+    fn from(e: rusqlite::Error) -> Self {
+        // SQL errors at the bridge layer are a subclass of "core" — they
+        // arise from project_engine_status etc. running ad-hoc queries
+        // against the encrypted project DB. Reusing the `Core` variant
+        // keeps the JS-side error taxonomy small.
+        Self::Core(e.to_string())
+    }
 }
 
 impl From<aec_core::error::AecError> for BridgeServiceError {
@@ -68,6 +87,39 @@ impl From<CoreProjectSummary> for ProjectSummary {
             template_id: s.template_id,
         }
     }
+}
+
+/// Aggregated status the renderer can show on a project's
+/// engine/status pane. Reports the schema version recorded in the
+/// SQLCipher database, the audit-chain head hash + entry count, and
+/// the per-scope command-journal counts (LIVE counts derived from the
+/// in-memory chain — mirroring into the SQL `audit_chain` table is a
+/// separate explicit call). All values are read-only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EngineStatusReport {
+    /// Schema version recorded in the project's SQLCipher `meta` table.
+    /// New projects come out of [`open_encrypted`] at this value;
+    /// existing projects may report a higher version if the registry
+    /// is ahead of this binary, which is itself a hard error and
+    /// surfaces via [`BridgeServiceError::Core`] instead of reaching
+    /// here.
+    pub schema_version: u32,
+    /// Head hash of the BLAKE3 audit chain (e.g. `blake3:<hex>`), or
+    /// `aec_audit::AuditLog::GENESIS` if the chain is empty.
+    pub audit_chain_head: String,
+    /// Total number of entries in the JSONL audit log.
+    pub audit_entry_count: u64,
+    /// Number of rows in the SQL-side `audit_chain` table. Equal to
+    /// `audit_entry_count` when the SQL mirror is up-to-date and less
+    /// when the renderer has appended without re-mirroring (or zero
+    /// for a freshly-opened legacy project before any sync).
+    pub audit_chain_sql_count: u64,
+    /// Per-scope counts taken from the SQL mirror. Keys are
+    /// `Scope::as_str` (`design` / `draft` / `bim` / `render` /
+    /// `deliver`). A scope with no entries is included with value
+    /// `0` so the renderer can render the full set without a
+    /// post-process step.
+    pub audit_chain_by_scope: std::collections::BTreeMap<String, u64>,
 }
 
 /// Hardware-status snapshot. The shape mirrors the TypeScript
@@ -176,8 +228,17 @@ impl BridgeService {
     }
 
     /// Open an existing project package and update the recents store.
+    ///
+    /// Routes through [`ProjectPackage::open_with_master_key`] so any
+    /// pending schema migrations are applied on the SQLCipher database
+    /// AND the on-disk `manifest.json`'s `schema_version` field is
+    /// bumped to the current [`aec_core::manifest::SCHEMA_VERSION`] in
+    /// the same call. Without this step, a v1 project would refuse to
+    /// re-open the next time around (because a future, stricter
+    /// validator could downgrade tolerance) and the `audit_chain` SQL
+    /// table introduced in v2 would not exist on legacy databases.
     pub fn project_open(&mut self, path: &str) -> Result<ProjectSummary, BridgeServiceError> {
-        let pkg = ProjectPackage::open(path)?;
+        let pkg = ProjectPackage::open_with_master_key(path, &self.master_key)?;
         let core_summary = pkg.summary();
         let summary: ProjectSummary = core_summary.clone().into();
         self.recents.record(&core_summary)?;
@@ -185,10 +246,112 @@ impl BridgeService {
     }
 
     /// Persist the manifest of an open project.
+    ///
+    /// Also routes through [`ProjectPackage::open_with_master_key`]
+    /// because Save is a natural "the user actively touched this
+    /// project" checkpoint and is the right place to lazily complete
+    /// any pending v(N-1)→vN walk that a previous open might have
+    /// skipped (e.g. because the binary didn't have the key handy).
     pub fn project_save(&mut self, path: &str) -> Result<ProjectSummary, BridgeServiceError> {
-        let mut pkg = ProjectPackage::open(path)?;
+        let mut pkg = ProjectPackage::open_with_master_key(path, &self.master_key)?;
         pkg.save()?;
         Ok(pkg.summary().into())
+    }
+
+    /// Mirror the JSONL audit chain at `<project>/audit/log.jsonl` into
+    /// the SQLCipher `audit_chain` table and return the number of
+    /// newly-inserted rows. Safe to call on a freshly-created project
+    /// (will be a no-op when the chain is empty) and on a project that
+    /// has already been mirrored (will return `0`).
+    ///
+    /// This is the only mutating call in the audit-chain-aware bridge
+    /// surface; the renderer uses it after the command engine appends
+    /// entries via `aec_audit::AuditLog::append` so the SQL mirror
+    /// stays in sync. `project_engine_status` is read-only and will
+    /// happily report an out-of-sync state if the renderer forgets to
+    /// call this.
+    pub fn project_audit_sync(&mut self, path: &str) -> Result<u64, BridgeServiceError> {
+        // `open_with_master_key_and_database` runs any pending schema
+        // migrations (so the v2 `audit_chain` table exists on legacy
+        // v1 projects) AND upgrades the manifest's `schema_version`
+        // field, AND hands us back the connection it opened — so we
+        // don't re-run the key-derive + `PRAGMA cipher_*` + migration
+        // walk a second time just to grab a connection for
+        // `mirror_to_sql`. Without the migration step,
+        // `mirror_to_sql`'s INSERT would fail on a v1 project because
+        // the target table wouldn't exist.
+        let (pkg, mut conn) =
+            ProjectPackage::open_with_master_key_and_database(path, &self.master_key)?;
+        let log = AuditLog::open(pkg.root().join("audit").join("log.jsonl"))?;
+        let n = log.mirror_to_sql(&mut conn)?;
+        Ok(n as u64)
+    }
+
+    /// Read-only engine status for the renderer's status pane.
+    /// Combines `meta.schema_version` (from the SQLCipher DB) with the
+    /// audit chain head (from JSONL) and per-scope row counts (from the
+    /// SQL mirror).
+    ///
+    /// **Not** read-only at the byte level: [`ProjectPackage::open_database`]
+    /// calls [`aec_core::db::open_encrypted`], which runs the migration
+    /// registry, so a legacy v1 project's SQLCipher file *will* be
+    /// migrated forward on first read. The on-disk `manifest.json` is
+    /// intentionally left at its on-disk version — only the mutating
+    /// endpoints (`project_open`, `project_save`, `project_audit_sync`)
+    /// route through [`ProjectPackage::open_with_master_key`] to bump
+    /// the manifest. This means the SQL and JSON sides can briefly
+    /// diverge until the user's next mutating action, which is fine:
+    /// `validate()` accepts any version ≤ `SCHEMA_VERSION`, so the
+    /// project still opens cleanly through the read-only path.
+    pub fn project_engine_status(
+        &self,
+        path: &str,
+    ) -> Result<EngineStatusReport, BridgeServiceError> {
+        // Engine status is the most likely entry-point for a renderer
+        // to touch a legacy project (the status pane refreshes
+        // periodically), so it MUST tolerate pre-v2 SQL schemas. We
+        // don't take `&mut self` here, so the manifest stays untouched
+        // — but `open_database` calls `open_encrypted` internally
+        // which runs the migration registry, so the SQL side is
+        // brought up to date. The manifest's `schema_version` field
+        // will be advanced the next time the user explicitly
+        // opens/saves the project through the mutating endpoints.
+        let pkg = ProjectPackage::open(path)?;
+        let conn = pkg.open_database(&self.master_key)?;
+        let log = AuditLog::open(pkg.root().join("audit").join("log.jsonl"))?;
+
+        let schema_version = aec_core::db::schema_version(&conn)?;
+        let audit_chain_head = log.head().to_string();
+        let audit_entry_count = log.entries().len() as u64;
+
+        let sql_count: i64 =
+            conn.query_row("SELECT count(*) FROM audit_chain", [], |r| r.get(0))?;
+        let mut by_scope: std::collections::BTreeMap<String, u64> =
+            std::collections::BTreeMap::new();
+        // Initialise all canonical scopes to 0 so the renderer can show
+        // a stable set of labels even on a fresh project.
+        for s in Scope::all() {
+            by_scope.insert(s.as_str().to_string(), 0);
+        }
+        // Override with real counts from the SQL mirror. We don't trust
+        // arbitrary scope strings — anything not in `Scope::all()` is
+        // ignored, which keeps the renderer's label set bounded.
+        let mut stmt = conn.prepare("SELECT scope, count(*) FROM audit_chain GROUP BY scope")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+        for row in rows {
+            let (scope, n) = row?;
+            if by_scope.contains_key(&scope) {
+                by_scope.insert(scope, n as u64);
+            }
+        }
+
+        Ok(EngineStatusReport {
+            schema_version,
+            audit_chain_head,
+            audit_entry_count,
+            audit_chain_sql_count: sql_count as u64,
+            audit_chain_by_scope: by_scope,
+        })
     }
 
     /// Return the recents list (most-recent first), in the API shape.

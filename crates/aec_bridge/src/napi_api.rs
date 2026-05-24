@@ -150,6 +150,54 @@ pub fn project_list_recents() -> Result<Vec<ProjectSummaryJs>> {
     with_service(|svc| svc.project_list_recents()).map(|v| v.into_iter().map(Into::into).collect())
 }
 
+/// JS-facing engine status. Field names map directly to the TS
+/// `EngineStatus` interface in `apps/desktop/electron/bridge.ts`.
+/// `auditChainByScope` is a flat object whose keys are
+/// `Scope::as_str` (`design`, `draft`, etc.) — using an object rather
+/// than an array means the renderer can look up a specific scope's
+/// count in O(1) without a `find` call.
+///
+/// Values stored as `u32` are guaranteed to fit by construction: even
+/// a project with one entry per millisecond for a year (~31.5B) would
+/// exceed u32, but the SQLite primary key column is `INTEGER` which
+/// SQLite represents as a 64-bit signed value internally; the
+/// renderer's status pane never needs more than 32-bit precision.
+/// The cast saturates at `u32::MAX` if a project ever does run hot.
+#[napi(object)]
+pub struct EngineStatusJs {
+    pub schema_version: u32,
+    pub audit_chain_head: String,
+    pub audit_entry_count: u32,
+    pub audit_chain_sql_count: u32,
+    pub audit_chain_by_scope: std::collections::HashMap<String, u32>,
+}
+
+impl From<crate::service::EngineStatusReport> for EngineStatusJs {
+    fn from(r: crate::service::EngineStatusReport) -> Self {
+        Self {
+            schema_version: r.schema_version,
+            audit_chain_head: r.audit_chain_head,
+            audit_entry_count: r.audit_entry_count.min(u32::MAX as u64) as u32,
+            audit_chain_sql_count: r.audit_chain_sql_count.min(u32::MAX as u64) as u32,
+            audit_chain_by_scope: r
+                .audit_chain_by_scope
+                .into_iter()
+                .map(|(k, v)| (k, v.min(u32::MAX as u64) as u32))
+                .collect(),
+        }
+    }
+}
+
+#[napi]
+pub fn project_engine_status(path: String) -> Result<EngineStatusJs> {
+    with_service(|svc| svc.project_engine_status(&path)).map(Into::into)
+}
+
+#[napi]
+pub fn project_audit_sync(path: String) -> Result<u32> {
+    with_service(|svc| svc.project_audit_sync(&path)).map(|n| n.min(u32::MAX as u64) as u32)
+}
+
 /// JS-facing CPU descriptor. Mirrors `RuntimeStatus["cpu"]` in
 /// `apps/desktop/electron/bridge.ts`.
 #[napi(object)]

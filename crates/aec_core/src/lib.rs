@@ -29,6 +29,7 @@ pub mod kchat_config;
 #[cfg(feature = "kchat")]
 pub mod kchat_sync;
 pub mod manifest;
+pub mod migrations;
 pub mod package;
 pub mod revision;
 pub mod templates;

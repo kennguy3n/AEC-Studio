@@ -174,6 +174,28 @@ export interface BridgeBackend {
   }): Promise<DeliverPackResult>;
 
   runtimeStatus(): Promise<RuntimeStatus>;
+
+  /**
+   * Read-only engine status for the renderer's status pane. Combines
+   * the SQLCipher schema version, the audit chain head + entry count
+   * from the JSONL log, and per-scope row counts from the SQL mirror.
+   *
+   * On the native backend this is a single call into Rust. On the
+   * in-process fallback it's implemented against the same JSONL store
+   * (and the SQL counts are 0 since there's no SQLite file in the
+   * fallback path); callers must therefore treat
+   * `auditChainSqlCount === 0 && auditEntryCount > 0` as a
+   * "fallback-only" state rather than a real "stale mirror" warning.
+   */
+  projectEngineStatus(projectPath: string): Promise<EngineStatus>;
+
+  /**
+   * Mirror the JSONL audit chain into the SQLCipher `audit_chain`
+   * table. Returns the number of rows inserted. Idempotent. Safe to
+   * call on a fresh project (returns 0). On the in-process fallback
+   * this is a no-op that always returns 0.
+   */
+  projectAuditSync(projectPath: string): Promise<number>;
 }
 
 /**
@@ -269,6 +291,26 @@ export interface RuntimeStatus {
   os: string;
 }
 
+/**
+ * Engine status for the renderer's status pane. Field-for-field
+ * mirror of `EngineStatusJs` in
+ * `crates/aec_bridge/src/napi_api.rs::EngineStatusJs`. Drift between
+ * the two is a runtime bug surfaced as `undefined` on the renderer
+ * side, so keep them aligned when adding fields.
+ *
+ * `auditChainByScope` is keyed by `Scope::as_str` (`design`,
+ * `draft`, `bim`, `render`, `deliver`). All five keys are always
+ * present — the bridge backfills missing scopes with `0` so the
+ * renderer can do a flat lookup without a fallback.
+ */
+export interface EngineStatus {
+  schemaVersion: number;
+  auditChainHead: string;
+  auditEntryCount: number;
+  auditChainSqlCount: number;
+  auditChainByScope: Record<string, number>;
+}
+
 let backend: BridgeBackend | null = null;
 
 export function getBridge(): BridgeBackend {
@@ -337,6 +379,8 @@ interface NativeApi {
   project_save(project_path: string): unknown;
   project_list_recents(): unknown;
   runtime_status(): unknown;
+  project_engine_status(project_path: string): unknown;
+  project_audit_sync(project_path: string): unknown;
 }
 
 /**
@@ -355,6 +399,8 @@ export const NATIVE_WIRED_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   "projectSave",
   "projectListRecents",
   "runtimeStatus",
+  "projectEngineStatus",
+  "projectAuditSync",
 ];
 
 /**
@@ -453,6 +499,8 @@ function adaptNative(n: NativeApi): BridgeBackend {
     projectSave: async (p) => n.project_save(p) as ProjectSummary,
     projectListRecents: async () => n.project_list_recents() as ProjectSummary[],
     runtimeStatus: async () => n.runtime_status() as RuntimeStatus,
+    projectEngineStatus: async (p) => n.project_engine_status(p) as EngineStatus,
+    projectAuditSync: async (p) => n.project_audit_sync(p) as number,
   };
   // Self-check: the two catalogues above must, together, reference every
   // method on the in-process backend. We throw rather than warn so a new
@@ -806,6 +854,41 @@ export function inProcessBackend(): BridgeBackend {
     async runtimeStatus() {
       return inProcessRuntimeStatus();
     },
+
+    async projectEngineStatus(_projectPath) {
+      // The in-process backend doesn't own an SQLCipher file, and the
+      // audit chain isn't tracked here either. Return a constant
+      // "zero-state" shape so the renderer UI exercises every
+      // EngineStatus code path. Callers that need real values should
+      // load the native bridge or run through `BridgeService` directly.
+      return inProcessEngineStatus();
+    },
+
+    async projectAuditSync(_projectPath) {
+      // No SQL mirror exists in the in-process fallback, so any "sync"
+      // call is a no-op. Returning 0 rather than throwing keeps the
+      // surface call-compatible with the native backend; the
+      // documentation in `BridgeBackend` instructs callers to interpret
+      // a 0 here as "fallback didn't insert anything".
+      return 0;
+    },
+  };
+}
+
+function inProcessEngineStatus(): EngineStatus {
+  const byScope: Record<string, number> = {};
+  for (const scope of ["design", "draft", "bim", "render", "deliver"] as const) {
+    byScope[scope] = 0;
+  }
+  return {
+    // 1 mirrors the base schema version the in-process backend pretends
+    // to be at; we don't pretend to be at v2 because the v2 audit_chain
+    // table doesn't exist outside the SQLCipher path.
+    schemaVersion: 1,
+    auditChainHead: AUDIT_HEAD_PLACEHOLDER,
+    auditEntryCount: 0,
+    auditChainSqlCount: 0,
+    auditChainByScope: byScope,
   };
 }
 
