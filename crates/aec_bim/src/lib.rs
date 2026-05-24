@@ -12,6 +12,7 @@ pub mod classification;
 pub mod diff;
 pub mod drawing_gen;
 pub mod ifc;
+pub mod materials;
 pub mod properties;
 pub mod relations;
 pub mod schedules;
@@ -29,6 +30,7 @@ pub use drawing_gen::{
     generate_elevation, generate_plan, generate_section, DrawingResult, ElementGeometry,
     SectionPlane,
 };
+pub use materials::{Material, MaterialAssignment, MaterialLayer, MaterialLayerSet, MaterialStore};
 pub use properties::{
     standard_pset_keys, standard_pset_name_for_class, ElementProperties, PropertySet,
     PropertyStore, PropertyValue, QuantitySet,

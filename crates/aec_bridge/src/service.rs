@@ -33,6 +33,17 @@ pub enum BridgeServiceError {
     Audit(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// IFC (BIM) reader / writer failure. Carries the parser's own
+    /// error message verbatim so the renderer can show the user
+    /// which STEP entity / line failed.
+    #[error("bim: {0}")]
+    Bim(String),
+}
+
+impl From<aec_bim::ifc::IfcReadError> for BridgeServiceError {
+    fn from(e: aec_bim::ifc::IfcReadError) -> Self {
+        Self::Bim(e.to_string())
+    }
 }
 
 impl From<aec_audit::AuditError> for BridgeServiceError {
@@ -121,6 +132,38 @@ pub struct EngineStatusReport {
     /// `0` so the renderer can render the full set without a
     /// post-process step.
     pub audit_chain_by_scope: std::collections::BTreeMap<String, u64>,
+}
+
+/// Parse-only summary of a BIM (IFC) import. Returned by
+/// [`BridgeService::bim_import_ifc`] and rendered as a preview on
+/// the Import panel before the user commits the file into the
+/// active project.
+///
+/// Field naming matches the renderer's `BimImportSummary` TS
+/// interface 1:1 — drift here is a runtime bug surfacing as
+/// `undefined` on a status pane.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BimImportSummary {
+    /// Canonicalised path the user pointed at.
+    pub path: String,
+    /// IFC schema version recovered from `FILE_SCHEMA`, formatted
+    /// as the `IfcSchema` enum's `Debug` impl (e.g. `"Ifc4"` /
+    /// `"Ifc2x3"`).
+    pub schema: String,
+    pub spatial_nodes: u64,
+    pub elements: u64,
+    pub psets: u64,
+    pub qsets: u64,
+    pub aggregations: u64,
+    pub containments: u64,
+    /// `IfcMaterial` definitions recovered from the file.
+    pub materials: u64,
+    /// `IfcMaterialLayerSet` composites recovered.
+    pub material_layer_sets: u64,
+    /// `IfcRelAssociatesMaterial` element-to-material bindings.
+    pub material_assignments: u64,
+    /// Total STEP records the reader walked (records_seen).
+    pub records_seen: u64,
 }
 
 /// Hardware-status snapshot. The shape mirrors the TypeScript
@@ -480,6 +523,47 @@ impl BridgeService {
                 audit_chain_sql_count: sql_count as u64,
                 audit_chain_by_scope: by_scope,
             })
+        })
+    }
+
+    /// Read an `.ifc` file from disk and return a structured import
+    /// summary the renderer can show on its "Import BIM" panel.
+    ///
+    /// This is a *parse-only* operation: nothing is written into the
+    /// active project. The renderer uses the returned counts to render
+    /// a preview ("123 walls, 45 slabs, …"), and a follow-up
+    /// `bim_attach_*` call (PR-L) will actually fold the parsed model
+    /// into the project's authoring graph. Splitting the parse from
+    /// the attach keeps the parse path safely re-runnable on bad
+    /// files without polluting project state.
+    ///
+    /// **Schema support**: IFC2x3 and IFC4 (both base and `IFC4X3`
+    /// when found in `FILE_SCHEMA`; IFC4x3-specific entities still
+    /// flow through the tolerate-and-skip discipline). Material
+    /// library coverage includes `IfcMaterial`,
+    /// `IfcMaterialLayerSet`, and `IfcRelAssociatesMaterial`;
+    /// `IfcMaterialProfileSet` and `IfcMaterialConstituentSet` are
+    /// silently skipped per the module-level contract.
+    pub fn bim_import_ifc(&self, path: &str) -> Result<BimImportSummary, BridgeServiceError> {
+        // Defer `&self` to `&BridgeService` not `&mut` so this can
+        // run through `with_service_ref_fallible` alongside other
+        // read-only endpoints — IFC parsing is CPU-bound but doesn't
+        // touch project state, so it doesn't need exclusive access.
+        let body = std::fs::read_to_string(Path::new(path))?;
+        let snapshot = aec_bim::ifc::IfcReader::from_string(&body)?;
+        Ok(BimImportSummary {
+            path: path.to_string(),
+            schema: format!("{:?}", snapshot.schema),
+            spatial_nodes: snapshot.stats.spatial_nodes as u64,
+            elements: snapshot.stats.elements as u64,
+            psets: snapshot.stats.psets as u64,
+            qsets: snapshot.stats.qsets as u64,
+            aggregations: snapshot.stats.aggregations as u64,
+            containments: snapshot.stats.containments as u64,
+            materials: snapshot.stats.materials as u64,
+            material_layer_sets: snapshot.stats.material_layer_sets as u64,
+            material_assignments: snapshot.stats.material_assignments as u64,
+            records_seen: snapshot.stats.records_seen as u64,
         })
     }
 

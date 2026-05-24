@@ -33,6 +33,9 @@ use thiserror::Error;
 use aec_core::types::EntityId;
 
 use crate::classification::{ClassificationSource, ClassificationStore, IfcClass};
+use crate::materials::{
+    Material, MaterialAssignment, MaterialLayer, MaterialLayerSet, MaterialStore,
+};
 use crate::properties::{PropertySet, PropertyStore, PropertyValue, QuantitySet};
 use crate::spatial::Project;
 
@@ -106,6 +109,13 @@ pub struct IfcReadStats {
     pub qsets: usize,
     pub aggregations: usize,
     pub containments: usize,
+    /// `IfcMaterial` instances recovered from the file.
+    pub materials: usize,
+    /// `IfcMaterialLayerSet` instances recovered.
+    pub material_layer_sets: usize,
+    /// `IfcRelAssociatesMaterial` element-to-material bindings
+    /// recovered.
+    pub material_assignments: usize,
     /// Number of `#N = TYPE(...)` entity instances the tokenizer
     /// observed before the modeled-entity filter. Useful as a
     /// sanity-check when feeding an external IFC file: the value
@@ -124,6 +134,12 @@ pub struct IfcSnapshot {
     pub project: Project,
     pub classification: ClassificationStore,
     pub properties: PropertyStore,
+    /// Material library — `IfcMaterial` definitions, layer-set
+    /// composites, and per-element `IfcRelAssociatesMaterial`
+    /// bindings recovered from the file. Empty when the source IFC
+    /// carried no material entities (rare in practice — most
+    /// authoring tools emit them by default).
+    pub materials: MaterialStore,
     /// GUID per spatial node (Project/Site/Building/Storey/Space) and
     /// per building element, keyed on the original `EntityId`.
     pub guid_by_entity: HashMap<EntityId, String>,
@@ -166,6 +182,18 @@ impl IfcReader {
         let mut qsets: HashMap<u32, QsetRow> = HashMap::new();
         let mut prop_values: HashMap<u32, PropRow> = HashMap::new();
         let mut qty_values: HashMap<u32, QtyRow> = HashMap::new();
+        // Material library — three index tables resolved together in
+        // the second pass. `materials_step` keys on the STEP id
+        // returning the material name (the load-bearing identity);
+        // `material_layers_step` returns the parent material name +
+        // thickness so a layer-set can rebuild the ordered layer
+        // stack; `material_layer_sets_step` returns the
+        // `MaterialLayerSet` keyed by STEP id, populated *after*
+        // the second pass resolves layer refs.
+        let mut materials_step: HashMap<u32, Material> = HashMap::new();
+        let mut material_layers_step: HashMap<u32, MaterialLayer> = HashMap::new();
+        let mut material_layer_sets_step: HashMap<u32, (String, Option<String>, Vec<u32>)> =
+            HashMap::new();
 
         for g in &groups {
             match g.kind.as_str() {
@@ -243,8 +271,80 @@ impl IfcReader {
                 }
                 "IFCRELAGGREGATES"
                 | "IFCRELCONTAINEDINSPATIALSTRUCTURE"
-                | "IFCRELDEFINESBYPROPERTIES" => {
+                | "IFCRELDEFINESBYPROPERTIES"
+                | "IFCRELASSOCIATESMATERIAL" => {
                     // Handled in the second pass.
+                }
+                "IFCMATERIAL" => {
+                    // IFC4 form: IFCMATERIAL('Name','Description','Category')
+                    // IFC2x3 form: IFCMATERIAL('Name') — accept either by
+                    // positional argument count.
+                    let name = g.string_arg(0)?;
+                    let description = optional_string_arg(g, 1)?;
+                    let category = optional_string_arg(g, 2)?;
+                    if !name.is_empty() {
+                        materials_step.insert(
+                            g.step_id,
+                            Material {
+                                name,
+                                description,
+                                category,
+                            },
+                        );
+                    }
+                }
+                "IFCMATERIALLAYER" => {
+                    // IFC4 form:
+                    //   IFCMATERIALLAYER(#Material, LayerThickness,
+                    //                    IsVentilated, 'Name',
+                    //                    'Description', 'Category',
+                    //                    Priority)
+                    // IFC2x3 form (3-arg):
+                    //   IFCMATERIALLAYER(#Material, LayerThickness, IsVentilated)
+                    // We accept either; missing optionals fall through
+                    // as `None`. The Material ref is resolved in the
+                    // second pass.
+                    let material_ref = g.ref_arg(0)?;
+                    let thickness = g
+                        .args
+                        .get(1)
+                        .and_then(|a| parse_step_real(a))
+                        .ok_or_else(|| Self::malformed(g, "expected LayerThickness real"))?;
+                    let is_ventilated = parse_optional_bool(g.args.get(2).map(String::as_str));
+                    let name = optional_string_arg(g, 3)?;
+                    let description = optional_string_arg(g, 4)?;
+                    let category = optional_string_arg(g, 5)?;
+                    let priority = g.args.get(6).and_then(|a| {
+                        if a == "$" {
+                            None
+                        } else {
+                            a.parse::<i32>().ok()
+                        }
+                    });
+                    // Stash the material ref as a sentinel name; the
+                    // second pass replaces it with the resolved name.
+                    let sentinel_material_name = format!("__ref:{material_ref}");
+                    material_layers_step.insert(
+                        g.step_id,
+                        MaterialLayer {
+                            material_name: sentinel_material_name,
+                            thickness_m: thickness,
+                            is_ventilated,
+                            name,
+                            description,
+                            category,
+                            priority,
+                        },
+                    );
+                }
+                "IFCMATERIALLAYERSET" => {
+                    // IFCMATERIALLAYERSET((#L1,#L2,...), 'Name', 'Description')
+                    let layer_refs = g.ref_list_arg(0)?;
+                    let name = g.string_arg(1)?;
+                    let description = optional_string_arg(g, 2)?;
+                    if !name.is_empty() {
+                        material_layer_sets_step.insert(g.step_id, (name, description, layer_refs));
+                    }
                 }
                 other => {
                     // Anything else with a 9-field shape and a
@@ -311,6 +411,8 @@ impl IfcReader {
         let mut agg: Vec<(u32, Vec<u32>)> = Vec::new();
         let mut contains: Vec<(u32, Vec<u32>)> = Vec::new();
         let mut defines_pset: Vec<(Vec<u32>, u32)> = Vec::new();
+        // IFCRELASSOCIATESMATERIAL(GUID,#owner,$,$,(#elems…),#material_or_set)
+        let mut associates_material: Vec<(Vec<u32>, u32)> = Vec::new();
         for g in &groups {
             match g.kind.as_str() {
                 "IFCRELAGGREGATES" => {
@@ -327,6 +429,11 @@ impl IfcReader {
                     let elems = g.ref_list_arg(4)?;
                     let pset_ref = g.ref_arg(5)?;
                     defines_pset.push((elems, pset_ref));
+                }
+                "IFCRELASSOCIATESMATERIAL" => {
+                    let elems = g.ref_list_arg(4)?;
+                    let mat_ref = g.ref_arg(5)?;
+                    associates_material.push((elems, mat_ref));
                 }
                 _ => {}
             }
@@ -495,6 +602,84 @@ impl IfcReader {
             }
         }
 
+        // ---- Rebuild MaterialStore ----
+        //
+        // Materials populate `MaterialStore` in two stages:
+        //   1. Insert each `IfcMaterial` definition keyed on its
+        //      load-bearing `Name`.
+        //   2. Resolve every `IfcMaterialLayerSet`'s ordered layer
+        //      references by walking back through the
+        //      `IfcMaterialLayer` table, replacing the per-layer
+        //      `__ref:<step_id>` sentinel material-name with the
+        //      real `IfcMaterial.Name` pulled from the resolved
+        //      material STEP id. A layer whose material ref points
+        //      at an unmodeled / unknown row is silently dropped from
+        //      the layer set — same tolerate-and-skip discipline
+        //      that `IfcRelDefinesByProperties` uses for unknown
+        //      pset targets.
+        //   3. Walk each `IfcRelAssociatesMaterial` row and bind the
+        //      named material (single) or layer-set (composite) to
+        //      every referenced element.
+        let mut materials_store = MaterialStore::new();
+        // Stage 1: materials
+        for mat in materials_step.values() {
+            materials_store.upsert_material(mat.clone());
+        }
+        // Stage 2: layer sets
+        for (set_name, set_description, layer_refs) in material_layer_sets_step.values() {
+            let mut set = MaterialLayerSet::new(set_name.clone());
+            set.description.clone_from(set_description);
+            for layer_step in layer_refs {
+                let Some(layer) = material_layers_step.get(layer_step) else {
+                    continue;
+                };
+                // Resolve the layer's "__ref:<step>" sentinel back to
+                // the real material name.
+                let sentinel = &layer.material_name;
+                let resolved_name = sentinel
+                    .strip_prefix("__ref:")
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .and_then(|step| materials_step.get(&step))
+                    .map(|m| m.name.clone());
+                let Some(resolved_name) = resolved_name else {
+                    continue;
+                };
+                let mut resolved = layer.clone();
+                resolved.material_name = resolved_name;
+                set.layers.push(resolved);
+            }
+            materials_store.upsert_layer_set(set);
+        }
+        // Stage 3: assignments
+        let mut material_assignment_count = 0usize;
+        for (elem_steps, mat_ref) in &associates_material {
+            let assignment_opt = if let Some(mat) = materials_step.get(mat_ref) {
+                Some(MaterialAssignment::Single(mat.name.clone()))
+            } else if let Some((set_name, _, _)) = material_layer_sets_step.get(mat_ref) {
+                Some(MaterialAssignment::LayerSet(set_name.clone()))
+            } else {
+                None
+            };
+            let Some(assignment) = assignment_opt else {
+                // Unmodeled material reference (e.g.
+                // `IfcMaterialProfileSet` / `IfcMaterialConstituentSet`
+                // — not yet handled). Skip per the tolerate-and-skip
+                // contract.
+                continue;
+            };
+            for elem_step in elem_steps {
+                let entity_opt = elements
+                    .get(elem_step)
+                    .map(|el| el.entity.clone())
+                    .or_else(|| spatial.get(elem_step).map(|sp| sp.entity.clone()));
+                if let Some(entity) = entity_opt {
+                    if materials_store.assign_to_element(entity, assignment.clone()) {
+                        material_assignment_count += 1;
+                    }
+                }
+            }
+        }
+
         // ---- Build GUID map ----
         let mut guid_by_entity: HashMap<EntityId, String> = HashMap::new();
         for row in spatial.values() {
@@ -513,6 +698,9 @@ impl IfcReader {
             qsets: qset_count,
             aggregations,
             containments,
+            materials: materials_store.material_count(),
+            material_layer_sets: materials_store.layer_set_count(),
+            material_assignments: material_assignment_count,
             records_seen: groups.len(),
         };
 
@@ -523,6 +711,7 @@ impl IfcReader {
             project,
             classification,
             properties: props,
+            materials: materials_store,
             guid_by_entity,
             element_parent,
             schema,
@@ -1462,6 +1651,47 @@ pub(crate) fn parse_step_real(s: &str) -> Option<f64> {
 fn parse_int(s: &str) -> IfcReadResult<i64> {
     s.parse::<i64>()
         .map_err(|e| IfcReadError::Malformed(format!("int parse: {e}")))
+}
+
+/// Decode a single-quoted string argument at `idx`, returning `None`
+/// when the slot holds the STEP "no value" sentinel `$`. Used by the
+/// material reader for `Description` / `Category` slots that authoring
+/// tools commonly leave empty.
+///
+/// Distinct from [`StepRecord::string_arg`] which hard-rejects `$`.
+/// IFC4 optional string fields (`IfcMaterial.Description`,
+/// `IfcMaterial.Category`, etc.) are routinely emitted as `$` so the
+/// reader must treat them as `Option`, not an error.
+fn optional_string_arg(g: &StepRecord, idx: usize) -> IfcReadResult<Option<String>> {
+    let Some(raw) = g.args.get(idx) else {
+        return Ok(None);
+    };
+    let s = raw.trim();
+    if s == "$" || s.is_empty() {
+        return Ok(None);
+    }
+    if !(s.starts_with('\'') && s.ends_with('\'')) {
+        return Err(IfcReadError::Malformed(format!(
+            "expected quoted string at arg {idx} of {} but got '{s}'",
+            g.kind
+        )));
+    }
+    Ok(Some(unescape_step_string(&s[1..s.len() - 1])))
+}
+
+/// Decode an IFC LOGICAL field (`.T.` / `.F.` / `.U.` / `$`).
+///
+/// Returns `Some(true)`/`Some(false)` for `.T.`/`.F.`, and `None` for
+/// `.U.` (UNKNOWN — IFC4 `IfcLogical` distinguishes this from
+/// `IfcBoolean`) or absent (`$`). Used for
+/// `IfcMaterialLayer.IsVentilated`.
+fn parse_optional_bool(raw: Option<&str>) -> Option<bool> {
+    let s = raw?.trim();
+    match s {
+        ".T." | ".TRUE." => Some(true),
+        ".F." | ".FALSE." => Some(false),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------

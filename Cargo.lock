@@ -85,6 +85,7 @@ version = "0.1.0"
 dependencies = [
  "aec_assets",
  "aec_audit",
+ "aec_bim",
  "aec_command",
  "aec_core",
  "aec_export",

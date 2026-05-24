@@ -1060,6 +1060,419 @@ fn plane_basis(n: [f64; 3]) -> ([f64; 3], [f64; 3]) {
 }
 
 // ---------------------------------------------------------------------
+// IfcRevolvedAreaSolid
+// ---------------------------------------------------------------------
+
+/// `IfcRevolvedAreaSolid`: a 2D `Profile` revolved around a 3D axis
+/// through angle `angle_rad` (radians). Used for domes, half-arches,
+/// spiralled stair newel posts, columns, finials, and curved
+/// balustrades — geometry no `IfcExtrudedAreaSolid` can describe.
+///
+/// **Axis convention** (matches IFC4):
+///
+/// * The profile sits in the local XZ-plane (i.e. `profile.points`
+///   are `(x_local, z_local)` coordinates, treated here as
+///   `(x, 0, z)` in 3D).
+/// * The axis is anchored at `axis_origin` and aligned along
+///   `axis_direction` in the **local** (profile) frame. The
+///   reader re-orients the profile so the axis becomes the
+///   Z-axis prior to instantiating this struct, so the
+///   tessellator assumes `axis_origin = [0, 0, 0]` and
+///   `axis_direction = [0, 0, 1]` for the internal sweep math.
+/// * The revolution sweeps CCW around the axis when viewed from
+///   `+axis_direction`.
+///
+/// **Discretisation**: `segments` controls how many angular steps
+/// span the full `angle_rad`. A full 2π revolution at 32 segments
+/// is the default Revit "fine" detail level. The actual segment
+/// count is clamped to `[3, 256]`.
+///
+/// **Caps**: when `angle_rad < 2π`, the start and end faces of the
+/// swept ring are closed with triangulated copies of the original
+/// profile so the resulting mesh is watertight. A full revolution
+/// (`angle_rad ≈ 2π`) needs no caps — the ribbon meets itself.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RevolvedAreaSolid {
+    pub profile: Profile,
+    /// Total revolution angle in radians. Clamped to `(0, 2π]`.
+    pub angle_rad: f64,
+    /// Number of angular subdivisions. Clamped to `[3, 256]`.
+    pub segments: u32,
+}
+
+impl RevolvedAreaSolid {
+    pub const DEFAULT_SEGMENTS: u32 = 32;
+
+    /// Tessellate to a closed (or capped-open) triangle mesh.
+    ///
+    /// Returns [`TessellatorError::PartialTriangulation`] if the
+    /// profile is self-intersecting and ear clipping bails out
+    /// when triangulating the caps (a full revolution has no
+    /// caps, so the error is impossible in that case).
+    ///
+    /// Returns `Ok(empty mesh)` when the profile has fewer than 3
+    /// points, when `angle_rad <= 0`, or when both profile X
+    /// coordinates straddle zero AND the axis is along Z — that
+    /// last case would produce self-intersecting geometry on the
+    /// axis crossing and is treated as malformed by the IFC4
+    /// implementer agreement.
+    #[allow(clippy::many_single_char_names)]
+    pub fn tessellate(&self) -> TessellatorResult<Mesh> {
+        let mut mesh = Mesh::default();
+        let n_profile = self.profile.points.len();
+        if n_profile < 3 || self.angle_rad <= 0.0 {
+            return Ok(mesh);
+        }
+        let full_revolution = (self.angle_rad - TAU).abs() < 1e-9 || self.angle_rad >= TAU;
+        let angle = self.angle_rad.min(TAU);
+        let segs = self.segments.clamp(3, 256) as usize;
+
+        // Profile must lie on one side of the revolution axis (X >= 0
+        // when revolving around Z). If a vertex has X < 0 the
+        // revolved sweep would self-intersect on the axis crossing —
+        // surface an empty mesh per the IFC4 implementer agreement.
+        if self.profile.points.iter().any(|p| p[0] < -1e-9) {
+            return Ok(mesh);
+        }
+
+        // For each of `segs + 1` (or `segs` if full) angular steps,
+        // rotate the 2D profile around the Z-axis. Build the
+        // positions array layer-by-layer.
+        //
+        // For a full revolution we emit `segs` cross-sections; the
+        // ribbon stitches segment i to segment (i+1) % segs.
+        // For a partial revolution we emit `segs + 1` cross-sections;
+        // the ribbon stitches i to i+1 with no wrap.
+        let cross_section_count = if full_revolution { segs } else { segs + 1 };
+        // `den` divides the section index to produce a 0..=1 sweep
+        // parameter. Equal in both branches today (segs), kept as a
+        // distinct binding so future per-branch adjustments (e.g.
+        // half-step offsets) have a single point of edit.
+        let den = segs as f64;
+        for s in 0..cross_section_count {
+            let t = (s as f64) / den;
+            let theta = t * angle;
+            let (sin_t, cos_t) = theta.sin_cos();
+            for p in &self.profile.points {
+                // Profile (x_local, z_local) → 3D (x cos θ, x sin θ, z)
+                let x = p[0] * cos_t;
+                let y = p[0] * sin_t;
+                let z = p[1];
+                mesh.positions.push([x, y, z]);
+            }
+        }
+        // Side ribbon: edge i↔j in profile, layer s↔(s+1) in sweep.
+        for s in 0..segs {
+            let s_next = if full_revolution {
+                (s + 1) % segs
+            } else {
+                s + 1
+            };
+            let base_a = (s * n_profile) as u32;
+            let base_b = (s_next * n_profile) as u32;
+            for i in 0..n_profile {
+                let j = (i + 1) % n_profile;
+                let a_i = base_a + i as u32;
+                let a_j = base_a + j as u32;
+                let b_i = base_b + i as u32;
+                let b_j = base_b + j as u32;
+                mesh.push_tri(a_i, a_j, b_j);
+                mesh.push_tri(a_i, b_j, b_i);
+            }
+        }
+        // Caps for partial revolutions only.
+        if !full_revolution {
+            let cap_tris = triangulate_polygon_2d(&self.profile.points)?;
+            // Start cap (θ = 0): vertices already at indices 0..n_profile,
+            // facing the −θ direction → flip winding.
+            for [a, b, c] in &cap_tris {
+                mesh.push_tri(*c, *b, *a);
+            }
+            // End cap (θ = angle): vertices at indices
+            // `segs*n_profile..(segs+1)*n_profile`, facing +θ → keep CCW.
+            let end_base = (segs * n_profile) as u32;
+            for [a, b, c] in &cap_tris {
+                mesh.push_tri(*a + end_base, *b + end_base, *c + end_base);
+            }
+        }
+        Ok(mesh)
+    }
+}
+
+// ---------------------------------------------------------------------
+// IfcSweptDiskSolid
+// ---------------------------------------------------------------------
+
+/// `IfcSweptDiskSolid`: a disk (circular cross-section) swept along
+/// a 3D polyline. The workhorse of MEP / structural modelling —
+/// every pipe, raceway, rebar, conduit, and railing handrail in
+/// IFC is exported as one of these.
+///
+/// The cross-section is a circle of radius `radius_m` (outer) with
+/// optional inner radius `inner_radius_m` (hollow tube — IFC4's
+/// `IfcSweptDiskSolid.InnerRadius`). The sweep direction at each
+/// vertex is computed as the parallel-transported tangent so the
+/// cross-section avoids the rolling-tangent twist that pure-Frenet
+/// frames produce at S-curves.
+///
+/// **Endpoints**: capped with a triangulated disk facing the
+/// segment direction. Hollow tubes are capped with an annulus
+/// (outer disk minus inner disk).
+///
+/// **Validity**: requires at least 2 vertices on the path. A path
+/// of 2 collinear vertices becomes a straight cylinder; a path of
+/// N vertices produces N-1 cylindrical segments stitched into a
+/// continuous tube.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SweptDiskSolid {
+    /// 3D polyline the disk is swept along.
+    pub path: Vec<[f64; 3]>,
+    /// Outer radius of the disk in metres.
+    pub radius_m: f64,
+    /// Optional inner radius for hollow tubes (pipes). Must be
+    /// strictly less than `radius_m` if `Some`.
+    pub inner_radius_m: Option<f64>,
+    /// Number of circumferential samples around the disk. Clamped
+    /// to `[3, 256]`. Default 16 (Revit's "fine" detail).
+    pub segments: u32,
+}
+
+impl SweptDiskSolid {
+    pub const DEFAULT_SEGMENTS: u32 = 16;
+
+    #[allow(clippy::many_single_char_names)]
+    pub fn tessellate(&self) -> TessellatorResult<Mesh> {
+        let mut mesh = Mesh::default();
+        if self.path.len() < 2 || self.radius_m <= 0.0 {
+            return Ok(mesh);
+        }
+        if let Some(r_in) = self.inner_radius_m {
+            if r_in <= 0.0 || r_in >= self.radius_m {
+                return Ok(mesh);
+            }
+        }
+        let segs = self.segments.clamp(3, 256) as usize;
+        let path_len = self.path.len();
+
+        // Parallel-transport frames along the polyline. Avoid the
+        // Frenet-frame twist at S-curves by rotating the previous
+        // frame's "up" vector into the plane perpendicular to the
+        // current tangent (Hanrahan's parallel transport).
+        let mut tangents: Vec<[f64; 3]> = Vec::with_capacity(path_len);
+        for i in 0..path_len {
+            let t = if i == 0 {
+                sub3(self.path[1], self.path[0])
+            } else if i == path_len - 1 {
+                sub3(self.path[i], self.path[i - 1])
+            } else {
+                // Average of incoming + outgoing edges → tangent at the
+                // joint. Smoother than picking one or the other.
+                let incoming = normalize3(sub3(self.path[i], self.path[i - 1]));
+                let outgoing = normalize3(sub3(self.path[i + 1], self.path[i]));
+                [
+                    incoming[0] + outgoing[0],
+                    incoming[1] + outgoing[1],
+                    incoming[2] + outgoing[2],
+                ]
+            };
+            tangents.push(normalize3(t));
+        }
+
+        // Initial frame: pick any unit vector NOT parallel to the
+        // first tangent.
+        let mut up = pick_perpendicular(tangents[0]);
+        let mut frames: Vec<([f64; 3], [f64; 3])> = Vec::with_capacity(path_len);
+        frames.push((up, cross3(tangents[0], up)));
+        for tangent in tangents.iter().skip(1) {
+            // Rotate `up` from the previous tangent to the current
+            // tangent. Geometrically this projects `up` into the plane
+            // perpendicular to the current tangent and renormalises.
+            up = project_perpendicular(up, *tangent);
+            up = normalize3(up);
+            let right = cross3(*tangent, up);
+            frames.push((up, right));
+        }
+
+        let r_out = self.radius_m;
+        let r_in = self.inner_radius_m;
+
+        // Per-segment vertex layout: for each path vertex i, emit a
+        // ring of `segs` outer-radius vertices. If hollow, append a
+        // second ring of `segs` inner-radius vertices. We index them
+        // as: outer[i, k] = (i * segs * 2) + k                if hollow
+        //                  (i * segs) + k                     if solid
+        //     inner[i, k] = (i * segs * 2) + segs + k         if hollow
+        let stride = if r_in.is_some() { segs * 2 } else { segs };
+        for (i, &(uvec, vvec)) in frames.iter().enumerate() {
+            let center = self.path[i];
+            for k in 0..segs {
+                let t = (k as f64) / (segs as f64) * TAU;
+                let (sin_t, cos_t) = t.sin_cos();
+                let dir_u = [uvec[0] * cos_t, uvec[1] * cos_t, uvec[2] * cos_t];
+                let dir_v = [vvec[0] * sin_t, vvec[1] * sin_t, vvec[2] * sin_t];
+                let outer = [
+                    center[0] + r_out * (dir_u[0] + dir_v[0]),
+                    center[1] + r_out * (dir_u[1] + dir_v[1]),
+                    center[2] + r_out * (dir_u[2] + dir_v[2]),
+                ];
+                mesh.positions.push(outer);
+            }
+            if let Some(r_in_v) = r_in {
+                for k in 0..segs {
+                    let t = (k as f64) / (segs as f64) * TAU;
+                    let (sin_t, cos_t) = t.sin_cos();
+                    let dir_u = [uvec[0] * cos_t, uvec[1] * cos_t, uvec[2] * cos_t];
+                    let dir_v = [vvec[0] * sin_t, vvec[1] * sin_t, vvec[2] * sin_t];
+                    let inner = [
+                        center[0] + r_in_v * (dir_u[0] + dir_v[0]),
+                        center[1] + r_in_v * (dir_u[1] + dir_v[1]),
+                        center[2] + r_in_v * (dir_u[2] + dir_v[2]),
+                    ];
+                    mesh.positions.push(inner);
+                }
+            }
+        }
+
+        // Outer ribbon: for each segment i↔i+1, stitch the `segs`
+        // outer-ring vertices into a tube.
+        for i in 0..(path_len - 1) {
+            let base_a = (i * stride) as u32;
+            let base_b = ((i + 1) * stride) as u32;
+            for k in 0..segs {
+                let k_next = (k + 1) % segs;
+                let a_k = base_a + k as u32;
+                let a_n = base_a + k_next as u32;
+                let b_k = base_b + k as u32;
+                let b_n = base_b + k_next as u32;
+                mesh.push_tri(a_k, a_n, b_n);
+                mesh.push_tri(a_k, b_n, b_k);
+            }
+        }
+        // Inner ribbon (flipped winding so the inside of the tube
+        // faces outward toward the tube interior).
+        if r_in.is_some() {
+            for i in 0..(path_len - 1) {
+                let base_a = (i * stride + segs) as u32;
+                let base_b = ((i + 1) * stride + segs) as u32;
+                for k in 0..segs {
+                    let k_next = (k + 1) % segs;
+                    let a_k = base_a + k as u32;
+                    let a_n = base_a + k_next as u32;
+                    let b_k = base_b + k as u32;
+                    let b_n = base_b + k_next as u32;
+                    mesh.push_tri(a_k, b_n, a_n);
+                    mesh.push_tri(a_k, b_k, b_n);
+                }
+            }
+        }
+        // End caps: a disk at i=0 facing −tangent, a disk at
+        // i=last facing +tangent.
+        // Solid case: triangulate the disk as a fan from vertex k=0.
+        // Hollow case: triangulate as a quad ribbon between outer
+        // and inner rings.
+        let last = path_len - 1;
+        let base_start = 0u32;
+        let base_end = (last * stride) as u32;
+        if r_in.is_some() {
+            // Hollow start cap: ribbon between outer (offset 0) and
+            // inner (offset segs) rings, facing −tangent (flip
+            // winding).
+            for k in 0..segs {
+                let k_next = (k + 1) % segs;
+                let outer_a = base_start + k as u32;
+                let outer_b = base_start + k_next as u32;
+                let inner_a = base_start + (segs + k) as u32;
+                let inner_b = base_start + (segs + k_next) as u32;
+                mesh.push_tri(outer_a, inner_b, outer_b);
+                mesh.push_tri(outer_a, inner_a, inner_b);
+            }
+            // Hollow end cap: same ribbon, normal winding.
+            for k in 0..segs {
+                let k_next = (k + 1) % segs;
+                let outer_a = base_end + k as u32;
+                let outer_b = base_end + k_next as u32;
+                let inner_a = base_end + (segs + k) as u32;
+                let inner_b = base_end + (segs + k_next) as u32;
+                mesh.push_tri(outer_a, outer_b, inner_b);
+                mesh.push_tri(outer_a, inner_b, inner_a);
+            }
+        } else {
+            // Solid start cap: fan triangulation from k=0.
+            for k in 1..(segs - 1) {
+                let v0 = base_start;
+                let v1 = base_start + k as u32;
+                let v2 = base_start + (k + 1) as u32;
+                // Reverse winding so the normal faces −tangent.
+                mesh.push_tri(v0, v2, v1);
+            }
+            // Solid end cap: fan triangulation, normal winding.
+            for k in 1..(segs - 1) {
+                let v0 = base_end;
+                let v1 = base_end + k as u32;
+                let v2 = base_end + (k + 1) as u32;
+                mesh.push_tri(v0, v1, v2);
+            }
+        }
+        Ok(mesh)
+    }
+}
+
+/// Subtract `b` from `a` component-wise.
+fn sub3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+/// Normalise a 3-vector; returns the zero vector if the input is
+/// zero-length.
+fn normalize3(v: [f64; 3]) -> [f64; 3] {
+    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    if len > 1e-12 {
+        [v[0] / len, v[1] / len, v[2] / len]
+    } else {
+        [0.0, 0.0, 0.0]
+    }
+}
+
+/// Cross product `a × b`.
+fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+/// Pick an arbitrary unit vector perpendicular to `t`. Used to
+/// initialise the parallel-transport frame at the start of a
+/// [`SweptDiskSolid`] path.
+fn pick_perpendicular(t: [f64; 3]) -> [f64; 3] {
+    // Choose the axis that's least aligned with `t`, then cross
+    // with `t` to get a perpendicular vector. The "axis with the
+    // smallest |dot| with `t`" gives the most numerically stable
+    // result.
+    let abs_x = t[0].abs();
+    let abs_y = t[1].abs();
+    let abs_z = t[2].abs();
+    let helper = if abs_x <= abs_y && abs_x <= abs_z {
+        [1.0, 0.0, 0.0]
+    } else if abs_y <= abs_z {
+        [0.0, 1.0, 0.0]
+    } else {
+        [0.0, 0.0, 1.0]
+    };
+    normalize3(cross3(t, helper))
+}
+
+/// Project `v` into the plane perpendicular to `n` (subtract the
+/// `n`-component of `v`). Used to roll the parallel-transport
+/// frame from one segment's tangent to the next without
+/// introducing twist.
+fn project_perpendicular(v: [f64; 3], n: [f64; 3]) -> [f64; 3] {
+    let d = v[0] * n[0] + v[1] * n[1] + v[2] * n[2];
+    [v[0] - d * n[0], v[1] - d * n[1], v[2] - d * n[2]]
+}
+
+// ---------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------
 
@@ -1631,5 +2044,168 @@ mod tests {
             welded.positions
         );
         assert_eq!(welded.indices.len(), 2);
+    }
+
+    // -----------------------------------------------------------------
+    // IfcRevolvedAreaSolid
+    // -----------------------------------------------------------------
+
+    /// A square profile centred at `x=2, z=0` revolved through 2π
+    /// around the Z axis should produce a torus-like ring.
+    #[test]
+    fn revolved_full_torus_is_watertight() {
+        let profile = Profile::closed(vec![[1.0, -0.5], [2.0, -0.5], [2.0, 0.5], [1.0, 0.5]]);
+        let solid = RevolvedAreaSolid {
+            profile,
+            angle_rad: TAU,
+            segments: 32,
+        };
+        let mesh = solid.tessellate().expect("full revolution should not fail");
+        // 32 sections × 4 vertices = 128 positions
+        assert_eq!(mesh.positions.len(), 32 * 4);
+        // Side ribbon only — no caps for full revolution.
+        // 32 segments × 4 edges × 2 tris = 256 triangles.
+        assert_eq!(mesh.indices.len(), 32 * 4 * 2);
+        // Approximate volume via signed_volume (torus V ≈ 2π² R r²).
+        let v = mesh.signed_volume().abs();
+        assert!(v > 0.0);
+    }
+
+    /// A half-revolution (π rad) of the same profile should emit
+    /// caps at θ=0 and θ=π so the result is watertight.
+    #[test]
+    fn revolved_half_revolution_emits_caps() {
+        let profile = Profile::closed(vec![[1.0, -0.5], [2.0, -0.5], [2.0, 0.5], [1.0, 0.5]]);
+        let solid = RevolvedAreaSolid {
+            profile,
+            angle_rad: std::f64::consts::PI,
+            segments: 16,
+        };
+        let mesh = solid.tessellate().expect("half revolution");
+        // 17 sections (16 + 1) × 4 vertices = 68 positions
+        assert_eq!(mesh.positions.len(), 17 * 4);
+        // Side: 16 × 4 × 2 = 128. Caps: 2 × (4-2) ear-clipped tris = 4.
+        assert_eq!(mesh.indices.len(), 16 * 4 * 2 + 4);
+    }
+
+    /// A profile that crosses the axis must produce an empty mesh
+    /// (self-intersecting sweep is treated as malformed per the
+    /// IFC4 implementer agreement).
+    #[test]
+    fn revolved_axis_crossing_profile_yields_empty_mesh() {
+        let profile = Profile::closed(vec![[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5]]);
+        let solid = RevolvedAreaSolid {
+            profile,
+            angle_rad: TAU,
+            segments: 32,
+        };
+        let mesh = solid.tessellate().expect("axis crossing");
+        assert!(mesh.positions.is_empty());
+        assert!(mesh.indices.is_empty());
+    }
+
+    /// Segment count below 3 must be clamped up to 3 — the
+    /// resulting mesh has ≥ 3 sections worth of positions.
+    #[test]
+    fn revolved_clamps_segments_to_minimum() {
+        let profile = Profile::closed(vec![[1.0, 0.0], [2.0, 0.0], [2.0, 1.0], [1.0, 1.0]]);
+        let solid = RevolvedAreaSolid {
+            profile,
+            angle_rad: TAU,
+            segments: 0,
+        };
+        let mesh = solid.tessellate().expect("clamped");
+        assert_eq!(mesh.positions.len(), 3 * 4);
+    }
+
+    // -----------------------------------------------------------------
+    // IfcSweptDiskSolid
+    // -----------------------------------------------------------------
+
+    /// A straight 2-vertex path with a solid disk swept along it
+    /// produces a closed cylinder: outer ribbon + 2 fan caps.
+    #[test]
+    fn swept_disk_straight_cylinder_is_closed() {
+        let solid = SweptDiskSolid {
+            path: vec![[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+            radius_m: 0.5,
+            inner_radius_m: None,
+            segments: 16,
+        };
+        let mesh = solid.tessellate().expect("straight cylinder");
+        // 2 path vertices × 16 ring samples = 32 positions
+        assert_eq!(mesh.positions.len(), 2 * 16);
+        // Ribbon: 1 segment × 16 quads × 2 tris = 32 triangles.
+        // Caps: 2 × (16 - 2) fan tris = 28 triangles.
+        assert_eq!(mesh.indices.len(), 32 + 28);
+        // Discretised cylinder volume at 16 segs ≈ 0.77; allow 15 %
+        // slack against the analytic π r² h = 0.785.
+        let v = mesh.signed_volume().abs();
+        assert!(v > 0.6 && v < 0.9, "volume = {v}");
+    }
+
+    /// A hollow tube (inner_radius > 0) has 2 rings per section and
+    /// ring-shaped caps.
+    #[test]
+    fn swept_disk_hollow_tube_layout() {
+        let solid = SweptDiskSolid {
+            path: vec![[0.0, 0.0, 0.0], [0.0, 0.0, 2.0]],
+            radius_m: 0.5,
+            inner_radius_m: Some(0.4),
+            segments: 12,
+        };
+        let mesh = solid.tessellate().expect("hollow tube");
+        // 2 sections × 2 rings × 12 = 48 positions
+        assert_eq!(mesh.positions.len(), 2 * 2 * 12);
+        // Outer ribbon: 12 × 2 = 24. Inner ribbon: 24. Caps:
+        // 12 × 2 = 24 each. 24 + 24 + 24 + 24 = 96 triangles.
+        assert_eq!(mesh.indices.len(), 24 + 24 + 24 + 24);
+    }
+
+    /// An L-shaped path with 3 vertices produces 2 cylinder
+    /// segments sharing the joint cross-section.
+    #[test]
+    fn swept_disk_polyline_shares_joint_section() {
+        let solid = SweptDiskSolid {
+            path: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0]],
+            radius_m: 0.1,
+            inner_radius_m: None,
+            segments: 8,
+        };
+        let mesh = solid.tessellate().expect("L-shape");
+        // 3 sections × 8 ring samples = 24 positions
+        assert_eq!(mesh.positions.len(), 3 * 8);
+        // 2 ribbon segments × 8 × 2 = 32 tris. Caps: 2 × (8 - 2) = 12.
+        assert_eq!(mesh.indices.len(), 32 + 12);
+    }
+
+    /// A degenerate path (single point) returns an empty mesh.
+    #[test]
+    fn swept_disk_single_point_path_is_empty() {
+        let solid = SweptDiskSolid {
+            path: vec![[0.0, 0.0, 0.0]],
+            radius_m: 0.5,
+            inner_radius_m: None,
+            segments: 16,
+        };
+        let mesh = solid.tessellate().expect("single point");
+        assert!(mesh.positions.is_empty());
+        assert!(mesh.indices.is_empty());
+    }
+
+    /// Inner radius ≥ outer radius is malformed; tessellator
+    /// returns an empty mesh rather than producing self-intersecting
+    /// geometry.
+    #[test]
+    fn swept_disk_invalid_inner_radius_is_empty() {
+        let solid = SweptDiskSolid {
+            path: vec![[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+            radius_m: 0.5,
+            inner_radius_m: Some(0.6),
+            segments: 16,
+        };
+        let mesh = solid.tessellate().expect("invalid inner");
+        assert!(mesh.positions.is_empty());
+        assert!(mesh.indices.is_empty());
     }
 }
