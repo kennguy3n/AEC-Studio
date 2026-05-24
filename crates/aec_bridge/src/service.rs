@@ -4,7 +4,7 @@
 //! these methods. Keeping the napi wrappers thin and the logic here makes
 //! this layer trivially testable.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -18,6 +18,7 @@ use aec_core::types::{ProjectId, Scope};
 use aec_governor::profiler::{CpuProfile, GpuProfile, HardwareProfiler};
 use aec_governor::tier::HardwareTier;
 
+use crate::engine_status_cache::EngineStatusCache;
 use crate::recents::{RecentsStore, RecentsStoreError};
 
 #[derive(Debug, Error)]
@@ -161,6 +162,18 @@ pub struct BridgeService {
     /// main process keeps this in the OS keychain; in tests we pass a
     /// well-known value.
     master_key: [u8; 32],
+    /// Connection cache for [`Self::project_engine_status`]. Lives on
+    /// the service so its lifetime tracks the bridge singleton: when
+    /// the Electron process tears down, all cached `SQLCipher`
+    /// connections drop with it.
+    ///
+    /// Interior-mutable so `project_engine_status` (which takes
+    /// `&self`) can still mutate the cache. The mutating endpoints
+    /// (`project_open`, `project_save`, `project_audit_sync`) call
+    /// [`EngineStatusCache::invalidate`] for the affected path to
+    /// ensure subsequent reads observe their writes through a fresh
+    /// connection.
+    engine_status_cache: EngineStatusCache,
 }
 
 impl BridgeService {
@@ -173,7 +186,57 @@ impl BridgeService {
             config,
             recents,
             master_key,
+            engine_status_cache: EngineStatusCache::new(),
         })
+    }
+
+    /// Canonicalise a caller-supplied project path so the same project
+    /// is keyed identically in the cache regardless of trailing slashes,
+    /// `..` components, or symlink form. The path must already exist on
+    /// disk — callers reach this method through a [`ProjectPackage`]
+    /// open which itself validates the package layout, so any failure
+    /// here would indicate the package vanished between the open and
+    /// the cache key derivation. Returns a plain [`PathBuf`] (no
+    /// platform-specific path-prefix manipulation) since we only use
+    /// the value as a `HashMap` key.
+    fn cache_key(path: &str) -> Result<PathBuf, BridgeServiceError> {
+        Ok(std::fs::canonicalize(Path::new(path))?)
+    }
+
+    /// Invalidate the engine-status cache entry for `path`. If
+    /// canonicalisation fails (a transient filesystem error or a
+    /// path that disappeared between the successful open and the
+    /// post-mutation invalidation), fall back to dropping every
+    /// cached connection. This guarantees the next status read can
+    /// never observe stale post-mutation state — the previous
+    /// behaviour was an `if let Ok(...)` silent-skip that would have
+    /// left a stale entry alive for up to `CACHE_TTL`.
+    ///
+    /// Used by every mutating endpoint: `project_open`,
+    /// `project_save`, `project_audit_sync`. Kept on `&self` (not
+    /// `&mut self`) so it composes inside the existing
+    /// `&mut self` method signatures without further borrow churn.
+    fn invalidate_status_cache_for(&self, path: &str) {
+        match Self::cache_key(path) {
+            Ok(key) => self.engine_status_cache.invalidate(&key),
+            Err(_) => self.engine_status_cache.invalidate_all(),
+        }
+    }
+
+    /// Test-only accessor for the engine-status connection cache size.
+    /// Lets unit AND integration tests in the same crate assert
+    /// cache-hit / invalidation behavior without exposing the cache
+    /// to external callers.
+    ///
+    /// `#[doc(hidden)]` — not part of the stable API. The leading `__`
+    /// is the de-facto Rust convention for "internal, may break".
+    /// Integration tests must use `pub` accessors (they don't get
+    /// `cfg(test)`-gated items from the library crate), so this is
+    /// the cheapest way to thread the assertion through without
+    /// building a separate test-only feature.
+    #[doc(hidden)]
+    pub fn __engine_status_cache_len(&self) -> usize {
+        self.engine_status_cache.len()
     }
 
     /// List bundled templates available for the New Project flow.
@@ -197,6 +260,19 @@ impl BridgeService {
     }
 
     /// Create a new project on disk from a template.
+    ///
+    /// After a successful create, invalidates any engine-status cache
+    /// entry that *might* exist for the new project's path. In the
+    /// common case [`ProjectPackage::create`] fails with
+    /// `AlreadyExists` if the path is occupied, so no cache entry can
+    /// exist at that path. The invalidation covers the edge case
+    /// where the project directory was removed externally (e.g.
+    /// `rm -rf` while the bridge was running) and a new project is
+    /// created at the same slug — without it, the next status poll
+    /// would serve a stale connection bound to the deleted file.
+    /// Keeping the rule "every mutating endpoint calls
+    /// `invalidate_status_cache_for`" without exception also makes
+    /// the architectural contract easier to audit.
     pub fn project_create_from_template(
         &mut self,
         template_key: &str,
@@ -221,6 +297,14 @@ impl BridgeService {
             Some(template.template_id.clone()),
             &self.master_key,
         )?;
+        // Drop any stale cache entry for this path before publishing
+        // the new project to the recents store. `root` is a `PathBuf`
+        // and the cache key is derived via `cache_key` (which goes
+        // through `canonicalize`); pass the str form through the
+        // standard helper so it shares the same canonicalisation
+        // failure handling as the other mutating endpoints.
+        let root_str = root.to_string_lossy();
+        self.invalidate_status_cache_for(&root_str);
         let summary: ProjectSummary = pkg.summary().into();
         let core_summary = pkg.summary();
         self.recents.record(&core_summary)?;
@@ -239,6 +323,16 @@ impl BridgeService {
     /// table introduced in v2 would not exist on legacy databases.
     pub fn project_open(&mut self, path: &str) -> Result<ProjectSummary, BridgeServiceError> {
         let pkg = ProjectPackage::open_with_master_key(path, &self.master_key)?;
+        // `open_with_master_key` ran the migration registry; any
+        // status-pane connection we'd cached pre-open would have a
+        // stale prepared-statement cache against the old schema.
+        // Drop it so the next `project_engine_status` re-opens.
+        // Fall back to `invalidate_all` if canonicalisation fails (a
+        // transient filesystem error between the successful open and
+        // here) so the cache can never serve stale post-migration
+        // state — see `EngineStatusCache::invalidate_all` for the
+        // full rationale.
+        self.invalidate_status_cache_for(path);
         let core_summary = pkg.summary();
         let summary: ProjectSummary = core_summary.clone().into();
         self.recents.record(&core_summary)?;
@@ -255,6 +349,12 @@ impl BridgeService {
     pub fn project_save(&mut self, path: &str) -> Result<ProjectSummary, BridgeServiceError> {
         let mut pkg = ProjectPackage::open_with_master_key(path, &self.master_key)?;
         pkg.save()?;
+        // The manifest just changed on disk; any cached status
+        // connection's view of `schema_version` is now stale.
+        // Invalidate so the next status read sees the post-save
+        // state. Falls back to `invalidate_all` on canonicalise
+        // failure (see `invalidate_status_cache_for`).
+        self.invalidate_status_cache_for(path);
         Ok(pkg.summary().into())
     }
 
@@ -284,6 +384,13 @@ impl BridgeService {
             ProjectPackage::open_with_master_key_and_database(path, &self.master_key)?;
         let log = AuditLog::open(pkg.root().join("audit").join("log.jsonl"))?;
         let n = log.mirror_to_sql(&mut conn)?;
+        // The SQL `audit_chain` table just gained rows; the cached
+        // engine-status connection's `SELECT count(*)` and per-scope
+        // counts would otherwise be evaluated against a stale snapshot
+        // until idle eviction. Invalidate so the next status read picks
+        // up the synced rows immediately. Falls back to `invalidate_all`
+        // on canonicalise failure (see `invalidate_status_cache_for`).
+        self.invalidate_status_cache_for(path);
         Ok(n as u64)
     }
 
@@ -316,41 +423,63 @@ impl BridgeService {
         // brought up to date. The manifest's `schema_version` field
         // will be advanced the next time the user explicitly
         // opens/saves the project through the mutating endpoints.
-        let pkg = ProjectPackage::open(path)?;
-        let conn = pkg.open_database(&self.master_key)?;
-        let log = AuditLog::open(pkg.root().join("audit").join("log.jsonl"))?;
+        //
+        // The connection is cached in [`Self::engine_status_cache`] so
+        // consecutive renderer polls don't re-derive the SQLCipher key
+        // and re-walk the migration registry. The cache is invalidated
+        // by `project_open`, `project_save`, and `project_audit_sync`
+        // — see those methods for the invalidation pairings.
+        let cache_key = Self::cache_key(path)?;
+        let master_key = &self.master_key;
+        let cached = self
+            .engine_status_cache
+            .get_or_open::<_, BridgeServiceError>(&cache_key, || {
+                let pkg = ProjectPackage::open(path)?;
+                Ok(pkg.open_database(master_key)?)
+            })?;
 
-        let schema_version = aec_core::db::schema_version(&conn)?;
+        // The JSONL audit log is opened fresh each call. It's a
+        // memory-mapped replay of a typically-small file (the chain
+        // grows by one entry per command, not per frame) and reading
+        // it doesn't touch SQLCipher, so caching it would add
+        // invalidation surface for negligible speedup.
+        let log = AuditLog::open(cache_key.join("audit").join("log.jsonl"))?;
         let audit_chain_head = log.head().to_string();
         let audit_entry_count = log.entries().len() as u64;
 
-        let sql_count: i64 =
-            conn.query_row("SELECT count(*) FROM audit_chain", [], |r| r.get(0))?;
-        let mut by_scope: std::collections::BTreeMap<String, u64> =
-            std::collections::BTreeMap::new();
-        // Initialise all canonical scopes to 0 so the renderer can show
-        // a stable set of labels even on a fresh project.
-        for s in Scope::all() {
-            by_scope.insert(s.as_str().to_string(), 0);
-        }
-        // Override with real counts from the SQL mirror. We don't trust
-        // arbitrary scope strings — anything not in `Scope::all()` is
-        // ignored, which keeps the renderer's label set bounded.
-        let mut stmt = conn.prepare("SELECT scope, count(*) FROM audit_chain GROUP BY scope")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
-        for row in rows {
-            let (scope, n) = row?;
-            if by_scope.contains_key(&scope) {
-                by_scope.insert(scope, n as u64);
-            }
-        }
+        cached.with_conn(|conn| -> Result<EngineStatusReport, BridgeServiceError> {
+            let schema_version = aec_core::db::schema_version(conn)?;
 
-        Ok(EngineStatusReport {
-            schema_version,
-            audit_chain_head,
-            audit_entry_count,
-            audit_chain_sql_count: sql_count as u64,
-            audit_chain_by_scope: by_scope,
+            let sql_count: i64 =
+                conn.query_row("SELECT count(*) FROM audit_chain", [], |r| r.get(0))?;
+            let mut by_scope: std::collections::BTreeMap<String, u64> =
+                std::collections::BTreeMap::new();
+            // Initialise all canonical scopes to 0 so the renderer can
+            // show a stable set of labels even on a fresh project.
+            for s in Scope::all() {
+                by_scope.insert(s.as_str().to_string(), 0);
+            }
+            // Override with real counts from the SQL mirror. We don't
+            // trust arbitrary scope strings — anything not in
+            // `Scope::all()` is ignored, which keeps the renderer's
+            // label set bounded.
+            let mut stmt =
+                conn.prepare("SELECT scope, count(*) FROM audit_chain GROUP BY scope")?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+            for row in rows {
+                let (scope, n) = row?;
+                if by_scope.contains_key(&scope) {
+                    by_scope.insert(scope, n as u64);
+                }
+            }
+
+            Ok(EngineStatusReport {
+                schema_version,
+                audit_chain_head,
+                audit_entry_count,
+                audit_chain_sql_count: sql_count as u64,
+                audit_chain_by_scope: by_scope,
+            })
         })
     }
 
@@ -550,5 +679,150 @@ mod tests {
         assert_eq!(slugify("Hello World!"), "hello-world");
         assert_eq!(slugify("   "), "project");
         assert_eq!(slugify("Loft 12B"), "loft-12b");
+    }
+
+    #[test]
+    fn engine_status_caches_connection_across_consecutive_calls() {
+        // First poll populates the cache; second poll reuses the
+        // cached `SQLCipher` connection (no second key-derive / no
+        // second `PRAGMA cipher_*` round-trip). We can't measure the
+        // open cost in-process, but we can assert the cache contains
+        // exactly one entry afterwards.
+        let (mut s, _g) = service();
+        let summary = s
+            .project_create_from_template("interior.apartment", "Cached")
+            .unwrap();
+        assert_eq!(s.__engine_status_cache_len(), 0);
+
+        let r1 = s.project_engine_status(&summary.path).unwrap();
+        assert_eq!(s.__engine_status_cache_len(), 1);
+        let r2 = s.project_engine_status(&summary.path).unwrap();
+        assert_eq!(s.__engine_status_cache_len(), 1);
+        assert_eq!(r1, r2);
+    }
+
+    #[test]
+    fn project_save_invalidates_engine_status_cache() {
+        // Save mutates the manifest on disk (`updated_at` and possibly
+        // `schema_version`). Any cached engine-status connection would
+        // otherwise serve a stale snapshot until idle eviction.
+        let (mut s, _g) = service();
+        let summary = s
+            .project_create_from_template("interior.apartment", "Saved")
+            .unwrap();
+        s.project_engine_status(&summary.path).unwrap();
+        assert_eq!(s.__engine_status_cache_len(), 1);
+
+        s.project_save(&summary.path).unwrap();
+        assert_eq!(
+            s.__engine_status_cache_len(),
+            0,
+            "project_save must invalidate the engine-status cache entry"
+        );
+
+        // Re-poll re-populates with a fresh connection.
+        s.project_engine_status(&summary.path).unwrap();
+        assert_eq!(s.__engine_status_cache_len(), 1);
+    }
+
+    #[test]
+    fn project_open_invalidates_engine_status_cache() {
+        // `project_open` runs the migration registry; a v3+ migration
+        // could rewrite the schema underneath a cached read connection's
+        // statement cache. Drop the entry so the next status read
+        // re-opens against the post-migration schema.
+        let (mut s, _g) = service();
+        let summary = s
+            .project_create_from_template("interior.apartment", "Reopened")
+            .unwrap();
+        s.project_engine_status(&summary.path).unwrap();
+        assert_eq!(s.__engine_status_cache_len(), 1);
+
+        s.project_open(&summary.path).unwrap();
+        assert_eq!(
+            s.__engine_status_cache_len(),
+            0,
+            "project_open must invalidate the engine-status cache entry"
+        );
+    }
+
+    #[test]
+    fn project_audit_sync_invalidates_engine_status_cache() {
+        // After mirror_to_sql writes new rows to `audit_chain`, the
+        // cached engine-status connection's `SELECT count(*)` would
+        // (on connections held across a transaction boundary) keep
+        // showing the pre-sync count. Invalidating forces the next
+        // status read to observe the synced rows immediately.
+        let (mut s, _g) = service();
+        let summary = s
+            .project_create_from_template("interior.apartment", "Synced")
+            .unwrap();
+        s.project_engine_status(&summary.path).unwrap();
+        assert_eq!(s.__engine_status_cache_len(), 1);
+
+        s.project_audit_sync(&summary.path).unwrap();
+        assert_eq!(
+            s.__engine_status_cache_len(),
+            0,
+            "project_audit_sync must invalidate the engine-status cache entry"
+        );
+    }
+
+    #[test]
+    fn invalidate_status_cache_for_falls_back_when_canonicalize_fails() {
+        // Populate the cache with two entries, then call the
+        // invalidation helper with a path that cannot be canonicalised
+        // (does not exist on disk). The fallback `invalidate_all` must
+        // wipe the cache so a follow-up status read on EITHER project
+        // re-opens against the freshest on-disk state — this is what
+        // protects us against the silent-skip regression the previous
+        // `if let Ok(...)` implementation had.
+        let (mut s, _g) = service();
+        let a = s
+            .project_create_from_template("interior.apartment", "Cleared A")
+            .unwrap();
+        let b = s
+            .project_create_from_template("interior.apartment", "Cleared B")
+            .unwrap();
+        s.project_engine_status(&a.path).unwrap();
+        s.project_engine_status(&b.path).unwrap();
+        assert_eq!(s.__engine_status_cache_len(), 2);
+
+        // A bogus path under the same projects_dir parent. canonicalize
+        // will return an `Err` because the path does not exist.
+        let bogus = "/this/path/definitely/does/not/exist/project.aecstudio";
+        s.invalidate_status_cache_for(bogus);
+
+        assert_eq!(
+            s.__engine_status_cache_len(),
+            0,
+            "invalidate_status_cache_for must wipe the entire cache when canonicalize fails"
+        );
+    }
+
+    #[test]
+    fn engine_status_cache_keys_by_canonical_path() {
+        // Two textually-different paths that canonicalise to the same
+        // project directory (e.g. with a redundant `./` component)
+        // must hit the same cache entry, not produce duplicates.
+        let (mut s, _g) = service();
+        let summary = s
+            .project_create_from_template("interior.apartment", "Canonical")
+            .unwrap();
+
+        s.project_engine_status(&summary.path).unwrap();
+        assert_eq!(s.__engine_status_cache_len(), 1);
+
+        // Construct a non-canonical but equivalent path. The summary
+        // path is already absolute (recents store records absolute
+        // paths), so build a variant by appending `/.` which is a
+        // benign no-op on any POSIX filesystem.
+        let alt_path = format!("{}/.", summary.path);
+        s.project_engine_status(&alt_path).unwrap();
+        assert_eq!(
+            s.__engine_status_cache_len(),
+            1,
+            "canonicalisation must collapse non-canonical paths to the same cache entry"
+        );
     }
 }
