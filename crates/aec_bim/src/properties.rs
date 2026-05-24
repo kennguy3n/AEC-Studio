@@ -208,6 +208,41 @@ impl PropertyValue {
         }
     }
 
+    /// Boolean projection of any IFC primitive that semantically
+    /// carries a true/false value. Returns:
+    ///
+    /// * `Some(b)` for [`Self::Boolean`] — the strict two-valued
+    ///   `IfcBoolean` (`.T.` / `.F.`).
+    /// * `Some(true)` / `Some(false)` for
+    ///   [`Self::Logical`]`(LogicalValue::True | LogicalValue::False)`
+    ///   — the IFC4 `IfcLogical` tri-state when the source recorded
+    ///   a definite value. Uses [`LogicalValue::as_optional_bool`]
+    ///   so the two enums stay in sync.
+    /// * `None` for [`Self::Logical`]`(LogicalValue::Unknown)` —
+    ///   `.U.` means "we recorded this is unknown", which is **not**
+    ///   the same as `Some(false)`. Callers that want to demote
+    ///   `.U.` to `false` should do it explicitly with
+    ///   `.unwrap_or(false)`.
+    /// * `None` for every other variant.
+    ///
+    /// **Why this helper exists**: before [`Self::Logical`] was
+    /// promoted to a first-class variant, every `pbool` call-site
+    /// (schedules, BOQ, validators) used to pattern-match only on
+    /// `Boolean(b)`. After the promotion, the same call-sites would
+    /// silently treat a `.T.` / `.F.` carried as `IFCLOGICAL` (which
+    /// IFC2X3 dialects use for `Pset_DoorCommon.IsExternal` etc.) as
+    /// absent — a regression. Centralising the coercion contract on
+    /// `PropertyValue` (mirroring how [`Self::as_real`] already
+    /// handles `Integer` → `f64`) keeps every consumer in sync with
+    /// the typing.
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Boolean(b) => Some(*b),
+            Self::Logical(l) => l.as_optional_bool(),
+            _ => None,
+        }
+    }
+
     /// Decoded text view of a string-typed property. Returns a
     /// `Cow<str>` so the common (no-escape) case avoids allocation
     /// while still emitting a properly unescaped string when the raw
@@ -497,6 +532,56 @@ mod tests {
         assert_eq!(
             PropertyValue::Label("hi".into()).as_text().as_deref(),
             Some("hi")
+        );
+    }
+
+    /// `as_bool` must recognise both the strict two-valued
+    /// `IfcBoolean` and the IFC4 `IfcLogical` tri-state — without
+    /// this, IFC2X3-vintage `IFCLOGICAL(.T.)` (used by some exporters
+    /// for `Pset_DoorCommon.IsExternal` and similar flags) would be
+    /// silently treated as absent by schedule / BOQ / validator
+    /// consumers, since the typed reader routes `.T.`/`.F.` carried
+    /// inside `IFCLOGICAL` to [`PropertyValue::Logical`] not to
+    /// [`PropertyValue::Boolean`]. `.U.` (recorded-unknown) must
+    /// surface as `None`, distinct from a definite `Some(false)`.
+    #[test]
+    fn as_bool_recognises_boolean_logical_true_false_but_not_unknown() {
+        // Strict IfcBoolean.
+        assert_eq!(PropertyValue::Boolean(true).as_bool(), Some(true));
+        assert_eq!(PropertyValue::Boolean(false).as_bool(), Some(false));
+        // Tri-state IfcLogical — definite values.
+        assert_eq!(
+            PropertyValue::Logical(LogicalValue::True).as_bool(),
+            Some(true),
+            "IFCLOGICAL(.T.) must project to Some(true) for schedule/BOQ consumers",
+        );
+        assert_eq!(
+            PropertyValue::Logical(LogicalValue::False).as_bool(),
+            Some(false),
+            "IFCLOGICAL(.F.) must project to Some(false)",
+        );
+        // Tri-state IfcLogical — explicit unknown.
+        assert_eq!(
+            PropertyValue::Logical(LogicalValue::Unknown).as_bool(),
+            None,
+            "IFCLOGICAL(.U.) is recorded-unknown, NOT the same as Some(false) — \
+             must surface as None so callers can choose to demote it via `.unwrap_or(false)`",
+        );
+        // Non-boolean variants.
+        assert_eq!(PropertyValue::Real(1.0).as_bool(), None);
+        assert_eq!(PropertyValue::Integer(0).as_bool(), None);
+        assert_eq!(PropertyValue::Text("true".into()).as_bool(), None);
+        assert_eq!(PropertyValue::Label("TRUE".into()).as_bool(), None);
+        assert_eq!(
+            PropertyValue::Other {
+                measure: "IFCBOOLEAN".into(),
+                raw: ".T.".into(),
+            }
+            .as_bool(),
+            None,
+            "Opaque `Other`-routed booleans deliberately do NOT round-trip via \
+             `as_bool` — the reader is expected to route recognised primitives \
+             to typed variants; `Other` is for measures we don't model",
         );
     }
 

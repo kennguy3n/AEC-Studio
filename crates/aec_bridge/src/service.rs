@@ -667,11 +667,27 @@ impl BridgeService {
     /// [`BimImportSummary::large_file_warning`] doc comment
     /// stating the flag is purely advisory.
     pub fn bim_check_file_size(&self, path: &str) -> Result<BimFileSizeCheck, BridgeServiceError> {
-        let metadata = std::fs::metadata(Path::new(path))?;
+        // Order: canonicalize → metadata, matching the error-surface
+        // semantics of `bim_import_ifc` below (which calls
+        // `std::fs::read` first — and `read` follows symlinks and
+        // fails on dangling targets). Doing metadata-first would
+        // give a different error for a dangling symlink: `metadata`
+        // returns the link's own info (reporting the link size,
+        // **not** the would-be target size), and then `canonicalize`
+        // fails because the target doesn't exist. The renderer would
+        // see a "checkFileSize OK, importIfc not-found" sequence on
+        // the same path, which is surprising.
+        //
+        // Canonicalizing first surfaces dangling links as a single
+        // `Io(NotFound)` error from `canonicalize`, identical to what
+        // `bim_import_ifc` would produce from its `std::fs::read`
+        // call. Subsequent `metadata` then operates on the resolved
+        // path — single symlink resolution, single source of truth
+        // for "does this file exist" semantics.
+        let canonical_path_buf = std::fs::canonicalize(Path::new(path))?;
+        let metadata = std::fs::metadata(&canonical_path_buf)?;
         let file_size_bytes = metadata.len();
-        let canonical_path = std::fs::canonicalize(Path::new(path))?
-            .to_string_lossy()
-            .into_owned();
+        let canonical_path = canonical_path_buf.to_string_lossy().into_owned();
         Ok(BimFileSizeCheck {
             path: canonical_path,
             file_size_bytes,
@@ -1468,6 +1484,57 @@ END-ISO-10303-21;\n";
         let path = tmp.path().join("does-not-exist.ifc");
         let err = s.bim_check_file_size(path.to_str().unwrap());
         assert!(err.is_err(), "missing file must produce an error");
+    }
+
+    /// Dangling-symlink regression: `bim_check_file_size` and
+    /// `bim_import_ifc` must surface the **same** error on a dangling
+    /// symlink, so the renderer never sees a "checkFileSize OK,
+    /// importIfc not-found" sequence on the same path.
+    ///
+    /// Pre-fix the canonicalize was done **after** `metadata`, and
+    /// `metadata` on a symlink returns the link's own info (with
+    /// `is_file() = false` on the symlink itself but a small `len()`
+    /// reading the link target string). The "successful" stat would
+    /// return a tiny `file_size_bytes` and `large_file_warning =
+    /// false`, then `bim_import_ifc`'s `std::fs::read` would fail on
+    /// the same dangling target — a surprising UX. Post-fix the
+    /// canonicalize runs first, fails on the dangling target, and
+    /// both methods produce the same `Io(NotFound)` error.
+    #[cfg(unix)]
+    #[test]
+    fn bim_check_file_size_errors_on_dangling_symlink_like_bim_import_ifc() {
+        let (s, _g) = service();
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("does-not-exist-target.ifc");
+        let link = tmp.path().join("dangling-link.ifc");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink");
+
+        let check_err = s.bim_check_file_size(link.to_str().unwrap());
+        let import_err = s.bim_import_ifc(link.to_str().unwrap());
+
+        assert!(
+            check_err.is_err(),
+            "bim_check_file_size on a dangling symlink must surface an error \
+             (matching bim_import_ifc's std::fs::read semantics) — got Ok: {:?}",
+            check_err,
+        );
+        assert!(
+            import_err.is_err(),
+            "bim_import_ifc on a dangling symlink must error",
+        );
+        // Defense-in-depth: both must be `Io` variant. We don't pin
+        // the exact ErrorKind because some platforms surface it as
+        // NotFound and others as InvalidInput.
+        assert!(
+            matches!(check_err, Err(BridgeServiceError::Io(_))),
+            "bim_check_file_size dangling-symlink error must be Io — got {:?}",
+            check_err,
+        );
+        assert!(
+            matches!(import_err, Err(BridgeServiceError::Io(_))),
+            "bim_import_ifc dangling-symlink error must be Io — got {:?}",
+            import_err,
+        );
     }
 
     #[test]
