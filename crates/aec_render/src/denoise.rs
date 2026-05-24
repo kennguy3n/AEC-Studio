@@ -503,4 +503,94 @@ mod tests {
         let img = ImageRgb::from_pixels(3, 3, pix.clone());
         assert_eq!(img.pixels, pix);
     }
+
+    /// Pins the contract that `bilateral_denoise`'s second argument is
+    /// the *normal* image and the third is the *albedo* image. The two
+    /// slots are not interchangeable because the kernel uses
+    /// structurally different formulas:
+    ///
+    /// * normal-edge term — `(1 − dot(n_c, n_s))² · inv_2σ²_normal`,
+    ///   tuned for unit-length vectors in `[-1, 1]`.
+    /// * albedo-edge term — `‖a_c − a_s‖² · inv_2σ²_albedo`, tuned for
+    ///   RGB triples in `[0, 1]`.
+    ///
+    /// If a future refactor accidentally swaps them at any call site
+    /// (the failure mode flagged by Devin Review in PR-J round-2 on the
+    /// `encode_srgb8` call), feeding the same data into the wrong slot
+    /// produces a different distance metric — so two calls with the
+    /// aux images in opposite slots must produce a measurably different
+    /// output. This test makes that property explicit.
+    #[test]
+    fn bilateral_normal_and_albedo_slots_are_not_interchangeable() {
+        // Color: 5×5 sinusoid in luminance so the kernel has something
+        // to weight. Per-pixel value depends on (x + y) to break any
+        // accidental symmetry between row-major and column-major.
+        let w = 5_u32;
+        let h = 5_u32;
+        let pixels: Vec<[f32; 3]> = (0..(w * h))
+            .map(|i| {
+                let x = (i % w) as f32;
+                let y = (i / w) as f32;
+                let v = 0.5 + 0.3 * ((x * 0.7 + y * 1.3).sin());
+                [v, v, v]
+            })
+            .collect();
+        let color = ImageRgb::from_pixels(w, h, pixels);
+        // `n_like` is shaped like a real normal buffer — components
+        // in `[-1, 1]` with magnitudes near 1.
+        let n_like = ImageRgb::from_pixels(
+            w,
+            h,
+            (0..(w * h))
+                .map(|i| {
+                    let t = i as f32 * 0.31;
+                    let nx = t.sin();
+                    let ny = t.cos();
+                    let nz = (1.0 - nx * nx - ny * ny).max(0.0).sqrt();
+                    [nx, ny, nz]
+                })
+                .collect(),
+        );
+        // `a_like` is shaped like an albedo buffer — RGB in `[0, 1]`
+        // with deliberately different spatial variation than `n_like`.
+        let a_like = ImageRgb::from_pixels(
+            w,
+            h,
+            (0..(w * h))
+                .map(|i| {
+                    let t = i as f32 * 0.17;
+                    [0.5 + 0.4 * t.sin(), 0.5 + 0.4 * t.cos(), 0.5]
+                })
+                .collect(),
+        );
+
+        // Use sigmas large enough that BOTH terms contribute
+        // measurably to the weights (otherwise the exp() saturates and
+        // the swap is invisible).
+        let params = BilateralParams {
+            radius: 2,
+            sigma_space: 2.0,
+            sigma_color: 0.5,
+            sigma_normal: 0.6,
+            sigma_albedo: 0.6,
+        };
+        let correct = bilateral_denoise(&color, Some(&n_like), Some(&a_like), params);
+        let swapped = bilateral_denoise(&color, Some(&a_like), Some(&n_like), params);
+
+        let mut max_abs_diff = 0.0_f32;
+        for (c, s) in correct.pixels.iter().zip(swapped.pixels.iter()) {
+            for ch in 0..3 {
+                max_abs_diff = max_abs_diff.max((c[ch] - s[ch]).abs());
+            }
+        }
+        // The two outputs MUST differ by more than floating-point
+        // noise — otherwise the kernel would be symmetric in
+        // `(normal, albedo)` and the call-site argument order would
+        // be meaningless.
+        assert!(
+            max_abs_diff > 1.0e-3,
+            "bilateral_denoise must distinguish (normal, albedo) from \
+             (albedo, normal); got max_abs_diff = {max_abs_diff}"
+        );
+    }
 }

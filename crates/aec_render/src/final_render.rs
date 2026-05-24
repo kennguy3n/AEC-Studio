@@ -278,14 +278,22 @@ pub(crate) fn encode_srgb8(buffer: &AccumulationBuffer, denoise: bool) -> Vec<u8
             height: buffer.height,
             pixels,
         });
+    // Argument order must match `bilateral_denoise(color, normal, albedo, params)`.
+    // Mismatching the two aux images is silently incorrect because the
+    // kernel computes a normal-edge term `(1 - dot(nc, ns))²` (which
+    // assumes unit-length vectors with range [-1, 1]) on the second
+    // argument and an L2 RGB-distance term on the third — fed the wrong
+    // way around, geometric silhouettes get over-smoothed and material
+    // boundaries get over-sharpened because the sigmas are tuned for
+    // mismatched value ranges.
     let denoised = crate::denoise::bilateral_denoise(
         &crate::denoise::ImageRgb {
             width: buffer.width,
             height: buffer.height,
             pixels: avg,
         },
-        albedo_img.as_ref(),
         normal_img.as_ref(),
+        albedo_img.as_ref(),
         crate::denoise::BilateralParams::default(),
     );
 

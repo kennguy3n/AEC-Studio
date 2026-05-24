@@ -700,6 +700,16 @@ pub fn render_tile_pass_with_aux(
     )
 }
 
+// Internal helper used by [`render_tile_pass`] and
+// [`render_tile_pass_with_aux`]. Eight arguments is one over clippy's
+// default cap, but every single one is load-bearing:
+//   - scene / camera / config: scene context
+//   - tile / samples_this_pass / samples_so_far: scheduling state
+//   - rng_seed / capture_aux: per-call kernel knobs
+// Packing them into a struct would just move the verbosity from the
+// callers into the struct literal and add a `&` indirection on every
+// hot-loop field access. Allow it locally instead.
+#[allow(clippy::too_many_arguments)]
 fn render_tile_pass_inner(
     scene: &PathTraceScene,
     camera: &RenderCamera,
@@ -886,15 +896,31 @@ fn render_tile(
             let mut alb_accum = [0.0_f32; 3];
             let mut nrm_accum = [0.0_f32; 3];
             let mut dep_accum = 0.0_f32;
-            // Per-pixel Cranley-Patterson rotation: one random offset
-            // shared by all of this pixel's samples. Decorrelates the
-            // Halton sequence between pixels so the image doesn't
-            // show a global pattern, while preserving the low-
-            // discrepancy property within each pixel.
-            let pixel_seed = [rng.f32(), rng.f32()];
+            let px = tile.x_start + lx as u32;
+            let py = tile.y_start + ly as u32;
+            // Per-pixel Cranley-Patterson rotation, derived
+            // deterministically from `(px, py)` rather than drawn from
+            // `rng`. Two reasons to keep the single-shot path and the
+            // multi-pass [`render_tile_pass_inner`] path on the same
+            // strategy here:
+            //
+            // 1. Output determinism — the rotation is now a pure
+            //    function of pixel coordinates, so identical scenes
+            //    render bit-identically regardless of how many RNG
+            //    draws happened earlier in the tile loop. Drawing from
+            //    `rng` made the rotation depend on whichever pixel was
+            //    visited first, which entangled tile-iteration order
+            //    into pixel output.
+            // 2. Path-coherence — if a caller later switches a render
+            //    from single-shot ([`render_tile`]) to progressive
+            //    ([`render_tile_pass`]) or back, the rotation matches
+            //    and the resulting Halton-shifted sequence per pixel
+            //    is bit-stable across the swap. Otherwise the same
+            //    scene with the same total sample count would produce
+            //    a slightly different image depending on which
+            //    scheduling path drove it.
+            let pixel_seed = crate::sampling::pixel_rotation_seed(px, py);
             for s in 0..config.samples_per_pixel {
-                let px = tile.x_start + lx as u32;
-                let py = tile.y_start + ly as u32;
                 let (jx, jy) = crate::sampling::stratified_jitter(s, pixel_seed);
                 let dir_world = match config.projection {
                     CameraProjection::Perspective => {
