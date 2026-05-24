@@ -539,15 +539,46 @@ fn upsert_entity(
             UpsertOutcome::Updated
         }
         None => {
-            // Not previously seen — INSERT both rows. Use OR IGNORE on
-            // entities so a stale `bim_cache` row with the same
-            // global_id but no matching `entities` row (which would
-            // be a v1 schema oddity) doesn't crash; the subsequent
-            // INSERT OR IGNORE INTO bim_cache covers the symmetric
-            // edge case.
+            // No `bim_cache` row matched the GUID — either the entity
+            // is genuinely new (first attach), or the GUID is `None`
+            // (the GUID-less path that always lands here), or a prior
+            // attach's `bim_cache` row was wiped externally (DB
+            // recovery, schema rebuild, manual `DELETE FROM
+            // bim_cache`). All three cases must result in a row in
+            // `entities` and `bim_cache` reflecting the current
+            // snapshot, but the third needs special care:
+            //
+            // The naive `INSERT OR REPLACE INTO entities` would, on
+            // `id` conflict, expand to `DELETE old + INSERT new`. The
+            // `DELETE old` then fires SQLite's `ON DELETE CASCADE`
+            // pragmas (`entities.parent_id` → `entities.id` cascade
+            // at `aec_core/src/db.rs:85`, and `components.entity_id`
+            // → `entities.id` cascade at `aec_core/src/db.rs:95`),
+            // silently destroying the conflicting entity's entire
+            // child-entity subtree AND every component (Pset, Qto,
+            // material assignment, user-authored render-material
+            // override, command-engine marker, …) — data the user
+            // expects this attach to *preserve*, not blow away.
+            //
+            // Use a proper `ON CONFLICT(id) DO UPDATE` upsert instead:
+            // it rewrites the existing row in place without firing
+            // DELETE, so no cascade triggers. `created_at` is left
+            // alone via the `excluded` alias being omitted from the
+            // SET list — the row's original insert timestamp is
+            // preserved, which is the correct audit semantic. The
+            // `bim_cache` UPSERT mirrors the pattern for consistency
+            // (no FK cascades attach to `bim_cache`, but using the
+            // same idiom across both inserts keeps the dedup
+            // re-attach contract uniform and avoids tempting future
+            // contributors to read `INSERT OR REPLACE` as benign).
             tx.execute(
-                "INSERT OR REPLACE INTO entities(id, kind, parent_id, created_at, updated_at, body) \
-                 VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+                "INSERT INTO entities(id, kind, parent_id, created_at, updated_at, body) \
+                 VALUES (?1, ?2, ?3, ?4, ?4, ?5) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                   kind = excluded.kind, \
+                   parent_id = excluded.parent_id, \
+                   updated_at = excluded.updated_at, \
+                   body = excluded.body",
                 params![
                     entity_id.as_str(),
                     entity_kind,
@@ -558,8 +589,13 @@ fn upsert_entity(
             )?;
             if let Some(g) = guid {
                 tx.execute(
-                    "INSERT OR REPLACE INTO bim_cache(global_id, geom_hash, pset_hash, class_hash, last_seen) \
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    "INSERT INTO bim_cache(global_id, geom_hash, pset_hash, class_hash, last_seen) \
+                     VALUES (?1, ?2, ?3, ?4, ?5) \
+                     ON CONFLICT(global_id) DO UPDATE SET \
+                       geom_hash = excluded.geom_hash, \
+                       pset_hash = excluded.pset_hash, \
+                       class_hash = excluded.class_hash, \
+                       last_seen = excluded.last_seen",
                     params![g, &geom_hash, &pset_hash, &class_hash, now_rfc3339],
                 )?;
             }

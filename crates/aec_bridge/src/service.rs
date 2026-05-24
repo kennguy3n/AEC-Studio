@@ -1516,6 +1516,127 @@ END-ISO-10303-21;\n";
     }
 
     #[test]
+    fn bim_attach_ifc_preserves_user_authored_children_when_bim_cache_was_wiped() {
+        // Regression for Devin Review round 5 BUG_0001: the
+        // `Inserted` branch of `upsert_entity` used to call
+        // `INSERT OR REPLACE INTO entities ...`. With SQLite's
+        // `PRAGMA foreign_keys = ON` plus the `ON DELETE CASCADE`
+        // wiring on `entities.parent_id` and `components.entity_id`
+        // (see `aec_core/src/db.rs`), an `OR REPLACE` conflict on
+        // `entities.id` expands to `DELETE old + INSERT new` and
+        // cascade-deletes every child entity and every component
+        // belonging to the conflicting row. The fix swapped that
+        // statement for a proper `ON CONFLICT(id) DO UPDATE` upsert,
+        // which rewrites the row in place without firing DELETE.
+        //
+        // This test reproduces the scenario the bot described:
+        //   1. Attach the fixture once so the IfcProject row lands
+        //      in `entities` and `bim_cache`.
+        //   2. Add a user-authored CHILD entity under the project
+        //      (e.g., a hand-placed annotation marker) AND a
+        //      user-authored component on the project itself
+        //      (e.g., a render-material override). Neither row is
+        //      part of any future BIM attach's wipe set.
+        //   3. Manually wipe `bim_cache` to simulate the DB-recovery
+        //      / schema-rebuild / manual-DELETE scenarios that
+        //      legitimately leave `entities` populated but
+        //      `bim_cache` empty. This forces re-attach down the
+        //      `Inserted` (None match) branch.
+        //   4. Re-attach. Under the OLD `INSERT OR REPLACE`, the
+        //      user-authored child and component would be silently
+        //      cascade-deleted. Under the fix, both survive.
+        let (mut s, _g) = service();
+        let project = s
+            .project_create_from_template("interior.apartment", "PreserveUserAuthored")
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let ifc_path = tmp.path().join("fixture.ifc");
+        let body = b"ISO-10303-21;\n\
+HEADER;\n\
+FILE_DESCRIPTION(('preserve'),'2;1');\n\
+FILE_NAME('p.ifc','2026-05-20T00:00:00',(''),(''),'','','');\n\
+FILE_SCHEMA(('IFC4'));\n\
+ENDSEC;\n\
+DATA;\n\
+#1 = IFCOWNERHISTORY($,$,$,.NOCHANGE.,$,$,$,1747699200);\n\
+#2 = IFCPROJECT('00000000000000000000z1',#1,'P','P',$,$,$,$,$);\n\
+ENDSEC;\n\
+END-ISO-10303-21;\n";
+        std::fs::write(&ifc_path, body).unwrap();
+
+        s.bim_attach_ifc(&project.path, ifc_path.to_str().unwrap())
+            .expect("first attach must succeed");
+
+        let project_entity_id = aec_core::types::EntityId::from_guid_seed("00000000000000000000z1");
+        let user_child_id = aec_core::types::EntityId::new();
+        let user_component_id = format!("{}/annotation/{}", project_entity_id.as_str(), "user-1");
+
+        let pkg = aec_core::package::ProjectPackage::open_with_master_key(
+            std::path::Path::new(&project.path),
+            &[42u8; 32],
+        )
+        .unwrap();
+        let conn = pkg.open_database(&[42u8; 32]).unwrap();
+
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO entities(id, kind, parent_id, created_at, updated_at, body) \
+             VALUES (?1, 'user/annotation', ?2, ?3, ?3, '{}')",
+            rusqlite::params![user_child_id.as_str(), project_entity_id.as_str(), now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO components(id, entity_id, kind, body) \
+             VALUES (?1, ?2, 'user/render_override', '{}')",
+            rusqlite::params![user_component_id, project_entity_id.as_str()],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM bim_cache", []).unwrap();
+        drop(conn);
+        drop(pkg);
+
+        let second = s
+            .bim_attach_ifc(&project.path, ifc_path.to_str().unwrap())
+            .expect("re-attach with wiped bim_cache must succeed");
+        assert!(
+            second.spatial_nodes_inserted >= 1,
+            "wiped bim_cache forces Inserted branch; got {} inserted",
+            second.spatial_nodes_inserted
+        );
+
+        let pkg = aec_core::package::ProjectPackage::open_with_master_key(
+            std::path::Path::new(&project.path),
+            &[42u8; 32],
+        )
+        .unwrap();
+        let conn = pkg.open_database(&[42u8; 32]).unwrap();
+        let user_child_survived: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entities WHERE id = ?1",
+                rusqlite::params![user_child_id.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            user_child_survived, 1,
+            "user-authored child entity under the IfcProject MUST survive re-attach \
+             (it would be cascade-deleted under the old `INSERT OR REPLACE`)"
+        );
+        let user_component_survived: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM components WHERE id = ?1",
+                rusqlite::params![user_component_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            user_component_survived, 1,
+            "user-authored component on the IfcProject MUST survive re-attach \
+             (it would be cascade-deleted under the old `INSERT OR REPLACE`)"
+        );
+    }
+
+    #[test]
     fn bim_attach_ifc_invalidates_engine_status_cache() {
         // After the attach, the engine-status cache entry for the
         // project must be gone so a subsequent
