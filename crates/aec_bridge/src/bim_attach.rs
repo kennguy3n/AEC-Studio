@@ -406,6 +406,31 @@ enum UpsertOutcome {
 
 /// Upsert one `entities` row + its `bim_cache` index entry. Implements
 /// the "GUID-aware dedup" described in the module docs.
+///
+/// # Load-bearing coupling: `bim_cache.global_id` ↔ `entities.id`
+///
+/// `bim_cache` (declared in `aec_core/src/db.rs:120-126`) is keyed on
+/// IFC `global_id` and stores only the three content hashes plus
+/// `last_seen` — it deliberately does NOT store the matching
+/// `entities.id`. The `Updated` branch below relies on the invariant
+/// that `entities.id == EntityId::from_guid_seed(global_id)` for every
+/// GUID-bearing row that ever lands in `bim_cache`, because we look up
+/// `bim_cache` by `global_id` (the GUID) but then UPDATE `entities`
+/// keyed by the *snapshot's* derived `entity_id`. If the namespace
+/// UUID inside [`EntityId::from_guid_seed`] (`aec_core/src/types.rs`)
+/// were ever changed, previously-attached entities would have a
+/// different `entities.id` than the new derivation, and the `UPDATE
+/// entities WHERE id = ?` would silently match zero rows while the
+/// `bim_cache` hashes refreshed normally — locking those entities
+/// into a stale body forever (the next attach would see matching
+/// hashes and take the `Unchanged` branch).
+///
+/// The `entity_id_from_guid_seed_namespace_pin` test in
+/// `aec_core/src/types.rs` guards the namespace constant against
+/// silent changes. Any future schema migration that *intentionally*
+/// rotates the namespace MUST also walk `bim_cache` and re-derive
+/// every `entities.id` to the new namespace in the same forward-only
+/// migration step.
 #[allow(clippy::too_many_arguments)]
 fn upsert_entity(
     tx: &Transaction<'_>,
