@@ -1332,14 +1332,19 @@ function adaptNative(n: NativeApi): BridgeBackend {
   // in-process impl with *no* trace, hiding the wiring gap. We throw
   // for the same reason self-check 1 does: surfaces the mistake at
   // bridge boot rather than at first call site.
-  const overridden = new Set<string>(Object.keys(native));
+  //
+  // The detector is a function-reference comparison: every key in
+  // `BridgeBackend` is already present in `native` (because of the
+  // `...wrapped` spread that the explicit overrides extend), so a
+  // bare `Object.keys(native).has(key)` would never fire. A real
+  // native override replaces the spread-through entry with a distinct
+  // closure (`async (...) => n.foo(...)`), making its function
+  // reference differ from the in-process base function. Equality
+  // therefore means "no real override".
   const wiredButMissingOverride = NATIVE_WIRED_METHODS.filter((key) => {
     const overrideFn = (native as unknown as Record<string, unknown>)[key];
     const baseFn = (base as unknown as Record<string, unknown>)[key];
-    // Method may be in `native` only because of the `...wrapped` spread.
-    // Treat the entry as a missing override if the function reference is
-    // identical to the in-process base function (i.e. no real override).
-    return !overridden.has(key) || overrideFn === baseFn;
+    return overrideFn === baseFn;
   });
   if (
     wiredButMissingOverride.length > 0 &&

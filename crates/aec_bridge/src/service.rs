@@ -1805,11 +1805,8 @@ impl BridgeService {
         let property_delta_to_change = |d: &aec_bim::diff::PropertyDelta| BimDiffPropertyChange {
             pset: d.pset.clone(),
             key: d.key.clone(),
-            before: d
-                .before
-                .as_ref()
-                .and_then(|v| serde_json::to_string(v).ok()),
-            after: d.after.as_ref().and_then(|v| serde_json::to_string(v).ok()),
+            before: d.before.as_ref().map(property_value_to_diff_string),
+            after: d.after.as_ref().map(property_value_to_diff_string),
         };
         let modified = proj_diff
             .modified
@@ -2273,6 +2270,24 @@ fn parse_scene_json(scene_json: Option<&str>) -> Result<RenderScene, BridgeServi
             BridgeServiceError::Core(format!("render scene_json deserialisation failed: {e}"))
         }),
     }
+}
+
+/// Stringify a `PropertyValue` for inclusion in a
+/// [`BimDiffPropertyChange::before`] / `::after` field.
+///
+/// `BimDiffPropertyChange::before` / `::after` use `Option<String>`
+/// with the documented contract that `None` means "property didn't
+/// exist on that side" — added when `before.is_none()`, removed
+/// when `after.is_none()`. A `serde_json::to_string` failure on a
+/// `PropertyValue::{Real, Length, Area, Volume, Ratio}` carrying
+/// `NaN` / `±Infinity` *must not* silently degrade `Some(value)`
+/// to `None`, because that would corrupt the semantic — a
+/// *changed* property would show up as *added* or *removed*. The
+/// fallback string `"null"` is the documented "stringify failed"
+/// sentinel that the renderer can render distinctly from a missing
+/// field (a literal JSON `null`, not the empty `Option`).
+fn property_value_to_diff_string(v: &aec_bim::properties::PropertyValue) -> String {
+    serde_json::to_string(v).unwrap_or_else(|_| "null".to_string())
 }
 
 fn slugify(name: &str) -> String {
@@ -4024,5 +4039,54 @@ END-ISO-10303-21;\n";
         assert_eq!(saturating_u32(0), 0);
         assert_eq!(saturating_u32(7), 7);
         assert_eq!(saturating_u32(u32::MAX as usize), u32::MAX);
+    }
+
+    #[test]
+    fn property_value_to_diff_string_preserves_some_on_serialisation_failure() {
+        use aec_bim::properties::PropertyValue;
+        // Finite floats round-trip via serde_json normally.
+        let normal = PropertyValue::Real(1.5);
+        let s = property_value_to_diff_string(&normal);
+        assert!(s.contains("\"real\""), "got {s}");
+        assert!(s.contains("1.5"), "got {s}");
+
+        // Non-finite floats also produce *some* string — the regression
+        // we're pinning here is that the call site uses `.map(...)`
+        // rather than `.and_then(|v| serde_json::to_string(v).ok())`.
+        // Today serde_json emits `{"type":"real","value":null}` (no
+        // error) for `f64::NAN` / `±Infinity`, so the live shape is
+        // preserved. *If* a future serde_json release ever errors on
+        // non-finite floats (or a new PropertyValue variant carries a
+        // type whose Serialize impl can return Err — non-UTF8 paths,
+        // overflowing integers via a manual impl, etc.), the
+        // `unwrap_or_else(|_| "null".to_string())` fallback keeps the
+        // `Some(_)` wrapper on `BimDiffPropertyChange::before`/`::after`.
+        // Without it, `.and_then(...ok())` would silently collapse the
+        // `Some(value)` to `None`, corrupting the documented
+        // added/removed/changed semantic (None means "property didn't
+        // exist on that side").
+        for v in [
+            PropertyValue::Real(f64::NAN),
+            PropertyValue::Real(f64::INFINITY),
+            PropertyValue::Real(f64::NEG_INFINITY),
+            PropertyValue::Length(f64::NAN),
+            PropertyValue::Area(f64::INFINITY),
+            PropertyValue::Volume(f64::NEG_INFINITY),
+            PropertyValue::Ratio(f64::NAN),
+        ] {
+            let s = property_value_to_diff_string(&v);
+            assert!(
+                !s.is_empty(),
+                "non-finite f64 must produce some string, never lose the Some wrapper: {v:?}"
+            );
+            // Current serde_json behavior emits the wrapper with
+            // `"value":null`; either that or the explicit fallback
+            // string `"null"` is acceptable — both keep the
+            // `Some(_)` wrapper intact.
+            assert!(
+                s == "null" || s.contains("\"value\":null"),
+                "expected non-finite to serialise either as fallback `\"null\"` or as wrapped `\"value\":null`, got {s} for {v:?}"
+            );
+        }
     }
 }
