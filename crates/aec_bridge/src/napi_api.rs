@@ -217,7 +217,7 @@ pub fn project_list_recents() -> Result<Vec<ProjectSummaryJs>> {
     // Home page's recents list run concurrently with status-pane
     // polls and with each other — only the mutating endpoints
     // (project_open / save / sync / create) exclude these reads.
-    with_service_ref_fallible(|svc| svc.project_list_recents())
+    with_service_ref_fallible(BridgeService::project_list_recents)
         .map(|v| v.into_iter().map(Into::into).collect())
 }
 
