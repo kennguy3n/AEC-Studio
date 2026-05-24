@@ -472,6 +472,147 @@ pub fn render_with_aux(
     render_inner(scene, camera, config, progress, cancel, true)
 }
 
+/// Fill the first-hit aux feature channels (albedo / normal / depth)
+/// of an existing [`AccumulationBuffer`] by tracing a single
+/// center-of-pixel primary ray per pixel — no jitter, no bounces, no
+/// shading.
+///
+/// This is the cheap "companion pass" used by
+/// [`crate::gpu_trace::render_or_fallback`] when the GPU path produces
+/// a radiance-only buffer but the caller asked for aux. The GPU does
+/// the expensive multi-bounce radiance integration, and this function
+/// adds aux feature buffers so the downstream bilateral kernel in
+/// [`crate::final_render::encode_srgb8`] runs in feature-guided mode
+/// rather than luminance-only — closing the quality gap between
+/// GPU-equipped and CPU-fallback machines for the same denoise preset.
+///
+/// **Cost.** One BVH traversal per pixel — empirically < 1 % of a
+/// full path-traced render's cost. The first-hit computation has no
+/// shading and no NEE, so it scales linearly in pixel count and is
+/// independent of `samples_per_pixel` and `max_bounces`.
+///
+/// **Sampling convention.** Single-sample, center-of-pixel, no jitter.
+/// This is the convention used by OIDN ("Denoising Albedo / Normal" /
+/// "Denoising Depth") and by Cycles' aux passes. The bilateral kernel
+/// consumes aux as a *similarity signal* — "are these two pixels on
+/// the same surface?" — not as a precise per-sample integral, so
+/// per-pixel jitter averaging would buy nothing for denoising
+/// guidance but would cost N× more rays.
+///
+/// **Bit-stability vs. CPU `render_with_aux`.** This function does NOT
+/// reproduce `render_with_aux`'s jittered per-sample aux average. For
+/// the same scene the two paths produce numerically different aux
+/// buffers: this one is the *primary-ray* first hit, `render_with_aux`
+/// is the *sample-averaged* first hit. Both are valid OIDN-style aux
+/// inputs; the bilateral kernel treats them identically.
+///
+/// **Accumulator format.** Aux is stored as `(per-pixel value) ×
+/// pixels[i][3]` so the existing
+/// [`AccumulationBuffer::average_albedo`] / `average_normal` /
+/// `average_depth` helpers — which divide by `pixels[i][3]` — recover
+/// the first-hit value directly. If `buffer.albedo` / `normal` /
+/// `depth` are `None`, they are allocated to match `width × height`.
+pub fn fill_first_hit_aux(
+    scene: &PathTraceScene,
+    camera: &RenderCamera,
+    config: &PathTraceConfig,
+    buffer: &mut AccumulationBuffer,
+) {
+    debug_assert_eq!(
+        buffer.width, config.width,
+        "buffer.width must match config.width"
+    );
+    debug_assert_eq!(
+        buffer.height, config.height,
+        "buffer.height must match config.height"
+    );
+    let pixel_count = (buffer.width as usize) * (buffer.height as usize);
+    // Allocate aux channels up-front (if absent) so the loop below can
+    // index into them without re-checking `Option` on every pixel.
+    let _ = buffer
+        .albedo
+        .get_or_insert_with(|| vec![[0.0_f32; 3]; pixel_count]);
+    let _ = buffer
+        .normal
+        .get_or_insert_with(|| vec![[0.0_f32; 3]; pixel_count]);
+    let _ = buffer
+        .depth
+        .get_or_insert_with(|| vec![0.0_f32; pixel_count]);
+
+    let view = build_view(camera);
+    let aspect = config.width as f32 / config.height.max(1) as f32;
+    let half_h = focal_to_half_height(camera.focal_length_mm).max(1e-4);
+    let half_w = half_h * aspect;
+
+    for py in 0..config.height {
+        for px in 0..config.width {
+            let i = (py * config.width + px) as usize;
+            // Sample-count scale so that `average_*` helpers recover
+            // the per-pixel first-hit value: `aux_sum / samples = aux`.
+            // Use `max(1.0)` to defend against an uninitialised
+            // `pixels[i][3]` (e.g. GPU returned an empty buffer on
+            // cancel) — division would otherwise blow up.
+            let scale = buffer.pixels[i][3].max(1.0);
+            let dir_world = match config.projection {
+                CameraProjection::Perspective => {
+                    let nx = (px as f32 + 0.5) / config.width as f32 * 2.0 - 1.0;
+                    let ny = 1.0 - (py as f32 + 0.5) / config.height as f32 * 2.0;
+                    let dir_view = Vec3::new(nx * half_w, ny * half_h, -1.0).normalize();
+                    view.basis * dir_view
+                }
+                CameraProjection::Equirectangular => equirectangular_dir(
+                    px as f32 + 0.5,
+                    py as f32 + 0.5,
+                    config.width,
+                    config.height,
+                    &view,
+                ),
+            };
+            let ray = Ray::new(view.origin, dir_world);
+            let aux = compute_first_hit_aux(scene, &ray);
+            let (a, nrm, d) = aux.to_triplet(dir_world);
+            // Safe to unwrap: we just inserted these above.
+            let albedo = buffer.albedo.as_mut().unwrap();
+            let normal = buffer.normal.as_mut().unwrap();
+            let depth = buffer.depth.as_mut().unwrap();
+            albedo[i] = [a[0] * scale, a[1] * scale, a[2] * scale];
+            normal[i] = [nrm[0] * scale, nrm[1] * scale, nrm[2] * scale];
+            depth[i] = d * scale;
+        }
+    }
+}
+
+/// Compute the first-hit aux features for a single primary ray. Used
+/// by [`fill_first_hit_aux`] and mirrors the bounce-0 aux capture
+/// logic inside [`trace_path`] so the standalone aux-only pass and the
+/// integrated radiance pass produce semantically-identical aux for the
+/// same primary ray.
+fn compute_first_hit_aux(scene: &PathTraceScene, ray: &Ray) -> FirstHitAux {
+    let Some(hit) = closest_hit(&scene.bvh, &scene.triangles, ray) else {
+        return FirstHitAux::Miss;
+    };
+    let tri = &scene.triangles[hit.prim_id as usize];
+    let shading = &scene.shading_data[hit.prim_id as usize];
+    let mat = scene.material_for(hit.prim_id);
+    let w = 1.0 - hit.u - hit.v;
+    let smooth = shading.n0 * w + shading.n1 * hit.u + shading.n2 * hit.v;
+    let n_shade = if smooth.length_squared() < 1e-8 {
+        crate::intersect::geom_normal(tri)
+    } else {
+        smooth.normalize()
+    };
+    let n = if n_shade.dot(-ray.dir) > 0.0 {
+        n_shade
+    } else {
+        -n_shade
+    };
+    FirstHitAux::Hit {
+        albedo: mat.base_color,
+        normal: n,
+        depth: hit.t,
+    }
+}
+
 fn render_inner(
     scene: &PathTraceScene,
     camera: &RenderCamera,

@@ -107,41 +107,7 @@ impl PanoramaPipeline {
             }
         }
 
-        let sky = scene_sky(scene);
-        let pt_scene = build_path_trace_scene(scene, &self.materials, sky);
-
-        // Force 2:1 aspect ratio so each pixel covers equal solid angle.
-        // Equirectangular panoramas REQUIRE width = 2 * height exactly,
-        // otherwise the bottom row covers a slightly different solid
-        // angle than the rest, breaking VR / 360° viewer conventions.
-        // Integer division on odd widths (e.g. 65) silently produces an
-        // off-by-one height (32, giving 65:32 = 2.03:1) so clamp width
-        // down to the nearest even value before deriving height. Stock
-        // presets ship even widths (1024, 2048, 4096), but a caller
-        // wiring a custom resolution_x should not be able to break the
-        // invariant.
-        let mut config =
-            path_trace_config_from_preset(&preset.config, CameraProjection::Equirectangular);
-        let width = (config.width.max(2)) & !1u32;
-        // height = width / 2 is now exact (no truncation).
-        let height = width / 2;
-        config.width = width;
-        config.height = height;
-
-        let start = Instant::now();
-        // Panorama / equirectangular path: aux feature buffers (albedo /
-        // normal / depth) are not currently used for denoising of
-        // panoramas because the equirectangular projection produces
-        // strong pole distortion that the bilateral kernel handles
-        // best with luminance-only filtering. If denoising of panoramas
-        // becomes critical, a future PR can opt this path into aux too.
-        let buffer = render_or_fallback(&pt_scene, camera, &config, None, cancel.clone(), false);
-        let elapsed = start.elapsed();
-        if let Some(token) = &cancel {
-            if token.is_cancelled() {
-                return Err(PanoramaError::Cancelled);
-            }
-        }
+        let (buffer, elapsed) = self.render_buffer(scene, preset, camera, cancel)?;
 
         let buf_width = buffer.width;
         let buf_height = buffer.height;
@@ -165,6 +131,79 @@ impl PanoramaPipeline {
             elapsed,
             denoised,
         })
+    }
+
+    /// Render the radiance + aux buffers for a panorama, without
+    /// encoding them to disk. Exposed at crate visibility so unit
+    /// tests can pin the aux-channel contract (i.e. that
+    /// `preset.config.denoise = true` actually produces an
+    /// aux-populated buffer) without going through the file-I/O path.
+    ///
+    /// Public callers should use [`Self::render_with_camera`] which
+    /// composes this with tone-mapping and PNG encoding.
+    pub(crate) fn render_buffer(
+        &self,
+        scene: &RenderScene,
+        preset: &RenderPreset,
+        camera: &RenderCamera,
+        cancel: Option<CancelToken>,
+    ) -> Result<(crate::path_trace::AccumulationBuffer, Duration), PanoramaError> {
+        let sky = scene_sky(scene);
+        let pt_scene = build_path_trace_scene(scene, &self.materials, sky);
+
+        // Force 2:1 aspect ratio so each pixel covers equal solid angle.
+        // Equirectangular panoramas REQUIRE width = 2 * height exactly,
+        // otherwise the bottom row covers a slightly different solid
+        // angle than the rest, breaking VR / 360° viewer conventions.
+        // Integer division on odd widths (e.g. 65) silently produces an
+        // off-by-one height (32, giving 65:32 = 2.03:1) so clamp width
+        // down to the nearest even value before deriving height. Stock
+        // presets ship even widths (1024, 2048, 4096), but a caller
+        // wiring a custom resolution_x should not be able to break the
+        // invariant.
+        let mut config =
+            path_trace_config_from_preset(&preset.config, CameraProjection::Equirectangular);
+        let width = (config.width.max(2)) & !1u32;
+        // height = width / 2 is now exact (no truncation).
+        let height = width / 2;
+        config.width = width;
+        config.height = height;
+
+        let start = Instant::now();
+        // Aux feature buffers (albedo / normal / depth) are gated on
+        // the preset's `denoise` flag — same contract as the flat /
+        // walkthrough paths via `scheduler::config_from_preset`. Wiring
+        // aux to a hardcoded `false` (the pre-PR-J-round-3 behavior)
+        // meant panorama presets that ship with `denoise = true` got
+        // luminance-only bilateral filtering even though the matched
+        // flat preset got feature-guided filtering — a silent
+        // quality regression vs. the rest of the render surface.
+        //
+        // Equirectangular pole distortion is sometimes cited as a
+        // reason to avoid aux on panoramas, but: (a) the aux signals
+        // themselves are world-space (albedo, world-normal, depth) and
+        // projection-invariant; (b) the bilateral kernel's spatial
+        // weight is already off near the poles regardless of aux, so
+        // adding aux can only *improve* the kernel's surface-vs-edge
+        // discrimination in the noisy pole regions; (c) at the
+        // equator a panorama pixel neighborhood is identical to a
+        // perspective pixel neighborhood, so aux is strictly more
+        // useful there. Defer to the preset, not the projection.
+        let buffer = render_or_fallback(
+            &pt_scene,
+            camera,
+            &config,
+            None,
+            cancel.clone(),
+            preset.config.denoise,
+        );
+        let elapsed = start.elapsed();
+        if let Some(token) = &cancel {
+            if token.is_cancelled() {
+                return Err(PanoramaError::Cancelled);
+            }
+        }
+        Ok((buffer, elapsed))
     }
 }
 
@@ -402,6 +441,68 @@ mod tests {
         assert_eq!(out.width, 64);
         assert_eq!(out.height, 32);
         assert_eq!(out.width, 2 * out.height);
+    }
+
+    /// Regression test pinning that a panorama preset with
+    /// `denoise = true` actually drives the renderer in
+    /// aux-capturing mode — i.e. the intermediate
+    /// [`crate::path_trace::AccumulationBuffer`] has all three aux
+    /// channels populated, not just allocated.
+    ///
+    /// Pre PR-J round-3, panorama hardcoded `capture_aux = false`,
+    /// which silently downgraded panorama denoising to luminance-only
+    /// bilateral filtering even when the preset asked for the
+    /// feature-guided kernel. That was a quality split between the
+    /// flat / walkthrough paths (which honoured the preset via
+    /// `scheduler::config_from_preset`) and the panorama path. This
+    /// test asserts the two sides now agree.
+    #[test]
+    fn panorama_with_denoise_true_produces_aux_populated_buffer() {
+        let scene = tiny_scene();
+        let mut preset = fast_preset();
+        preset.config.denoise = true;
+        // The aux signal needs at least one geometric hit to be
+        // non-degenerate; tiny_scene's floor at y = 0 ensures the
+        // bottom hemisphere of the panorama hits geometry.
+        let camera = scene.cameras[0].clone();
+        let pipeline = PanoramaPipeline::new();
+        let (buffer, _elapsed) = pipeline
+            .render_buffer(&scene, &preset, &camera, None)
+            .expect("render_buffer must succeed");
+        assert!(
+            buffer.has_aux(),
+            "panorama with denoise = true must produce a buffer with all aux channels"
+        );
+        let normals = buffer
+            .average_normal()
+            .expect("aux is populated; average_normal must succeed");
+        let any_nonzero = normals
+            .iter()
+            .any(|n| n[0].abs() > 1e-3 || n[1].abs() > 1e-3 || n[2].abs() > 1e-3);
+        assert!(
+            any_nonzero,
+            "aux normals must be populated by the first-hit pass, not just allocated to zero"
+        );
+    }
+
+    /// Inverse contract: `denoise = false` must NOT pay the aux
+    /// accumulation cost. This pins that the preset → capture_aux
+    /// wiring is symmetric — i.e. we didn't accidentally always
+    /// capture aux.
+    #[test]
+    fn panorama_with_denoise_false_produces_aux_less_buffer() {
+        let scene = tiny_scene();
+        let mut preset = fast_preset();
+        preset.config.denoise = false;
+        let camera = scene.cameras[0].clone();
+        let pipeline = PanoramaPipeline::new();
+        let (buffer, _elapsed) = pipeline
+            .render_buffer(&scene, &preset, &camera, None)
+            .expect("render_buffer must succeed");
+        assert!(
+            !buffer.has_aux(),
+            "panorama with denoise = false must NOT allocate aux channels"
+        );
     }
 
     #[test]
