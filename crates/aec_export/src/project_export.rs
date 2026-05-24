@@ -326,6 +326,15 @@ impl DeliverPackKind {
 /// Options for [`write_deliver_pack`]. Mirrors the renderer's
 /// `deliver.buildPack` request shape so the bridge call site can pass
 /// the JS params through verbatim.
+///
+/// **Default semantics asymmetry note**: `Default::default()` here
+/// gives all-`false` (standard Rust semantics — `bool::default()` is
+/// `false`). The JS-facing `deliver.buildPack` contract defaults
+/// omitted flags to `true` (see `apps/desktop/electron/bridge.ts`
+/// `?? true` and `crates/aec_bridge/src/napi_api.rs` `unwrap_or(true)`).
+/// Direct Rust callers wanting the JS-equivalent "include everything"
+/// behaviour should use [`DeliverPackOptions::all_enabled`] rather
+/// than `default()`.
 #[derive(Debug, Clone, Default)]
 pub struct DeliverPackOptions {
     pub include_renders: bool,
@@ -333,6 +342,25 @@ pub struct DeliverPackOptions {
     pub include_ifc: bool,
     pub include_boq: bool,
     pub include_proposal: bool,
+}
+
+impl DeliverPackOptions {
+    /// Returns an options struct with every `include_*` flag set to
+    /// `true`. This matches the JS-facing `deliver.buildPack` default
+    /// where omitted flags are treated as enabled.
+    ///
+    /// Use this rather than `DeliverPackOptions::default()` when a
+    /// Rust caller wants the "include everything" semantics that the
+    /// JS layer presents to renderer code.
+    pub fn all_enabled() -> Self {
+        Self {
+            include_renders: true,
+            include_sheets: true,
+            include_ifc: true,
+            include_boq: true,
+            include_proposal: true,
+        }
+    }
 }
 
 /// Returned by [`write_deliver_pack`].
@@ -829,6 +857,93 @@ mod tests {
         assert!(res.contents.contains(&"validation_report.pdf".to_string()));
         assert!(res.contents.contains(&"model/project.ifc".to_string()));
         assert!(res.contents.contains(&"sheets/A100.pdf".to_string()));
+    }
+
+    /// Pins the exact `write_deliver_pack` output ordering for the
+    /// "all flags enabled" path of all four kinds. The JS-side mirror
+    /// (`apps/desktop/electron/bridge.ts::packContents` + its vitest at
+    /// `apps/desktop/renderer/src/__tests__/export-in-process.test.ts`)
+    /// asserts the same sequences with `toEqual`. Together these two
+    /// tests pin the cross-language ordering parity that the renderer's
+    /// preview pane relies on (the synthetic JS preview must match the
+    /// real ZIP the native backend produces).
+    #[test]
+    fn write_deliver_pack_contents_ordering_matches_js_pack_contents() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let cases = [
+            (
+                DeliverPackKind::Concept,
+                "concept_all_flags.zip",
+                vec![
+                    "concept_pack.pdf".to_string(),
+                    "sheets/A100.pdf".to_string(),
+                    "renders/01_cover.png".to_string(),
+                    "manifest.json".to_string(),
+                ],
+            ),
+            (
+                DeliverPackKind::Interior,
+                "interior_all_flags.zip",
+                vec![
+                    "interior_summary.pdf".to_string(),
+                    "renders/01_living.png".to_string(),
+                    "renders/02_kitchen.png".to_string(),
+                    "schedules/materials.xlsx".to_string(),
+                    "manifest.json".to_string(),
+                ],
+            ),
+            (
+                DeliverPackKind::Contractor,
+                "contractor_all_flags.zip",
+                vec![
+                    "contractor_summary.pdf".to_string(),
+                    "sheets/A100.pdf".to_string(),
+                    "sheets/A101.pdf".to_string(),
+                    "schedules/materials.xlsx".to_string(),
+                    "schedules/boq.xlsx".to_string(),
+                    "model/project.ifc".to_string(),
+                    "proposal.pdf".to_string(),
+                    "manifest.json".to_string(),
+                ],
+            ),
+            (
+                DeliverPackKind::Bim,
+                "bim_all_flags.zip",
+                vec![
+                    "validation_report.pdf".to_string(),
+                    "sheets/A100.pdf".to_string(),
+                    "sheets/A101.pdf".to_string(),
+                    "model/project.ifc".to_string(),
+                    "manifest.json".to_string(),
+                ],
+            ),
+        ];
+
+        for (kind, filename, expected) in cases {
+            let out = dir.path().join(filename);
+            let res = write_deliver_pack(
+                &out,
+                kind,
+                &DeliverPackOptions::all_enabled(),
+                "Test Project",
+            )
+            .unwrap();
+            assert_eq!(
+                res.contents, expected,
+                "{kind:?} contents ordering must match JS packContents"
+            );
+        }
+    }
+
+    #[test]
+    fn deliver_pack_options_all_enabled_sets_every_flag() {
+        let opts = DeliverPackOptions::all_enabled();
+        assert!(opts.include_renders);
+        assert!(opts.include_sheets);
+        assert!(opts.include_ifc);
+        assert!(opts.include_boq);
+        assert!(opts.include_proposal);
     }
 
     #[test]

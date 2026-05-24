@@ -869,9 +869,7 @@ impl From<crate::service::DeliverPackResult> for DeliverBuildPackResultJs {
 /// parallel with the archive assembly.
 #[napi]
 pub fn deliver_build_pack(params: DeliverBuildPackParamsJs) -> Result<DeliverBuildPackResultJs> {
-    let project_name = params
-        .project_name
-        .unwrap_or_else(|| "Project".to_string());
+    let project_name = params.project_name.unwrap_or_else(|| "Project".to_string());
     let svc_params = crate::service::DeliverBuildPackParams {
         out_path: params.out_path,
         kind: params.kind,

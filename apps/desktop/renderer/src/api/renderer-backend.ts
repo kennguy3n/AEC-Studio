@@ -434,16 +434,22 @@ function deliverMock(newId: (prefix: string) => string) {
       // uses simplified inventory that diverges from packContents".
       // Same `?? true` defaults flow through `packContents`, so
       // omitted `include_*` flags match the native + electron
-      // behaviour automatically. `totalBytes` stays a synthetic
-      // function of the file count (4 KB per file) because the vitest
-      // fallback has no real bytes to measure — production replaces
-      // this whole call with `deliver_build_pack`'s real ZIP
-      // assembly.
+      // behaviour automatically. `totalBytes` is a synthetic function
+      // of the file count because the vitest fallback has no real
+      // bytes to measure — production replaces this whole call with
+      // `deliver_build_pack`'s real ZIP assembly.
+      //
+      // The formula `acc + 1024 + i * 256` is byte-identical to the
+      // electron in-process backend at `apps/desktop/electron/
+      // bridge.ts::inProcessBackend()::deliverBuildPack`. The shared
+      // shape lets a renderer regression test that covers both
+      // surfaces compare against the same synthetic number without
+      // branching on which backend is running.
       const contents = packContents(params);
       return {
         outPath: params.outPath,
         contents,
-        totalBytes: contents.length * 4096,
+        totalBytes: contents.reduce((acc, _name, i) => acc + 1024 + i * 256, 0),
       };
     },
   };

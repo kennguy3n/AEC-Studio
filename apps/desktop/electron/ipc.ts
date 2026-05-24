@@ -274,6 +274,10 @@ export function registerIpcHandlers(): void {
     return getBridge().deliverBuildPack({
       kind: p.kind as "concept" | "interior" | "contractor" | "bim",
       outPath: p.outPath,
+      // Forwarded so the native backend's PDF-summary label matches
+      // the renderer-supplied project name (otherwise napi defaults
+      // to the generic "Project" string).
+      projectName: typeof p.projectName === "string" ? p.projectName : undefined,
       includeRenders: typeof p.includeRenders === "boolean" ? p.includeRenders : undefined,
       includeSheets: typeof p.includeSheets === "boolean" ? p.includeSheets : undefined,
       includeIfc: typeof p.includeIfc === "boolean" ? p.includeIfc : undefined,
