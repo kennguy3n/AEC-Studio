@@ -184,9 +184,14 @@ export function rendererInProcessBackend(): AecApi {
       // in-process backend in `electron/bridge.ts` 1:1 (same field
       // names, same zero-finding payloads) so vitest sees the
       // exact same shape the real bridge would produce in dev
-      // mode. They intentionally do NOT touch the filesystem
-      // (unlike the electron-side stubs, which write a placeholder
-      // file) — the renderer runs in jsdom and has no `fs`.
+      // mode. Both the electron-side stubs (`bridge.ts:1272-1299`)
+      // and these renderer-side mocks intentionally do NOT touch
+      // the filesystem — they return zeroed-out, wire-format-
+      // compliant payloads so the renderer can exercise its
+      // status panes against synthetic `demo://project.ifc`
+      // paths that don't exist on disk. The actual IFC pipeline
+      // is exercised end-to-end by
+      // `crates/aec_bridge/tests/bim_readonly_ops.rs`.
       exportIfc: async (params) => ({
         sourcePath: params.sourcePath,
         outPath: params.outPath,

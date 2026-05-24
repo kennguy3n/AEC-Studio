@@ -931,7 +931,17 @@ impl From<crate::service::BimExportIfcSummary> for BimExportIfcSummaryJs {
 /// — both paths share `IfcWriter::to_string_with_materials`. The
 /// snapshot cache fronts repeated calls against the same source.
 ///
-/// Routes through `with_service_ref_fallible` (read-only).
+/// Routes through `with_service_ref_fallible` (the reader-side
+/// `RwLock` helper) because `BridgeService::bim_export_ifc` is
+/// `&self` — the only `BridgeService` state it touches is the
+/// snapshot cache via interior mutability. The function *does*
+/// write to `out_path` on disk (so it isn't pure read-only at
+/// the syscall layer), but that filesystem side effect is
+/// orthogonal to the `BridgeService` lock contract. Concurrent
+/// callers targeting the same `out_path` would race on the
+/// filesystem itself, not on any in-memory state guarded by the
+/// lock. See `with_service_ref_fallible` in `napi_api.rs:32`
+/// for the broader rationale.
 #[napi]
 pub fn bim_export_ifc(ifc_path: String, out_path: String) -> Result<BimExportIfcSummaryJs> {
     with_service_ref_fallible(|svc| svc.bim_export_ifc(&ifc_path, &out_path)).map(Into::into)
@@ -1148,7 +1158,16 @@ impl From<crate::service::BimScheduleSummary> for BimScheduleSummaryJs {
 /// in the snapshot cache (keyed on `(canonical_path, mtime,
 /// size)`).
 ///
-/// Routes through `with_service_ref_fallible` (read-only).
+/// Routes through `with_service_ref_fallible` (the reader-side
+/// `RwLock` helper) because `BridgeService::bim_generate_schedule`
+/// is `&self` — the only `BridgeService` state it touches is the
+/// snapshot cache via interior mutability. The function *does*
+/// write the XLSX bytes to `out_path` on disk (so it isn't pure
+/// read-only at the syscall layer), but that filesystem side
+/// effect is orthogonal to the `BridgeService` lock contract.
+/// Concurrent callers targeting the same `out_path` would race
+/// on the filesystem itself, not on any in-memory state guarded
+/// by the lock. Same caveat as `bim_export_ifc` above.
 #[napi]
 pub fn bim_generate_schedule(
     ifc_path: String,
