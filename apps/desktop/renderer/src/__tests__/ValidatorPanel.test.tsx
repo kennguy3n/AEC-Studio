@@ -82,7 +82,9 @@ describe("ValidatorPanel", () => {
     );
     fireEvent.click(screen.getByTestId("validator-revalidate"));
     await waitFor(() => expect(onFindings).toHaveBeenCalled());
-    // The default in-process backend returns `{ ok: true, errors: [], warnings: [] }`.
+    // The default in-process backend returns
+    // `{ ok: true, sourcePath, schema: "IFC4", errors: [], warnings: [], infos: [], parseCacheHit: false }`,
+    // which `bimReportToFindings` flattens to an empty `ValidationFinding[]`.
     expect(onFindings).toHaveBeenCalledWith([]);
   });
 });

@@ -1764,12 +1764,23 @@ impl BridgeService {
     /// level diff: added GUIDs, removed GUIDs, modified elements
     /// (class changes, name changes, property deltas).
     ///
-    /// `diff_id` is *input*-addressed: BLAKE3 hash of the canonical
-    /// (before, after) path pair — **not** the file bytes. Same
-    /// inputs → same id even if the files change, so the renderer
-    /// can dedup repeated diffs and cache rendered views.
-    /// Content-aware invalidation happens one layer down in the
-    /// snapshot cache (keyed on `(canonical_path, mtime, size)`).
+    /// `diff_id` is **input-addressed**, not content-addressed:
+    /// BLAKE3 hash of `(canonical_before, canonical_after)`. Same
+    /// path pair → same id, *regardless of whether the file bytes at
+    /// those paths changed between calls*. This is intentional and
+    /// matches the design contract that callers use for deduping
+    /// repeated diff invocations with the same arguments (the
+    /// renderer's primary use case: don't re-run the diff when the
+    /// user re-clicks "Diff" against the same pair). Content-aware
+    /// invalidation lives in the snapshot cache one layer down,
+    /// which keys on `(canonical_path, mtime, size)`; if the file's
+    /// mtime/size changes the parse re-runs and the returned `added`
+    /// / `removed` / `modified` arrays reflect the new content, even
+    /// though `diff_id` stays stable. Renderer-side view caches that
+    /// memoise off `diff_id` should be either (a) keyed jointly with
+    /// `(before_cache_hit, after_cache_hit)` if they need to react
+    /// to re-parses, or (b) cleared on file-watcher events for the
+    /// inputs.
     ///
     /// Routes through `with_service_ref_fallible` (read-only). Both
     /// parses can hit the snapshot cache independently, so a diff
@@ -1816,9 +1827,11 @@ impl BridgeService {
                     .collect(),
             })
             .collect();
-        // Content-addressed id: hash of (canonical before, canonical
-        // after). Stable across calls so the renderer can cache
-        // rendered diff views without server round-trips.
+        // Input-addressed id: hash of (canonical before, canonical
+        // after). Stable across calls so the renderer can dedup
+        // repeated diff invocations with the same path pair. See
+        // the doc comment above for the content-vs-input addressing
+        // contract.
         let mut hasher = blake3::Hasher::new();
         hasher.update(canonical_before.as_bytes());
         hasher.update(b"\0");
@@ -1843,11 +1856,17 @@ impl BridgeService {
     /// writing the result to `out_path` as an XLSX workbook via
     /// `ScheduleSheet::write_xlsx`.
     ///
-    /// `schedule_id` is *input*-addressed: BLAKE3 hash of `(kind,
-    /// canonical source path)` — **not** the file bytes. Same
-    /// inputs → same id even if the source file changes. Content-
-    /// aware invalidation happens one layer down in the snapshot
-    /// cache (keyed on `(canonical_path, mtime, size)`).
+    /// `schedule_id` is **input-addressed**, not content-addressed:
+    /// BLAKE3 hash of `(kind, canonical_source_path)`. Same kind +
+    /// same source path → same id, *regardless of whether the file
+    /// bytes at that path changed between calls*, and regardless of
+    /// the `out_path` (so renderer caches dedup the schedule *data*,
+    /// not the workbook file location). This mirrors `bim_diff`'s
+    /// id contract — see that method's doc comment for the rationale.
+    /// Renderer-side caches keyed off `schedule_id` that need to
+    /// react to source-file edits should either include
+    /// `parse_cache_hit` in their cache key or invalidate on a file-
+    /// watcher signal for `source_path`.
     ///
     /// Routes through `with_service_ref_fallible` (read-only). The
     /// IFC parse is snapshot-cache fronted; the schedule generators
