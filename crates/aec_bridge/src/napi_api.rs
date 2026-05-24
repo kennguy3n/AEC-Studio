@@ -871,7 +871,6 @@ impl From<crate::service::DeliverPackResult> for DeliverBuildPackResultJs {
 pub fn deliver_build_pack(params: DeliverBuildPackParamsJs) -> Result<DeliverBuildPackResultJs> {
     let project_name = params
         .project_name
-        .clone()
         .unwrap_or_else(|| "Project".to_string());
     let svc_params = crate::service::DeliverBuildPackParams {
         out_path: params.out_path,
@@ -891,7 +890,11 @@ pub fn deliver_build_pack(params: DeliverBuildPackParamsJs) -> Result<DeliverBui
             include_proposal: params.include_proposal.unwrap_or(true),
         },
     };
-    with_service_ref_fallible(|svc| svc.deliver_build_pack(svc_params.clone())).map(Into::into)
+    // `with_service_ref_fallible` takes `FnOnce` (see helper declaration
+    // ~600 LoC above) so the closure can consume `svc_params` directly
+    // via `move` — no `.clone()` needed. Saves a `DeliverBuildPackParams`
+    // copy per call. Flagged in PR-S round 2 ANALYSIS_0003.
+    with_service_ref_fallible(move |svc| svc.deliver_build_pack(svc_params)).map(Into::into)
 }
 
 /// JS-facing CPU descriptor. Mirrors `RuntimeStatus["cpu"]` in

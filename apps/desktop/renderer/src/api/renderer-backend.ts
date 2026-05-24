@@ -15,6 +15,7 @@ import {
   diffRevisionsInProcess,
   ensureInProcessGraph,
   inProcessParsedForTool,
+  packContents,
   type Command,
   type CommandScope,
   type EntityRecord,
@@ -274,22 +275,35 @@ export function rendererInProcessBackend(): AecApi {
       // (`exportPdf`) is pinned at `2` to match
       // `aec_export::write_project_pdf` (1 cover + 1 overview); the
       // electron-side in-process fallback uses the same value.
-      exportPdf: async (params) => ({
-        outPath: requireStringField(params, "exportPdf", "outPath"),
-        pages: 2,
-      }),
-      exportDxf: async (params) => ({
-        outPath: requireStringField(params, "exportDxf", "outPath"),
-      }),
-      exportIfc: async (params) => ({
-        outPath: requireStringField(params, "exportIfc", "outPath"),
-      }),
-      exportGltf: async (params) => ({
-        outPath: requireStringField(params, "exportGltf", "outPath"),
-      }),
-      buildProposalPack: async (params) => ({
-        outPath: requireStringField(params, "buildProposalPack", "outPath"),
-      }),
+      exportPdf: async (params) => {
+        const outPath = requireStringField(params, "exportPdf", "outPath");
+        requireStringField(params, "exportPdf", "projectName");
+        return { outPath, pages: 2 };
+      },
+      exportDxf: async (params) => {
+        const outPath = requireStringField(params, "exportDxf", "outPath");
+        requireStringField(params, "exportDxf", "projectName");
+        return { outPath };
+      },
+      exportIfc: async (params) => {
+        const outPath = requireStringField(params, "exportIfc", "outPath");
+        requireStringField(params, "exportIfc", "projectName");
+        return { outPath };
+      },
+      exportGltf: async (params) => {
+        const outPath = requireStringField(params, "exportGltf", "outPath");
+        requireStringField(params, "exportGltf", "projectName");
+        return { outPath };
+      },
+      buildProposalPack: async (params) => {
+        const outPath = requireStringField(
+          params,
+          "buildProposalPack",
+          "outPath",
+        );
+        requireStringField(params, "buildProposalPack", "projectName");
+        return { outPath };
+      },
     },
     deliver: deliverMock(newId),
     command: commandMock(),
@@ -411,24 +425,21 @@ function deliverMock(newId: (prefix: string) => string) {
       includeProposal?: boolean;
       region?: "eu" | "na" | "apac";
     }): Promise<{ outPath: string; contents: string[]; totalBytes: number }> {
-      const contents: string[] = [];
-      if (params.kind === "concept") {
-        contents.push("concept_pack.pdf", "manifest.json");
-      } else if (params.kind === "interior") {
-        contents.push(
-          "interior_summary.pdf",
-          "schedules/materials.xlsx",
-          "manifest.json",
-        );
-      } else if (params.kind === "contractor") {
-        contents.push("sheets/A100.pdf", "schedules/boq.xlsx", "manifest.json");
-      } else {
-        contents.push(
-          "model/project.ifc",
-          "validation_report.pdf",
-          "manifest.json",
-        );
-      }
+      // Reuse the same `packContents` builder the electron in-process
+      // backend uses (and which itself pins the inventory shape to the
+      // native Rust `aec_export::write_deliver_pack`). Without this,
+      // the renderer's vitest fixture returned a simpler 2–3-file
+      // inventory while production produced the full per-kind list —
+      // flagged in PR-S round 2 "deliverMock in renderer-backend.ts
+      // uses simplified inventory that diverges from packContents".
+      // Same `?? true` defaults flow through `packContents`, so
+      // omitted `include_*` flags match the native + electron
+      // behaviour automatically. `totalBytes` stays a synthetic
+      // function of the file count (4 KB per file) because the vitest
+      // fallback has no real bytes to measure — production replaces
+      // this whole call with `deliver_build_pack`'s real ZIP
+      // assembly.
+      const contents = packContents(params);
       return {
         outPath: params.outPath,
         contents,

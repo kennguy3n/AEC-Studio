@@ -4,6 +4,7 @@ import {
   NATIVE_WIRED_METHODS,
   inProcessBackend,
 } from "../../../electron/bridge";
+import { rendererInProcessBackend } from "../api/renderer-backend";
 
 /**
  * PR-S pins the export.* + deliver.* IPC surface against the
@@ -191,5 +192,95 @@ describe("bridge in-process export methods", () => {
       "model/project.ifc",
       "manifest.json",
     ]);
+  });
+});
+
+/**
+ * Mirror of the above pin set, but against the renderer-side vitest
+ * fallback (`rendererInProcessBackend` in
+ * `apps/desktop/renderer/src/api/renderer-backend.ts`). The two
+ * backends are different objects with separate code paths but must
+ * be observable as identical to a renderer test — otherwise the
+ * "in-process backend mirrors the native napi struct contract" claim
+ * the bridge module makes is only true on one of the two surfaces.
+ *
+ * Pinned here in PR-S round 2 after Devin Review caught the gap:
+ * the renderer fallback only checked `outPath`, silently passed
+ * calls missing `projectName`, and used a simplified `deliverMock`
+ * inventory that diverged from `packContents`. Both surfaces now
+ * share the same `packContents` builder and the same
+ * `requireStringField` strictness.
+ */
+describe("renderer-backend in-process export methods", () => {
+  it("exportPdf rejects missing outPath + projectName (same error shape as electron-side)", async () => {
+    const b = rendererInProcessBackend();
+    await expect(b.export.exportPdf({})).rejects.toThrow(
+      /exportPdf: missing required string field 'outPath'/,
+    );
+    await expect(
+      b.export.exportPdf({ outPath: "/tmp/a.pdf" }),
+    ).rejects.toThrow(
+      /exportPdf: missing required string field 'projectName'/,
+    );
+  });
+
+  it("exportDxf / exportIfc / exportGltf / buildProposalPack also reject missing projectName", async () => {
+    const b = rendererInProcessBackend();
+    await expect(
+      b.export.exportDxf({ outPath: "/tmp/a.dxf" }),
+    ).rejects.toThrow(
+      /exportDxf: missing required string field 'projectName'/,
+    );
+    await expect(
+      b.export.exportIfc({ outPath: "/tmp/a.ifc" }),
+    ).rejects.toThrow(
+      /exportIfc: missing required string field 'projectName'/,
+    );
+    await expect(
+      b.export.exportGltf({ outPath: "/tmp/a.gltf" }),
+    ).rejects.toThrow(
+      /exportGltf: missing required string field 'projectName'/,
+    );
+    await expect(
+      b.export.buildProposalPack({ outPath: "/tmp/p.pdf" }),
+    ).rejects.toThrow(
+      /buildProposalPack: missing required string field 'projectName'/,
+    );
+  });
+
+  it("exportPdf with both fields returns the same shape (outPath + pages=2) as electron-side", async () => {
+    const b = rendererInProcessBackend();
+    const r = await b.export.exportPdf({
+      outPath: "/tmp/my-project.pdf",
+      projectName: "My Project",
+    });
+    expect(r.outPath).toBe("/tmp/my-project.pdf");
+    expect(r.pages).toBe(2);
+  });
+
+  it("deliver.buildPack produces the same per-kind inventory as electron-side packContents", async () => {
+    // The two in-process backends must agree on `contents` so a
+    // renderer test asserting on the file list works under both the
+    // electron host (electron-side `inProcessBackend`) and pure
+    // vitest (`rendererInProcessBackend`). Drift surfaces here as a
+    // hard-coded mismatch — pinned across all four kinds.
+    const a = inProcessBackend();
+    const b = rendererInProcessBackend();
+    for (const kind of [
+      "concept",
+      "interior",
+      "contractor",
+      "bim",
+    ] as const) {
+      const fromElectron = await a.deliverBuildPack({
+        kind,
+        outPath: `/tmp/${kind}-pack.zip`,
+      });
+      const fromRenderer = await b.deliver.buildPack({
+        kind,
+        outPath: `/tmp/${kind}-pack.zip`,
+      });
+      expect(fromRenderer.contents).toEqual(fromElectron.contents);
+    }
   });
 });

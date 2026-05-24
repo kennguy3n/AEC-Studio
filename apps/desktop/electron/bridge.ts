@@ -2208,7 +2208,17 @@ export function diffRevisionsInProcess(
  * matching the native side's `unwrap_or(true)` in the napi binding —
  * see `crates/aec_bridge/src/napi_api.rs` `deliver_build_pack`.
  */
-function packContents(params: {
+// Exported so the renderer-side vitest fallback in
+// `apps/desktop/renderer/src/api/renderer-backend.ts` can reuse the
+// same inventory builder for its `deliver.buildPack` mock. Pre-PR-S
+// the two surfaces drifted (renderer mock returned 1–3 file stubs,
+// electron in-process returned the full per-kind inventory) which
+// meant renderer tests that asserted on `deliver.buildPack`'s
+// `contents` array would have passed against the simpler shape and
+// then failed in production where the native + electron-in-process
+// inventories are the real shape. Pinning the export here closes the
+// drift surface.
+export function packContents(params: {
   kind: "concept" | "interior" | "contractor" | "bim";
   includeRenders?: boolean;
   includeSheets?: boolean;
