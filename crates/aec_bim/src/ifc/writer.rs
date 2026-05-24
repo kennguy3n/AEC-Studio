@@ -943,9 +943,53 @@ struct LayerSetUsageKey {
 impl LayerSetUsageKey {
     /// Recover the usage metadata from `properties.entry(entity)`'s
     /// `AEC_LayerSetUsage` synthetic Pset, if present. Returns
-    /// `None` when the element has no such Pset or the Pset is
-    /// empty (i.e. all three fields are missing) — in either case
-    /// the writer falls back to a direct `IfcMaterialLayerSet` ref.
+    /// `None` (writer falls back to a direct `IfcMaterialLayerSet`
+    /// ref) when EITHER:
+    ///   * the element has no `AEC_LayerSetUsage` Pset at all, OR
+    ///   * the Pset is present but ANY of the three fields
+    ///     (`LayerSetDirection`, `DirectionSense`,
+    ///     `OffsetFromReferenceLine`) is missing.
+    ///
+    /// The all-three-or-none guard is load-bearing for IFC4 schema
+    /// conformance: `IfcMaterialLayerSetUsage`'s three orientation
+    /// fields are all declared MANDATORY (no `OPTIONAL` keyword in
+    /// the EXPRESS schema), so emitting `$` for any of them produces
+    /// a structurally invalid STEP entity that mvdXML conformance
+    /// checkers (Solibri, BIMcollab) flag as a schema violation.
+    /// Defective sources occasionally drop one or two of the three
+    /// fields (an ArchiCAD bug that has been reported in IFC2X3
+    /// exports for years emits `IfcMaterialLayerSetUsage(#5,.AXIS2.,$,$)`
+    /// when the wall has no offset configured). On import we capture
+    /// whatever the source provided — the reader populates the
+    /// synthetic Pset with whichever subset is present, preserving
+    /// the partial information for forensic inspection — but on
+    /// EXPORT we either round-trip the whole wrapper correctly or
+    /// drop it entirely. Producing a half-populated wrapper on
+    /// export would WORSEN the input file's quality (we'd take a
+    /// defective IFC and produce another defective IFC, but now
+    /// claiming it came through AEC Studio's writer).
+    ///
+    /// The partial Pset stays in the IN-MEMORY project graph for as
+    /// long as the snapshot is held, so a downstream consumer that
+    /// reads from `PropertyStore` directly still sees it. It is
+    /// however NOT round-tripped through STEP: the synthetic Pset
+    /// is reader-only (it's reconstructed from an
+    /// `IfcMaterialLayerSetUsage` STEP entity on import and never
+    /// emitted as a real `IfcPropertySet` — see
+    /// `material_layer_set_usage_metadata_round_trips_via_synthetic_pset`
+    /// in `tests/ifc_materials_roundtrip.rs`), so dropping the
+    /// wrapper means the partial fields don't survive an
+    /// export→reimport cycle. This trade-off is preferable to
+    /// emitting `$` for mandatory fields because the alternative
+    /// would mean every AEC Studio export silently propagates the
+    /// original defect under our writer's signature (with all the
+    /// schema-validator failures and downstream-tool incompatibilities
+    /// that implies).
+    ///
+    /// If a future use case calls for round-tripping partial
+    /// metadata bit-for-bit, this is the place to relax — add a
+    /// `strict_schema: bool` knob and gate the guard on it, rather
+    /// than silently producing schema-invalid output by default.
     fn from_property_store(
         properties: &PropertyStore,
         entity: &EntityId,
@@ -955,23 +999,20 @@ impl LayerSetUsageKey {
         let direction = pset
             .properties
             .get(AEC_LAYER_SET_USAGE_KEY_DIRECTION)
-            .and_then(label_value);
+            .and_then(label_value)?;
         let sense = pset
             .properties
             .get(AEC_LAYER_SET_USAGE_KEY_SENSE)
-            .and_then(label_value);
+            .and_then(label_value)?;
         let offset_bits = pset
             .properties
             .get(AEC_LAYER_SET_USAGE_KEY_OFFSET)
             .and_then(length_value)
-            .map(f64::to_bits);
-        if direction.is_none() && sense.is_none() && offset_bits.is_none() {
-            return None;
-        }
+            .map(f64::to_bits)?;
         Some(LayerSetUsageKey {
-            direction,
-            sense,
-            offset_bits,
+            direction: Some(direction),
+            sense: Some(sense),
+            offset_bits: Some(offset_bits),
         })
     }
 

@@ -194,6 +194,24 @@ pub(crate) fn attach_snapshot(
     // more predictable insertion order that makes test assertions
     // easier to reason about, and matches the order
     // `nodes_of_class()` produces for the renderer-side preview.
+    //
+    // While walking, accumulate every entity that took the `Unchanged`
+    // dedup branch in `upsert_entity` into `unchanged_entities`. Those
+    // entities had matching `geom_hash + pset_hash + class_hash` in
+    // `bim_cache`, which means their `entities.body` JSON AND every
+    // per-entity component (Pset/Qto/material) is bit-identical to the
+    // on-disk state. The components wipe-and-rewrite is a no-op for
+    // them — wiping just to re-insert identical rows is pure overhead.
+    // On a 12 000-element MEP federation re-attached unchanged, that's
+    // ~40 000+ DELETE/INSERT pairs (Psets+Qtos+materials per element)
+    // of pure churn against a SQLCipher-encrypted page cache.
+    //
+    // The component-wipe block below uses this set to skip both the
+    // DELETE loop and the `write_psets`/`write_materials` re-insert
+    // for Unchanged entities, keeping the SQL contract sound: a row's
+    // hash on disk is the hash of the components currently on disk
+    // for that row, and we only touch components when the hash differs.
+    let mut unchanged_entities: HashSet<EntityId> = HashSet::new();
     let bfs_order = spatial_bfs(&snapshot.project);
     for (parent_id, node_id) in &bfs_order {
         let Some(node) = snapshot.project.get(node_id) else {
@@ -249,7 +267,10 @@ pub(crate) fn attach_snapshot(
         match outcome {
             UpsertOutcome::Inserted => counts.spatial_nodes_inserted += 1,
             UpsertOutcome::Updated => counts.spatial_nodes_updated += 1,
-            UpsertOutcome::Unchanged => counts.spatial_nodes_unchanged += 1,
+            UpsertOutcome::Unchanged => {
+                counts.spatial_nodes_unchanged += 1;
+                unchanged_entities.insert(node_id.clone());
+            }
         }
         counts.cache_rows += 1;
     }
@@ -324,7 +345,10 @@ pub(crate) fn attach_snapshot(
             match outcome {
                 UpsertOutcome::Inserted => counts.elements_inserted += 1,
                 UpsertOutcome::Updated => counts.elements_updated += 1,
-                UpsertOutcome::Unchanged => counts.elements_unchanged += 1,
+                UpsertOutcome::Unchanged => {
+                    counts.elements_unchanged += 1;
+                    unchanged_entities.insert(element_id.clone());
+                }
             }
             counts.cache_rows += 1;
 
@@ -410,6 +434,20 @@ pub(crate) fn attach_snapshot(
     // attach. Wiping them here keeps the SQL contract sound
     // regardless of how the reader's property and material graphs
     // evolve.
+    //
+    // Then SUBTRACT `unchanged_entities`: those took the dedup
+    // `Unchanged` branch in `upsert_entity`, which means their
+    // `pset_hash` already matched the on-disk hash, which in turn
+    // means the JSON of their Psets / Qtos / material assignment
+    // serialises identically to the components currently on disk.
+    // Wiping + re-inserting would be a pure no-op against the SQL
+    // page cache. The pset_hash composition (see `upsert_entity`'s
+    // `pset_input` block) folds in BOTH the `PropertyStore` entry
+    // AND the `MaterialStore` assignment, so an `Unchanged`
+    // classification truly covers every per-entity component bucket
+    // we wipe-and-rewrite below — there's no third bucket of
+    // components-not-covered-by-pset_hash that could go stale by
+    // skipping the wipe.
     let mut touched_entities: HashSet<EntityId> = HashSet::new();
     for (_, id) in &bfs_order {
         touched_entities.insert(id.clone());
@@ -418,14 +456,17 @@ pub(crate) fn attach_snapshot(
     touched_entities.extend(snapshot.properties.iter().map(|(id, _)| id.clone()));
     touched_entities.extend(snapshot.materials.assignments().map(|(id, _)| id.clone()));
     for entity_id in &touched_entities {
+        if unchanged_entities.contains(entity_id) {
+            continue;
+        }
         tx.execute(
             "DELETE FROM components WHERE entity_id = ?1 AND kind LIKE 'bim/%'",
             params![entity_id.as_str()],
         )?;
     }
 
-    counts.components_inserted += write_psets(tx, &snapshot.properties)?;
-    counts.components_inserted += write_materials(tx, &snapshot.materials)?;
+    counts.components_inserted += write_psets(tx, &snapshot.properties, &unchanged_entities)?;
+    counts.components_inserted += write_materials(tx, &snapshot.materials, &unchanged_entities)?;
 
     Ok(counts)
 }
@@ -666,12 +707,25 @@ fn upsert_entity(
 
 /// Walk the `PropertyStore` and emit one `bim/pset/*` or `bim/qset/*`
 /// row per Pset / Qset on each entity. Returns the total row count.
+///
+/// Skips any entity in `unchanged_entities`: those took the dedup
+/// `Unchanged` branch in [`upsert_entity`], so their on-disk
+/// components already match the snapshot's serialisation and the
+/// component wipe loop above also skipped them. Re-inserting would
+/// produce a primary-key conflict on `components.id` anyway because
+/// `insert_component`'s deterministic `{entity_id}/{kind}` id collides
+/// with the row already on disk; skipping is both faster AND a
+/// correctness guard.
 fn write_psets(
     tx: &Transaction<'_>,
     properties: &PropertyStore,
+    unchanged_entities: &HashSet<EntityId>,
 ) -> Result<u64, BridgeServiceError> {
     let mut written = 0u64;
     for (entity_id, props) in properties.iter() {
+        if unchanged_entities.contains(entity_id) {
+            continue;
+        }
         for (name, pset) in &props.psets {
             let body = BimPropertyComponent {
                 set_name: name.clone(),
@@ -726,12 +780,22 @@ fn write_psets(
 
 /// Walk the `MaterialStore` and emit one `bim/material_assignment`
 /// row per element binding.
+///
+/// Skips any entity in `unchanged_entities` for the same reason as
+/// [`write_psets`]: an `Unchanged` entity's `pset_hash` already
+/// covers the material assignment (see `upsert_entity`'s `pset_input`
+/// composition), so the on-disk row matches and re-inserting would
+/// PK-conflict.
 fn write_materials(
     tx: &Transaction<'_>,
     materials: &MaterialStore,
+    unchanged_entities: &HashSet<EntityId>,
 ) -> Result<u64, BridgeServiceError> {
     let mut written = 0u64;
     for (entity_id, assignment) in materials.assignments() {
+        if unchanged_entities.contains(entity_id) {
+            continue;
+        }
         let body = match assignment {
             aec_bim::MaterialAssignment::Single(name) => BimMaterialComponent {
                 kind: "material",

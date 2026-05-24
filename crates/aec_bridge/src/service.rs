@@ -1412,6 +1412,189 @@ END-ISO-10303-21;\n";
     }
 
     #[test]
+    fn bim_attach_ifc_skips_component_rewrite_on_unchanged_reattach() {
+        // Regression for Devin Review (web-UI flag, post-PR-L):
+        // `Unchanged` entities used to still get their `bim/%`
+        // components DELETEd and re-INSERTed on every re-attach,
+        // even though `bim_cache.pset_hash` matched (which means
+        // the components on disk were already byte-identical to the
+        // snapshot). For a 12 000-element MEP federation that's
+        // ~40 000+ no-op DELETE/INSERT pairs per re-attach against
+        // a SQLCipher-encrypted page cache.
+        //
+        // After the fix: `bim_attach_ifc` tracks every entity that
+        // took the `Unchanged` branch in `upsert_entity` and skips
+        // both the component-wipe loop and the
+        // `write_psets`/`write_materials` re-insert for those
+        // entities. The summary reflects this:
+        // `components_inserted == 0` on an all-unchanged re-attach.
+        //
+        // We assert TWO things:
+        //   1. `BimAttachSummary.components_inserted == 0` on the
+        //      second attach (no churn).
+        //   2. The components ARE still on disk afterwards (the
+        //      skip didn't accidentally remove them). Use a raw
+        //      `SELECT COUNT(*)` against the project DB so the test
+        //      sees the SQL contract directly, not just the summary.
+        //
+        // Fixture: write a real IFC via `IfcWriter` carrying a wall
+        // with a `Pset_WallCommon` property set. That ensures the
+        // first attach actually writes components (the minimal
+        // project-only `fixture_ifc_body` doesn't, so the skip-loop
+        // becomes a no-op on it for trivial reasons rather than
+        // exercising the post-fix branch).
+        use aec_bim::classification::ClassificationStore;
+        use aec_bim::ifc::IfcWriter;
+        use aec_bim::properties::{PropertySet, PropertyStore, PropertyValue};
+        use aec_bim::spatial::Project;
+        use aec_bim::IfcClass;
+
+        let (mut s, _g) = service();
+        let project = s
+            .project_create_from_template("interior.apartment", "SkipUnchanged")
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let ifc_path = tmp.path().join("skip-unchanged.ifc");
+
+        // Build a deterministic Project graph: Project → Site →
+        // Building → Storey → Wall, with a `Pset_WallCommon` on
+        // the wall so `bim_attach` writes at least one
+        // `bim/pset/Pset_WallCommon` component on the first pass.
+        let project_id = aec_core::types::EntityId::from_guid_seed("00000000000000000000a1");
+        let site_id = aec_core::types::EntityId::from_guid_seed("00000000000000000000a2");
+        let building_id = aec_core::types::EntityId::from_guid_seed("00000000000000000000a3");
+        let storey_id = aec_core::types::EntityId::from_guid_seed("00000000000000000000a4");
+        let wall_id =
+            aec_core::types::EntityId::from_string("ent_aabbccddeeff00112233445566778899").unwrap();
+
+        let mut project_graph = Project {
+            root: project_id.clone(),
+            nodes: std::collections::HashMap::new(),
+        };
+        project_graph.nodes.insert(
+            project_id.clone(),
+            aec_bim::spatial::SpatialNode {
+                id: project_id.clone(),
+                ifc_guid: Some("00000000000000000000a1".into()),
+                class: IfcClass::IfcProject,
+                name: "P".into(),
+                children: vec![site_id.clone()],
+                elements: Vec::new(),
+            },
+        );
+        project_graph.nodes.insert(
+            site_id.clone(),
+            aec_bim::spatial::SpatialNode {
+                id: site_id.clone(),
+                ifc_guid: Some("00000000000000000000a2".into()),
+                class: IfcClass::IfcSite,
+                name: "S".into(),
+                children: vec![building_id.clone()],
+                elements: Vec::new(),
+            },
+        );
+        project_graph.nodes.insert(
+            building_id.clone(),
+            aec_bim::spatial::SpatialNode {
+                id: building_id.clone(),
+                ifc_guid: Some("00000000000000000000a3".into()),
+                class: IfcClass::IfcBuilding,
+                name: "B".into(),
+                children: vec![storey_id.clone()],
+                elements: Vec::new(),
+            },
+        );
+        project_graph.nodes.insert(
+            storey_id.clone(),
+            aec_bim::spatial::SpatialNode {
+                id: storey_id.clone(),
+                ifc_guid: Some("00000000000000000000a4".into()),
+                class: IfcClass::IfcBuildingStorey,
+                name: "L1".into(),
+                children: Vec::new(),
+                elements: vec![wall_id.clone()],
+            },
+        );
+        let mut classification = ClassificationStore::new();
+        classification.assign_manual(wall_id.clone(), IfcClass::IfcWall);
+        let mut properties = PropertyStore::default();
+        let mut pset = PropertySet::new("Pset_WallCommon");
+        pset.set("LoadBearing", PropertyValue::Boolean(true));
+        pset.set("IsExternal", PropertyValue::Boolean(false));
+        properties.entry(wall_id.clone()).upsert_pset(pset);
+        let step = IfcWriter::to_string(&project_graph, &classification, &properties);
+        std::fs::write(&ifc_path, &step).unwrap();
+
+        let first = s
+            .bim_attach_ifc(&project.path, ifc_path.to_str().unwrap())
+            .unwrap();
+        assert!(
+            first.components_inserted > 0,
+            "first attach must write at least one component row (the wall's Pset_WallCommon); \
+             got {}",
+            first.components_inserted
+        );
+
+        // Snapshot the BIM-component row count after the first
+        // attach so we can assert the second attach didn't change it.
+        let first_components: i64 = {
+            let pkg = aec_core::package::ProjectPackage::open_with_master_key(
+                std::path::Path::new(&project.path),
+                &[42u8; 32],
+            )
+            .unwrap();
+            let conn = pkg.open_database(&[42u8; 32]).unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM components WHERE kind LIKE 'bim/%'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+
+        let second = s
+            .bim_attach_ifc(&project.path, ifc_path.to_str().unwrap())
+            .unwrap();
+
+        assert_eq!(
+            second.components_inserted, 0,
+            "all-unchanged re-attach must not re-insert any components (post-fix); the prior \
+             behaviour wiped+re-inserted every Pset/material on every re-attach"
+        );
+        // Every spatial node from pass 1 (Project, Site, Building,
+        // Storey) plus the wall element should classify as Unchanged.
+        assert_eq!(
+            second.spatial_nodes_unchanged, first.spatial_nodes_inserted,
+            "every spatial node must be classified as Unchanged on a no-op re-attach"
+        );
+        assert_eq!(
+            second.elements_unchanged, first.elements_inserted,
+            "every element must be classified as Unchanged on a no-op re-attach"
+        );
+
+        // Verify the components ARE still on disk (skip didn't drop
+        // them). Same count, same kind set.
+        let second_components: i64 = {
+            let pkg = aec_core::package::ProjectPackage::open_with_master_key(
+                std::path::Path::new(&project.path),
+                &[42u8; 32],
+            )
+            .unwrap();
+            let conn = pkg.open_database(&[42u8; 32]).unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM components WHERE kind LIKE 'bim/%'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            first_components, second_components,
+            "skipping the wipe must leave the component rows on disk"
+        );
+    }
+
+    #[test]
     fn bim_attach_ifc_hits_snapshot_cache_after_import() {
         // The whole point of the snapshot cache is to avoid a
         // re-parse on the import → attach handoff. Verify the
