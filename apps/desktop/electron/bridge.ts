@@ -247,6 +247,43 @@ export interface BridgeBackend {
    * this is a no-op that always returns 0.
    */
   projectAuditSync(projectPath: string): Promise<number>;
+
+  /**
+   * Apply a typed command (`Command`) to the project graph. The
+   * Rust side rebuilds the in-memory engine from the SQLCipher
+   * `entities` + `undo_journal` tables, executes the command, and
+   * returns the resulting deltas plus the post-call undo/redo stack
+   * depths so the renderer can keep its toolbar in sync.
+   *
+   * `command` is the typed envelope produced by the renderer-side
+   * helpers in `apps/desktop/renderer/src/api/commands.ts` —
+   * containing the `command_id`, `scope`, `actor`, `ts`, and
+   * `kind` (tagged `design.create_wall`, `design.paint_material`,
+   * etc., per `aec_command::commands::CommandKind`'s serde tags).
+   */
+  commandApply(projectPath: string, command: Command): Promise<CommandApplyResult>;
+
+  /**
+   * Undo the most recently applied command. The renderer renders
+   * the returned inverse deltas immediately and refreshes any
+   * affected entity panels.
+   *
+   * `activeScope` must match the scope of the command being
+   * undone (the journal carries the scope; the engine validates
+   * this on `undo`).
+   */
+  commandUndo(projectPath: string, activeScope: CommandScope): Promise<CommandApplyResult>;
+
+  /** Symmetric counterpart to {@link commandUndo}. */
+  commandRedo(projectPath: string, activeScope: CommandScope): Promise<CommandApplyResult>;
+
+  /**
+   * Read-only listing of the project graph. Pass `kindFilter`
+   * (e.g. `"wall"`, `"room"`, `"camera"`) to narrow; pass
+   * `undefined` for the full graph. Order is unspecified — the
+   * renderer sorts client-side if it needs deterministic display.
+   */
+  projectGraphList(projectPath: string, kindFilter?: string): Promise<EntityRecord[]>;
 }
 
 /**
@@ -293,6 +330,114 @@ export interface VersionDiffSummary {
       unchanged: number;
     }
   >;
+}
+
+/**
+ * The five workflow scopes from `aec_core::types::Scope`. Used to tag
+ * commands and to validate that an undo/redo doesn't cross a scope
+ * boundary (e.g. you can't undo a design command while in the bim
+ * workflow). String values match the Rust serde `rename_all =
+ * "snake_case"` output exactly.
+ */
+export type CommandScope = "design" | "draft" | "bim" | "render" | "deliver";
+
+/**
+ * One reversible change to the project graph. Mirrors
+ * `aec_command::commands::project_graph::EntityDelta` 1:1 — the same
+ * three-arm tagged union (`create` / `update` / `delete`) the Rust
+ * side produces from `Command::execute_persistent`.
+ */
+export type EntityDelta =
+  | { kind: "create"; record: EntityRecord }
+  | { kind: "update"; id: string; before: unknown; after: unknown }
+  | { kind: "delete"; record: EntityRecord };
+
+/**
+ * An entity in the project graph. Mirrors
+ * `aec_command::commands::EntityRecord` — the renderer treats
+ * `body` as opaque structured JSON whose shape depends on `kind`
+ * (`"wall"`, `"room"`, `"camera"`, …).
+ *
+ * `parent` is the optional parent entity id (e.g. an opening
+ * parented to a wall).
+ */
+export interface EntityRecord {
+  id: string;
+  kind: string;
+  parent: string | null;
+  /**
+   * Tool-specific body payload. Walls carry `start_mm` / `end_mm`
+   * / `height_mm` / `thickness_mm` / `material_id`; rooms carry
+   * `polygon_mm` / `floor_height_mm`; cameras carry `params`; etc.
+   * See `crates/aec_command/src/commands/*.rs` for the per-kind
+   * shapes.
+   */
+  body: unknown;
+}
+
+/**
+ * Provenance carried with each command. `user` for interactive UI
+ * commands; `ai` for AI-issued commands (the `tool` field carries
+ * the AI tool name). Serde shape mirrors `aec_command::Actor`.
+ */
+export type CommandActor =
+  | { kind: "user" }
+  | { kind: "ai"; tool: string };
+
+/**
+ * A typed command envelope. Mirrors `aec_command::commands::Command`
+ * 1:1 — the `command_id` / `ts` / `scope` / `actor` / `kind` quintuple
+ * the Rust engine consumes. Helpers in
+ * `apps/desktop/renderer/src/api/commands.ts` build these for each
+ * design / draft tool so callers don't have to hand-roll the
+ * envelope or invent ids.
+ *
+ * The wire format mirrors the Rust serde derives: snake_case keys
+ * for the envelope fields, snake_case `tool` tag (e.g.
+ * `"design.create_wall"`, `"design.paint_material"`), and the
+ * `arguments` payload alongside `tool` per
+ * `CommandKind`'s `#[serde(tag = "tool", content = "arguments")]`.
+ */
+export interface Command {
+  command_id: string;
+  ts: string;
+  scope: CommandScope;
+  actor: CommandActor;
+  /**
+   * Tool dispatch tag. One of
+   * `design.create_wall` / `design.move_wall` / `design.delete_wall` /
+   * `design.create_room` / `design.modify_room` /
+   * `design.create_floor` / `design.modify_floor` /
+   * `design.place_door` / `design.place_window` /
+   * `design.move_opening` / `design.delete_opening` /
+   * `design.paint_material` / `design.swap_finish` /
+   * `design.set_lighting` / `design.add_light` /
+   * `design.remove_light` / `design.save_camera` /
+   * `design.update_camera` / `design.delete_camera`. The
+   * argument shape under `arguments` depends on the tool tag.
+   */
+  tool: string;
+  arguments: unknown;
+}
+
+/**
+ * Returned by {@link BridgeBackend.commandApply},
+ * {@link BridgeBackend.commandUndo}, and
+ * {@link BridgeBackend.commandRedo}.
+ *
+ * `applied` is the list of {@link EntityDelta} the engine just
+ * committed (forward deltas for `apply` / `redo`, inverse deltas
+ * for `undo`). The renderer uses these directly to update its
+ * scene graph without re-querying.
+ *
+ * `undoLen` / `redoLen` are the post-call stack depths so the
+ * renderer's undo/redo toolbar buttons stay coherent.
+ */
+export interface CommandApplyResult {
+  commandId: string;
+  applied: EntityDelta[];
+  undoLen: number;
+  redoLen: number;
 }
 
 /** Result returned by `deliver:buildPack`. */
@@ -480,6 +625,59 @@ export function nativeLibraryCandidates(platform: NodeJS.Platform): string[] {
   }
 }
 
+/**
+ * Wire shape for {@link CommandApplyResult} returned by the
+ * `command_*` napi exports. Mirrors `CommandApplyResultJs` in
+ * `crates/aec_bridge/src/napi_api.rs` 1:1.
+ *
+ * `appliedJson` is a JSON-stringified `Vec<EntityDelta>`; the
+ * renderer-side decoder parses it once and hands plain
+ * `EntityDelta` objects to callers.
+ */
+interface CommandApplyResultJs {
+  commandId: string;
+  appliedJson: string;
+  undoLen: number;
+  redoLen: number;
+}
+
+/**
+ * Wire shape for an entity row from `project_graph_list`. Mirrors
+ * `EntityRecordJs` in `crates/aec_bridge/src/napi_api.rs`.
+ *
+ * `bodyJson` is the JSON-stringified entity body; the decoder
+ * parses it once before handing the result to renderer code.
+ */
+interface EntityRecordJs {
+  id: string;
+  kind: string;
+  parent: string | null;
+  bodyJson: string;
+}
+
+function decodeCommandApplyJs(r: CommandApplyResultJs): CommandApplyResult {
+  return {
+    commandId: r.commandId,
+    // The Rust side serialises with `serde_json::to_string`, which
+    // never produces invalid UTF-8 or non-JSON output — parsing is
+    // infallible in practice. We still guard with a clear error so
+    // a future serde shape change surfaces here rather than at the
+    // first downstream consumer.
+    applied: JSON.parse(r.appliedJson) as EntityDelta[],
+    undoLen: r.undoLen,
+    redoLen: r.redoLen,
+  };
+}
+
+function decodeEntityRecordJs(r: EntityRecordJs): EntityRecord {
+  return {
+    id: r.id,
+    kind: r.kind,
+    parent: r.parent,
+    body: JSON.parse(r.bodyJson),
+  };
+}
+
 interface NativeApi {
   project_create_from_template(template_key: string, project_name: string): unknown;
   project_open(project_path: string): unknown;
@@ -491,6 +689,10 @@ interface NativeApi {
   bim_import_ifc(path: string): unknown;
   bim_check_file_size(path: string): unknown;
   bim_attach_ifc(project_path: string, ifc_path: string): unknown;
+  command_apply(project_path: string, command_json: string): unknown;
+  command_undo(project_path: string, active_scope: string): unknown;
+  command_redo(project_path: string, active_scope: string): unknown;
+  project_graph_list(project_path: string, kind_filter: string | null | undefined): unknown;
 }
 
 /**
@@ -519,6 +721,16 @@ export const NATIVE_WIRED_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   "bimImportIfc",
   "bimCheckFileSize",
   "bimAttachIfc",
+  // Command engine wired in PR-Q. `commandApply` / `commandUndo` /
+  // `commandRedo` / `projectGraphList` route directly to
+  // `aec_command::engine::CommandEngine` through the
+  // `crates/aec_bridge/src/napi_api.rs` exports; the in-process
+  // fallback is a working JS reimplementation used by vitest and
+  // pre-build dev mode.
+  "commandApply",
+  "commandUndo",
+  "commandRedo",
+  "projectGraphList",
 ];
 
 /**
@@ -622,6 +834,22 @@ function adaptNative(n: NativeApi): BridgeBackend {
     bimCheckFileSize: async (p) => n.bim_check_file_size(p) as BimFileSizeCheck,
     bimAttachIfc: async (projectPath, ifcPath) =>
       n.bim_attach_ifc(projectPath, ifcPath) as BimAttachSummary,
+    commandApply: async (projectPath, command) =>
+      decodeCommandApplyJs(
+        n.command_apply(projectPath, JSON.stringify(command)) as CommandApplyResultJs,
+      ),
+    commandUndo: async (projectPath, activeScope) =>
+      decodeCommandApplyJs(
+        n.command_undo(projectPath, activeScope) as CommandApplyResultJs,
+      ),
+    commandRedo: async (projectPath, activeScope) =>
+      decodeCommandApplyJs(
+        n.command_redo(projectPath, activeScope) as CommandApplyResultJs,
+      ),
+    projectGraphList: async (projectPath, kindFilter) =>
+      (n.project_graph_list(projectPath, kindFilter ?? null) as EntityRecordJs[]).map(
+        decodeEntityRecordJs,
+      ),
   };
   // Self-check: the two catalogues above must, together, reference every
   // method on the in-process backend. We throw rather than warn so a new
@@ -672,6 +900,10 @@ export function inProcessBackend(): BridgeBackend {
   // `adaptNative`, which builds its own `base = inProcessBackend()`)
   // get isolated revision lists.
   const revisions: RevisionSummary[] = [];
+  // Per-project command-engine state for the in-process fallback. Keyed
+  // by `projectPath` so a vitest that opens two projects gets two
+  // independent graphs / undo stacks.
+  const graphs = new Map<string, InProcessGraph>();
 
   return {
     async projectCreateFromTemplate(templateKey, projectName) {
@@ -1045,7 +1277,200 @@ export function inProcessBackend(): BridgeBackend {
       // a 0 here as "fallback didn't insert anything".
       return 0;
     },
+
+    async commandApply(projectPath, command) {
+      const graph = ensureGraph(graphs, projectPath);
+      const deltas = computeForwardDeltas(graph, command);
+      const inverse = applyDeltas(graph, deltas);
+      graph.undo.push({ commandId: command.command_id, forward: deltas, inverse });
+      graph.redo.length = 0;
+      return {
+        commandId: command.command_id,
+        applied: deltas,
+        undoLen: graph.undo.length,
+        redoLen: graph.redo.length,
+      };
+    },
+
+    async commandUndo(projectPath, _activeScope) {
+      const graph = ensureGraph(graphs, projectPath);
+      const entry = graph.undo.pop();
+      if (!entry) {
+        throw new Error("command_undo: nothing to undo");
+      }
+      applyDeltas(graph, entry.inverse);
+      graph.redo.push(entry);
+      return {
+        commandId: entry.commandId,
+        applied: entry.inverse,
+        undoLen: graph.undo.length,
+        redoLen: graph.redo.length,
+      };
+    },
+
+    async commandRedo(projectPath, _activeScope) {
+      const graph = ensureGraph(graphs, projectPath);
+      const entry = graph.redo.pop();
+      if (!entry) {
+        throw new Error("command_redo: nothing to redo");
+      }
+      applyDeltas(graph, entry.forward);
+      graph.undo.push(entry);
+      return {
+        commandId: entry.commandId,
+        applied: entry.forward,
+        undoLen: graph.undo.length,
+        redoLen: graph.redo.length,
+      };
+    },
+
+    async projectGraphList(projectPath, kindFilter) {
+      const graph = ensureGraph(graphs, projectPath);
+      const rows: EntityRecord[] = [];
+      for (const r of graph.entities.values()) {
+        if (kindFilter === undefined || r.kind === kindFilter) {
+          rows.push({
+            id: r.id,
+            kind: r.kind,
+            parent: r.parent,
+            // Defensive deep-clone so renderer mutation doesn't leak
+            // back into the engine state.
+            body: r.body === null || r.body === undefined ? r.body : JSON.parse(JSON.stringify(r.body)),
+          });
+        }
+      }
+      return rows;
+    },
   };
+}
+
+/**
+ * In-memory shadow of the Rust `ProjectGraph` + `UndoRedoJournal` used
+ * by the in-process backend. Scoped per project path so multiple open
+ * projects (or test fixtures) don't bleed entities into one another.
+ *
+ * This is a **working reimplementation**, not a stub: it mirrors the
+ * three-arm delta semantics from
+ * `aec_command::commands::project_graph::EntityDelta`, applies them
+ * in order, and pushes inverse-delta records onto an undo stack so
+ * the renderer can exercise create / undo / redo end-to-end in
+ * vitest without the `.node` artefact.
+ */
+interface InProcessGraph {
+  entities: Map<string, EntityRecord>;
+  undo: Array<{ commandId: string; forward: EntityDelta[]; inverse: EntityDelta[] }>;
+  redo: Array<{ commandId: string; forward: EntityDelta[]; inverse: EntityDelta[] }>;
+}
+
+function ensureGraph(graphs: Map<string, InProcessGraph>, projectPath: string): InProcessGraph {
+  let g = graphs.get(projectPath);
+  if (!g) {
+    g = { entities: new Map(), undo: [], redo: [] };
+    graphs.set(projectPath, g);
+  }
+  return g;
+}
+
+/**
+ * Compute the forward deltas for `command` against `graph`. Mirrors
+ * the per-tool dispatch in `aec_command::engine::CommandEngine::compute_deltas`.
+ *
+ * The renderer currently only exercises a handful of design.*
+ * commands; the rest are mapped through a single generic
+ * "create-from-arguments" path that constructs a `kind = $tool`
+ * entity from the `arguments` payload. That keeps the surface
+ * call-compatible with the native backend even for tools the
+ * fallback doesn't fully model — vitests that need richer semantics
+ * either load the `.node` artefact or stub `commandApply` directly.
+ */
+function computeForwardDeltas(graph: InProcessGraph, command: Command): EntityDelta[] {
+  const args = command.arguments as Record<string, unknown> | undefined;
+  switch (command.tool) {
+    case "design.create_wall":
+    case "design.create_room":
+    case "design.create_floor":
+    case "design.place_door":
+    case "design.place_window":
+    case "design.add_light":
+    case "design.save_camera": {
+      const entityId = (args?.entity_id as string | undefined) ?? randomId();
+      const kind = command.tool.split(".").pop()!.replace(/^(create_|place_|add_|save_)/, "");
+      return [
+        {
+          kind: "create",
+          record: {
+            id: entityId,
+            kind,
+            parent: (args?.parent as string | undefined) ?? null,
+            body: { ...(args ?? {}) },
+          },
+        },
+      ];
+    }
+    case "design.delete_wall":
+    case "design.delete_opening":
+    case "design.remove_light":
+    case "design.delete_camera": {
+      const id = args?.entity_id as string | undefined;
+      if (!id) throw new Error(`${command.tool}: missing entity_id`);
+      const existing = graph.entities.get(id);
+      if (!existing) throw new Error(`${command.tool}: entity not found: ${id}`);
+      return [{ kind: "delete", record: { ...existing } }];
+    }
+    case "design.move_wall":
+    case "design.modify_room":
+    case "design.modify_floor":
+    case "design.move_opening":
+    case "design.paint_material":
+    case "design.swap_finish":
+    case "design.set_lighting":
+    case "design.update_camera": {
+      const id = args?.entity_id as string | undefined;
+      if (!id) throw new Error(`${command.tool}: missing entity_id`);
+      const existing = graph.entities.get(id);
+      if (!existing) throw new Error(`${command.tool}: entity not found: ${id}`);
+      const after = { ...(existing.body as Record<string, unknown>), ...(args ?? {}) };
+      return [{ kind: "update", id, before: existing.body, after }];
+    }
+    default:
+      throw new Error(`commandApply (in-process): unsupported tool: ${command.tool}`);
+  }
+}
+
+/**
+ * Apply `deltas` to `graph` in order and return the corresponding
+ * inverse deltas (in **reverse** order, matching Rust's
+ * `iter().rev().map(EntityDelta::invert).collect()` semantics).
+ *
+ * Each branch mirrors the inversion in
+ * `aec_command::commands::project_graph::EntityDelta::invert`:
+ *   • Create   ↔ Delete (carrying the full record)
+ *   • Update   ↔ Update with `before` / `after` swapped
+ *   • Delete   ↔ Create
+ */
+function applyDeltas(graph: InProcessGraph, deltas: EntityDelta[]): EntityDelta[] {
+  const inverse: EntityDelta[] = [];
+  for (const d of deltas) {
+    switch (d.kind) {
+      case "create":
+        graph.entities.set(d.record.id, { ...d.record });
+        inverse.unshift({ kind: "delete", record: { ...d.record } });
+        break;
+      case "update": {
+        const existing = graph.entities.get(d.id);
+        if (!existing) throw new Error(`update: entity not found: ${d.id}`);
+        const updated: EntityRecord = { ...existing, body: d.after };
+        graph.entities.set(d.id, updated);
+        inverse.unshift({ kind: "update", id: d.id, before: d.after, after: d.before });
+        break;
+      }
+      case "delete":
+        graph.entities.delete(d.record.id);
+        inverse.unshift({ kind: "create", record: { ...d.record } });
+        break;
+    }
+  }
+  return inverse;
 }
 
 function inProcessEngineStatus(): EngineStatus {

@@ -2,11 +2,14 @@
 //! snapshots — replaying `inverse` undoes the command; replaying `forward`
 //! redoes it.
 
+use chrono::{DateTime, Utc};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
 use aec_core::types::CommandId;
 
 use crate::commands::EntityDelta;
+use crate::error::{CommandError, CommandResult};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JournalEntry {
@@ -91,6 +94,119 @@ impl UndoRedoJournal {
     pub fn commit_redone(&mut self, entry: JournalEntry) {
         self.undo.push(entry);
     }
+
+    /// Load the journal from the `undo_journal` table. Rows with
+    /// `superseded = 0` are placed on the undo stack in seq order; the
+    /// redo stack is loaded from `superseded = 1` rows (newest first).
+    ///
+    /// The redo stack must remain coherent across save/reload — a redo
+    /// pushed *after* a take_undo+commit_undone keeps the entry's
+    /// `superseded = 1` marker; a subsequent `record()` clears the redo
+    /// stack in memory and on disk (see [`Self::persist_record`]).
+    pub fn load(conn: &Connection, capacity: usize) -> CommandResult<Self> {
+        let mut undo = Vec::new();
+        let mut redo = Vec::new();
+        let mut stmt = conn.prepare(
+            "SELECT seq, command_id, applied_at, forward, inverse, superseded \
+             FROM undo_journal ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map(params![], |row| {
+            let _seq: i64 = row.get(0)?;
+            let command_id_str: String = row.get(1)?;
+            let applied_at_str: String = row.get(2)?;
+            let forward_str: String = row.get(3)?;
+            let inverse_str: String = row.get(4)?;
+            let superseded: i64 = row.get(5)?;
+            Ok((
+                command_id_str,
+                applied_at_str,
+                forward_str,
+                inverse_str,
+                superseded,
+            ))
+        })?;
+        for r in rows {
+            let (command_id_str, applied_at_str, forward_str, inverse_str, superseded) = r?;
+            let command_id = CommandId::from_string(command_id_str)
+                .map_err(|e| CommandError::JournalCorrupt(format!("invalid command id: {e}")))?;
+            let applied_at: DateTime<Utc> = applied_at_str
+                .parse::<DateTime<Utc>>()
+                .map_err(|e| CommandError::JournalCorrupt(format!("invalid applied_at: {e}")))?;
+            let forward: Vec<EntityDelta> = serde_json::from_str(&forward_str)?;
+            let inverse: Vec<EntityDelta> = serde_json::from_str(&inverse_str)?;
+            let entry = JournalEntry {
+                command_id,
+                applied_at,
+                forward,
+                inverse,
+            };
+            if superseded == 0 {
+                undo.push(entry);
+            } else {
+                redo.push(entry);
+            }
+        }
+        Ok(Self {
+            undo,
+            redo,
+            capacity,
+        })
+    }
+
+    /// Persist a freshly-recorded entry to the `undo_journal` table and
+    /// mark any existing redo rows as removed (mirrors the in-memory
+    /// `record()` behaviour of clearing the redo stack on a new forward
+    /// command).
+    pub fn persist_record(conn: &mut Connection, entry: &JournalEntry) -> CommandResult<()> {
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM undo_journal WHERE superseded = 1", params![])?;
+        let forward = serde_json::to_string(&entry.forward)?;
+        let inverse = serde_json::to_string(&entry.inverse)?;
+        tx.execute(
+            "INSERT INTO undo_journal (command_id, applied_at, forward, inverse, superseded) \
+             VALUES (?1, ?2, ?3, ?4, 0)",
+            params![
+                entry.command_id.to_string(),
+                entry.applied_at.to_rfc3339(),
+                forward,
+                inverse,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Move the top undo row to the redo stack (`superseded = 1`).
+    /// Called after a successful `undo`.
+    pub fn persist_undo(conn: &mut Connection, command_id: &CommandId) -> CommandResult<()> {
+        let n = conn.execute(
+            "UPDATE undo_journal SET superseded = 1 \
+             WHERE seq = (SELECT MAX(seq) FROM undo_journal WHERE command_id = ?1 AND superseded = 0)",
+            params![command_id.to_string()],
+        )?;
+        if n == 0 {
+            return Err(CommandError::JournalCorrupt(format!(
+                "undo persist: no row for command_id={command_id}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Move the top redo row back to the undo stack (`superseded = 0`).
+    /// Called after a successful `redo`.
+    pub fn persist_redo(conn: &mut Connection, command_id: &CommandId) -> CommandResult<()> {
+        let n = conn.execute(
+            "UPDATE undo_journal SET superseded = 0 \
+             WHERE seq = (SELECT MAX(seq) FROM undo_journal WHERE command_id = ?1 AND superseded = 1)",
+            params![command_id.to_string()],
+        )?;
+        if n == 0 {
+            return Err(CommandError::JournalCorrupt(format!(
+                "redo persist: no row for command_id={command_id}"
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -166,5 +282,71 @@ mod tests {
         j.record(entry());
         j.record(entry());
         assert_eq!(j.undo_len(), 2);
+    }
+
+    fn open_in_memory_with_journal_table() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE undo_journal (
+                seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+                command_id  TEXT NOT NULL,
+                applied_at  TEXT NOT NULL,
+                forward     TEXT NOT NULL,
+                inverse     TEXT NOT NULL,
+                superseded  INTEGER NOT NULL DEFAULT 0
+            );",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn persist_record_then_load_restores_undo_stack() {
+        let mut conn = open_in_memory_with_journal_table();
+        let e1 = entry();
+        let e2 = entry();
+        UndoRedoJournal::persist_record(&mut conn, &e1).unwrap();
+        UndoRedoJournal::persist_record(&mut conn, &e2).unwrap();
+        let j = UndoRedoJournal::load(&conn, 1024).unwrap();
+        assert_eq!(j.undo_len(), 2);
+        assert_eq!(j.redo_len(), 0);
+    }
+
+    #[test]
+    fn persist_undo_marks_row_superseded_and_load_places_on_redo() {
+        let mut conn = open_in_memory_with_journal_table();
+        let e = entry();
+        UndoRedoJournal::persist_record(&mut conn, &e).unwrap();
+        UndoRedoJournal::persist_undo(&mut conn, &e.command_id).unwrap();
+        let j = UndoRedoJournal::load(&conn, 1024).unwrap();
+        assert_eq!(j.undo_len(), 0);
+        assert_eq!(j.redo_len(), 1);
+    }
+
+    #[test]
+    fn persist_redo_clears_superseded_and_load_places_on_undo() {
+        let mut conn = open_in_memory_with_journal_table();
+        let e = entry();
+        UndoRedoJournal::persist_record(&mut conn, &e).unwrap();
+        UndoRedoJournal::persist_undo(&mut conn, &e.command_id).unwrap();
+        UndoRedoJournal::persist_redo(&mut conn, &e.command_id).unwrap();
+        let j = UndoRedoJournal::load(&conn, 1024).unwrap();
+        assert_eq!(j.undo_len(), 1);
+        assert_eq!(j.redo_len(), 0);
+    }
+
+    #[test]
+    fn persist_record_clears_redo_rows_on_disk() {
+        let mut conn = open_in_memory_with_journal_table();
+        // Build up an undo+redo state.
+        let e1 = entry();
+        UndoRedoJournal::persist_record(&mut conn, &e1).unwrap();
+        UndoRedoJournal::persist_undo(&mut conn, &e1.command_id).unwrap();
+        // e1 is now on the redo side. A new record should clear it.
+        let e2 = entry();
+        UndoRedoJournal::persist_record(&mut conn, &e2).unwrap();
+        let j = UndoRedoJournal::load(&conn, 1024).unwrap();
+        assert_eq!(j.undo_len(), 1);
+        assert_eq!(j.redo_len(), 0);
     }
 }

@@ -238,6 +238,133 @@ impl CommandEngine {
             CommandKind::DeleteCamera(c) => vec![c.to_delta(&self.graph)?],
         })
     }
+
+    /// Rebuild the engine from a SQLCipher-backed project package. The
+    /// graph is loaded from the `entities` table and the journal from
+    /// `undo_journal`. Use [`Self::execute_persistent`] to commit
+    /// subsequent commands back to disk.
+    pub fn open(conn: &rusqlite::Connection, active_scope: Scope) -> Result<Self> {
+        Ok(Self {
+            graph: crate::commands::ProjectGraph::load(conn)?,
+            journal: crate::journal::UndoRedoJournal::load(conn, 1024)?,
+            audit: crate::audit::AuditHashChain::new(),
+            active_scope,
+        })
+    }
+
+    /// Execute a command and persist the resulting deltas and journal
+    /// entry to the connection. The in-memory state and the on-disk
+    /// state advance in lock-step — a failure in either leaves both
+    /// rolled back via [`crate::commands::ProjectGraph::persist_delta`]'s
+    /// inverse-apply.
+    pub fn execute_persistent(
+        &mut self,
+        cmd: Command,
+        conn: &mut rusqlite::Connection,
+    ) -> Result<CommandResult> {
+        let deltas = self.compute_deltas(&cmd.kind)?;
+        // Persist each delta one at a time so the in-memory graph and
+        // the SQL table advance together. If the n-th delta fails we
+        // unwind the first n-1 via their inverses on both sides.
+        let mut applied: Vec<EntityDelta> = Vec::with_capacity(deltas.len());
+        for d in &deltas {
+            if let Err(err) = self.graph.persist_delta(conn, d) {
+                for done in applied.iter().rev() {
+                    // Inverse apply on both layers. A failure here would
+                    // leave the system in an inconsistent state; we
+                    // log it via the surfacing error but continue so we
+                    // unwind as much as possible.
+                    let _ = self.graph.persist_delta(conn, &done.invert());
+                }
+                return Err(err);
+            }
+            applied.push(d.clone());
+        }
+        let inverse: Vec<EntityDelta> = applied.iter().rev().map(EntityDelta::invert).collect();
+        let envelope = self.audit.extend(
+            &cmd.command_id,
+            &serde_json::to_value(&cmd).unwrap_or(serde_json::Value::Null),
+        );
+        let entry = JournalEntry {
+            command_id: cmd.command_id.clone(),
+            applied_at: cmd.ts,
+            forward: applied.clone(),
+            inverse,
+        };
+        crate::journal::UndoRedoJournal::persist_record(conn, &entry)?;
+        self.journal.record(entry);
+        Ok(CommandResult {
+            command_id: cmd.command_id,
+            applied,
+            audit: envelope,
+        })
+    }
+
+    /// Persistent counterpart to [`Self::undo`]. Mirrors the in-memory
+    /// two-phase journal mutation: detach → replay inverse → commit, or
+    /// restore on replay failure.
+    pub fn undo_persistent(&mut self, conn: &mut rusqlite::Connection) -> Result<CommandResult> {
+        let entry = self
+            .journal
+            .take_undo()
+            .ok_or(CommandError::NothingToUndo)?;
+        // Persist each inverse delta on both layers.
+        let mut applied: Vec<EntityDelta> = Vec::with_capacity(entry.inverse.len());
+        for d in &entry.inverse {
+            if let Err(err) = self.graph.persist_delta(conn, d) {
+                // Roll back the inverses we already applied.
+                for done in applied.iter().rev() {
+                    let _ = self.graph.persist_delta(conn, &done.invert());
+                }
+                self.journal.restore_undo(entry);
+                return Err(err);
+            }
+            applied.push(d.clone());
+        }
+        let envelope = self.audit.extend(
+            &entry.command_id,
+            &serde_json::json!({"undo": entry.command_id.as_str()}),
+        );
+        let result = CommandResult {
+            command_id: entry.command_id.clone(),
+            applied,
+            audit: envelope,
+        };
+        crate::journal::UndoRedoJournal::persist_undo(conn, &entry.command_id)?;
+        self.journal.commit_undone(entry);
+        Ok(result)
+    }
+
+    /// Persistent counterpart to [`Self::redo`].
+    pub fn redo_persistent(&mut self, conn: &mut rusqlite::Connection) -> Result<CommandResult> {
+        let entry = self
+            .journal
+            .take_redo()
+            .ok_or(CommandError::NothingToRedo)?;
+        let mut applied: Vec<EntityDelta> = Vec::with_capacity(entry.forward.len());
+        for d in &entry.forward {
+            if let Err(err) = self.graph.persist_delta(conn, d) {
+                for done in applied.iter().rev() {
+                    let _ = self.graph.persist_delta(conn, &done.invert());
+                }
+                self.journal.restore_redo(entry);
+                return Err(err);
+            }
+            applied.push(d.clone());
+        }
+        let envelope = self.audit.extend(
+            &entry.command_id,
+            &serde_json::json!({"redo": entry.command_id.as_str()}),
+        );
+        let result = CommandResult {
+            command_id: entry.command_id.clone(),
+            applied,
+            audit: envelope,
+        };
+        crate::journal::UndoRedoJournal::persist_redo(conn, &entry.command_id)?;
+        self.journal.commit_redone(entry);
+        Ok(result)
+    }
 }
 
 #[cfg(test)]

@@ -181,6 +181,69 @@ const api = {
     }) => ipcRenderer.invoke("deliver:buildPack", params),
   },
 
+  // ----- Command engine -----
+  // Typed bridge between the renderer-side command helpers
+  // (`apps/desktop/renderer/src/api/commands.ts`) and the Rust
+  // `aec_command::engine::CommandEngine`. Mirrors the inline shape
+  // pattern used by `bim.attachIfc` / `bim.importIfc` above:
+  // duplicated here rather than imported from `bridge.ts` because
+  // Electron's context-isolation boundary forbids dragging the
+  // main-process typing surface into the isolated world. Drift is
+  // bounded by two compile-time guards (the IPC-handler return type
+  // in `ipc.ts:command:apply` + the renderer-side `aec.ts` re-typing
+  // against `CommandApplyResult`).
+  command: {
+    /**
+     * Apply a typed command. `command` is the wire-shape envelope
+     * (snake_case `command_id` / `ts` / `scope` / `actor` / `tool` /
+     * `arguments`) produced by the renderer-side helpers.
+     */
+    apply: (projectPath: string, command: unknown) =>
+      ipcRenderer.invoke("command:apply", { projectPath, command }) as Promise<{
+        commandId: string;
+        applied: Array<
+          | { kind: "create"; record: { id: string; kind: string; parent: string | null; body: unknown } }
+          | { kind: "update"; id: string; before: unknown; after: unknown }
+          | { kind: "delete"; record: { id: string; kind: string; parent: string | null; body: unknown } }
+        >;
+        undoLen: number;
+        redoLen: number;
+      }>,
+    /** Undo the most recently applied command. */
+    undo: (projectPath: string, activeScope: string) =>
+      ipcRenderer.invoke("command:undo", { projectPath, activeScope }) as Promise<{
+        commandId: string;
+        applied: Array<
+          | { kind: "create"; record: { id: string; kind: string; parent: string | null; body: unknown } }
+          | { kind: "update"; id: string; before: unknown; after: unknown }
+          | { kind: "delete"; record: { id: string; kind: string; parent: string | null; body: unknown } }
+        >;
+        undoLen: number;
+        redoLen: number;
+      }>,
+    /** Redo the most recently undone command. */
+    redo: (projectPath: string, activeScope: string) =>
+      ipcRenderer.invoke("command:redo", { projectPath, activeScope }) as Promise<{
+        commandId: string;
+        applied: Array<
+          | { kind: "create"; record: { id: string; kind: string; parent: string | null; body: unknown } }
+          | { kind: "update"; id: string; before: unknown; after: unknown }
+          | { kind: "delete"; record: { id: string; kind: string; parent: string | null; body: unknown } }
+        >;
+        undoLen: number;
+        redoLen: number;
+      }>,
+    /**
+     * List the project graph. `kindFilter` narrows to a single
+     * entity kind (e.g. `"wall"` / `"room"` / `"camera"`); pass
+     * `undefined` for the full graph.
+     */
+    listGraph: (projectPath: string, kindFilter?: string) =>
+      ipcRenderer.invoke("project:graphList", { projectPath, kindFilter }) as Promise<
+        Array<{ id: string; kind: string; parent: string | null; body: unknown }>
+      >,
+  },
+
   // ----- Runtime -----
   runtime: {
     status: () => ipcRenderer.invoke("runtime:status"),

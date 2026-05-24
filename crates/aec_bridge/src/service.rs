@@ -12,10 +12,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use aec_audit::AuditLog;
+use aec_command::commands::{Command, EntityDelta, EntityRecord};
+use aec_command::engine::CommandEngine;
 use aec_core::config::ProjectSettings;
 use aec_core::package::{ProjectPackage, ProjectSummary as CoreProjectSummary};
 use aec_core::templates::TemplateLoader;
-use aec_core::types::{ProjectId, Scope};
+use aec_core::types::{CommandId, ProjectId, Scope};
 use aec_governor::profiler::{CpuProfile, GpuProfile, HardwareProfiler};
 use aec_governor::tier::HardwareTier;
 
@@ -52,6 +54,18 @@ pub enum BridgeServiceError {
     /// which STEP entity / line failed.
     #[error("bim: {0}")]
     Bim(String),
+    /// Command-engine failure (validation, scope mismatch, journal
+    /// corruption, persistence). The error message preserves
+    /// `aec_command::error::CommandError`'s `Display` so the renderer
+    /// can surface "entity X not found", "scope mismatch", etc.
+    #[error("command: {0}")]
+    Command(String),
+}
+
+impl From<aec_command::error::CommandError> for BridgeServiceError {
+    fn from(e: aec_command::error::CommandError) -> Self {
+        Self::Command(e.to_string())
+    }
 }
 
 impl From<aec_bim::ifc::IfcReadError> for BridgeServiceError {
@@ -521,6 +535,120 @@ impl BridgeService {
         Ok(pkg.summary().into())
     }
 
+    /// Apply a typed command to the project graph and persist the
+    /// resulting deltas + journal entry to the SQLCipher database.
+    ///
+    /// The on-disk graph and journal are the source of truth: each call
+    /// rebuilds an in-memory [`CommandEngine`] from the package's
+    /// `entities` and `undo_journal` tables, executes the command via
+    /// [`CommandEngine::execute_persistent`] (so the SQL transaction and
+    /// the in-memory mutation advance in lock-step), and returns the
+    /// list of applied deltas plus the new audit envelope. The cache
+    /// invalidations match the policy on `project_save` /
+    /// `project_audit_sync` — any status pane open against this path
+    /// would otherwise serve a stale row count after the apply.
+    pub fn command_apply(
+        &mut self,
+        project_path: &str,
+        command: Command,
+    ) -> Result<CommandApplyResult, BridgeServiceError> {
+        let (_pkg, mut conn) =
+            ProjectPackage::open_with_master_key_and_database(project_path, &self.master_key)?;
+        let mut engine = CommandEngine::open(&conn, command.scope)?;
+        let result = engine.execute_persistent(command, &mut conn)?;
+        self.invalidate_status_cache_for(project_path);
+        Ok(CommandApplyResult {
+            command_id: result.command_id,
+            applied: result.applied,
+            undo_len: engine.undo_len() as u32,
+            redo_len: engine.redo_len() as u32,
+        })
+    }
+
+    /// Undo the most recently applied command. Returns the inverse
+    /// deltas that were just applied (so the renderer can update its
+    /// view of the project graph without re-querying).
+    ///
+    /// Errors:
+    /// * [`BridgeServiceError::Command`] with `nothing to undo` when the
+    ///   journal's undo stack is empty.
+    /// * [`BridgeServiceError::Command`] with `entity ... not found`
+    ///   when a concurrent process mutated the graph out from under
+    ///   the journal (extremely unlikely with the per-project file lock,
+    ///   but the engine reports it cleanly).
+    pub fn command_undo(
+        &mut self,
+        project_path: &str,
+        active_scope: Scope,
+    ) -> Result<CommandApplyResult, BridgeServiceError> {
+        let (_pkg, mut conn) =
+            ProjectPackage::open_with_master_key_and_database(project_path, &self.master_key)?;
+        let mut engine = CommandEngine::open(&conn, active_scope)?;
+        let result = engine.undo_persistent(&mut conn)?;
+        self.invalidate_status_cache_for(project_path);
+        Ok(CommandApplyResult {
+            command_id: result.command_id,
+            applied: result.applied,
+            undo_len: engine.undo_len() as u32,
+            redo_len: engine.redo_len() as u32,
+        })
+    }
+
+    /// Redo the most recently undone command. Symmetric counterpart to
+    /// [`Self::command_undo`].
+    pub fn command_redo(
+        &mut self,
+        project_path: &str,
+        active_scope: Scope,
+    ) -> Result<CommandApplyResult, BridgeServiceError> {
+        let (_pkg, mut conn) =
+            ProjectPackage::open_with_master_key_and_database(project_path, &self.master_key)?;
+        let mut engine = CommandEngine::open(&conn, active_scope)?;
+        let result = engine.redo_persistent(&mut conn)?;
+        self.invalidate_status_cache_for(project_path);
+        Ok(CommandApplyResult {
+            command_id: result.command_id,
+            applied: result.applied,
+            undo_len: engine.undo_len() as u32,
+            redo_len: engine.redo_len() as u32,
+        })
+    }
+
+    /// List the project graph: every entity, regardless of kind. The
+    /// optional `kind_filter` narrows the result to a single kind
+    /// (e.g. `"wall"`, `"room"`, `"camera"`); pass `None` for the full
+    /// graph. Order is unspecified — the renderer is expected to sort
+    /// client-side if it needs deterministic display order.
+    pub fn project_graph_list(
+        &self,
+        project_path: &str,
+        kind_filter: Option<&str>,
+    ) -> Result<Vec<EntityRecord>, BridgeServiceError> {
+        let (_pkg, conn) =
+            ProjectPackage::open_with_master_key_and_database(project_path, &self.master_key)?;
+        let graph = aec_command::commands::ProjectGraph::load(&conn)?;
+        let entities: Vec<EntityRecord> = match kind_filter {
+            Some(k) => graph.entities_of_kind(k).cloned().collect(),
+            None => graph.iter().cloned().collect(),
+        };
+        Ok(entities)
+    }
+}
+
+/// Result returned by [`BridgeService::command_apply`] and the
+/// undo/redo variants. Mirrors `aec_command::engine::CommandResult` but
+/// also carries the post-call undo/redo stack depths so the renderer
+/// can keep its "undo available?" / "redo available?" toolbar buttons
+/// in sync without a follow-up query.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CommandApplyResult {
+    pub command_id: CommandId,
+    pub applied: Vec<EntityDelta>,
+    pub undo_len: u32,
+    pub redo_len: u32,
+}
+
+impl BridgeService {
     /// Mirror the JSONL audit chain at `<project>/audit/log.jsonl` into
     /// the SQLCipher `audit_chain` table and return the number of
     /// newly-inserted rows. Safe to call on a freshly-created project
@@ -1159,6 +1287,166 @@ mod tests {
             0,
             "project_open must invalidate the engine-status cache entry"
         );
+    }
+
+    #[test]
+    fn command_apply_executes_create_wall_and_persists_to_graph() {
+        use aec_command::commands::{wall, CommandKind};
+        let (mut s, _g) = service();
+        let summary = s
+            .project_create_from_template("interior.apartment", "CmdApply")
+            .unwrap();
+        let cmd = aec_command::commands::Command::user(CommandKind::CreateWall(wall::CreateWall {
+            entity_id: aec_core::types::EntityId::new(),
+            start_mm: [0.0, 0.0],
+            end_mm: [4500.0, 0.0],
+            height_mm: 2700.0,
+            thickness_mm: 100.0,
+            material_id: None,
+        }));
+        let result = s.command_apply(&summary.path, cmd).unwrap();
+        assert_eq!(result.applied.len(), 1);
+        assert_eq!(result.undo_len, 1);
+        assert_eq!(result.redo_len, 0);
+        // Reload from disk: the graph should hold exactly one wall.
+        let entities = s.project_graph_list(&summary.path, Some("wall")).unwrap();
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].kind, "wall");
+    }
+
+    #[test]
+    fn command_undo_reverses_a_persisted_apply() {
+        use aec_command::commands::{wall, CommandKind};
+        let (mut s, _g) = service();
+        let summary = s
+            .project_create_from_template("interior.apartment", "CmdUndo")
+            .unwrap();
+        let cmd = aec_command::commands::Command::user(CommandKind::CreateWall(wall::CreateWall {
+            entity_id: aec_core::types::EntityId::new(),
+            start_mm: [0.0, 0.0],
+            end_mm: [4500.0, 0.0],
+            height_mm: 2700.0,
+            thickness_mm: 100.0,
+            material_id: None,
+        }));
+        s.command_apply(&summary.path, cmd).unwrap();
+        let undo = s
+            .command_undo(&summary.path, aec_core::types::Scope::Design)
+            .unwrap();
+        // Inverse of a Create is a Delete; one delta applied.
+        assert_eq!(undo.applied.len(), 1);
+        assert_eq!(undo.undo_len, 0);
+        assert_eq!(undo.redo_len, 1);
+        let entities = s.project_graph_list(&summary.path, Some("wall")).unwrap();
+        assert!(entities.is_empty());
+    }
+
+    #[test]
+    fn command_redo_re_applies_an_undone_command() {
+        use aec_command::commands::{wall, CommandKind};
+        let (mut s, _g) = service();
+        let summary = s
+            .project_create_from_template("interior.apartment", "CmdRedo")
+            .unwrap();
+        let cmd = aec_command::commands::Command::user(CommandKind::CreateWall(wall::CreateWall {
+            entity_id: aec_core::types::EntityId::new(),
+            start_mm: [0.0, 0.0],
+            end_mm: [4500.0, 0.0],
+            height_mm: 2700.0,
+            thickness_mm: 100.0,
+            material_id: None,
+        }));
+        s.command_apply(&summary.path, cmd).unwrap();
+        s.command_undo(&summary.path, aec_core::types::Scope::Design)
+            .unwrap();
+        let redo = s
+            .command_redo(&summary.path, aec_core::types::Scope::Design)
+            .unwrap();
+        assert_eq!(redo.applied.len(), 1);
+        assert_eq!(redo.undo_len, 1);
+        assert_eq!(redo.redo_len, 0);
+        let entities = s.project_graph_list(&summary.path, Some("wall")).unwrap();
+        assert_eq!(entities.len(), 1);
+    }
+
+    #[test]
+    fn project_graph_list_filters_by_kind() {
+        use aec_command::commands::{wall, CommandKind};
+        let (mut s, _g) = service();
+        let summary = s
+            .project_create_from_template("interior.apartment", "GraphList")
+            .unwrap();
+        let cmd = aec_command::commands::Command::user(CommandKind::CreateWall(wall::CreateWall {
+            entity_id: aec_core::types::EntityId::new(),
+            start_mm: [0.0, 0.0],
+            end_mm: [4500.0, 0.0],
+            height_mm: 2700.0,
+            thickness_mm: 100.0,
+            material_id: None,
+        }));
+        s.command_apply(&summary.path, cmd).unwrap();
+        // All entities should include exactly the one wall.
+        let all = s.project_graph_list(&summary.path, None).unwrap();
+        assert_eq!(all.len(), 1);
+        // Filtering by an irrelevant kind returns zero.
+        let rooms = s.project_graph_list(&summary.path, Some("room")).unwrap();
+        assert!(rooms.is_empty());
+    }
+
+    #[test]
+    fn command_apply_persists_across_service_instances() {
+        // The on-disk SQLCipher database is the source of truth — a
+        // fresh `BridgeService` created against the same project root
+        // must see the command's effects, otherwise the renderer would
+        // lose graph state across restarts.
+        use aec_command::commands::{wall, CommandKind};
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let projects = tmp.path().join("projects");
+        let templates = tmp.path().join("templates");
+        std::fs::create_dir_all(&templates).unwrap();
+        write_template(&templates, "interior", "apartment");
+        let cfg = BridgeConfig {
+            state_dir: state.clone(),
+            projects_dir: projects.clone(),
+            templates_dir: templates.clone(),
+            max_recents: 10,
+        };
+        let mut s1 = BridgeService::new(cfg.clone(), [42u8; 32]).unwrap();
+        let summary = s1
+            .project_create_from_template("interior.apartment", "Restart")
+            .unwrap();
+        let cmd = aec_command::commands::Command::user(CommandKind::CreateWall(wall::CreateWall {
+            entity_id: aec_core::types::EntityId::new(),
+            start_mm: [0.0, 0.0],
+            end_mm: [4500.0, 0.0],
+            height_mm: 2700.0,
+            thickness_mm: 100.0,
+            material_id: None,
+        }));
+        s1.command_apply(&summary.path, cmd).unwrap();
+        drop(s1);
+
+        let s2 = BridgeService::new(cfg, [42u8; 32]).unwrap();
+        let entities = s2.project_graph_list(&summary.path, Some("wall")).unwrap();
+        assert_eq!(entities.len(), 1, "graph state lost across service restart");
+    }
+
+    #[test]
+    fn command_undo_on_empty_journal_returns_error() {
+        let (mut s, _g) = service();
+        let summary = s
+            .project_create_from_template("interior.apartment", "NoUndo")
+            .unwrap();
+        let err = s
+            .command_undo(&summary.path, aec_core::types::Scope::Design)
+            .unwrap_err();
+        match err {
+            BridgeServiceError::Command(msg) => {
+                assert!(msg.contains("nothing to undo"), "got {msg}");
+            }
+            other => panic!("expected Command(nothing to undo), got {other:?}"),
+        }
     }
 
     #[test]
