@@ -196,10 +196,19 @@ export async function deleteWall(
   );
 }
 
-/** Build + apply `design.paint_material`. */
+/**
+ * Build + apply `design.paint_material`. The Rust
+ * `aec_command::commands::material::PaintMaterial` struct uses the
+ * field name `target_entity_id` (not `entity_id`) for the target —
+ * because PaintMaterial is conceptually applied *to* a wall/floor/room,
+ * not authored *as* a new entity. `surface` is optional and selects a
+ * sub-surface (e.g. `wall:interior`, `floor:top`) — when omitted, the
+ * whole-entity `material_id` is set; when present, the per-surface
+ * `surface_materials[surface]` slot is updated.
+ */
 export async function paintMaterial(
   projectPath: string,
-  args: { entity_id: string; material_id: string },
+  args: { target_entity_id: string; material_id: string; surface?: string },
 ): Promise<CommandApplyResult> {
   return commandApply(
     projectPath,
@@ -207,15 +216,28 @@ export async function paintMaterial(
   );
 }
 
-/** Build + apply `design.save_camera`. */
+/**
+ * Build + apply `design.save_camera`. The Rust
+ * `aec_command::commands::camera::SaveCamera` struct nests the camera
+ * parameters under a `params: CameraParams` field — the renderer must
+ * send the same shape, not a flat object. `focal_length_mm` is the
+ * Rust field name (not `fov_deg`); `depth_of_field_f` is an optional
+ * f-stop value (omit for pin-hole).
+ */
 export async function saveCamera(
   projectPath: string,
   args: {
     entity_id?: string;
     name: string;
-    position_mm: [number, number, number];
-    target_mm: [number, number, number];
-    fov_deg: number;
+    params: {
+      position_mm: [number, number, number];
+      target_mm: [number, number, number];
+      focal_length_mm: number;
+      exposure_ev: number;
+      white_balance_k: number;
+      depth_of_field_f?: number | null;
+      aspect_ratio: number;
+    };
   },
 ): Promise<CommandApplyResult> {
   return commandApply(

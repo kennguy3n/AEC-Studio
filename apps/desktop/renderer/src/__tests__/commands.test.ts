@@ -125,7 +125,7 @@ describe("renderer command surface", () => {
     expect(reapplied.redoLen).toBe(0);
   });
 
-  it("paintMaterial issues an Update delta and the body merges", async () => {
+  it("paintMaterial issues a surgical Update delta against target_entity_id", async () => {
     const projectPath = `/projects/paint_${Date.now()}.aecstudio`;
     await createWall(projectPath, {
       entity_id: "wall_paint",
@@ -135,17 +135,48 @@ describe("renderer command surface", () => {
       thickness_mm: 100,
       material_id: "white",
     });
+    // Field name is `target_entity_id` (not `entity_id`) to match the
+    // Rust `aec_command::commands::material::PaintMaterial` struct.
     const result = await paintMaterial(projectPath, {
-      entity_id: "wall_paint",
+      target_entity_id: "wall_paint",
       material_id: "oak",
     });
     expect(result.applied).toHaveLength(1);
     const delta = result.applied[0]!;
     expect(delta.kind).toBe("update");
     if (delta.kind !== "update") throw new Error("expected update delta");
-    expect((delta.after as { material_id: string }).material_id).toBe("oak");
-    // Body merge — existing fields preserved.
-    expect((delta.after as { height_mm: number }).height_mm).toBe(2700);
+    const after = delta.after as Record<string, unknown>;
+    // `material_id` was overwritten; other body fields preserved.
+    expect(after.material_id).toBe("oak");
+    expect(after.height_mm).toBe(2700);
+    // Critically: the command's `target_entity_id` must NOT leak into
+    // the entity body — Rust's `PaintMaterial::to_delta` only inserts
+    // `material_id`, never the routing fields.
+    expect(after.target_entity_id).toBeUndefined();
+  });
+
+  it("paintMaterial with `surface` writes into surface_materials instead of overwriting material_id", async () => {
+    const projectPath = `/projects/paint_surface_${Date.now()}.aecstudio`;
+    await createWall(projectPath, {
+      entity_id: "wall_surface",
+      start_mm: [0, 0],
+      end_mm: [3000, 0],
+      height_mm: 2700,
+      thickness_mm: 100,
+      material_id: "white",
+    });
+    const result = await paintMaterial(projectPath, {
+      target_entity_id: "wall_surface",
+      material_id: "oak",
+      surface: "wall:interior",
+    });
+    const delta = result.applied[0]!;
+    if (delta.kind !== "update") throw new Error("expected update delta");
+    const after = delta.after as Record<string, unknown>;
+    // Whole-entity material is untouched.
+    expect(after.material_id).toBe("white");
+    // Surface map carries the new per-surface assignment.
+    expect(after.surface_materials).toEqual({ "wall:interior": "oak" });
   });
 
   it("deleteWall removes the entity from the graph", async () => {
@@ -163,19 +194,32 @@ describe("renderer command surface", () => {
     expect(await projectGraphList(projectPath, "wall")).toEqual([]);
   });
 
-  it("saveCamera persists camera entities under kind=camera", async () => {
+  it("saveCamera persists camera entities under kind=camera with nested params", async () => {
     const projectPath = `/projects/cam_${Date.now()}.aecstudio`;
+    // Shape mirrors `aec_command::commands::camera::SaveCamera` 1:1:
+    // `params` is nested under `CameraParams`, and the field is
+    // `focal_length_mm` (not the legacy `fov_deg`).
     await saveCamera(projectPath, {
       entity_id: "cam_1",
       name: "Hero",
-      position_mm: [1000, 1000, 1500],
-      target_mm: [0, 0, 1500],
-      fov_deg: 45,
+      params: {
+        position_mm: [1000, 1000, 1500],
+        target_mm: [0, 0, 1500],
+        focal_length_mm: 35,
+        exposure_ev: 0,
+        white_balance_k: 5500,
+        depth_of_field_f: 2.8,
+        aspect_ratio: 16 / 9,
+      },
     });
     const rows = await projectGraphList(projectPath, "camera");
     expect(rows).toHaveLength(1);
     expect(rows[0]!.id).toBe("cam_1");
-    expect((rows[0]!.body as { name: string }).name).toBe("Hero");
+    const body = rows[0]!.body as { name: string; params: { focal_length_mm: number } };
+    expect(body.name).toBe("Hero");
+    expect(body.params.focal_length_mm).toBe(35);
+    // Routing field `entity_id` must not leak into the body.
+    expect((rows[0]!.body as Record<string, unknown>).entity_id).toBeUndefined();
   });
 
   it("projectGraphList with no kindFilter returns the full graph", async () => {
@@ -190,13 +234,23 @@ describe("renderer command surface", () => {
     await saveCamera(projectPath, {
       entity_id: "c_all_1",
       name: "All",
-      position_mm: [0, 0, 0],
-      target_mm: [1, 0, 0],
-      fov_deg: 60,
+      params: {
+        position_mm: [0, 0, 0],
+        target_mm: [1, 0, 0],
+        focal_length_mm: 50,
+        exposure_ev: 0,
+        white_balance_k: 5500,
+        aspect_ratio: 16 / 9,
+      },
     });
     const all = await projectGraphList(projectPath);
     expect(all).toHaveLength(2);
     expect(new Set(all.map((r) => r.kind))).toEqual(new Set(["wall", "camera"]));
+    // Root entities must have `parent === null`, never `undefined` —
+    // pins the BUG_0001 normalisation contract from PR-Q round 3.
+    for (const r of all) {
+      expect(r.parent).toBeNull();
+    }
   });
 
   it("commandApply on the same projectPath shares state across calls", async () => {

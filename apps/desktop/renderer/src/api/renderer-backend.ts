@@ -8,9 +8,15 @@ import type { AecApi } from "../../../electron/preload";
 import { AI_TOOLS } from "../../../electron/ai-tools";
 import {
   BIM_IMPORT_LARGE_FILE_THRESHOLD_BYTES,
+  applyDeltas,
   classifyTier,
+  computeForwardDeltas,
   diffRevisionsInProcess,
+  ensureInProcessGraph,
   inProcessParsedForTool,
+  type Command,
+  type EntityRecord,
+  type InProcessGraph,
   type RevisionSummary,
   type VersionDiffSummary,
 } from "../../../electron/bridge";
@@ -353,150 +359,34 @@ function deliverMock(newId: (prefix: string) => string) {
 }
 
 /**
- * Renderer-side fixture for the `command` IPC namespace. The renderer
- * is the side that constructs `Command` envelopes (the IPC layer
- * passes them through unchanged), so the fixture's responsibility is
- * just to model a working create / undo / redo loop the way the Rust
- * engine does — applying forward deltas, capturing inverse deltas,
- * popping on undo, pushing onto redo, and dropping the redo stack on
- * any new apply. This mirrors `aec_command::engine::CommandEngine`'s
- * semantics 1:1.
+ * Renderer-side fixture for the `command` IPC namespace.
+ *
+ * The renderer constructs `Command` envelopes; the IPC layer passes
+ * them through unchanged. The fixture's responsibility is to model a
+ * working create / undo / redo loop the way the Rust engine does —
+ * applying forward deltas, capturing inverse deltas, popping on undo,
+ * pushing onto redo, and dropping the redo stack on any new apply.
+ *
+ * Both the per-tool delta computation (`computeForwardDeltas`) and
+ * the inverse-delta application loop (`applyDeltas`) are imported
+ * from `bridge.ts` so the renderer-side vitest fallback and the
+ * electron-side in-process fallback share a *single* implementation.
+ * Earlier drafts had three near-identical copies (Rust engine +
+ * bridge.ts + renderer-backend.ts) — see Devin Review round 3
+ * ANALYSIS_0003. Sharing the TypeScript implementation eliminates
+ * the JS-side drift; the Rust ↔ JS parity is enforced by the
+ * `crates/aec_bridge::service::tests::command_*` integration tests
+ * which run both engines side-by-side.
  */
-type CommandEntityRecord = {
-  id: string;
-  kind: string;
-  parent: string | null;
-  body: unknown;
-};
-type CommandDelta =
-  | { kind: "create"; record: CommandEntityRecord }
-  | { kind: "update"; id: string; before: unknown; after: unknown }
-  | { kind: "delete"; record: CommandEntityRecord };
-
 function commandMock() {
-  interface JournalEntry {
-    commandId: string;
-    forward: CommandDelta[];
-    inverse: CommandDelta[];
-  }
-  interface Graph {
-    entities: Map<string, CommandEntityRecord>;
-    undo: JournalEntry[];
-    redo: JournalEntry[];
-  }
-  const graphs = new Map<string, Graph>();
-  const ensure = (path: string): Graph => {
-    let g = graphs.get(path);
-    if (!g) {
-      g = { entities: new Map(), undo: [], redo: [] };
-      graphs.set(path, g);
-    }
-    return g;
-  };
-  const apply = (graph: Graph, deltas: CommandDelta[]): CommandDelta[] => {
-    const inverse: CommandDelta[] = [];
-    for (const d of deltas) {
-      switch (d.kind) {
-        case "create":
-          graph.entities.set(d.record.id, { ...d.record });
-          inverse.unshift({ kind: "delete", record: { ...d.record } });
-          break;
-        case "update": {
-          const existing = graph.entities.get(d.id);
-          if (!existing) throw new Error(`update: entity not found: ${d.id}`);
-          graph.entities.set(d.id, { ...existing, body: d.after });
-          inverse.unshift({ kind: "update", id: d.id, before: d.after, after: d.before });
-          break;
-        }
-        case "delete":
-          graph.entities.delete(d.record.id);
-          inverse.unshift({ kind: "create", record: { ...d.record } });
-          break;
-      }
-    }
-    return inverse;
-  };
-  const forward = (graph: Graph, command: { tool: string; arguments: unknown }): CommandDelta[] => {
-    const args = (command.arguments ?? {}) as Record<string, unknown>;
-    const tool = command.tool;
-    if (
-      tool === "design.create_wall" ||
-      tool === "design.create_room" ||
-      tool === "design.create_floor" ||
-      tool === "design.place_door" ||
-      tool === "design.place_window" ||
-      tool === "design.add_light" ||
-      tool === "design.save_camera"
-    ) {
-      const entityId =
-        (args.entity_id as string | undefined) ??
-        `ent_${Math.random().toString(36).slice(2, 10)}`;
-      const kind = tool
-        .split(".")
-        .pop()!
-        .replace(/^(create_|place_|add_|save_)/, "");
-      return [
-        {
-          kind: "create",
-          record: {
-            id: entityId,
-            kind,
-            parent: (args.parent as string | undefined) ?? null,
-            body: { ...args },
-          },
-        },
-      ];
-    }
-    if (
-      tool === "design.delete_wall" ||
-      tool === "design.delete_opening" ||
-      tool === "design.remove_light" ||
-      tool === "design.delete_camera"
-    ) {
-      const id = args.entity_id as string | undefined;
-      if (!id) throw new Error(`${tool}: missing entity_id`);
-      const existing = graph.entities.get(id);
-      if (!existing) throw new Error(`${tool}: entity not found: ${id}`);
-      return [{ kind: "delete", record: { ...existing } }];
-    }
-    if (
-      tool === "design.move_wall" ||
-      tool === "design.modify_room" ||
-      tool === "design.modify_floor" ||
-      tool === "design.move_opening" ||
-      tool === "design.paint_material" ||
-      tool === "design.swap_finish" ||
-      tool === "design.update_camera"
-    ) {
-      const id = args.entity_id as string | undefined;
-      if (!id) throw new Error(`${tool}: missing entity_id`);
-      const existing = graph.entities.get(id);
-      if (!existing) throw new Error(`${tool}: entity not found: ${id}`);
-      const after = { ...(existing.body as Record<string, unknown>), ...args };
-      return [{ kind: "update", id, before: existing.body, after }];
-    }
-    if (tool === "design.set_lighting") {
-      // Audit-only command: mirrors
-      // `aec_command::engine::CommandEngine::compute_deltas`'s
-      // `SetLighting` arm, which returns zero `EntityDelta`s. The
-      // journal entry still gets pushed (forward = inverse = []),
-      // preserving the round-trip property for undo/redo without
-      // mutating the graph.
-      const presetId = args.preset_id as string | undefined;
-      if (!presetId || presetId.trim() === "") {
-        throw new Error("design.set_lighting: preset_id must not be empty");
-      }
-      return [];
-    }
-    throw new Error(`commandApply (renderer-fallback): unsupported tool: ${tool}`);
-  };
+  const graphs = new Map<string, InProcessGraph>();
 
   return {
     async apply(projectPath: string, command: unknown) {
-      const c = command as { command_id: string; tool: string; arguments: unknown };
-      const graph = ensure(projectPath);
-      const fwd = forward(graph, c);
-      const inv = apply(graph, fwd);
+      const c = command as Command;
+      const graph = ensureInProcessGraph(graphs, projectPath);
+      const fwd = computeForwardDeltas(graph, c);
+      const inv = applyDeltas(graph, fwd);
       graph.undo.push({ commandId: c.command_id, forward: fwd, inverse: inv });
       graph.redo.length = 0;
       return {
@@ -507,10 +397,10 @@ function commandMock() {
       };
     },
     async undo(projectPath: string, _activeScope: string) {
-      const graph = ensure(projectPath);
+      const graph = ensureInProcessGraph(graphs, projectPath);
       const entry = graph.undo.pop();
       if (!entry) throw new Error("command_undo: nothing to undo");
-      apply(graph, entry.inverse);
+      applyDeltas(graph, entry.inverse);
       graph.redo.push(entry);
       return {
         commandId: entry.commandId,
@@ -520,10 +410,10 @@ function commandMock() {
       };
     },
     async redo(projectPath: string, _activeScope: string) {
-      const graph = ensure(projectPath);
+      const graph = ensureInProcessGraph(graphs, projectPath);
       const entry = graph.redo.pop();
       if (!entry) throw new Error("command_redo: nothing to redo");
-      apply(graph, entry.forward);
+      applyDeltas(graph, entry.forward);
       graph.undo.push(entry);
       return {
         commandId: entry.commandId,
@@ -532,18 +422,19 @@ function commandMock() {
         redoLen: graph.redo.length,
       };
     },
-    async listGraph(projectPath: string, kindFilter?: string) {
-      const graph = ensure(projectPath);
-      const rows: Array<{ id: string; kind: string; parent: string | null; body: unknown }> = [];
+    async listGraph(projectPath: string, kindFilter?: string): Promise<EntityRecord[]> {
+      const graph = ensureInProcessGraph(graphs, projectPath);
+      const rows: EntityRecord[] = [];
       for (const r of graph.entities.values()) {
         if (kindFilter === undefined || r.kind === kindFilter) {
           rows.push({
             id: r.id,
             kind: r.kind,
             parent: r.parent,
-            body: r.body === null || r.body === undefined
-              ? r.body
-              : JSON.parse(JSON.stringify(r.body)),
+            body:
+              r.body === null || r.body === undefined
+                ? r.body
+                : JSON.parse(JSON.stringify(r.body)),
           });
         }
       }

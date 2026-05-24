@@ -655,6 +655,31 @@ interface EntityRecordJs {
   bodyJson: string;
 }
 
+/**
+ * Normalise a parsed `EntityRecord` so that `parent` is always
+ * `string | null` on the JS side.
+ *
+ * The Rust `EntityRecord.parent` is `Option<EntityId>` with
+ * `#[serde(default, skip_serializing_if = "Option::is_none")]`, so
+ * when an entity has no parent, `serde_json::to_string` omits the
+ * field entirely. `JSON.parse` then leaves `record.parent` as
+ * `undefined`, which violates the declared `EntityRecord.parent:
+ * string | null` shape and breaks any consumer doing `parent ===
+ * null` to identify root entities (walls, rooms, cameras, lights,
+ * floors). We coalesce missing/undefined to `null` so the native
+ * path matches the in-process path's invariant exactly.
+ */
+function normaliseEntityRecord<T extends { parent?: string | null }>(record: T): T {
+  return { ...record, parent: record.parent ?? null };
+}
+
+function normaliseEntityDelta(d: EntityDelta): EntityDelta {
+  if (d.kind === "create" || d.kind === "delete") {
+    return { ...d, record: normaliseEntityRecord(d.record) };
+  }
+  return d;
+}
+
 function decodeCommandApplyJs(r: CommandApplyResultJs): CommandApplyResult {
   return {
     commandId: r.commandId,
@@ -663,19 +688,19 @@ function decodeCommandApplyJs(r: CommandApplyResultJs): CommandApplyResult {
     // infallible in practice. We still guard with a clear error so
     // a future serde shape change surfaces here rather than at the
     // first downstream consumer.
-    applied: JSON.parse(r.appliedJson) as EntityDelta[],
+    applied: (JSON.parse(r.appliedJson) as EntityDelta[]).map(normaliseEntityDelta),
     undoLen: r.undoLen,
     redoLen: r.redoLen,
   };
 }
 
 function decodeEntityRecordJs(r: EntityRecordJs): EntityRecord {
-  return {
+  return normaliseEntityRecord({
     id: r.id,
     kind: r.kind,
     parent: r.parent,
     body: JSON.parse(r.bodyJson),
-  };
+  });
 }
 
 interface NativeApi {
@@ -1279,7 +1304,7 @@ export function inProcessBackend(): BridgeBackend {
     },
 
     async commandApply(projectPath, command) {
-      const graph = ensureGraph(graphs, projectPath);
+      const graph = ensureInProcessGraph(graphs, projectPath);
       const deltas = computeForwardDeltas(graph, command);
       const inverse = applyDeltas(graph, deltas);
       graph.undo.push({ commandId: command.command_id, forward: deltas, inverse });
@@ -1293,7 +1318,7 @@ export function inProcessBackend(): BridgeBackend {
     },
 
     async commandUndo(projectPath, _activeScope) {
-      const graph = ensureGraph(graphs, projectPath);
+      const graph = ensureInProcessGraph(graphs, projectPath);
       const entry = graph.undo.pop();
       if (!entry) {
         throw new Error("command_undo: nothing to undo");
@@ -1309,7 +1334,7 @@ export function inProcessBackend(): BridgeBackend {
     },
 
     async commandRedo(projectPath, _activeScope) {
-      const graph = ensureGraph(graphs, projectPath);
+      const graph = ensureInProcessGraph(graphs, projectPath);
       const entry = graph.redo.pop();
       if (!entry) {
         throw new Error("command_redo: nothing to redo");
@@ -1325,7 +1350,7 @@ export function inProcessBackend(): BridgeBackend {
     },
 
     async projectGraphList(projectPath, kindFilter) {
-      const graph = ensureGraph(graphs, projectPath);
+      const graph = ensureInProcessGraph(graphs, projectPath);
       const rows: EntityRecord[] = [];
       for (const r of graph.entities.values()) {
         if (kindFilter === undefined || r.kind === kindFilter) {
@@ -1356,13 +1381,16 @@ export function inProcessBackend(): BridgeBackend {
  * the renderer can exercise create / undo / redo end-to-end in
  * vitest without the `.node` artefact.
  */
-interface InProcessGraph {
+export interface InProcessGraph {
   entities: Map<string, EntityRecord>;
   undo: Array<{ commandId: string; forward: EntityDelta[]; inverse: EntityDelta[] }>;
   redo: Array<{ commandId: string; forward: EntityDelta[]; inverse: EntityDelta[] }>;
 }
 
-function ensureGraph(graphs: Map<string, InProcessGraph>, projectPath: string): InProcessGraph {
+export function ensureInProcessGraph(
+  graphs: Map<string, InProcessGraph>,
+  projectPath: string,
+): InProcessGraph {
   let g = graphs.get(projectPath);
   if (!g) {
     g = { entities: new Map(), undo: [], redo: [] };
@@ -1371,18 +1399,6 @@ function ensureGraph(graphs: Map<string, InProcessGraph>, projectPath: string): 
   return g;
 }
 
-/**
- * Compute the forward deltas for `command` against `graph`. Mirrors
- * the per-tool dispatch in `aec_command::engine::CommandEngine::compute_deltas`.
- *
- * The renderer currently only exercises a handful of design.*
- * commands; the rest are mapped through a single generic
- * "create-from-arguments" path that constructs a `kind = $tool`
- * entity from the `arguments` payload. That keeps the surface
- * call-compatible with the native backend even for tools the
- * fallback doesn't fully model — vitests that need richer semantics
- * either load the `.node` artefact or stub `commandApply` directly.
- */
 /**
  * Explicit kind map for the create-side tools. Each entry maps a
  * `design.*` tool name to the entity `kind` the Rust engine writes
@@ -1401,9 +1417,71 @@ const CREATE_TOOL_KIND_MAP: Record<string, string> = {
   "design.save_camera": "camera",
 };
 
-function computeForwardDeltas(graph: InProcessGraph, command: Command): EntityDelta[] {
-  const args = command.arguments as Record<string, unknown> | undefined;
-  switch (command.tool) {
+/**
+ * Strip the args object of any field used purely for routing /
+ * targeting (i.e. the lookup id, not part of the body). Mirrors the
+ * Rust engine's behaviour where `to_delta()` reads
+ * `target_entity_id` / `entity_id` from the command and never copies
+ * them into the entity body. Without this scrub, the in-process
+ * fallback would silently leak `entity_id` (and friends) into the
+ * `record.body` of newly-created entities — divergent from the
+ * native path where the body is constructed from the command struct
+ * via `serde_json::to_value(self)` which only emits the per-struct
+ * fields explicitly declared in the body.
+ */
+const NON_BODY_FIELDS_FOR_CREATE: Record<string, readonly string[]> = {
+  "design.create_wall": ["entity_id"],
+  "design.create_room": ["entity_id"],
+  "design.create_floor": ["entity_id"],
+  "design.place_door": ["entity_id"],
+  "design.place_window": ["entity_id"],
+  "design.add_light": ["entity_id"],
+  "design.save_camera": ["entity_id"],
+};
+
+function stripFields(
+  obj: Record<string, unknown>,
+  fields: readonly string[],
+): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...obj };
+  for (const f of fields) delete out[f];
+  return out;
+}
+
+function assertObjectBody(
+  body: unknown,
+  tool: string,
+): Record<string, unknown> {
+  if (body === null || typeof body !== "object" || Array.isArray(body)) {
+    throw new Error(`${tool}: stored entity body is not an object`);
+  }
+  return body as Record<string, unknown>;
+}
+
+/**
+ * Compute the forward deltas for `command` against `graph`.
+ *
+ * Each branch mirrors the corresponding `to_delta()` in
+ * `aec_command::commands::*` — the in-process fallback is a real
+ * working reimplementation that keeps body shape, identity-field
+ * naming (e.g. PaintMaterial's `target_entity_id` vs MoveWall's
+ * `entity_id`), and surgical update semantics in lock-step with the
+ * native path. This is enforced by the renderer-backend tests
+ * (which exercise this code directly) plus the Rust integration
+ * tests (`crates/aec_bridge::service::tests::command_*`).
+ *
+ * Exported so the renderer-side vitest fallback
+ * (`renderer-backend.ts`) can share the same implementation — the
+ * single-source-of-truth approach prevents drift between bridge.ts
+ * and renderer-backend.ts that an earlier draft of this engine
+ * had (Devin Review round 3, ANALYSIS_0003).
+ */
+export function computeForwardDeltas(graph: InProcessGraph, command: Command): EntityDelta[] {
+  const args = (command.arguments as Record<string, unknown> | undefined) ?? {};
+  const tool = command.tool;
+  switch (tool) {
+    // --- Create-side tools: emit a Create delta with body = command
+    //     struct minus the routing-only `entity_id` field.
     case "design.create_wall":
     case "design.create_room":
     case "design.create_floor":
@@ -1411,64 +1489,176 @@ function computeForwardDeltas(graph: InProcessGraph, command: Command): EntityDe
     case "design.place_window":
     case "design.add_light":
     case "design.save_camera": {
-      const entityId = (args?.entity_id as string | undefined) ?? randomId();
-      const kind = CREATE_TOOL_KIND_MAP[command.tool];
+      const entityId = (args.entity_id as string | undefined) ?? randomId();
+      const kind = CREATE_TOOL_KIND_MAP[tool];
       if (!kind) {
-        throw new Error(`commandApply (in-process): kind map missing entry for ${command.tool}`);
+        throw new Error(`commandApply (in-process): kind map missing entry for ${tool}`);
       }
+      const nonBody = NON_BODY_FIELDS_FOR_CREATE[tool] ?? ["entity_id"];
+      // Openings (doors/windows) hang off the host wall in the Rust
+      // engine (`PlaceDoor::to_delta` sets `parent: Some(host_wall_id)`).
+      const parent =
+        tool === "design.place_door" || tool === "design.place_window"
+          ? ((args.host_wall_id as string | undefined) ?? null)
+          : ((args.parent as string | undefined) ?? null);
       return [
         {
           kind: "create",
           record: {
             id: entityId,
             kind,
-            parent: (args?.parent as string | undefined) ?? null,
-            body: { ...(args ?? {}) },
+            parent,
+            body: stripFields(args, nonBody),
           },
         },
       ];
     }
+
+    // --- Delete-side tools.
     case "design.delete_wall":
     case "design.delete_opening":
     case "design.remove_light":
     case "design.delete_camera": {
-      const id = args?.entity_id as string | undefined;
-      if (!id) throw new Error(`${command.tool}: missing entity_id`);
+      const id = args.entity_id as string | undefined;
+      if (!id) throw new Error(`${tool}: missing entity_id`);
       const existing = graph.entities.get(id);
-      if (!existing) throw new Error(`${command.tool}: entity not found: ${id}`);
+      if (!existing) throw new Error(`${tool}: entity not found: ${id}`);
       return [{ kind: "delete", record: { ...existing } }];
     }
-    case "design.move_wall":
-    case "design.modify_room":
-    case "design.modify_floor":
-    case "design.move_opening":
-    case "design.paint_material":
-    case "design.swap_finish":
-    case "design.update_camera": {
-      const id = args?.entity_id as string | undefined;
-      if (!id) throw new Error(`${command.tool}: missing entity_id`);
+
+    // --- design.move_wall: update body.start_mm + body.end_mm.
+    case "design.move_wall": {
+      const id = args.entity_id as string | undefined;
+      if (!id) throw new Error(`${tool}: missing entity_id`);
       const existing = graph.entities.get(id);
-      if (!existing) throw new Error(`${command.tool}: entity not found: ${id}`);
-      const after = { ...(existing.body as Record<string, unknown>), ...(args ?? {}) };
+      if (!existing) throw new Error(`${tool}: entity not found: ${id}`);
+      const body = assertObjectBody(existing.body, tool);
+      const after = {
+        ...body,
+        start_mm: args.new_start_mm,
+        end_mm: args.new_end_mm,
+      };
       return [{ kind: "update", id, before: existing.body, after }];
     }
+
+    // --- design.modify_room: update body.name (if present) + merge wall_ids.
+    case "design.modify_room": {
+      const id = args.entity_id as string | undefined;
+      if (!id) throw new Error(`${tool}: missing entity_id`);
+      const existing = graph.entities.get(id);
+      if (!existing) throw new Error(`${tool}: entity not found: ${id}`);
+      const body = assertObjectBody(existing.body, tool);
+      const after: Record<string, unknown> = { ...body };
+      if (typeof args.name === "string") {
+        after.name = args.name;
+      }
+      const existingWalls = Array.isArray(body.wall_ids)
+        ? (body.wall_ids as string[]).slice()
+        : [];
+      const remove = (args.remove_wall_ids as string[] | undefined) ?? [];
+      const add = (args.add_wall_ids as string[] | undefined) ?? [];
+      const merged = existingWalls.filter((w) => !remove.includes(w));
+      for (const w of add) if (!merged.includes(w)) merged.push(w);
+      after.wall_ids = merged;
+      return [{ kind: "update", id, before: existing.body, after }];
+    }
+
+    // --- design.modify_floor: surgical updates to boundary_mm /
+    //     thickness_mm / material_id (only when the corresponding
+    //     `new_*` field is provided, per Rust semantics).
+    case "design.modify_floor": {
+      const id = args.entity_id as string | undefined;
+      if (!id) throw new Error(`${tool}: missing entity_id`);
+      const existing = graph.entities.get(id);
+      if (!existing) throw new Error(`${tool}: entity not found: ${id}`);
+      const body = assertObjectBody(existing.body, tool);
+      const after: Record<string, unknown> = { ...body };
+      if (args.new_boundary_mm !== undefined) after.boundary_mm = args.new_boundary_mm;
+      if (args.new_thickness_mm !== undefined) after.thickness_mm = args.new_thickness_mm;
+      if (args.new_material_id !== undefined) after.material_id = args.new_material_id;
+      return [{ kind: "update", id, before: existing.body, after }];
+    }
+
+    // --- design.move_opening: update body.position_along_wall_mm.
+    case "design.move_opening": {
+      const id = args.entity_id as string | undefined;
+      if (!id) throw new Error(`${tool}: missing entity_id`);
+      const existing = graph.entities.get(id);
+      if (!existing) throw new Error(`${tool}: entity not found: ${id}`);
+      const body = assertObjectBody(existing.body, tool);
+      const after = {
+        ...body,
+        position_along_wall_mm: args.new_position_along_wall_mm,
+      };
+      return [{ kind: "update", id, before: existing.body, after }];
+    }
+
+    // --- design.paint_material: lookup by `target_entity_id` (not
+    //     `entity_id`) because PaintMaterial is conceptually applied
+    //     *to* a wall/floor/room. Update body.material_id (whole-entity)
+    //     or body.surface_materials[surface] (per-surface).
+    case "design.paint_material": {
+      const id = args.target_entity_id as string | undefined;
+      if (!id) throw new Error(`${tool}: missing target_entity_id`);
+      const existing = graph.entities.get(id);
+      if (!existing) throw new Error(`${tool}: entity not found: ${id}`);
+      const materialId = args.material_id as string | undefined;
+      if (!materialId || materialId.trim() === "") {
+        throw new Error(`${tool}: material_id must not be empty`);
+      }
+      const body = assertObjectBody(existing.body, tool);
+      const after: Record<string, unknown> = { ...body };
+      const surface = args.surface as string | undefined;
+      if (surface === undefined || surface === null) {
+        after.material_id = materialId;
+      } else {
+        const surfaces = { ...((body.surface_materials as Record<string, unknown> | undefined) ?? {}) };
+        surfaces[surface] = materialId;
+        after.surface_materials = surfaces;
+      }
+      return [{ kind: "update", id, before: existing.body, after }];
+    }
+
+    // --- design.swap_finish: equivalent to PaintMaterial with
+    //     `material_id = to_material_id` and no surface (per
+    //     `SwapFinish::to_paint()`).
+    case "design.swap_finish": {
+      const id = args.target_entity_id as string | undefined;
+      if (!id) throw new Error(`${tool}: missing target_entity_id`);
+      const existing = graph.entities.get(id);
+      if (!existing) throw new Error(`${tool}: entity not found: ${id}`);
+      const body = assertObjectBody(existing.body, tool);
+      const after: Record<string, unknown> = { ...body, material_id: args.to_material_id };
+      return [{ kind: "update", id, before: existing.body, after }];
+    }
+
+    // --- design.update_camera: replace body.params with the new
+    //     CameraParams value (matches Rust's `obj.insert("params", …)`).
+    case "design.update_camera": {
+      const id = args.entity_id as string | undefined;
+      if (!id) throw new Error(`${tool}: missing entity_id`);
+      const existing = graph.entities.get(id);
+      if (!existing) throw new Error(`${tool}: entity not found: ${id}`);
+      const body = assertObjectBody(existing.body, tool);
+      const after: Record<string, unknown> = { ...body, params: args.params };
+      return [{ kind: "update", id, before: existing.body, after }];
+    }
+
+    // --- design.set_lighting: audit-only command. Mirrors
+    //     `aec_command::engine::CommandEngine::compute_deltas`'s
+    //     `SetLighting` arm which returns zero `EntityDelta`s. The
+    //     journal entry is still recorded (forward = inverse = []), so
+    //     undo/redo cycle counts stay in sync with the native backend.
     case "design.set_lighting": {
-      // Mirror the Rust engine: lighting preset is captured as audit-only
-      // state with **zero** entity deltas (see
-      // `aec_command::engine::CommandEngine::compute_deltas`'s `SetLighting`
-      // arm). Producing an Update here would let the in-process fallback
-      // silently diverge from the native backend's undo/redo semantics —
-      // undoing a SetLighting must be a no-op against the graph, not a
-      // body revert. We still validate `preset_id` so a missing field
-      // surfaces at apply-time rather than as a silent shadow.
-      const presetId = args?.preset_id as string | undefined;
+      const presetId = args.preset_id as string | undefined;
       if (!presetId || presetId.trim() === "") {
         throw new Error("design.set_lighting: preset_id must not be empty");
       }
       return [];
     }
+
     default:
-      throw new Error(`commandApply (in-process): unsupported tool: ${command.tool}`);
+      throw new Error(`commandApply (in-process): unsupported tool: ${tool}`);
   }
 }
 
@@ -1483,7 +1673,7 @@ function computeForwardDeltas(graph: InProcessGraph, command: Command): EntityDe
  *   • Update   ↔ Update with `before` / `after` swapped
  *   • Delete   ↔ Create
  */
-function applyDeltas(graph: InProcessGraph, deltas: EntityDelta[]): EntityDelta[] {
+export function applyDeltas(graph: InProcessGraph, deltas: EntityDelta[]): EntityDelta[] {
   const inverse: EntityDelta[] = [];
   for (const d of deltas) {
     switch (d.kind) {
