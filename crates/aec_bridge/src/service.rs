@@ -144,7 +144,13 @@ pub struct EngineStatusReport {
 /// `undefined` on a status pane.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BimImportSummary {
-    /// Canonicalised path the user pointed at.
+    /// Canonical absolute path to the IFC file (`std::fs::canonicalize`
+    /// applied to whatever the user pointed at). The TS renderer
+    /// displays this verbatim, and downstream consumers (the future
+    /// PR-L snapshot cache, dedup helpers) key on it — so callers can
+    /// trust the value is symlink-resolved and free of `./` / `..`
+    /// segments. On Windows the result is the verbatim `\\?\C:\...`
+    /// form per the platform's canonicalisation rules.
     pub path: String,
     /// IFC schema version recovered from `FILE_SCHEMA`, rendered
     /// via the `IfcSchema` enum's `Display` impl — the canonical
@@ -573,9 +579,20 @@ impl BridgeService {
         // failing the import.
         let bytes = std::fs::read(Path::new(path))?;
         let body = String::from_utf8_lossy(&bytes).into_owned();
+        // Canonicalise after the read succeeds so a non-existent path
+        // surfaces as the same `Io` error the read itself would have
+        // produced (rather than two different code paths for missing
+        // file). `cache_key` at line ≈249 follows the same pattern
+        // for the engine-status cache. The renderer-facing
+        // `BimImportSummary.path` field documents this canonical form
+        // so downstream consumers (PR-L snapshot cache, dedup) can
+        // trust it.
+        let canonical_path = std::fs::canonicalize(Path::new(path))?
+            .to_string_lossy()
+            .into_owned();
         let snapshot = aec_bim::ifc::IfcReader::from_string(&body)?;
         Ok(BimImportSummary {
-            path: path.to_string(),
+            path: canonical_path,
             // `Display` returns the canonical STEP token
             // (`"IFC2X3"` / `"IFC4"` / `"IFC4X3"`) — a stable
             // contract for the renderer's "Import BIM" panel.
@@ -988,5 +1005,56 @@ END-ISO-10303-21;\n",
         // The project entity parsed (spatial_nodes >= 1 means the
         // structural parse survived the lossy-decoded byte).
         assert!(summary.spatial_nodes >= 1);
+    }
+
+    #[test]
+    fn bim_import_ifc_returns_canonical_path() {
+        // The `BimImportSummary.path` doc commits to "Canonical
+        // absolute path" — verify the implementation honours that by
+        // pointing the importer at a non-canonical form (a `./`
+        // segment) and asserting the returned path matches
+        // `std::fs::canonicalize` on the same input. The future PR-L
+        // snapshot cache will key on this field, so the contract has
+        // to hold up.
+        let (s, _g) = service();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("canonical.ifc");
+        let body = b"ISO-10303-21;\n\
+HEADER;\n\
+FILE_DESCRIPTION(('test'),'2;1');\n\
+FILE_NAME('t.ifc','2026-05-20T00:00:00',(''),(''),'','','');\n\
+FILE_SCHEMA(('IFC4'));\n\
+ENDSEC;\n\
+DATA;\n\
+#1 = IFCOWNERHISTORY($,$,$,.NOCHANGE.,$,$,$,1747699200);\n\
+#2 = IFCPROJECT('00000000000000000000a1',#1,'P','P',$,$,$,$,$);\n\
+ENDSEC;\n\
+END-ISO-10303-21;\n";
+        std::fs::write(&path, body).unwrap();
+
+        // Build a non-canonical path with a `./` segment so the input
+        // and the canonical form differ on every platform.
+        let parent = tmp.path();
+        let file_name = path.file_name().unwrap();
+        let non_canonical: PathBuf = parent.join(".").join(file_name);
+        let summary = s
+            .bim_import_ifc(non_canonical.to_str().unwrap())
+            .expect("valid IFC body must parse");
+
+        let expected = std::fs::canonicalize(&non_canonical)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            summary.path, expected,
+            "BimImportSummary.path must be canonicalised per the docstring contract"
+        );
+        // Sanity: the canonical form does NOT include the `/./`
+        // segment we injected (proves canonicalize actually ran).
+        assert!(
+            !summary.path.contains("/./") && !summary.path.contains("\\.\\"),
+            "canonical path must not contain '.' segments: {}",
+            summary.path
+        );
     }
 }
