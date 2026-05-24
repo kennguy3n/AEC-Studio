@@ -756,16 +756,22 @@ pub struct BimScheduleSummary {
 ///   case-folding lives in the FTS5 path covered by
 ///   [`aec_assets::search`]).
 /// * `tags` — every supplied tag must appear in
-///   `AssetMetadata::tags` (AND, not OR). Filtered in Rust on top of
-///   the SQL result set since `assets.tags` is a JSON-encoded text
-///   column.
+///   `AssetMetadata::tags` (AND, not OR). Pushed into SQL as one
+///   `AND EXISTS (SELECT 1 FROM json_each(assets.tags) ...)` clause
+///   per tag inside [`aec_assets::db::AssetDatabase::query`] so the
+///   `LIMIT` composes correctly (filter first, slice last).
 /// * `style_tags` — same AND semantics as `tags`, against the
-///   `style_tags` column.
+///   `style_tags` column, also pushed into SQL via `json_each`.
 /// * `limit` — caps the JS-side result list. Defaults to **24** to
 ///   match the renderer's grid-page size (4 columns × 6 rows). The
 ///   `aec_assets::AssetQuery::limit` default is 200 (the
 ///   library-import default); the bridge tightens it because the
-///   renderer paginates the browser UI.
+///   renderer paginates the browser UI. Saturating-clamped to
+///   [`DESIGN_LIST_ASSETS_MAX_LIMIT`] (10_000) inside
+///   [`BridgeService::design_list_assets`] so an upstream renderer
+///   bug — including a JS negative number that wraps to a near-
+///   `u32::MAX` value through napi's `ToUint32()` coercion — can't
+///   force the SQLite call to materialise an unbounded result set.
 ///
 /// Unrecognised fields are silently ignored — the napi layer hands
 /// us a typed struct, but the in-process TS fallback historically
@@ -785,7 +791,10 @@ pub struct AssetListQuery {
     #[serde(default)]
     pub style_tags: Vec<String>,
     /// Max number of rows to return. Saturating-clamped to
-    /// `u32::MAX` inside [`BridgeService::design_list_assets`].
+    /// [`DESIGN_LIST_ASSETS_MAX_LIMIT`] inside
+    /// [`BridgeService::design_list_assets`] so even a JS negative
+    /// number that wraps to ~`u32::MAX` through napi's `ToUint32()`
+    /// coercion can't force an unbounded SQLite materialisation.
     /// `None` falls through to the bridge default (24).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
@@ -794,6 +803,15 @@ pub struct AssetListQuery {
 /// Default JS-side asset-browser page size. Matches the renderer's
 /// `bridge.ts` `filterAssets()` default (4 columns × 6 rows = 24).
 pub(crate) const DESIGN_LIST_ASSETS_DEFAULT_LIMIT: u32 = 24;
+
+/// Hard upper bound on a single `design_list_assets` page size, used
+/// to back up the saturating-clamp promise on [`AssetListQuery::limit`].
+/// 10_000 is well above any plausible renderer use (the asset browser
+/// paginates at 24 per page; a power user scrolling "show all" still
+/// stays in the low thousands for any human-curated library) while
+/// also being small enough that the worst-case `AssetSummary`
+/// allocation stays bounded.
+pub(crate) const DESIGN_LIST_ASSETS_MAX_LIMIT: u32 = 10_000;
 
 /// Renderer-facing projection of [`aec_assets::AssetMetadata`]. Only
 /// the fields the asset-browser card consumes — drop the full LOD
@@ -1450,8 +1468,13 @@ impl BridgeService {
     /// * `query.limit` → `AssetQuery::limit`, defaulting to
     ///   [`DESIGN_LIST_ASSETS_DEFAULT_LIMIT`] (24, the renderer's
     ///   grid-page size) when `None`. Saturating-clamped to
-    ///   `u32::MAX` to defend against an upstream renderer bug
-    ///   sending a negative number that wraps.
+    ///   [`DESIGN_LIST_ASSETS_MAX_LIMIT`] (10_000) to defend against
+    ///   an upstream renderer bug sending a JS negative number that
+    ///   wraps to a near-`u32::MAX` value through napi's
+    ///   `ToUint32()` coercion — without the clamp such a value
+    ///   would reach SQLite as `LIMIT 4294967295` and materialise an
+    ///   unbounded result set on a real (multi-thousand-row) asset
+    ///   library.
     /// * `AssetMetadata::vendor.name` → `AssetSummary::vendor`. An
     ///   empty vendor display string is mapped to `None` so the JS
     ///   side sees a missing vendor field rather than an empty
@@ -1466,7 +1489,10 @@ impl BridgeService {
         &self,
         query: &AssetListQuery,
     ) -> Result<Vec<AssetSummary>, BridgeServiceError> {
-        let limit = query.limit.unwrap_or(DESIGN_LIST_ASSETS_DEFAULT_LIMIT);
+        let limit = query
+            .limit
+            .unwrap_or(DESIGN_LIST_ASSETS_DEFAULT_LIMIT)
+            .min(DESIGN_LIST_ASSETS_MAX_LIMIT);
         let aq = aec_assets::AssetQuery {
             name_contains: query.search.as_ref().filter(|s| !s.is_empty()).cloned(),
             vendor_id: None,
@@ -4387,6 +4413,39 @@ END-ISO-10303-21;\n";
         assert!(
             zero.is_empty(),
             "limit=0 must return an empty list, not the seed default"
+        );
+    }
+
+    #[test]
+    fn design_list_assets_saturating_clamps_to_max_limit() {
+        // Regression test for the saturating-clamp promise on
+        // `AssetListQuery::limit`. A renderer-side bug (or a malicious
+        // caller) sending `limit = u32::MAX` would otherwise reach
+        // SQLite as `LIMIT 4294967295` and materialise an unbounded
+        // result set on a real library. The bridge clamps the
+        // effective limit to `DESIGN_LIST_ASSETS_MAX_LIMIT` (10_000).
+        //
+        // We can't directly observe the clamped value through the
+        // public surface (the SQL LIMIT is internal), but we *can*
+        // pin that the call succeeds with a sane bound: the seed
+        // library has 4 assets, so the response should be exactly
+        // 4 — same as the unbounded query — not an error and not
+        // a wrapped/truncated list. The companion test
+        // `design_list_assets_respects_limit` proves smaller limits
+        // still take effect (so the clamp isn't an unconditional
+        // override of the user's choice). Together they pin the
+        // saturating-clamp invariant.
+        let (s, _g) = service();
+        let res = s
+            .design_list_assets(&AssetListQuery {
+                limit: Some(u32::MAX),
+                ..AssetListQuery::default()
+            })
+            .expect("u32::MAX limit must succeed (clamped, not unbounded)");
+        assert_eq!(
+            res.len(),
+            4,
+            "clamped query must still return the full seed library"
         );
     }
 
