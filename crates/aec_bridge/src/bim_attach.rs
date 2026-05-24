@@ -223,6 +223,7 @@ pub(crate) fn attach_snapshot(
             guid,
             &now,
             &node.class,
+            &snapshot.properties,
         )?;
         match outcome {
             UpsertOutcome::Inserted => counts.spatial_nodes_inserted += 1,
@@ -282,6 +283,7 @@ pub(crate) fn attach_snapshot(
                 guid,
                 &now,
                 &class,
+                &snapshot.properties,
             )?;
             match outcome {
                 UpsertOutcome::Inserted => counts.elements_inserted += 1,
@@ -312,11 +314,26 @@ pub(crate) fn attach_snapshot(
     // updated snapshot doesn't accumulate stale `bim/pset/*` rows. We
     // wipe at element granularity (one DELETE per entity_id) rather
     // than a bulk DELETE so the SQL trace is auditable per element.
-    let touched_entities: Vec<EntityId> = bfs_order
-        .iter()
-        .map(|(_, id)| id.clone())
-        .chain(seen_elements.iter().cloned())
-        .collect();
+    //
+    // Compose the wipe set from THREE sources, deliberately wider than
+    // strictly necessary for today's reader:
+    //   1. Every spatial node we just visited (`bfs_order`).
+    //   2. Every element we just visited (`seen_elements`).
+    //   3. Every entity the snapshot's `PropertyStore` carries.
+    //
+    // (3) defends against a future reader change that adds Psets to
+    // entities outside the spatial tree (e.g. type-object properties
+    // from `IfcRelDefinesByType`). Without it, `write_psets` would
+    // hit a primary-key conflict on the bare `INSERT INTO components`
+    // (no ON CONFLICT clause) the first time such a row showed up
+    // after a prior attach. Wiping them here keeps the SQL contract
+    // sound regardless of how the reader's property graph evolves.
+    let mut touched_entities: HashSet<EntityId> = HashSet::new();
+    for (_, id) in &bfs_order {
+        touched_entities.insert(id.clone());
+    }
+    touched_entities.extend(seen_elements.iter().cloned());
+    touched_entities.extend(snapshot.properties.iter().map(|(id, _)| id.clone()));
     for entity_id in &touched_entities {
         tx.execute(
             "DELETE FROM components WHERE entity_id = ?1 AND kind LIKE 'bim/%'",
@@ -350,18 +367,27 @@ fn upsert_entity(
     guid: Option<&str>,
     now_rfc3339: &str,
     class: &IfcClass,
+    properties: &PropertyStore,
 ) -> Result<UpsertOutcome, BridgeServiceError> {
     let geom_hash = blake3_hex(body_json.as_bytes());
     let class_hash = blake3_hex(class.ifc_tag().as_bytes());
-    // Pset hash is bound to the *entity* not the snapshot. We can't
-    // compute the full pset hash until we know which Psets attach to
-    // this entity (that happens later in `write_psets`), so use a
-    // placeholder here and let a future v3 schema migration add a
-    // separate `pset_hash` update pass. The dedup check below
-    // therefore relies on `geom_hash + class_hash` only — sufficient
-    // to detect every body or class change that matters for the
-    // entities-table state.
-    let pset_hash = String::new();
+    // Compute the per-entity Pset/Qto hash by serialising the entity's
+    // `ElementProperties` (a struct of two `BTreeMap`s — Psets and
+    // Qtos — deterministically ordered) into JSON and hashing the
+    // bytes. This makes the dedup check sensitive to Pset / Qto
+    // changes (e.g. a wall's `LoadBearing` flag flipping) so a
+    // re-attach that only touches Psets is correctly classified as
+    // `Updated`, not `Unchanged`. An entity with no properties hashes
+    // the empty `ElementProperties::default()`, so the value is
+    // stable across attaches that don't attach Psets at all.
+    let pset_hash = match properties.get(entity_id) {
+        Some(ep) => blake3_hex(
+            serde_json::to_string(ep)
+                .map_err(|e| BridgeServiceError::Bim(e.to_string()))?
+                .as_bytes(),
+        ),
+        None => blake3_hex(b""),
+    };
 
     // Look up the bim_cache row by GUID first (most common: file has
     // GUIDs and the dedup index hits). Fall back to entity_id only
@@ -386,8 +412,10 @@ fn upsert_entity(
     };
 
     let outcome = match existing {
-        Some((existing_geom, _existing_pset, existing_class))
-            if existing_geom == geom_hash && existing_class == class_hash =>
+        Some((existing_geom, existing_pset, existing_class))
+            if existing_geom == geom_hash
+                && existing_class == class_hash
+                && existing_pset == pset_hash =>
         {
             // True no-op: hashes match, just bump last_seen so the
             // dedup index reflects the most recent attach time. Don't

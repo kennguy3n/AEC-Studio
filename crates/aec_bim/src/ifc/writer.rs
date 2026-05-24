@@ -612,9 +612,23 @@ DATA;\n";
                     (direct_mat_ref, String::new())
                 };
                 let rel = buf.alloc();
+                // GUID seed: append `::{usage_tag}` ONLY when usage
+                // metadata is present. Unconditionally appending
+                // `::` (even with an empty suffix) would change every
+                // pre-existing material rel's GUID across the
+                // writer-version boundary, silently breaking the
+                // byte-identical cross-version round-trip guarantee
+                // for files without `IfcMaterialLayerSetUsage`
+                // (the common case — AEC-Studio's own exports prior
+                // to this PR never carried per-wall offsets).
                 let rel_guid = derive_guid_from_str(&format!(
-                    "rel-mat::{kind}::{name}::{usage_tag}",
+                    "rel-mat::{kind}::{name}{usage_suffix}",
                     kind = if is_layer_set { "set" } else { "single" },
+                    usage_suffix = if usage_tag.is_empty() {
+                        String::new()
+                    } else {
+                        format!("::{usage_tag}")
+                    },
                 ));
                 buf.write_line(
                     rel,

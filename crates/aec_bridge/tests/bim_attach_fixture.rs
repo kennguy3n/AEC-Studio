@@ -105,11 +105,17 @@ fn small_office_fixture_attaches_into_project_graph() {
     // Material assignments: 5 (one per element — 2 walls via usage
     // indirection, 1 slab single, 2 columns/beam single).
     assert_eq!(preview.material_assignments, 5);
-    // The fixture has 1 Pset (`Pset_WallCommon`) shared across 2
-    // walls via one `IfcRelDefinesByProperties` relation; the reader
-    // counts per-relation, so 1 (see reader.rs ≈660).
-    assert_eq!(preview.psets, 1);
-    // Likewise 1 Qto via one relation.
+    // The fixture has 2 Psets: `Pset_WallCommon` on the two walls
+    // via one `IfcRelDefinesByProperties` relation, plus
+    // `Pset_SpaceCommon` on the two IfcSpaces via a second
+    // relation. The Space pset is deliberate — it's the
+    // Revit / ArchiCAD pattern that previously triggered an FK
+    // violation on re-attach (spatial nodes had non-deterministic
+    // `EntityId::new()` ids that didn't match the previously
+    // persisted row when components were re-inserted). See
+    // `crates/aec_core/src/types.rs::EntityId::from_guid_seed`.
+    assert_eq!(preview.psets, 2);
+    // 1 Qto via one relation.
     assert_eq!(preview.qsets, 1);
     // File size < threshold.
     assert!(!preview.large_file_warning);
@@ -152,4 +158,28 @@ fn small_office_fixture_attaches_into_project_graph() {
     assert_eq!(reattach.elements_inserted, 0);
     assert_eq!(reattach.elements_updated, 0);
     assert_eq!(reattach.elements_unchanged, 5);
+
+    // 4. Pset-only change: rewrite the fixture with a flipped
+    //    `LoadBearing` value on `Pset_WallCommon` (IFCBOOLEAN(.T.) →
+    //    IFCBOOLEAN(.F.)) and re-attach. The dedup classifier must
+    //    report at least one entity as `_updated` rather than
+    //    silently leaving it as `_unchanged`. Pre-fix the `pset_hash`
+    //    was a placeholder empty string and the classifier ignored
+    //    Pset changes; post-fix it hashes `ElementProperties`
+    //    serde-serialised, so a flipped Pset value flips the hash
+    //    and lifts the row from Unchanged → Updated.
+    let pset_changed = std::str::from_utf8(FIXTURE_BYTES).unwrap().replace(
+        "IFCPROPERTYSINGLEVALUE('LoadBearing',$,IFCBOOLEAN(.T.),$);",
+        "IFCPROPERTYSINGLEVALUE('LoadBearing',$,IFCBOOLEAN(.F.),$);",
+    );
+    let pset_changed_path = ifc_dir.path().join("small_office_pset_changed.ifc");
+    std::fs::write(&pset_changed_path, pset_changed.as_bytes()).unwrap();
+    let pset_changed_path_str = pset_changed_path.to_string_lossy().into_owned();
+    let pset_attach = s
+        .bim_attach_ifc(&project.path, &pset_changed_path_str)
+        .unwrap();
+    assert!(
+        pset_attach.elements_updated >= 1,
+        "Pset-only change must produce at least one Updated element, got {pset_attach:?}",
+    );
 }
