@@ -668,7 +668,18 @@ impl BridgeService {
         // trust it.
         let canonical_path_buf = std::fs::canonicalize(Path::new(path))?;
         let canonical_path = canonical_path_buf.to_string_lossy().into_owned();
-        let snapshot = aec_bim::ifc::IfcReader::from_string(&body)?;
+        // Wrap the parsed snapshot in `Arc` immediately so the cache
+        // insert can use `Arc::clone` (refcount bump, microseconds)
+        // rather than a full `IfcSnapshot::clone` (deep-copies every
+        // `PropertyStore` / `ClassificationStore` / `MaterialStore` /
+        // `guid_by_entity` entry — on a 50–500 MB federated IFC that's
+        // 100+ MB of heap traffic, temporarily doubling peak memory
+        // and defeating the very point of the cache as stated in
+        // `snapshot_cache.rs`'s module docs).
+        //
+        // All subsequent reads in this function (`.schema`,
+        // `.stats.*`) go through `Arc::deref` automatically.
+        let snapshot = Arc::new(aec_bim::ifc::IfcReader::from_string(&body)?);
         // Populate the snapshot cache so a follow-up
         // `bim_attach_ifc` for the same file doesn't have to re-parse.
         // The cache key is `(canonical_path, mtime, size)` — a file
@@ -676,7 +687,7 @@ impl BridgeService {
         // mtime / new size), forcing a re-parse, so we never serve a
         // stale snapshot.
         if let Ok(key) = SnapshotKey::from_canonical_path(&canonical_path_buf) {
-            self.snapshot_cache.insert(key, Arc::new(snapshot.clone()));
+            self.snapshot_cache.insert(key, Arc::clone(&snapshot));
         }
         // If the SnapshotKey::from_canonical_path call failed,
         // `metadata` errored even though `canonicalize` succeeded a
