@@ -1689,20 +1689,13 @@ END-ISO-10303-21;\n";
         // produces the same `EntityId`s on every parse (via
         // `EntityId::from_guid_seed`, which the reader uses for
         // GUID-bearing spatial rows).
-        let project_id =
-            aec_core::types::EntityId::from_guid_seed("00000000000000000000a1");
-        let site_id =
-            aec_core::types::EntityId::from_guid_seed("00000000000000000000a2");
-        let building_id =
-            aec_core::types::EntityId::from_guid_seed("00000000000000000000a3");
-        let storey_l1_id =
-            aec_core::types::EntityId::from_guid_seed("00000000000000000000a4");
-        let storey_l2_id =
-            aec_core::types::EntityId::from_guid_seed("00000000000000000000bd");
-        let wall_id = aec_core::types::EntityId::from_string(
-            "ent_aabbccddeeff00112233445566778899",
-        )
-        .unwrap();
+        let project_id = aec_core::types::EntityId::from_guid_seed("00000000000000000000a1");
+        let site_id = aec_core::types::EntityId::from_guid_seed("00000000000000000000a2");
+        let building_id = aec_core::types::EntityId::from_guid_seed("00000000000000000000a3");
+        let storey_l1_id = aec_core::types::EntityId::from_guid_seed("00000000000000000000a4");
+        let storey_l2_id = aec_core::types::EntityId::from_guid_seed("00000000000000000000bd");
+        let wall_id =
+            aec_core::types::EntityId::from_string("ent_aabbccddeeff00112233445566778899").unwrap();
 
         // Helper: build a Project graph with the given storey-id and
         // serialize to STEP via `IfcWriter`.
