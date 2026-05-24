@@ -1,6 +1,10 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import {
+  BUILT_IN_PRESET_IDS,
   NATIVE_FALLBACK_METHODS,
   NATIVE_WIRED_METHODS,
   inProcessBackend,
@@ -32,5 +36,54 @@ describe("bridge catalogue", () => {
     const wired = new Set<string>(NATIVE_WIRED_METHODS);
     const overlap = NATIVE_FALLBACK_METHODS.filter((k) => wired.has(k));
     expect(overlap).toEqual([]);
+  });
+
+  /**
+   * Cross-language pin for the built-in render preset ids — see the
+   * doc comment on `BUILT_IN_PRESET_IDS` in `bridge.ts` and the
+   * companion Rust integration test
+   * `crates/aec_render/tests/preset_ids.rs`. The fixture
+   * `crates/aec_render/tests/preset_ids.json` is regenerated from
+   * `RenderPreset::defaults()` via:
+   *
+   *   AEC_UPDATE_PRESET_IDS=1 cargo test -p aec_render --test preset_ids
+   *
+   * If this test fails, the TS-side `BUILT_IN_PRESET_IDS` constant
+   * drifted from the Rust source of truth. Add or remove the missing
+   * id (in the constant *and* in the renderer-side preset selector)
+   * to bring it back into lockstep.
+   */
+  it("BUILT_IN_PRESET_IDS matches the native RenderPresetStore", () => {
+    // Resolve the fixture relative to the Cargo workspace root rather
+    // than relying on a brittle `../../../../../` traversal. The
+    // workspace root is the nearest ancestor of `__dirname` that
+    // contains `Cargo.toml`. This stays correct if either this test
+    // file or the fixture file is ever moved within the workspace —
+    // the only assumption is that both live under the same Cargo
+    // workspace, which is enforced by every other Rust integration
+    // test in the repo. Mirrors the Rust side's
+    // `env!("CARGO_MANIFEST_DIR")` discipline.
+    let workspaceRoot = __dirname;
+    while (!fs.existsSync(path.join(workspaceRoot, "Cargo.toml"))) {
+      const parent = path.dirname(workspaceRoot);
+      if (parent === workspaceRoot) {
+        throw new Error(
+          `could not locate Cargo workspace root walking up from ${__dirname}`,
+        );
+      }
+      workspaceRoot = parent;
+    }
+    const fixturePath = path.join(
+      workspaceRoot,
+      "crates",
+      "aec_render",
+      "tests",
+      "preset_ids.json",
+    );
+    const expectedSorted = JSON.parse(
+      fs.readFileSync(fixturePath, "utf-8"),
+    ) as string[];
+    const actualSorted = [...BUILT_IN_PRESET_IDS].sort();
+    expect(actualSorted).toEqual(expectedSorted);
   });
 });

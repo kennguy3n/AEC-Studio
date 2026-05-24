@@ -8,6 +8,7 @@ import type { AecApi } from "../../../electron/preload";
 import { AI_TOOLS } from "../../../electron/ai-tools";
 import {
   BIM_IMPORT_LARGE_FILE_THRESHOLD_BYTES,
+  isBuiltInPresetId,
   applyDeltas,
   classifyTier,
   computeForwardDeltas,
@@ -189,15 +190,46 @@ export function rendererInProcessBackend(): AecApi {
       enqueueRender: async () => ({ jobId: newId("job") }),
       listJobs: async () => [],
       cancelJob: async () => ({ cancelled: true }),
-      applyPreset: async () => ({ ok: true }),
+      applyPreset: async (params) => {
+        // Validate against the shared `BUILT_IN_PRESET_IDS` constant
+        // in `apps/desktop/electron/bridge.ts` — see its doc comment
+        // for the dev/production parity rationale.
+        const presetId = typeof params.preset === "string" ? params.preset : "";
+        if (!isBuiltInPresetId(presetId)) {
+          throw new Error(`unknown render preset id \`${presetId}\``);
+        }
+        return { ok: true };
+      },
       diagnose: async (jobId) => ({ jobId, suggestions: [] }),
       enqueueBatch: async (params) => {
+        // Mirror the in-process electron backend and the native side:
+        // empty cameras/presets *and* unknown preset ids are hard
+        // errors, not a silent `["standard"]` fallback. Renderer
+        // vitest tests must see the same rejection contract as
+        // production. `isBuiltInPresetId` is the single TS-side
+        // source of truth — see `BUILT_IN_PRESET_IDS` in
+        // `apps/desktop/electron/bridge.ts`.
         const presets =
-          (params.presetIds && params.presetIds.length > 0
+          params.presetIds && params.presetIds.length > 0
             ? params.presetIds
             : params.presetId
               ? [params.presetId]
-              : ["standard"]);
+              : [];
+        if (params.cameraIds.length === 0) {
+          throw new Error(
+            "renderEnqueueBatch requires at least one camera id",
+          );
+        }
+        if (presets.length === 0) {
+          throw new Error(
+            "renderEnqueueBatch requires at least one preset id",
+          );
+        }
+        for (const preset of presets) {
+          if (!isBuiltInPresetId(preset)) {
+            throw new Error(`unknown render preset id \`${preset}\``);
+          }
+        }
         const batchId = newId("batch");
         const jobIds: string[] = [];
         for (let i = 0; i < params.cameraIds.length * presets.length; i++) {

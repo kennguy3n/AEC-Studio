@@ -17,5 +17,8 @@ pub mod napi_api;
 pub use recents::{RecentsStore, RecentsStoreError};
 pub use service::{
     BimAttachSummary, BimFileSizeCheck, BimImportSummary, BridgeConfig, BridgeService,
-    BridgeServiceError, EngineStatusReport, ProjectSummary, RuntimeStatusReport, TemplateChoice,
+    BridgeServiceError, EngineStatusReport, ProjectSummary, RenderApplyPresetResult,
+    RenderBatchProgressReport, RenderCancelResult, RenderCheckMaterialsReport,
+    RenderDiagnoseReport, RenderEnqueueBatchResult, RenderEnqueueResult, RenderJobSummary,
+    RenderMaterialFinding, RuntimeStatusReport, TemplateChoice,
 };

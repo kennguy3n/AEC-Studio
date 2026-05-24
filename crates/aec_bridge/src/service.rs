@@ -5,7 +5,7 @@
 //! this layer trivially testable.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,11 @@ use aec_core::templates::TemplateLoader;
 use aec_core::types::{CommandId, ProjectId, Scope};
 use aec_governor::profiler::{CpuProfile, GpuProfile, HardwareProfiler};
 use aec_governor::tier::HardwareTier;
+use aec_render::doctor::{check_materials, CheckMaterialsOptions, MaterialFinding};
+use aec_render::job::{RenderJob as CoreRenderJob, RenderJobStatus};
+use aec_render::preset::RenderPresetStore;
+use aec_render::queue::{BatchProgress as CoreBatchProgress, RenderQueue};
+use aec_render::scene::RenderScene;
 
 use crate::bim_attach;
 use crate::engine_status_cache::EngineStatusCache;
@@ -279,6 +284,205 @@ pub struct BimAttachSummary {
     pub cache_rows: u64,
 }
 
+// ----- Render result shapes -----
+//
+// Service-layer projections of the rich `aec_render::job::RenderJob`,
+// `aec_render::queue::BatchProgress`, and `aec_render::doctor::*` types.
+// Trimmed to just the fields the renderer-side UI actually needs so
+// the napi serialisation stays cheap.
+
+/// Renderer-facing summary of a single [`aec_render::RenderJob`].
+/// Field names match the TypeScript `RenderJob` interface in
+/// `apps/desktop/electron/bridge.ts`. The full `RenderScene` and per-
+/// frame `completed_frames` vector held by the core type are
+/// intentionally not propagated through the napi surface — the queue
+/// view shows a status pill and a progress bar, neither needs the
+/// scene geometry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RenderJobSummary {
+    pub job_id: String,
+    /// Lowercase variant of [`aec_render::RenderJobStatus`]
+    /// (`queued` / `running` / `completed` / `failed` / `cancelled`),
+    /// matching the literal-union on the TS side.
+    pub status: String,
+    /// Preset id (e.g. `aec.preset.standard`) — *not* the human
+    /// label, so the renderer can re-resolve it via the preset
+    /// store if it needs to render the long form.
+    pub preset: String,
+    /// `0.0..=1.0`. Completed jobs report `1.0`; failed and cancelled
+    /// jobs report whatever progress they had reached at termination.
+    pub progress: f32,
+    pub camera_id: Option<String>,
+    pub batch_id: Option<String>,
+}
+
+impl From<&CoreRenderJob> for RenderJobSummary {
+    fn from(j: &CoreRenderJob) -> Self {
+        Self {
+            job_id: j.id.clone(),
+            status: render_job_status_to_str(j.status).to_string(),
+            preset: j.preset.id.clone(),
+            progress: j.progress,
+            camera_id: j.camera_id.clone(),
+            batch_id: j.batch_id.clone(),
+        }
+    }
+}
+
+fn render_job_status_to_str(s: RenderJobStatus) -> &'static str {
+    match s {
+        RenderJobStatus::Queued => "queued",
+        RenderJobStatus::Running => "running",
+        RenderJobStatus::Completed => "completed",
+        RenderJobStatus::Failed => "failed",
+        RenderJobStatus::Cancelled => "cancelled",
+    }
+}
+
+/// Renderer-facing aggregate for a render batch.
+///
+/// Mirrors [`aec_render::queue::BatchProgress`] field for field — the
+/// service layer just copies the values so the napi struct can be
+/// `#[napi(object)]` without a `serde_json` round-trip.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RenderBatchProgressReport {
+    pub batch_id: String,
+    pub total: u32,
+    pub queued: u32,
+    pub running: u32,
+    pub completed: u32,
+    pub failed: u32,
+    pub cancelled: u32,
+    pub average_progress: f32,
+}
+
+impl From<CoreBatchProgress> for RenderBatchProgressReport {
+    fn from(p: CoreBatchProgress) -> Self {
+        // Saturate at `u32::MAX` defensively rather than letting `as u32`
+        // wrap on 64-bit hosts: plain `usize as u32` truncates the upper
+        // bits, so a hypothetical 2^32-job batch would report `0` rather
+        // than `u32::MAX`. The doc comment on `RenderBatchProgressJs`
+        // promises saturating behaviour; this is where that promise is
+        // kept.
+        Self {
+            batch_id: p.batch_id,
+            total: saturating_u32(p.total),
+            queued: saturating_u32(p.queued),
+            running: saturating_u32(p.running),
+            completed: saturating_u32(p.completed),
+            failed: saturating_u32(p.failed),
+            cancelled: saturating_u32(p.cancelled),
+            average_progress: p.average_progress,
+        }
+    }
+}
+
+/// Clamp `n` to `u32::MAX` before casting to `u32`. Plain `as u32`
+/// silently wraps on 64-bit platforms (`u32::MAX as usize + 1` becomes
+/// `0`); this saturates as documented on `RenderBatchProgressJs`.
+fn saturating_u32(n: usize) -> u32 {
+    if n > u32::MAX as usize {
+        u32::MAX
+    } else {
+        n as u32
+    }
+}
+
+/// Renderer-facing material finding. Flattens
+/// [`aec_render::doctor::MaterialFinding`] into the JSON shape the
+/// TS `renderCheckMaterials` consumer expects (object per finding
+/// with `code` / `severity` / `materialId` / `message` / `fix`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RenderMaterialFinding {
+    pub code: String,
+    pub severity: String,
+    pub material_id: Option<String>,
+    pub message: String,
+    pub fix: Option<String>,
+}
+
+impl From<&MaterialFinding> for RenderMaterialFinding {
+    fn from(f: &MaterialFinding) -> Self {
+        let mat = f.material_id();
+        // The doctor uses literal `<material>` / `<unknown>` strings
+        // for the "missing material" case where there is no real
+        // material id. Surface `None` in those cases so the
+        // renderer can fall back to a generic placeholder rather
+        // than rendering "Material: <unknown>" literally.
+        let material_id = if mat.is_empty() || mat.starts_with('<') {
+            None
+        } else {
+            Some(mat.to_string())
+        };
+        Self {
+            code: f.code().to_string(),
+            severity: f.severity().to_string(),
+            material_id,
+            message: f.message(),
+            fix: f.fix(),
+        }
+    }
+}
+
+/// Result of [`BridgeService::render_check_materials`]. Wrapper around
+/// the findings vec so the napi side can expose a `{ findings: [] }`
+/// object shape matching the TS interface (and so a future field
+/// like `summary` can be added without changing every caller).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RenderCheckMaterialsReport {
+    pub findings: Vec<RenderMaterialFinding>,
+}
+
+/// Result of [`BridgeService::render_diagnose`].
+///
+/// The renderer's `RenderDoctor` panel renders one bullet per
+/// suggestion. Each entry is a short human-readable diagnostic
+/// string — the same content as a `MaterialFinding::message()`
+/// plus, where available, the corresponding `fix()` rendered as
+/// "Try: <fix>". Producing strings (rather than the structured
+/// `MaterialFinding`) means the panel renders without a second
+/// finding-to-string formatter on the JS side; the structured
+/// form is still available via `render_check_materials`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RenderDiagnoseReport {
+    pub job_id: String,
+    pub suggestions: Vec<String>,
+}
+
+/// Result of [`BridgeService::render_enqueue`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenderEnqueueResult {
+    pub job_id: String,
+}
+
+/// Result of [`BridgeService::render_enqueue_batch`] /
+/// [`BridgeService::render_enqueue_matrix`]. Carries the shared
+/// batch id plus the per-camera job ids.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenderEnqueueBatchResult {
+    pub batch_id: String,
+    pub job_ids: Vec<String>,
+}
+
+/// Result of [`BridgeService::render_cancel_job`]. A struct (rather
+/// than `bool`) so future fields like `was_running: bool` can be
+/// added without breaking the napi interface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenderCancelResult {
+    pub cancelled: bool,
+}
+
+/// Result of [`BridgeService::render_apply_preset`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RenderApplyPresetResult {
+    pub ok: bool,
+    /// The resolved preset id after the apply. Echoes the requested id
+    /// on success; carries the previous active id on failure so the
+    /// renderer can keep its dropdown selection consistent with the
+    /// engine.
+    pub active_preset_id: String,
+}
+
 /// Hardware-status snapshot. The shape mirrors the TypeScript
 /// `RuntimeStatus` interface in `apps/desktop/electron/bridge.ts` so that
 /// the JS bridge can hand the value to React components without a runtime
@@ -340,6 +544,48 @@ pub struct BridgeService {
     /// idle TTL, 4-entry LRU, double-checked locking model that
     /// mirrors [`EngineStatusCache`]).
     snapshot_cache: SnapshotCache,
+    /// Process-wide render state: the in-memory [`RenderQueue`] tracking
+    /// every submitted job (queued / running / completed / failed /
+    /// cancelled) and the [`RenderPresetStore`] tracking the active
+    /// preset id.
+    ///
+    /// Interior-mutable behind a [`Mutex`] so every render endpoint can
+    /// take `&self` on [`BridgeService`] — the napi singleton's outer
+    /// [`std::sync::RwLock`] would otherwise force every queue mutation
+    /// through the writer side, blocking concurrent status-pane polls
+    /// for the duration of a `submit_batch` of N cameras × M presets.
+    /// The inner mutex is granular: each render method takes it just
+    /// long enough to mutate the queue or read a snapshot.
+    ///
+    /// Single global queue (rather than per-project) intentionally —
+    /// the renderer UX treats render jobs as belonging to the active
+    /// project session, and there is no scenario today where two
+    /// projects need independent queues live at once. When that
+    /// changes (e.g. multi-window), the field type becomes a
+    /// `HashMap<PathBuf, Mutex<RenderState>>` keyed by canonical
+    /// project path; no callers outside this struct see the
+    /// difference.
+    render_state: Mutex<RenderState>,
+}
+
+/// Process-wide render state held by [`BridgeService::render_state`].
+///
+/// Wrapping both the queue and the preset store in one struct (rather
+/// than two parallel `Mutex`es) lets endpoints that touch both —
+/// `render_apply_preset` followed by an immediate `render_list_jobs`
+/// — see a consistent snapshot without a lock-ordering discipline.
+pub(crate) struct RenderState {
+    pub(crate) queue: RenderQueue,
+    pub(crate) preset_store: RenderPresetStore,
+}
+
+impl RenderState {
+    fn new() -> Self {
+        Self {
+            queue: RenderQueue::new(),
+            preset_store: RenderPresetStore::default(),
+        }
+    }
 }
 
 impl BridgeService {
@@ -354,6 +600,7 @@ impl BridgeService {
             master_key,
             engine_status_cache: EngineStatusCache::new(),
             snapshot_cache: SnapshotCache::new(),
+            render_state: Mutex::new(RenderState::new()),
         })
     }
 
@@ -1092,6 +1339,266 @@ impl BridgeService {
             gpu: gpu_hint,
             os: profile.os.clone(),
         }
+    }
+
+    // ----- Render endpoints (Phase 10 PR-R) -----
+
+    /// Submit a single render job for the supplied camera + preset.
+    ///
+    /// The `preset_id` is resolved against the in-memory preset store
+    /// (built-ins for the current hardware tier plus any user-added
+    /// custom presets). An unknown id is a [`BridgeServiceError::Core`]
+    /// rather than a silent fallback so the renderer can tell the user
+    /// the preset string they sent was wrong rather than mysteriously
+    /// rendering at a different quality.
+    ///
+    /// `camera_id` is recorded on the job so the queue view can group
+    /// jobs by camera; it is *not* validated against any CameraStore
+    /// here — the validation is the responsibility of the caller (the
+    /// renderer-side `Render` page only sends ids it just read from a
+    /// `commandListCameras` response).
+    ///
+    /// `priority` defaults to `0`; higher values are admitted first by
+    /// [`RenderQueue::admit`].
+    ///
+    /// `scene_json`, when present, is deserialised as a
+    /// [`RenderScene`] and stored on the job for the doctor /
+    /// diagnose paths to operate on. Defaults to an empty scene when
+    /// absent — the queue is the source of truth for "intent to
+    /// render"; pushing the geometry through to the queue is the
+    /// renderer's job at submission time.
+    pub fn render_enqueue(
+        &self,
+        camera_id: &str,
+        preset_id: &str,
+        priority: i32,
+        scene_json: Option<&str>,
+    ) -> Result<RenderEnqueueResult, BridgeServiceError> {
+        let mut state = self.lock_render_state()?;
+        let preset = state.preset_store.get(preset_id).ok_or_else(|| {
+            BridgeServiceError::Core(format!("unknown render preset id `{preset_id}`"))
+        })?;
+        let scene = parse_scene_json(scene_json)?;
+        let job = CoreRenderJob::new(preset, scene)
+            .with_camera_id(camera_id.to_string())
+            .with_priority(priority);
+        let job_id = state.queue.submit(job);
+        Ok(RenderEnqueueResult { job_id })
+    }
+
+    /// Submit a render batch: one job per (camera × preset) pair, all
+    /// sharing one batch id so the renderer can aggregate progress
+    /// via [`Self::render_batch_progress`].
+    ///
+    /// When `preset_ids.len() == 1` this is the "batch render" path
+    /// (every camera at the same quality); when `preset_ids.len() > 1`
+    /// it's the "render matrix" path (every camera × every preset).
+    /// Empty `preset_ids` is a hard error — silently substituting
+    /// `standard` would hide a renderer-side dropdown bug.
+    pub fn render_enqueue_batch(
+        &self,
+        camera_ids: &[String],
+        preset_ids: &[String],
+        scene_json: Option<&str>,
+    ) -> Result<RenderEnqueueBatchResult, BridgeServiceError> {
+        if camera_ids.is_empty() {
+            return Err(BridgeServiceError::Core(
+                "render_enqueue_batch requires at least one camera id".into(),
+            ));
+        }
+        if preset_ids.is_empty() {
+            return Err(BridgeServiceError::Core(
+                "render_enqueue_batch requires at least one preset id".into(),
+            ));
+        }
+        let mut state = self.lock_render_state()?;
+        let mut presets = Vec::with_capacity(preset_ids.len());
+        for id in preset_ids {
+            let preset = state.preset_store.get(id).ok_or_else(|| {
+                BridgeServiceError::Core(format!("unknown render preset id `{id}`"))
+            })?;
+            presets.push(preset);
+        }
+        let scene = parse_scene_json(scene_json)?;
+        // Mirror `RenderQueue::submit_matrix` semantics — one job per
+        // (camera, preset) pair, all sharing one batch id. We
+        // re-implement the loop here (rather than calling
+        // `submit_batch` / `submit_matrix`) because the service layer
+        // works in plain camera-id strings, not the rich
+        // `CameraSnapshot` the queue's helpers expect.
+        let batch_id = format!("batch_{}", uuid::Uuid::new_v4().simple());
+        let mut job_ids = Vec::with_capacity(camera_ids.len() * presets.len());
+        for cam in camera_ids {
+            for preset in &presets {
+                let job = CoreRenderJob::new(preset.clone(), scene.clone())
+                    .with_camera_id(cam.clone())
+                    .with_batch_id(batch_id.clone());
+                job_ids.push(state.queue.submit(job));
+            }
+        }
+        Ok(RenderEnqueueBatchResult { batch_id, job_ids })
+    }
+
+    /// Aggregate progress for the given batch. Returns `None` when no
+    /// jobs match the id (rather than an error) so a stale renderer
+    /// poll after the batch's jobs have all been removed degrades to
+    /// a no-op on the UI side.
+    pub fn render_batch_progress(
+        &self,
+        batch_id: &str,
+    ) -> Result<Option<RenderBatchProgressReport>, BridgeServiceError> {
+        let state = self.lock_render_state()?;
+        Ok(state.queue.batch_progress(batch_id).map(Into::into))
+    }
+
+    /// List every job currently tracked by the queue, in
+    /// queued → running → completed order. Returns a defensive copy so
+    /// the caller can iterate without holding the render-state lock.
+    pub fn render_list_jobs(&self) -> Result<Vec<RenderJobSummary>, BridgeServiceError> {
+        let state = self.lock_render_state()?;
+        Ok(state
+            .queue
+            .list_jobs()
+            .into_iter()
+            .map(RenderJobSummary::from)
+            .collect())
+    }
+
+    /// Cancel the given job. Returns `cancelled: false` (rather than
+    /// an error) when the job is already terminal — cancelling a
+    /// completed job is idempotent and the renderer's "Cancel" button
+    /// can race with the queue running the job to completion.
+    pub fn render_cancel_job(
+        &self,
+        job_id: &str,
+    ) -> Result<RenderCancelResult, BridgeServiceError> {
+        let mut state = self.lock_render_state()?;
+        match state.queue.cancel(job_id) {
+            Ok(()) => Ok(RenderCancelResult { cancelled: true }),
+            Err(aec_render::queue::QueueError::Terminal(_)) => {
+                Ok(RenderCancelResult { cancelled: false })
+            }
+            Err(aec_render::queue::QueueError::UnknownJob(id)) => Err(BridgeServiceError::Core(
+                format!("unknown render job `{id}`"),
+            )),
+        }
+    }
+
+    /// Select the given preset id as the active preset in the in-memory
+    /// preset store. The return carries the now-active preset id so
+    /// the renderer can keep its dropdown in lock-step with the engine
+    /// even if a future change adds preset aliasing.
+    pub fn render_apply_preset(
+        &self,
+        preset_id: &str,
+    ) -> Result<RenderApplyPresetResult, BridgeServiceError> {
+        let mut state = self.lock_render_state()?;
+        let previous = state.preset_store.current().id;
+        if state.preset_store.select(preset_id) {
+            Ok(RenderApplyPresetResult {
+                ok: true,
+                active_preset_id: state.preset_store.current().id,
+            })
+        } else {
+            Err(BridgeServiceError::Core(format!(
+                "unknown render preset id `{preset_id}` (active preset unchanged: `{previous}`)"
+            )))
+        }
+    }
+
+    /// Diagnose a single job: run [`check_materials`] on the job's
+    /// scene and render each finding as a human-readable suggestion.
+    ///
+    /// Returns an empty `suggestions` vector for a job whose scene is
+    /// empty (the common case today because the renderer hasn't yet
+    /// learned to push scene geometry through the queue at submission
+    /// time). A `BridgeServiceError::Core` is returned only when the
+    /// job id itself is unknown — distinguishing "no findings" from
+    /// "you sent a bogus id" matters for the renderer's loading state.
+    pub fn render_diagnose(
+        &self,
+        job_id: &str,
+    ) -> Result<RenderDiagnoseReport, BridgeServiceError> {
+        let state = self.lock_render_state()?;
+        let job = state
+            .queue
+            .get(job_id)
+            .ok_or_else(|| BridgeServiceError::Core(format!("unknown render job `{job_id}`")))?;
+        let opts = CheckMaterialsOptions::default();
+        // The renderer currently doesn't push a populated material
+        // library through the queue; pass empty slices so the check
+        // still surfaces "scene references unknown material" findings,
+        // the most common pre-render mistake even without a library.
+        let result = check_materials(&job.scene, &[], &std::collections::BTreeSet::new(), &opts);
+        let suggestions = result
+            .findings
+            .iter()
+            .map(|f| {
+                if let Some(fix) = f.fix() {
+                    format!("{} — Try: {}", f.message(), fix)
+                } else {
+                    f.message()
+                }
+            })
+            .collect();
+        Ok(RenderDiagnoseReport {
+            job_id: job_id.to_string(),
+            suggestions,
+        })
+    }
+
+    /// Run [`check_materials`] across every scene referenced by the
+    /// current queue. The renderer's "Check Materials" button runs
+    /// pre-render so the user can clean up missing textures / non-PBR
+    /// materials before submitting a job; aggregating across queued +
+    /// running jobs is a reasonable approximation of "the user's current
+    /// material intent" until the renderer plumbs a single project-level
+    /// scene through here.
+    ///
+    /// Duplicate findings (same code + same material id) are folded
+    /// to one entry so the panel doesn't render the same warning N
+    /// times for an N-job batch.
+    pub fn render_check_materials(&self) -> Result<RenderCheckMaterialsReport, BridgeServiceError> {
+        let state = self.lock_render_state()?;
+        let opts = CheckMaterialsOptions::default();
+        let known: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mats: Vec<aec_materials::material::PbrMaterial> = Vec::new();
+        let mut seen: std::collections::BTreeSet<(String, String)> =
+            std::collections::BTreeSet::new();
+        let mut findings: Vec<RenderMaterialFinding> = Vec::new();
+        for job in state.queue.list_jobs() {
+            let result = check_materials(&job.scene, &mats, &known, &opts);
+            for f in &result.findings {
+                let key = (f.code().to_string(), f.material_id().to_string());
+                if seen.insert(key) {
+                    findings.push(RenderMaterialFinding::from(f));
+                }
+            }
+        }
+        Ok(RenderCheckMaterialsReport { findings })
+    }
+
+    fn lock_render_state(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, RenderState>, BridgeServiceError> {
+        self.render_state
+            .lock()
+            .map_err(|e| BridgeServiceError::Core(format!("render state poisoned: {e}")))
+    }
+}
+
+/// Parse a caller-supplied `scene_json` parameter into a
+/// [`RenderScene`]. Treats `None` and the empty string as "no scene
+/// supplied" (returns the default empty scene). Returns
+/// [`BridgeServiceError::Core`] on JSON parse failure so the
+/// renderer can show the user the deserialisation error rather than
+/// silently dropping their scene.
+fn parse_scene_json(scene_json: Option<&str>) -> Result<RenderScene, BridgeServiceError> {
+    match scene_json {
+        None | Some("") => Ok(RenderScene::default()),
+        Some(s) => serde_json::from_str(s).map_err(|e| {
+            BridgeServiceError::Core(format!("render scene_json deserialisation failed: {e}"))
+        }),
     }
 }
 
@@ -2578,5 +3085,271 @@ END-ISO-10303-21;\n";
             0,
             "bim_attach_ifc must invalidate the engine-status cache for the project"
         );
+    }
+
+    // ----- Render endpoint tests (Phase 10 PR-R) -----
+    //
+    // Service-layer tests; the napi layer's tests live in
+    // `crates/aec_bridge/tests/napi_render.rs` (round-trip the
+    // result structs through `serde_json::to_string` to pin the
+    // JS-facing shape).
+
+    #[test]
+    fn render_enqueue_returns_job_id_and_lists_back() {
+        let (s, _g) = service();
+        let r = s
+            .render_enqueue("camera-1", "standard", 0, None)
+            .expect("enqueue must succeed with a built-in preset");
+        assert!(
+            !r.job_id.is_empty(),
+            "render_enqueue must return a non-empty job id"
+        );
+        let jobs = s.render_list_jobs().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].job_id, r.job_id);
+        assert_eq!(jobs[0].status, "queued");
+        assert_eq!(jobs[0].preset, "standard");
+        assert_eq!(jobs[0].camera_id.as_deref(), Some("camera-1"));
+    }
+
+    #[test]
+    fn render_enqueue_unknown_preset_is_rejected() {
+        let (s, _g) = service();
+        let err = s
+            .render_enqueue("camera-1", "does-not-exist", 0, None)
+            .unwrap_err();
+        match err {
+            BridgeServiceError::Core(m) => {
+                assert!(
+                    m.contains("does-not-exist"),
+                    "error must name the unknown preset id (got `{m}`)"
+                );
+            }
+            other => panic!("expected Core error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn render_enqueue_batch_creates_one_job_per_pair() {
+        let (s, _g) = service();
+        let r = s
+            .render_enqueue_batch(
+                &["cam-a".into(), "cam-b".into()],
+                &["quick".into(), "standard".into()],
+                None,
+            )
+            .expect("batch enqueue must succeed");
+        // 2 cameras × 2 presets = 4 jobs.
+        assert_eq!(r.job_ids.len(), 4);
+        assert!(r.batch_id.starts_with("batch_"));
+        let jobs = s.render_list_jobs().unwrap();
+        assert_eq!(jobs.len(), 4);
+        for j in &jobs {
+            assert_eq!(j.batch_id.as_deref(), Some(r.batch_id.as_str()));
+        }
+        // Every (camera, preset) combination present exactly once.
+        let mut combos: Vec<(String, String)> = jobs
+            .iter()
+            .map(|j| (j.camera_id.clone().unwrap(), j.preset.clone()))
+            .collect();
+        combos.sort();
+        let expected: Vec<(String, String)> = vec![
+            ("cam-a".into(), "quick".into()),
+            ("cam-a".into(), "standard".into()),
+            ("cam-b".into(), "quick".into()),
+            ("cam-b".into(), "standard".into()),
+        ];
+        assert_eq!(combos, expected);
+    }
+
+    #[test]
+    fn render_enqueue_batch_rejects_empty_inputs() {
+        let (s, _g) = service();
+        let err = s
+            .render_enqueue_batch(&[], &["standard".into()], None)
+            .unwrap_err();
+        assert!(matches!(err, BridgeServiceError::Core(_)));
+        let err = s
+            .render_enqueue_batch(&["cam-a".into()], &[], None)
+            .unwrap_err();
+        assert!(matches!(err, BridgeServiceError::Core(_)));
+    }
+
+    #[test]
+    fn render_batch_progress_aggregates_per_status() {
+        let (s, _g) = service();
+        let r = s
+            .render_enqueue_batch(
+                &["cam-a".into(), "cam-b".into(), "cam-c".into()],
+                &["quick".into()],
+                None,
+            )
+            .unwrap();
+        let p = s
+            .render_batch_progress(&r.batch_id)
+            .unwrap()
+            .expect("just-submitted batch must have progress");
+        assert_eq!(p.batch_id, r.batch_id);
+        assert_eq!(p.total, 3);
+        assert_eq!(p.queued, 3);
+        assert_eq!(p.running, 0);
+        assert_eq!(p.completed, 0);
+        assert_eq!(p.failed, 0);
+        assert_eq!(p.cancelled, 0);
+        // All-queued batch reports 0.0 average progress.
+        assert!(
+            p.average_progress.abs() < f32::EPSILON,
+            "queued-only batch must report 0.0 average progress, got {}",
+            p.average_progress
+        );
+    }
+
+    #[test]
+    fn render_batch_progress_unknown_batch_id_returns_none() {
+        let (s, _g) = service();
+        // Submit one job in a different batch so the queue isn't empty.
+        let _ = s
+            .render_enqueue_batch(&["cam-x".into()], &["quick".into()], None)
+            .unwrap();
+        assert!(
+            s.render_batch_progress("batch_nonexistent")
+                .unwrap()
+                .is_none(),
+            "unknown batch id must return None, not an error"
+        );
+    }
+
+    #[test]
+    fn render_cancel_job_transitions_to_cancelled() {
+        let (s, _g) = service();
+        let r = s.render_enqueue("cam-1", "quick", 0, None).unwrap();
+        let c = s.render_cancel_job(&r.job_id).unwrap();
+        assert!(c.cancelled);
+        let jobs = s.render_list_jobs().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].status, "cancelled");
+    }
+
+    #[test]
+    fn render_cancel_job_unknown_id_is_error() {
+        let (s, _g) = service();
+        let err = s.render_cancel_job("not-a-real-job").unwrap_err();
+        match err {
+            BridgeServiceError::Core(m) => {
+                assert!(m.contains("not-a-real-job"));
+            }
+            other => panic!("expected Core error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn render_apply_preset_updates_active_selection() {
+        let (s, _g) = service();
+        // Default selection comes from hardware-tier recommendation —
+        // we don't assert what it is, only that it changes after apply.
+        let r = s.render_apply_preset("studio").unwrap();
+        assert!(r.ok);
+        assert_eq!(r.active_preset_id, "studio");
+        // Re-applying the same preset is idempotent.
+        let r2 = s.render_apply_preset("studio").unwrap();
+        assert_eq!(r2.active_preset_id, "studio");
+    }
+
+    #[test]
+    fn render_apply_preset_unknown_id_is_error_and_preserves_active() {
+        let (s, _g) = service();
+        s.render_apply_preset("standard").unwrap();
+        let err = s.render_apply_preset("does-not-exist").unwrap_err();
+        let msg = match err {
+            BridgeServiceError::Core(m) => m,
+            other => panic!("expected Core error, got {other:?}"),
+        };
+        assert!(msg.contains("does-not-exist"));
+        // The original active preset must remain unchanged.
+        let after = s.render_apply_preset("standard").unwrap();
+        assert_eq!(after.active_preset_id, "standard");
+    }
+
+    #[test]
+    fn render_diagnose_returns_empty_suggestions_for_empty_scene() {
+        let (s, _g) = service();
+        let r = s.render_enqueue("cam-1", "quick", 0, None).unwrap();
+        let d = s.render_diagnose(&r.job_id).unwrap();
+        assert_eq!(d.job_id, r.job_id);
+        assert!(
+            d.suggestions.is_empty(),
+            "empty scene must produce no doctor findings, got {:?}",
+            d.suggestions
+        );
+    }
+
+    #[test]
+    fn render_diagnose_unknown_job_is_error() {
+        let (s, _g) = service();
+        let err = s.render_diagnose("not-a-real-job").unwrap_err();
+        assert!(matches!(err, BridgeServiceError::Core(_)));
+    }
+
+    #[test]
+    fn render_check_materials_with_empty_queue_has_no_findings() {
+        let (s, _g) = service();
+        let r = s.render_check_materials().unwrap();
+        assert!(r.findings.is_empty());
+    }
+
+    #[test]
+    fn render_list_jobs_visits_all_statuses() {
+        let (s, _g) = service();
+        // queued → cancelled transition; the third job stays queued.
+        let a = s.render_enqueue("cam-1", "quick", 0, None).unwrap();
+        let _b = s.render_enqueue("cam-2", "standard", 0, None).unwrap();
+        s.render_cancel_job(&a.job_id).unwrap();
+        let jobs = s.render_list_jobs().unwrap();
+        let cancelled_count = jobs.iter().filter(|j| j.status == "cancelled").count();
+        let queued_count = jobs.iter().filter(|j| j.status == "queued").count();
+        assert_eq!(cancelled_count, 1);
+        assert_eq!(queued_count, 1);
+    }
+
+    #[test]
+    fn render_endpoints_serialise_to_finite_json_numbers() {
+        // Guards against the f64::INFINITY footgun: any result
+        // shape that derives Serialize must round-trip through
+        // serde_json without producing non-finite tokens.
+        let (s, _g) = service();
+        let _ = s.render_enqueue("cam-1", "quick", 0, None).unwrap();
+        let jobs = s.render_list_jobs().unwrap();
+        let json = serde_json::to_string(&jobs).expect("RenderJobSummary must serialise");
+        assert!(
+            !json.contains("Infinity") && !json.contains("NaN"),
+            "render_list_jobs output must not contain non-finite tokens: {json}"
+        );
+        let report = s.render_check_materials().unwrap();
+        let _ = serde_json::to_string(&report).expect("RenderCheckMaterialsReport must serialise");
+    }
+
+    #[test]
+    fn render_batch_progress_count_saturates_at_u32_max() {
+        // Plain `usize as u32` wraps on 64-bit hosts — a `usize::MAX`
+        // input would round-trip as `u32::MAX` (0xffff_ffff) via the
+        // truncation rules, but `(u32::MAX as usize) + 1` would land at
+        // `0`, silently corrupting the renderer's status pane. Pin the
+        // saturating behaviour the `RenderBatchProgressJs` doc comment
+        // advertises so this contract can't drift.
+        let big = u32::MAX as usize + 1;
+        assert_eq!(
+            saturating_u32(big),
+            u32::MAX,
+            "count above u32::MAX must clamp, not wrap"
+        );
+        assert_eq!(
+            saturating_u32(usize::MAX),
+            u32::MAX,
+            "usize::MAX must clamp at u32::MAX"
+        );
+        // Below-threshold inputs must round-trip unchanged.
+        assert_eq!(saturating_u32(0), 0);
+        assert_eq!(saturating_u32(7), 7);
+        assert_eq!(saturating_u32(u32::MAX as usize), u32::MAX);
     }
 }

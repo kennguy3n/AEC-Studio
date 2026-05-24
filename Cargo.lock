@@ -91,6 +91,7 @@ dependencies = [
  "aec_export",
  "aec_geometry",
  "aec_governor",
+ "aec_materials",
  "aec_render",
  "blake3",
  "chrono",
@@ -102,6 +103,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
+ "uuid",
 ]
 
 [[package]]

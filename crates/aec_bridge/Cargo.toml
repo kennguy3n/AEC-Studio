@@ -30,6 +30,8 @@ rusqlite = { workspace = true }
 aec_geometry = { path = "../aec_geometry" }
 aec_assets = { path = "../aec_assets" }
 aec_render = { path = "../aec_render" }
+aec_materials = { path = "../aec_materials" }
+uuid = { workspace = true }
 aec_governor = { path = "../aec_governor" }
 aec_export = { path = "../aec_export" }
 blake3 = { workspace = true }

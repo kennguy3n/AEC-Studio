@@ -249,6 +249,21 @@ impl RenderQueue {
         Err(QueueError::UnknownJob(id.into()))
     }
 
+    /// Cancel `id`. Idempotency contract:
+    ///
+    /// - if the job is queued or running, transition it to `Cancelled`
+    ///   and return `Ok(())`;
+    /// - if the job is already terminal (`Completed`, `Failed`, or
+    ///   `Cancelled` — i.e. lives in the [`Self::completed`] vec),
+    ///   return [`QueueError::Terminal`] so the caller can distinguish
+    ///   "already in a terminal state" from "no such job";
+    /// - if the job id is unknown, return [`QueueError::UnknownJob`].
+    ///
+    /// Returning `Terminal` (rather than swallowing the call silently
+    /// inside the queue) lets the bridge layer surface the "already
+    /// done" case as `{ cancelled: false }` on the napi boundary, which
+    /// the renderer's Cancel button uses to stay idempotent when a job
+    /// races to completion under the user's click.
     pub fn cancel(&mut self, id: &str) -> Result<(), QueueError> {
         if let Some(idx) = self.queued.iter().position(|j| j.id == id) {
             let mut job = self.queued.remove(idx).unwrap();
@@ -263,6 +278,9 @@ impl RenderQueue {
             job.completed_at = Some(Utc::now());
             self.completed.push(job);
             return Ok(());
+        }
+        if self.completed.iter().any(|j| j.id == id) {
+            return Err(QueueError::Terminal(id.into()));
         }
         Err(QueueError::UnknownJob(id.into()))
     }
@@ -397,6 +415,45 @@ mod tests {
         q.cancel(&b).unwrap();
         assert_eq!(q.get(&a).unwrap().status, RenderJobStatus::Cancelled);
         assert_eq!(q.get(&b).unwrap().status, RenderJobStatus::Cancelled);
+    }
+
+    #[test]
+    fn cancel_on_terminal_job_returns_terminal_not_unknown() {
+        // Already-cancelled, already-completed, and already-failed jobs
+        // all live in `self.completed`. Re-cancelling them must return
+        // `QueueError::Terminal` so the bridge can surface idempotent
+        // "already done" rather than the misleading "no such job".
+        let mut q = RenderQueue::new();
+        let cancelled_id = q.submit(make_job(0));
+        q.cancel(&cancelled_id).unwrap();
+        match q.cancel(&cancelled_id) {
+            Err(QueueError::Terminal(id)) => assert_eq!(id, cancelled_id),
+            other => panic!("re-cancelling a Cancelled job must return Terminal, got {other:?}"),
+        }
+
+        let completed_id = q.submit(make_job(0));
+        let _ = q.admit().unwrap();
+        q.complete(&completed_id, "/tmp/out.png").unwrap();
+        match q.cancel(&completed_id) {
+            Err(QueueError::Terminal(id)) => assert_eq!(id, completed_id),
+            other => panic!("cancelling a Completed job must return Terminal, got {other:?}"),
+        }
+
+        let failed_id = q.submit(make_job(0));
+        let _ = q.admit().unwrap();
+        q.fail(&failed_id, "boom").unwrap();
+        match q.cancel(&failed_id) {
+            Err(QueueError::Terminal(id)) => assert_eq!(id, failed_id),
+            other => panic!("cancelling a Failed job must return Terminal, got {other:?}"),
+        }
+
+        // True unknown id must still surface as UnknownJob — the queue
+        // must distinguish "I've seen this id before" from "never heard
+        // of it".
+        match q.cancel("definitely-not-a-job-id") {
+            Err(QueueError::UnknownJob(id)) => assert_eq!(id, "definitely-not-a-job-id"),
+            other => panic!("cancelling an unknown id must return UnknownJob, got {other:?}"),
+        }
     }
 
     #[test]
