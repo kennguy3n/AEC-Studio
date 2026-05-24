@@ -539,20 +539,44 @@ impl IfcReader {
                     //       which is the least-surprising behaviour
                     //       for malformed input).
                     // First, try path (a) — AEC-Studio-authored.
-                    // The writer's Name field is the `{tag}::{eid}`
-                    // encoding lives at arg 3 (`IfcRoot.Description`),
-                    // so probe that first. If arg 3 doesn't have an
-                    // `rsplit_once("::")` match (either because arg 3
-                    // is absent / `$` / malformed, or because the
-                    // string is a real Description like "Basic Wall:
-                    // Generic - 200mm" without `::`), fall through to
-                    // path (b) below.
-                    let aec_authored_eid = g.string_arg(3).ok().and_then(|name| {
-                        name.rsplit_once("::")
-                            .map(|(tag, eid)| (tag.to_string(), eid.to_string()))
+                    // The writer's `{tag}::{eid}` encoding lives at
+                    // arg 3 (`IfcRoot.Description`), so probe that
+                    // first. Path (a) is taken **only** when ALL
+                    // THREE conditions hold:
+                    //
+                    //   1. arg 3 is a quoted string (not `$`,
+                    //      not absent, not malformed).
+                    //   2. arg 3 contains a `::` separator that
+                    //      `rsplit_once` matches.
+                    //   3. The suffix after the final `::` parses
+                    //      as a valid [`EntityId`] (`ent_<uuid>`).
+                    //
+                    // The EntityId parse is folded into the
+                    // detection — not deferred — because external
+                    // IFC Descriptions can contain `::` for
+                    // human-prose reasons (e.g. Revit's
+                    // `"Partition :: Fire Rated"`, ArchiCAD's
+                    // `"MEP :: Duct"`). Without (3), those would
+                    // match (1) and (2), enter path (a), fail
+                    // `EntityId::from_string`, and propagate the
+                    // error via `?` — silently aborting the
+                    // entire file parse with
+                    // `IfcReadError::Malformed("embedded
+                    // EntityId `Fire Rated` is invalid: …")`
+                    // even though path (b) was designed to
+                    // handle exactly this case.
+                    //
+                    // Failing the EntityId parse here lands in
+                    // `None` → path (b) falls through and the
+                    // element gets captured by STEP tag the same
+                    // way any other external-IFC element would.
+                    let aec_authored = g.string_arg(3).ok().and_then(|name| {
+                        let (tag, eid_str) = name.rsplit_once("::")?;
+                        let entity = EntityId::from_string(eid_str).ok()?;
+                        Some((tag.to_string(), entity))
                     });
 
-                    if let Some((tag, eid)) = aec_authored_eid {
+                    if let Some((tag, entity)) = aec_authored {
                         // (a) Path: AEC-Studio-authored.
                         //
                         // Prefer the tag carried in the Name field
@@ -576,11 +600,6 @@ impl IfcReader {
                         let class = ifc_class_from_tag(&tag, &tag);
                         let _ = other; // STEP type is informational
                         let guid = g.string_arg(0)?;
-                        let entity = EntityId::from_string(&eid).map_err(|e| {
-                            IfcReadError::Malformed(format!(
-                                "embedded EntityId `{eid}` is invalid: {e}"
-                            ))
-                        })?;
                         elements.insert(
                             g.step_id,
                             ElementRow {
@@ -4034,6 +4053,70 @@ END-ISO-10303-21;
         assert_eq!(
             building.1.name, "Office Building",
             "spatial node must fall back to arg 2 when arg 3 is `$`",
+        );
+    }
+
+    /// Regression test for the path (a) → path (b) fallback's
+    /// EntityId-validation behaviour. An external IFC wall whose
+    /// `IfcRoot.Description` (arg 3) legitimately contains `::`
+    /// for human-prose reasons (e.g. Revit's
+    /// `"Partition :: Fire Rated"`, ArchiCAD's `"MEP :: Duct"`)
+    /// must not abort the parse: the `rsplit_once("::")` match
+    /// would trip the path (a) detection, and then
+    /// `EntityId::from_string("Fire Rated")` would fail with the
+    /// error propagated via `?`, killing the whole parse. The fix
+    /// folds the EntityId validation into the `aec_authored`
+    /// detection — a failed parse lands in `None` and path (b)
+    /// captures the wall by STEP tag the same way any other
+    /// external-IFC element would.
+    #[test]
+    fn external_ifc_with_double_colon_in_description_falls_through_to_path_b() {
+        let step = "\
+ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('External Revit export'),'2;1');
+FILE_NAME('test.ifc','2024-01-01T00:00:00',(''),(''),'','','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('2vqOSiJTrEEvbbnEAh4Lay',$,'External Revit Project',$,$,$,$,(#2),#3);
+#2=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-5,#4,$);
+#3=IFCUNITASSIGNMENT((#5));
+#4=IFCAXIS2PLACEMENT3D(#6,$,$);
+#5=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#6=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCSITE('2vqOSiJTrEEvbbnEAh4Lb1',$,'External Revit Site',$,$,#4,$,$,.ELEMENT.,$,$,$,$,$);
+#100=IFCWALL('1bbU_VHpzCEvLPibG6XfX2',$,'Partition Wall','Partition :: Fire Rated',$,#4,$,$,.NOTDEFINED.);
+ENDSEC;
+END-ISO-10303-21;
+";
+        let snap = IfcReader::from_string(step).expect(
+            "external IFC with `::` in Description (but invalid EntityId suffix) \
+             must parse without erroring — path (a) detection must validate \
+             the EntityId parse before committing to path (a)",
+        );
+
+        // The wall is captured (path b fall-through).
+        let walls: Vec<_> = snap
+            .classification
+            .iter()
+            .filter(|(_, a)| matches!(a.class, IfcClass::IfcWall))
+            .collect();
+        assert_eq!(
+            walls.len(),
+            1,
+            "exactly one wall must be captured; got {walls:?}",
+        );
+
+        // EntityId is deterministically derived from GlobalId (path
+        // b), NOT from the "Fire Rated" suffix in the Description.
+        let (wall_id, _) = walls[0];
+        let expected = EntityId::from_guid_seed("1bbU_VHpzCEvLPibG6XfX2");
+        assert_eq!(
+            wall_id, &expected,
+            "external-IFC wall whose Description has `::` must derive \
+             EntityId from GlobalId via path (b), not from the \
+             Description suffix",
         );
     }
 
