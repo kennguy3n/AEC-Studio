@@ -15,6 +15,7 @@ import {
   ensureInProcessGraph,
   inProcessParsedForTool,
   type Command,
+  type CommandScope,
   type EntityRecord,
   type InProcessGraph,
   type RevisionSummary,
@@ -387,7 +388,15 @@ function commandMock() {
       const graph = ensureInProcessGraph(graphs, projectPath);
       const fwd = computeForwardDeltas(graph, c);
       const inv = applyDeltas(graph, fwd);
-      graph.undo.push({ commandId: c.command_id, forward: fwd, inverse: inv });
+      graph.undo.push({
+        commandId: c.command_id,
+        // Tag the entry with the originating command's scope so the
+        // mirror of `CommandError::ScopeMismatch` in `undo` / `redo`
+        // can reject a stale `activeScope` before either stack moves.
+        scope: c.scope,
+        forward: fwd,
+        inverse: inv,
+      });
       graph.redo.length = 0;
       return {
         commandId: c.command_id,
@@ -396,10 +405,16 @@ function commandMock() {
         redoLen: graph.redo.length,
       };
     },
-    async undo(projectPath: string, _activeScope: string) {
+    async undo(projectPath: string, activeScope: string) {
       const graph = ensureInProcessGraph(graphs, projectPath);
-      const entry = graph.undo.pop();
-      if (!entry) throw new Error("command_undo: nothing to undo");
+      const top = graph.undo[graph.undo.length - 1];
+      if (!top) throw new Error("command_undo: nothing to undo");
+      if (top.scope !== (activeScope as CommandScope)) {
+        throw new Error(
+          `command_undo: scope mismatch (expected ${top.scope}, got ${activeScope})`,
+        );
+      }
+      const entry = graph.undo.pop()!;
       applyDeltas(graph, entry.inverse);
       graph.redo.push(entry);
       return {
@@ -409,10 +424,16 @@ function commandMock() {
         redoLen: graph.redo.length,
       };
     },
-    async redo(projectPath: string, _activeScope: string) {
+    async redo(projectPath: string, activeScope: string) {
       const graph = ensureInProcessGraph(graphs, projectPath);
-      const entry = graph.redo.pop();
-      if (!entry) throw new Error("command_redo: nothing to redo");
+      const top = graph.redo[graph.redo.length - 1];
+      if (!top) throw new Error("command_redo: nothing to redo");
+      if (top.scope !== (activeScope as CommandScope)) {
+        throw new Error(
+          `command_redo: scope mismatch (expected ${top.scope}, got ${activeScope})`,
+        );
+      }
+      const entry = graph.redo.pop()!;
       applyDeltas(graph, entry.forward);
       graph.undo.push(entry);
       return {

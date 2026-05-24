@@ -269,8 +269,13 @@ export interface BridgeBackend {
    * affected entity panels.
    *
    * `activeScope` must match the scope of the command being
-   * undone (the journal carries the scope; the engine validates
-   * this on `undo`).
+   * undone. The native engine stores the originating scope on every
+   * `undo_journal` row and rejects mismatches with
+   * `CommandError::ScopeMismatch`; the in-process JS fallback
+   * mirrors the check using the per-entry `scope` field on
+   * {@link InProcessGraph.undo} / `.redo`. Without this validation
+   * an undo issued under the wrong active scope would silently
+   * apply inverse deltas tagged for a different rail.
    */
   commandUndo(projectPath: string, activeScope: CommandScope): Promise<CommandApplyResult>;
 
@@ -1307,7 +1312,17 @@ export function inProcessBackend(): BridgeBackend {
       const graph = ensureInProcessGraph(graphs, projectPath);
       const deltas = computeForwardDeltas(graph, command);
       const inverse = applyDeltas(graph, deltas);
-      graph.undo.push({ commandId: command.command_id, forward: deltas, inverse });
+      graph.undo.push({
+        commandId: command.command_id,
+        // Record the originating scope alongside the deltas so undo/
+        // redo can validate against it (mirrors the native engine's
+        // `JournalEntry.scope`). Without this the fallback would
+        // accept any `activeScope` at undo time and silently apply
+        // inverse deltas for the wrong rail.
+        scope: command.scope,
+        forward: deltas,
+        inverse,
+      });
       graph.redo.length = 0;
       return {
         commandId: command.command_id,
@@ -1317,12 +1332,22 @@ export function inProcessBackend(): BridgeBackend {
       };
     },
 
-    async commandUndo(projectPath, _activeScope) {
+    async commandUndo(projectPath, activeScope) {
       const graph = ensureInProcessGraph(graphs, projectPath);
-      const entry = graph.undo.pop();
-      if (!entry) {
+      const top = graph.undo[graph.undo.length - 1];
+      if (!top) {
         throw new Error("command_undo: nothing to undo");
       }
+      if (top.scope !== activeScope) {
+        // Mirror of `CommandError::ScopeMismatch` from the native
+        // engine. Validate before mutating either stack so a
+        // rejected call leaves the journal exactly as it was.
+        throw new Error(
+          `command_undo: scope mismatch (expected ${top.scope}, got ${activeScope})`,
+        );
+      }
+      // Take from the undo stack only after the scope check passes.
+      const entry = graph.undo.pop()!;
       applyDeltas(graph, entry.inverse);
       graph.redo.push(entry);
       return {
@@ -1333,12 +1358,18 @@ export function inProcessBackend(): BridgeBackend {
       };
     },
 
-    async commandRedo(projectPath, _activeScope) {
+    async commandRedo(projectPath, activeScope) {
       const graph = ensureInProcessGraph(graphs, projectPath);
-      const entry = graph.redo.pop();
-      if (!entry) {
+      const top = graph.redo[graph.redo.length - 1];
+      if (!top) {
         throw new Error("command_redo: nothing to redo");
       }
+      if (top.scope !== activeScope) {
+        throw new Error(
+          `command_redo: scope mismatch (expected ${top.scope}, got ${activeScope})`,
+        );
+      }
+      const entry = graph.redo.pop()!;
       applyDeltas(graph, entry.forward);
       graph.undo.push(entry);
       return {
@@ -1383,8 +1414,28 @@ export function inProcessBackend(): BridgeBackend {
  */
 export interface InProcessGraph {
   entities: Map<string, EntityRecord>;
-  undo: Array<{ commandId: string; forward: EntityDelta[]; inverse: EntityDelta[] }>;
-  redo: Array<{ commandId: string; forward: EntityDelta[]; inverse: EntityDelta[] }>;
+  /**
+   * The undo stack carries each command's originating `scope` so
+   * {@link BridgeBackend.commandUndo} can validate that the
+   * `activeScope` argument matches the scope the command was
+   * executed under. The native path stores this on the
+   * `undo_journal.scope` column (added in schema v3 — see
+   * `crates/aec_core/src/migrations/v3_undo_journal_scope.rs`); the
+   * JS fallback keeps the same invariant so the two backends are
+   * indistinguishable from the renderer's point of view.
+   */
+  undo: Array<{
+    commandId: string;
+    scope: CommandScope;
+    forward: EntityDelta[];
+    inverse: EntityDelta[];
+  }>;
+  redo: Array<{
+    commandId: string;
+    scope: CommandScope;
+    forward: EntityDelta[];
+    inverse: EntityDelta[];
+  }>;
 }
 
 export function ensureInProcessGraph(
@@ -1418,34 +1469,33 @@ const CREATE_TOOL_KIND_MAP: Record<string, string> = {
 };
 
 /**
- * Strip the args object of any field used purely for routing /
- * targeting (i.e. the lookup id, not part of the body). Mirrors the
- * Rust engine's behaviour where `to_delta()` reads
- * `target_entity_id` / `entity_id` from the command and never copies
- * them into the entity body. Without this scrub, the in-process
- * fallback would silently leak `entity_id` (and friends) into the
- * `record.body` of newly-created entities — divergent from the
- * native path where the body is constructed from the command struct
- * via `serde_json::to_value(self)` which only emits the per-struct
- * fields explicitly declared in the body.
+ * Build the create-side entity body for `tool` from the command
+ * arguments. Mirrors what `to_delta()` writes into
+ * `EntityRecord.body` in `crates/aec_command/src/commands/*`:
+ *
+ * - CreateWall / CreateRoom / CreateFloor / PlaceDoor / PlaceWindow /
+ *   SaveCamera all use `body: serde_json::to_value(self)`, which
+ *   serialises the **entire** struct including `entity_id` (and
+ *   `host_wall_id` for openings). The body therefore mirrors the
+ *   command shape 1:1 — we just spread `args` into a fresh object.
+ *
+ * - AddLight uses `body: serde_json::to_value(&self.light)`, which
+ *   only serialises the `LightKind` sub-object — `entity_id` is
+ *   **not** in the body. We extract `args.light` instead.
+ *
+ * Without this branch the fallback would diverge from the native
+ * path: an earlier draft tried to strip `entity_id` from every
+ * create body, which inverted the contract — the native path keeps
+ * `entity_id`, only AddLight stores just the nested `light`.
  */
-const NON_BODY_FIELDS_FOR_CREATE: Record<string, readonly string[]> = {
-  "design.create_wall": ["entity_id"],
-  "design.create_room": ["entity_id"],
-  "design.create_floor": ["entity_id"],
-  "design.place_door": ["entity_id"],
-  "design.place_window": ["entity_id"],
-  "design.add_light": ["entity_id"],
-  "design.save_camera": ["entity_id"],
-};
-
-function stripFields(
-  obj: Record<string, unknown>,
-  fields: readonly string[],
-): Record<string, unknown> {
-  const out: Record<string, unknown> = { ...obj };
-  for (const f of fields) delete out[f];
-  return out;
+function createBodyFor(tool: string, args: Record<string, unknown>): unknown {
+  if (tool === "design.add_light") {
+    if (args.light === undefined) {
+      throw new Error(`${tool}: missing 'light' field (LightKind)`);
+    }
+    return args.light;
+  }
+  return { ...args };
 }
 
 function assertObjectBody(
@@ -1480,8 +1530,9 @@ export function computeForwardDeltas(graph: InProcessGraph, command: Command): E
   const args = (command.arguments as Record<string, unknown> | undefined) ?? {};
   const tool = command.tool;
   switch (tool) {
-    // --- Create-side tools: emit a Create delta with body = command
-    //     struct minus the routing-only `entity_id` field.
+    // --- Create-side tools: emit a Create delta with body matching
+    //     Rust's `to_delta()` for each command. See `createBodyFor`
+    //     for the per-tool body shape contract.
     case "design.create_wall":
     case "design.create_room":
     case "design.create_floor":
@@ -1494,7 +1545,6 @@ export function computeForwardDeltas(graph: InProcessGraph, command: Command): E
       if (!kind) {
         throw new Error(`commandApply (in-process): kind map missing entry for ${tool}`);
       }
-      const nonBody = NON_BODY_FIELDS_FOR_CREATE[tool] ?? ["entity_id"];
       // Openings (doors/windows) hang off the host wall in the Rust
       // engine (`PlaceDoor::to_delta` sets `parent: Some(host_wall_id)`).
       const parent =
@@ -1508,7 +1558,7 @@ export function computeForwardDeltas(graph: InProcessGraph, command: Command): E
             id: entityId,
             kind,
             parent,
-            body: stripFields(args, nonBody),
+            body: createBodyFor(tool, args),
           },
         },
       ];

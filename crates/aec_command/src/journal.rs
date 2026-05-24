@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, Transaction};
 use serde::{Deserialize, Serialize};
 
-use aec_core::types::CommandId;
+use aec_core::types::{CommandId, Scope};
 
 use crate::commands::EntityDelta;
 use crate::error::{CommandError, CommandResult};
@@ -15,6 +15,13 @@ use crate::error::{CommandError, CommandResult};
 pub struct JournalEntry {
     pub command_id: CommandId,
     pub applied_at: chrono::DateTime<chrono::Utc>,
+    /// Scope the originating command was executed under. The engine
+    /// validates this on `undo` / `redo`: an entry recorded under
+    /// `Scope::Bim` may not be undone while the active scope is
+    /// `Scope::Design`. Without this field the only enforcement was on
+    /// the *forward* path (in `compute_deltas`); the undo/redo paths
+    /// would happily undo into the wrong scope.
+    pub scope: Scope,
     pub forward: Vec<EntityDelta>,
     pub inverse: Vec<EntityDelta>,
 }
@@ -120,7 +127,7 @@ impl UndoRedoJournal {
         let mut undo = Vec::new();
         let mut redo = Vec::new();
         let mut stmt = conn.prepare(
-            "SELECT seq, command_id, applied_at, forward, inverse, superseded \
+            "SELECT seq, command_id, applied_at, forward, inverse, superseded, scope \
              FROM undo_journal ORDER BY seq ASC",
         )?;
         let rows = stmt.query_map(params![], |row| {
@@ -130,26 +137,32 @@ impl UndoRedoJournal {
             let forward_str: String = row.get(3)?;
             let inverse_str: String = row.get(4)?;
             let superseded: i64 = row.get(5)?;
+            let scope_str: String = row.get(6)?;
             Ok((
                 command_id_str,
                 applied_at_str,
                 forward_str,
                 inverse_str,
                 superseded,
+                scope_str,
             ))
         })?;
         for r in rows {
-            let (command_id_str, applied_at_str, forward_str, inverse_str, superseded) = r?;
+            let (command_id_str, applied_at_str, forward_str, inverse_str, superseded, scope_str) =
+                r?;
             let command_id = CommandId::from_string(command_id_str)
                 .map_err(|e| CommandError::JournalCorrupt(format!("invalid command id: {e}")))?;
             let applied_at: DateTime<Utc> = applied_at_str
                 .parse::<DateTime<Utc>>()
                 .map_err(|e| CommandError::JournalCorrupt(format!("invalid applied_at: {e}")))?;
+            let scope = Scope::parse(&scope_str)
+                .map_err(|e| CommandError::JournalCorrupt(format!("invalid scope: {e}")))?;
             let forward: Vec<EntityDelta> = serde_json::from_str(&forward_str)?;
             let inverse: Vec<EntityDelta> = serde_json::from_str(&inverse_str)?;
             let entry = JournalEntry {
                 command_id,
                 applied_at,
+                scope,
                 forward,
                 inverse,
             };
@@ -187,13 +200,14 @@ impl UndoRedoJournal {
         let forward = serde_json::to_string(&entry.forward)?;
         let inverse = serde_json::to_string(&entry.inverse)?;
         tx.execute(
-            "INSERT INTO undo_journal (command_id, applied_at, forward, inverse, superseded) \
-             VALUES (?1, ?2, ?3, ?4, 0)",
+            "INSERT INTO undo_journal (command_id, applied_at, forward, inverse, superseded, scope) \
+             VALUES (?1, ?2, ?3, ?4, 0, ?5)",
             params![
                 entry.command_id.to_string(),
                 entry.applied_at.to_rfc3339(),
                 forward,
                 inverse,
+                entry.scope.as_str(),
             ],
         )?;
         Ok(())
@@ -257,6 +271,10 @@ mod tests {
     use aec_core::types::EntityId;
 
     fn entry() -> JournalEntry {
+        entry_with_scope(Scope::Design)
+    }
+
+    fn entry_with_scope(scope: Scope) -> JournalEntry {
         let id = EntityId::new();
         let record = EntityRecord {
             id: id.clone(),
@@ -267,6 +285,7 @@ mod tests {
         JournalEntry {
             command_id: CommandId::new(),
             applied_at: chrono::Utc::now(),
+            scope,
             forward: vec![EntityDelta::Create {
                 record: record.clone(),
             }],
@@ -334,11 +353,24 @@ mod tests {
                 applied_at  TEXT NOT NULL,
                 forward     TEXT NOT NULL,
                 inverse     TEXT NOT NULL,
-                superseded  INTEGER NOT NULL DEFAULT 0
+                superseded  INTEGER NOT NULL DEFAULT 0,
+                scope       TEXT NOT NULL DEFAULT 'design'
             );",
         )
         .unwrap();
         conn
+    }
+
+    #[test]
+    fn persist_record_round_trips_scope() {
+        let mut conn = open_in_memory_with_journal_table();
+        let mut e = entry();
+        e.scope = Scope::Bim;
+        UndoRedoJournal::persist_record(&mut conn, &e).unwrap();
+        let j = UndoRedoJournal::load(&conn, 1024).unwrap();
+        assert_eq!(j.undo_len(), 1);
+        let head = j.peek_undo().expect("undo stack has one entry");
+        assert_eq!(head.scope, Scope::Bim);
     }
 
     #[test]

@@ -149,9 +149,14 @@ describe("renderer command surface", () => {
     // `material_id` was overwritten; other body fields preserved.
     expect(after.material_id).toBe("oak");
     expect(after.height_mm).toBe(2700);
-    // Critically: the command's `target_entity_id` must NOT leak into
-    // the entity body — Rust's `PaintMaterial::to_delta` only inserts
-    // `material_id`, never the routing fields.
+    // Rust's `PaintMaterial::to_delta` only inserts `material_id`
+    // (or the surface slot) into the *existing* wall body; it never
+    // touches the routing-only `target_entity_id` field. The wall's
+    // serialised body comes from `CreateWall::to_delta`'s
+    // `serde_json::to_value(self)`, which carries `entity_id` (the
+    // wall's own id) but never carries a `target_entity_id` field
+    // because `CreateWall` doesn't have one. So the routing field
+    // must remain absent here.
     expect(after.target_entity_id).toBeUndefined();
   });
 
@@ -218,8 +223,14 @@ describe("renderer command surface", () => {
     const body = rows[0]!.body as { name: string; params: { focal_length_mm: number } };
     expect(body.name).toBe("Hero");
     expect(body.params.focal_length_mm).toBe(35);
-    // Routing field `entity_id` must not leak into the body.
-    expect((rows[0]!.body as Record<string, unknown>).entity_id).toBeUndefined();
+    // `SaveCamera::to_delta` writes `serde_json::to_value(self)` as
+    // the body, which includes the `entity_id` field. The native
+    // path therefore round-trips with `entity_id` present in the
+    // body; the in-process fallback matches this contract via
+    // `createBodyFor("design.save_camera", args)` in
+    // `apps/desktop/electron/bridge.ts`. Pin both backends to the
+    // same shape.
+    expect((rows[0]!.body as Record<string, unknown>).entity_id).toBe("cam_1");
   });
 
   it("projectGraphList with no kindFilter returns the full graph", async () => {
@@ -280,6 +291,48 @@ describe("renderer command surface", () => {
   it("undo on an empty journal rejects with a clear error", async () => {
     const projectPath = `/projects/empty_${Date.now()}.aecstudio`;
     await expect(commandUndo(projectPath, "design")).rejects.toThrow(/nothing to undo/i);
+  });
+
+  // Pins scope validation on undo/redo. The renderer-facing contract
+  // (BridgeBackend.commandUndo doc comment) and the native engine
+  // both reject undoing a command tagged with one scope while the
+  // active scope is another. The in-process fallback must enforce
+  // the same invariant or dev/test mode would silently accept
+  // mismatched undo calls that production would reject.
+  it("commandUndo rejects when activeScope disagrees with the journal entry's scope", async () => {
+    const projectPath = `/projects/scope_undo_${Date.now()}.aecstudio`;
+    await createWall(projectPath, {
+      entity_id: "wall_scope",
+      start_mm: [0, 0],
+      end_mm: [3000, 0],
+      height_mm: 2700,
+      thickness_mm: 100,
+    });
+    // The wall was created under `design`; an undo issued from
+    // any other scope must be rejected before either stack moves.
+    await expect(commandUndo(projectPath, "bim")).rejects.toThrow(/scope mismatch/i);
+    // Journal is untouched: a follow-up undo from the correct
+    // scope still succeeds.
+    const undone = await commandUndo(projectPath, "design");
+    expect(undone.applied).toHaveLength(1);
+    expect(undone.undoLen).toBe(0);
+    expect(undone.redoLen).toBe(1);
+  });
+
+  it("commandRedo rejects when activeScope disagrees with the journal entry's scope", async () => {
+    const projectPath = `/projects/scope_redo_${Date.now()}.aecstudio`;
+    await createWall(projectPath, {
+      entity_id: "wall_redo_scope",
+      start_mm: [0, 0],
+      end_mm: [3000, 0],
+      height_mm: 2700,
+      thickness_mm: 100,
+    });
+    await commandUndo(projectPath, "design");
+    await expect(commandRedo(projectPath, "render")).rejects.toThrow(/scope mismatch/i);
+    const redone = await commandRedo(projectPath, "design");
+    expect(redone.applied[0]!.kind).toBe("create");
+    expect(redone.undoLen).toBe(1);
   });
 
   // Pins the audit-only contract for `design.set_lighting`. The Rust

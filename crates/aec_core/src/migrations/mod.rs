@@ -39,6 +39,7 @@ use rusqlite::{params, Connection};
 use crate::error::{AecError, AecResult};
 
 pub mod v2_audit_chain;
+pub mod v3_undo_journal_scope;
 
 /// A forward-only DDL step that moves a database from
 /// `target - 1` to `target`. SQL is run inside the migration runner's
@@ -70,7 +71,10 @@ impl Migration {
         // SQL local to its diff. Order must be ascending by `target`
         // and dense; `validate_registry` enforces both at runner
         // start time.
-        &[v2_audit_chain::V2_AUDIT_CHAIN]
+        &[
+            v2_audit_chain::V2_AUDIT_CHAIN,
+            v3_undo_journal_scope::V3_UNDO_JOURNAL_SCOPE,
+        ]
     }
 
     /// Verify the registry is a dense, ascending, duplicate-free chain
@@ -394,8 +398,15 @@ mod tests {
             .unwrap();
         assert_eq!(exists, 1);
         // 2. Simulate a "legacy v1" database by clobbering the recorded
-        //    schema_version back to 1 and dropping the v2 table.
-        conn.execute_batch("DROP TABLE audit_chain;").unwrap();
+        //    schema_version back to 1 and rolling every post-v1 DDL
+        //    out: drop the v2 audit_chain table and the v3
+        //    `undo_journal.scope` column.
+        conn.execute_batch(
+            "DROP TABLE audit_chain;
+             DROP INDEX idx_undo_journal_scope;
+             ALTER TABLE undo_journal DROP COLUMN scope;",
+        )
+        .unwrap();
         write_schema_version(&conn, 1).unwrap();
         drop(conn);
         // 3. Re-open. The production migration runner should upgrade

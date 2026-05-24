@@ -83,6 +83,10 @@ impl CommandEngine {
         self.journal.record(JournalEntry {
             command_id: cmd.command_id.clone(),
             applied_at: cmd.ts,
+            // Tag the entry with the active scope so the undo/redo
+            // path can validate scope on pop. See `compute_deltas` for
+            // the forward-side check.
+            scope: self.active_scope,
             forward: applied.clone(),
             inverse,
         });
@@ -110,6 +114,19 @@ impl CommandEngine {
     /// entry on the redo stack and the next `redo` call would re-apply
     /// changes that are already in effect.
     pub fn undo(&mut self) -> Result<CommandResult> {
+        // Validate scope before detaching the entry: if the active
+        // scope disagrees with the recorded scope, the undo is rejected
+        // and the journal is left untouched. Without this, an `undo`
+        // issued under the wrong active scope would silently apply
+        // inverse deltas tagged for a different rail.
+        if let Some(top) = self.journal.peek_undo() {
+            if top.scope != self.active_scope {
+                return Err(CommandError::ScopeMismatch {
+                    expected: top.scope.to_string(),
+                    actual: self.active_scope.to_string(),
+                });
+            }
+        }
         let entry = self
             .journal
             .take_undo()
@@ -143,6 +160,15 @@ impl CommandEngine {
     /// Mirrors [`Self::undo`] with two-phase journal mutation — see that
     /// method's docs for the rationale.
     pub fn redo(&mut self) -> Result<CommandResult> {
+        // Mirror of the scope-validation in [`Self::undo`].
+        if let Some(top) = self.journal.peek_redo() {
+            if top.scope != self.active_scope {
+                return Err(CommandError::ScopeMismatch {
+                    expected: top.scope.to_string(),
+                    actual: self.active_scope.to_string(),
+                });
+            }
+        }
         let entry = self
             .journal
             .take_redo()
@@ -285,6 +311,10 @@ impl CommandEngine {
         let entry = JournalEntry {
             command_id: cmd.command_id.clone(),
             applied_at: cmd.ts,
+            // Tag the journal entry with the active scope so a
+            // subsequent `undo` / `redo` can validate that the caller's
+            // active scope matches the command's originating scope.
+            scope: self.active_scope,
             forward: deltas.clone(),
             inverse,
         };
@@ -327,6 +357,14 @@ impl CommandEngine {
             .peek_undo()
             .ok_or(CommandError::NothingToUndo)?
             .clone();
+        // Reject before validating deltas or opening a tx so a scope
+        // mismatch leaves both the journal and the SQL state untouched.
+        if entry.scope != self.active_scope {
+            return Err(CommandError::ScopeMismatch {
+                expected: entry.scope.to_string(),
+                actual: self.active_scope.to_string(),
+            });
+        }
         self.graph.validate_all(&entry.inverse)?;
         let tx = conn.transaction()?;
         for d in &entry.inverse {
@@ -363,6 +401,13 @@ impl CommandEngine {
             .peek_redo()
             .ok_or(CommandError::NothingToRedo)?
             .clone();
+        // Mirror of the scope check in [`Self::undo_persistent`].
+        if entry.scope != self.active_scope {
+            return Err(CommandError::ScopeMismatch {
+                expected: entry.scope.to_string(),
+                actual: self.active_scope.to_string(),
+            });
+        }
         self.graph.validate_all(&entry.forward)?;
         let tx = conn.transaction()?;
         for d in &entry.forward {
@@ -686,7 +731,8 @@ mod tests {
                 applied_at  TEXT NOT NULL,
                 forward     TEXT NOT NULL,
                 inverse     TEXT NOT NULL,
-                superseded  INTEGER NOT NULL DEFAULT 0
+                superseded  INTEGER NOT NULL DEFAULT 0,
+                scope       TEXT NOT NULL DEFAULT 'design'
             );",
         )
         .unwrap();
