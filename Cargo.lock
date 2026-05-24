@@ -92,6 +92,7 @@ dependencies = [
  "aec_geometry",
  "aec_governor",
  "aec_render",
+ "blake3",
  "chrono",
  "napi",
  "napi-build",

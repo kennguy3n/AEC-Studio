@@ -36,6 +36,43 @@ use serde::{Deserialize, Serialize};
 
 use aec_core::types::EntityId;
 
+/// Name of the synthetic `IfcPropertySet` the BIM round-trip uses to
+/// preserve `IfcMaterialLayerSetUsage` metadata (LayerSetDirection,
+/// DirectionSense, OffsetFromReferenceLine).
+///
+/// IFC4 carries layer-set orientation per element via the
+/// `IfcMaterialLayerSetUsage` wrapper around `IfcMaterialLayerSet`.
+/// AEC Studio's [`MaterialAssignment::LayerSet`] only references the
+/// underlying set by name (no per-wall orientation), so when reading
+/// a Revit / ArchiCAD-authored file we'd lose that metadata. To keep
+/// the round-trip lossless, the reader extracts the usage fields and
+/// stores them as a synthetic Pset on the element under this name; the
+/// writer recovers them when emitting `IfcRelAssociatesMaterial` and
+/// emits a real `IfcMaterialLayerSetUsage` wrapper instead of a direct
+/// `IfcMaterialLayerSet` ref.
+///
+/// The leading `AEC_` prefix follows the BIM-tool convention for
+/// vendor-private Psets (`Pset_*` is reserved for buildingSMART;
+/// `<Vendor>_*` is the standard escape hatch).
+///
+/// **Pset keys** (string literals so consumers can search for them):
+/// * [`AEC_LAYER_SET_USAGE_KEY_DIRECTION`] — `"LayerSetDirection"`
+/// * [`AEC_LAYER_SET_USAGE_KEY_SENSE`] — `"DirectionSense"`
+/// * [`AEC_LAYER_SET_USAGE_KEY_OFFSET`] — `"OffsetFromReferenceLine"`
+pub const AEC_LAYER_SET_USAGE_PSET: &str = "AEC_LayerSetUsage";
+
+/// Pset property key for `IfcMaterialLayerSetUsage.LayerSetDirection`
+/// (`.AXIS2.` for walls, `.AXIS3.` for slabs).
+pub const AEC_LAYER_SET_USAGE_KEY_DIRECTION: &str = "LayerSetDirection";
+
+/// Pset property key for `IfcMaterialLayerSetUsage.DirectionSense`
+/// (`.POSITIVE.` / `.NEGATIVE.`).
+pub const AEC_LAYER_SET_USAGE_KEY_SENSE: &str = "DirectionSense";
+
+/// Pset property key for `IfcMaterialLayerSetUsage.OffsetFromReferenceLine`
+/// (signed real, in metres).
+pub const AEC_LAYER_SET_USAGE_KEY_OFFSET: &str = "OffsetFromReferenceLine";
+
 /// A single homogeneous material — e.g. `"Concrete - C25/30"`.
 ///
 /// Two materials with the same name are considered the same material

@@ -5,6 +5,7 @@
 //! this layer trivially testable.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -18,8 +19,21 @@ use aec_core::types::{ProjectId, Scope};
 use aec_governor::profiler::{CpuProfile, GpuProfile, HardwareProfiler};
 use aec_governor::tier::HardwareTier;
 
+use crate::bim_attach;
 use crate::engine_status_cache::EngineStatusCache;
 use crate::recents::{RecentsStore, RecentsStoreError};
+use crate::snapshot_cache::{SnapshotCache, SnapshotKey};
+
+/// Renderer-side warning threshold for IFC files. Files at or above
+/// this byte count surface a `BimImportSummary.large_file_warning`
+/// flag so the renderer can show a confirm dialog ("This file is N
+/// MB; parsing may take a while — continue?") before the user
+/// commits to the parse path. The bridge still runs the import — the
+/// flag is advisory — because we don't want to silently reject a
+/// real workflow just because the file is large. Set to 100 MB,
+/// chosen as the rough boundary between "interactive parse" (< 5 s
+/// on a modern laptop) and "go-grab-a-coffee parse".
+pub(crate) const BIM_IMPORT_LARGE_FILE_THRESHOLD_BYTES: u64 = 100 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum BridgeServiceError {
@@ -174,6 +188,49 @@ pub struct BimImportSummary {
     pub material_assignments: u64,
     /// Total STEP records the reader walked (records_seen).
     pub records_seen: u64,
+    /// File size in bytes the bridge read off disk. Surfaced so the
+    /// renderer can render a humanised "123 MB" line on the preview
+    /// without re-running `fs.stat` from the JS side.
+    pub file_size_bytes: u64,
+    /// `true` when the file size meets-or-exceeds
+    /// [`BIM_IMPORT_LARGE_FILE_THRESHOLD_BYTES`] (100 MB). The bridge
+    /// still parses the file — the flag is advisory — so the
+    /// renderer can throw up a confirm dialog *before* committing to
+    /// the parse path on a multi-hundred-MB MEP federation. Set to
+    /// `false` for typical architectural models.
+    pub large_file_warning: bool,
+}
+
+/// Result of a successful [`BridgeService::bim_attach_ifc`] call.
+/// Counts how the snapshot was folded into the project graph so the
+/// renderer can show "Attached 3 storeys, 142 walls, 87 doors, ...".
+///
+/// All counters are post-dedup: a re-attach of the same file with
+/// identical content reports `_unchanged` instead of `_inserted` /
+/// `_updated`. See [`crate::bim_attach`] for the dedup contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BimAttachSummary {
+    /// Canonical absolute path of the IFC file that was attached.
+    /// Same canonical form as [`BimImportSummary::path`] so the
+    /// renderer can dedup recents across import → attach.
+    pub path: String,
+    /// Project the attach landed in. Mirrors the field the renderer
+    /// shows on the Home / dashboard tiles.
+    pub project_path: String,
+    /// `true` if the snapshot for this file was served from the
+    /// in-process cache populated by a prior `bim_import_ifc`, false
+    /// if the bridge had to re-parse the file from disk. Useful for
+    /// instrumentation and for the renderer's loading indicator.
+    pub parse_cache_hit: bool,
+    pub spatial_nodes_inserted: u64,
+    pub spatial_nodes_updated: u64,
+    pub spatial_nodes_unchanged: u64,
+    pub elements_inserted: u64,
+    pub elements_updated: u64,
+    pub elements_unchanged: u64,
+    pub components_inserted: u64,
+    pub relations_inserted: u64,
+    pub cache_rows: u64,
 }
 
 /// Hardware-status snapshot. The shape mirrors the TypeScript
@@ -227,6 +284,16 @@ pub struct BridgeService {
     /// ensure subsequent reads observe their writes through a fresh
     /// connection.
     engine_status_cache: EngineStatusCache,
+    /// LRU cache for parsed [`aec_bim::ifc::IfcSnapshot`]s, keyed on
+    /// `(canonical_path, mtime, size)`. Populated by
+    /// [`Self::bim_import_ifc`] (the preview path) and consumed by
+    /// [`Self::bim_attach_ifc`] (the commit path) so a
+    /// preview → attach handoff doesn't re-parse the file.
+    ///
+    /// See [`crate::snapshot_cache`] for the cache semantics (60 s
+    /// idle TTL, 4-entry LRU, double-checked locking model that
+    /// mirrors [`EngineStatusCache`]).
+    snapshot_cache: SnapshotCache,
 }
 
 impl BridgeService {
@@ -240,6 +307,7 @@ impl BridgeService {
             recents,
             master_key,
             engine_status_cache: EngineStatusCache::new(),
+            snapshot_cache: SnapshotCache::new(),
         })
     }
 
@@ -290,6 +358,16 @@ impl BridgeService {
     #[doc(hidden)]
     pub fn __engine_status_cache_len(&self) -> usize {
         self.engine_status_cache.len()
+    }
+
+    /// Test-only accessor for the snapshot LRU cache size. Mirrors
+    /// `__engine_status_cache_len`'s rationale: lets integration tests
+    /// in `tests/` assert that `bim_import_ifc` → `bim_attach_ifc`
+    /// actually hits the cache (avoiding a re-parse) without exposing
+    /// the cache type itself.
+    #[doc(hidden)]
+    pub fn __snapshot_cache_len(&self) -> usize {
+        self.snapshot_cache.len()
     }
 
     /// List bundled templates available for the New Project flow.
@@ -578,6 +656,7 @@ impl BridgeService {
         // pset values), which is a strict improvement over outright
         // failing the import.
         let bytes = std::fs::read(Path::new(path))?;
+        let file_size_bytes = bytes.len() as u64;
         let body = String::from_utf8_lossy(&bytes).into_owned();
         // Canonicalise after the read succeeds so a non-existent path
         // surfaces as the same `Io` error the read itself would have
@@ -587,10 +666,35 @@ impl BridgeService {
         // `BimImportSummary.path` field documents this canonical form
         // so downstream consumers (PR-L snapshot cache, dedup) can
         // trust it.
-        let canonical_path = std::fs::canonicalize(Path::new(path))?
-            .to_string_lossy()
-            .into_owned();
-        let snapshot = aec_bim::ifc::IfcReader::from_string(&body)?;
+        let canonical_path_buf = std::fs::canonicalize(Path::new(path))?;
+        let canonical_path = canonical_path_buf.to_string_lossy().into_owned();
+        // Wrap the parsed snapshot in `Arc` immediately so the cache
+        // insert can use `Arc::clone` (refcount bump, microseconds)
+        // rather than a full `IfcSnapshot::clone` (deep-copies every
+        // `PropertyStore` / `ClassificationStore` / `MaterialStore` /
+        // `guid_by_entity` entry — on a 50–500 MB federated IFC that's
+        // 100+ MB of heap traffic, temporarily doubling peak memory
+        // and defeating the very point of the cache as stated in
+        // `snapshot_cache.rs`'s module docs).
+        //
+        // All subsequent reads in this function (`.schema`,
+        // `.stats.*`) go through `Arc::deref` automatically.
+        let snapshot = Arc::new(aec_bim::ifc::IfcReader::from_string(&body)?);
+        // Populate the snapshot cache so a follow-up
+        // `bim_attach_ifc` for the same file doesn't have to re-parse.
+        // The cache key is `(canonical_path, mtime, size)` — a file
+        // overwritten between import and attach naturally misses (new
+        // mtime / new size), forcing a re-parse, so we never serve a
+        // stale snapshot.
+        if let Ok(key) = SnapshotKey::from_canonical_path(&canonical_path_buf) {
+            self.snapshot_cache.insert(key, Arc::clone(&snapshot));
+        }
+        // If the SnapshotKey::from_canonical_path call failed,
+        // `metadata` errored even though `canonicalize` succeeded a
+        // moment ago — a transient FS hiccup. We don't have a stable
+        // key to insert under, so skip the cache and let the next
+        // call re-parse. This is a strict downgrade in performance,
+        // not a correctness hazard.
         Ok(BimImportSummary {
             path: canonical_path,
             // `Display` returns the canonical STEP token
@@ -610,6 +714,105 @@ impl BridgeService {
             material_layer_sets: snapshot.stats.material_layer_sets as u64,
             material_assignments: snapshot.stats.material_assignments as u64,
             records_seen: snapshot.stats.records_seen as u64,
+            file_size_bytes,
+            large_file_warning: file_size_bytes >= BIM_IMPORT_LARGE_FILE_THRESHOLD_BYTES,
+        })
+    }
+
+    /// Fold a parsed IFC file into the active project's authoring
+    /// graph. The complement of [`Self::bim_import_ifc`] — the
+    /// renderer typically calls `bim_import_ifc` first to show the
+    /// user a preview ("123 walls, 45 slabs, ..."), and `bim_attach_ifc`
+    /// once the user confirms they want to commit the model.
+    ///
+    /// This method writes to the project package's encrypted SQLite
+    /// database under a single [`rusqlite::Transaction`]: every
+    /// `entities` / `components` / `relations` / `bim_cache` row is
+    /// either fully committed or fully rolled back. A mid-attach
+    /// failure (e.g. disk-full halfway through writing 12 000
+    /// `IfcWall` rows from an MEP federation) leaves the project
+    /// graph at its pre-attach state.
+    ///
+    /// **Re-attach dedup**: if `ifc_path` has been attached before,
+    /// the bridge looks up each entity by its `bim_cache.global_id`
+    /// (IFC GUID). Rows with unchanged hashes only bump `last_seen`;
+    /// rows with new content UPDATE the `entities` body and wipe + re-
+    /// insert the BIM-namespaced components. Non-BIM components
+    /// (e.g. user-added render-material overrides) are NOT touched.
+    ///
+    /// **Cache awareness**: if a recent `bim_import_ifc` populated
+    /// the snapshot cache for this `(canonical_path, mtime, size)`
+    /// triple, the attach reuses the parsed snapshot without
+    /// re-reading or re-parsing the IFC file. The returned
+    /// [`BimAttachSummary::parse_cache_hit`] flag exposes whether
+    /// the cache fired so the renderer can show "Attached (cached)"
+    /// vs "Attached (re-parsed)" on the status pane.
+    pub fn bim_attach_ifc(
+        &self,
+        project_path: &str,
+        ifc_path: &str,
+    ) -> Result<BimAttachSummary, BridgeServiceError> {
+        let canonical_ifc_buf = std::fs::canonicalize(Path::new(ifc_path))?;
+        let canonical_ifc = canonical_ifc_buf.to_string_lossy().into_owned();
+
+        // Snapshot cache: try a hit first; on miss, read + parse the
+        // file and populate the cache for any next attach.
+        let key_opt = SnapshotKey::from_canonical_path(&canonical_ifc_buf).ok();
+        let (snapshot_arc, parse_cache_hit) =
+            if let Some(snap) = key_opt.as_ref().and_then(|k| self.snapshot_cache.get(k)) {
+                (snap, true)
+            } else {
+                // Cache miss (or no cache key available) — read and
+                // parse the file ourselves. We still populate the cache
+                // on a successful parse if we have a key, so the next
+                // attach for the same `(path, mtime, size)` is fast.
+                let bytes = std::fs::read(&canonical_ifc_buf)?;
+                let body = String::from_utf8_lossy(&bytes).into_owned();
+                let parsed = aec_bim::ifc::IfcReader::from_string(&body)?;
+                let arc = Arc::new(parsed);
+                if let Some(key) = key_opt {
+                    self.snapshot_cache.insert(key, Arc::clone(&arc));
+                }
+                (arc, false)
+            };
+
+        // Open the project package + DB. We need a mutable connection
+        // for the transaction; `open_with_master_key_and_database`
+        // bundles the package open and the connection handoff so we
+        // don't re-run the SQLCipher key derivation twice.
+        let (_pkg, mut conn) = ProjectPackage::open_with_master_key_and_database(
+            Path::new(project_path),
+            &self.master_key,
+        )?;
+
+        let counts = {
+            let tx = conn.transaction()?;
+            let counts = bim_attach::attach_snapshot(&tx, &snapshot_arc, &canonical_ifc)?;
+            tx.commit()?;
+            counts
+        };
+
+        // The attach mutated the project DB, so the cached engine-
+        // status connection for this project path must be invalidated
+        // — otherwise a subsequent `project_engine_status` call could
+        // hand the renderer a connection that doesn't see the new
+        // entities / components rows. Mirrors the discipline
+        // documented at `invalidate_status_cache_for` (line ≈272).
+        self.invalidate_status_cache_for(project_path);
+
+        Ok(BimAttachSummary {
+            path: canonical_ifc,
+            project_path: project_path.to_owned(),
+            parse_cache_hit,
+            spatial_nodes_inserted: counts.spatial_nodes_inserted,
+            spatial_nodes_updated: counts.spatial_nodes_updated,
+            spatial_nodes_unchanged: counts.spatial_nodes_unchanged,
+            elements_inserted: counts.elements_inserted,
+            elements_updated: counts.elements_updated,
+            elements_unchanged: counts.elements_unchanged,
+            components_inserted: counts.components_inserted,
+            relations_inserted: counts.relations_inserted,
+            cache_rows: counts.cache_rows,
         })
     }
 
@@ -1055,6 +1258,647 @@ END-ISO-10303-21;\n";
             !summary.path.contains("/./") && !summary.path.contains("\\.\\"),
             "canonical path must not contain '.' segments: {}",
             summary.path
+        );
+    }
+
+    /// Minimal valid IFC4 body used by the bim_attach tests below.
+    /// The reader requires a project entity with a non-null GUID; the
+    /// site/building/storey/space spatial chain is added so the
+    /// attach path has multiple `entities.parent_id` levels to
+    /// exercise (a flat single-node IFC wouldn't stress the BFS).
+    fn fixture_ifc_body() -> Vec<u8> {
+        let raw = b"ISO-10303-21;\n\
+HEADER;\n\
+FILE_DESCRIPTION(('test'),'2;1');\n\
+FILE_NAME('t.ifc','2026-05-20T00:00:00',(''),(''),'','','');\n\
+FILE_SCHEMA(('IFC4'));\n\
+ENDSEC;\n\
+DATA;\n\
+#1 = IFCOWNERHISTORY($,$,$,.NOCHANGE.,$,$,$,1747699200);\n\
+#2 = IFCPROJECT('00000000000000000000a1',#1,'Project','Project',$,$,$,$,$);\n\
+ENDSEC;\n\
+END-ISO-10303-21;\n";
+        raw.to_vec()
+    }
+
+    #[test]
+    fn bim_import_ifc_populates_snapshot_cache() {
+        // Verifies the cache-warm side effect of `bim_import_ifc`:
+        // after a successful parse, the snapshot cache MUST hold one
+        // entry keyed under the file the user pointed at. Without
+        // this, the matching `bim_attach_ifc` would re-parse the
+        // file from disk — defeating the whole point of the preview
+        // → attach handoff.
+        let (s, _g) = service();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("import-cache.ifc");
+        std::fs::write(&path, fixture_ifc_body()).unwrap();
+        assert_eq!(s.__snapshot_cache_len(), 0, "cache starts empty");
+        let _ = s
+            .bim_import_ifc(path.to_str().unwrap())
+            .expect("valid IFC must parse");
+        assert_eq!(
+            s.__snapshot_cache_len(),
+            1,
+            "bim_import_ifc must populate the snapshot cache"
+        );
+    }
+
+    #[test]
+    fn bim_import_ifc_reports_file_size_and_large_file_flag() {
+        // The renderer needs `file_size_bytes` to show a humanised
+        // size on the preview panel. `large_file_warning` is false
+        // for small fixtures — assert that explicitly so the
+        // 100MB threshold doesn't drift to "always warn" by accident.
+        let (s, _g) = service();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("size.ifc");
+        let body = fixture_ifc_body();
+        let expected_size = body.len() as u64;
+        std::fs::write(&path, &body).unwrap();
+        let summary = s
+            .bim_import_ifc(path.to_str().unwrap())
+            .expect("valid IFC must parse");
+        assert_eq!(summary.file_size_bytes, expected_size);
+        assert!(
+            !summary.large_file_warning,
+            "fixture is well below 100 MB; large_file_warning must be false"
+        );
+        assert!(
+            expected_size < BIM_IMPORT_LARGE_FILE_THRESHOLD_BYTES,
+            "fixture must be smaller than the warning threshold"
+        );
+    }
+
+    #[test]
+    fn bim_attach_ifc_persists_spatial_nodes_into_entities() {
+        // End-to-end: create a project, point bim_attach_ifc at a
+        // freshly-written IFC file, and assert the spatial graph
+        // landed in the `entities` table under the `bim/spatial/...`
+        // kind namespace.
+        let (mut s, _g) = service();
+        let project = s
+            .project_create_from_template("interior.apartment", "Attach Target")
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let ifc_path = tmp.path().join("attach.ifc");
+        std::fs::write(&ifc_path, fixture_ifc_body()).unwrap();
+
+        let attach = s
+            .bim_attach_ifc(&project.path, ifc_path.to_str().unwrap())
+            .expect("attach must succeed");
+        assert!(
+            attach.spatial_nodes_inserted >= 1,
+            "at least the IfcProject root must be inserted"
+        );
+        assert_eq!(
+            attach.spatial_nodes_updated, 0,
+            "first attach on an empty project must have zero updates"
+        );
+        assert!(attach.cache_rows >= 1, "bim_cache must record the GUID");
+
+        // Re-open the DB directly and assert the row landed.
+        let pkg = aec_core::package::ProjectPackage::open_with_master_key(
+            std::path::Path::new(&project.path),
+            &[42u8; 32],
+        )
+        .unwrap();
+        let conn = pkg.open_database(&[42u8; 32]).unwrap();
+        let spatial_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entities WHERE kind LIKE 'bim/spatial/%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            spatial_count >= 1,
+            "expected >=1 bim/spatial/* entity; got {spatial_count}"
+        );
+    }
+
+    #[test]
+    fn bim_attach_ifc_is_idempotent_on_reattach() {
+        // Re-attaching the same file MUST be a no-op for the
+        // entities table: the second call reports `_unchanged` for
+        // every spatial node and inserts zero new ones. This is the
+        // dedup contract documented at `crates/aec_bridge/src/bim_attach.rs`.
+        let (mut s, _g) = service();
+        let project = s
+            .project_create_from_template("interior.apartment", "Idempotent")
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let ifc_path = tmp.path().join("idem.ifc");
+        std::fs::write(&ifc_path, fixture_ifc_body()).unwrap();
+
+        let first = s
+            .bim_attach_ifc(&project.path, ifc_path.to_str().unwrap())
+            .unwrap();
+        let second = s
+            .bim_attach_ifc(&project.path, ifc_path.to_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            first.spatial_nodes_inserted, second.spatial_nodes_unchanged,
+            "all spatial nodes inserted on first attach must be unchanged on second"
+        );
+        assert_eq!(
+            second.spatial_nodes_inserted, 0,
+            "re-attach must not insert any spatial nodes"
+        );
+        assert_eq!(
+            second.spatial_nodes_updated, 0,
+            "identical content must not be classified as updated"
+        );
+    }
+
+    #[test]
+    fn bim_attach_ifc_hits_snapshot_cache_after_import() {
+        // The whole point of the snapshot cache is to avoid a
+        // re-parse on the import → attach handoff. Verify the
+        // `parse_cache_hit` flag fires when the prior
+        // `bim_import_ifc` populated the cache.
+        let (mut s, _g) = service();
+        let project = s
+            .project_create_from_template("interior.apartment", "Cache Hit")
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let ifc_path = tmp.path().join("cached.ifc");
+        std::fs::write(&ifc_path, fixture_ifc_body()).unwrap();
+
+        let _ = s
+            .bim_import_ifc(ifc_path.to_str().unwrap())
+            .expect("import must parse");
+        let attach = s
+            .bim_attach_ifc(&project.path, ifc_path.to_str().unwrap())
+            .unwrap();
+        assert!(
+            attach.parse_cache_hit,
+            "attach after import must reuse the cached snapshot"
+        );
+    }
+
+    #[test]
+    fn bim_attach_ifc_handles_empty_guid_spatial_nodes_without_fk_violation() {
+        // Regression for Devin Review round 4 BUG_0001: a spatial
+        // node with an empty-string `IfcRoot.GlobalId` ('' in the
+        // STEP literal) used to flow through the bridge as
+        // `Some("")` rather than `None`. The reader synthesises a
+        // fresh non-deterministic `EntityId` for every parse of a
+        // GUID-less row, but the `bim_cache.global_id` index would
+        // alias all `Some("")` rows together on lookup. On the
+        // second attach of the same file, the new (random) EntityId
+        // for the empty-GUID site would never be inserted into
+        // `entities` (the dedup path took the `Unchanged` / `Updated`
+        // branch and did `UPDATE WHERE id = <new_random>`, matching
+        // zero rows). Any child whose `parent_id` referenced that
+        // new EntityId then violated the `entities.parent_id`
+        // foreign-key.
+        //
+        // Test shape: an IFC with `IfcProject` (real GUID) →
+        // `IfcSite` (EMPTY GUID, `''`) → `IfcBuilding` (real GUID),
+        // attached twice. The second attach must succeed. Empty-GUID
+        // sites get fresh EntityIds per parse and always take the
+        // `Inserted` branch, so children's `parent_id` always points
+        // at a row we just inserted.
+        let (mut s, _g) = service();
+        let project = s
+            .project_create_from_template("interior.apartment", "EmptyGuid")
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let ifc_path = tmp.path().join("empty-guid.ifc");
+        let body = b"ISO-10303-21;\n\
+HEADER;\n\
+FILE_DESCRIPTION(('empty-guid'),'2;1');\n\
+FILE_NAME('e.ifc','2026-05-20T00:00:00',(''),(''),'','','');\n\
+FILE_SCHEMA(('IFC4'));\n\
+ENDSEC;\n\
+DATA;\n\
+#1 = IFCOWNERHISTORY($,$,$,.NOCHANGE.,$,$,$,1747699200);\n\
+#2 = IFCPROJECT('00000000000000000000a1',#1,'P','P',$,$,$,$,$);\n\
+#3 = IFCSITE('',#1,$,'NoGuidSite',$,$,$,$,$);\n\
+#4 = IFCBUILDING('00000000000000000000a4',#1,$,'B',$,$,$,$,$);\n\
+#5 = IFCRELAGGREGATES('00000000000000000000a5',#1,$,$,#2,(#3));\n\
+#6 = IFCRELAGGREGATES('00000000000000000000a6',#1,$,$,#3,(#4));\n\
+ENDSEC;\n\
+END-ISO-10303-21;\n";
+        std::fs::write(&ifc_path, body).unwrap();
+
+        let first = s
+            .bim_attach_ifc(&project.path, ifc_path.to_str().unwrap())
+            .expect("first attach must succeed");
+        assert!(
+            first.spatial_nodes_inserted >= 3,
+            "expected >=3 (project + site + building) on first attach; got {}",
+            first.spatial_nodes_inserted
+        );
+        // The whole point: re-attach must NOT raise an
+        // FOREIGN KEY constraint failed error. The empty-GUID site
+        // takes the `Inserted` branch on every attach, but so does
+        // every other GUID-less row, so the bridge call should
+        // return `Ok(_)` even though it inserts a fresh EntityId
+        // for the site.
+        let second = s
+            .bim_attach_ifc(&project.path, ifc_path.to_str().unwrap())
+            .expect("re-attach with an empty-GUID spatial node must succeed (no FK violation)");
+        // The site row is GUID-less, so it can't dedupe on
+        // `bim_cache.global_id` — it's `Inserted` again. The two
+        // GUID-bearing rows (project + building) still dedupe.
+        assert!(
+            second.spatial_nodes_unchanged >= 2,
+            "project + building must dedupe on re-attach; got {} unchanged",
+            second.spatial_nodes_unchanged
+        );
+        assert!(
+            second.spatial_nodes_inserted >= 1,
+            "the GUID-less site must take the always-insert path; got {} inserted",
+            second.spatial_nodes_inserted
+        );
+    }
+
+    #[test]
+    fn bim_attach_ifc_preserves_user_authored_children_when_bim_cache_was_wiped() {
+        // Regression for Devin Review round 5 BUG_0001: the
+        // `Inserted` branch of `upsert_entity` used to call
+        // `INSERT OR REPLACE INTO entities ...`. With SQLite's
+        // `PRAGMA foreign_keys = ON` plus the `ON DELETE CASCADE`
+        // wiring on `entities.parent_id` and `components.entity_id`
+        // (see `aec_core/src/db.rs`), an `OR REPLACE` conflict on
+        // `entities.id` expands to `DELETE old + INSERT new` and
+        // cascade-deletes every child entity and every component
+        // belonging to the conflicting row. The fix swapped that
+        // statement for a proper `ON CONFLICT(id) DO UPDATE` upsert,
+        // which rewrites the row in place without firing DELETE.
+        //
+        // This test reproduces the scenario the bot described:
+        //   1. Attach the fixture once so the IfcProject row lands
+        //      in `entities` and `bim_cache`.
+        //   2. Add a user-authored CHILD entity under the project
+        //      (e.g., a hand-placed annotation marker) AND a
+        //      user-authored component on the project itself
+        //      (e.g., a render-material override). Neither row is
+        //      part of any future BIM attach's wipe set.
+        //   3. Manually wipe `bim_cache` to simulate the DB-recovery
+        //      / schema-rebuild / manual-DELETE scenarios that
+        //      legitimately leave `entities` populated but
+        //      `bim_cache` empty. This forces re-attach down the
+        //      `Inserted` (None match) branch.
+        //   4. Re-attach. Under the OLD `INSERT OR REPLACE`, the
+        //      user-authored child and component would be silently
+        //      cascade-deleted. Under the fix, both survive.
+        let (mut s, _g) = service();
+        let project = s
+            .project_create_from_template("interior.apartment", "PreserveUserAuthored")
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let ifc_path = tmp.path().join("fixture.ifc");
+        let body = b"ISO-10303-21;\n\
+HEADER;\n\
+FILE_DESCRIPTION(('preserve'),'2;1');\n\
+FILE_NAME('p.ifc','2026-05-20T00:00:00',(''),(''),'','','');\n\
+FILE_SCHEMA(('IFC4'));\n\
+ENDSEC;\n\
+DATA;\n\
+#1 = IFCOWNERHISTORY($,$,$,.NOCHANGE.,$,$,$,1747699200);\n\
+#2 = IFCPROJECT('00000000000000000000z1',#1,'P','P',$,$,$,$,$);\n\
+ENDSEC;\n\
+END-ISO-10303-21;\n";
+        std::fs::write(&ifc_path, body).unwrap();
+
+        s.bim_attach_ifc(&project.path, ifc_path.to_str().unwrap())
+            .expect("first attach must succeed");
+
+        let project_entity_id = aec_core::types::EntityId::from_guid_seed("00000000000000000000z1");
+        let user_child_id = aec_core::types::EntityId::new();
+        let user_component_id = format!("{}/annotation/{}", project_entity_id.as_str(), "user-1");
+
+        let pkg = aec_core::package::ProjectPackage::open_with_master_key(
+            std::path::Path::new(&project.path),
+            &[42u8; 32],
+        )
+        .unwrap();
+        let conn = pkg.open_database(&[42u8; 32]).unwrap();
+
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO entities(id, kind, parent_id, created_at, updated_at, body) \
+             VALUES (?1, 'user/annotation', ?2, ?3, ?3, '{}')",
+            rusqlite::params![user_child_id.as_str(), project_entity_id.as_str(), now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO components(id, entity_id, kind, body) \
+             VALUES (?1, ?2, 'user/render_override', '{}')",
+            rusqlite::params![user_component_id, project_entity_id.as_str()],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM bim_cache", []).unwrap();
+        drop(conn);
+        drop(pkg);
+
+        let second = s
+            .bim_attach_ifc(&project.path, ifc_path.to_str().unwrap())
+            .expect("re-attach with wiped bim_cache must succeed");
+        assert!(
+            second.spatial_nodes_inserted >= 1,
+            "wiped bim_cache forces Inserted branch; got {} inserted",
+            second.spatial_nodes_inserted
+        );
+
+        let pkg = aec_core::package::ProjectPackage::open_with_master_key(
+            std::path::Path::new(&project.path),
+            &[42u8; 32],
+        )
+        .unwrap();
+        let conn = pkg.open_database(&[42u8; 32]).unwrap();
+        let user_child_survived: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM entities WHERE id = ?1",
+                rusqlite::params![user_child_id.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            user_child_survived, 1,
+            "user-authored child entity under the IfcProject MUST survive re-attach \
+             (it would be cascade-deleted under the old `INSERT OR REPLACE`)"
+        );
+        let user_component_survived: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM components WHERE id = ?1",
+                rusqlite::params![user_component_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            user_component_survived, 1,
+            "user-authored component on the IfcProject MUST survive re-attach \
+             (it would be cascade-deleted under the old `INSERT OR REPLACE`)"
+        );
+    }
+
+    #[test]
+    fn bim_attach_ifc_replaces_stale_contained_in_relation_on_element_reparent() {
+        // Regression for Devin Review BUG_0001 on 0e5fc84: the
+        // `bim/contained_in` relation persisted at
+        // `bim_attach.rs:374-384` used to be a bare `INSERT OR IGNORE`.
+        // That statement dedupes on the exact `(kind, from_id, to_id)`
+        // tuple — fine for an unchanged re-attach, but the unique key
+        // does NOT match when an element's storey changes between
+        // attaches. The new edge `(wall_id, storey_b)` inserts
+        // alongside the old `(wall_id, storey_a)` instead of replacing
+        // it, leaving the `relations` table — documented as the index
+        // the future `bim_detach_*` flow walks — claiming the same
+        // element has TWO spatial parents.
+        //
+        // The fix wraps the INSERT with a per-element DELETE of all
+        // prior `bim/contained_in` edges pointing OUT of the element,
+        // so the relations projection always matches the authoritative
+        // `entities.parent_id` graph (which the `geom_hash` dedup
+        // already keeps correct via the `Updated` branch — the parent
+        // is folded into the hash).
+        //
+        // The fixtures: pass-1 puts the wall under storey-L1; pass-2
+        // re-parents the same wall (same EntityId/GUID) onto a NEW
+        // storey-L2 (different EntityId/GUID). Project/site/building
+        // keep their EntityIds across both passes so they dedupe on
+        // `bim_cache`. After re-attach there must be EXACTLY ONE
+        // `bim/contained_in` row for the wall — pointing at the L2
+        // storey, not the stale L1 row. Under the OLD `INSERT OR
+        // IGNORE` we'd see two.
+        //
+        // Note: we generate both STEP fixtures via `IfcWriter` rather
+        // than authoring them by hand, because the reader requires
+        // each element row's Name field to carry the writer-emitted
+        // `{IfcTag}::{EntityId}` encoding so it can recover the eid.
+        // Synthesising the writer's output is the easiest way to
+        // guarantee that contract holds.
+        use aec_bim::classification::ClassificationStore;
+        use aec_bim::ifc::IfcWriter;
+        use aec_bim::properties::PropertyStore;
+        use aec_bim::spatial::Project;
+        use aec_bim::IfcClass;
+
+        let (mut s, _g) = service();
+        let project_pkg = s
+            .project_create_from_template("interior.apartment", "ReparentRelation")
+            .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let ifc_path = tmp.path().join("reparent.ifc");
+
+        // Deterministic spatial-node IDs so the matching IfcReader
+        // produces the same `EntityId`s on every parse (via
+        // `EntityId::from_guid_seed`, which the reader uses for
+        // GUID-bearing spatial rows).
+        let project_id = aec_core::types::EntityId::from_guid_seed("00000000000000000000a1");
+        let site_id = aec_core::types::EntityId::from_guid_seed("00000000000000000000a2");
+        let building_id = aec_core::types::EntityId::from_guid_seed("00000000000000000000a3");
+        let storey_l1_id = aec_core::types::EntityId::from_guid_seed("00000000000000000000a4");
+        let storey_l2_id = aec_core::types::EntityId::from_guid_seed("00000000000000000000bd");
+        let wall_id =
+            aec_core::types::EntityId::from_string("ent_aabbccddeeff00112233445566778899").unwrap();
+
+        // Helper: build a Project graph with the given storey-id and
+        // serialize to STEP via `IfcWriter`.
+        let build_step = |storey_id: &aec_core::types::EntityId, storey_name: &str| -> String {
+            let mut project_graph = Project {
+                root: project_id.clone(),
+                nodes: std::collections::HashMap::new(),
+            };
+            project_graph.nodes.insert(
+                project_id.clone(),
+                aec_bim::spatial::SpatialNode {
+                    id: project_id.clone(),
+                    ifc_guid: Some("00000000000000000000a1".into()),
+                    class: IfcClass::IfcProject,
+                    name: "P".into(),
+                    children: vec![site_id.clone()],
+                    elements: Vec::new(),
+                },
+            );
+            project_graph.nodes.insert(
+                site_id.clone(),
+                aec_bim::spatial::SpatialNode {
+                    id: site_id.clone(),
+                    ifc_guid: Some("00000000000000000000a2".into()),
+                    class: IfcClass::IfcSite,
+                    name: "S".into(),
+                    children: vec![building_id.clone()],
+                    elements: Vec::new(),
+                },
+            );
+            project_graph.nodes.insert(
+                building_id.clone(),
+                aec_bim::spatial::SpatialNode {
+                    id: building_id.clone(),
+                    ifc_guid: Some("00000000000000000000a3".into()),
+                    class: IfcClass::IfcBuilding,
+                    name: "B".into(),
+                    children: vec![storey_id.clone()],
+                    elements: Vec::new(),
+                },
+            );
+            project_graph.nodes.insert(
+                storey_id.clone(),
+                aec_bim::spatial::SpatialNode {
+                    id: storey_id.clone(),
+                    ifc_guid: Some(match storey_name {
+                        "L1" => "00000000000000000000a4".into(),
+                        _ => "00000000000000000000bd".into(),
+                    }),
+                    class: IfcClass::IfcBuildingStorey,
+                    name: storey_name.into(),
+                    children: Vec::new(),
+                    elements: vec![wall_id.clone()],
+                },
+            );
+            let mut classification = ClassificationStore::new();
+            classification.assign_manual(wall_id.clone(), IfcClass::IfcWall);
+            let properties = PropertyStore::default();
+            IfcWriter::to_string(&project_graph, &classification, &properties)
+        };
+
+        // Pass 1: wall under storey-L1.
+        std::fs::write(&ifc_path, build_step(&storey_l1_id, "L1")).unwrap();
+        let first = s
+            .bim_attach_ifc(&project_pkg.path, ifc_path.to_str().unwrap())
+            .expect("first attach must succeed");
+        assert!(
+            first.elements_inserted >= 1,
+            "first attach must insert the wall; got {} elements",
+            first.elements_inserted
+        );
+
+        // Sanity: pass-1 produced exactly one `bim/contained_in` row
+        // for the wall, pointing at L1.
+        let pkg = aec_core::package::ProjectPackage::open_with_master_key(
+            std::path::Path::new(&project_pkg.path),
+            &[42u8; 32],
+        )
+        .unwrap();
+        {
+            let conn = pkg.open_database(&[42u8; 32]).unwrap();
+            let after_pass1: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM relations \
+                     WHERE kind = 'bim/contained_in' AND from_id = ?1",
+                    rusqlite::params![wall_id.as_str()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                after_pass1, 1,
+                "first attach must produce exactly one `bim/contained_in` row for the wall"
+            );
+            let parent_after_pass1: String = conn
+                .query_row(
+                    "SELECT to_id FROM relations \
+                     WHERE kind = 'bim/contained_in' AND from_id = ?1",
+                    rusqlite::params![wall_id.as_str()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                parent_after_pass1,
+                storey_l1_id.as_str(),
+                "pass-1 must point the wall at storey L1"
+            );
+        }
+        drop(pkg);
+
+        // Pass 2: same wall (same EntityId) re-parented onto storey-L2.
+        std::fs::write(&ifc_path, build_step(&storey_l2_id, "L2")).unwrap();
+        let second = s
+            .bim_attach_ifc(&project_pkg.path, ifc_path.to_str().unwrap())
+            .expect("re-attach with re-parented wall must succeed");
+        // The wall's `entities.parent_id` flipped, which folds into
+        // `geom_hash` — so it MUST land on `Updated`, not `Unchanged`.
+        assert!(
+            second.elements_updated >= 1,
+            "re-parented wall must take the Updated dedup branch; got {} updated",
+            second.elements_updated
+        );
+
+        // The contract: exactly ONE `bim/contained_in` row for the
+        // wall, pointing at the NEW storey. Under the old
+        // `INSERT OR IGNORE` we'd see two (one stale L1, one new L2).
+        let pkg = aec_core::package::ProjectPackage::open_with_master_key(
+            std::path::Path::new(&project_pkg.path),
+            &[42u8; 32],
+        )
+        .unwrap();
+        let conn = pkg.open_database(&[42u8; 32]).unwrap();
+        let after_pass2: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM relations \
+                 WHERE kind = 'bim/contained_in' AND from_id = ?1",
+                rusqlite::params![wall_id.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            after_pass2, 1,
+            "re-attach with a re-parented wall must leave exactly one `bim/contained_in` \
+             row for the wall (the OLD `INSERT OR IGNORE` would leave two)"
+        );
+        let parent_after_pass2: String = conn
+            .query_row(
+                "SELECT to_id FROM relations \
+                 WHERE kind = 'bim/contained_in' AND from_id = ?1",
+                rusqlite::params![wall_id.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            parent_after_pass2,
+            storey_l2_id.as_str(),
+            "re-attach must point the wall at the NEW storey, not the stale L1"
+        );
+
+        // Defense-in-depth: the stale (wall, L1) row is gone
+        // specifically, not just absent from a SELECT-by-current-parent.
+        let stale_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM relations \
+                 WHERE kind = 'bim/contained_in' AND from_id = ?1 AND to_id = ?2",
+                rusqlite::params![wall_id.as_str(), storey_l1_id.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stale_rows, 0,
+            "no stale `(wall, storey-L1)` row may remain after the wall is re-parented"
+        );
+    }
+
+    #[test]
+    fn bim_attach_ifc_invalidates_engine_status_cache() {
+        // After the attach, the engine-status cache entry for the
+        // project must be gone so a subsequent
+        // `project_engine_status` call observes the new entities
+        // rows rather than a stale cached connection. Mirrors the
+        // discipline of `project_save_invalidates_engine_status_cache`.
+        let (mut s, _g) = service();
+        let project = s
+            .project_create_from_template("interior.apartment", "Invalidate")
+            .unwrap();
+        // Prime the engine-status cache.
+        let _ = s.project_engine_status(&project.path).unwrap();
+        assert_eq!(
+            s.__engine_status_cache_len(),
+            1,
+            "engine status cache must be primed by the first poll"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ifc_path = tmp.path().join("invalidate.ifc");
+        std::fs::write(&ifc_path, fixture_ifc_body()).unwrap();
+        let _ = s
+            .bim_attach_ifc(&project.path, ifc_path.to_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            s.__engine_status_cache_len(),
+            0,
+            "bim_attach_ifc must invalidate the engine-status cache for the project"
         );
     }
 }

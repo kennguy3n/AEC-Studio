@@ -480,3 +480,141 @@ END-ISO-10303-21;
     assert_eq!(snap.materials.layer_set_count(), 0);
     assert_eq!(snap.stats.elements, 1);
 }
+
+#[test]
+fn material_layer_set_usage_metadata_round_trips_via_synthetic_pset() {
+    // External BIM tools (Revit, ArchiCAD) bind walls to layer-sets
+    // via `IfcMaterialLayerSetUsage`, which carries per-wall
+    // LayerSetDirection / DirectionSense / OffsetFromReferenceLine
+    // metadata. AEC Studio's `MaterialAssignment::LayerSet` only
+    // captures the set name, so the reader pivots the usage
+    // metadata into a synthetic `AEC_LayerSetUsage` Pset on the
+    // element. The writer recovers it and emits a real
+    // `IfcMaterialLayerSetUsage` wrapper on export.
+    //
+    // This test pins the full round-trip:
+    //   1. Parse a Revit-style IFC with two walls bound through
+    //      IfcMaterialLayerSetUsage (different offsets per wall).
+    //   2. Assert the synthetic Pset materialised with the right
+    //      direction / sense / offset on each wall.
+    //   3. Re-export the snapshot.
+    //   4. Re-parse the export — assert the synthetic Pset survives
+    //      unchanged on both walls.
+    //   5. Assert the exported STEP body contains
+    //      `IFCMATERIALLAYERSETUSAGE` (proof we emitted the wrapper
+    //      and didn't fall back to a direct layer-set ref).
+    let body = "\
+ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('test'),'2;1');
+FILE_NAME('t.ifc','2026-05-20T00:00:00',(''),(''),'','','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1 = IFCOWNERHISTORY($,$,$,.NOCHANGE.,$,$,$,1747699200);
+#2 = IFCPROJECT('00000000000000000000a1',#1,'P','P',$,$,$,$,$);
+#3 = IFCSITE('00000000000000000000a2',#1,'S','S',$,$,$,$);
+#4 = IFCBUILDING('00000000000000000000a3',#1,'B','B',$,$,$,$);
+#5 = IFCBUILDINGSTOREY('00000000000000000000a4',#1,'L1','L1',$,$,$,$);
+#6 = IFCRELAGGREGATES('00000000000000000000a5',#1,$,$,#2,(#3));
+#7 = IFCRELAGGREGATES('00000000000000000000a6',#1,$,$,#3,(#4));
+#8 = IFCRELAGGREGATES('00000000000000000000a7',#1,$,$,#4,(#5));
+#11 = IFCMATERIAL('Concrete',$,$);
+#12 = IFCMATERIALLAYER(#11,0.2,.F.,$,$,$,$);
+#13 = IFCMATERIALLAYERSET((#12),'Wall-200',$);
+#14 = IFCWALL('00000000000000000000a8',#1,'W1','IfcWall::ent_01hx5sabwall0000000000000001','Wall',$,$,$);
+#15 = IFCWALL('00000000000000000000a9',#1,'W2','IfcWall::ent_01hx5sabwall0000000000000002','Wall',$,$,$);
+#16 = IFCRELCONTAINEDINSPATIALSTRUCTURE('00000000000000000000b1',#1,$,$,(#14,#15),#5);
+#20 = IFCMATERIALLAYERSETUSAGE(#13,.AXIS2.,.POSITIVE.,0.1,$);
+#21 = IFCMATERIALLAYERSETUSAGE(#13,.AXIS2.,.NEGATIVE.,-0.05,$);
+#22 = IFCRELASSOCIATESMATERIAL('00000000000000000000b2',#1,$,$,(#14),#20);
+#23 = IFCRELASSOCIATESMATERIAL('00000000000000000000b3',#1,$,$,(#15),#21);
+ENDSEC;
+END-ISO-10303-21;
+";
+    let snap = IfcReader::from_string(body).expect("parse Revit-style usage indirection");
+
+    // The two walls landed and both have a LayerSet assignment.
+    let wall_ids: Vec<_> = snap
+        .materials
+        .assignments()
+        .filter_map(|(id, a)| match a {
+            MaterialAssignment::LayerSet(n) if n == "Wall-200" => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        wall_ids.len(),
+        2,
+        "both walls must have layer-set assignment"
+    );
+
+    // Each wall has the synthetic AEC_LayerSetUsage Pset with the
+    // direction / sense / offset values from its usage step.
+    let mut offsets: Vec<f64> = Vec::new();
+    for id in &wall_ids {
+        let props = snap
+            .properties
+            .get(id)
+            .expect("wall must have a properties entry");
+        let usage = props
+            .psets
+            .get(aec_bim::materials::AEC_LAYER_SET_USAGE_PSET)
+            .expect("AEC_LayerSetUsage pset must be attached to each wall");
+        // LayerSetDirection survived literal-verbatim.
+        match usage
+            .properties
+            .get(aec_bim::materials::AEC_LAYER_SET_USAGE_KEY_DIRECTION)
+        {
+            Some(aec_bim::properties::PropertyValue::Label(s)) => assert_eq!(s, ".AXIS2."),
+            other => panic!("expected LayerSetDirection label, got {other:?}"),
+        }
+        // OffsetFromReferenceLine survived as a Length value.
+        match usage
+            .properties
+            .get(aec_bim::materials::AEC_LAYER_SET_USAGE_KEY_OFFSET)
+        {
+            Some(aec_bim::properties::PropertyValue::Length(v)) => offsets.push(*v),
+            other => panic!("expected OffsetFromReferenceLine length, got {other:?}"),
+        }
+    }
+    offsets.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert!(
+        (offsets[0] - (-0.05)).abs() < 1e-9 && (offsets[1] - 0.1).abs() < 1e-9,
+        "offsets must round-trip exactly (got {offsets:?})"
+    );
+
+    // Re-export and re-read.
+    let s = IfcWriter::to_string_with_materials(
+        &snap.project,
+        &snap.classification,
+        &snap.properties,
+        &snap.materials,
+    );
+    assert!(
+        s.contains("IFCMATERIALLAYERSETUSAGE"),
+        "writer must emit IFCMATERIALLAYERSETUSAGE wrapper"
+    );
+    // Synthetic Pset must NOT leak as a real IfcPropertySet on the
+    // wire — the writer suppresses it.
+    assert!(
+        !s.contains("AEC_LayerSetUsage"),
+        "synthetic Pset must not be emitted as IFCPROPERTYSET"
+    );
+
+    let snap2 = IfcReader::from_string(&s).expect("re-parse after re-export");
+    // Both synthetic psets survive a second round-trip.
+    let recovered: usize = snap2
+        .materials
+        .assignments()
+        .filter_map(|(id, _)| snap2.properties.get(id))
+        .filter(|p| {
+            p.psets
+                .contains_key(aec_bim::materials::AEC_LAYER_SET_USAGE_PSET)
+        })
+        .count();
+    assert_eq!(
+        recovered, 2,
+        "both walls must still have AEC_LayerSetUsage after re-export"
+    );
+}

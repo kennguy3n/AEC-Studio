@@ -71,6 +71,50 @@ typed_id!(
     "ent",
     "Identifier for a single entity in the project graph."
 );
+
+impl EntityId {
+    /// Derive a deterministic [`EntityId`] from an external identity
+    /// seed (e.g. an `IfcGloballyUniqueId` recovered from an external
+    /// BIM authoring tool's export). The same seed always produces the
+    /// same `EntityId` across runs and across processes.
+    ///
+    /// ## Why
+    ///
+    /// Default-constructed `EntityId`s use a UUIDv4 — non-deterministic
+    /// per call. That's the right behaviour for entities authored
+    /// inside AEC Studio: an author placing two walls produces two
+    /// distinct ids. But for entities recovered from an external file
+    /// that doesn't carry an `EntityId` literal (e.g. a Revit-authored
+    /// `IfcBuildingStorey`), we need the parser to produce the
+    /// **same** id every time it parses the same row, so the bridge's
+    /// `bim_attach_ifc` dedup index can correctly identify "this
+    /// spatial node already exists in the project database" by id
+    /// alone, without an extra `guid → id` side table.
+    ///
+    /// Backed by UUIDv5 with a fixed AEC Studio namespace UUID, so:
+    ///
+    /// * It's a true deterministic function of the seed (RFC 4122 §4.3),
+    ///   collision resistance is bounded by the 122-bit UUID space.
+    /// * Two different namespaces (e.g. a future
+    ///   `Self::from_dwg_handle`) won't collide with IFC-derived ids
+    ///   even if their seeds happen to overlap.
+    pub fn from_guid_seed(seed: &str) -> Self {
+        // Fixed AEC Studio namespace UUID for IFC-derived entities.
+        // Derivation: the first 4 bytes spell "aec5" (≈ "AEC Studio")
+        // followed by 12 random bytes generated once with `uuidgen`.
+        // The literal is pinned here forever; if this constant changes,
+        // all previously-attached BIM snapshots will lose dedup
+        // continuity (they'd be reported as `inserted` on the next
+        // re-attach, with the old rows orphaned), so the test
+        // `entity_id_from_guid_seed_namespace_pin` asserts the exact
+        // UUIDv5 output for a known seed to catch accidental drift.
+        // Treat as load-bearing.
+        const NAMESPACE: Uuid = Uuid::from_u128(0xaec5_70d1_0fc4_4ec8_a2ed_cb44_9d4f_1e55_u128);
+        let uuid = Uuid::new_v5(&NAMESPACE, seed.as_bytes());
+        Self(format!("ent_{}", uuid.simple()))
+    }
+}
+
 typed_id!(
     CommandId,
     "cmd",
@@ -272,6 +316,41 @@ mod tests {
         let raw = "ent_aabbccdd";
         let id: EntityId = raw.parse().expect("parse");
         assert_eq!(id.as_str(), raw);
+    }
+
+    #[test]
+    fn entity_id_from_guid_seed_is_deterministic() {
+        let seed = "00000000000000000000a6";
+        let a = EntityId::from_guid_seed(seed);
+        let b = EntityId::from_guid_seed(seed);
+        assert_eq!(a, b, "same seed must produce the same EntityId");
+        assert!(a.as_str().starts_with("ent_"));
+        assert_eq!(
+            a.as_str().len(),
+            "ent_".len() + 32,
+            "UUIDv5 simple form is 32 hex chars"
+        );
+    }
+
+    #[test]
+    fn entity_id_from_guid_seed_diverges_on_different_seeds() {
+        let a = EntityId::from_guid_seed("00000000000000000000a6");
+        let b = EntityId::from_guid_seed("00000000000000000000a7");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn entity_id_from_guid_seed_namespace_pin() {
+        // Pin the namespace UUID. If this test fails it means the
+        // namespace constant in `EntityId::from_guid_seed` changed,
+        // which would orphan every previously-attached BIM
+        // snapshot. Treat any change here as a backwards-incompatible
+        // migration; the namespace is load-bearing for re-attach
+        // dedup.
+        assert_eq!(
+            EntityId::from_guid_seed("AEC-Studio fixture pin").as_str(),
+            "ent_7759ca01f97959cb9592d55c929f018c",
+        );
     }
 
     #[test]
