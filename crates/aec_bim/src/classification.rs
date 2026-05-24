@@ -33,6 +33,29 @@ pub enum IfcClass {
     IfcLightFixture,
     IfcPlumbingFixture,
     IfcOpeningElement,
+    /// `IfcBuildingElementProxy` — the IFC schema's first-class
+    /// catch-all for "this is a building element but it doesn't
+    /// fit any specific subtype". Heavily used by:
+    /// * **Revit**: families that don't map cleanly to a precise IFC
+    ///   class (custom families, in-place components,
+    ///   non-load-bearing prismatic elements) export as
+    ///   `IFCBUILDINGELEMENTPROXY`.
+    /// * **ArchiCAD**: MEP / structural-system extensions and
+    ///   skin-component decorations that don't have an IFC2x3/IFC4
+    ///   equivalent.
+    /// * **buildingSMART** exemplars and Coordination View Class
+    ///   files: any "shaped placeholder" where the geometry is
+    ///   accurate but the schema-level type is unknown.
+    ///
+    /// Promoting this to a first-class variant (rather than landing
+    /// in `Other("IfcBuildingElementProxy")`) is what makes proxy
+    /// elements visible in the external-IFC element capture path
+    /// (`reader.rs` path (b)) — the `Other(_)` arm there is the
+    /// "drop non-element STEP records" filter, so anything routed
+    /// through `Other` is silently invisible to the project graph.
+    /// Real proxies need to be captured the same way an `IfcWall`
+    /// is.
+    IfcBuildingElementProxy,
     Other(String),
 }
 
@@ -62,6 +85,7 @@ impl IfcClass {
             Self::IfcLightFixture => "IfcLightFixture",
             Self::IfcPlumbingFixture => "IfcPlumbingFixture",
             Self::IfcOpeningElement => "IfcOpeningElement",
+            Self::IfcBuildingElementProxy => "IfcBuildingElementProxy",
             Self::Other(s) => s.as_str(),
         }
     }

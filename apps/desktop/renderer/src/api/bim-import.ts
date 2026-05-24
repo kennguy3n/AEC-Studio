@@ -15,6 +15,7 @@
  * Production callers pass `window.confirm`; tests pass a stub.
  */
 
+import type { BimImportSummary } from "../../../electron/bridge";
 import { aec } from "./aec";
 
 /**
@@ -22,7 +23,7 @@ import { aec } from "./aec";
  * callers can render the right toast / status line:
  *
  *   * `"imported"` — file was parsed and the bridge returned a
- *     summary; payload is the bridge result verbatim.
+ *     `BimImportSummary` (path, schema, entity counts).
  *   * `"cancelled-by-user"` — user declined the large-file confirm
  *     dialog. The renderer should restore the previous state and
  *     leave a "import cancelled" hint visible.
@@ -31,7 +32,7 @@ import { aec } from "./aec";
  *     error message so the renderer can surface it in a toast.
  */
 export type BimImportOutcome =
-  | { kind: "imported"; result: unknown }
+  | { kind: "imported"; result: BimImportSummary }
   | { kind: "cancelled-by-user"; sizeBytes: number; thresholdBytes: number }
   | { kind: "failed"; error: string };
 

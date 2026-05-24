@@ -390,6 +390,80 @@ pub fn bim_check_file_size(path: String) -> Result<BimFileSizeCheckJs> {
     with_service_ref_fallible(|svc| svc.bim_check_file_size(&path)).map(Into::into)
 }
 
+/// JS-facing post-attach summary. Mirrors the renderer's
+/// `BimAttachSummary` interface in `apps/desktop/electron/bridge.ts`.
+///
+/// Numeric fields follow the same `u32` saturating-clamp pattern as
+/// [`BimImportSummaryJs`] — no real-world IFC file produces > 4 B
+/// entities of any individual kind, and overflow is clamped at
+/// `u32::MAX` for safety rather than panicking. JS receives plain
+/// `number`s (no BigInt / Number coercion footgun).
+#[napi(object)]
+pub struct BimAttachSummaryJs {
+    pub path: String,
+    pub project_path: String,
+    pub parse_cache_hit: bool,
+    pub spatial_nodes_inserted: u32,
+    pub spatial_nodes_updated: u32,
+    pub spatial_nodes_unchanged: u32,
+    pub elements_inserted: u32,
+    pub elements_updated: u32,
+    pub elements_unchanged: u32,
+    pub components_inserted: u32,
+    pub relations_inserted: u32,
+    pub cache_rows: u32,
+}
+
+impl From<crate::service::BimAttachSummary> for BimAttachSummaryJs {
+    fn from(r: crate::service::BimAttachSummary) -> Self {
+        let clamp = |n: u64| n.min(u32::MAX as u64) as u32;
+        Self {
+            path: r.path,
+            project_path: r.project_path,
+            parse_cache_hit: r.parse_cache_hit,
+            spatial_nodes_inserted: clamp(r.spatial_nodes_inserted),
+            spatial_nodes_updated: clamp(r.spatial_nodes_updated),
+            spatial_nodes_unchanged: clamp(r.spatial_nodes_unchanged),
+            elements_inserted: clamp(r.elements_inserted),
+            elements_updated: clamp(r.elements_updated),
+            elements_unchanged: clamp(r.elements_unchanged),
+            components_inserted: clamp(r.components_inserted),
+            relations_inserted: clamp(r.relations_inserted),
+            cache_rows: clamp(r.cache_rows),
+        }
+    }
+}
+
+/// Attach a parsed IFC snapshot into the active project's
+/// SQLCipher database. Folds spatial nodes, elements, Psets,
+/// materials, and aggregation / containment relations into the
+/// project graph, deduping against the existing rows so a
+/// re-attach of the same file with identical content is cheap
+/// (reports `_unchanged` instead of `_inserted` / `_updated`).
+///
+/// Routes through `with_service_ref_fallible` (the reader-side
+/// lock helper) — `BridgeService::bim_attach_ifc` is `&self`;
+/// the project-DB mutation lives behind a `Mutex`-guarded
+/// `rusqlite::Connection` inside the project package, and the
+/// snapshot-cache / status-cache invalidation use interior
+/// mutability. Same pattern as [`bim_import_ifc`] /
+/// [`bim_check_file_size`].
+///
+/// On a successful attach the service invalidates the
+/// `project_engine_status` connection cache for the affected
+/// project so subsequent polls see the new entities / components
+/// rows.
+///
+/// The `parse_cache_hit` field on the result tells the renderer
+/// whether the in-process snapshot cache served the parse — useful
+/// for the loading-indicator UX (cache hit is sub-millisecond;
+/// miss is the multi-second STEP parse path that `bim_import_ifc`
+/// would otherwise re-run).
+#[napi]
+pub fn bim_attach_ifc(project_path: String, ifc_path: String) -> Result<BimAttachSummaryJs> {
+    with_service_ref_fallible(|svc| svc.bim_attach_ifc(&project_path, &ifc_path)).map(Into::into)
+}
+
 /// JS-facing CPU descriptor. Mirrors `RuntimeStatus["cpu"]` in
 /// `apps/desktop/electron/bridge.ts`.
 #[napi(object)]

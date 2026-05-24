@@ -17,7 +17,7 @@ stays readable as the project grows.
 | **6 — Deliver and export** | A studio lead can ship a complete delivery package — client, contractor, BIM, revision-tracked — from one project. | `DONE` |
 | **7 — Optional KChat integration** | Teams using KChat can publish AEC Studio artifacts and route review comments back to the audit trail without giving up local-first. | `DONE` |
 | **8 — Extension system** | Asset packs, templates, schedules, export targets, AI tools, and importers ship as Ed25519-signed third-party extensions with a typed permission model. | `DONE` |
-| **9 — Native render & BIM engine** | Replace the Blender and IfcOpenShell worker processes with in-process Rust implementations (SAH BVH, wgpu compute path tracer, PBR rasterizer preview, STEP parser/writer, geometry tessellator). No external runtime dependency for rendering or IFC. | `IN PROGRESS` |
+| **9 — Native render & BIM engine** | Replace the Blender and IfcOpenShell worker processes with in-process Rust implementations (SAH BVH, wgpu compute path tracer, PBR rasterizer preview, STEP parser/writer, geometry tessellator). No external runtime dependency for rendering or IFC. | `DONE` |
 
 ## Cross-cutting
 

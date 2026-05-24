@@ -98,24 +98,46 @@ export interface BridgeBackend {
   draftImportDxf(path: string): Promise<{ imported: number }>;
   draftExportDxf(path: string): Promise<{ exported: true; path: string }>;
 
-  bimImportIfc(path: string): Promise<{ imported: number }>;
+  /**
+   * Parse an IFC file and return a structured preview summary. The
+   * file is NOT yet folded into the active project — that's the
+   * follow-up `bimAttachIfc` call. The renderer uses this for the
+   * "Import BIM" preview pane (entity counts, schema version,
+   * canonical path).
+   *
+   * The shape mirrors `BimImportSummaryJs` in
+   * `crates/aec_bridge/src/napi_api.rs` 1:1 — drift is a runtime
+   * bug surfaced as `undefined` on a status pane.
+   */
+  bimImportIfc(path: string): Promise<BimImportSummary>;
   /**
    * Cheap pre-parse file-size check. The renderer's file-picker UI
    * calls this *before* `bimImportIfc` so it can show a "this file
    * is N MB; continue?" confirm dialog on large IFC files (e.g.
    * 400 MB MEP federations) without first paying the multi-second
-   * parse cost. Cost: one `fs::metadata` + one `fs::canonicalize`
+   * parse cost. Cost: one `fs::canonicalize` + one `fs::metadata`
    * — no file read.
    *
    * The `largeFileWarning` flag is advisory; the renderer is free
    * to ignore it and call `bimImportIfc` anyway.
    */
-  bimCheckFileSize(path: string): Promise<{
-    path: string;
-    fileSizeBytes: number;
-    largeFileWarning: boolean;
-    thresholdBytes: number;
-  }>;
+  bimCheckFileSize(path: string): Promise<BimFileSizeCheck>;
+  /**
+   * Attach a parsed IFC snapshot into the active project's
+   * SQLCipher database. Folds spatial nodes, elements, Psets,
+   * materials, and aggregation / containment relations into the
+   * project graph, deduping against existing rows so a re-attach
+   * of the same file with identical content reports `_unchanged`
+   * instead of `_inserted` / `_updated`.
+   *
+   * The shape mirrors `BimAttachSummaryJs` in
+   * `crates/aec_bridge/src/napi_api.rs` 1:1.
+   *
+   * If the renderer just ran `bimImportIfc` on the same path, the
+   * bridge's in-process snapshot cache will serve the parse for
+   * free (reported as `parseCacheHit: true`).
+   */
+  bimAttachIfc(projectPath: string, ifcPath: string): Promise<BimAttachSummary>;
   bimExportIfc(path: string): Promise<{ exported: true; path: string }>;
   bimClassify(params: Record<string, unknown>): Promise<{ classified: number }>;
   bimSetProperty(params: Record<string, unknown>): Promise<{ ok: true }>;
@@ -321,6 +343,62 @@ export interface RuntimeStatus {
 }
 
 /**
+ * Parse-only BIM/IFC import summary. Field-for-field mirror of
+ * `BimImportSummaryJs` in `crates/aec_bridge/src/napi_api.rs`.
+ * Drift here is a runtime bug surfacing as `undefined` on a
+ * status pane.
+ */
+export interface BimImportSummary {
+  path: string;
+  schema: string;
+  spatialNodes: number;
+  elements: number;
+  psets: number;
+  qsets: number;
+  aggregations: number;
+  containments: number;
+  materials: number;
+  materialLayerSets: number;
+  materialAssignments: number;
+  recordsSeen: number;
+}
+
+/**
+ * Cheap pre-parse file-size check shape. Field-for-field mirror
+ * of `BimFileSizeCheckJs` in `crates/aec_bridge/src/napi_api.rs`.
+ */
+export interface BimFileSizeCheck {
+  path: string;
+  fileSizeBytes: number;
+  largeFileWarning: boolean;
+  thresholdBytes: number;
+}
+
+/**
+ * Post-attach summary. Field-for-field mirror of
+ * `BimAttachSummaryJs` in `crates/aec_bridge/src/napi_api.rs`.
+ * All counters are post-dedup: a re-attach of the same file with
+ * identical content reports `_unchanged` instead of `_inserted` /
+ * `_updated`.
+ */
+export interface BimAttachSummary {
+  path: string;
+  projectPath: string;
+  /** `true` if the snapshot for this file was served from the
+   *  in-process cache populated by a prior `bimImportIfc`. */
+  parseCacheHit: boolean;
+  spatialNodesInserted: number;
+  spatialNodesUpdated: number;
+  spatialNodesUnchanged: number;
+  elementsInserted: number;
+  elementsUpdated: number;
+  elementsUnchanged: number;
+  componentsInserted: number;
+  relationsInserted: number;
+  cacheRows: number;
+}
+
+/**
  * Engine status for the renderer's status pane. Field-for-field
  * mirror of `EngineStatusJs` in
  * `crates/aec_bridge/src/napi_api.rs::EngineStatusJs`. Drift between
@@ -410,6 +488,9 @@ interface NativeApi {
   runtime_status(): unknown;
   project_engine_status(project_path: string): unknown;
   project_audit_sync(project_path: string): unknown;
+  bim_import_ifc(path: string): unknown;
+  bim_check_file_size(path: string): unknown;
+  bim_attach_ifc(project_path: string, ifc_path: string): unknown;
 }
 
 /**
@@ -430,6 +511,14 @@ export const NATIVE_WIRED_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   "runtimeStatus",
   "projectEngineStatus",
   "projectAuditSync",
+  // BIM domain wired in PR-P. `bimImportIfc` / `bimAttachIfc` /
+  // `bimCheckFileSize` all delegate to real `#[napi]` exports in
+  // `crates/aec_bridge/src/napi_api.rs`. The remaining `bim*`
+  // methods (`bimExportIfc`, `bimClassify`, ...) stay in the
+  // fallback list pending their own follow-up napi exports.
+  "bimImportIfc",
+  "bimCheckFileSize",
+  "bimAttachIfc",
 ];
 
 /**
@@ -457,8 +546,6 @@ export const NATIVE_FALLBACK_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   "draftSetLayerState",
   "draftImportDxf",
   "draftExportDxf",
-  "bimImportIfc",
-  "bimCheckFileSize",
   "bimExportIfc",
   "bimClassify",
   "bimSetProperty",
@@ -531,6 +618,10 @@ function adaptNative(n: NativeApi): BridgeBackend {
     runtimeStatus: async () => n.runtime_status() as RuntimeStatus,
     projectEngineStatus: async (p) => n.project_engine_status(p) as EngineStatus,
     projectAuditSync: async (p) => n.project_audit_sync(p) as number,
+    bimImportIfc: async (p) => n.bim_import_ifc(p) as BimImportSummary,
+    bimCheckFileSize: async (p) => n.bim_check_file_size(p) as BimFileSizeCheck,
+    bimAttachIfc: async (projectPath, ifcPath) =>
+      n.bim_attach_ifc(projectPath, ifcPath) as BimAttachSummary,
   };
   // Self-check: the two catalogues above must, together, reference every
   // method on the in-process backend. We throw rather than warn so a new
@@ -662,20 +753,59 @@ export function inProcessBackend(): BridgeBackend {
       return { exported: true, path: p };
     },
 
-    async bimImportIfc(_path) {
-      return { imported: 0 };
+    async bimImportIfc(path) {
+      // In-process fallback used by Vitest and by dev mode when the
+      // native `.node` artifact isn't loaded. Returns the
+      // `BimImportSummary` shape with all counters zeroed and
+      // `schema` flagged as `"unknown"` so callers can tell the
+      // fallback apart from a real parse.
+      return {
+        path,
+        schema: "unknown",
+        spatialNodes: 0,
+        elements: 0,
+        psets: 0,
+        qsets: 0,
+        aggregations: 0,
+        containments: 0,
+        materials: 0,
+        materialLayerSets: 0,
+        materialAssignments: 0,
+        recordsSeen: 0,
+      };
     },
     async bimCheckFileSize(_path) {
       // In-process fallback used by Vitest. The Rust bridge runs
-      // `fs::metadata` on the real file; the JS-only fallback
-      // reports 0 bytes (well below threshold) so the
-      // file-picker UX doesn't spuriously warn during unit tests
-      // that don't exercise a real on-disk path.
+      // `fs::canonicalize` + `fs::metadata` on the real file; the
+      // JS-only fallback reports 0 bytes (well below threshold) so
+      // the file-picker UX doesn't spuriously warn during unit
+      // tests that don't exercise a real on-disk path.
       return {
         path: _path,
         fileSizeBytes: 0,
         largeFileWarning: false,
         thresholdBytes: BIM_IMPORT_LARGE_FILE_THRESHOLD_BYTES,
+      };
+    },
+    async bimAttachIfc(projectPath, ifcPath) {
+      // In-process fallback used by Vitest and by dev mode when the
+      // native `.node` artifact isn't loaded. Returns the
+      // `BimAttachSummary` shape with all counters zeroed so the
+      // renderer's "Attach to Project" UX is exercisable in tests
+      // even though no actual SQLCipher mutation happens here.
+      return {
+        path: ifcPath,
+        projectPath,
+        parseCacheHit: false,
+        spatialNodesInserted: 0,
+        spatialNodesUpdated: 0,
+        spatialNodesUnchanged: 0,
+        elementsInserted: 0,
+        elementsUpdated: 0,
+        elementsUnchanged: 0,
+        componentsInserted: 0,
+        relationsInserted: 0,
+        cacheRows: 0,
       };
     },
     async bimExportIfc(p) {

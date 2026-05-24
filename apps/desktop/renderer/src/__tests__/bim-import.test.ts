@@ -3,7 +3,27 @@ import {
   importIfcWithSizeGuard,
   defaultLargeFileConfirm,
 } from "../api/bim-import";
+import type { BimImportSummary } from "../../../electron/bridge";
 import { aec } from "../api/aec";
+
+// Helper: build a populated `BimImportSummary` shape for the mock.
+// Overrides let individual tests assert on the counts they care about
+// without restating every zero-valued field.
+const summary = (over: Partial<BimImportSummary> = {}): BimImportSummary => ({
+  path: "/abs/file.ifc",
+  schema: "IFC4",
+  spatialNodes: 0,
+  elements: 0,
+  psets: 0,
+  qsets: 0,
+  aggregations: 0,
+  containments: 0,
+  materials: 0,
+  materialLayerSets: 0,
+  materialAssignments: 0,
+  recordsSeen: 0,
+  ...over,
+});
 
 // The size-guard contract: before invoking the multi-second
 // `bim_import_ifc` parse, the renderer issues a cheap
@@ -31,7 +51,7 @@ describe("importIfcWithSizeGuard", () => {
     });
     const importSpy = vi
       .spyOn(aec.bim, "importIfc")
-      .mockResolvedValue({ imported: 42 });
+      .mockResolvedValue(summary({ path: "/abs/small.ifc", spatialNodes: 2, elements: 42 }));
     const confirmStub = vi.fn(() => true);
 
     const outcome = await importIfcWithSizeGuard(
@@ -40,6 +60,10 @@ describe("importIfcWithSizeGuard", () => {
     );
 
     expect(outcome.kind).toBe("imported");
+    if (outcome.kind === "imported") {
+      expect(outcome.result.path).toBe("/abs/small.ifc");
+      expect(outcome.result.elements).toBe(42);
+    }
     expect(checkSpy).toHaveBeenCalledOnce();
     expect(checkSpy).toHaveBeenCalledWith("/abs/small.ifc");
     expect(importSpy).toHaveBeenCalledOnce();
@@ -59,7 +83,7 @@ describe("importIfcWithSizeGuard", () => {
     });
     const importSpy = vi
       .spyOn(aec.bim, "importIfc")
-      .mockResolvedValue({ imported: 9999 });
+      .mockResolvedValue(summary({ path: "/abs/big.ifc", elements: 9999 }));
     const confirmStub = vi.fn(() => true);
 
     const outcome = await importIfcWithSizeGuard(
@@ -148,7 +172,7 @@ describe("importIfcWithSizeGuard", () => {
     });
     const importSpy = vi
       .spyOn(aec.bim, "importIfc")
-      .mockResolvedValue({ imported: 1 });
+      .mockResolvedValue(summary({ path: "/abs/large.ifc", elements: 1 }));
     // Simulate an async modal: the dialog resolves after a tick.
     const asyncConfirm = vi.fn(() => Promise.resolve(true));
 

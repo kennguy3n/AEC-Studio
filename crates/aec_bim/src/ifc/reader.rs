@@ -617,7 +617,8 @@ impl IfcReader {
                         // to a typed [`IfcClass`] variant —
                         // i.e. one of the recognized building-
                         // element classes (IFCWALL, IFCWINDOW,
-                        // IFCSLAB, IFCBEAM, IFCCOLUMN, …). Any
+                        // IFCSLAB, IFCBEAM, IFCCOLUMN,
+                        // IFCBUILDINGELEMENTPROXY, …). Any
                         // other STEP record reaching this branch
                         // — type entities (IfcWindowType,
                         // IfcDoorType), library declarations
@@ -1769,6 +1770,20 @@ fn ifc_class_from_tag(tag: &str, raw_tag: &str) -> IfcClass {
         "IFCLIGHTFIXTURE" => IfcClass::IfcLightFixture,
         "IFCPLUMBINGFIXTURE" => IfcClass::IfcPlumbingFixture,
         "IFCOPENINGELEMENT" => IfcClass::IfcOpeningElement,
+        // `IfcBuildingElementProxy` is the IFC schema's first-class
+        // "this is a building element but it doesn't fit a precise
+        // subtype" placeholder. Heavily used by Revit (custom
+        // families, in-place components, non-load-bearing prismatic
+        // elements) and ArchiCAD (MEP extensions, skin decorations).
+        // Pre-fix this landed in the `Other(_)` catch-all, which in
+        // turn was filtered out by the path-(b) element capture loop
+        // in `reader.rs` (the `Other` arm there is the "drop
+        // non-element STEP records" filter), so external IFCs with
+        // proxy elements would have those elements silently
+        // disappear from the project graph. Promoting it to a
+        // first-class variant means proxy elements now get captured
+        // the same way an `IfcWall` is.
+        "IFCBUILDINGELEMENTPROXY" => IfcClass::IfcBuildingElementProxy,
         _ => IfcClass::Other(raw_tag.to_string()),
     }
 }
@@ -2469,6 +2484,13 @@ END-ISO-10303-21;
         // The AI classifier produces `IfcClass::Other(...)` for
         // shapes that don't match any known IFC element type. Make
         // sure these round-trip without being dropped or rejected.
+        //
+        // Note: `"IfcBuildingElementProxy"` used to be the chosen
+        // example here, but PR-P promoted that string to a
+        // first-class `IfcClass::IfcBuildingElementProxy` variant
+        // (see `classification.rs` doc comment), so this test now
+        // uses a synthetic identifier that is guaranteed to remain
+        // in the `Other(_)` arm.
         let mut project = Project::new("OtherRT");
         let site = project
             .add_child(&project.root.clone(), IfcClass::IfcSite, "S")
@@ -2484,10 +2506,9 @@ END-ISO-10303-21;
         let props = PropertyStore::new();
         let el = EntityId::new();
         project.attach_element(&storey, el.clone());
-        // This is the exact string the AI fallback emits today.
         classification.assign_manual(
             el.clone(),
-            IfcClass::Other("IfcBuildingElementProxy".into()),
+            IfcClass::Other("IfcAecStudioCustomComponent".into()),
         );
 
         let s = crate::ifc::IfcWriter::to_string(&project, &classification, &props);
@@ -2498,8 +2519,62 @@ END-ISO-10303-21;
             .expect("element classified");
         assert_eq!(
             class,
-            &IfcClass::Other("IfcBuildingElementProxy".into()),
+            &IfcClass::Other("IfcAecStudioCustomComponent".into()),
             "Other variant preserves the original spelling",
+        );
+    }
+
+    #[test]
+    fn ifc_building_element_proxy_roundtrips_as_first_class_variant() {
+        // Sibling to `ifc_class_other_roundtrips_through_writer_and_reader`.
+        // Pre-PR-P, `IfcBuildingElementProxy` was the canonical
+        // `Other(...)` example because no producer (Revit, ArchiCAD,
+        // AEC Studio's own AI fallback) had a more precise class
+        // for "generic prismatic element". PR-P promoted it to a
+        // first-class variant so external IFCs from those tools
+        // don't get silently dropped in path (b) (the `Other(_)`
+        // guard) and so `is_building_element()` returns `true`. Pin
+        // both contracts here: the writer emits
+        // `IFCBUILDINGELEMENTPROXY` verbatim, and the reader
+        // recovers the first-class variant.
+        let mut project = Project::new("ProxyRT");
+        let site = project
+            .add_child(&project.root.clone(), IfcClass::IfcSite, "S")
+            .unwrap();
+        let bldg = project
+            .add_child(&site, IfcClass::IfcBuilding, "B")
+            .unwrap();
+        let storey = project
+            .add_child(&bldg, IfcClass::IfcBuildingStorey, "L01")
+            .unwrap();
+
+        let mut classification = ClassificationStore::new();
+        let props = PropertyStore::new();
+        let el = EntityId::new();
+        project.attach_element(&storey, el.clone());
+        classification.assign_manual(el.clone(), IfcClass::IfcBuildingElementProxy);
+
+        let s = crate::ifc::IfcWriter::to_string(&project, &classification, &props);
+        // The writer emits STEP entity tags verbatim from
+        // `IfcClass::ifc_tag()`, which uses mixed-case identifiers
+        // (`"IfcBuildingElementProxy"`). The reader uppercases for
+        // matching, so the on-the-wire case doesn't matter for
+        // round-trip correctness. Asserting case-insensitively is
+        // robust to either convention.
+        assert!(
+            s.to_ascii_uppercase().contains("IFCBUILDINGELEMENTPROXY"),
+            "writer must emit the canonical IfcBuildingElementProxy STEP type, got:\n{s}",
+        );
+        let snap = IfcReader::from_string(&s).expect("IfcBuildingElementProxy round-trips");
+        let class = snap
+            .classification
+            .accepted_for(&el)
+            .expect("element classified");
+        assert_eq!(
+            class,
+            &IfcClass::IfcBuildingElementProxy,
+            "reader must promote IFCBUILDINGELEMENTPROXY back to the first-class variant, \
+             NOT Other(\"IfcBuildingElementProxy\")",
         );
     }
 
@@ -4117,6 +4192,116 @@ END-ISO-10303-21;
             "external-IFC wall whose Description has `::` must derive \
              EntityId from GlobalId via path (b), not from the \
              Description suffix",
+        );
+    }
+
+    /// Path (b) regression: `IFCBUILDINGELEMENTPROXY` records must
+    /// be captured as elements, not silently dropped.
+    ///
+    /// Pre-fix `ifc_class_from_tag` returned
+    /// `IfcClass::Other("IfcBuildingElementProxy")` for the
+    /// `IFCBUILDINGELEMENTPROXY` tag, which then got filtered out
+    /// by the `matches!(class, IfcClass::Other(_)) { continue; }`
+    /// guard in path (b). External IFCs from Revit (which uses
+    /// `IfcBuildingElementProxy` for custom families, in-place
+    /// components, and any element whose source class doesn't map
+    /// cleanly to IFC) and ArchiCAD (MEP extensions, skin
+    /// decorations) would lose those elements on import.
+    ///
+    /// Post-fix the tag classifies as `IfcClass::IfcBuildingElementProxy`,
+    /// passing the `Other(_)` filter and being captured normally
+    /// with `EntityId::from_guid_seed(guid)` (the same dedup path
+    /// every other building element takes).
+    #[test]
+    fn external_ifc_captures_ifcbuildingelementproxy_via_path_b() {
+        let step = "\
+ISO-10303-21;
+HEADER;
+FILE_DESCRIPTION(('External Revit export with proxy'),'2;1');
+FILE_NAME('test.ifc','2024-01-01T00:00:00',(''),(''),'','','');
+FILE_SCHEMA(('IFC4'));
+ENDSEC;
+DATA;
+#1=IFCPROJECT('2vqOSiJTrEEvbbnEAh4Lay',$,'External Revit Project',$,$,$,$,(#2),#3);
+#2=IFCGEOMETRICREPRESENTATIONCONTEXT($,'Model',3,1.E-5,#4,$);
+#3=IFCUNITASSIGNMENT((#5));
+#4=IFCAXIS2PLACEMENT3D(#6,$,$);
+#5=IFCSIUNIT(*,.LENGTHUNIT.,$,.METRE.);
+#6=IFCCARTESIANPOINT((0.,0.,0.));
+#10=IFCSITE('2vqOSiJTrEEvbbnEAh4Lb1',$,'External Revit Site',$,$,#4,$,$,.ELEMENT.,$,$,$,$,$);
+#100=IFCWALL('1bbU_VHpzCEvLPibG6XfX2',$,'External Revit Wall',$,$,#4,$,$,.NOTDEFINED.);
+#200=IFCBUILDINGELEMENTPROXY('3aaR_XKqzCEvLPibG6XfPxy',$,'Custom MEP Bracket',$,$,#4,$,$,.NOTDEFINED.);
+#201=IFCBUILDINGELEMENTPROXY('4ccS_YLrzCEvLPibG6XfQyz',$,'In-Place Component',$,$,#4,$,$,.NOTDEFINED.);
+ENDSEC;
+END-ISO-10303-21;
+";
+        let snap = IfcReader::from_string(step)
+            .expect("external IFC with IFCBUILDINGELEMENTPROXY records must parse");
+
+        let walls: Vec<_> = snap
+            .classification
+            .iter()
+            .filter(|(_, a)| matches!(a.class, IfcClass::IfcWall))
+            .collect();
+        assert_eq!(
+            walls.len(),
+            1,
+            "the IFCWALL must still be captured alongside the proxies; got {walls:?}",
+        );
+
+        let proxies: Vec<_> = snap
+            .classification
+            .iter()
+            .filter(|(_, a)| matches!(a.class, IfcClass::IfcBuildingElementProxy))
+            .collect();
+        assert_eq!(
+            proxies.len(),
+            2,
+            "both IFCBUILDINGELEMENTPROXY records must be captured \
+             as elements (pre-fix they landed in Other(_) and were \
+             dropped by the path-(b) filter); got {proxies:?}",
+        );
+
+        let expected_proxy_1 = EntityId::from_guid_seed("3aaR_XKqzCEvLPibG6XfPxy");
+        let expected_proxy_2 = EntityId::from_guid_seed("4ccS_YLrzCEvLPibG6XfQyz");
+        let proxy_ids: std::collections::HashSet<_> =
+            proxies.iter().map(|(id, _)| (*id).clone()).collect();
+        assert!(
+            proxy_ids.contains(&expected_proxy_1),
+            "proxy 1 must use EntityId::from_guid_seed for dedup; \
+             expected {expected_proxy_1:?}, got {proxy_ids:?}",
+        );
+        assert!(
+            proxy_ids.contains(&expected_proxy_2),
+            "proxy 2 must use EntityId::from_guid_seed for dedup; \
+             expected {expected_proxy_2:?}, got {proxy_ids:?}",
+        );
+    }
+
+    /// `IfcBuildingElementProxy` must classify as a building element,
+    /// not a spatial container — proxies are physical things that live
+    /// inside a storey, just like walls and windows. Pins the public
+    /// classification contract that `bim_attach` + the schedule
+    /// engines depend on.
+    #[test]
+    fn ifc_building_element_proxy_classifies_as_building_element() {
+        assert!(
+            IfcClass::IfcBuildingElementProxy.is_building_element(),
+            "IfcBuildingElementProxy must be a building element \
+             (it is the IFC schema's catch-all for elements that \
+             physically live inside a storey)",
+        );
+        assert!(
+            !IfcClass::IfcBuildingElementProxy.is_spatial(),
+            "IfcBuildingElementProxy must NOT be classified as a \
+             spatial container (it's a physical element, not a \
+             Project/Site/Building/Storey/Space)",
+        );
+        assert_eq!(
+            IfcClass::IfcBuildingElementProxy.ifc_tag(),
+            "IfcBuildingElementProxy",
+            "the writer-facing IFC tag must round-trip the \
+             canonical mixed-case name",
         );
     }
 

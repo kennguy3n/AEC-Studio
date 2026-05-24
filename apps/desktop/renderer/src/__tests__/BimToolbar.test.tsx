@@ -7,6 +7,7 @@ describe("BimToolbar", () => {
     render(<BimToolbar busyAction={null} onInvoke={() => undefined} />);
     for (const id of [
       "importIfc",
+      "attachIfc",
       "exportIfc",
       "validate",
       "classify",
