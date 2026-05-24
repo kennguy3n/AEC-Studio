@@ -116,6 +116,11 @@ fn initialize_schema(conn: &Connection) -> AecResult<()> {
             superseded  INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_undo_command ON undo_journal(command_id);
+        -- `undo_journal.scope` is intentionally NOT in this base v1
+        -- schema: it is added by migration v3 (see
+        -- `crates/aec_core/src/migrations/v3_undo_journal_scope.rs`)
+        -- so every fresh database exercises the same migration path
+        -- as an in-place upgrade from a pre-v3 project.
 
         CREATE TABLE IF NOT EXISTS bim_cache (
             global_id   TEXT PRIMARY KEY,

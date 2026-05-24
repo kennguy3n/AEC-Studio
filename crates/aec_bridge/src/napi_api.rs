@@ -464,6 +464,158 @@ pub fn bim_attach_ifc(project_path: String, ifc_path: String) -> Result<BimAttac
     with_service_ref_fallible(|svc| svc.bim_attach_ifc(&project_path, &ifc_path)).map(Into::into)
 }
 
+/// JS-facing command-apply result. Mirrors
+/// `apps/desktop/electron/bridge.ts`'s `CommandApplyResult`. The
+/// renderer consumes `commandId` for audit-pane linking, `applied`
+/// as opaque-but-roundtrippable JSON (the renderer renders new
+/// entities directly from each `Create` delta, updates from
+/// `Update`, deletes from `Delete`), and `undoLen` / `redoLen` to
+/// keep the undo / redo toolbar buttons in sync without a follow-up
+/// query.
+///
+/// `applied` carries `Vec<EntityDelta>` as a JSON-stringified
+/// payload (rather than a structured napi object) for two reasons:
+/// (1) `EntityDelta`'s `Create` / `Update` / `Delete` shape is
+/// already serde-tagged in `aec_command::commands::project_graph`
+/// and re-deriving the same tagged union in napi-rs would be lossy
+/// (napi-rs unions don't preserve the tag), and (2) the renderer
+/// already has `JSON.parse` infrastructure for delta application.
+#[napi(object)]
+pub struct CommandApplyResultJs {
+    /// `CommandId` as the underlying string (e.g. `"cmd_..."`).
+    /// `CommandId` doesn't roundtrip through napi-rs as a custom
+    /// type — exposing the string form here matches every other
+    /// id-bearing field in the bridge surface.
+    pub command_id: String,
+    /// JSON-stringified `Vec<EntityDelta>`. See the doc comment on
+    /// [`CommandApplyResultJs`] for the rationale.
+    pub applied_json: String,
+    /// Post-call undo-stack depth. `0` means "nothing to undo".
+    pub undo_len: u32,
+    /// Post-call redo-stack depth. `0` means "nothing to redo".
+    pub redo_len: u32,
+}
+
+impl From<crate::service::CommandApplyResult> for CommandApplyResultJs {
+    fn from(r: crate::service::CommandApplyResult) -> Self {
+        Self {
+            command_id: r.command_id.to_string(),
+            // `serde_json::to_string` on `Vec<EntityDelta>` is
+            // infallible for the shapes produced by the engine
+            // (all fields are owned strings / numbers / serde Values
+            // that already roundtripped through `serde_json::Value`
+            // on the way in), so we serialise here without an
+            // additional fallible step in the napi return path.
+            applied_json: serde_json::to_string(&r.applied).unwrap_or_else(|_| "[]".to_string()),
+            undo_len: r.undo_len,
+            redo_len: r.redo_len,
+        }
+    }
+}
+
+/// JS-facing entity record. Mirrors the renderer's
+/// `apps/desktop/electron/bridge.ts` `EntityRecord` interface for
+/// `projectGraphList`.
+///
+/// `body_json` carries `serde_json::Value` as a JSON string for the
+/// same reason as `CommandApplyResultJs::applied_json` — the
+/// renderer-side delta consumer already handles parsing.
+#[napi(object)]
+pub struct EntityRecordJs {
+    pub id: String,
+    pub kind: String,
+    pub parent: Option<String>,
+    pub body_json: String,
+}
+
+impl From<aec_command::commands::EntityRecord> for EntityRecordJs {
+    fn from(r: aec_command::commands::EntityRecord) -> Self {
+        Self {
+            id: r.id.to_string(),
+            kind: r.kind,
+            parent: r.parent.map(|p| p.to_string()),
+            body_json: serde_json::to_string(&r.body).unwrap_or_else(|_| "null".to_string()),
+        }
+    }
+}
+
+/// Apply a typed command to the project graph.
+///
+/// `command_json` is a serialised [`aec_command::commands::Command`]
+/// (the `command_id` / `ts` / `scope` / `actor` / `kind` envelope
+/// produced by the renderer-side command helpers). The engine
+/// rebuilds itself from the on-disk graph + journal, executes the
+/// command via [`aec_command::engine::CommandEngine::execute_persistent`]
+/// so the SQL and in-memory layers advance in lock-step, and
+/// returns the resulting deltas + audit envelope.
+///
+/// Routes through `with_service` (the `&mut self` helper) because
+/// [`crate::service::BridgeService::command_apply`] takes `&mut self`
+/// to mutate the engine-status cache after a command lands — without
+/// taking the write lock here, a status poll racing against the apply
+/// could read a stale row count. The DB connection itself serialises
+/// writes through `Mutex<rusqlite::Connection>`, so the outer lock is
+/// not protecting on-disk state, only the in-memory caches that hang
+/// off [`crate::service::BridgeService`].
+#[napi]
+pub fn command_apply(project_path: String, command_json: String) -> Result<CommandApplyResultJs> {
+    let cmd: aec_command::commands::Command = serde_json::from_str(&command_json).map_err(|e| {
+        Error::new(
+            Status::InvalidArg,
+            format!("command_apply: invalid command JSON: {e}"),
+        )
+    })?;
+    with_service(|svc| svc.command_apply(&project_path, cmd)).map(Into::into)
+}
+
+/// Undo the most recently applied command on `project_path`.
+///
+/// `active_scope` is one of `"design"`, `"draft"`, `"bim"`,
+/// `"render"`, `"deliver"` — passed by the renderer to tag the
+/// resulting audit envelope and to validate that the inverse
+/// deltas don't cross a scope boundary (e.g. you can't undo a
+/// design command while in the bim workflow).
+#[napi]
+pub fn command_undo(project_path: String, active_scope: String) -> Result<CommandApplyResultJs> {
+    let scope = parse_scope(&active_scope)?;
+    with_service(|svc| svc.command_undo(&project_path, scope)).map(Into::into)
+}
+
+/// Redo the most recently undone command. Symmetric counterpart
+/// to [`command_undo`].
+#[napi]
+pub fn command_redo(project_path: String, active_scope: String) -> Result<CommandApplyResultJs> {
+    let scope = parse_scope(&active_scope)?;
+    with_service(|svc| svc.command_redo(&project_path, scope)).map(Into::into)
+}
+
+/// List the project graph. Pass `kind_filter = None` for the full
+/// graph; pass `Some(kind)` to narrow (e.g. `"wall"`, `"room"`,
+/// `"camera"`). Read-only; safe to call concurrently with status
+/// polls — routed through `with_service_ref_fallible`.
+#[napi]
+pub fn project_graph_list(
+    project_path: String,
+    kind_filter: Option<String>,
+) -> Result<Vec<EntityRecordJs>> {
+    with_service_ref_fallible(|svc| svc.project_graph_list(&project_path, kind_filter.as_deref()))
+        .map(|rs| rs.into_iter().map(Into::into).collect())
+}
+
+fn parse_scope(s: &str) -> Result<aec_core::types::Scope> {
+    match s {
+        "design" => Ok(aec_core::types::Scope::Design),
+        "draft" => Ok(aec_core::types::Scope::Draft),
+        "bim" => Ok(aec_core::types::Scope::Bim),
+        "render" => Ok(aec_core::types::Scope::Render),
+        "deliver" => Ok(aec_core::types::Scope::Deliver),
+        other => Err(Error::new(
+            Status::InvalidArg,
+            format!("unknown scope `{other}` (expected design / draft / bim / render / deliver)"),
+        )),
+    }
+}
+
 /// JS-facing CPU descriptor. Mirrors `RuntimeStatus["cpu"]` in
 /// `apps/desktop/electron/bridge.ts`.
 #[napi(object)]

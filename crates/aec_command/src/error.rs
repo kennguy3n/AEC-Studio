@@ -31,4 +31,7 @@ pub enum CommandError {
 
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
+
+    #[error("persistence error: {0}")]
+    Persist(#[from] rusqlite::Error),
 }

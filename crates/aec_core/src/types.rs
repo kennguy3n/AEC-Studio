@@ -162,6 +162,32 @@ impl Scope {
             Self::Deliver,
         ]
     }
+
+    /// Parse a [`Scope`] from its [`Self::as_str`] representation
+    /// (`"design"` / `"draft"` / `"bim"` / `"render"` / `"deliver"`).
+    /// Returns [`AecError::Other`] for any other value so the round-trip
+    /// `as_str` → `parse` is total over the enum and rejects any
+    /// stray-or-stale value at the seam (SQL → struct, JSON → struct).
+    pub fn parse(s: &str) -> AecResult<Self> {
+        match s {
+            "design" => Ok(Self::Design),
+            "draft" => Ok(Self::Draft),
+            "bim" => Ok(Self::Bim),
+            "render" => Ok(Self::Render),
+            "deliver" => Ok(Self::Deliver),
+            other => Err(AecError::Other(format!(
+                "unknown scope `{other}` (expected one of design / draft / bim / render / deliver)"
+            ))),
+        }
+    }
+}
+
+impl FromStr for Scope {
+    type Err = AecError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
+    }
 }
 
 impl fmt::Display for Scope {

@@ -283,6 +283,51 @@ export function registerIpcHandlers(): void {
     });
   });
 
+  // ----- Command engine -----
+  // `command:apply` / `command:undo` / `command:redo` route the
+  // renderer's typed command envelopes to the Rust command engine
+  // through `aec_bridge::napi_api::command_*`. The IPC layer is
+  // intentionally thin — every field on the `command` payload is
+  // validated structurally on the Rust side (serde + dispatch); we
+  // only assert shape pre-conditions here so a malformed renderer
+  // call fails fast at the boundary.
+  ipcMain.handle("command:apply", async (_e, { projectPath, command }) => {
+    assertString(projectPath, "projectPath");
+    assertObject(command, "command");
+    const c = command as Record<string, unknown>;
+    assertString(c.command_id as unknown, "command.command_id");
+    assertString(c.tool as unknown, "command.tool");
+    // The envelope's `scope` must be one of the five workflow scopes so
+    // an invalid value (e.g. a renderer typo or stale call site) fails
+    // fast at the IPC boundary rather than as an opaque serde error on
+    // the Rust side or as a silent accept by the in-process fallback.
+    assertScope(c.scope, "command.scope");
+    return getBridge().commandApply(
+      projectPath,
+      command as unknown as import("./bridge").Command,
+    );
+  });
+  ipcMain.handle("command:undo", async (_e, { projectPath, activeScope }) => {
+    assertString(projectPath, "projectPath");
+    assertScope(activeScope);
+    return getBridge().commandUndo(projectPath, activeScope);
+  });
+  ipcMain.handle("command:redo", async (_e, { projectPath, activeScope }) => {
+    assertString(projectPath, "projectPath");
+    assertScope(activeScope);
+    return getBridge().commandRedo(projectPath, activeScope);
+  });
+  ipcMain.handle("project:graphList", async (_e, { projectPath, kindFilter }) => {
+    assertString(projectPath, "projectPath");
+    if (kindFilter !== undefined && kindFilter !== null) {
+      assertString(kindFilter, "kindFilter");
+    }
+    return getBridge().projectGraphList(
+      projectPath,
+      typeof kindFilter === "string" ? kindFilter : undefined,
+    );
+  });
+
   // ----- Runtime -----
   ipcMain.handle("runtime:status", async () => getBridge().runtimeStatus());
 }
@@ -301,6 +346,26 @@ function assertObject(
 ): asserts value is Record<string, unknown> {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new IpcValidationError(`${field} must be an object`);
+  }
+}
+
+/**
+ * Validate that `value` is one of the five workflow scopes the
+ * `aec_command` engine recognises. We narrow to a string literal
+ * union here so the call into `commandUndo` / `commandRedo` is
+ * typesafe and a typo from the renderer surfaces at the IPC
+ * boundary rather than as a deserialisation error on the Rust
+ * side.
+ */
+export function assertScope(
+  value: unknown,
+  field: string = "activeScope",
+): asserts value is import("./bridge").CommandScope {
+  const allowed = ["design", "draft", "bim", "render", "deliver"] as const;
+  if (typeof value !== "string" || !allowed.includes(value as typeof allowed[number])) {
+    throw new IpcValidationError(
+      `${field} must be one of ${allowed.join(" / ")} (got: ${String(value)})`,
+    );
   }
 }
 

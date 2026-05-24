@@ -456,10 +456,15 @@ mod tests {
             // manifest path runs again below — a no-op shouldn't
             // break anything.
             let conn = pkg.open_database(&master).unwrap();
-            // Forcibly clobber it back to v1 and drop audit_chain so
-            // the "legacy DB" half of the simulation is realistic.
+            // Forcibly clobber it back to v1: drop every post-v1 DDL
+            // (audit_chain from v2, `undo_journal.scope` from v3) and
+            // reset the recorded schema_version. This makes the
+            // "legacy DB" half of the simulation realistic across the
+            // full migration chain rather than just v2.
             conn.execute_batch(
                 "DROP TABLE IF EXISTS audit_chain; \
+                 DROP INDEX IF EXISTS idx_undo_journal_scope; \
+                 ALTER TABLE undo_journal DROP COLUMN scope; \
                  INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', '1');",
             )
             .unwrap();

@@ -1,13 +1,20 @@
-//! Minimal in-memory project graph that commands mutate.
+//! Project graph that commands mutate.
 //!
-//! Phase 1/2 keeps the graph in memory; persistence to `aec_core::db` will
-//! land in Phase 3 alongside the on-disk command-log replay.
+//! In-memory representation backed by the `entities` table in the
+//! SQLCipher database (see `aec_core::db`). Use [`ProjectGraph::load`]
+//! to read the current state from disk and [`ProjectGraph::persist_delta`]
+//! to apply a single [`EntityDelta`] inside a transaction so the on-disk
+//! state and the in-memory state stay in lock-step.
 
 use std::collections::HashMap;
 
+use chrono::Utc;
+use rusqlite::{params, Connection, Transaction};
 use serde::{Deserialize, Serialize};
 
 use aec_core::types::EntityId;
+
+use crate::error::{CommandError, CommandResult};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EntityRecord {
@@ -93,6 +100,148 @@ impl ProjectGraph {
         self.entities.values()
     }
 
+    /// Load the graph from the `entities` table of an open SQLCipher
+    /// connection. The schema is initialised by `aec_core::db::open_encrypted`;
+    /// a freshly-created package has the table but zero rows.
+    pub fn load(conn: &Connection) -> CommandResult<Self> {
+        let mut stmt = conn.prepare("SELECT id, kind, parent_id, body FROM entities")?;
+        let rows = stmt.query_map(params![], |row| {
+            let id_str: String = row.get(0)?;
+            let kind: String = row.get(1)?;
+            let parent: Option<String> = row.get(2)?;
+            let body_text: String = row.get(3)?;
+            Ok((id_str, kind, parent, body_text))
+        })?;
+        let mut entities = HashMap::new();
+        for r in rows {
+            let (id_str, kind, parent, body_text) = r?;
+            let id = EntityId::from_string(id_str)
+                .map_err(|e| CommandError::JournalCorrupt(format!("invalid entity id: {e}")))?;
+            let body: serde_json::Value = serde_json::from_str(&body_text)?;
+            let parent = parent
+                .map(EntityId::from_string)
+                .transpose()
+                .map_err(|e| CommandError::JournalCorrupt(format!("invalid parent id: {e}")))?;
+            entities.insert(
+                id.clone(),
+                EntityRecord {
+                    id,
+                    kind,
+                    body,
+                    parent,
+                },
+            );
+        }
+        Ok(Self { entities })
+    }
+
+    /// Read-only validation: would this delta apply cleanly against the
+    /// current in-memory state? Used by the persistent execution path to
+    /// detect duplicate-create / not-found-update / not-found-delete
+    /// **before** opening the SQL transaction, so a validation failure
+    /// leaves both layers untouched.
+    pub fn validate(&self, delta: &EntityDelta) -> CommandResult<()> {
+        match delta {
+            EntityDelta::Create { record } => {
+                if self.entities.contains_key(&record.id) {
+                    return Err(CommandError::EntityAlreadyExists(record.id.to_string()));
+                }
+            }
+            EntityDelta::Update { id, .. } => {
+                if !self.entities.contains_key(id) {
+                    return Err(CommandError::EntityNotFound(id.to_string()));
+                }
+            }
+            EntityDelta::Delete { record } => {
+                if !self.entities.contains_key(&record.id) {
+                    return Err(CommandError::EntityNotFound(record.id.to_string()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate a sequence of deltas as a unit. Walks a shadow copy of
+    /// the entity map so the n-th delta is checked against the state
+    /// after applying the first n-1 — necessary for multi-delta commands
+    /// where e.g. a `Create` followed by an `Update` on the same id is
+    /// valid even though the second `Update` alone wouldn't be against
+    /// the pre-state.
+    pub fn validate_all(&self, deltas: &[EntityDelta]) -> CommandResult<()> {
+        let mut shadow = self.clone();
+        for d in deltas {
+            shadow.apply(d)?;
+        }
+        Ok(())
+    }
+
+    /// SQL-only persist of a single delta inside an externally-managed
+    /// transaction. Does **not** mutate the in-memory state — the
+    /// caller is responsible for calling [`Self::apply`] after the
+    /// transaction has been committed. This split makes
+    /// validate → SQL → commit → in-memory an all-or-nothing pipeline:
+    /// if SQL fails (or the transaction is dropped without commit), the
+    /// in-memory graph is never touched.
+    pub fn persist_delta_in_tx(tx: &Transaction, delta: &EntityDelta) -> CommandResult<()> {
+        let now = Utc::now().to_rfc3339();
+        match delta {
+            EntityDelta::Create { record } => {
+                let body = serde_json::to_string(&record.body)?;
+                tx.execute(
+                    "INSERT INTO entities (id, kind, parent_id, created_at, updated_at, body) \
+                     VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+                    params![
+                        record.id.to_string(),
+                        record.kind,
+                        record.parent.as_ref().map(EntityId::to_string),
+                        now,
+                        body,
+                    ],
+                )?;
+            }
+            EntityDelta::Update { id, after, .. } => {
+                let body = serde_json::to_string(after)?;
+                let n = tx.execute(
+                    "UPDATE entities SET body = ?1, updated_at = ?2 WHERE id = ?3",
+                    params![body, now, id.to_string()],
+                )?;
+                if n == 0 {
+                    return Err(CommandError::EntityNotFound(id.to_string()));
+                }
+            }
+            EntityDelta::Delete { record } => {
+                let n = tx.execute(
+                    "DELETE FROM entities WHERE id = ?1",
+                    params![record.id.to_string()],
+                )?;
+                if n == 0 {
+                    return Err(CommandError::EntityNotFound(record.id.to_string()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Convenience wrapper that opens its own transaction. Kept for
+    /// callers that want a single self-contained persist; the engine
+    /// uses [`Self::persist_delta_in_tx`] directly so it can combine
+    /// entity writes and journal writes into one atomic commit.
+    pub fn persist_delta(
+        &mut self,
+        conn: &mut Connection,
+        delta: &EntityDelta,
+    ) -> CommandResult<()> {
+        self.validate(delta)?;
+        let tx = conn.transaction()?;
+        Self::persist_delta_in_tx(&tx, delta)?;
+        tx.commit()?;
+        // Only mutate in-memory after the commit succeeds. If the commit
+        // fails the `?` above returns early and the graph is untouched.
+        self.apply(delta)
+            .expect("validated above; apply cannot fail");
+        Ok(())
+    }
+
     /// Apply a single delta. The returned bool indicates whether the
     /// graph was changed (false would indicate the delta was a no-op, which
     /// is a bug; we panic-free-return so the engine can roll back).
@@ -176,5 +325,83 @@ mod tests {
         let r = record("wall");
         let err = g.apply(&EntityDelta::Delete { record: r }).unwrap_err();
         matches!(err, crate::error::CommandError::EntityNotFound(_));
+    }
+
+    fn open_in_memory_with_entities_table() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE entities (
+                id          TEXT PRIMARY KEY,
+                kind        TEXT NOT NULL,
+                parent_id   TEXT,
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL,
+                body        TEXT NOT NULL,
+                FOREIGN KEY (parent_id) REFERENCES entities(id) ON DELETE CASCADE
+            );",
+        )
+        .unwrap();
+        conn
+    }
+
+    #[test]
+    fn persist_delta_create_then_load_round_trips_record() {
+        let mut conn = open_in_memory_with_entities_table();
+        let mut g = ProjectGraph::new();
+        let r = record("wall");
+        g.persist_delta(&mut conn, &EntityDelta::Create { record: r.clone() })
+            .unwrap();
+        let reloaded = ProjectGraph::load(&conn).unwrap();
+        assert_eq!(reloaded.len(), 1);
+        assert_eq!(reloaded.get(&r.id).unwrap(), &r);
+    }
+
+    #[test]
+    fn persist_delta_update_then_load_reads_after_body() {
+        let mut conn = open_in_memory_with_entities_table();
+        let mut g = ProjectGraph::new();
+        let r = record("room");
+        g.persist_delta(&mut conn, &EntityDelta::Create { record: r.clone() })
+            .unwrap();
+        g.persist_delta(
+            &mut conn,
+            &EntityDelta::Update {
+                id: r.id.clone(),
+                before: r.body.clone(),
+                after: serde_json::json!({"v": 99}),
+            },
+        )
+        .unwrap();
+        let reloaded = ProjectGraph::load(&conn).unwrap();
+        assert_eq!(reloaded.get(&r.id).unwrap().body["v"], 99);
+    }
+
+    #[test]
+    fn persist_delta_delete_then_load_drops_record() {
+        let mut conn = open_in_memory_with_entities_table();
+        let mut g = ProjectGraph::new();
+        let r = record("light");
+        g.persist_delta(&mut conn, &EntityDelta::Create { record: r.clone() })
+            .unwrap();
+        g.persist_delta(&mut conn, &EntityDelta::Delete { record: r })
+            .unwrap();
+        let reloaded = ProjectGraph::load(&conn).unwrap();
+        assert!(reloaded.is_empty());
+    }
+
+    #[test]
+    fn persist_delta_duplicate_create_returns_error_without_disturbing_sql() {
+        let mut conn = open_in_memory_with_entities_table();
+        let mut g = ProjectGraph::new();
+        let r = record("wall");
+        g.persist_delta(&mut conn, &EntityDelta::Create { record: r.clone() })
+            .unwrap();
+        let err = g
+            .persist_delta(&mut conn, &EntityDelta::Create { record: r.clone() })
+            .unwrap_err();
+        assert!(matches!(err, CommandError::EntityAlreadyExists(_)));
+        // SQL table still has exactly the original row.
+        let reloaded = ProjectGraph::load(&conn).unwrap();
+        assert_eq!(reloaded.len(), 1);
     }
 }

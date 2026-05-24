@@ -131,6 +131,7 @@ dependencies = [
  "aec_render",
  "blake3",
  "chrono",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

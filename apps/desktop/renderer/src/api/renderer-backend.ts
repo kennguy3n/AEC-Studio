@@ -8,9 +8,16 @@ import type { AecApi } from "../../../electron/preload";
 import { AI_TOOLS } from "../../../electron/ai-tools";
 import {
   BIM_IMPORT_LARGE_FILE_THRESHOLD_BYTES,
+  applyDeltas,
   classifyTier,
+  computeForwardDeltas,
   diffRevisionsInProcess,
+  ensureInProcessGraph,
   inProcessParsedForTool,
+  type Command,
+  type CommandScope,
+  type EntityRecord,
+  type InProcessGraph,
   type RevisionSummary,
   type VersionDiffSummary,
 } from "../../../electron/bridge";
@@ -232,6 +239,7 @@ export function rendererInProcessBackend(): AecApi {
       buildProposalPack: async () => ({ outPath: "/exports/proposal.pdf" }),
     },
     deliver: deliverMock(newId),
+    command: commandMock(),
     runtime: {
       // Derive the tier from the same `classifyTier` the production
       // backend uses so the test fixture cannot drift away from real
@@ -347,6 +355,111 @@ function deliverMock(newId: (prefix: string) => string) {
         contents,
         totalBytes: contents.length * 4096,
       };
+    },
+  };
+}
+
+/**
+ * Renderer-side fixture for the `command` IPC namespace.
+ *
+ * The renderer constructs `Command` envelopes; the IPC layer passes
+ * them through unchanged. The fixture's responsibility is to model a
+ * working create / undo / redo loop the way the Rust engine does —
+ * applying forward deltas, capturing inverse deltas, popping on undo,
+ * pushing onto redo, and dropping the redo stack on any new apply.
+ *
+ * Both the per-tool delta computation (`computeForwardDeltas`) and
+ * the inverse-delta application loop (`applyDeltas`) are imported
+ * from `bridge.ts` so the renderer-side vitest fallback and the
+ * electron-side in-process fallback share a *single* implementation.
+ * Earlier drafts had three near-identical copies (Rust engine +
+ * bridge.ts + renderer-backend.ts) — see Devin Review round 3
+ * ANALYSIS_0003. Sharing the TypeScript implementation eliminates
+ * the JS-side drift; the Rust ↔ JS parity is enforced by the
+ * `crates/aec_bridge::service::tests::command_*` integration tests
+ * which run both engines side-by-side.
+ */
+function commandMock() {
+  const graphs = new Map<string, InProcessGraph>();
+
+  return {
+    async apply(projectPath: string, command: unknown) {
+      const c = command as Command;
+      const graph = ensureInProcessGraph(graphs, projectPath);
+      const fwd = computeForwardDeltas(graph, c);
+      const inv = applyDeltas(graph, fwd);
+      graph.undo.push({
+        commandId: c.command_id,
+        // Tag the entry with the originating command's scope so the
+        // mirror of `CommandError::ScopeMismatch` in `undo` / `redo`
+        // can reject a stale `activeScope` before either stack moves.
+        scope: c.scope,
+        forward: fwd,
+        inverse: inv,
+      });
+      graph.redo.length = 0;
+      return {
+        commandId: c.command_id,
+        applied: fwd,
+        undoLen: graph.undo.length,
+        redoLen: graph.redo.length,
+      };
+    },
+    async undo(projectPath: string, activeScope: string) {
+      const graph = ensureInProcessGraph(graphs, projectPath);
+      const top = graph.undo[graph.undo.length - 1];
+      if (!top) throw new Error("command_undo: nothing to undo");
+      if (top.scope !== (activeScope as CommandScope)) {
+        throw new Error(
+          `command_undo: scope mismatch (expected ${top.scope}, got ${activeScope})`,
+        );
+      }
+      const entry = graph.undo.pop()!;
+      applyDeltas(graph, entry.inverse);
+      graph.redo.push(entry);
+      return {
+        commandId: entry.commandId,
+        applied: entry.inverse,
+        undoLen: graph.undo.length,
+        redoLen: graph.redo.length,
+      };
+    },
+    async redo(projectPath: string, activeScope: string) {
+      const graph = ensureInProcessGraph(graphs, projectPath);
+      const top = graph.redo[graph.redo.length - 1];
+      if (!top) throw new Error("command_redo: nothing to redo");
+      if (top.scope !== (activeScope as CommandScope)) {
+        throw new Error(
+          `command_redo: scope mismatch (expected ${top.scope}, got ${activeScope})`,
+        );
+      }
+      const entry = graph.redo.pop()!;
+      applyDeltas(graph, entry.forward);
+      graph.undo.push(entry);
+      return {
+        commandId: entry.commandId,
+        applied: entry.forward,
+        undoLen: graph.undo.length,
+        redoLen: graph.redo.length,
+      };
+    },
+    async listGraph(projectPath: string, kindFilter?: string): Promise<EntityRecord[]> {
+      const graph = ensureInProcessGraph(graphs, projectPath);
+      const rows: EntityRecord[] = [];
+      for (const r of graph.entities.values()) {
+        if (kindFilter === undefined || r.kind === kindFilter) {
+          rows.push({
+            id: r.id,
+            kind: r.kind,
+            parent: r.parent,
+            body:
+              r.body === null || r.body === undefined
+                ? r.body
+                : JSON.parse(JSON.stringify(r.body)),
+          });
+        }
+      }
+      return rows;
     },
   };
 }
