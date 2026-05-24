@@ -895,6 +895,270 @@ pub fn deliver_build_pack(params: DeliverBuildPackParamsJs) -> Result<DeliverBui
     with_service_ref_fallible(move |svc| svc.deliver_build_pack(svc_params)).map(Into::into)
 }
 
+/// JS-facing summary of [`crate::service::BridgeService::bim_export_ifc`].
+/// Mirrors the renderer's `BimExportIfcSummary` interface in
+/// `apps/desktop/electron/bridge.ts`.
+///
+/// `bytes_written` is `f64` (JS `number`) for the same reason
+/// [`BimFileSizeCheckJs::file_size_bytes`] is — `f64` has exact
+/// integer precision up to 2^53 (~9 PB), well beyond any
+/// conceivable IFC file, and avoids the BigInt / Number
+/// incompatibility footgun.
+#[napi(object)]
+pub struct BimExportIfcSummaryJs {
+    pub source_path: String,
+    pub out_path: String,
+    pub schema: String,
+    pub bytes_written: f64,
+    pub parse_cache_hit: bool,
+}
+
+impl From<crate::service::BimExportIfcSummary> for BimExportIfcSummaryJs {
+    fn from(r: crate::service::BimExportIfcSummary) -> Self {
+        Self {
+            source_path: r.source_path,
+            out_path: r.out_path,
+            schema: r.schema,
+            bytes_written: r.bytes_written as f64,
+            parse_cache_hit: r.parse_cache_hit,
+        }
+    }
+}
+
+/// Parse an `.ifc` file, re-serialise the resulting snapshot back
+/// to STEP-21, and write the bytes to `out_path`. The output is
+/// byte-identical to what `bim_attach_ifc`'s snapshot would write
+/// — both paths share `IfcWriter::to_string_with_materials`. The
+/// snapshot cache fronts repeated calls against the same source.
+///
+/// Routes through `with_service_ref_fallible` (read-only).
+#[napi]
+pub fn bim_export_ifc(ifc_path: String, out_path: String) -> Result<BimExportIfcSummaryJs> {
+    with_service_ref_fallible(|svc| svc.bim_export_ifc(&ifc_path, &out_path)).map(Into::into)
+}
+
+/// JS-facing validation finding. Mirrors the renderer's
+/// `BimValidationFinding` interface in
+/// `apps/desktop/electron/bridge.ts`.
+#[napi(object)]
+pub struct BimValidationFindingJs {
+    pub severity: String,
+    pub code: String,
+    pub element: Option<String>,
+    pub description: String,
+    pub suggestion: Option<String>,
+}
+
+impl From<crate::service::BimValidationFinding> for BimValidationFindingJs {
+    fn from(r: crate::service::BimValidationFinding) -> Self {
+        Self {
+            severity: r.severity,
+            code: r.code,
+            element: r.element,
+            description: r.description,
+            suggestion: r.suggestion,
+        }
+    }
+}
+
+/// JS-facing summary of [`crate::service::BridgeService::bim_validate`].
+/// Mirrors the renderer's `BimValidateReport` interface in
+/// `apps/desktop/electron/bridge.ts`. Errors / warnings / infos
+/// are pre-split into three vectors so the renderer's three-panel
+/// view can render directly.
+#[napi(object)]
+pub struct BimValidateReportJs {
+    pub ok: bool,
+    pub source_path: String,
+    pub schema: String,
+    pub errors: Vec<BimValidationFindingJs>,
+    pub warnings: Vec<BimValidationFindingJs>,
+    pub infos: Vec<BimValidationFindingJs>,
+    pub parse_cache_hit: bool,
+}
+
+impl From<crate::service::BimValidateReport> for BimValidateReportJs {
+    fn from(r: crate::service::BimValidateReport) -> Self {
+        Self {
+            ok: r.ok,
+            source_path: r.source_path,
+            schema: r.schema,
+            errors: r.errors.into_iter().map(Into::into).collect(),
+            warnings: r.warnings.into_iter().map(Into::into).collect(),
+            infos: r.infos.into_iter().map(Into::into).collect(),
+            parse_cache_hit: r.parse_cache_hit,
+        }
+    }
+}
+
+/// Parse an `.ifc` file and run the rule-based BIM validator
+/// against the resulting snapshot. Findings are split by severity
+/// (errors / warnings / infos). The relations side of the
+/// validator runs with an empty `RelationStore` because the IFC
+/// reader folds spatial relationships directly into
+/// `Project.nodes[*].elements`; remaining checks operate on the
+/// snapshot's stores directly.
+///
+/// Routes through `with_service_ref_fallible` (read-only).
+#[napi]
+pub fn bim_validate(ifc_path: String) -> Result<BimValidateReportJs> {
+    with_service_ref_fallible(|svc| svc.bim_validate(&ifc_path)).map(Into::into)
+}
+
+/// JS-facing property-level change. `before` / `after` are JSON-
+/// stringified `PropertyValue` so the napi layer doesn't have to
+/// encode the tagged-union variants (Boolean / Logical / Real /
+/// etc.) into a typed shape — the renderer parses them with
+/// `JSON.parse` and renders the appropriate widget.
+#[napi(object)]
+pub struct BimDiffPropertyChangeJs {
+    pub pset: String,
+    pub key: String,
+    pub before: Option<String>,
+    pub after: Option<String>,
+}
+
+impl From<crate::service::BimDiffPropertyChange> for BimDiffPropertyChangeJs {
+    fn from(r: crate::service::BimDiffPropertyChange) -> Self {
+        Self {
+            pset: r.pset,
+            key: r.key,
+            before: r.before,
+            after: r.after,
+        }
+    }
+}
+
+/// JS-facing element-level change inside a `BimDiffSummary::modified`
+/// list. The `key` is the join key built by `aec_bim::diff` — GUID
+/// first, falling back to `class:name`.
+#[napi(object)]
+pub struct BimDiffElementChangeJs {
+    pub key: String,
+    pub class_before: Option<String>,
+    pub class_after: Option<String>,
+    pub name_before: Option<String>,
+    pub name_after: Option<String>,
+    pub property_deltas: Vec<BimDiffPropertyChangeJs>,
+}
+
+impl From<crate::service::BimDiffElementChange> for BimDiffElementChangeJs {
+    fn from(r: crate::service::BimDiffElementChange) -> Self {
+        Self {
+            key: r.key,
+            class_before: r.class_before,
+            class_after: r.class_after,
+            name_before: r.name_before,
+            name_after: r.name_after,
+            property_deltas: r.property_deltas.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// JS-facing summary of [`crate::service::BridgeService::bim_diff`].
+/// Mirrors the renderer's `BimDiffSummary` interface in
+/// `apps/desktop/electron/bridge.ts`. `diff_id` is content-
+/// addressed (BLAKE3 of canonical (before, after) path pair) so
+/// the renderer can dedup repeated diffs and cache rendered views.
+#[napi(object)]
+pub struct BimDiffSummaryJs {
+    pub diff_id: String,
+    pub before_path: String,
+    pub after_path: String,
+    pub before_schema: String,
+    pub after_schema: String,
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    pub modified: Vec<BimDiffElementChangeJs>,
+    pub before_cache_hit: bool,
+    pub after_cache_hit: bool,
+}
+
+impl From<crate::service::BimDiffSummary> for BimDiffSummaryJs {
+    fn from(r: crate::service::BimDiffSummary) -> Self {
+        Self {
+            diff_id: r.diff_id,
+            before_path: r.before_path,
+            after_path: r.after_path,
+            before_schema: r.before_schema,
+            after_schema: r.after_schema,
+            added: r.added,
+            removed: r.removed,
+            modified: r.modified.into_iter().map(Into::into).collect(),
+            before_cache_hit: r.before_cache_hit,
+            after_cache_hit: r.after_cache_hit,
+        }
+    }
+}
+
+/// Parse two `.ifc` files (independently snapshot-cache fronted)
+/// and run `aec_bim::diff::diff_projects` to produce an element-
+/// level diff. `diff_id` is *input*-addressed (BLAKE3 of the
+/// canonical `(before, after)` path pair, **not** the file bytes)
+/// so the same path pair always produces the same id even if the
+/// files change. Content-aware invalidation happens one layer
+/// down in the snapshot cache (keyed on `(canonical_path, mtime,
+/// size)`).
+///
+/// Routes through `with_service_ref_fallible` (read-only).
+#[napi]
+pub fn bim_diff(before_path: String, after_path: String) -> Result<BimDiffSummaryJs> {
+    with_service_ref_fallible(|svc| svc.bim_diff(&before_path, &after_path)).map(Into::into)
+}
+
+/// JS-facing summary of
+/// [`crate::service::BridgeService::bim_generate_schedule`]. Mirrors
+/// the renderer's `BimScheduleSummary` interface in
+/// `apps/desktop/electron/bridge.ts`. `bytes_written` is `f64` for
+/// the same precision reason as [`BimExportIfcSummaryJs::bytes_written`].
+#[napi(object)]
+pub struct BimScheduleSummaryJs {
+    pub schedule_id: String,
+    pub kind: String,
+    pub source_path: String,
+    pub out_path: String,
+    pub rows: u32,
+    pub columns: u32,
+    pub bytes_written: f64,
+    pub parse_cache_hit: bool,
+}
+
+impl From<crate::service::BimScheduleSummary> for BimScheduleSummaryJs {
+    fn from(r: crate::service::BimScheduleSummary) -> Self {
+        Self {
+            schedule_id: r.schedule_id,
+            kind: r.kind,
+            source_path: r.source_path,
+            out_path: r.out_path,
+            rows: r.rows,
+            columns: r.columns,
+            bytes_written: r.bytes_written as f64,
+            parse_cache_hit: r.parse_cache_hit,
+        }
+    }
+}
+
+/// Parse an `.ifc` file and generate one of the four supported
+/// schedules (`"door"` / `"window"` / `"room"` / `"material"`),
+/// writing the result to `out_path` as an XLSX workbook.
+/// `schedule_id` is *input*-addressed (BLAKE3 of `(kind, canonical
+/// source path)`, **not** the file bytes), so the same
+/// `(kind, source)` pair always produces the same id even if the
+/// IFC changes. Content-aware invalidation happens one layer down
+/// in the snapshot cache (keyed on `(canonical_path, mtime,
+/// size)`).
+///
+/// Routes through `with_service_ref_fallible` (read-only).
+#[napi]
+pub fn bim_generate_schedule(
+    ifc_path: String,
+    kind: String,
+    out_path: String,
+) -> Result<BimScheduleSummaryJs> {
+    with_service_ref_fallible(|svc| svc.bim_generate_schedule(&ifc_path, &kind, &out_path))
+        .map(Into::into)
+}
+
 /// JS-facing CPU descriptor. Mirrors `RuntimeStatus["cpu"]` in
 /// `apps/desktop/electron/bridge.ts`.
 #[napi(object)]

@@ -103,9 +103,13 @@ export function registerIpcHandlers(): void {
     assertString(ifcPath, "ifcPath");
     return getBridge().bimAttachIfc(projectPath, ifcPath);
   });
-  ipcMain.handle("bim:exportIfc", async (_e, { path }) => {
-    assertString(path, "path");
-    return getBridge().bimExportIfc(path);
+  ipcMain.handle("bim:exportIfc", async (_e, p) => {
+    assertObject(p, "params");
+    const sourcePath = (p as { sourcePath?: unknown }).sourcePath;
+    const outPath = (p as { outPath?: unknown }).outPath;
+    assertString(sourcePath, "sourcePath");
+    assertString(outPath, "outPath");
+    return getBridge().bimExportIfc({ sourcePath, outPath });
   });
   ipcMain.handle("bim:classify", async (_e, p) => {
     assertObject(p, "params");
@@ -117,12 +121,37 @@ export function registerIpcHandlers(): void {
   });
   ipcMain.handle("bim:generateSchedule", async (_e, p) => {
     assertObject(p, "params");
-    return getBridge().bimGenerateSchedule(p);
+    const sourcePath = (p as { sourcePath?: unknown }).sourcePath;
+    const outPath = (p as { outPath?: unknown }).outPath;
+    const kind = (p as { kind?: unknown }).kind;
+    assertString(sourcePath, "sourcePath");
+    assertString(outPath, "outPath");
+    assertString(kind, "kind");
+    if (
+      kind !== "door" &&
+      kind !== "window" &&
+      kind !== "room" &&
+      kind !== "material"
+    ) {
+      throw new Error(
+        `bimGenerateSchedule: kind must be one of door/window/room/material, got ${kind}`,
+      );
+    }
+    return getBridge().bimGenerateSchedule({ sourcePath, outPath, kind });
   });
-  ipcMain.handle("bim:validate", async () => getBridge().bimValidate());
+  ipcMain.handle("bim:validate", async (_e, p) => {
+    assertObject(p, "params");
+    const sourcePath = (p as { sourcePath?: unknown }).sourcePath;
+    assertString(sourcePath, "sourcePath");
+    return getBridge().bimValidate({ sourcePath });
+  });
   ipcMain.handle("bim:diff", async (_e, p) => {
     assertObject(p, "params");
-    return getBridge().bimDiff(p);
+    const beforePath = (p as { beforePath?: unknown }).beforePath;
+    const afterPath = (p as { afterPath?: unknown }).afterPath;
+    assertString(beforePath, "beforePath");
+    assertString(afterPath, "afterPath");
+    return getBridge().bimDiff({ beforePath, afterPath });
   });
 
   // ----- Render -----

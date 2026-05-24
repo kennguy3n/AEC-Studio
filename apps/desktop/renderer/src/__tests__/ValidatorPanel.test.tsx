@@ -24,6 +24,7 @@ describe("ValidatorPanel", () => {
   it("shows the empty state when no findings", () => {
     render(
       <ValidatorPanel
+        sourcePath="demo://project.ifc"
         findings={[]}
         onFindings={() => undefined}
         onZoomTo={() => undefined}
@@ -38,6 +39,7 @@ describe("ValidatorPanel", () => {
   it("renders one row per finding with the severity tag", () => {
     render(
       <ValidatorPanel
+        sourcePath="demo://project.ifc"
         findings={FINDINGS}
         onFindings={() => undefined}
         onZoomTo={() => undefined}
@@ -58,6 +60,7 @@ describe("ValidatorPanel", () => {
     const onZoomTo = vi.fn();
     render(
       <ValidatorPanel
+        sourcePath="demo://project.ifc"
         findings={FINDINGS}
         onFindings={() => undefined}
         onZoomTo={onZoomTo}
@@ -71,6 +74,7 @@ describe("ValidatorPanel", () => {
     const onFindings = vi.fn();
     render(
       <ValidatorPanel
+        sourcePath="demo://project.ifc"
         findings={[]}
         onFindings={onFindings}
         onZoomTo={() => undefined}

@@ -578,6 +578,156 @@ pub struct DeliverPackResult {
     pub total_bytes: u64,
 }
 
+/// Result of a successful [`BridgeService::bim_export_ifc`] call.
+/// The bridge parses the input IFC (hitting the snapshot cache where
+/// possible), then re-serialises the parsed `IfcSnapshot` back to a
+/// STEP-21 byte stream and writes it to `out_path`. The renderer's
+/// "Export BIM" panel shows `out_path` + `bytes_written` so the user
+/// can confirm the file landed and how big it is.
+///
+/// This is a *normalise-and-emit* pipeline (parse → AEC-Studio
+/// canonical form → write), useful for validating round-trip
+/// fidelity, stripping vendor-specific fluff, and producing a
+/// stable golden for downstream comparison. The output is byte-
+/// identical to what `bim_attach_ifc`'s snapshot would write,
+/// because both paths share `IfcWriter::to_string_with_materials`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BimExportIfcSummary {
+    /// Canonical absolute path of the input IFC file.
+    pub source_path: String,
+    /// Canonical absolute path of the written output file. Computed
+    /// post-write via `canonicalize`, so symlinks and `./` segments
+    /// are resolved exactly as `BimImportSummary::path` resolves them.
+    pub out_path: String,
+    /// IFC schema declared in the input file's `FILE_SCHEMA` header
+    /// (e.g. `"IFC2X3"`, `"IFC4"`, `"IFC4X3"`). Surfaced so the
+    /// renderer can warn if it's exporting a schema mismatch.
+    pub schema: String,
+    /// Bytes written to `out_path`.
+    pub bytes_written: u64,
+    /// `true` if the input snapshot came from the in-process cache
+    /// populated by a prior `bim_import_ifc` / `bim_attach_ifc` /
+    /// `bim_validate` / `bim_diff` call for the same `(path, mtime,
+    /// size)`. Cache miss → reparse → cache populate. Useful for
+    /// the renderer's loading indicator.
+    pub parse_cache_hit: bool,
+}
+
+/// One finding from [`BridgeService::bim_validate`]. Mirrors
+/// [`aec_bim::validation::ValidationFinding`] but uses owned
+/// `String`s and a string severity discriminator so the napi /
+/// JSON boundary can serialise without round-tripping through a
+/// Rust enum.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BimValidationFinding {
+    /// `"error"` / `"warning"` / `"info"`. The renderer matches on
+    /// these tokens; do NOT switch back to `format!("{:?}")` (which
+    /// would leak the Rust variant casing) — see the
+    /// `BimImportSummary::schema` field comment for the same
+    /// discipline applied to the schema string.
+    pub severity: String,
+    /// Stable machine-readable code (e.g. `"BIM_DANGLING_AGGREGATE_PARENT"`).
+    pub code: String,
+    /// `EntityId` rendered via its `Display` impl, or `None` when the
+    /// finding isn't attached to a specific element (rare).
+    pub element: Option<String>,
+    pub description: String,
+    pub suggestion: Option<String>,
+}
+
+/// Result of a successful [`BridgeService::bim_validate`] call.
+///
+/// The renderer's "BIM Validate" panel uses `ok` for the headline
+/// (PASS / FAIL badge) and renders `errors` / `warnings` / `infos`
+/// as three separate sections.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BimValidateReport {
+    /// `true` when the input has zero `error`-severity findings.
+    /// Mirrors `ValidationReport::is_clean()`.
+    pub ok: bool,
+    /// Canonical absolute path of the validated IFC file.
+    pub source_path: String,
+    /// IFC schema declared in the file's `FILE_SCHEMA` header.
+    pub schema: String,
+    pub errors: Vec<BimValidationFinding>,
+    pub warnings: Vec<BimValidationFinding>,
+    pub infos: Vec<BimValidationFinding>,
+    pub parse_cache_hit: bool,
+}
+
+/// One property-level change inside a [`BimDiffElementChange`].
+/// `before` / `after` are JSON-stringified `PropertyValue` (so the
+/// renderer can show a Logical-vs-Boolean distinction without the
+/// napi layer needing to encode the tagged-union variants directly).
+/// One side being `None` means the property was added (`before =
+/// None`) or removed (`after = None`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BimDiffPropertyChange {
+    pub pset: String,
+    pub key: String,
+    pub before: Option<String>,
+    pub after: Option<String>,
+}
+
+/// One element-level change inside a [`BimDiffSummary::modified`]
+/// list. The `key` is the join key built by `aec_bim::diff` —
+/// GUID first, falling back to `class:name`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BimDiffElementChange {
+    pub key: String,
+    /// `Some((before_class, after_class))` when the IFC class changed
+    /// (e.g. `IfcWall → IfcCurtainWall`); `None` otherwise.
+    pub class_before: Option<String>,
+    pub class_after: Option<String>,
+    pub name_before: Option<String>,
+    pub name_after: Option<String>,
+    pub property_deltas: Vec<BimDiffPropertyChange>,
+}
+
+/// Result of a successful [`BridgeService::bim_diff`] call.
+///
+/// `diff_id` is *input*-addressed: BLAKE3 hash of the (canonical
+/// before path, canonical after path) pair — **not** the file
+/// bytes. Same inputs → same id even if the files change, so the
+/// renderer can dedup repeated diffs and cache rendered
+/// views without a server round-trip.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BimDiffSummary {
+    pub diff_id: String,
+    pub before_path: String,
+    pub after_path: String,
+    pub before_schema: String,
+    pub after_schema: String,
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    pub modified: Vec<BimDiffElementChange>,
+    pub before_cache_hit: bool,
+    pub after_cache_hit: bool,
+}
+
+/// Result of a successful [`BridgeService::bim_generate_schedule`]
+/// call. The schedule is written to `out_path` as an XLSX file
+/// using `ScheduleSheet::write_xlsx`. `rows` is the row count
+/// excluding the header; `columns` is the column count.
+///
+/// `schedule_id` is *input*-addressed: BLAKE3 hash of `(kind,
+/// canonical source path)` — **not** the file bytes. Same inputs
+/// → same id even if the source file changes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BimScheduleSummary {
+    pub schedule_id: String,
+    /// `"door"` / `"window"` / `"room"` / `"material"`. The
+    /// renderer uses this for the page title and to pick the
+    /// correct column rendering.
+    pub kind: String,
+    pub source_path: String,
+    pub out_path: String,
+    pub rows: u32,
+    pub columns: u32,
+    pub bytes_written: u64,
+    pub parse_cache_hit: bool,
+}
+
 /// Hardware-status snapshot. The shape mirrors the TypeScript
 /// `RuntimeStatus` interface in `apps/desktop/electron/bridge.ts` so that
 /// the JS bridge can hand the value to React components without a runtime
@@ -1485,6 +1635,310 @@ impl BridgeService {
             out_path: res.out_path.to_string_lossy().into_owned(),
             contents: res.contents,
             total_bytes: res.total_bytes,
+        })
+    }
+
+    /// Load an IFC snapshot, hitting the in-process snapshot cache
+    /// where the file's `(canonical path, mtime, size)` already has
+    /// a parsed entry. On miss, reads + parses the file and inserts
+    /// the result into the cache so the next caller for the same
+    /// `(path, mtime, size)` is a sub-millisecond hit.
+    ///
+    /// Shared helper for [`Self::bim_attach_ifc`] (PR-L) and the
+    /// PR-T read-only IFC methods ([`Self::bim_export_ifc`],
+    /// [`Self::bim_validate`], [`Self::bim_diff`],
+    /// [`Self::bim_generate_schedule`]). Extracted because the
+    /// "canonicalise → cache lookup → read + parse → cache populate"
+    /// dance has to be byte-identical across the call sites: if any
+    /// of them used a different cache key or skipped the populate
+    /// step, the cache would stop fronting the multi-second STEP
+    /// parse for re-uses.
+    fn load_ifc_snapshot(
+        &self,
+        path: &str,
+    ) -> Result<(Arc<aec_bim::ifc::IfcSnapshot>, bool, String), BridgeServiceError> {
+        let canonical_buf = std::fs::canonicalize(Path::new(path))?;
+        let canonical = canonical_buf.to_string_lossy().into_owned();
+        let key_opt = SnapshotKey::from_canonical_path(&canonical_buf).ok();
+        if let Some(snap) = key_opt.as_ref().and_then(|k| self.snapshot_cache.get(k)) {
+            return Ok((snap, true, canonical));
+        }
+        let bytes = std::fs::read(&canonical_buf)?;
+        let body = String::from_utf8_lossy(&bytes).into_owned();
+        let snap = Arc::new(aec_bim::ifc::IfcReader::from_string(&body)?);
+        if let Some(key) = key_opt {
+            self.snapshot_cache.insert(key, Arc::clone(&snap));
+        }
+        Ok((snap, false, canonical))
+    }
+
+    /// Parse an `.ifc` file, re-serialise the resulting snapshot
+    /// back to STEP-21, and write the bytes to `out_path`. The
+    /// output is byte-identical to what [`Self::bim_attach_ifc`]'s
+    /// snapshot would write — both paths share
+    /// `IfcWriter::to_string_with_materials`.
+    ///
+    /// Useful as a normalise-and-emit step (parse vendor IFC →
+    /// AEC-Studio canonical form → write), for round-trip fidelity
+    /// validation, and for producing golden files for the regression
+    /// suite. The renderer's "Export BIM" button invokes this to
+    /// re-emit the active project's source IFC after edits land via
+    /// the future PR-T.5 / PR-U write methods.
+    ///
+    /// Routes through `with_service_ref_fallible` (read-only) so a
+    /// long IFC parse / write doesn't block status polls. The
+    /// in-process snapshot cache fronts repeated calls against the
+    /// same source file.
+    pub fn bim_export_ifc(
+        &self,
+        ifc_path: &str,
+        out_path: &str,
+    ) -> Result<BimExportIfcSummary, BridgeServiceError> {
+        let (snapshot, parse_cache_hit, canonical_source) = self.load_ifc_snapshot(ifc_path)?;
+        let body = aec_bim::ifc::IfcWriter::to_string_with_materials(
+            &snapshot.project,
+            &snapshot.classification,
+            &snapshot.properties,
+            &snapshot.materials,
+        );
+        let bytes = body.as_bytes();
+        let bytes_written = bytes.len() as u64;
+        std::fs::write(Path::new(out_path), bytes)?;
+        // Canonicalise post-write so the renderer can dedup pick
+        // → export sequences across non-canonical inputs (`./out.ifc`
+        // vs absolute). Mirrors `BimImportSummary::path` rules.
+        let canonical_out = std::fs::canonicalize(Path::new(out_path))?
+            .to_string_lossy()
+            .into_owned();
+        Ok(BimExportIfcSummary {
+            source_path: canonical_source,
+            out_path: canonical_out,
+            schema: snapshot.schema.to_string(),
+            bytes_written,
+            parse_cache_hit,
+        })
+    }
+
+    /// Parse an `.ifc` file and run the BIM rule-based validator
+    /// against the resulting snapshot. Returns the full set of
+    /// findings split by severity (errors / warnings / infos).
+    ///
+    /// The relations side of the validator (dangling aggregate /
+    /// containment refs) is run with an empty `RelationStore`
+    /// because the IFC reader folds spatial relationships directly
+    /// into `Project.nodes[*].elements` rather than producing a
+    /// standalone `RelationStore`. The remaining checks
+    /// (missing-classifications, duplicate-GUIDs, required-Psets,
+    /// orphan-elements) operate on the snapshot's stores directly
+    /// and produce real findings.
+    ///
+    /// Routes through `with_service_ref_fallible` (read-only).
+    pub fn bim_validate(&self, ifc_path: &str) -> Result<BimValidateReport, BridgeServiceError> {
+        let (snapshot, parse_cache_hit, canonical_source) = self.load_ifc_snapshot(ifc_path)?;
+        let relations = aec_bim::RelationStore::new();
+        let report = aec_bim::validation::validate_project(
+            &snapshot.project,
+            &snapshot.classification,
+            &snapshot.properties,
+            &relations,
+        );
+        let to_finding = |f: &aec_bim::validation::ValidationFinding| BimValidationFinding {
+            severity: match f.severity {
+                aec_bim::validation::ValidationSeverity::Error => "error".into(),
+                aec_bim::validation::ValidationSeverity::Warning => "warning".into(),
+                aec_bim::validation::ValidationSeverity::Info => "info".into(),
+            },
+            code: f.code.clone(),
+            element: f.element.as_ref().map(ToString::to_string),
+            description: f.description.clone(),
+            suggestion: f.suggestion.clone(),
+        };
+        let mut errors = Vec::new();
+        let mut warnings = Vec::new();
+        let mut infos = Vec::new();
+        for f in &report.findings {
+            match f.severity {
+                aec_bim::validation::ValidationSeverity::Error => errors.push(to_finding(f)),
+                aec_bim::validation::ValidationSeverity::Warning => warnings.push(to_finding(f)),
+                aec_bim::validation::ValidationSeverity::Info => infos.push(to_finding(f)),
+            }
+        }
+        Ok(BimValidateReport {
+            ok: errors.is_empty(),
+            source_path: canonical_source,
+            schema: snapshot.schema.to_string(),
+            errors,
+            warnings,
+            infos,
+            parse_cache_hit,
+        })
+    }
+
+    /// Parse two `.ifc` files (independently snapshot-cache fronted)
+    /// and run `aec_bim::diff::diff_projects` to produce an element-
+    /// level diff: added GUIDs, removed GUIDs, modified elements
+    /// (class changes, name changes, property deltas).
+    ///
+    /// `diff_id` is *input*-addressed: BLAKE3 hash of the canonical
+    /// (before, after) path pair — **not** the file bytes. Same
+    /// inputs → same id even if the files change, so the renderer
+    /// can dedup repeated diffs and cache rendered views.
+    /// Content-aware invalidation happens one layer down in the
+    /// snapshot cache (keyed on `(canonical_path, mtime, size)`).
+    ///
+    /// Routes through `with_service_ref_fallible` (read-only). Both
+    /// parses can hit the snapshot cache independently, so a diff
+    /// of `(before, after)` followed by a diff of `(before, other)`
+    /// re-uses the parsed `before` snapshot.
+    pub fn bim_diff(
+        &self,
+        before_path: &str,
+        after_path: &str,
+    ) -> Result<BimDiffSummary, BridgeServiceError> {
+        let (before_snap, before_cache_hit, canonical_before) =
+            self.load_ifc_snapshot(before_path)?;
+        let (after_snap, after_cache_hit, canonical_after) = self.load_ifc_snapshot(after_path)?;
+        let proj_diff = aec_bim::diff::diff_projects(
+            &before_snap.project,
+            &before_snap.classification,
+            &before_snap.properties,
+            &after_snap.project,
+            &after_snap.classification,
+            &after_snap.properties,
+        );
+        let property_delta_to_change = |d: &aec_bim::diff::PropertyDelta| BimDiffPropertyChange {
+            pset: d.pset.clone(),
+            key: d.key.clone(),
+            before: d
+                .before
+                .as_ref()
+                .and_then(|v| serde_json::to_string(v).ok()),
+            after: d.after.as_ref().and_then(|v| serde_json::to_string(v).ok()),
+        };
+        let modified = proj_diff
+            .modified
+            .iter()
+            .map(|m| BimDiffElementChange {
+                key: m.key.clone(),
+                class_before: m.class_changed.as_ref().map(|(b, _)| b.clone()),
+                class_after: m.class_changed.as_ref().map(|(_, a)| a.clone()),
+                name_before: m.name_changed.as_ref().map(|(b, _)| b.clone()),
+                name_after: m.name_changed.as_ref().map(|(_, a)| a.clone()),
+                property_deltas: m
+                    .property_deltas
+                    .iter()
+                    .map(property_delta_to_change)
+                    .collect(),
+            })
+            .collect();
+        // Content-addressed id: hash of (canonical before, canonical
+        // after). Stable across calls so the renderer can cache
+        // rendered diff views without server round-trips.
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(canonical_before.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(canonical_after.as_bytes());
+        let diff_id = format!("diff_blake3_{}", &hasher.finalize().to_hex().as_str()[..16]);
+        Ok(BimDiffSummary {
+            diff_id,
+            before_path: canonical_before,
+            after_path: canonical_after,
+            before_schema: before_snap.schema.to_string(),
+            after_schema: after_snap.schema.to_string(),
+            added: proj_diff.added,
+            removed: proj_diff.removed,
+            modified,
+            before_cache_hit,
+            after_cache_hit,
+        })
+    }
+
+    /// Parse an `.ifc` file and generate one of the four supported
+    /// schedules (`door` / `window` / `room` / `material`),
+    /// writing the result to `out_path` as an XLSX workbook via
+    /// `ScheduleSheet::write_xlsx`.
+    ///
+    /// `schedule_id` is *input*-addressed: BLAKE3 hash of `(kind,
+    /// canonical source path)` — **not** the file bytes. Same
+    /// inputs → same id even if the source file changes. Content-
+    /// aware invalidation happens one layer down in the snapshot
+    /// cache (keyed on `(canonical_path, mtime, size)`).
+    ///
+    /// Routes through `with_service_ref_fallible` (read-only). The
+    /// IFC parse is snapshot-cache fronted; the schedule generators
+    /// are pure functions over the parsed stores.
+    pub fn bim_generate_schedule(
+        &self,
+        ifc_path: &str,
+        kind: &str,
+        out_path: &str,
+    ) -> Result<BimScheduleSummary, BridgeServiceError> {
+        let (snapshot, parse_cache_hit, canonical_source) = self.load_ifc_snapshot(ifc_path)?;
+        // Build the schedule sheet for the requested kind. Each
+        // generator returns `(Vec<Entry>, ScheduleSheet)`; we only
+        // need the sheet for the XLSX write + row/column counts.
+        // Unknown `kind` is a hard `Bim` error so the renderer
+        // surfaces the typo rather than silently producing an empty
+        // workbook.
+        let sheet = match kind {
+            "door" => {
+                aec_bim::schedules::generate_door_schedule(
+                    &snapshot.classification,
+                    &snapshot.properties,
+                )
+                .1
+            }
+            "window" => {
+                aec_bim::schedules::generate_window_schedule(
+                    &snapshot.classification,
+                    &snapshot.properties,
+                )
+                .1
+            }
+            "room" => {
+                aec_bim::schedules::generate_room_schedule(&snapshot.project, &snapshot.properties)
+                    .1
+            }
+            "material" => {
+                aec_bim::schedules::generate_material_schedule(
+                    &snapshot.classification,
+                    &snapshot.properties,
+                )
+                .1
+            }
+            other => {
+                return Err(BridgeServiceError::Bim(format!(
+                    "bim_generate_schedule: unknown schedule kind '{other}' \
+                     (expected door / window / room / material)"
+                )));
+            }
+        };
+        let rows = sheet.rows.len() as u32;
+        let columns = sheet.columns.len() as u32;
+        sheet
+            .write_xlsx(Path::new(out_path))
+            .map_err(|e| BridgeServiceError::Bim(format!("xlsx: {e}")))?;
+        let bytes_written = std::fs::metadata(Path::new(out_path))?.len();
+        let canonical_out = std::fs::canonicalize(Path::new(out_path))?
+            .to_string_lossy()
+            .into_owned();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(kind.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(canonical_source.as_bytes());
+        let schedule_id = format!(
+            "sched_blake3_{}",
+            &hasher.finalize().to_hex().as_str()[..16]
+        );
+        Ok(BimScheduleSummary {
+            schedule_id,
+            kind: kind.to_owned(),
+            source_path: canonical_source,
+            out_path: canonical_out,
+            rows,
+            columns,
+            bytes_written,
+            parse_cache_hit,
         })
     }
 

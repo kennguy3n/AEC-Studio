@@ -180,12 +180,53 @@ export function rendererInProcessBackend(): AecApi {
         relationsInserted: 0,
         cacheRows: 0,
       }),
-      exportIfc: async (p) => ({ exported: true, path: p }),
+      // PR-T read-only BIM ops. These mirror the electron-side
+      // in-process backend in `electron/bridge.ts` 1:1 (same field
+      // names, same zero-finding payloads) so vitest sees the
+      // exact same shape the real bridge would produce in dev
+      // mode. They intentionally do NOT touch the filesystem
+      // (unlike the electron-side stubs, which write a placeholder
+      // file) — the renderer runs in jsdom and has no `fs`.
+      exportIfc: async (params) => ({
+        sourcePath: params.sourcePath,
+        outPath: params.outPath,
+        schema: "IFC4",
+        bytesWritten: 0,
+        parseCacheHit: false,
+      }),
       classify: async () => ({ classified: 0 }),
       setProperty: async () => ({ ok: true }),
-      generateSchedule: async () => ({ scheduleId: newId("sched") }),
-      validate: async () => ({ ok: true, errors: [], warnings: [] }),
-      diff: async () => ({ diffId: newId("diff") }),
+      generateSchedule: async (params) => ({
+        scheduleId: newId("sched"),
+        kind: params.kind,
+        sourcePath: params.sourcePath,
+        outPath: params.outPath,
+        rows: 0,
+        columns: 0,
+        bytesWritten: 0,
+        parseCacheHit: false,
+      }),
+      validate: async (params) => ({
+        ok: true,
+        sourcePath: params.sourcePath,
+        schema: "IFC4",
+        errors: [],
+        warnings: [],
+        infos: [],
+        parseCacheHit: false,
+      }),
+      diff: async (params) => ({
+        diffId: newId("diff"),
+        beforePath: params.beforePath,
+        afterPath: params.afterPath,
+        beforeSchema: "IFC4",
+        afterSchema: "IFC4",
+        added: [],
+        removed: [],
+        modified: [],
+        beforeCacheHit: false,
+        afterCacheHit: false,
+      }),
     },
     render: {
       enqueueRender: async () => ({ jobId: newId("job") }),

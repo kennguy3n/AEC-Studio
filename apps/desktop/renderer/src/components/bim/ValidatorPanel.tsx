@@ -12,27 +12,55 @@ export interface ValidationFinding {
 }
 
 interface Props {
+  /** IFC path to validate when "Re-validate" is clicked. */
+  sourcePath: string;
   findings: ValidationFinding[];
   onFindings: (next: ValidationFinding[]) => void;
   onZoomTo?: (entityId: string) => void;
 }
 
-export function ValidatorPanel({ findings, onFindings, onZoomTo }: Props) {
+/**
+ * Convert a wire-format `BimValidationFinding` (from the bridge) to
+ * the renderer-internal `ValidationFinding` shape. The wire format
+ * uses `description` / `element` / `suggestion` (matching the
+ * Rust service struct); the renderer uses the more user-facing
+ * `message` / `entityId` / `hint`.
+ */
+function adapt(
+  f: {
+    severity: ValidationSeverity;
+    code: string;
+    element: string | null;
+    description: string;
+    suggestion: string | null;
+  },
+  severity: ValidationSeverity,
+): ValidationFinding {
+  return {
+    code: f.code,
+    severity,
+    message: f.description,
+    entityId: f.element,
+    hint: f.suggestion,
+  };
+}
+
+export function ValidatorPanel({
+  sourcePath,
+  findings,
+  onFindings,
+  onZoomTo,
+}: Props) {
   const [busy, setBusy] = useState(false);
 
   const revalidate = async () => {
     setBusy(true);
     try {
-      const result = (await aec.bim.validate()) as {
-        ok: boolean;
-        errors: ValidationFinding[];
-        warnings: ValidationFinding[];
-        info?: ValidationFinding[];
-      };
+      const result = await aec.bim.validate({ sourcePath });
       const merged: ValidationFinding[] = [
-        ...(result.errors ?? []).map((f) => ({ ...f, severity: "error" as const })),
-        ...(result.warnings ?? []).map((f) => ({ ...f, severity: "warning" as const })),
-        ...(result.info ?? []).map((f) => ({ ...f, severity: "info" as const })),
+        ...result.errors.map((f) => adapt(f, "error")),
+        ...result.warnings.map((f) => adapt(f, "warning")),
+        ...result.infos.map((f) => adapt(f, "info")),
       ];
       onFindings(merged);
     } finally {

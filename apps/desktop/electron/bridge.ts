@@ -174,12 +174,66 @@ export interface BridgeBackend {
    * free (reported as `parseCacheHit: true`).
    */
   bimAttachIfc(projectPath: string, ifcPath: string): Promise<BimAttachSummary>;
-  bimExportIfc(path: string): Promise<{ exported: true; path: string }>;
+  /**
+   * Parse an IFC file, re-serialise the resulting snapshot back to
+   * STEP-21, and write the bytes to `outPath`. The output is byte-
+   * identical to what `bimAttachIfc`'s snapshot would write — both
+   * paths share `IfcWriter::to_string_with_materials`. Useful as a
+   * normalise-and-emit pipeline (vendor IFC → AEC-Studio canonical
+   * form → write) and as round-trip fidelity validation.
+   *
+   * The shape mirrors `BimExportIfcSummaryJs` in
+   * `crates/aec_bridge/src/napi_api.rs` 1:1.
+   */
+  bimExportIfc(params: {
+    sourcePath: string;
+    outPath: string;
+  }): Promise<BimExportIfcSummary>;
   bimClassify(params: Record<string, unknown>): Promise<{ classified: number }>;
   bimSetProperty(params: Record<string, unknown>): Promise<{ ok: true }>;
-  bimGenerateSchedule(params: Record<string, unknown>): Promise<{ scheduleId: string }>;
-  bimValidate(): Promise<{ ok: boolean; errors: unknown[]; warnings: unknown[] }>;
-  bimDiff(params: Record<string, unknown>): Promise<{ diffId: string }>;
+  /**
+   * Parse an IFC file and generate one of the four supported
+   * schedules (`"door"` / `"window"` / `"room"` / `"material"`),
+   * writing the result to `outPath` as an XLSX workbook via
+   * `ScheduleSheet::write_xlsx`.
+   *
+   * The shape mirrors `BimScheduleSummaryJs` in
+   * `crates/aec_bridge/src/napi_api.rs` 1:1.
+   */
+  bimGenerateSchedule(params: {
+    sourcePath: string;
+    kind: "door" | "window" | "room" | "material";
+    outPath: string;
+  }): Promise<BimScheduleSummary>;
+  /**
+   * Parse an IFC file and run the rule-based BIM validator against
+   * the resulting snapshot. Findings are split by severity (errors
+   * / warnings / infos) so the renderer's three-panel view can
+   * render directly.
+   *
+   * The shape mirrors `BimValidateReportJs` in
+   * `crates/aec_bridge/src/napi_api.rs` 1:1.
+   */
+  bimValidate(params: { sourcePath: string }): Promise<BimValidateReport>;
+  /**
+   * Parse two IFC files and run `aec_bim::diff::diff_projects` to
+   * produce an element-level diff. `diffId` is *input*-addressed
+   * (BLAKE3 of the canonical `(before, after)` path pair, **not**
+   * the file bytes) so the same path pair always produces the same
+   * id even if the underlying files change between calls. The
+   * snapshot cache one layer down keys on `(canonical_path, mtime,
+   * size)` and is what re-parses when a file actually changes —
+   * renderer-side caches keyed on `diffId` should either include
+   * `parseCacheHit` / `beforeCacheHit` / `afterCacheHit` in their
+   * own cache key, or invalidate on file-watcher events.
+   *
+   * The shape mirrors `BimDiffSummaryJs` in
+   * `crates/aec_bridge/src/napi_api.rs` 1:1.
+   */
+  bimDiff(params: {
+    beforePath: string;
+    afterPath: string;
+  }): Promise<BimDiffSummary>;
 
   renderEnqueue(params: Record<string, unknown>): Promise<{ jobId: string }>;
   renderEnqueueBatch(params: {
@@ -595,6 +649,132 @@ export interface BimAttachSummary {
 }
 
 /**
+ * Post-export summary. Field-for-field mirror of
+ * `BimExportIfcSummaryJs` in `crates/aec_bridge/src/napi_api.rs`.
+ * The bridge re-serialises the parsed snapshot back to STEP-21
+ * via `IfcWriter::to_string_with_materials` — same writer the
+ * `bimAttachIfc` path uses, so the output is byte-identical to
+ * what `bimAttachIfc` would produce.
+ */
+export interface BimExportIfcSummary {
+  sourcePath: string;
+  outPath: string;
+  schema: string;
+  bytesWritten: number;
+  /** `true` if the input snapshot came from the in-process cache. */
+  parseCacheHit: boolean;
+}
+
+/**
+ * One finding from `bimValidate`. Field-for-field mirror of
+ * `BimValidationFindingJs` in `crates/aec_bridge/src/napi_api.rs`.
+ * `severity` is `"error"` / `"warning"` / `"info"` (lowercase) so
+ * the renderer can use it as a CSS class suffix.
+ */
+export interface BimValidationFinding {
+  severity: "error" | "warning" | "info";
+  code: string;
+  element: string | null;
+  description: string;
+  suggestion: string | null;
+}
+
+/**
+ * Validation report from `bimValidate`. Field-for-field mirror of
+ * `BimValidateReportJs` in `crates/aec_bridge/src/napi_api.rs`.
+ * Findings are pre-split into three vectors so the renderer's
+ * three-panel view can render directly.
+ */
+export interface BimValidateReport {
+  /** `true` when there are zero `error`-severity findings. */
+  ok: boolean;
+  sourcePath: string;
+  schema: string;
+  errors: BimValidationFinding[];
+  warnings: BimValidationFinding[];
+  infos: BimValidationFinding[];
+  parseCacheHit: boolean;
+}
+
+/**
+ * Property-level delta inside a `BimDiffElementChange`. `before` /
+ * `after` are JSON-stringified `PropertyValue` (the renderer
+ * parses them with `JSON.parse` on display). One side being `null`
+ * means the property was added (`before = null`) or removed
+ * (`after = null`).
+ */
+export interface BimDiffPropertyChange {
+  pset: string;
+  key: string;
+  before: string | null;
+  after: string | null;
+}
+
+/**
+ * Element-level change inside `BimDiffSummary.modified`. The
+ * `key` is the join key built by `aec_bim::diff` — GUID first,
+ * falling back to `class:name`. Field-for-field mirror of
+ * `BimDiffElementChangeJs` in `crates/aec_bridge/src/napi_api.rs`.
+ */
+export interface BimDiffElementChange {
+  key: string;
+  classBefore: string | null;
+  classAfter: string | null;
+  nameBefore: string | null;
+  nameAfter: string | null;
+  propertyDeltas: BimDiffPropertyChange[];
+}
+
+/**
+ * Diff summary from `bimDiff`. Field-for-field mirror of
+ * `BimDiffSummaryJs` in `crates/aec_bridge/src/napi_api.rs`.
+ * `diffId` is *input*-addressed (BLAKE3 of the canonical
+ * `(before, after)` path pair, **not** the file bytes), so the
+ * same path pair always produces the same id even if the
+ * underlying files change. Renderer-side view caches keyed on
+ * `diffId` should either include the per-side cache-hit flags in
+ * their own cache key, or invalidate on file-watcher events.
+ * Content-aware invalidation happens one layer down in the
+ * snapshot cache (keyed on `(canonical_path, mtime, size)`).
+ */
+export interface BimDiffSummary {
+  diffId: string;
+  beforePath: string;
+  afterPath: string;
+  beforeSchema: string;
+  afterSchema: string;
+  added: string[];
+  removed: string[];
+  modified: BimDiffElementChange[];
+  beforeCacheHit: boolean;
+  afterCacheHit: boolean;
+}
+
+/**
+ * Schedule summary from `bimGenerateSchedule`. Field-for-field
+ * mirror of `BimScheduleSummaryJs` in
+ * `crates/aec_bridge/src/napi_api.rs`. `scheduleId` is *input*-
+ * addressed (BLAKE3 of `(kind, canonical sourcePath)`, **not**
+ * the file bytes), so the same `(kind, sourcePath)` pair always
+ * produces the same id even if the underlying IFC changes.
+ * Renderer-side view caches keyed on `scheduleId` should either
+ * include `parseCacheHit` in their cache key, or invalidate on
+ * file-watcher events. Content-aware invalidation happens one
+ * layer down in the snapshot cache (keyed on `(canonical_path,
+ * mtime, size)`).
+ */
+export interface BimScheduleSummary {
+  scheduleId: string;
+  kind: "door" | "window" | "room" | "material";
+  sourcePath: string;
+  outPath: string;
+  rows: number;
+  columns: number;
+  bytesWritten: number;
+  parseCacheHit: boolean;
+}
+
+/**
  * Engine status for the renderer's status pane. Field-for-field
  * mirror of `EngineStatusJs` in
  * `crates/aec_bridge/src/napi_api.rs::EngineStatusJs`. Drift between
@@ -802,6 +982,15 @@ interface NativeApi {
   export_gltf(params: Record<string, unknown>): unknown;
   export_build_proposal_pack(params: Record<string, unknown>): unknown;
   deliver_build_pack(params: Record<string, unknown>): unknown;
+  // Read-only BIM operations wired in PR-T. All four operate on
+  // standalone IFC files, route through the snapshot cache
+  // populated by `bimImportIfc` / `bimAttachIfc`, and return
+  // structured summaries the renderer's BIM panels can render
+  // directly (no opaque `{ scheduleId: string }` placeholder).
+  bim_export_ifc(ifc_path: string, out_path: string): unknown;
+  bim_validate(ifc_path: string): unknown;
+  bim_diff(before_path: string, after_path: string): unknown;
+  bim_generate_schedule(ifc_path: string, kind: string, out_path: string): unknown;
 }
 
 /**
@@ -824,9 +1013,7 @@ export const NATIVE_WIRED_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   "projectAuditSync",
   // BIM domain wired in PR-P. `bimImportIfc` / `bimAttachIfc` /
   // `bimCheckFileSize` all delegate to real `#[napi]` exports in
-  // `crates/aec_bridge/src/napi_api.rs`. The remaining `bim*`
-  // methods (`bimExportIfc`, `bimClassify`, ...) stay in the
-  // fallback list pending their own follow-up napi exports.
+  // `crates/aec_bridge/src/napi_api.rs`.
   "bimImportIfc",
   "bimCheckFileSize",
   "bimAttachIfc",
@@ -865,6 +1052,15 @@ export const NATIVE_WIRED_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   "exportGltf",
   "exportBuildProposalPack",
   "deliverBuildPack",
+  // Read-only BIM operations wired in PR-T. All four operate on
+  // standalone IFC files, route through the snapshot cache
+  // populated by `bimImportIfc` / `bimAttachIfc`, and return
+  // structured summaries the renderer's BIM panels can render
+  // directly (no opaque `{ scheduleId: string }` placeholder).
+  "bimExportIfc",
+  "bimValidate",
+  "bimDiff",
+  "bimGenerateSchedule",
 ];
 
 /**
@@ -892,12 +1088,8 @@ export const NATIVE_FALLBACK_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   "draftSetLayerState",
   "draftImportDxf",
   "draftExportDxf",
-  "bimExportIfc",
   "bimClassify",
   "bimSetProperty",
-  "bimGenerateSchedule",
-  "bimValidate",
-  "bimDiff",
   "aiListTools",
   "aiPlan",
   "aiAcceptDiff",
@@ -1082,6 +1274,19 @@ function adaptNative(n: NativeApi): BridgeBackend {
       n.export_build_proposal_pack(params) as { outPath: string },
     deliverBuildPack: async (params) =>
       n.deliver_build_pack(params) as DeliverPackResult,
+    // ----- BIM read-only endpoints (PR-T) -----
+    bimExportIfc: async (params) =>
+      n.bim_export_ifc(params.sourcePath, params.outPath) as BimExportIfcSummary,
+    bimValidate: async (params) =>
+      n.bim_validate(params.sourcePath) as BimValidateReport,
+    bimDiff: async (params) =>
+      n.bim_diff(params.beforePath, params.afterPath) as BimDiffSummary,
+    bimGenerateSchedule: async (params) =>
+      n.bim_generate_schedule(
+        params.sourcePath,
+        params.kind,
+        params.outPath,
+      ) as BimScheduleSummary,
   };
   // Self-check: the two catalogues above must, together, reference every
   // method on the in-process backend. We throw rather than warn so a new
@@ -1272,8 +1477,43 @@ export function inProcessBackend(): BridgeBackend {
         cacheRows: 0,
       };
     },
-    async bimExportIfc(p) {
-      return { exported: true, path: p };
+    // In-process implementations for the four read-only BIM ops
+    // wired in PR-T. These mirror the napi service-layer
+    // semantics 1:1: parse the source IFC (via `aec_bim`'s
+    // pure-Rust reader, transpiled? — no, we don't have a JS IFC
+    // reader, so we shell out via a vitest fallback that
+    // exercises only the path-validation + summary-shape contract
+    // and returns realistic empty / zero-finding payloads).
+    //
+    // Concretely: in the vitest renderer-only path there is no
+    // .node artefact loaded, so these stubs are exercised by
+    // tests that check the renderer's parameter marshalling and
+    // result-shape narrowing — not the actual IFC parse pipeline
+    // (covered by `tests/bim_readonly_ops.rs`). The stubs validate
+    // their input paths exist on disk so a renderer that fat-
+    // fingers `sourcePath` gets the same `ENOENT` error in
+    // dev-mode that it would get from the native bridge.
+    async bimExportIfc(params) {
+      await fs.promises.access(params.sourcePath);
+      // Mirror the native: write a placeholder STEP envelope to
+      // `outPath` so downstream code that follows the export with
+      // a read sees a real (if minimal) file. The bytes match the
+      // ISO-10303-21 header structure even though they're an
+      // empty model — the renderer's "Export BIM" panel just
+      // checks the file exists and has a non-zero size.
+      const placeholder =
+        "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION(('AEC dev-mode placeholder'),'2;1');\n" +
+        "FILE_NAME('aec_studio.ifc','2026-05-20T00:00:00',('AEC Studio'),('Studio'),'AEC Studio','AEC Studio','');\n" +
+        "FILE_SCHEMA(('IFC4'));\nENDSEC;\nDATA;\nENDSEC;\nEND-ISO-10303-21;\n";
+      await fs.promises.writeFile(params.outPath, placeholder, "utf-8");
+      const stat = await fs.promises.stat(params.outPath);
+      return {
+        sourcePath: params.sourcePath,
+        outPath: params.outPath,
+        schema: "IFC4",
+        bytesWritten: stat.size,
+        parseCacheHit: false,
+      };
     },
     async bimClassify(_p) {
       return { classified: 0 };
@@ -1281,14 +1521,58 @@ export function inProcessBackend(): BridgeBackend {
     async bimSetProperty(_p) {
       return { ok: true };
     },
-    async bimGenerateSchedule(_p) {
-      return { scheduleId: id("sched") };
+    async bimGenerateSchedule(params) {
+      await fs.promises.access(params.sourcePath);
+      // Write a placeholder XLSX (zero-byte file is fine for the
+      // dev-mode stub; the renderer's status code just checks
+      // that the path appeared on disk). Realistic row / column
+      // counts mirror the schedule kinds in `aec_bim`:
+      // door = 8, window = 9, room = 7, material = 4.
+      await fs.promises.writeFile(params.outPath, "");
+      const columnsByKind: Record<typeof params.kind, number> = {
+        door: 8,
+        window: 9,
+        room: 7,
+        material: 4,
+      };
+      return {
+        scheduleId: id("sched"),
+        kind: params.kind,
+        sourcePath: params.sourcePath,
+        outPath: params.outPath,
+        rows: 0,
+        columns: columnsByKind[params.kind] ?? 0,
+        bytesWritten: 0,
+        parseCacheHit: false,
+      };
     },
-    async bimValidate() {
-      return { ok: true, errors: [], warnings: [] };
+    async bimValidate(params) {
+      await fs.promises.access(params.sourcePath);
+      return {
+        ok: true,
+        sourcePath: params.sourcePath,
+        schema: "IFC4",
+        errors: [],
+        warnings: [],
+        infos: [],
+        parseCacheHit: false,
+      };
     },
-    async bimDiff(_p) {
-      return { diffId: id("diff") };
+    async bimDiff(params) {
+      await fs.promises.access(params.beforePath);
+      await fs.promises.access(params.afterPath);
+      return {
+        diffId: id("diff"),
+        beforePath: params.beforePath,
+        afterPath: params.afterPath,
+        beforeSchema: "IFC4",
+        afterSchema: "IFC4",
+        added: [],
+        removed: [],
+        modified: [],
+        beforeCacheHit: false,
+        afterCacheHit: false,
+      };
     },
 
     async renderEnqueue(params) {
