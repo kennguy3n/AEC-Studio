@@ -1303,7 +1303,7 @@ function adaptNative(n: NativeApi): BridgeBackend {
         params.outPath,
       ) as BimScheduleSummary,
   };
-  // Self-check: the two catalogues above must, together, reference every
+  // Self-check 1: the two catalogues above must, together, reference every
   // method on the in-process backend. We throw rather than warn so a new
   // BridgeBackend method that is forgotten in the declarations fails
   // fast at bridge initialisation — instead of silently falling through
@@ -1320,6 +1320,38 @@ function adaptNative(n: NativeApi): BridgeBackend {
       `[aec_bridge] BridgeBackend method(s) ${JSON.stringify(missing)} not declared ` +
         `in NATIVE_WIRED_METHODS or NATIVE_FALLBACK_METHODS \u2014 update bridge.ts ` +
         `so every method has an explicit wired/fallback classification.`,
+    );
+  }
+  // Self-check 2 (symmetric to self-check 1): every method declared in
+  // `NATIVE_WIRED_METHODS` must have a matching native override in the
+  // `native` object literal above. Without this guard, a method listed
+  // as wired but missing its override would silently inherit the
+  // in-process implementation from the `...wrapped` spread — but the
+  // wrapper only adds the debug-logging trace for methods in the
+  // *fallback* set, so a missing wired override would degrade to the
+  // in-process impl with *no* trace, hiding the wiring gap. We throw
+  // for the same reason self-check 1 does: surfaces the mistake at
+  // bridge boot rather than at first call site.
+  const overridden = new Set<string>(Object.keys(native));
+  const wiredButMissingOverride = NATIVE_WIRED_METHODS.filter((key) => {
+    const overrideFn = (native as unknown as Record<string, unknown>)[key];
+    const baseFn = (base as unknown as Record<string, unknown>)[key];
+    // Method may be in `native` only because of the `...wrapped` spread.
+    // Treat the entry as a missing override if the function reference is
+    // identical to the in-process base function (i.e. no real override).
+    return !overridden.has(key) || overrideFn === baseFn;
+  });
+  if (
+    wiredButMissingOverride.length > 0 &&
+    process.env.AEC_BRIDGE_SKIP_SELFCHECK !== "1"
+  ) {
+    throw new Error(
+      `[aec_bridge] BridgeBackend method(s) ${JSON.stringify(
+        wiredButMissingOverride,
+      )} declared in NATIVE_WIRED_METHODS but missing a native override in ` +
+        `\`adaptNative\` \u2014 add the \`n.xxx(...)\` adapter so the method ` +
+        `actually routes through N-API instead of silently falling back to ` +
+        `the in-process implementation with no debug trace.`,
     );
   }
   return native;
