@@ -87,6 +87,7 @@ dependencies = [
  "aec_assets",
  "aec_audit",
  "aec_bim",
+ "aec_cad",
  "aec_command",
  "aec_core",
  "aec_export",

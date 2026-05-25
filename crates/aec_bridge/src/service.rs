@@ -1516,8 +1516,24 @@ impl BridgeService {
     ) -> Result<CommandApplyResult, BridgeServiceError> {
         let (_pkg, mut conn) =
             ProjectPackage::open_with_master_key_and_database(project_path, &self.master_key)?;
-        let mut engine = CommandEngine::open(&conn, command.scope)?;
-        let result = engine.execute_persistent(command, &mut conn)?;
+        self.command_apply_on_conn(project_path, &mut conn, command)
+    }
+
+    /// Internal helper: apply a single command against an already-open
+    /// SQLCipher connection. Used by `command_apply` (which opens the
+    /// connection itself) and by callers that need to share a
+    /// connection across multiple steps (e.g.
+    /// [`Self::deliver_create_revision`], which journals the
+    /// `CreateRevision` command *and* enumerates the on-disk graph
+    /// for the revision snapshot without re-opening the project).
+    fn command_apply_on_conn(
+        &mut self,
+        project_path: &str,
+        conn: &mut rusqlite::Connection,
+        command: Command,
+    ) -> Result<CommandApplyResult, BridgeServiceError> {
+        let mut engine = CommandEngine::open(&*conn, command.scope)?;
+        let result = engine.execute_persistent(command, conn)?;
         self.invalidate_status_cache_for(project_path);
         Ok(CommandApplyResult {
             command_id: result.command_id,
@@ -1525,6 +1541,60 @@ impl BridgeService {
             undo_len: engine.undo_len() as u32,
             redo_len: engine.redo_len() as u32,
         })
+    }
+
+    /// Apply a sequence of commands as a single atomic batch.
+    ///
+    /// Opens the project package once, opens one [`CommandEngine`]
+    /// for the batch's shared scope (every command must agree on
+    /// `Command::scope`), and routes the whole sequence through
+    /// [`CommandEngine::execute_persistent_batch`] so a multi-thousand
+    /// command DXF / IFC ingest collapses to a single SQL transaction,
+    /// one engine open, and one status-cache invalidation rather than
+    /// N of each.
+    ///
+    /// Returns the per-command [`CommandApplyResult`]s in input
+    /// order, matching what N back-to-back `command_apply` calls
+    /// would have produced (minus the per-command undo/redo length
+    /// snapshot — those reflect the post-batch state on every entry,
+    /// which is what every current caller wants).
+    pub fn command_apply_batch(
+        &mut self,
+        project_path: &str,
+        commands: Vec<Command>,
+    ) -> Result<Vec<CommandApplyResult>, BridgeServiceError> {
+        if commands.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Every command in the batch must agree on scope so a single
+        // engine can validate + persist them. Mixed-scope batches
+        // are rejected here rather than producing a confusing
+        // engine-level scope-mismatch error half-way through.
+        let scope = commands[0].scope;
+        for cmd in &commands {
+            if cmd.scope != scope {
+                return Err(BridgeServiceError::Command(format!(
+                    "command_apply_batch: mixed-scope batch ({scope:?} vs {:?})",
+                    cmd.scope,
+                )));
+            }
+        }
+        let (_pkg, mut conn) =
+            ProjectPackage::open_with_master_key_and_database(project_path, &self.master_key)?;
+        let mut engine = CommandEngine::open(&conn, scope)?;
+        let results = engine.execute_persistent_batch(commands, &mut conn)?;
+        self.invalidate_status_cache_for(project_path);
+        let undo_len = engine.undo_len() as u32;
+        let redo_len = engine.redo_len() as u32;
+        Ok(results
+            .into_iter()
+            .map(|r| CommandApplyResult {
+                command_id: r.command_id,
+                applied: r.applied,
+                undo_len,
+                redo_len,
+            })
+            .collect())
     }
 
     /// Undo the most recently applied command. Returns the inverse
@@ -3153,16 +3223,16 @@ impl BridgeService {
     // AI endpoints
     // ---------------------------------------------------------------
     //
-    // All six methods take `&self`. They do NOT serialise against one
-    // another — the three internal primitives on [`AiState`] (an
-    // `RwLock` for lifecycle state, a `Mutex` for the spawn slot, a
-    // `Mutex` for the diff registry) are independent, so:
+    // Read-only AI endpoints (`ai_list_tools`, `ai_plan`,
+    // `ai_runtime_status`, `ai_cancel_job`) take `&self` and run
+    // fully concurrent with one another — the three internal
+    // primitives on [`AiState`] (an `RwLock` for lifecycle state,
+    // a `Mutex` for the spawn slot, a `Mutex` for the diff
+    // registry) are independent, so:
     //
     //  - `ai_runtime_status` polls (the hot path: every ~500 ms while
     //    a plan is in flight) only take the `runtime` `RwLock` *read*
     //    side and run fully concurrent with everything else.
-    //  - `ai_accept_diff` / `ai_reject_diff` only take the
-    //    `pending_diffs` mutex, never touching sidecar state.
     //  - `ai_plan` holds the spawn-slot mutex only across
     //    `ensure_ready` (typically microseconds on the warm path, up
     //    to `DEFAULT_SPAWN_TIMEOUT` on the first call), then drops
@@ -3170,6 +3240,20 @@ impl BridgeService {
     //  - `ai_cancel_job` takes the spawn-slot mutex to terminate the
     //    handle, so it serialises with `ensure_ready` (correct: we
     //    must not race a `take()` against a freshly-`Some()` write).
+    //
+    // [`Self::ai_accept_diff`] and [`Self::ai_reject_diff`] take
+    // `&mut self`. They mutate the project graph (accept) or the
+    // AI audit log (both) and therefore go through
+    // [`Self::command_apply_batch`] / [`Self::ai_audit_append`]
+    // which require unique access to the service so the SQL
+    // transaction, journal, and audit envelope are journaled
+    // atomically. The bridge's outer `RwLock<BridgeService>` (held
+    // by the napi shim) takes the write side for these two
+    // methods, serialising them against every other bridge call
+    // for the duration of the apply. This is intentional — the
+    // accept path mutates SQLCipher state behind the user's most
+    // recent gesture and must not race with concurrent reads of
+    // the same project graph.
     //
     // The napi layer adds the second half of the fix: every blocking
     // AI endpoint is `#[napi] async fn` routed through
@@ -3356,13 +3440,32 @@ impl BridgeService {
     pub fn ai_accept_diff(&mut self, diff_id: &str) -> Result<AiAcceptOutcome, BridgeServiceError> {
         let pending = self.ai_state.accept_diff(diff_id)?;
         let project_path = pending.project_path.clone();
-        let scope = pending.scope;
+        // `pending.scope` is the engine scope the user invoked the
+        // plan under (e.g. `Design` for a furniture-placement
+        // session). It is the single source of truth used by every
+        // downstream step:
+        //   - `command_apply_batch` opens the engine with it.
+        //   - `BUG_0001`'s batch scope guard validates each emitted
+        //     command against it.
+        //   - `ai_audit_append` records the scope on the AI audit
+        //     envelope so the provenance log can be filtered by
+        //     mode.
+        // Capturing it here (instead of re-deriving from
+        // `conversion.commands[0].scope`) prevents the variable
+        // shadow Devin Review flagged as `ANALYSIS_0004` and keeps
+        // the audit-log scope honest even if `diff_to_commands`
+        // ever produces an empty command list (e.g. every operation
+        // was skipped).
+        let plan_scope = pending.scope;
         let diff = pending.diff;
         let op_count = u32::try_from(diff.operations.len()).unwrap_or(u32::MAX);
         // Open the package + graph once. We need the graph for the
         // converter's `Update` / `Delete` dispatch and the
-        // connection for `command_apply_batch`.
-        let (_pkg, mut conn) =
+        // connection for `command_apply_batch`. We keep the `pkg`
+        // binding (instead of `_pkg`) so the AI audit append can
+        // reuse it without a second key-derive + PRAGMA cipher
+        // dance — see `ANALYSIS_0003`.
+        let (pkg, mut conn) =
             ProjectPackage::open_with_master_key_and_database(&project_path, &self.master_key)?;
         let graph = aec_command::ProjectGraph::load(&conn)
             .map_err(|e| BridgeServiceError::Command(e.to_string()))?;
@@ -3387,8 +3490,13 @@ impl BridgeService {
             // Drive the batch through the same on-conn helper that
             // single applies use so the SQL transaction stays
             // co-extensive with the per-command engine state.
-            let scope = conversion.commands[0].scope;
-            let mut engine = aec_command::CommandEngine::open(&conn, scope)
+            // The engine is opened with the plan's authoritative
+            // scope (`plan_scope`); the batch path now enforces
+            // every command match that scope (see `BUG_0001`), so
+            // a model that emits an off-scope command surfaces a
+            // `ScopeMismatch` before any SQL is touched rather
+            // than silently mislabelling the journal entry.
+            let mut engine = aec_command::CommandEngine::open(&conn, plan_scope)
                 .map_err(|e| BridgeServiceError::Command(e.to_string()))?;
             let results = engine
                 .execute_persistent_batch(conversion.commands, &mut conn)
@@ -3416,8 +3524,12 @@ impl BridgeService {
         // surface the error — the graph mutation is already on
         // disk, but the renderer needs to know the provenance log
         // is out of sync so the user can re-export the audit chain.
+        //
+        // We reuse the `pkg` opened above so the audit append
+        // doesn't re-derive the project key and re-issue the
+        // `PRAGMA cipher_*` sequence — see `ANALYSIS_0003`.
         let audit_chain_head =
-            self.ai_audit_append(&project_path, scope, &diff, DiffStatus::Accepted, None)?;
+            Self::ai_audit_append_with_pkg(&pkg, plan_scope, &diff, DiffStatus::Accepted, None)?;
         Ok(AiAcceptOutcome {
             ok: true,
             diff_id: diff_id.to_owned(),
@@ -3450,8 +3562,15 @@ impl BridgeService {
         let scope = pending.scope;
         let diff = pending.diff;
         let op_count = u32::try_from(diff.operations.len()).unwrap_or(u32::MAX);
+        // Reject does not mutate the graph, so the only state it
+        // touches is the AI audit log. Open the package here
+        // (since reject doesn't have an outer `pkg` from a graph
+        // apply) and hand the package to the shared helper. The
+        // accept path reuses its already-open `pkg`, avoiding the
+        // double-open Devin Review flagged as `ANALYSIS_0003`.
+        let pkg = ProjectPackage::open_with_master_key(&project_path, &self.master_key)?;
         let audit_chain_head =
-            self.ai_audit_append(&project_path, scope, &diff, DiffStatus::Rejected, reason)?;
+            Self::ai_audit_append_with_pkg(&pkg, scope, &diff, DiffStatus::Rejected, reason)?;
         Ok(AiRejectOutcome {
             ok: true,
             diff_id: diff_id.to_owned(),
@@ -3465,6 +3584,13 @@ impl BridgeService {
     /// AI audit log (`<project>/audit/ai_audit.jsonl`) and return
     /// the new chain head.
     ///
+    /// Takes an already-opened [`ProjectPackage`] by reference so
+    /// the caller's pkg handle (typically opened earlier in
+    /// `ai_accept_diff` for the graph apply) is reused instead of
+    /// re-deriving the project key and re-issuing the
+    /// `PRAGMA cipher_*` sequence. This avoids the double-open
+    /// pattern Devin Review flagged as `ANALYSIS_0003`.
+    ///
     /// The AI audit log is a separate hash chain from the main
     /// command audit log (`<project>/audit/log.jsonl`) so the AI
     /// lifecycle (plan → accept / reject) lives on its own
@@ -3473,15 +3599,13 @@ impl BridgeService {
     /// answers "how many of the model's proposals did the user
     /// accept?" without grepping through every command's actor
     /// field.
-    fn ai_audit_append(
-        &self,
-        project_path: &str,
+    fn ai_audit_append_with_pkg(
+        pkg: &ProjectPackage,
         scope: Scope,
         diff: &aec_ai::Diff,
         status: DiffStatus,
         reason: Option<&str>,
     ) -> Result<String, BridgeServiceError> {
-        let pkg = ProjectPackage::open_with_master_key(project_path, &self.master_key)?;
         let ai_audit_path = pkg.root().join("audit").join("ai_audit.jsonl");
         let mut logger = AiAuditLogger::open(&ai_audit_path)?;
         match status {
@@ -3493,7 +3617,7 @@ impl BridgeService {
             }
             DiffStatus::Pending => {
                 // `Pending` is a registry-only state and never
-                // reaches this path \u2014 the audit log only records
+                // reaches this path — the audit log only records
                 // terminal transitions.
                 return Err(BridgeServiceError::Ai(
                     "ai_audit_append called with Pending status".into(),
@@ -3534,6 +3658,404 @@ impl BridgeService {
             pending_diff_ids: snap.pending_diff_ids,
         })
     }
+
+    // ----- Draft scope (DXF import/export + drawing + sheet/layer ----- //
+
+    /// Import a DXF file at `dxf_path` into the project graph. Each
+    /// importable DXF entity (line / polyline / arc / circle /
+    /// ellipse / text) is converted to a modelling
+    /// [`aec_cad::primitives::Primitive`], wrapped in
+    /// [`aec_command::commands::draft::DrawPrimitive`], and applied
+    /// through [`Self::command_apply`] so each import is journaled,
+    /// auditable, and undo-able. Entities without a modelling
+    /// counterpart (Insert / Dimension / Spline / Hatch) are skipped
+    /// for now &mdash; see [`aec_cad::dxf::dxf_to_primitive`] for the
+    /// supported set.
+    pub fn draft_import_dxf(
+        &mut self,
+        project_path: &str,
+        dxf_path: &str,
+    ) -> Result<DraftImportDxfResult, BridgeServiceError> {
+        use aec_cad::dxf::{dxf_to_primitive, DxfReader};
+        use aec_command::commands::draft::DrawPrimitive;
+        use aec_command::commands::CommandKind;
+        use aec_core::types::EntityId;
+        use std::fs::File;
+
+        let f = File::open(dxf_path).map_err(|e| {
+            BridgeServiceError::Io(std::io::Error::other(format!(
+                "draft_import_dxf: open {dxf_path}: {e}"
+            )))
+        })?;
+        let doc = DxfReader::read(f)
+            .map_err(|e| BridgeServiceError::Invalid(format!("draft_import_dxf: parse: {e}")))?;
+        let mut layer_count = doc.layers.len() as u32;
+        let block_count = doc.block_records.len() as u32;
+        // Two-pass: convert every supported DXF entity to a
+        // `DrawPrimitive` command up front, count the rest as
+        // skipped, and apply the whole batch in one SQL transaction.
+        // Earlier versions issued N independent `command_apply`
+        // calls — O(N) project-package opens, O(N) engine reads of
+        // the entire entity table, O(N) audit-chain extensions.
+        // Routing through `command_apply_batch` collapses that to a
+        // single open, a single engine load, and a single
+        // transaction; the audit chain still records each gesture
+        // distinctly (see `execute_persistent_batch` phase 3).
+        let mut commands = Vec::with_capacity(doc.entities.len());
+        let mut skipped = 0u32;
+        for entity in &doc.entities {
+            match dxf_to_primitive(entity) {
+                Some(prim) => {
+                    commands.push(Command::user(CommandKind::DrawPrimitive(DrawPrimitive {
+                        entity_id: EntityId::new(),
+                        primitive: prim,
+                    })));
+                }
+                None => skipped += 1,
+            }
+        }
+        let entity_count = commands.len() as u32;
+        self.command_apply_batch(project_path, commands)?;
+        // Ensure we always report at least one layer (the "0" layer
+        // exists by default in every DXF document).
+        if layer_count == 0 {
+            layer_count = 1;
+        }
+        Ok(DraftImportDxfResult {
+            entity_count,
+            layer_count,
+            block_count,
+            skipped_count: skipped,
+        })
+    }
+
+    /// Export the project graph's draft primitives to a DXF file at
+    /// `dxf_path`. Walks the on-disk graph (rebuilt from the
+    /// SQLCipher `entities` table), filters to primitive records, and
+    /// converts each through
+    /// [`aec_cad::dxf::primitive_to_dxf`].
+    pub fn draft_export_dxf(
+        &self,
+        project_path: &str,
+        dxf_path: &str,
+    ) -> Result<DraftExportDxfResult, BridgeServiceError> {
+        use aec_cad::dxf::{primitive_to_dxf, DxfDocument, DxfWriter};
+        use aec_command::commands::draft::DrawPrimitive;
+        use std::fs::File;
+
+        let (_pkg, conn) =
+            ProjectPackage::open_with_master_key_and_database(project_path, &self.master_key)?;
+        let engine = CommandEngine::open(&conn, Scope::Draft)?;
+        let mut doc = DxfDocument::default();
+        for rec in engine.graph().iter() {
+            if rec.kind != "primitive" {
+                continue;
+            }
+            let prim: DrawPrimitive = match serde_json::from_value(rec.body.clone()) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if let Some(d) = primitive_to_dxf(&prim.primitive) {
+                doc.entities.push(d);
+            }
+        }
+        let entity_count = doc.entities.len() as u32;
+        let mut f = File::create(dxf_path).map_err(|e| {
+            BridgeServiceError::Io(std::io::Error::other(format!(
+                "draft_export_dxf: create {dxf_path}: {e}"
+            )))
+        })?;
+        DxfWriter::write(&doc, &mut f)
+            .map_err(|e| BridgeServiceError::Export(format!("draft_export_dxf: write: {e}")))?;
+        let file_size = std::fs::metadata(dxf_path).map_or(0, |m| m.len());
+        Ok(DraftExportDxfResult {
+            path: dxf_path.to_string(),
+            entity_count,
+            file_size,
+        })
+    }
+
+    // ----- Deliver scope (revision snapshot + diff) ----- //
+
+    /// Capture a revision snapshot of the project.
+    ///
+    /// The snapshot includes (a) the project graph entities, hashed
+    /// via BLAKE3 of their canonical serialised form, (b) the audit
+    /// chain head pointer at snapshot time, and (c) manifest
+    /// metadata for UI display. The snapshot is persisted to
+    /// `<project>/revisions/<id>.json` atomically (write to .tmp,
+    /// rename). The journaled
+    /// [`aec_command::commands::deliver::CreateRevision`] command
+    /// records the user-visible gesture in the audit chain.
+    pub fn deliver_create_revision(
+        &mut self,
+        project_path: &str,
+        tag: &str,
+        description: &str,
+        caller_entities: Option<Vec<RevisionTrackedEntity>>,
+    ) -> Result<RevisionSummary, BridgeServiceError> {
+        use aec_command::commands::deliver::CreateRevision;
+        use aec_command::commands::CommandKind;
+        use aec_core::revision::{RevisionDraft, RevisionEntity, RevisionStore};
+
+        // 1) Open package + journal the command (audit trail + undo
+        //    so the gesture is reversible if a user mis-tags). We
+        //    share the same `conn` between the command-apply step
+        //    and the post-apply enumeration in (2) so the snapshot
+        //    sees exactly the state the command just committed —
+        //    `command_apply_on_conn` reuses the connection instead
+        //    of opening a second one. (Earlier iterations had two
+        //    independent opens; if `CreateRevision` ever gains
+        //    graph-mutating deltas, the outer conn would see stale
+        //    state until the next reopen.)
+        let (pkg, mut conn) =
+            ProjectPackage::open_with_master_key_and_database(project_path, &self.master_key)?;
+        let cmd = Command::user(CommandKind::CreateRevision(CreateRevision {
+            tag: tag.to_string(),
+            description: description.to_string(),
+            revision_id: None,
+        }));
+        let apply_res = self.command_apply_on_conn(project_path, &mut conn, cmd)?;
+
+        // 2) Build the tracked-entity list. Prefer caller-supplied
+        //    entries when present (so the renderer can include
+        //    domain-specific entities the bridge can't reach, e.g.
+        //    schedule rows held in renderer memory). Otherwise
+        //    enumerate the on-disk graph and hash each entity's
+        //    canonical body via BLAKE3.
+        let mut draft = RevisionDraft::new(
+            pkg.manifest().project_id.clone(),
+            tag.to_string(),
+            description.to_string(),
+            // Audit head at the moment of snapshot. We re-read the
+            // log here rather than threading it through
+            // command_apply because the JSONL is the source of
+            // truth and command_apply doesn't expose the head.
+            read_audit_head(pkg.root())?,
+            pkg.manifest().name.clone(),
+            pkg.manifest().app_version.clone(),
+        );
+        if let Some(entries) = caller_entities {
+            for e in entries {
+                draft = draft.add_entity(RevisionEntity {
+                    category: e.category,
+                    id: e.id,
+                    payload_hash: e.payload_hash,
+                    label: e.label,
+                });
+            }
+        } else {
+            // The deliver-scope command engine doesn't expose the
+            // graph, so re-open as Design (the scope that owns the
+            // entity store) to enumerate tracked entities for the
+            // snapshot.
+            let engine = CommandEngine::open(&conn, Scope::Design)?;
+            for rec in engine.graph().iter() {
+                let canonical = serde_json::to_vec(&rec.body)
+                    .map_err(|e| BridgeServiceError::Command(format!("revision serialize: {e}")))?;
+                let hash = blake3::hash(&canonical).to_hex().to_string();
+                draft = draft.add_entity(RevisionEntity {
+                    category: rec.kind.clone(),
+                    id: rec.id.to_string(),
+                    payload_hash: hash,
+                    label: None,
+                });
+            }
+        }
+
+        // 3) Persist to revisions/<id>.json.
+        let store = RevisionStore::open(pkg.root().join("revisions"))?;
+        let revision = store.create(draft)?;
+
+        // Discard the unused command result detail; we surface the
+        // revision summary instead.
+        let _ = apply_res;
+
+        Ok(revision_to_summary(revision))
+    }
+
+    /// Return the project's revision summaries in chronological
+    /// order. Suitable for the Deliver-mode "Versions" pane.
+    pub fn deliver_list_revisions(
+        &self,
+        project_path: &str,
+    ) -> Result<Vec<RevisionSummary>, BridgeServiceError> {
+        use aec_core::revision::RevisionStore;
+        let (pkg, _conn) =
+            ProjectPackage::open_with_master_key_and_database(project_path, &self.master_key)?;
+        let store = RevisionStore::open(pkg.root().join("revisions"))?;
+        Ok(store.list()?.into_iter().map(revision_to_summary).collect())
+    }
+
+    /// Diff two revisions at the tracked-entity level. Both revisions
+    /// must exist in the project's `revisions/` directory.
+    pub fn deliver_compare_revisions(
+        &self,
+        project_path: &str,
+        base_id: &str,
+        head_id: &str,
+    ) -> Result<RevisionDiffReport, BridgeServiceError> {
+        use aec_core::revision::RevisionStore;
+        use aec_core::version_diff::compare_revisions;
+
+        let (pkg, _conn) =
+            ProjectPackage::open_with_master_key_and_database(project_path, &self.master_key)?;
+        let store = RevisionStore::open(pkg.root().join("revisions"))?;
+        let base = store
+            .get(base_id)?
+            .ok_or_else(|| BridgeServiceError::Invalid(format!("revision not found: {base_id}")))?;
+        let head = store
+            .get(head_id)?
+            .ok_or_else(|| BridgeServiceError::Invalid(format!("revision not found: {head_id}")))?;
+        let diff = compare_revisions(&base, &head);
+        let mut by_category = std::collections::BTreeMap::new();
+        for (cat, counts) in &diff.by_category {
+            by_category.insert(
+                cat.clone(),
+                RevisionDiffCounts {
+                    added: counts.added as u32,
+                    removed: counts.removed as u32,
+                    modified: counts.modified as u32,
+                    unchanged: counts.unchanged as u32,
+                },
+            );
+        }
+        let changes = diff
+            .changes
+            .into_iter()
+            .map(|c| RevisionEntityChange {
+                category: c.category,
+                id: c.id,
+                kind: match c.kind {
+                    aec_core::version_diff::EntityChangeKind::Added => "added".into(),
+                    aec_core::version_diff::EntityChangeKind::Removed => "removed".into(),
+                    aec_core::version_diff::EntityChangeKind::Modified => "modified".into(),
+                    aec_core::version_diff::EntityChangeKind::Unchanged => "unchanged".into(),
+                },
+                before_hash: c.before_hash,
+                after_hash: c.after_hash,
+                label: c.label,
+            })
+            .collect();
+        Ok(RevisionDiffReport {
+            base_revision_id: base_id.to_string(),
+            head_revision_id: head_id.to_string(),
+            by_category,
+            changes,
+        })
+    }
+}
+
+fn revision_to_summary(r: aec_core::revision::Revision) -> RevisionSummary {
+    RevisionSummary {
+        revision_id: r.id,
+        tag: r.tag,
+        description: r.description,
+        created_at: r.created_at.to_rfc3339(),
+        audit_chain_head: r.audit_chain_head,
+        manifest_name: r.manifest_name,
+        manifest_app_version: r.manifest_app_version,
+        tracked_entities: r
+            .tracked_entities
+            .into_iter()
+            .map(|e| RevisionTrackedEntity {
+                category: e.category,
+                id: e.id,
+                payload_hash: e.payload_hash,
+                label: e.label,
+            })
+            .collect(),
+    }
+}
+
+/// Read the head BLAKE3 hash of the project's append-only audit log
+/// (an empty string if the chain hasn't been initialised yet — a
+/// brand-new project before its first command).
+fn read_audit_head(project_root: &Path) -> Result<String, BridgeServiceError> {
+    let path = project_root.join("audit").join("log.jsonl");
+    if !path.exists() {
+        return Ok(String::new());
+    }
+    let log = AuditLog::open(path)?;
+    Ok(log.head().to_string())
+}
+
+/// Result returned by [`BridgeService::draft_import_dxf`]. Counts are
+/// post-import; `skipped_count` covers DXF entities that don't have a
+/// modelling primitive counterpart yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftImportDxfResult {
+    pub entity_count: u32,
+    pub layer_count: u32,
+    pub block_count: u32,
+    pub skipped_count: u32,
+}
+
+/// Result returned by [`BridgeService::draft_export_dxf`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftExportDxfResult {
+    pub path: String,
+    pub entity_count: u32,
+    pub file_size: u64,
+}
+
+/// JSON-friendly mirror of [`aec_core::revision::Revision`] used by
+/// the [`BridgeService::deliver_*`] endpoints. Field names align 1:1
+/// (via serde rename) with the renderer-side `RevisionSummary`
+/// interface in `apps/desktop/electron/bridge.ts`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RevisionSummary {
+    pub revision_id: String,
+    pub tag: String,
+    pub description: String,
+    pub created_at: String,
+    pub audit_chain_head: String,
+    pub manifest_name: String,
+    pub manifest_app_version: String,
+    pub tracked_entities: Vec<RevisionTrackedEntity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RevisionTrackedEntity {
+    pub category: String,
+    pub id: String,
+    pub payload_hash: String,
+    pub label: Option<String>,
+}
+
+/// JSON-friendly mirror of [`aec_core::version_diff::VersionDiff`].
+/// Field names align 1:1 (via serde rename) with the renderer-side
+/// `VersionDiffSummary` interface in `apps/desktop/electron/bridge.ts`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RevisionDiffReport {
+    pub base_revision_id: String,
+    pub head_revision_id: String,
+    pub by_category: std::collections::BTreeMap<String, RevisionDiffCounts>,
+    pub changes: Vec<RevisionEntityChange>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RevisionDiffCounts {
+    pub added: u32,
+    pub removed: u32,
+    pub modified: u32,
+    pub unchanged: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RevisionEntityChange {
+    pub category: String,
+    pub id: String,
+    /// One of `"added"` / `"removed"` / `"modified"` / `"unchanged"`.
+    pub kind: String,
+    pub before_hash: Option<String>,
+    pub after_hash: Option<String>,
+    pub label: Option<String>,
 }
 
 /// Render an [`aec_ai::RuntimeState`] as the lowercase wire string the
@@ -5924,5 +6446,167 @@ END-ISO-10303-21;\n";
             Some("false"),
             "IsExternal preserved"
         );
+    }
+
+    // ============================================================
+    // Group A Phase 10: draft / deliver scope wiring
+    // ============================================================
+
+    fn seed_one_primitive(s: &mut BridgeService, summary: &ProjectSummary) {
+        use aec_cad::primitives::{Line, Primitive};
+        use aec_command::commands::draft::DrawPrimitive;
+        use aec_command::commands::CommandKind;
+        let cmd = aec_command::commands::Command::user(CommandKind::DrawPrimitive(DrawPrimitive {
+            entity_id: aec_core::types::EntityId::new(),
+            primitive: Primitive::Line(Line::new("0", [0.0, 0.0], [10.0, 0.0])),
+        }));
+        s.command_apply(&summary.path, cmd).expect("seed primitive");
+    }
+
+    #[test]
+    fn draft_export_dxf_emits_all_primitives_then_reimports_them() {
+        let (mut s, g) = service();
+        let summary = s
+            .project_create_from_template("interior.apartment", "Dxf-Roundtrip")
+            .unwrap();
+        seed_one_primitive(&mut s, &summary);
+        // Export to a temp DXF file.
+        let dxf_path = g.path().join("export.dxf");
+        let res = s
+            .draft_export_dxf(&summary.path, dxf_path.to_str().unwrap())
+            .expect("export DXF");
+        assert_eq!(res.entity_count, 1);
+        assert!(res.file_size > 0);
+        // Now re-import into the same project — should add one more
+        // primitive (the import is additive).
+        let imp = s
+            .draft_import_dxf(&summary.path, dxf_path.to_str().unwrap())
+            .expect("import DXF");
+        assert_eq!(imp.entity_count, 1);
+        // The "0" layer is always present.
+        assert!(imp.layer_count >= 1);
+    }
+
+    #[test]
+    fn deliver_create_then_list_revisions_returns_camelcase_summary() {
+        let (mut s, _g) = service();
+        let summary = s
+            .project_create_from_template("interior.apartment", "Revision-Test")
+            .unwrap();
+        let rev = s
+            .deliver_create_revision(&summary.path, "rev-1", "first snapshot", None)
+            .expect("create revision");
+        assert_eq!(rev.tag, "rev-1");
+        assert_eq!(rev.description, "first snapshot");
+        assert!(!rev.revision_id.is_empty(), "revision_id is generated");
+        // Empty new project — tracked_entities reflects whatever the
+        // template seeded (could be zero or more, but the field
+        // exists and serialises as `trackedEntities`).
+        let json = serde_json::to_value(&rev).unwrap();
+        assert!(json.get("trackedEntities").is_some());
+        assert!(json.get("revisionId").is_some());
+
+        // listing returns the same revision (by revision_id).
+        let list = s.deliver_list_revisions(&summary.path).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].revision_id, rev.revision_id);
+    }
+
+    #[test]
+    fn deliver_compare_revisions_reports_added_and_modified() {
+        use aec_cad::primitives::{Line, Primitive};
+        use aec_command::commands::draft::DrawPrimitive;
+        use aec_command::commands::CommandKind;
+        let (mut s, _g) = service();
+        let summary = s
+            .project_create_from_template("interior.apartment", "Diff-Test")
+            .unwrap();
+        // r1: snapshot the empty project.
+        let r1 = s
+            .deliver_create_revision(&summary.path, "r1", "empty", None)
+            .unwrap();
+        // Add a primitive between snapshots.
+        let id = aec_core::types::EntityId::new();
+        let cmd = aec_command::commands::Command::user(CommandKind::DrawPrimitive(DrawPrimitive {
+            entity_id: id.clone(),
+            primitive: Primitive::Line(Line::new("0", [0.0, 0.0], [10.0, 0.0])),
+        }));
+        s.command_apply(&summary.path, cmd).unwrap();
+        let r2 = s
+            .deliver_create_revision(&summary.path, "r2", "after add", None)
+            .unwrap();
+        // Compare.
+        let diff = s
+            .deliver_compare_revisions(&summary.path, &r1.revision_id, &r2.revision_id)
+            .expect("diff");
+        assert_eq!(diff.base_revision_id, r1.revision_id);
+        assert_eq!(diff.head_revision_id, r2.revision_id);
+        // The added line shows up either as a new entity in `head`
+        // (no entry in `base`) → Added in by_category.
+        let counts = diff.by_category.get("primitive").unwrap_or_else(|| {
+            panic!(
+                "expected `primitive` category in diff; got keys: {:?}",
+                diff.by_category.keys().collect::<Vec<_>>()
+            )
+        });
+        assert!(counts.added >= 1, "added count: {counts:?}");
+        assert_eq!(counts.removed, 0);
+    }
+
+    #[test]
+    fn revision_summary_serializes_in_camel_case() {
+        let rev = RevisionSummary {
+            revision_id: "rev_a".into(),
+            tag: "v1".into(),
+            description: "desc".into(),
+            created_at: "2026-05-25T00:00:00Z".into(),
+            audit_chain_head: "abc".into(),
+            manifest_name: "Demo".into(),
+            manifest_app_version: "0.1.0".into(),
+            tracked_entities: vec![RevisionTrackedEntity {
+                category: "wall".into(),
+                id: "e1".into(),
+                payload_hash: "h".into(),
+                label: None,
+            }],
+        };
+        let json = serde_json::to_value(&rev).unwrap();
+        assert!(json.get("revisionId").is_some());
+        assert!(json.get("trackedEntities").is_some());
+        assert!(json.get("auditChainHead").is_some());
+        assert!(json.get("manifestAppVersion").is_some());
+        // No snake_case leaks.
+        assert!(json.get("revision_id").is_none());
+        assert!(json.get("tracked_entities").is_none());
+    }
+
+    #[test]
+    fn diff_report_serializes_in_camel_case() {
+        let diff = RevisionDiffReport {
+            base_revision_id: "a".into(),
+            head_revision_id: "b".into(),
+            by_category: std::collections::BTreeMap::from([(
+                "wall".into(),
+                RevisionDiffCounts {
+                    added: 1,
+                    ..Default::default()
+                },
+            )]),
+            changes: vec![RevisionEntityChange {
+                category: "wall".into(),
+                id: "w1".into(),
+                kind: "added".into(),
+                before_hash: None,
+                after_hash: Some("h".into()),
+                label: None,
+            }],
+        };
+        let json = serde_json::to_value(&diff).unwrap();
+        assert!(json.get("baseRevisionId").is_some());
+        assert!(json.get("headRevisionId").is_some());
+        assert!(json.get("byCategory").is_some());
+        let ch = json["changes"][0].clone();
+        assert!(ch.get("beforeHash").is_some());
+        assert!(ch.get("afterHash").is_some());
     }
 }

@@ -15,6 +15,7 @@ aec_core = { path = "../aec_core" }
 # (planner + diff engine + audit logger) and has no transitive deps
 # on `aec_command`, so pulling it in here doesn't create a cycle.
 aec_ai = { path = "../aec_ai" }
+aec_cad = { path = "../aec_cad" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
@@ -25,7 +26,6 @@ rusqlite = { workspace = true }
 [dev-dependencies]
 aec_audit = { path = "../aec_audit" }
 aec_bim = { path = "../aec_bim" }
-aec_cad = { path = "../aec_cad" }
 aec_export = { path = "../aec_export" }
 aec_materials = { path = "../aec_materials" }
 aec_render = { path = "../aec_render" }

@@ -287,7 +287,12 @@ fn build_place_furniture(payload: &Value) -> Result<PlaceFurniture, String> {
         .get("asset_id")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "furniture insert missing `asset_id`".to_string())?;
-    let position_mm = parse_xyz(payload.get("position_mm"))?;
+    // Missing `position_mm` defaults to origin for an Insert because
+    // a bare asset-shelf payload (no spatial planner involvement)
+    // intentionally has no coordinate — the renderer drops the
+    // instance at the world origin so the user can drag it into
+    // place. A *present* but malformed position is still an error.
+    let position_mm = parse_xyz_or_default(payload.get("position_mm"), [0.0, 0.0, 0.0])?;
     let rotation_yaw_deg = payload
         .get("rotation_deg")
         .and_then(serde_json::Value::as_f64)
@@ -366,7 +371,7 @@ fn convert_update(
     };
     let kind = record.kind.as_str();
     if is_furniture_kind(kind) {
-        match build_move_furniture(target.clone(), patch) {
+        match build_move_furniture(target.clone(), patch, record) {
             Ok(cmd) => commands.push(Command::ai(tool, CommandKind::MoveFurniture(cmd))),
             Err(reason) => skipped.push(SkippedOperation { op_index, reason }),
         }
@@ -385,18 +390,93 @@ fn convert_update(
     });
 }
 
-fn build_move_furniture(target: EntityId, patch: &Value) -> Result<MoveFurniture, String> {
-    let position_mm = parse_xyz(patch.get("position_mm"))?;
+fn build_move_furniture(
+    target: EntityId,
+    patch: &Value,
+    record: &crate::commands::EntityRecord,
+) -> Result<MoveFurniture, String> {
+    // Missing fields on an *Update* mean "leave this field
+    // unchanged" — read the current values out of the existing
+    // entity record and use them as the default. Previously a
+    // missing `position_mm` defaulted to `[0, 0, 0]` (teleporting
+    // the furniture to the world origin) and a missing
+    // `rotation_deg` defaulted to `0.0` (resetting any prior
+    // yaw). Devin Review flagged this asymmetry as
+    // `ANALYSIS_0005`: parsing was asymmetric (Update accepted
+    // partial patches but silently substituted defaults). The
+    // fix keeps the partial-patch contract but resolves missing
+    // fields against the record's current body instead of
+    // hard-coded defaults.
+    let current_position = current_position_mm(record);
+    let current_rotation = current_rotation_yaw_deg(record);
+    let position_mm = parse_xyz_or_default(patch.get("position_mm"), current_position)?;
     let rotation_yaw_deg = patch
         .get("rotation_deg")
-        .and_then(serde_json::Value::as_f64)
-        .unwrap_or(0.0);
+        .map(|v| {
+            v.as_f64()
+                .ok_or_else(|| "rotation_deg is not a number".to_string())
+        })
+        .transpose()?
+        .unwrap_or(current_rotation);
+    // `scale_override` follows the same "absent = keep current"
+    // semantics so a yaw-only patch doesn't strip an existing
+    // scale override.
+    let scale_override = if patch.get("scale_override").is_some() {
+        patch
+            .get("scale_override")
+            .and_then(serde_json::Value::as_f64)
+    } else {
+        current_scale_override(record)
+    };
     Ok(MoveFurniture {
         entity_id: target,
         position_mm,
         rotation_yaw_deg,
-        scale_override: None,
+        scale_override,
     })
+}
+
+/// Read the current `position_mm` out of a furniture entity's
+/// body, defaulting to the world origin if the field is missing
+/// or malformed.
+///
+/// Used by [`build_move_furniture`] so an Update patch with no
+/// `position_mm` leaves the existing position untouched. The
+/// world-origin fallback only fires for legacy records that
+/// pre-date the `position_mm` field being mandatory; current
+/// schema invariants ensure every furniture record has one.
+fn current_position_mm(record: &crate::commands::EntityRecord) -> [f64; 3] {
+    record
+        .body
+        .get("position_mm")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| {
+            if arr.len() >= 3 {
+                Some([
+                    arr[0].as_f64().unwrap_or(0.0),
+                    arr[1].as_f64().unwrap_or(0.0),
+                    arr[2].as_f64().unwrap_or(0.0),
+                ])
+            } else {
+                None
+            }
+        })
+        .unwrap_or([0.0, 0.0, 0.0])
+}
+
+fn current_rotation_yaw_deg(record: &crate::commands::EntityRecord) -> f64 {
+    record
+        .body
+        .get("rotation_yaw_deg")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0)
+}
+
+fn current_scale_override(record: &crate::commands::EntityRecord) -> Option<f64> {
+    record
+        .body
+        .get("scale_override")
+        .and_then(serde_json::Value::as_f64)
 }
 
 fn build_update_camera(
@@ -483,12 +563,39 @@ fn convert_delete(
     }
 }
 
-fn parse_xyz(v: Option<&Value>) -> Result<[f64; 3], String> {
-    let Some(arr) = v.and_then(|v| v.as_array()) else {
-        // Missing position is acceptable for some payloads (e.g. a
-        // furniture insert from a pure asset shelf); default to
-        // origin so the model's intent is preserved.
-        return Ok([0.0, 0.0, 0.0]);
+/// Parse a `[x, y, z]` triple, returning a caller-supplied default
+/// when the field is **absent** (the JSON key is missing or its value
+/// is `null` / not an array) and an `Err` when the field is **present
+/// but malformed** (wrong length, non-numeric component).
+///
+/// This is the canonical entry point for both Insert payloads and
+/// Update patches. Insert callers pass `[0.0, 0.0, 0.0]` as the
+/// default (asset-shelf payloads with no coordinate intentionally
+/// drop the instance at the world origin). Update callers pass the
+/// entity's current position so a partial patch (e.g. yaw-only)
+/// preserves the existing position instead of teleporting it.
+///
+/// Devin Review flagged the previous form (`parse_xyz`) as
+/// `ANALYSIS_0005`: it silently substituted the origin in both
+/// directions, masking malformed payloads as well as
+/// missing-but-intentional ones. This split form keeps the
+/// permissive "missing is fine" semantics for the cases that
+/// actually want them while letting callers distinguish absence
+/// from malformedness.
+fn parse_xyz_or_default(v: Option<&Value>, default: [f64; 3]) -> Result<[f64; 3], String> {
+    let Some(value) = v else {
+        // Field absent.
+        return Ok(default);
+    };
+    if value.is_null() {
+        // Field present but explicitly null — treat like absent.
+        return Ok(default);
+    }
+    let Some(arr) = value.as_array() else {
+        return Err(format!(
+            "expected [x, y, z] number triple, got non-array value {}",
+            value
+        ));
     };
     if arr.len() < 3 {
         return Err(format!(
@@ -695,5 +802,157 @@ mod tests {
         assert!(out.commands.is_empty());
         assert_eq!(out.skipped.len(), 1);
         assert!(out.skipped[0].reason.contains("not found"));
+    }
+
+    #[test]
+    fn update_furniture_yaw_only_patch_preserves_current_position() {
+        // Regression for Devin Review ANALYSIS_0005: a yaw-only
+        // Update patch on a furniture instance used to silently
+        // teleport the entity to the world origin because the
+        // missing `position_mm` defaulted to `[0, 0, 0]`. The
+        // fix reads the current `position_mm` out of the entity
+        // record and uses it as the default, so partial patches
+        // touch only the fields they specify.
+        use crate::commands::{EntityDelta, EntityRecord, ProjectGraph};
+        let mut g = ProjectGraph::new();
+        let furn_id = EntityId::new();
+        g.apply(&EntityDelta::Create {
+            record: EntityRecord {
+                id: furn_id.clone(),
+                kind: "furniture".into(),
+                body: json!({
+                    "asset_ref": "asset_chair",
+                    "position_mm": [1500.0, 2500.0, 0.0],
+                    "rotation_yaw_deg": 45.0,
+                    "scale_override": 1.25,
+                }),
+                parent: None,
+            },
+        })
+        .unwrap();
+        let diff = diff_of(
+            ToolName::LayoutSuggestion,
+            vec![DiffOperation::Update {
+                target: furn_id.clone(),
+                patch: json!({"rotation_deg": 90.0}),
+            }],
+        );
+        let out = diff_to_commands(&diff, &g, ApplyDefaults::default());
+        assert_eq!(out.commands.len(), 1);
+        match &out.commands[0].kind {
+            CommandKind::MoveFurniture(c) => {
+                assert_eq!(c.entity_id, furn_id);
+                // Position preserved from the record.
+                assert_eq!(c.position_mm, [1500.0, 2500.0, 0.0]);
+                // Yaw taken from the patch.
+                assert_eq!(c.rotation_yaw_deg, 90.0);
+                // Scale override preserved from the record.
+                assert_eq!(c.scale_override, Some(1.25));
+            }
+            other => panic!("expected MoveFurniture, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_furniture_position_only_patch_preserves_current_rotation() {
+        // Companion to the yaw-only test: a position-only patch
+        // should preserve the existing rotation_yaw_deg rather
+        // than resetting it to 0.
+        use crate::commands::{EntityDelta, EntityRecord, ProjectGraph};
+        let mut g = ProjectGraph::new();
+        let furn_id = EntityId::new();
+        g.apply(&EntityDelta::Create {
+            record: EntityRecord {
+                id: furn_id.clone(),
+                kind: "furniture".into(),
+                body: json!({
+                    "asset_ref": "asset_lamp",
+                    "position_mm": [100.0, 200.0, 0.0],
+                    "rotation_yaw_deg": 67.5,
+                }),
+                parent: None,
+            },
+        })
+        .unwrap();
+        let diff = diff_of(
+            ToolName::LayoutSuggestion,
+            vec![DiffOperation::Update {
+                target: furn_id.clone(),
+                patch: json!({"position_mm": [3000.0, 4000.0, 0.0]}),
+            }],
+        );
+        let out = diff_to_commands(&diff, &g, ApplyDefaults::default());
+        assert_eq!(out.commands.len(), 1);
+        match &out.commands[0].kind {
+            CommandKind::MoveFurniture(c) => {
+                assert_eq!(c.position_mm, [3000.0, 4000.0, 0.0]);
+                assert_eq!(c.rotation_yaw_deg, 67.5);
+            }
+            other => panic!("expected MoveFurniture, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_furniture_malformed_position_is_skipped() {
+        // ANALYSIS_0005 (continued): a *present* but malformed
+        // `position_mm` (wrong length / non-numeric component)
+        // must NOT silently fall back to the default — that was
+        // the original silent-corruption bug. It should surface
+        // as a skipped operation so the user knows the model
+        // emitted an invalid patch.
+        use crate::commands::{EntityDelta, EntityRecord, ProjectGraph};
+        let mut g = ProjectGraph::new();
+        let furn_id = EntityId::new();
+        g.apply(&EntityDelta::Create {
+            record: EntityRecord {
+                id: furn_id.clone(),
+                kind: "furniture".into(),
+                body: json!({
+                    "asset_ref": "asset_table",
+                    "position_mm": [10.0, 20.0, 0.0],
+                    "rotation_yaw_deg": 0.0,
+                }),
+                parent: None,
+            },
+        })
+        .unwrap();
+        let diff = diff_of(
+            ToolName::LayoutSuggestion,
+            vec![DiffOperation::Update {
+                target: furn_id.clone(),
+                patch: json!({"position_mm": [1.0, 2.0]}),
+            }],
+        );
+        let out = diff_to_commands(&diff, &g, ApplyDefaults::default());
+        assert!(out.commands.is_empty());
+        assert_eq!(out.skipped.len(), 1);
+        assert!(out.skipped[0].reason.contains("length 2"));
+    }
+
+    #[test]
+    fn insert_furniture_missing_position_defaults_to_origin() {
+        // Companion to ANALYSIS_0005: a *bare asset-shelf* Insert
+        // (no spatial planner involvement) intentionally has no
+        // coordinate. The renderer drops the instance at the
+        // world origin so the user can drag it into place. This
+        // is the one case where defaulting position to the
+        // origin is correct.
+        let diff = diff_of(
+            ToolName::StyleAssistant,
+            vec![DiffOperation::Insert {
+                entity_kind: "furniture".into(),
+                payload: json!({"asset_id": "asset_chair"}),
+            }],
+        );
+        let out = diff_to_commands(&diff, &empty_graph(), ApplyDefaults::default());
+        assert_eq!(out.commands.len(), 1);
+        match &out.commands[0].kind {
+            CommandKind::PlaceFurniture(c) => {
+                assert_eq!(c.asset_ref, "asset_chair");
+                assert_eq!(c.position_mm, [0.0, 0.0, 0.0]);
+                assert_eq!(c.rotation_yaw_deg, 0.0);
+            }
+            other => panic!("expected PlaceFurniture, got {other:?}"),
+        }
     }
 }

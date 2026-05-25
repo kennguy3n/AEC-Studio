@@ -1,6 +1,8 @@
 //! Typed commands for AEC Studio.
 
 pub mod camera;
+pub mod deliver;
+pub mod draft;
 pub mod floor;
 pub mod furniture;
 pub mod lighting;
@@ -72,6 +74,20 @@ pub enum CommandKind {
     MoveFurniture(furniture::MoveFurniture),
     #[serde(rename = "design.delete_furniture")]
     DeleteFurniture(furniture::DeleteFurniture),
+
+    // ----- Draft scope -----
+    #[serde(rename = "draft.draw_primitive")]
+    DrawPrimitive(draft::DrawPrimitive),
+    #[serde(rename = "draft.edit_tool")]
+    EditTool(draft::EditTool),
+    #[serde(rename = "draft.create_sheet")]
+    CreateSheet(draft::CreateSheet),
+    #[serde(rename = "draft.set_layer_state")]
+    SetLayerState(draft::SetLayerState),
+
+    // ----- Deliver scope -----
+    #[serde(rename = "deliver.create_revision")]
+    CreateRevision(deliver::CreateRevision),
 }
 
 impl CommandKind {
@@ -99,14 +115,50 @@ impl CommandKind {
             Self::PlaceFurniture(_) => "design.place_furniture",
             Self::MoveFurniture(_) => "design.move_furniture",
             Self::DeleteFurniture(_) => "design.delete_furniture",
+            Self::DrawPrimitive(_) => "draft.draw_primitive",
+            Self::EditTool(_) => "draft.edit_tool",
+            Self::CreateSheet(_) => "draft.create_sheet",
+            Self::SetLayerState(_) => "draft.set_layer_state",
+            Self::CreateRevision(_) => "deliver.create_revision",
         }
     }
 
-    /// All commands shipped in Phase 2 are in the `Design` scope. As new
-    /// modes (Draft / Bim / Render / Deliver) gain commands, this matches
-    /// out into separate scope branches.
+    /// Active scope of this command. Phase 2 commands all sit in the
+    /// `Design` scope; Phase 3 (`Draft`) and the Deliver-mode revision
+    /// commands fan out into their own scopes so the engine's scope-
+    /// matching check (`engine.rs::compute_deltas`) refuses to apply
+    /// a `draft.*` command while the engine is in `Design` and vice
+    /// versa.
     pub fn scope(&self) -> Scope {
-        Scope::Design
+        match self {
+            Self::CreateWall(_)
+            | Self::MoveWall(_)
+            | Self::DeleteWall(_)
+            | Self::CreateRoom(_)
+            | Self::ModifyRoom(_)
+            | Self::CreateFloor(_)
+            | Self::ModifyFloor(_)
+            | Self::PlaceDoor(_)
+            | Self::PlaceWindow(_)
+            | Self::MoveOpening(_)
+            | Self::DeleteOpening(_)
+            | Self::PaintMaterial(_)
+            | Self::SwapFinish(_)
+            | Self::SetLighting(_)
+            | Self::AddLight(_)
+            | Self::RemoveLight(_)
+            | Self::SaveCamera(_)
+            | Self::UpdateCamera(_)
+            | Self::DeleteCamera(_)
+            | Self::PlaceFurniture(_)
+            | Self::MoveFurniture(_)
+            | Self::DeleteFurniture(_) => Scope::Design,
+            Self::DrawPrimitive(_)
+            | Self::EditTool(_)
+            | Self::CreateSheet(_)
+            | Self::SetLayerState(_) => Scope::Draft,
+            Self::CreateRevision(_) => Scope::Deliver,
+        }
     }
 }
 

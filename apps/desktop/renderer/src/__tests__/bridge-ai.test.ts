@@ -33,23 +33,40 @@ describe("bridge in-process AI surface", () => {
     expect(result.parsed).not.toBeNull();
   });
 
-  it("aiAcceptDiff resolves to { accepted: true }", async () => {
+  it("aiAcceptDiff resolves to a rich AiAcceptOutcome", async () => {
+    // Phase 11 follow-up (Devin Review ANALYSIS_0002): the
+    // accept outcome carries the full apply telemetry, not just
+    // `{ accepted: true }`. The in-process fallback has no
+    // real diff registry so the counts are zero, but the
+    // shape must match the native backend so the renderer can
+    // render `outcome.appliedCount` etc. without branching.
     const bridge = inProcessBackend();
     const outcome = await bridge.aiAcceptDiff("diff_anything");
-    expect(outcome).toEqual({ accepted: true });
+    expect(outcome.accepted).toBe(true);
+    expect(outcome.diffId).toBe("diff_anything");
+    expect(outcome.opCount).toBe(0);
+    expect(outcome.appliedCount).toBe(0);
+    expect(outcome.skipped).toEqual([]);
+    expect(outcome.commandIds).toEqual([]);
+    expect(outcome.auditChainHead).toBe("");
   });
 
-  it("aiRejectDiff resolves to { rejected: true } with no reason", async () => {
+  it("aiRejectDiff resolves to a rich AiRejectOutcome with no reason", async () => {
     const bridge = inProcessBackend();
     const outcome = await bridge.aiRejectDiff("diff_anything");
-    expect(outcome).toEqual({ rejected: true });
+    expect(outcome.rejected).toBe(true);
+    expect(outcome.diffId).toBe("diff_anything");
+    expect(outcome.opCount).toBe(0);
+    expect(outcome.reason).toBeNull();
+    expect(outcome.auditChainHead).toBe("");
   });
 
-  it("aiRejectDiff accepts an optional reason string", async () => {
+  it("aiRejectDiff accepts an optional reason string and echoes it back", async () => {
     const bridge = inProcessBackend();
-    // The in-process fallback ignores `reason`; we only care that
-    // the TS signature accepts it so a renderer call passing a
-    // reason compiles. The native side records the reason in the
+    // The in-process fallback now echoes the renderer-supplied
+    // `reason` back on the outcome so the renderer's "Rejected
+    // because: ..." toast can read it without re-passing the
+    // string. The native side records the reason in the
     // forensic AI audit companion file (covered by the Rust
     // `ai_reject_diff_writes_reason_to_forensic_log` integration
     // test).
@@ -57,7 +74,8 @@ describe("bridge in-process AI surface", () => {
       "diff_anything",
       "doesn't match the brief",
     );
-    expect(outcome).toEqual({ rejected: true });
+    expect(outcome.rejected).toBe(true);
+    expect(outcome.reason).toBe("doesn't match the brief");
   });
 
   it("aiPlan rejects an empty projectPath", async () => {
