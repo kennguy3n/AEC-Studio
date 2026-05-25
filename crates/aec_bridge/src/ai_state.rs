@@ -57,6 +57,47 @@
 //! `crate::napi_api` module doc on the AI endpoints), this means the
 //! libuv main thread is never blocked by AI work, *and* the
 //! renderer's status pane keeps refreshing during cold-spawn.
+//!
+//! ## Lock ordering (canonical, grep-able)
+//!
+//! When any single code path needs to hold two (or all three) of the
+//! primitives simultaneously, it acquires them in this strictly
+//! increasing order:
+//!
+//! ```text
+//!   handle_slot  >  runtime  >  pending_diffs
+//! ```
+//!
+//! Every method on [`AiState`] respects this order, which means a
+//! circular-wait deadlock is statically impossible:
+//!
+//! | Method                | handle_slot | runtime               | pending_diffs |
+//! |-----------------------|-------------|-----------------------|---------------|
+//! | `ensure_ready`        | take (lock) | brief write (×1-4)    | —             |
+//! | `cancel_job`          | take (lock) | brief write           | —             |
+//! | `snapshot`            | —           | read                  | lock          |
+//! | `state` / `last_error`| —           | read                  | —             |
+//! | `insert_diff`         | —           | —                     | lock          |
+//! | `accept_diff` / `reject_diff` | —   | —                     | lock          |
+//!
+//! Notably, [`AiState::snapshot`] — the renderer's hot read path —
+//! deliberately does **not** touch `handle_slot`. That is what lets
+//! the cold-spawn status-poll responsiveness contract hold: while
+//! `ensure_ready` is parked on `/health` holding `handle_slot`, every
+//! concurrent `snapshot()` call takes only the cheap pair
+//! (`runtime.read()` → `pending_diffs.lock()`) and returns instantly.
+//! The integration test
+//! `ai_runtime_status_returns_loading_instantly_during_cold_spawn`
+//! in `crates/aec_bridge/tests/ai_endpoints.rs` pins this property —
+//! a regression that adds `handle_slot` to `snapshot()` would block
+//! the test for the full simulated spawn window and fail by an order
+//! of magnitude.
+//!
+//! When adding new methods to [`AiState`], stay within this order. If
+//! you find yourself needing a different ordering, the right fix is
+//! to extend the snapshot/registry boundary (e.g. publish more state
+//! into `SidecarRuntime` so it can be read without taking `handle_slot`),
+//! NOT to reorder the locks.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, RwLock};

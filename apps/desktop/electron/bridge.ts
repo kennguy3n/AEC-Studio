@@ -957,7 +957,13 @@ interface NativeApi {
   runtime_status(): unknown;
   project_engine_status(project_path: string): unknown;
   project_audit_sync(project_path: string): unknown;
-  bim_import_ifc(path: string): unknown;
+  // ASYNC: returns Promise<unknown> because the underlying napi
+  // function is `#[napi] async fn` (parses the IFC on a tokio
+  // blocking-pool worker so it doesn't freeze the JS event loop).
+  // Typed as `Promise<unknown>` rather than the looser `unknown`
+  // so call sites that forget `await` get a TS error instead of a
+  // pending-promise object showing up at runtime.
+  bim_import_ifc(path: string): Promise<unknown>;
   bim_check_file_size(path: string): unknown;
   bim_attach_ifc(project_path: string, ifc_path: string): unknown;
   command_apply(project_path: string, command_json: string): unknown;
@@ -1015,23 +1021,32 @@ interface NativeApi {
     styleTags?: string[];
     limit?: number;
   }): unknown;
-  // AI endpoints wired in PR-V. `parsed_json` on the result of
-  // `ai_plan` is a `JSON.stringify`'d tool-specific payload; the
-  // adaptor parses it back into a typed `AiPlanParsed` for the
-  // renderer. `context_json` on the request side is the renderer's
+  // AI endpoints wired in PR-V and made async in the async-napi
+  // follow-up. All six are `#[napi] async fn` on the Rust side —
+  // they route through `spawn_blocking_napi` so the libuv main
+  // thread is never blocked, even during the up-to-30 s cold-spawn
+  // of the llama-server child. Typed as `Promise<unknown>` rather
+  // than the looser `unknown` so a future contributor who writes
+  // `n.ai_runtime_status()` without `await` gets a TS error rather
+  // than silently consuming a pending-promise object.
+  //
+  // `parsed_json` on the result of `ai_plan` is a
+  // `JSON.stringify`'d tool-specific payload; the adaptor parses
+  // it back into a typed `AiPlanParsed` for the renderer.
+  // `context_json` on the request side is the renderer's
   // tool-specific context object, also serialised at the adaptor.
-  ai_list_tools(): unknown;
+  ai_list_tools(): Promise<unknown>;
   ai_plan(
     tool: string,
     scope: string,
     prompt: string,
     context_json: string,
     max_entities_modified: number,
-  ): unknown;
-  ai_accept_diff(diff_id: string): unknown;
-  ai_reject_diff(diff_id: string): unknown;
-  ai_cancel_job(job_id: string): unknown;
-  ai_runtime_status(): unknown;
+  ): Promise<unknown>;
+  ai_accept_diff(diff_id: string): Promise<unknown>;
+  ai_reject_diff(diff_id: string): Promise<unknown>;
+  ai_cancel_job(job_id: string): Promise<unknown>;
+  ai_runtime_status(): Promise<unknown>;
 }
 
 /**
