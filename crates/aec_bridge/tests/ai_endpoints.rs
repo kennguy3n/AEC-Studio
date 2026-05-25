@@ -380,7 +380,9 @@ fn ai_runtime_status_returns_loading_instantly_during_cold_spawn() {
     thread::sleep(Duration::from_millis(50));
 
     let start = Instant::now();
-    let snap = state.snapshot().expect("snapshot must not block on handle_slot");
+    let snap = state
+        .snapshot()
+        .expect("snapshot must not block on handle_slot");
     let elapsed = start.elapsed();
 
     assert_eq!(
