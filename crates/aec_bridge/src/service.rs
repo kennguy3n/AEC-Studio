@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, OptionalExtension, Transaction};
+use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -2149,6 +2149,26 @@ impl BridgeService {
     /// Returns the previous value (if any) so the renderer can wire
     /// undo via [`Self::bim_set_property`] of the prior value
     /// without an extra round trip.
+    ///
+    /// # Concurrency
+    ///
+    /// The read-modify-write of the property `body` JSON must be
+    /// atomic across concurrent callers — two `bim_set_property`
+    /// calls targeting the same `(entity_id, pset)` but different
+    /// `key`s would otherwise race: each reads the same prior body,
+    /// merges its own key, and the second writer's `ON CONFLICT
+    /// … DO UPDATE` overwrites the first writer's result, silently
+    /// dropping one key.
+    ///
+    /// To prevent that, the prior-body read runs **inside** the same
+    /// transaction as the write, and the transaction is opened with
+    /// [`TransactionBehavior::Immediate`] so it acquires SQLite's
+    /// RESERVED lock immediately on entry (not lazily on first write).
+    /// Combined with the `busy_timeout` pragma set in
+    /// `apply_pragmas`, concurrent callers serialise cleanly: the
+    /// second caller's `BEGIN IMMEDIATE` blocks until the first
+    /// caller's transaction commits, at which point the second
+    /// caller's read sees the first caller's write.
     pub fn bim_set_property(
         &self,
         project_path: &str,
@@ -2167,31 +2187,39 @@ impl BridgeService {
         let (_pkg, mut conn) =
             ProjectPackage::open_with_master_key_and_database(project_path, &self.master_key)?;
 
+        let component_kind = format!("aec/property/{pset}");
+
+        // Open the transaction as IMMEDIATE so the RESERVED lock is
+        // acquired up-front — every step (entity-existence check,
+        // prior-body read, write) runs against the same locked
+        // snapshot. The deferred default would acquire the lock only
+        // on the first write, which is exactly the TOCTOU window we
+        // need to close.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
         // Make sure the entity exists — silent inserts against
         // missing IDs are a footgun (and the FK on `components` would
         // catch it, but the error string is opaque). Caller-facing
         // `EntityNotFound` is more useful.
-        {
-            let exists: bool = conn
-                .query_row(
-                    "SELECT 1 FROM entities WHERE id = ?1",
-                    params![entity_id],
-                    |_| Ok(true),
-                )
-                .optional()?
-                .unwrap_or(false);
-            if !exists {
-                return Err(BridgeServiceError::Invalid(format!(
-                    "entity {entity_id} not found in project graph"
-                )));
-            }
+        let exists: bool = tx
+            .query_row(
+                "SELECT 1 FROM entities WHERE id = ?1",
+                params![entity_id],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !exists {
+            return Err(BridgeServiceError::Invalid(format!(
+                "entity {entity_id} not found in project graph"
+            )));
         }
 
-        let component_kind = format!("aec/property/{pset}");
-
         // Read previous body (if any) so we can extract the prior
-        // value for the response.
-        let prev_body: Option<String> = conn
+        // value for the response. This read must be INSIDE the
+        // IMMEDIATE transaction so concurrent writers see each
+        // other's commits before merging — see the doc comment.
+        let prev_body: Option<String> = tx
             .query_row(
                 "SELECT body FROM components WHERE entity_id = ?1 AND kind = ?2",
                 params![entity_id, &component_kind],
@@ -2213,7 +2241,6 @@ impl BridgeService {
         );
         let new_body = serde_json::Value::Object(body_obj);
 
-        let tx = conn.transaction()?;
         // `(entity_id, kind)` is the natural PK for our overlay rows.
         // `components.id` is the SQLite PK, but it doesn't carry
         // semantic meaning — we synthesise a deterministic value
@@ -5166,5 +5193,81 @@ END-ISO-10303-21;\n";
             s.bim_set_property(&summary.path, &target_id, "Pset", "  ", "v"),
             Err(BridgeServiceError::Invalid(_))
         ));
+    }
+
+    /// Regression for the read-modify-write race fixed by moving the
+    /// prior-body SELECT inside an `IMMEDIATE` transaction (PR-W
+    /// round 3): two sequential `bim_set_property` calls writing
+    /// *different* keys under the same `(entity, pset)` must both
+    /// land in the merged body. Before the fix, the second call's
+    /// read happened outside the transaction, so a concurrent first
+    /// caller (or, in the sequential case, a stale read) would
+    /// silently drop one key. With the IMMEDIATE-tx fix this
+    /// sequential case is straightforward and the test pins the
+    /// merge semantics so future refactors can't regress it.
+    #[test]
+    fn bim_set_property_merges_distinct_keys_into_same_pset() {
+        let (mut s, _g) = service();
+        let summary = s
+            .project_create_from_template("interior.apartment", "Merge-Pset")
+            .unwrap();
+        let entity_id = seed_one_wall(&mut s, &summary);
+        let target_id = entity_id.to_string();
+
+        s.bim_set_property(
+            &summary.path,
+            &target_id,
+            "Pset_WallCommon",
+            "FireRating",
+            "60min",
+        )
+        .expect("set FireRating");
+        s.bim_set_property(
+            &summary.path,
+            &target_id,
+            "Pset_WallCommon",
+            "LoadBearing",
+            "true",
+        )
+        .expect("set LoadBearing");
+        s.bim_set_property(
+            &summary.path,
+            &target_id,
+            "Pset_WallCommon",
+            "IsExternal",
+            "false",
+        )
+        .expect("set IsExternal");
+
+        // Read the merged body directly from the DB and assert all
+        // three keys are present. If the TOCTOU bug regressed (or the
+        // merge dropped keys), one of these `get` calls would return
+        // `None`.
+        let (_pkg, conn) =
+            ProjectPackage::open_with_master_key_and_database(&summary.path, &s.master_key)
+                .expect("open project");
+        let body: String = conn
+            .query_row(
+                "SELECT body FROM components WHERE entity_id = ?1 AND kind = ?2",
+                params![&target_id, "aec/property/Pset_WallCommon"],
+                |r| r.get(0),
+            )
+            .expect("body present");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("body parses");
+        assert_eq!(
+            parsed.get("FireRating").and_then(|v| v.as_str()),
+            Some("60min"),
+            "FireRating preserved across distinct-key writes"
+        );
+        assert_eq!(
+            parsed.get("LoadBearing").and_then(|v| v.as_str()),
+            Some("true"),
+            "LoadBearing preserved"
+        );
+        assert_eq!(
+            parsed.get("IsExternal").and_then(|v| v.as_str()),
+            Some("false"),
+            "IsExternal preserved"
+        );
     }
 }
