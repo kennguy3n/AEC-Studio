@@ -384,6 +384,103 @@ impl CommandEngine {
         })
     }
 
+    /// Apply a sequence of commands as a single atomic batch.
+    ///
+    /// Same shape as [`Self::execute_persistent`] but amortises the
+    /// per-command transaction + journal overhead across an arbitrary
+    /// number of commands. Used by bulk ingest paths (e.g. DXF
+    /// import, IFC attach) where issuing N independent
+    /// `execute_persistent` calls would mean N transactions, N audit
+    /// envelope extensions, and N status-pane invalidations.
+    ///
+    /// Pipeline (all-or-nothing):
+    /// 1. Validate every command's deltas against a forward-running
+    ///    clone of the graph so command `i` sees the post-state of
+    ///    commands `0..i`.
+    /// 2. Open a single SQL transaction; write every entity delta and
+    ///    every journal entry inside it. Any failure rolls back the
+    ///    whole batch — partial batches are never visible on disk.
+    /// 3. After `commit()` succeeds, mirror the changes to the
+    ///    in-memory graph + journal in the same order. Audit envelopes
+    ///    are extended per-command so the chain still records each
+    ///    user gesture distinctly.
+    ///
+    /// Returns the per-command [`CommandResult`]s in input order.
+    pub fn execute_persistent_batch(
+        &mut self,
+        commands: Vec<Command>,
+        conn: &mut rusqlite::Connection,
+    ) -> Result<Vec<CommandResult>> {
+        if commands.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Phase 1: compute + validate every command's deltas against
+        // a forward-running clone. We can't validate against
+        // `self.graph` directly because the n-th command may depend
+        // on entities created by command n-1.
+        let mut shadow = self.graph.clone();
+        let mut per_command_deltas: Vec<Vec<EntityDelta>> = Vec::with_capacity(commands.len());
+        let mut entries: Vec<JournalEntry> = Vec::with_capacity(commands.len());
+        for cmd in &commands {
+            let deltas = self.compute_deltas(&cmd.kind)?;
+            shadow.validate_all(&deltas)?;
+            for d in &deltas {
+                shadow
+                    .apply(d)
+                    .expect("validate_all just succeeded; apply on shadow cannot fail");
+            }
+            let inverse: Vec<EntityDelta> = deltas.iter().rev().map(EntityDelta::invert).collect();
+            entries.push(JournalEntry {
+                command_id: cmd.command_id.clone(),
+                applied_at: cmd.ts,
+                scope: self.active_scope,
+                forward: deltas.clone(),
+                inverse,
+            });
+            per_command_deltas.push(deltas);
+        }
+
+        // Phase 2: single SQL transaction covering every delta + every
+        // journal entry. If any write fails (or `commit()` itself
+        // fails) the batch is rolled back and none of the in-memory
+        // mutations from phase 3 below execute.
+        let tx = conn.transaction()?;
+        for deltas in &per_command_deltas {
+            for d in deltas {
+                crate::commands::ProjectGraph::persist_delta_in_tx(&tx, d)?;
+            }
+        }
+        for entry in &entries {
+            crate::journal::UndoRedoJournal::persist_record_in_tx(&tx, entry)?;
+        }
+        tx.commit()?;
+
+        // Phase 3: mirror to in-memory. Each apply is guaranteed to
+        // succeed because we validated against the same starting
+        // state via the shadow graph in phase 1.
+        let mut results = Vec::with_capacity(commands.len());
+        for (cmd, deltas) in commands.into_iter().zip(per_command_deltas) {
+            for d in &deltas {
+                self.graph
+                    .apply(d)
+                    .expect("shadow-validated above; apply on real graph cannot fail");
+            }
+            let envelope = self.audit.extend(
+                &cmd.command_id,
+                &serde_json::to_value(&cmd).unwrap_or(serde_json::Value::Null),
+            );
+            // Find the entry for this command (input order preserved).
+            let entry_idx = results.len();
+            self.journal.record(entries[entry_idx].clone());
+            results.push(CommandResult {
+                command_id: cmd.command_id,
+                applied: deltas,
+                audit: envelope,
+            });
+        }
+        Ok(results)
+    }
+
     /// Persistent counterpart to [`Self::undo`]. Same single-transaction
     /// validate → SQL → commit → in-memory pipeline as
     /// [`Self::execute_persistent`]: peek the top entry without
@@ -775,6 +872,77 @@ mod tests {
         )
         .unwrap();
         conn
+    }
+
+    #[test]
+    fn execute_persistent_batch_applies_all_or_nothing() {
+        use crate::commands::draft::DrawPrimitive;
+        use aec_cad::primitives::{Line, Primitive};
+        // Three independent DrawPrimitive commands. The batch must:
+        // (a) end with all three entities persisted in `entities`,
+        // (b) record three journal entries,
+        // (c) leave the engine's in-memory graph + journal in
+        //     lock-step with the persisted state.
+        let mut conn = open_in_memory_persistent_db();
+        let mut e = CommandEngine::open(&conn, Scope::Draft).unwrap();
+        let mk = |x: f64| {
+            Command::user(CommandKind::DrawPrimitive(DrawPrimitive {
+                entity_id: EntityId::new(),
+                primitive: Primitive::Line(Line::new("0", [x, 0.0], [x + 10.0, 0.0])),
+            }))
+        };
+        let cmds = vec![mk(0.0), mk(20.0), mk(40.0)];
+        let results = e.execute_persistent_batch(cmds, &mut conn).unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(e.graph().len(), 3);
+        assert_eq!(e.undo_len(), 3);
+        let entity_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entities", [], |r| r.get(0))
+            .unwrap();
+        let journal_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM undo_journal", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(entity_count, 3);
+        assert_eq!(journal_count, 3);
+    }
+
+    #[test]
+    fn execute_persistent_batch_rejects_duplicate_inside_batch() {
+        use crate::commands::draft::DrawPrimitive;
+        use aec_cad::primitives::{Line, Primitive};
+        // Two commands that both target the **same** entity_id. The
+        // second one collides with the first inside the same batch,
+        // so phase-1 validation must reject the whole batch and
+        // *no* rows / journal entries should be persisted.
+        let mut conn = open_in_memory_persistent_db();
+        let mut e = CommandEngine::open(&conn, Scope::Draft).unwrap();
+        let shared_id = EntityId::new();
+        let mk = |id: EntityId| {
+            Command::user(CommandKind::DrawPrimitive(DrawPrimitive {
+                entity_id: id,
+                primitive: Primitive::Line(Line::new("0", [0.0, 0.0], [10.0, 0.0])),
+            }))
+        };
+        let cmds = vec![mk(shared_id.clone()), mk(shared_id)];
+        let err = e.execute_persistent_batch(cmds, &mut conn).unwrap_err();
+        assert!(matches!(err, CommandError::EntityAlreadyExists(_)));
+        // All-or-nothing: neither command persisted.
+        assert_eq!(e.graph().len(), 0);
+        assert_eq!(e.undo_len(), 0);
+        let entity_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entities", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(entity_count, 0);
+    }
+
+    #[test]
+    fn execute_persistent_batch_empty_input_is_noop() {
+        let mut conn = open_in_memory_persistent_db();
+        let mut e = CommandEngine::open(&conn, Scope::Draft).unwrap();
+        let results = e.execute_persistent_batch(vec![], &mut conn).unwrap();
+        assert!(results.is_empty());
+        assert_eq!(e.graph().len(), 0);
+        assert_eq!(e.undo_len(), 0);
     }
 
     #[test]

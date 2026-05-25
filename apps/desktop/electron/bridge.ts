@@ -1247,10 +1247,15 @@ interface NativeApi {
     project_path: string,
     tag: string,
     description: string,
+    // `#[napi(object)]` on `RevisionTrackedEntityJs` auto-converts the
+    // Rust `payload_hash` field to camelCase `payloadHash` on the JS
+    // side. The TS surface here mirrors what the napi runtime
+    // actually accepts — declaring `payload_hash` would compile but
+    // deserialize to `None` at runtime.
     entities?: Array<{
       category: string;
       id: string;
-      payload_hash: string;
+      payloadHash: string;
       label?: string | null;
     }>,
   ): unknown;
@@ -1882,13 +1887,18 @@ function adaptNative(n: NativeApi): BridgeBackend {
       if (typeof tag !== "string" || tag.length === 0) {
         throw new Error("deliverCreateRevision: missing required string field 'tag'");
       }
-      // Native side accepts caller-supplied entities (passed through
-      // as snake_case on the napi struct). The renderer params shape
-      // uses camelCase `payloadHash`; map both sides here.
-      const entities = (params.entities ?? []).map((e) => ({
+      // `#[napi(object)]` on `RevisionTrackedEntityJs` auto-converts
+      // the Rust struct's snake_case fields to camelCase on the JS
+      // side, so the napi entry point accepts `payloadHash` (not
+      // `payload_hash`). We preserve `undefined` instead of
+      // coercing to `[]` so the bridge service falls through to its
+      // graph-enumeration branch when the caller omits entities
+      // entirely — collapsing `undefined` to `[]` would silently
+      // create revisions with zero tracked entities.
+      const entities = params.entities?.map((e) => ({
         category: e.category,
         id: e.id,
-        payload_hash: e.payloadHash,
+        payloadHash: e.payloadHash,
         label: e.label ?? null,
       }));
       const raw = n.deliver_create_revision(

@@ -1458,8 +1458,24 @@ impl BridgeService {
     ) -> Result<CommandApplyResult, BridgeServiceError> {
         let (_pkg, mut conn) =
             ProjectPackage::open_with_master_key_and_database(project_path, &self.master_key)?;
-        let mut engine = CommandEngine::open(&conn, command.scope)?;
-        let result = engine.execute_persistent(command, &mut conn)?;
+        self.command_apply_on_conn(project_path, &mut conn, command)
+    }
+
+    /// Internal helper: apply a single command against an already-open
+    /// SQLCipher connection. Used by `command_apply` (which opens the
+    /// connection itself) and by callers that need to share a
+    /// connection across multiple steps (e.g.
+    /// [`Self::deliver_create_revision`], which journals the
+    /// `CreateRevision` command *and* enumerates the on-disk graph
+    /// for the revision snapshot without re-opening the project).
+    fn command_apply_on_conn(
+        &mut self,
+        project_path: &str,
+        conn: &mut rusqlite::Connection,
+        command: Command,
+    ) -> Result<CommandApplyResult, BridgeServiceError> {
+        let mut engine = CommandEngine::open(&*conn, command.scope)?;
+        let result = engine.execute_persistent(command, conn)?;
         self.invalidate_status_cache_for(project_path);
         Ok(CommandApplyResult {
             command_id: result.command_id,
@@ -1467,6 +1483,60 @@ impl BridgeService {
             undo_len: engine.undo_len() as u32,
             redo_len: engine.redo_len() as u32,
         })
+    }
+
+    /// Apply a sequence of commands as a single atomic batch.
+    ///
+    /// Opens the project package once, opens one [`CommandEngine`]
+    /// for the batch's shared scope (every command must agree on
+    /// `Command::scope`), and routes the whole sequence through
+    /// [`CommandEngine::execute_persistent_batch`] so a multi-thousand
+    /// command DXF / IFC ingest collapses to a single SQL transaction,
+    /// one engine open, and one status-cache invalidation rather than
+    /// N of each.
+    ///
+    /// Returns the per-command [`CommandApplyResult`]s in input
+    /// order, matching what N back-to-back `command_apply` calls
+    /// would have produced (minus the per-command undo/redo length
+    /// snapshot — those reflect the post-batch state on every entry,
+    /// which is what every current caller wants).
+    pub fn command_apply_batch(
+        &mut self,
+        project_path: &str,
+        commands: Vec<Command>,
+    ) -> Result<Vec<CommandApplyResult>, BridgeServiceError> {
+        if commands.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Every command in the batch must agree on scope so a single
+        // engine can validate + persist them. Mixed-scope batches
+        // are rejected here rather than producing a confusing
+        // engine-level scope-mismatch error half-way through.
+        let scope = commands[0].scope;
+        for cmd in &commands {
+            if cmd.scope != scope {
+                return Err(BridgeServiceError::Command(format!(
+                    "command_apply_batch: mixed-scope batch ({scope:?} vs {:?})",
+                    cmd.scope,
+                )));
+            }
+        }
+        let (_pkg, mut conn) =
+            ProjectPackage::open_with_master_key_and_database(project_path, &self.master_key)?;
+        let mut engine = CommandEngine::open(&conn, scope)?;
+        let results = engine.execute_persistent_batch(commands, &mut conn)?;
+        self.invalidate_status_cache_for(project_path);
+        let undo_len = engine.undo_len() as u32;
+        let redo_len = engine.redo_len() as u32;
+        Ok(results
+            .into_iter()
+            .map(|r| CommandApplyResult {
+                command_id: r.command_id,
+                applied: r.applied,
+                undo_len,
+                redo_len,
+            })
+            .collect())
     }
 
     /// Undo the most recently applied command. Returns the inverse
@@ -3334,22 +3404,33 @@ impl BridgeService {
         })?;
         let doc = DxfReader::read(f)
             .map_err(|e| BridgeServiceError::Invalid(format!("draft_import_dxf: parse: {e}")))?;
-        let mut entity_count = 0u32;
         let mut layer_count = doc.layers.len() as u32;
         let block_count = doc.block_records.len() as u32;
+        // Two-pass: convert every supported DXF entity to a
+        // `DrawPrimitive` command up front, count the rest as
+        // skipped, and apply the whole batch in one SQL transaction.
+        // Earlier versions issued N independent `command_apply`
+        // calls — O(N) project-package opens, O(N) engine reads of
+        // the entire entity table, O(N) audit-chain extensions.
+        // Routing through `command_apply_batch` collapses that to a
+        // single open, a single engine load, and a single
+        // transaction; the audit chain still records each gesture
+        // distinctly (see `execute_persistent_batch` phase 3).
+        let mut commands = Vec::with_capacity(doc.entities.len());
         let mut skipped = 0u32;
         for entity in &doc.entities {
-            if let Some(prim) = dxf_to_primitive(entity) {
-                let cmd = Command::user(CommandKind::DrawPrimitive(DrawPrimitive {
-                    entity_id: EntityId::new(),
-                    primitive: prim,
-                }));
-                self.command_apply(project_path, cmd)?;
-                entity_count += 1;
-            } else {
-                skipped += 1;
+            match dxf_to_primitive(entity) {
+                Some(prim) => {
+                    commands.push(Command::user(CommandKind::DrawPrimitive(DrawPrimitive {
+                        entity_id: EntityId::new(),
+                        primitive: prim,
+                    })))
+                }
+                None => skipped += 1,
             }
         }
+        let entity_count = commands.len() as u32;
+        self.command_apply_batch(project_path, commands)?;
         // Ensure we always report at least one layer (the "0" layer
         // exists by default in every DXF document).
         if layer_count == 0 {
@@ -3433,15 +3514,23 @@ impl BridgeService {
         use aec_core::revision::{RevisionDraft, RevisionEntity, RevisionStore};
 
         // 1) Open package + journal the command (audit trail + undo
-        //    so the gesture is reversible if a user mis-tags).
-        let (pkg, conn) =
+        //    so the gesture is reversible if a user mis-tags). We
+        //    share the same `conn` between the command-apply step
+        //    and the post-apply enumeration in (2) so the snapshot
+        //    sees exactly the state the command just committed —
+        //    `command_apply_on_conn` reuses the connection instead
+        //    of opening a second one. (Earlier iterations had two
+        //    independent opens; if `CreateRevision` ever gains
+        //    graph-mutating deltas, the outer conn would see stale
+        //    state until the next reopen.)
+        let (pkg, mut conn) =
             ProjectPackage::open_with_master_key_and_database(project_path, &self.master_key)?;
         let cmd = Command::user(CommandKind::CreateRevision(CreateRevision {
             tag: tag.to_string(),
             description: description.to_string(),
             revision_id: None,
         }));
-        let apply_res = self.command_apply(project_path, cmd)?;
+        let apply_res = self.command_apply_on_conn(project_path, &mut conn, cmd)?;
 
         // 2) Build the tracked-entity list. Prefer caller-supplied
         //    entries when present (so the renderer can include

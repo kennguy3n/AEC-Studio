@@ -1,5 +1,10 @@
 import { ipcMain } from "electron";
 import { getBridge } from "./bridge";
+import {
+  getActiveProjectPath,
+  peekActiveProjectPath,
+  setActiveProjectPath,
+} from "./active-project";
 
 /**
  * Register every IPC handler the preload bridge expects. Handlers are
@@ -19,11 +24,23 @@ export function registerIpcHandlers(): void {
   ipcMain.handle("project:createFromTemplate", async (_e, { templateKey, projectName }) => {
     assertString(templateKey, "templateKey");
     assertString(projectName, "projectName");
-    return getBridge().projectCreateFromTemplate(templateKey, projectName);
+    // Promote the freshly created project to "active" so subsequent
+    // draft / deliver / command handlers that don't carry an explicit
+    // `projectPath` (because the renderer's public `aec.*` API doesn't
+    // expose one) can resolve the active project path. See
+    // `active-project.ts` for the design rationale.
+    const summary = await getBridge().projectCreateFromTemplate(templateKey, projectName);
+    setActiveProjectPath(summary.path);
+    return summary;
   });
   ipcMain.handle("project:open", async (_e, { projectPath }) => {
     assertString(projectPath, "projectPath");
-    return getBridge().projectOpen(projectPath);
+    const summary = await getBridge().projectOpen(projectPath);
+    // Same active-project promotion as `createFromTemplate`. Set
+    // *after* `projectOpen` succeeds so a failed open (bad path,
+    // wrong master key, etc.) doesn't leave a stale active project.
+    setActiveProjectPath(summary.path);
+    return summary;
   });
   ipcMain.handle("project:save", async (_e, { projectPath }) => {
     assertString(projectPath, "projectPath");
@@ -64,29 +81,50 @@ export function registerIpcHandlers(): void {
   // Same object-shape validation as the Design handlers above. We don't
   // want one renderer-side bug to send `undefined` / a number across the
   // IPC boundary into the native bridge.
+  // Every `draft:*` handler resolves a `projectPath` before calling
+  // the bridge. The renderer-side `aec.draft.*` shape doesn't expose
+  // `projectPath` (pages don't track which project is open — the
+  // main process does), so we inject it from the active-project
+  // tracker. If a caller *does* include `projectPath` in the params
+  // (e.g. a renderer test that prefers to be explicit), the
+  // caller-supplied value wins.
   ipcMain.handle("draft:drawPrimitive", async (_e, p) => {
     assertObject(p, "params");
-    return getBridge().draftDrawPrimitive(p);
+    return getBridge().draftDrawPrimitive(
+      withResolvedProjectPath(p, "draftDrawPrimitive"),
+    );
   });
   ipcMain.handle("draft:editTool", async (_e, p) => {
     assertObject(p, "params");
-    return getBridge().draftEditTool(p);
+    return getBridge().draftEditTool(
+      withResolvedProjectPath(p, "draftEditTool"),
+    );
   });
   ipcMain.handle("draft:createSheet", async (_e, p) => {
     assertObject(p, "params");
-    return getBridge().draftCreateSheet(p);
+    return getBridge().draftCreateSheet(
+      withResolvedProjectPath(p, "draftCreateSheet"),
+    );
   });
   ipcMain.handle("draft:setLayerState", async (_e, p) => {
     assertObject(p, "params");
-    return getBridge().draftSetLayerState(p);
+    return getBridge().draftSetLayerState(
+      withResolvedProjectPath(p, "draftSetLayerState"),
+    );
   });
   ipcMain.handle("draft:importDxf", async (_e, { path }) => {
     assertString(path, "path");
-    return getBridge().draftImportDxf(path);
+    return getBridge().draftImportDxf({
+      projectPath: getActiveProjectPath("draftImportDxf"),
+      dxfPath: path,
+    });
   });
   ipcMain.handle("draft:exportDxf", async (_e, { path }) => {
     assertString(path, "path");
-    return getBridge().draftExportDxf(path);
+    return getBridge().draftExportDxf({
+      projectPath: getActiveProjectPath("draftExportDxf"),
+      dxfPath: path,
+    });
   });
 
   // ----- BIM -----
@@ -268,19 +306,23 @@ export function registerIpcHandlers(): void {
         })
       : undefined;
     return getBridge().deliverCreateRevision({
+      projectPath: getActiveProjectPath("deliverCreateRevision"),
       tag: p.tag,
       description,
       entities,
     });
   });
   ipcMain.handle("deliver:listRevisions", async () =>
-    getBridge().deliverListRevisions(),
+    getBridge().deliverListRevisions({
+      projectPath: getActiveProjectPath("deliverListRevisions"),
+    }),
   );
   ipcMain.handle("deliver:compareRevisions", async (_e, p) => {
     assertObject(p, "params");
     assertString(p.baseId, "baseId");
     assertString(p.headId, "headId");
     return getBridge().deliverCompareRevisions({
+      projectPath: getActiveProjectPath("deliverCompareRevisions"),
       baseId: p.baseId,
       headId: p.headId,
     });
@@ -380,6 +422,35 @@ function assertObject(
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new IpcValidationError(`${field} must be an object`);
   }
+}
+
+/**
+ * Return a copy of `params` with `projectPath` filled in. If the
+ * caller already supplied `projectPath` in the params (e.g. a
+ * renderer test or a future page that wants to override the active
+ * project), that value is preserved; otherwise we inject the
+ * tracked active project path. Throws `IpcValidationError` if
+ * neither source has a path (i.e. no project is currently open).
+ *
+ * Centralising this here keeps every `draft:*` handler that takes
+ * a `Record<string, unknown>` from re-implementing the same merge
+ * logic (and possibly skipping it).
+ */
+function withResolvedProjectPath(
+  params: Record<string, unknown>,
+  method: string,
+): Record<string, unknown> {
+  if (typeof params.projectPath === "string" && params.projectPath.length > 0) {
+    return params;
+  }
+  const active = peekActiveProjectPath();
+  if (active === null) {
+    throw new IpcValidationError(
+      `${method}: no project is currently open. Call ` +
+        `\`project.open\` or \`project.createFromTemplate\` first.`,
+    );
+  }
+  return { ...params, projectPath: active };
 }
 
 /**
