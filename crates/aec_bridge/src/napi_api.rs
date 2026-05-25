@@ -142,7 +142,12 @@ where
 {
     napi::bindgen_prelude::spawn_blocking(f)
         .await
-        .map_err(|e| Error::new(Status::GenericFailure, format!("blocking task panicked: {e}")))?
+        .map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("blocking task panicked: {e}"),
+            )
+        })?
 }
 
 #[napi(object)]
