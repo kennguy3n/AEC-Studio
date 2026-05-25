@@ -143,8 +143,32 @@ export interface BridgeBackend {
   draftEditTool(params: Record<string, unknown>): Promise<{ ok: true }>;
   draftCreateSheet(params: Record<string, unknown>): Promise<{ sheetId: string }>;
   draftSetLayerState(params: Record<string, unknown>): Promise<{ ok: true }>;
-  draftImportDxf(path: string): Promise<{ imported: number }>;
-  draftExportDxf(path: string): Promise<{ exported: true; path: string }>;
+  /**
+   * Import a DXF file into the project graph. `params.projectPath`
+   * is the encrypted-DB path of the active project (the same convention
+   * used by every other draft.* / design.* / bim.* method); `params.dxfPath`
+   * is the on-disk DXF file the user picked from the file dialog.
+   *
+   * Returned `imported` is the count of DXF entities successfully
+   * converted to modelling primitives and journaled through
+   * `command_apply`. DXF entities without a modelling-primitive
+   * counterpart yet (Insert / Spline / Hatch with non-trivial
+   * patterns) are skipped; the native side surfaces a `skipped`
+   * count internally, but the renderer contract collapses to just
+   * `imported` for now.
+   */
+  draftImportDxf(params: {
+    projectPath: string;
+    dxfPath: string;
+  }): Promise<{ imported: number }>;
+  /**
+   * Export the project graph's draft primitives to a DXF file at
+   * `params.dxfPath`.
+   */
+  draftExportDxf(params: {
+    projectPath: string;
+    dxfPath: string;
+  }): Promise<{ exported: true; path: string }>;
 
   /**
    * Parse an IFC file and return a structured preview summary. The
@@ -317,7 +341,16 @@ export interface BridgeBackend {
 
   // ----- Deliver mode -----
 
+  /**
+   * Create a tagged revision snapshot of the project at
+   * `params.projectPath`. `params.entities` is optional —
+   * when supplied, the native side uses the caller-provided
+   * tracked-entity list (BLAKE3-hashed by the renderer);
+   * when omitted, the bridge enumerates the on-disk graph
+   * and hashes every record's canonical body.
+   */
   deliverCreateRevision(params: {
+    projectPath: string;
     tag: string;
     description: string;
     entities?: Array<{
@@ -327,8 +360,14 @@ export interface BridgeBackend {
       label?: string | null;
     }>;
   }): Promise<RevisionSummary>;
-  deliverListRevisions(): Promise<RevisionSummary[]>;
+  /** List every revision in the project at `params.projectPath`. */
+  deliverListRevisions(params: { projectPath: string }): Promise<RevisionSummary[]>;
+  /**
+   * Diff two revisions. Both must already exist in
+   * `params.projectPath`'s `revisions/` directory.
+   */
   deliverCompareRevisions(params: {
+    projectPath: string;
     baseId: string;
     headId: string;
   }): Promise<VersionDiffSummary>;
@@ -1192,6 +1231,51 @@ interface NativeApi {
   ai_reject_diff(diff_id: string): Promise<unknown>;
   ai_cancel_job(job_id: string): Promise<unknown>;
   ai_runtime_status(): Promise<unknown>;
+  // Group A (Phase 10) — draft.* / deliver.*. Symmetric to the
+  // design.* / bim.* facades above: `params_json` is a stringified
+  // command struct, the napi side routes through `command_apply` so
+  // the gesture is journaled / auditable / undo-able. The four
+  // draft.draw/edit/sheet/layer methods are sync on the Rust side
+  // (the command-engine apply is in-memory plus a single
+  // already-`Immediate` SQL tx); the DXF and `deliver_*` methods are
+  // `#[napi] async fn` routed through `spawn_blocking_napi` because
+  // they open the encrypted project package, read the full entity
+  // table, and/or read/write large files — work that would otherwise
+  // stall the Electron main (libuv) thread on large projects. Each
+  // async method is typed `Promise<unknown>` rather than the looser
+  // `unknown` so a future contributor who writes
+  // `n.deliver_create_revision(...)` without `await` gets a TS error
+  // at compile time rather than silently consuming a pending-promise
+  // object at runtime (the missing-await trap that bit
+  // `deliverCreateRevision` in PR-X round 3).
+  draft_draw_primitive(project_path: string, params_json: string): unknown;
+  draft_edit_tool(project_path: string, params_json: string): unknown;
+  draft_create_sheet(project_path: string, params_json: string): unknown;
+  draft_set_layer_state(project_path: string, params_json: string): unknown;
+  draft_import_dxf(project_path: string, dxf_path: string): Promise<unknown>;
+  draft_export_dxf(project_path: string, dxf_path: string): Promise<unknown>;
+  deliver_create_revision(
+    project_path: string,
+    tag: string,
+    description: string,
+    // `#[napi(object)]` on `RevisionTrackedEntityJs` auto-converts the
+    // Rust `payload_hash` field to camelCase `payloadHash` on the JS
+    // side. The TS surface here mirrors what the napi runtime
+    // actually accepts — declaring `payload_hash` would compile but
+    // deserialize to `None` at runtime.
+    entities?: Array<{
+      category: string;
+      id: string;
+      payloadHash: string;
+      label?: string | null;
+    }>,
+  ): Promise<unknown>;
+  deliver_list_revisions(project_path: string): Promise<unknown>;
+  deliver_compare_revisions(
+    project_path: string,
+    base_id: string,
+    head_id: string,
+  ): Promise<unknown>;
 }
 
 /**
@@ -1307,6 +1391,21 @@ export const NATIVE_WIRED_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   "aiRejectDiff",
   "aiCancelJob",
   "aiRuntimeStatus",
+  // Group A (Phase 10) — draft.* / deliver.* parity with
+  // design.* / bim.*. Each routes through a `#[napi]` export
+  // in `crates/aec_bridge/src/napi_api.rs` that wraps the
+  // command struct in `Command::user(...)` and calls
+  // `command_apply`. DXF I/O is async on the Rust side
+  // because file sizes can be large; everything else is sync.
+  "draftDrawPrimitive",
+  "draftEditTool",
+  "draftCreateSheet",
+  "draftSetLayerState",
+  "draftImportDxf",
+  "draftExportDxf",
+  "deliverCreateRevision",
+  "deliverListRevisions",
+  "deliverCompareRevisions",
 ];
 
 /**
@@ -1321,17 +1420,7 @@ export const NATIVE_WIRED_METHODS: ReadonlyArray<keyof BridgeBackend> = [
  * is explicit and grep-able, rather than implicit in the spread operator
  * inside {@link adaptNative}.
  */
-export const NATIVE_FALLBACK_METHODS: ReadonlyArray<keyof BridgeBackend> = [
-  "draftDrawPrimitive",
-  "draftEditTool",
-  "draftCreateSheet",
-  "draftSetLayerState",
-  "draftImportDxf",
-  "draftExportDxf",
-  "deliverCreateRevision",
-  "deliverListRevisions",
-  "deliverCompareRevisions",
-];
+export const NATIVE_FALLBACK_METHODS: ReadonlyArray<keyof BridgeBackend> = [];
 
 /**
  * Wrap a freshly-loaded N-API library with the {@link BridgeBackend} shape.
@@ -1751,6 +1840,108 @@ function adaptNative(n: NativeApi): BridgeBackend {
       // "3 pending diffs" badge, widen the interface in a follow-up.
       return { state: r.state, lastError: r.lastError };
     },
+    // ----- Group A (Phase 10) draft.* / deliver.* -----
+    //
+    // Symmetric to the design.* adapters above:
+    // `requireProjectPath` extracts the encrypted-DB path and we
+    // forward the rest of the renderer-side params as a
+    // JSON-stringified command struct. The renderer contract
+    // returns `{ entityId }` (DrawPrimitive) or `{ sheetId }`
+    // (CreateSheet) for ID-emitting commands; the rest return
+    // `{ ok: true }`.
+    draftDrawPrimitive: async (params) => {
+      const projectPath = requireProjectPath(params, "draftDrawPrimitive");
+      const inner = withoutProjectPath(params);
+      return n.draft_draw_primitive(projectPath, JSON.stringify(inner)) as {
+        entityId: string;
+      };
+    },
+    draftEditTool: async (params) => {
+      const projectPath = requireProjectPath(params, "draftEditTool");
+      const inner = withoutProjectPath(params);
+      return n.draft_edit_tool(projectPath, JSON.stringify(inner)) as { ok: true };
+    },
+    draftCreateSheet: async (params) => {
+      const projectPath = requireProjectPath(params, "draftCreateSheet");
+      const inner = withoutProjectPath(params);
+      return n.draft_create_sheet(projectPath, JSON.stringify(inner)) as {
+        sheetId: string;
+      };
+    },
+    draftSetLayerState: async (params) => {
+      const projectPath = requireProjectPath(params, "draftSetLayerState");
+      const inner = withoutProjectPath(params);
+      return n.draft_set_layer_state(projectPath, JSON.stringify(inner)) as { ok: true };
+    },
+    draftImportDxf: async (params) => {
+      const r = (await n.draft_import_dxf(params.projectPath, params.dxfPath)) as {
+        entityCount: number;
+      };
+      return { imported: r.entityCount };
+    },
+    draftExportDxf: async (params) => {
+      const r = (await n.draft_export_dxf(params.projectPath, params.dxfPath)) as {
+        path: string;
+      };
+      return { exported: true, path: r.path };
+    },
+    deliverCreateRevision: async (params) => {
+      // The native `deliver_create_revision` returns the same
+      // `RevisionSummary` shape the renderer's TS interface uses
+      // (via `#[serde(rename_all = "camelCase")]` on the Rust
+      // service struct), but wrapped in a `{ summaryJson }` envelope
+      // because nested `tracked_entities` doesn't flatten cleanly
+      // through napi. The renderer unwraps it here so the
+      // `BridgeBackend.deliverCreateRevision` return type stays
+      // `RevisionSummary`.
+      const tag = params.tag;
+      if (typeof tag !== "string" || tag.length === 0) {
+        throw new Error("deliverCreateRevision: missing required string field 'tag'");
+      }
+      // `#[napi(object)]` on `RevisionTrackedEntityJs` auto-converts
+      // the Rust struct's snake_case fields to camelCase on the JS
+      // side, so the napi entry point accepts `payloadHash` (not
+      // `payload_hash`). We preserve `undefined` instead of
+      // coercing to `[]` so the bridge service falls through to its
+      // graph-enumeration branch when the caller omits entities
+      // entirely — collapsing `undefined` to `[]` would silently
+      // create revisions with zero tracked entities.
+      const entities = params.entities?.map((e) => ({
+        category: e.category,
+        id: e.id,
+        payloadHash: e.payloadHash,
+        label: e.label ?? null,
+      }));
+      // `n.deliver_create_revision` is `#[napi] async fn` on the Rust
+      // side (PR-X round 3 routed it through `spawn_blocking_napi`
+      // because it opens the encrypted project package, reads the
+      // entity table to enumerate trackable entities when the caller
+      // omits them, and writes the snapshot file to disk). The
+      // matching `NativeApi.deliver_create_revision` signature is
+      // typed `Promise<unknown>` so a missing `await` here would be a
+      // compile error rather than the silent
+      // `JSON.parse(undefined) -> SyntaxError` runtime crash that
+      // shipped to Devin Review in round 3.
+      const raw = (await n.deliver_create_revision(
+        params.projectPath,
+        tag,
+        params.description,
+        entities,
+      )) as { summaryJson: string };
+      return JSON.parse(raw.summaryJson) as RevisionSummary;
+    },
+    deliverListRevisions: async (params) => {
+      const raw = (await n.deliver_list_revisions(params.projectPath)) as Array<{
+        summaryJson: string;
+      }>;
+      return raw.map((r) => JSON.parse(r.summaryJson) as RevisionSummary);
+    },
+    deliverCompareRevisions: async ({ projectPath, baseId, headId }) => {
+      const raw = (await n.deliver_compare_revisions(projectPath, baseId, headId)) as {
+        diffJson: string;
+      };
+      return JSON.parse(raw.diffJson) as VersionDiffSummary;
+    },
   };
   // Self-check 0: the two catalogues must be *disjoint*. A method
   // listed in both `NATIVE_WIRED_METHODS` and `NATIVE_FALLBACK_METHODS`
@@ -1941,11 +2132,11 @@ export function inProcessBackend(): BridgeBackend {
     async draftSetLayerState(_p) {
       return { ok: true };
     },
-    async draftImportDxf(_path) {
+    async draftImportDxf(_params) {
       return { imported: 0 };
     },
-    async draftExportDxf(p) {
-      return { exported: true, path: p };
+    async draftExportDxf(params) {
+      return { exported: true, path: params.dxfPath };
     },
 
     async bimImportIfc(path) {
@@ -2363,6 +2554,16 @@ export function inProcessBackend(): BridgeBackend {
     },
 
     async deliverCreateRevision(params) {
+      // `projectPath` is required at the interface level but the
+      // in-process backend doesn't own a real on-disk project — we
+      // still validate the field exists so renderer wiring bugs
+      // (missing projectPath) fail loudly here the same way they
+      // do against the native backend.
+      if (typeof params.projectPath !== "string" || params.projectPath.length === 0) {
+        throw new Error(
+          "deliverCreateRevision: params.projectPath must be a non-empty string",
+        );
+      }
       const tag = params.tag.trim();
       if (!tag) {
         throw new Error("revision tag must not be empty");
@@ -2388,12 +2589,22 @@ export function inProcessBackend(): BridgeBackend {
       revisions.push(rev);
       return rev;
     },
-    async deliverListRevisions() {
+    async deliverListRevisions(params) {
+      if (typeof params?.projectPath !== "string" || params.projectPath.length === 0) {
+        throw new Error(
+          "deliverListRevisions: params.projectPath must be a non-empty string",
+        );
+      }
       return revisions
         .slice()
         .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
     },
-    async deliverCompareRevisions({ baseId, headId }) {
+    async deliverCompareRevisions({ projectPath, baseId, headId }) {
+      if (typeof projectPath !== "string" || projectPath.length === 0) {
+        throw new Error(
+          "deliverCompareRevisions: params.projectPath must be a non-empty string",
+        );
+      }
       const base = revisions.find((r) => r.revisionId === baseId);
       const head = revisions.find((r) => r.revisionId === headId);
       if (!base) throw new Error(`unknown base revision: ${baseId}`);

@@ -25,6 +25,7 @@ napi = ["dep:napi", "dep:napi-derive", "dep:napi-build"]
 aec_core = { path = "../aec_core" }
 aec_audit = { path = "../aec_audit" }
 aec_bim = { path = "../aec_bim" }
+aec_cad = { path = "../aec_cad" }
 aec_command = { path = "../aec_command" }
 rusqlite = { workspace = true }
 aec_geometry = { path = "../aec_geometry" }

@@ -1,10 +1,12 @@
 //! DXF (ASCII) reader and writer.
 
+pub mod convert;
 pub mod entities;
 pub mod reader;
 pub mod tables;
 pub mod writer;
 
+pub use convert::{dxf_to_primitive, primitive_to_dxf};
 pub use entities::{
     DxfArc, DxfCircle, DxfDimStyle, DxfDimension, DxfDimensionKind, DxfEllipse, DxfEntity,
     DxfHatch, DxfHatchLoop, DxfInsert, DxfLine, DxfPolyline, DxfPolylineVertex, DxfSpline, DxfText,
