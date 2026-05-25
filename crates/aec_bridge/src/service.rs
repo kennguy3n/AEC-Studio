@@ -5,7 +5,7 @@
 //! this layer trivially testable.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -48,6 +48,27 @@ use crate::snapshot_cache::{SnapshotCache, SnapshotKey};
 /// chosen as the rough boundary between "interactive parse" (< 5 s
 /// on a modern laptop) and "go-grab-a-coffee parse".
 pub(crate) const BIM_IMPORT_LARGE_FILE_THRESHOLD_BYTES: u64 = 100 * 1024 * 1024;
+
+/// Process-wide cache for the AI tool-schema registry. `defaults()`
+/// parses a bundled JSON catalogue every call; `ai_plan` is called
+/// interactively per user prompt, so we initialise once and serve
+/// every subsequent call from the same immutable reference. The
+/// registry is `Clone + Send + Sync` and has no per-service state,
+/// so caching it as a static is safe.
+static AI_TOOL_SCHEMAS: OnceLock<AiToolSchemaRegistry> = OnceLock::new();
+
+/// Process-wide cache for the AI grammar registry. Same rationale as
+/// [`AI_TOOL_SCHEMAS`] — the bundled GBNF blobs are parsed once and
+/// shared as a read-only handle across every `ai_plan` invocation.
+static AI_GRAMMARS: OnceLock<AiGrammarRegistry> = OnceLock::new();
+
+fn ai_tool_schemas() -> &'static AiToolSchemaRegistry {
+    AI_TOOL_SCHEMAS.get_or_init(AiToolSchemaRegistry::defaults)
+}
+
+fn ai_grammars() -> &'static AiGrammarRegistry {
+    AI_GRAMMARS.get_or_init(AiGrammarRegistry::defaults)
+}
 
 #[derive(Debug, Error)]
 pub enum BridgeServiceError {
@@ -2608,11 +2629,12 @@ impl BridgeService {
     /// The renderer's "AI sidebar" calls this once at session start to
     /// populate the tool picker.
     pub fn ai_list_tools(&self) -> Result<Vec<AiToolDescriptor>, BridgeServiceError> {
-        let schemas = AiToolSchemaRegistry::defaults();
         // `iter_sorted` already orders by tool name, so the wire payload
         // is deterministic across calls (HashMap iteration order is not).
-        let tools: Vec<AiToolDescriptor> =
-            schemas.iter_sorted().map(AiToolDescriptor::from).collect();
+        let tools: Vec<AiToolDescriptor> = ai_tool_schemas()
+            .iter_sorted()
+            .map(AiToolDescriptor::from)
+            .collect();
         Ok(tools)
     }
 
@@ -2649,9 +2671,13 @@ impl BridgeService {
                 BridgeServiceError::Ai(format!("ai_plan context_json deserialisation failed: {e}"))
             })?
         };
-        let schemas = AiToolSchemaRegistry::defaults();
-        let grammars = AiGrammarRegistry::defaults();
-        let planner = ToolPlanner::new(&schemas, &grammars);
+        // The registries are parsed from JSON in `defaults()` (see
+        // `ai_tools.json` and the GBNF blobs). That parse is small
+        // (~2 KiB) but `ai_plan` is called interactively, so we cache
+        // both via `OnceLock` to amortise the cost across the session.
+        // Both types are immutable read-only collections behind shared
+        // references, so the cache is sound under concurrent reads.
+        let planner = ToolPlanner::new(ai_tool_schemas(), ai_grammars());
         let request = AiPlanRequest {
             tool: tool_name,
             scope,

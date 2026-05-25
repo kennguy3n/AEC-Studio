@@ -85,9 +85,15 @@ pub fn request(
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
     let mut stream = TcpStream::connect_timeout(&addr, connect_timeout)
         .map_err(|source| HttpError::Connect { addr, source })?;
+    // Map each setup error to the side it governs (read vs write)
+    // so the user-facing message tells the truth about which channel
+    // the platform refused to configure. A zero-duration timeout on
+    // some platforms (e.g. Windows pre-Vista) returns EINVAL here
+    // and `"write request: ..."` for a read-timeout failure would be
+    // genuinely confusing during debug.
     stream
         .set_read_timeout(Some(io_timeout))
-        .map_err(HttpError::Write)?;
+        .map_err(HttpError::Read)?;
     stream
         .set_write_timeout(Some(io_timeout))
         .map_err(HttpError::Write)?;
@@ -166,8 +172,15 @@ fn parse_response<R: Read + BufRead>(reader: &mut R) -> Result<HttpResponse, Htt
         }
     }
 
-    // Body.
-    let body = if let Some(len) = content_length {
+    // Body. Per RFC 7230 §3.3.3 rule 3, `Transfer-Encoding` takes
+    // precedence over `Content-Length` when both are present (the
+    // historical request-smuggling exploit class). The llama-server
+    // sidecar never sends both today, but checking TE first is
+    // defense-in-depth in case this client is ever reused against a
+    // different loopback server.
+    let body = if transfer_encoding_chunked {
+        read_chunked(reader)?
+    } else if let Some(len) = content_length {
         if len > MAX_RESPONSE_BODY_BYTES {
             return Err(HttpError::BodyTooLarge {
                 limit: MAX_RESPONSE_BODY_BYTES,
@@ -176,8 +189,6 @@ fn parse_response<R: Read + BufRead>(reader: &mut R) -> Result<HttpResponse, Htt
         let mut buf = vec![0u8; len];
         reader.read_exact(&mut buf).map_err(HttpError::Read)?;
         String::from_utf8(buf).map_err(|_| HttpError::MalformedHeaders)?
-    } else if transfer_encoding_chunked {
-        read_chunked(reader)?
     } else {
         // Connection: close → read until EOF, bounded by the cap.
         let mut buf = Vec::new();
