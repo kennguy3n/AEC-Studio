@@ -1175,9 +1175,18 @@ impl From<crate::service::BimClassifyResult> for BimClassifyResultJs {
 /// classification from `scheme`. Supported schemes: `"ifc"`,
 /// `"uniformat-ii"`, `"omniclass-21"`. Routes through
 /// [`crate::service::BridgeService::bim_classify`].
+///
+/// Routed through `with_service` (the write-lock helper) rather than
+/// `with_service_ref_fallible` because `bim_classify` mutates the
+/// project's SQLite DB via `UPDATE entities` (IFC scheme) and
+/// `INSERT INTO components` (Uniformat/OmniClass schemes). Even
+/// though `BridgeService` itself is not mutated, two concurrent
+/// classifications on the same project would race the underlying
+/// SQLCipher writes and could surface `SQLITE_BUSY`. The write lock
+/// serialises them at the bridge boundary.
 #[napi]
 pub fn bim_classify(project_path: String, scheme: String) -> Result<BimClassifyResultJs> {
-    with_service_ref_fallible(move |svc| svc.bim_classify(&project_path, &scheme)).map(Into::into)
+    with_service(move |svc| svc.bim_classify(&project_path, &scheme)).map(Into::into)
 }
 
 /// JS-facing result of [`bim_set_property`]. Mirrors the
@@ -1208,6 +1217,21 @@ impl From<crate::service::BimSetPropertyResult> for BimSetPropertyResultJs {
 /// a `bim_attach_ifc` re-attach (which wipes `bim/%` for changed
 /// entities). Routes through
 /// [`crate::service::BridgeService::bim_set_property`].
+///
+/// Routed through `with_service` (write lock) because the method
+/// mutates the project's SQLite DB via `INSERT INTO components ON
+/// CONFLICT`. Same reasoning as [`bim_classify`] above — the write
+/// lock serialises concurrent property edits at the bridge boundary
+/// so they don't race the underlying SQLCipher write.
+///
+/// Property edits **bypass** the [`crate::service::BridgeService`]
+/// command engine, so they do **not** participate in undo/redo at
+/// the engine level. The returned `previousValue` is provided so the
+/// renderer's local undo stack can re-call `bim_set_property` with
+/// the prior value — this is a UI-level undo, not an engine-level
+/// one. If a future change wants engine-level undo for property
+/// edits, this method needs to be reframed as a `Command::user`
+/// variant and routed through `command_apply`.
 #[napi]
 pub fn bim_set_property(
     project_path: String,
@@ -1216,10 +1240,8 @@ pub fn bim_set_property(
     key: String,
     value: String,
 ) -> Result<BimSetPropertyResultJs> {
-    with_service_ref_fallible(move |svc| {
-        svc.bim_set_property(&project_path, &entity_id, &pset, &key, &value)
-    })
-    .map(Into::into)
+    with_service(move |svc| svc.bim_set_property(&project_path, &entity_id, &pset, &key, &value))
+        .map(Into::into)
 }
 
 /// JS-facing summary of [`crate::service::BridgeService::bim_export_ifc`].

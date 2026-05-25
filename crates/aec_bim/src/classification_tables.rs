@@ -616,6 +616,31 @@ pub const OMNICLASS_21: &[OmniClassCode] = &[
         title: "Ceiling Finishes",
         level: 3,
     },
+    OmniClassCode {
+        code: "21-03 30 00",
+        title: "Stairs",
+        level: 2,
+    },
+    OmniClassCode {
+        code: "21-03 30 10",
+        title: "Regular Stairs",
+        level: 3,
+    },
+    OmniClassCode {
+        code: "21-03 30 20",
+        title: "Special Stairs",
+        level: 3,
+    },
+    OmniClassCode {
+        code: "21-03 30 30",
+        title: "Ramps",
+        level: 3,
+    },
+    OmniClassCode {
+        code: "21-03 30 40",
+        title: "Stair Specialties",
+        level: 3,
+    },
     // ----- 21-04: Services -----
     OmniClassCode {
         code: "21-04 00 00",
@@ -743,10 +768,16 @@ pub enum ClassificationScheme {
     /// `entities.kind` in-place.
     Ifc,
     /// Tag entities with their ASTM E1557 Uniformat-II code. Written
-    /// into a `bim/classification/uniformat-ii` component row.
+    /// into an `aec/classification/uniformat-ii` component row. The
+    /// `aec/` prefix (rather than `bim/`) is deliberate — the
+    /// `bim_attach_ifc` re-attach path wipes `bim/%` components for
+    /// changed entities (see `bim_attach.rs:463`), so storing the
+    /// user-visible classification under `aec/` keeps it intact across
+    /// re-imports of the underlying IFC.
     UniformatIi,
     /// Tag entities with their OmniClass Table 21 code. Written into
-    /// a `bim/classification/omniclass-21` component row.
+    /// an `aec/classification/omniclass-21` component row. Same
+    /// re-attach survival reasoning as [`Self::UniformatIi`].
     Omniclass21,
 }
 
@@ -775,8 +806,11 @@ impl ClassificationScheme {
     pub fn component_kind(&self) -> Option<&'static str> {
         match self {
             Self::Ifc => None,
-            Self::UniformatIi => Some("bim/classification/uniformat-ii"),
-            Self::Omniclass21 => Some("bim/classification/omniclass-21"),
+            // The `aec/` prefix (rather than `bim/`) keeps user
+            // classification intact when `bim_attach_ifc` wipes
+            // `bim/%` overlays on re-attach (`bim_attach.rs:463`).
+            Self::UniformatIi => Some("aec/classification/uniformat-ii"),
+            Self::Omniclass21 => Some("aec/classification/omniclass-21"),
         }
     }
 }
@@ -838,8 +872,14 @@ pub fn ifc_to_omniclass(class: &IfcClass) -> Option<&'static OmniClassCode> {
         IfcClass::IfcWindow => "21-02 20 20",
         IfcClass::IfcDoor => "21-02 20 30",
         IfcClass::IfcCovering => "21-03 20 10",
-        IfcClass::IfcStair => "21-03 10 10",
-        IfcClass::IfcRailing => "21-03 10 10",
+        // Stairs have their own CSI Table-21 group at `21-03 30 NN`.
+        // Railings count as stair specialties when attached to stairs
+        // (handrails/balustrades) — using `21-03 30 40` Stair
+        // Specialties is more accurate than the Interior Partitions
+        // bucket. Opening elements (cutouts for doors/windows) are
+        // partition-adjacent and stay at `21-03 10 10`.
+        IfcClass::IfcStair => "21-03 30 10",
+        IfcClass::IfcRailing => "21-03 30 40",
         IfcClass::IfcOpeningElement => "21-03 10 10",
         IfcClass::IfcColumn => "21-02 10 10",
         IfcClass::IfcBeam => "21-02 10 10",
@@ -897,7 +937,18 @@ pub fn classify_kind(kind: &str) -> Option<IfcClass> {
         "lightfixture" | "light" | "luminaire" => Some(IfcClass::IfcLightFixture),
         "plumbingfixture" | "plumbing" => Some(IfcClass::IfcPlumbingFixture),
         "sanitaryterminal" | "sanitary" => Some(IfcClass::IfcSanitaryTerminal),
-        "furniture" | "furnishingelement" | "furnishing" => Some(IfcClass::IfcFurniture),
+        // IFC2x3/IFC4 distinguish two furnishing entity classes:
+        // `IfcFurniture` is movable (chairs, desks, beds) and maps to
+        // Uniformat `E2020` / OmniClass `21-05 20 20` (Movable
+        // Furnishings); `IfcFurnishingElement` is fixed/built-in
+        // (built-in cabinetry, fixed seating) and maps to `E2010` /
+        // `21-05 20 10` (Fixed Furnishings). Keep the two arms
+        // separate so the Uniformat/OmniClass downstream lookups see
+        // the right class.
+        "furniture" => Some(IfcClass::IfcFurniture),
+        "furnishingelement" | "furnishing" | "fixed_furniture" | "builtin_furniture" => {
+            Some(IfcClass::IfcFurnishingElement)
+        }
         // Viewport artefacts — no IFC class.
         "camera" => None,
         // Material-only entities — no IFC element class.
@@ -1022,11 +1073,42 @@ mod tests {
         assert_eq!(ClassificationScheme::Ifc.component_kind(), None);
         assert_eq!(
             ClassificationScheme::UniformatIi.component_kind(),
-            Some("bim/classification/uniformat-ii"),
+            Some("aec/classification/uniformat-ii"),
         );
         assert_eq!(
             ClassificationScheme::Omniclass21.component_kind(),
-            Some("bim/classification/omniclass-21"),
+            Some("aec/classification/omniclass-21"),
+        );
+    }
+
+    #[test]
+    fn classify_kind_distinguishes_fixed_vs_movable_furnishings() {
+        assert_eq!(classify_kind("furniture"), Some(IfcClass::IfcFurniture));
+        assert_eq!(
+            classify_kind("furnishingelement"),
+            Some(IfcClass::IfcFurnishingElement),
+        );
+        assert_eq!(
+            classify_kind("furnishing"),
+            Some(IfcClass::IfcFurnishingElement),
+        );
+    }
+
+    #[test]
+    fn ifc_to_omniclass_returns_distinct_codes_for_stair_and_railing() {
+        assert_eq!(
+            ifc_to_omniclass(&IfcClass::IfcStair).unwrap().code,
+            "21-03 30 10",
+        );
+        assert_eq!(
+            ifc_to_omniclass(&IfcClass::IfcRailing).unwrap().code,
+            "21-03 30 40",
+        );
+        // OpeningElement stays in partitions since openings ARE in
+        // partitions/walls.
+        assert_eq!(
+            ifc_to_omniclass(&IfcClass::IfcOpeningElement).unwrap().code,
+            "21-03 10 10",
         );
     }
 }

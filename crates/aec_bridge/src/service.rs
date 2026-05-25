@@ -1949,7 +1949,8 @@ impl BridgeService {
     /// Classification overrides live under the `aec/classification/`
     /// component-kind prefix, **not** `bim/`, so they survive a
     /// `bim_attach_ifc` re-attach (which wipes `bim/%` for changed
-    /// entities — see `bim_attach.rs:462`).
+    /// entities — see `bim_attach.rs:463`). The prefix is supplied
+    /// by [`aec_bim::classification_tables::ClassificationScheme::component_kind`].
     pub fn bim_classify(
         &self,
         project_path: &str,
@@ -2050,8 +2051,11 @@ impl BridgeService {
         tx.commit()?;
 
         // Invalidate the engine-status cache so the renderer's next
-        // status poll picks up the new entity-kind histogram.
-        self.engine_status_cache.invalidate(Path::new(project_path));
+        // status poll picks up the new entity-kind histogram. Use the
+        // shared helper that canonicalises `project_path` first —
+        // the cache is keyed on canonical paths, so passing the raw
+        // input would silently leave a stale entry for one full TTL.
+        self.invalidate_status_cache_for(project_path);
 
         Ok(BimClassifyResult {
             scheme: scheme.as_str().into(),
@@ -2156,7 +2160,10 @@ impl BridgeService {
         )?;
         tx.commit()?;
 
-        self.engine_status_cache.invalidate(Path::new(project_path));
+        // Canonicalise via the shared helper so the invalidation
+        // hits the same cache key the original `project_engine_status`
+        // call inserted (the cache is keyed on canonical paths).
+        self.invalidate_status_cache_for(project_path);
         Ok(BimSetPropertyResult {
             entity_id: entity_id.to_string(),
             pset: pset.to_string(),

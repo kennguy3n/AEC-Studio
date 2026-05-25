@@ -746,10 +746,20 @@ export interface BimClassifyResult {
 /**
  * Result of `bimSetProperty` (PR-W Phase 4). Field-for-field
  * mirror of `BimSetPropertyResultJs` in
- * `crates/aec_bridge/src/napi_api.rs`. `previousValue` is `null`
- * for the first write to a `(pset, key)` pair so the renderer's
- * undo gesture can detect "first write" and not push an inverse
- * onto its undo stack.
+ * `crates/aec_bridge/src/napi_api.rs`.
+ *
+ * `previousValue` is `null` for the first write to a `(pset, key)`
+ * pair so the renderer can detect "first write" and tag its
+ * UI-level undo stack accordingly.
+ *
+ * NOTE: `bimSetProperty` bypasses the bridge command engine, so
+ * property edits are **not** undo/redo-able via
+ * `commandUndo` / `commandRedo`. Renderers that want undo must
+ * re-call `bimSetProperty(..., previousValue)` themselves —
+ * this is a UI-level undo, not an engine-level one. If a future
+ * change wants engine-level undo, the underlying Rust method
+ * needs to be reframed as a `Command::user` variant and routed
+ * through `command_apply`.
  */
 export interface BimSetPropertyResult {
   entityId: string;
