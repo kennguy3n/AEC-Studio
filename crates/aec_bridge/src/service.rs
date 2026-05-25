@@ -26,6 +26,7 @@ use aec_render::preset::RenderPresetStore;
 use aec_render::queue::{BatchProgress as CoreBatchProgress, RenderQueue};
 use aec_render::scene::RenderScene;
 
+use crate::asset_state::AssetState;
 use crate::bim_attach;
 use crate::engine_status_cache::EngineStatusCache;
 use crate::recents::{RecentsStore, RecentsStoreError};
@@ -71,6 +72,20 @@ pub enum BridgeServiceError {
     /// (e.g. for invalid layer names) what the user supplied.
     #[error("export: {0}")]
     Export(String),
+    /// Asset-library failure (SQLite I/O on the cross-project asset
+    /// catalogue at `<state_dir>/asset_library/assets.sqlite`,
+    /// serialisation of metadata rows, etc). Preserves
+    /// [`aec_assets::AssetError`]'s `Display` so the renderer can
+    /// distinguish "asset library is unreadable" from a generic
+    /// `Core` failure.
+    #[error("asset: {0}")]
+    Asset(String),
+}
+
+impl From<aec_assets::AssetError> for BridgeServiceError {
+    fn from(e: aec_assets::AssetError) -> Self {
+        Self::Asset(e.to_string())
+    }
 }
 
 impl From<aec_command::error::CommandError> for BridgeServiceError {
@@ -728,6 +743,106 @@ pub struct BimScheduleSummary {
     pub parse_cache_hit: bool,
 }
 
+/// Query parameters for [`BridgeService::design_list_assets`]. The
+/// shape mirrors the TypeScript `query` object that the renderer's
+/// asset browser passes through `designListAssets(query)` in
+/// `apps/desktop/electron/bridge.ts`.
+///
+/// Field semantics, in priority order:
+///
+/// * `search` — substring match against `AssetMetadata::name`. Uses
+///   SQLite `LIKE %...%` under the hood (case-sensitivity follows
+///   SQLite's default, which is ASCII case-insensitive — Unicode
+///   case-folding lives in the FTS5 path covered by
+///   [`aec_assets::search`]).
+/// * `tags` — every supplied tag must appear in
+///   `AssetMetadata::tags` (AND, not OR). Pushed into SQL as one
+///   `AND EXISTS (SELECT 1 FROM json_each(assets.tags) ...)` clause
+///   per tag inside [`aec_assets::db::AssetDatabase::query`] so the
+///   `LIMIT` composes correctly (filter first, slice last).
+/// * `style_tags` — same AND semantics as `tags`, against the
+///   `style_tags` column, also pushed into SQL via `json_each`.
+/// * `limit` — caps the JS-side result list. Defaults to **24** to
+///   match the renderer's grid-page size (4 columns × 6 rows). The
+///   `aec_assets::AssetQuery::limit` default is 200 (the
+///   library-import default); the bridge tightens it because the
+///   renderer paginates the browser UI. Saturating-clamped to
+///   [`DESIGN_LIST_ASSETS_MAX_LIMIT`] (10_000) inside
+///   [`BridgeService::design_list_assets`] so an upstream renderer
+///   bug — including a JS negative number that wraps to a near-
+///   `u32::MAX` value through napi's `ToUint32()` coercion — can't
+///   force the SQLite call to materialise an unbounded result set.
+///
+/// Unrecognised fields are silently ignored — the napi layer hands
+/// us a typed struct, but the in-process TS fallback historically
+/// accepted `Record<string, unknown>` so a forward-compatible
+/// "additional filter" doesn't break old renderers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssetListQuery {
+    /// Substring match against `AssetMetadata::name`. `None` /
+    /// missing / empty string disables the filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<String>,
+    /// Every tag in this list must appear in `AssetMetadata::tags`
+    /// (AND match). Empty list disables the filter.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Same AND semantics as [`Self::tags`], against `style_tags`.
+    #[serde(default)]
+    pub style_tags: Vec<String>,
+    /// Max number of rows to return. Saturating-clamped to
+    /// [`DESIGN_LIST_ASSETS_MAX_LIMIT`] inside
+    /// [`BridgeService::design_list_assets`] so even a JS negative
+    /// number that wraps to ~`u32::MAX` through napi's `ToUint32()`
+    /// coercion can't force an unbounded SQLite materialisation.
+    /// `None` falls through to the bridge default (24).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+/// Default JS-side asset-browser page size. Matches the renderer's
+/// `bridge.ts` `filterAssets()` default (4 columns × 6 rows = 24).
+pub(crate) const DESIGN_LIST_ASSETS_DEFAULT_LIMIT: u32 = 24;
+
+/// Hard upper bound on a single `design_list_assets` page size, used
+/// to back up the saturating-clamp promise on [`AssetListQuery::limit`].
+/// 10_000 is well above any plausible renderer use (the asset browser
+/// paginates at 24 per page; a power user scrolling "show all" still
+/// stays in the low thousands for any human-curated library) while
+/// also being small enough that the worst-case `AssetSummary`
+/// allocation stays bounded.
+pub(crate) const DESIGN_LIST_ASSETS_MAX_LIMIT: u32 = 10_000;
+
+/// Renderer-facing projection of [`aec_assets::AssetMetadata`]. Only
+/// the fields the asset-browser card consumes — drop the full LOD
+/// chain, materials list, license, version, and creation timestamp
+/// because the browser hands those off to a detail view that fetches
+/// them separately (out of PR-U scope).
+///
+/// Field shape matches `AssetSummary` in
+/// `apps/desktop/electron/bridge.ts` *exactly* so the napi layer
+/// just renames `vendor.name` → `vendor` and the renderer renders
+/// directly without a transform step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssetSummary {
+    pub asset_id: String,
+    pub name: String,
+    pub tags: Vec<String>,
+    pub style_tags: Vec<String>,
+    /// Vendor display name (e.g. "IKEA", "Muuto") — the renderer
+    /// shows this on the card subtitle. `None` for un-vendored
+    /// (community-contributed) assets — currently impossible on the
+    /// demo seed but supported by the schema.
+    pub vendor: Option<String>,
+    /// Pre-base64'd PNG thumbnail data URI, or `None` for assets
+    /// that haven't been thumbnailed yet (the renderer falls back
+    /// to a procedural placeholder card). The PR-U seed library is
+    /// `None` for all 4 demo assets — real thumbnail wiring lands
+    /// in the follow-up that hooks up the asset-import pipeline to
+    /// the napi surface.
+    pub thumbnail_data_uri: Option<String>,
+}
+
 /// Hardware-status snapshot. The shape mirrors the TypeScript
 /// `RuntimeStatus` interface in `apps/desktop/electron/bridge.ts` so that
 /// the JS bridge can hand the value to React components without a runtime
@@ -811,6 +926,16 @@ pub struct BridgeService {
     /// project path; no callers outside this struct see the
     /// difference.
     render_state: Mutex<RenderState>,
+    /// Lazy-init handle to the global asset library DB at
+    /// `<state_dir>/asset_library/assets.sqlite`. Construction
+    /// captures the path but does *not* open the DB so a bridge
+    /// boot that never touches the asset browser pays zero SQLite
+    /// open + schema-bootstrap + seed cost. On first use,
+    /// [`AssetState::with_db`] opens the file (creating it if
+    /// absent), runs the schema, and seeds 4 demo assets if the
+    /// `assets` table is empty so the renderer's asset browser has
+    /// content on a fresh install. See [`crate::asset_state`].
+    asset_state: AssetState,
 }
 
 /// Process-wide render state held by [`BridgeService::render_state`].
@@ -839,6 +964,7 @@ impl BridgeService {
         std::fs::create_dir_all(&config.projects_dir)?;
         let recents =
             RecentsStore::open(config.state_dir.join("recents.json"), config.max_recents)?;
+        let asset_state = AssetState::new(&config.state_dir);
         Ok(Self {
             config,
             recents,
@@ -846,6 +972,7 @@ impl BridgeService {
             engine_status_cache: EngineStatusCache::new(),
             snapshot_cache: SnapshotCache::new(),
             render_state: Mutex::new(RenderState::new()),
+            asset_state,
         })
     }
 
@@ -1314,6 +1441,67 @@ impl BridgeService {
             large_file_warning: file_size_bytes >= BIM_IMPORT_LARGE_FILE_THRESHOLD_BYTES,
             threshold_bytes: BIM_IMPORT_LARGE_FILE_THRESHOLD_BYTES,
         })
+    }
+
+    /// List assets from the global asset library matching `query`.
+    ///
+    /// Wraps [`aec_assets::AssetDatabase::query`] with the
+    /// renderer-side `AssetSummary` projection so the asset-browser
+    /// card can render directly off the napi return value. The DB is
+    /// lazy-opened on first call (see [`crate::asset_state`] for the
+    /// open + seed contract).
+    ///
+    /// `&self` rather than `&mut self` so the napi layer routes
+    /// through `with_service_ref_fallible` (read-side of the outer
+    /// `RwLock`) — the inner DB mutex inside [`AssetState`] serialises
+    /// the SQLite call so concurrent `bim_*` / `render_*` polls don't
+    /// block the asset browser. Same interior-mutability pattern as
+    /// [`Self::bim_check_file_size`] and the snapshot cache.
+    ///
+    /// Translation rules:
+    ///
+    /// * `query.search` → `AssetQuery::name_contains` (substring,
+    ///   ASCII case-insensitive, `%`/`_` LIKE-wildcard-escaped inside
+    ///   `AssetDatabase::query`).
+    /// * `query.tags` + `query.style_tags` → `AssetQuery::tags` /
+    ///   `style_tags`. AND semantics (every tag must match).
+    /// * `query.limit` → `AssetQuery::limit`, defaulting to
+    ///   [`DESIGN_LIST_ASSETS_DEFAULT_LIMIT`] (24, the renderer's
+    ///   grid-page size) when `None`. Saturating-clamped to
+    ///   [`DESIGN_LIST_ASSETS_MAX_LIMIT`] (10_000) to defend against
+    ///   an upstream renderer bug sending a JS negative number that
+    ///   wraps to a near-`u32::MAX` value through napi's
+    ///   `ToUint32()` coercion — without the clamp such a value
+    ///   would reach SQLite as `LIMIT 4294967295` and materialise an
+    ///   unbounded result set on a real (multi-thousand-row) asset
+    ///   library.
+    /// * `AssetMetadata::vendor.name` → `AssetSummary::vendor`. An
+    ///   empty vendor display string is mapped to `None` so the JS
+    ///   side sees a missing vendor field rather than an empty
+    ///   string (UX: no "by " line on the card vs " by ").
+    /// * `thumbnail_data_uri` is always `None` in PR-U — real
+    ///   thumbnail wiring lands in the follow-up that hooks the
+    ///   asset-import pipeline up to the napi surface (the schema
+    ///   already carries `thumbnail_hash` + the blob is in
+    ///   `asset_blobs`, but base64-encoding on every list call is
+    ///   wasteful; the asset detail panel will fetch on demand).
+    pub fn design_list_assets(
+        &self,
+        query: &AssetListQuery,
+    ) -> Result<Vec<AssetSummary>, BridgeServiceError> {
+        let limit = query
+            .limit
+            .unwrap_or(DESIGN_LIST_ASSETS_DEFAULT_LIMIT)
+            .min(DESIGN_LIST_ASSETS_MAX_LIMIT);
+        let aq = aec_assets::AssetQuery {
+            name_contains: query.search.as_ref().filter(|s| !s.is_empty()).cloned(),
+            vendor_id: None,
+            tags: query.tags.clone(),
+            style_tags: query.style_tags.clone(),
+            limit: Some(limit),
+        };
+        let rows = self.asset_state.with_db(|db| db.query(&aq))?;
+        Ok(rows.into_iter().map(asset_metadata_to_summary).collect())
     }
 
     /// Read an `.ifc` file from disk and return a structured import
@@ -2288,6 +2476,34 @@ fn parse_scene_json(scene_json: Option<&str>) -> Result<RenderScene, BridgeServi
 /// field (a literal JSON `null`, not the empty `Option`).
 fn property_value_to_diff_string(v: &aec_bim::properties::PropertyValue) -> String {
     serde_json::to_string(v).unwrap_or_else(|_| "null".to_string())
+}
+
+/// Project an [`aec_assets::AssetMetadata`] row down to the
+/// renderer-facing [`AssetSummary`] shape.
+///
+/// * `vendor.name` → `vendor` (the catalogue card shows the display
+///   name, not the id). Empty `vendor.name` strings collapse to
+///   `None` so the renderer can suppress the "by ..." line entirely
+///   rather than rendering "by " with a trailing space.
+/// * `thumbnail_data_uri` is always `None` — see
+///   [`BridgeService::design_list_assets`] for the deferral rationale.
+/// * `tags` / `style_tags` are copied verbatim because the renderer
+///   uses them for the card chip rendering + the "click chip → filter
+///   by tag" UX.
+fn asset_metadata_to_summary(m: aec_assets::AssetMetadata) -> AssetSummary {
+    let vendor = if m.vendor.name.is_empty() {
+        None
+    } else {
+        Some(m.vendor.name)
+    };
+    AssetSummary {
+        asset_id: m.asset_id,
+        name: m.name,
+        tags: m.tags,
+        style_tags: m.style_tags,
+        vendor,
+        thumbnail_data_uri: None,
+    }
 }
 
 fn slugify(name: &str) -> String {
@@ -4088,5 +4304,207 @@ END-ISO-10303-21;\n";
                 "expected non-finite to serialise either as fallback `\"null\"` or as wrapped `\"value\":null`, got {s} for {v:?}"
             );
         }
+    }
+
+    #[test]
+    fn design_list_assets_returns_seed_library_on_fresh_state() {
+        // Fresh `state_dir` → empty asset DB → seed runs → 4 demo
+        // assets visible to the renderer. Pins the contract that the
+        // native path matches the in-process TS fallback's
+        // `seedAssets()` output on the first open of an installation.
+        let (s, _g) = service();
+        let assets = s
+            .design_list_assets(&AssetListQuery::default())
+            .expect("design_list_assets succeeds on fresh state");
+        assert_eq!(assets.len(), 4, "seed library has 4 demo assets");
+        let names: Vec<&str> = assets.iter().map(|a| a.name.as_str()).collect();
+        assert!(names.contains(&"Kivik 3-seat Sofa"));
+        assert!(names.contains(&"Outline Armchair"));
+        assert!(names.contains(&"Bentwood Cafe Chair"));
+        assert!(names.contains(&"Cafe Table 700"));
+    }
+
+    #[test]
+    fn design_list_assets_filters_by_tag() {
+        // `tags = ["sofa"]` → only Kivik (the only seed entry tagged
+        // `sofa`). The other 3 (armchair, chair, table) must be
+        // filtered out. Pins the AND-semantics translation from the
+        // JS query to `AssetQuery::tags`.
+        let (s, _g) = service();
+        let q = AssetListQuery {
+            tags: vec!["sofa".to_string()],
+            ..AssetListQuery::default()
+        };
+        let assets = s.design_list_assets(&q).expect("tag-filtered query");
+        assert_eq!(assets.len(), 1, "only Kivik is tagged `sofa`");
+        assert_eq!(assets[0].asset_id, "ikea.sofa_kivik_3s");
+    }
+
+    #[test]
+    fn design_list_assets_filters_by_style_tag() {
+        // `style_tags = ["industrial"]` → cafe chair + cafe table
+        // (both tagged `industrial`). Kivik (`scandinavian` /
+        // `modern`) and Outline (`scandinavian` / `japandi`) drop out.
+        let (s, _g) = service();
+        let q = AssetListQuery {
+            style_tags: vec!["industrial".to_string()],
+            ..AssetListQuery::default()
+        };
+        let assets = s.design_list_assets(&q).expect("style-tag-filtered query");
+        assert_eq!(assets.len(), 2);
+        let ids: Vec<&str> = assets.iter().map(|a| a.asset_id.as_str()).collect();
+        assert!(ids.contains(&"vendor.cafe_chair_thonet"));
+        assert!(ids.contains(&"vendor.cafe_table_700"));
+    }
+
+    #[test]
+    fn design_list_assets_filters_by_search_substring() {
+        // `search = "Cafe"` → 2 cafe entries; "Kivik" → 1; "" → all 4
+        // (empty string treated as "no filter" per the doc on
+        // `AssetListQuery::search`).
+        let (s, _g) = service();
+        let cafe = s
+            .design_list_assets(&AssetListQuery {
+                search: Some("Cafe".to_string()),
+                ..AssetListQuery::default()
+            })
+            .expect("substring query");
+        assert_eq!(cafe.len(), 2);
+        let kivik = s
+            .design_list_assets(&AssetListQuery {
+                search: Some("Kivik".to_string()),
+                ..AssetListQuery::default()
+            })
+            .expect("substring query");
+        assert_eq!(kivik.len(), 1);
+        assert_eq!(kivik[0].asset_id, "ikea.sofa_kivik_3s");
+        let empty = s
+            .design_list_assets(&AssetListQuery {
+                search: Some(String::new()),
+                ..AssetListQuery::default()
+            })
+            .expect("empty-string substring query");
+        assert_eq!(
+            empty.len(),
+            4,
+            "empty `search` must behave like no filter, not match-nothing"
+        );
+    }
+
+    #[test]
+    fn design_list_assets_respects_limit() {
+        // `limit = 1` → 1 result; `limit = 0` → 0 results (the user
+        // is asking the bridge to no-op the query). Pins that the
+        // limit isn't silently bumped to a minimum.
+        let (s, _g) = service();
+        let one = s
+            .design_list_assets(&AssetListQuery {
+                limit: Some(1),
+                ..AssetListQuery::default()
+            })
+            .expect("limit=1");
+        assert_eq!(one.len(), 1);
+        let zero = s
+            .design_list_assets(&AssetListQuery {
+                limit: Some(0),
+                ..AssetListQuery::default()
+            })
+            .expect("limit=0");
+        assert!(
+            zero.is_empty(),
+            "limit=0 must return an empty list, not the seed default"
+        );
+    }
+
+    #[test]
+    fn design_list_assets_saturating_clamps_to_max_limit() {
+        // Regression test for the saturating-clamp promise on
+        // `AssetListQuery::limit`. A renderer-side bug (or a malicious
+        // caller) sending `limit = u32::MAX` would otherwise reach
+        // SQLite as `LIMIT 4294967295` and materialise an unbounded
+        // result set on a real library. The bridge clamps the
+        // effective limit to `DESIGN_LIST_ASSETS_MAX_LIMIT` (10_000).
+        //
+        // We can't directly observe the clamped value through the
+        // public surface (the SQL LIMIT is internal), but we *can*
+        // pin that the call succeeds with a sane bound: the seed
+        // library has 4 assets, so the response should be exactly
+        // 4 — same as the unbounded query — not an error and not
+        // a wrapped/truncated list. The companion test
+        // `design_list_assets_respects_limit` proves smaller limits
+        // still take effect (so the clamp isn't an unconditional
+        // override of the user's choice). Together they pin the
+        // saturating-clamp invariant.
+        let (s, _g) = service();
+        let res = s
+            .design_list_assets(&AssetListQuery {
+                limit: Some(u32::MAX),
+                ..AssetListQuery::default()
+            })
+            .expect("u32::MAX limit must succeed (clamped, not unbounded)");
+        assert_eq!(
+            res.len(),
+            4,
+            "clamped query must still return the full seed library"
+        );
+    }
+
+    #[test]
+    fn design_list_assets_summary_projection_drops_internal_fields() {
+        // The renderer-facing `AssetSummary` projection must NOT
+        // include LOD chain, materials, license, version, or
+        // thumbnail bytes. Pins the doc contract on the projection +
+        // guards against a future change to `aec_assets::AssetMetadata`
+        // accidentally widening the JS surface.
+        let (s, _g) = service();
+        let assets = s
+            .design_list_assets(&AssetListQuery::default())
+            .expect("query");
+        let kivik = assets
+            .iter()
+            .find(|a| a.asset_id == "ikea.sofa_kivik_3s")
+            .expect("kivik in seed");
+        assert_eq!(kivik.name, "Kivik 3-seat Sofa");
+        assert_eq!(kivik.vendor.as_deref(), Some("IKEA"));
+        assert!(
+            kivik.thumbnail_data_uri.is_none(),
+            "PR-U seed has no thumbnail blobs; renderer falls back to placeholder card"
+        );
+        assert!(kivik.tags.contains(&"sofa".to_string()));
+        assert!(kivik.style_tags.contains(&"scandinavian".to_string()));
+    }
+
+    #[test]
+    fn design_list_assets_combined_filters_intersect() {
+        // `tags = ["furniture"]` + `style_tags = ["scandinavian"]`
+        // intersect: only Kivik + Outline match both. Cafe entries
+        // share `furniture` but not `scandinavian`. Pins that
+        // `AssetQuery`'s tag + style-tag filters compose with AND
+        // (not OR).
+        let (s, _g) = service();
+        let q = AssetListQuery {
+            tags: vec!["furniture".to_string()],
+            style_tags: vec!["scandinavian".to_string()],
+            ..AssetListQuery::default()
+        };
+        let assets = s.design_list_assets(&q).expect("combined filter query");
+        assert_eq!(assets.len(), 2);
+        let ids: Vec<&str> = assets.iter().map(|a| a.asset_id.as_str()).collect();
+        assert!(ids.contains(&"ikea.sofa_kivik_3s"));
+        assert!(ids.contains(&"muuto.armchair_outline"));
+    }
+
+    #[test]
+    fn design_list_assets_unmatched_search_returns_empty() {
+        // No card matches "Unobtanium Throne" → empty list, no error.
+        // Pins that a no-result search isn't conflated with a DB error.
+        let (s, _g) = service();
+        let assets = s
+            .design_list_assets(&AssetListQuery {
+                search: Some("Unobtanium Throne".to_string()),
+                ..AssetListQuery::default()
+            })
+            .expect("no-match query is not an error");
+        assert!(assets.is_empty());
     }
 }

@@ -5,6 +5,7 @@
 //! Those functions delegate to [`service`], which is plain Rust and
 //! straightforward to unit-test.
 
+mod asset_state;
 mod bim_attach;
 mod engine_status_cache;
 pub mod recents;
@@ -16,9 +17,10 @@ pub mod napi_api;
 
 pub use recents::{RecentsStore, RecentsStoreError};
 pub use service::{
-    BimAttachSummary, BimFileSizeCheck, BimImportSummary, BridgeConfig, BridgeService,
-    BridgeServiceError, EngineStatusReport, ProjectSummary, RenderApplyPresetResult,
-    RenderBatchProgressReport, RenderCancelResult, RenderCheckMaterialsReport,
-    RenderDiagnoseReport, RenderEnqueueBatchResult, RenderEnqueueResult, RenderJobSummary,
-    RenderMaterialFinding, RuntimeStatusReport, TemplateChoice,
+    AssetListQuery, AssetSummary, BimAttachSummary, BimFileSizeCheck, BimImportSummary,
+    BridgeConfig, BridgeService, BridgeServiceError, EngineStatusReport, ProjectSummary,
+    RenderApplyPresetResult, RenderBatchProgressReport, RenderCancelResult,
+    RenderCheckMaterialsReport, RenderDiagnoseReport, RenderEnqueueBatchResult,
+    RenderEnqueueResult, RenderJobSummary, RenderMaterialFinding, RuntimeStatusReport,
+    TemplateChoice,
 };
