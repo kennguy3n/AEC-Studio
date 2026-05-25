@@ -13,6 +13,7 @@ pub mod cover_draft;
 pub mod diff_engine;
 pub mod extension_tools;
 pub mod grammars;
+pub mod http;
 pub mod layout_suggestion;
 pub mod lighting_balance;
 pub mod plan_detection;
@@ -23,8 +24,10 @@ pub mod render_doctor;
 pub mod runtime;
 pub mod safety_validator;
 pub mod schedule_fill;
+pub mod sidecar;
 pub mod style_assistant;
 pub mod tool_schema;
+pub mod transport;
 pub mod validation_help;
 
 pub use audit::{AiAuditLogger, AiAuditRecord};
@@ -49,7 +52,7 @@ pub use plan_to_wall::{
     convert as plan_to_wall_convert, convert_from_polylines as plan_to_wall_from_polylines,
     PlanToWallConfig, PlanToWallResult, Wall, WallAxisSegment, WallEndCap,
 };
-pub use planner::{PlanRequest, PlanResponse, ToolPlanner};
+pub use planner::{PlanError, PlanRequest, PlanResponse, ToolPlanner};
 pub use property_fill::{
     fill_properties, ElementContext, ProjectStandards, PropertyFillConfig, PropertyFillResult,
     PropertyProposal, StandardRule,
@@ -60,6 +63,11 @@ pub use safety_validator::{SafetyError, SafetyValidator, SafetyViolation};
 pub use schedule_fill::{
     FilledRow, ScheduleFillError, ScheduleFillResult, REVIEW_CONFIDENCE_THRESHOLD,
 };
+pub use sidecar::{SidecarHandle, SidecarSpawnError};
 pub use style_assistant::{StyleAssistantResult, StyleSuggestion};
 pub use tool_schema::{ToolName, ToolSchema, ToolSchemaRegistry};
+pub use transport::{
+    CompletionRequest, CompletionResponse, SidecarTransport, TransportError,
+    DEFAULT_HEALTH_TIMEOUT, DEFAULT_MAX_PREDICT, DEFAULT_TEMPERATURE,
+};
 pub use validation_help::{FixAction, ValidationFix, ValidationHelpError, ValidationHelpResult};

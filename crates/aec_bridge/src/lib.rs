@@ -5,6 +5,7 @@
 //! Those functions delegate to [`service`], which is plain Rust and
 //! straightforward to unit-test.
 
+pub mod ai_state;
 mod asset_state;
 mod bim_attach;
 mod engine_status_cache;
