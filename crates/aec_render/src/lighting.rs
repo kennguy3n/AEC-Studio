@@ -553,6 +553,124 @@ impl IesProfile {
         self.candela.iter().copied().fold(0.0_f32, f32::max) * self.candela_multiplier
     }
 
+    /// Total luminous flux declared by the IES file, in lumens.
+    /// `lamp_count × lumens_per_lamp` per LM-63 spec. Returns `None`
+    /// when the file did not declare a positive lumen value (some
+    /// fixtures use `-1` to indicate "absolute photometry").
+    pub fn declared_lumens(&self) -> Option<f32> {
+        if self.lumens_per_lamp > 0.0 {
+            Some(self.lumens_per_lamp * self.lamp_count.max(1) as f32)
+        } else {
+            None
+        }
+    }
+
+    /// Numerically integrate the candela distribution over the full
+    /// sphere using the trapezoidal rule on the sampled (vertical,
+    /// horizontal) grid:
+    ///
+    /// ```text
+    ///   Φ = ∫₀^{2π} ∫₀^π I(θ, φ) · sin(θ) · dθ dφ
+    /// ```
+    ///
+    /// For rotationally-symmetric distributions (a single sampled
+    /// horizontal angle), the inner integral collapses to `2π · I(θ) ·
+    /// sin(θ) · dθ`. For partial horizontal sweeps (0..=90°, 0..=180°)
+    /// the result is scaled up by the implied symmetry factor (4, 2)
+    /// — matching the LM-63 convention that a `[0, 90°]` horizontal
+    /// range implies a luminaire with four-way symmetry.
+    pub fn integrate_lumens(&self) -> f32 {
+        let v = &self.vertical_angles;
+        let h = &self.horizontal_angles;
+        if v.len() < 2 || h.is_empty() {
+            return 0.0;
+        }
+        let cd = |hi: usize, vi: usize| -> f64 { self.candela[hi * v.len() + vi] as f64 };
+
+        let mut flux = 0.0_f64;
+
+        if h.len() == 1 {
+            // Rotationally symmetric — revolve around the vertical
+            // axis. Φ = 2π · Σᵢ avg(I_i, I_{i+1}) · sin(θ_avg) · dθ.
+            for i in 0..v.len() - 1 {
+                let t0 = (v[i] as f64).to_radians();
+                let t1 = (v[i + 1] as f64).to_radians();
+                let dtheta = t1 - t0;
+                // Mid-point sin(θ) is more accurate than trapezoidal
+                // sin endpoints because sin(0)=0 vanishes at the pole.
+                let sin_mid = ((t0 + t1) * 0.5).sin();
+                let cd_avg = 0.5 * (cd(0, i) + cd(0, i + 1));
+                flux += 2.0 * std::f64::consts::PI * cd_avg * sin_mid * dtheta;
+            }
+        } else {
+            for i in 0..v.len() - 1 {
+                let t0 = (v[i] as f64).to_radians();
+                let t1 = (v[i + 1] as f64).to_radians();
+                let dtheta = t1 - t0;
+                let sin_mid = ((t0 + t1) * 0.5).sin();
+                for j in 0..h.len() - 1 {
+                    let p0 = (h[j] as f64).to_radians();
+                    let p1 = (h[j + 1] as f64).to_radians();
+                    let dphi = p1 - p0;
+                    // 4-corner average over the (θ, φ) cell.
+                    let cd_avg = 0.25 * (cd(j, i) + cd(j + 1, i) + cd(j, i + 1) + cd(j + 1, i + 1));
+                    flux += cd_avg * sin_mid * dtheta * dphi;
+                }
+            }
+            // Scale up by the implied LM-63 symmetry.
+            let span = (h.last().copied().unwrap_or(0.0) - h[0]) as f64;
+            if span > 0.0 {
+                let factor = 360.0 / span;
+                flux *= factor;
+            }
+        }
+
+        (flux * self.candela_multiplier as f64) as f32
+    }
+
+    /// Bake the photometric distribution into a rectified
+    /// (`horizontal_resolution` × `vertical_resolution`) f32 candela
+    /// lookup texture. Layout is row-major with `vertical_resolution`
+    /// rows and `horizontal_resolution` columns; row `y` corresponds
+    /// to a vertical angle of `y / (height - 1) · 180°`, column `x`
+    /// to a horizontal angle of `x / (width - 1) · 360°`. The
+    /// returned buffer is `width × height` floats including the
+    /// `candela_multiplier` so a path-tracer's GPU sampler can read
+    /// it directly without further scaling.
+    ///
+    /// The bake uses the same bilinear `candela_at` interpolator that
+    /// the CPU light sampler uses, so CPU and GPU samples agree to
+    /// within float precision.
+    pub fn to_lookup_texture(
+        &self,
+        horizontal_resolution: u32,
+        vertical_resolution: u32,
+    ) -> IesLookupTexture {
+        let w = horizontal_resolution.max(1) as usize;
+        let h = vertical_resolution.max(1) as usize;
+        let mut data = vec![0.0_f32; w * h];
+        for y in 0..h {
+            let v_deg = if h > 1 {
+                (y as f32 / (h - 1) as f32) * 180.0
+            } else {
+                0.0
+            };
+            for x in 0..w {
+                let h_deg = if w > 1 {
+                    (x as f32 / (w - 1) as f32) * 360.0
+                } else {
+                    0.0
+                };
+                data[y * w + x] = self.candela_at(v_deg, h_deg);
+            }
+        }
+        IesLookupTexture {
+            width: w as u32,
+            height: h as u32,
+            candela: data,
+        }
+    }
+
     /// Bilinearly-interpolated candela value at the supplied vertical /
     /// horizontal angles, in degrees. Vertical is measured from the
     /// luminaire's downward axis; horizontal is measured around it.
@@ -597,6 +715,50 @@ impl IesProfile {
             candela,
             photometric_type: IesPhotometricType::C,
         }
+    }
+}
+
+/// Rectified candela lookup texture, ready for upload to a GPU
+/// sampler or use by the CPU path tracer. The candela values
+/// include the source IES file's `candela_multiplier`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IesLookupTexture {
+    /// Number of columns (horizontal-angle steps, spanning 0..=360°).
+    pub width: u32,
+    /// Number of rows (vertical-angle steps, spanning 0..=180°).
+    pub height: u32,
+    /// Row-major candela values: `candela[y * width + x]`.
+    pub candela: Vec<f32>,
+}
+
+impl IesLookupTexture {
+    /// Bilinearly sample the texture at the supplied vertical /
+    /// horizontal angles in degrees. Vertical wraps via clamping;
+    /// horizontal wraps modulo 360.
+    pub fn sample(&self, vertical_deg: f32, horizontal_deg: f32) -> f32 {
+        let w = self.width.max(1) as usize;
+        let h = self.height.max(1) as usize;
+        if w == 0 || h == 0 {
+            return 0.0;
+        }
+        let vy = (vertical_deg.clamp(0.0, 180.0) / 180.0) * (h as f32 - 1.0);
+        let mut hx = horizontal_deg.rem_euclid(360.0) / 360.0 * (w as f32);
+        if hx >= w as f32 {
+            hx -= w as f32;
+        }
+        let y0 = vy.floor() as usize;
+        let y1 = (y0 + 1).min(h - 1);
+        let ty = vy - y0 as f32;
+        let x0 = hx.floor() as usize % w;
+        let x1 = (x0 + 1) % w;
+        let tx = hx - hx.floor();
+        let c00 = self.candela[y0 * w + x0];
+        let c10 = self.candela[y0 * w + x1];
+        let c01 = self.candela[y1 * w + x0];
+        let c11 = self.candela[y1 * w + x1];
+        let c0 = c00 + (c10 - c00) * tx;
+        let c1 = c01 + (c11 - c01) * tx;
+        c0 + (c1 - c0) * ty
     }
 }
 

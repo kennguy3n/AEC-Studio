@@ -57,7 +57,7 @@ pub use light_sampling::{
     environment_radiance, is_delta, power_heuristic, sample_light, LightSample, NativeLight,
 };
 pub use lighting::{
-    kelvin_to_rgb, IesParseError, IesPhotometricType, IesProfile, LightingPreset,
+    kelvin_to_rgb, IesLookupTexture, IesParseError, IesPhotometricType, IesProfile, LightingPreset,
     LightingPresetKind, LightingPresetStore, LightingValidationError, SkyParams,
 };
 pub use material::{
