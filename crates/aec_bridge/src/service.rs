@@ -2077,12 +2077,7 @@ impl BridgeService {
                     // count it. Querying first costs one extra
                     // SELECT but lets the renderer trust
                     // `classified`.
-                    if upsert_classification_component_if_changed(
-                        &tx,
-                        id,
-                        component_kind,
-                        &body,
-                    )? {
+                    if upsert_classification_component_if_changed(&tx, id, component_kind, &body)? {
                         classified += 1;
                     } else {
                         unchanged += 1;
@@ -2107,12 +2102,7 @@ impl BridgeService {
                         "level": code.level,
                         "source": "auto",
                     });
-                    if upsert_classification_component_if_changed(
-                        &tx,
-                        id,
-                        component_kind,
-                        &body,
-                    )? {
+                    if upsert_classification_component_if_changed(&tx, id, component_kind, &body)? {
                         classified += 1;
                     } else {
                         unchanged += 1;
@@ -5076,8 +5066,7 @@ END-ISO-10303-21;\n";
             "second call must report zero new mutations"
         );
         assert_eq!(
-            second.unchanged,
-            first.classified,
+            second.unchanged, first.classified,
             "every previously-classified entity must show up as `unchanged` on the rerun"
         );
     }
@@ -5101,8 +5090,7 @@ END-ISO-10303-21;\n";
             "second IFC call must not double-count already-IFC kinds"
         );
         assert_eq!(
-            second.unchanged,
-            first.classified,
+            second.unchanged, first.classified,
             "every IFC-rewritten entity must be `unchanged` on the rerun"
         );
     }

@@ -1258,8 +1258,10 @@ pub fn bim_set_property(
     key: String,
     value: String,
 ) -> Result<BimSetPropertyResultJs> {
-    with_service_ref_fallible(move |svc| svc.bim_set_property(&project_path, &entity_id, &pset, &key, &value))
-        .map(Into::into)
+    with_service_ref_fallible(move |svc| {
+        svc.bim_set_property(&project_path, &entity_id, &pset, &key, &value)
+    })
+    .map(Into::into)
 }
 
 /// JS-facing summary of [`crate::service::BridgeService::bim_export_ifc`].
