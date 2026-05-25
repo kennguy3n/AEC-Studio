@@ -34,13 +34,20 @@ aec_materials = { path = "../aec_materials" }
 uuid = { workspace = true }
 aec_governor = { path = "../aec_governor" }
 aec_export = { path = "../aec_export" }
+aec_ai = { path = "../aec_ai" }
 blake3 = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 
-napi = { version = "2", features = ["napi8"], optional = true }
+# `tokio_rt` is required so async `#[napi]` functions (e.g. `ai_plan`,
+# `bim_import_ifc`) execute on napi-rs's bundled tokio runtime rather
+# than the Node main thread. Without it, those calls would freeze the
+# Electron main process's JS event loop for the full duration of a
+# blocking sidecar HTTP completion (up to 120 s) or a multi-GB IFC
+# parse — see the PR-V round-5 follow-up commit for the rationale.
+napi = { version = "2", features = ["napi8", "tokio_rt"], optional = true }
 napi-derive = { version = "2", optional = true }
 
 [build-dependencies]
