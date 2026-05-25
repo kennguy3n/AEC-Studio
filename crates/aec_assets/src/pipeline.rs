@@ -182,7 +182,11 @@ impl<'a> AssetImportPipeline<'a> {
         }
 
         // Build the LOD chain (level 0 = base mesh, level N>0 = decimated).
-        let chain = LodChain::from_ratios(base_triangles, &req.extra_ratios);
+        // Real-mesh imports get the aggressive [1.0, 0.25, 0.05] chain so
+        // LOD2 is a true far-distance view, matching the Phase 11 spec.
+        // Extension-host imports keep the legacy [1.0, 0.5, 0.25] chain
+        // via the separate `import()` path.
+        let chain = LodChain::aggressive_for_real_mesh(base_triangles, &req.extra_ratios);
         let base_bytes = native::encode(&req.mesh);
         let base_hash = format!("blake3:{}", blake3::hash(&base_bytes).to_hex());
 
@@ -263,6 +267,58 @@ impl<'a> AssetImportPipeline<'a> {
             deduped,
         })
     }
+
+    /// One-shot ingest + real-mesh import: detect the format of `path`,
+    /// parse it via [`crate::ingest::ingest_path`], then route through
+    /// [`Self::import_mesh`] with the supplied metadata.
+    ///
+    /// This is the canonical Phase 11 entry point for "import a real
+    /// glTF/OBJ/IFC asset from disk into the asset DB". Use it from
+    /// the bridge layer when the user drops a model file onto the
+    /// asset library.
+    pub fn import_path(
+        &mut self,
+        path: &std::path::Path,
+        meta: PathImportMetadata,
+    ) -> AssetResult<ImportSummary> {
+        let ingested = crate::ingest::ingest_path(path)
+            .map_err(|e| AssetError::InvalidManifest(format!("ingest failed: {e}")))?;
+        let req = RealMeshImportRequest {
+            asset_id: meta.asset_id,
+            name: meta.name,
+            vendor: meta.vendor,
+            version: meta.version,
+            license: meta.license,
+            attribution: meta.attribution,
+            tags: meta.tags,
+            style_tags: meta.style_tags,
+            materials: meta.materials,
+            source_units: meta.source_units,
+            mesh: ingested.mesh,
+            extra_ratios: meta.extra_ratios,
+            thumbnail_opts: meta.thumbnail_opts,
+        };
+        self.import_mesh(req)
+    }
+}
+
+/// Metadata supplied alongside a file-path import. Everything except
+/// the mesh itself (which comes from the file) — used by
+/// [`AssetImportPipeline::import_path`].
+#[derive(Debug, Clone)]
+pub struct PathImportMetadata {
+    pub asset_id: String,
+    pub name: String,
+    pub vendor: Vendor,
+    pub version: String,
+    pub license: License,
+    pub attribution: Option<String>,
+    pub tags: Vec<String>,
+    pub style_tags: Vec<String>,
+    pub materials: Vec<String>,
+    pub source_units: Units,
+    pub extra_ratios: Vec<f32>,
+    pub thumbnail_opts: Option<ThumbnailOptions>,
 }
 
 /// Full real-import request: caller-supplied `Mesh` + metadata. The
@@ -282,7 +338,7 @@ pub struct RealMeshImportRequest {
     pub source_units: Units,
     /// Fully-realised mesh. Will be QEM-decimated for each LOD level.
     pub mesh: Mesh,
-    /// Extra LOD ratios beyond the default three (1.0, 0.5, 0.25).
+    /// Extra LOD ratios beyond the default chain (`[1.0, 0.25, 0.05]`).
     /// Empty means "use the default chain".
     pub extra_ratios: Vec<f32>,
     /// Override thumbnail rendering options. `None` -> defaults.

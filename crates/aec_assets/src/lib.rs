@@ -27,7 +27,9 @@ pub use ingest::{
 };
 pub use lod::{LodChain, LodLevel};
 pub use metadata::{AssetMetadata, License, MeshBlob, ThumbnailKind, Vendor};
-pub use pipeline::{AssetImportPipeline, ImportRequest, ImportSummary, RealMeshImportRequest};
+pub use pipeline::{
+    AssetImportPipeline, ImportRequest, ImportSummary, PathImportMetadata, RealMeshImportRequest,
+};
 pub use query::AssetQuery;
 pub use search::{SearchHit, SearchOptions};
 pub use thumbnail::{render_thumbnail, ThumbnailError, ThumbnailOptions};
