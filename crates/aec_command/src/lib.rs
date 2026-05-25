@@ -15,8 +15,13 @@ pub mod commands;
 pub mod engine;
 pub mod error;
 pub mod journal;
+pub mod template_apply;
 
 pub use ai_apply::{diff_to_commands, ApplyConversion, ApplyDefaults, SkippedOperation};
+pub use template_apply::{
+    template_to_commands, template_to_commands_as, CameraDefaults, InstantiationOutcome,
+    RoomInstantiation, SkippedRoom,
+};
 
 pub use audit::{AuditEnvelope, AuditHashChain};
 pub use commands::{Command, CommandKind, EntityDelta, ProjectGraph};
