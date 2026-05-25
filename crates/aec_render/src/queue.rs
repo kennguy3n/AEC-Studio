@@ -345,6 +345,41 @@ impl RenderQueue {
     pub fn get(&self, id: &str) -> Option<&RenderJob> {
         self.list_jobs().into_iter().find(|j| j.id == id)
     }
+
+    /// Restore a previously-persisted queued job into the in-memory
+    /// queue, preserving its priority placement. Used by
+    /// [`crate::job_store::RenderJobStore::load_queue`] on crash
+    /// recovery. The job's status is forced to `Queued` defensively;
+    /// callers should pre-filter their rows.
+    pub fn restore_queued(&mut self, mut job: RenderJob) {
+        job.status = RenderJobStatus::Queued;
+        let pos = self
+            .queued
+            .iter()
+            .position(|j| j.priority < job.priority)
+            .unwrap_or(self.queued.len());
+        self.queued.insert(pos, job);
+    }
+
+    /// Restore a previously-persisted running job. Used by crash
+    /// recovery to surface the "this job was running when we died"
+    /// state to the worker pool (which can then choose to flip it
+    /// back to queued via the store).
+    pub fn restore_running(&mut self, mut job: RenderJob) {
+        job.status = RenderJobStatus::Running;
+        self.running.push(job);
+    }
+
+    /// Restore a job in a terminal state (Completed / Failed / Cancelled)
+    /// — preserves the original status; does not coerce it.
+    pub fn restore_completed(&mut self, job: RenderJob) {
+        debug_assert!(
+            job.is_terminal(),
+            "restore_completed expects a terminal status; got {:?}",
+            job.status
+        );
+        self.completed.push(job);
+    }
 }
 
 #[cfg(test)]
