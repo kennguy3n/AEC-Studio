@@ -1,7 +1,6 @@
 import { ipcMain } from "electron";
 import { getBridge } from "./bridge";
 import {
-  getActiveProjectPath,
   peekActiveProjectPath,
   setActiveProjectPath,
 } from "./active-project";
@@ -302,6 +301,15 @@ export function registerIpcHandlers(): void {
   });
 
   // ----- Deliver -----
+  // The three `deliver:*` handlers resolve `projectPath` through the
+  // same `withResolvedProjectPath` helper the `draft:*` handlers use
+  // above. The renderer's public preload doesn't expose `projectPath`
+  // on these channels today (so in practice the tracker always wins),
+  // but routing through the helper means a future renderer call (or
+  // a test) that *does* pass an explicit `projectPath` will have it
+  // honoured — same caller-supplied-wins semantics as `draft:*`
+  // without a special case. Resolves PR-X round 4 ANALYSIS-0002
+  // (deliver / draft handler asymmetry).
   ipcMain.handle("deliver:createRevision", async (_e, p) => {
     assertObject(p, "params");
     assertString(p.tag, "tag");
@@ -319,26 +327,40 @@ export function registerIpcHandlers(): void {
           };
         })
       : undefined;
+    const resolved = withResolvedProjectPath(
+      { ...p, description, entities },
+      "deliverCreateRevision",
+    );
     return getBridge().deliverCreateRevision({
-      projectPath: getActiveProjectPath("deliverCreateRevision"),
-      tag: p.tag,
+      projectPath: resolved.projectPath as string,
+      tag: p.tag as string,
       description,
       entities,
     });
   });
-  ipcMain.handle("deliver:listRevisions", async () =>
-    getBridge().deliverListRevisions({
-      projectPath: getActiveProjectPath("deliverListRevisions"),
-    }),
-  );
+  ipcMain.handle("deliver:listRevisions", async (_e, p) => {
+    // `aec.deliver.listRevisions()` is called with no arguments from
+    // the renderer, so `p` is typically `undefined`. Normalize to an
+    // empty object before resolving the project path so the helper
+    // can apply the standard caller-supplied-wins semantics.
+    const params: Record<string, unknown> =
+      p !== null && typeof p === "object" && !Array.isArray(p)
+        ? (p as Record<string, unknown>)
+        : {};
+    const resolved = withResolvedProjectPath(params, "deliverListRevisions");
+    return getBridge().deliverListRevisions({
+      projectPath: resolved.projectPath as string,
+    });
+  });
   ipcMain.handle("deliver:compareRevisions", async (_e, p) => {
     assertObject(p, "params");
     assertString(p.baseId, "baseId");
     assertString(p.headId, "headId");
+    const resolved = withResolvedProjectPath(p, "deliverCompareRevisions");
     return getBridge().deliverCompareRevisions({
-      projectPath: getActiveProjectPath("deliverCompareRevisions"),
-      baseId: p.baseId,
-      headId: p.headId,
+      projectPath: resolved.projectPath as string,
+      baseId: p.baseId as string,
+      headId: p.headId as string,
     });
   });
   ipcMain.handle("deliver:buildPack", async (_e, p) => {

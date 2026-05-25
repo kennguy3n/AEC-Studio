@@ -67,8 +67,25 @@ export function peekActiveProjectPath(): string | null {
 }
 
 /**
- * Reset the tracker. Intended for tests; production code should
- * leave the active project set until the next `project:open`.
+ * Reset the tracker. Two callers:
+ *
+ *   1. Unit tests (`vitest`) that need a clean slot between cases
+ *      — the test file uses `afterEach(clearActiveProjectPath)`.
+ *   2. A future `project:close` IPC handler, when one exists.
+ *
+ * The Electron app today has no `project:close` channel: the only
+ * way the user can transition out of a project is to open another
+ * one (`project:open` / `project:createFromTemplate`), and both of
+ * those overwrite the slot via `setActiveProjectPath` after the
+ * bridge has successfully opened the new project package. We
+ * deliberately do *not* clear on window close either — if the
+ * renderer reloads (e.g. a dev `Cmd+R`) the main process keeps the
+ * active project so the renderer can re-attach without a
+ * round-trip through the open flow.
+ *
+ * Resolves PR-X round 4 ANALYSIS-0001 (active-project tracker not
+ * cleared on close): the design is intentional and the function
+ * is plumbed for the day a `project:close` handler is added.
  */
 export function clearActiveProjectPath(): void {
   activeProjectPath = null;

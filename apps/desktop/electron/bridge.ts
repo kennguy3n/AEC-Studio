@@ -1234,9 +1234,20 @@ interface NativeApi {
   // Group A (Phase 10) — draft.* / deliver.*. Symmetric to the
   // design.* / bim.* facades above: `params_json` is a stringified
   // command struct, the napi side routes through `command_apply` so
-  // the gesture is journaled / auditable / undo-able. Sync on the
-  // Rust side except for DXF I/O, which is async because real-world
-  // DXF files routinely cross 10 MiB.
+  // the gesture is journaled / auditable / undo-able. The four
+  // draft.draw/edit/sheet/layer methods are sync on the Rust side
+  // (the command-engine apply is in-memory plus a single
+  // already-`Immediate` SQL tx); the DXF and `deliver_*` methods are
+  // `#[napi] async fn` routed through `spawn_blocking_napi` because
+  // they open the encrypted project package, read the full entity
+  // table, and/or read/write large files — work that would otherwise
+  // stall the Electron main (libuv) thread on large projects. Each
+  // async method is typed `Promise<unknown>` rather than the looser
+  // `unknown` so a future contributor who writes
+  // `n.deliver_create_revision(...)` without `await` gets a TS error
+  // at compile time rather than silently consuming a pending-promise
+  // object at runtime (the missing-await trap that bit
+  // `deliverCreateRevision` in PR-X round 3).
   draft_draw_primitive(project_path: string, params_json: string): unknown;
   draft_edit_tool(project_path: string, params_json: string): unknown;
   draft_create_sheet(project_path: string, params_json: string): unknown;
@@ -1258,13 +1269,13 @@ interface NativeApi {
       payloadHash: string;
       label?: string | null;
     }>,
-  ): unknown;
-  deliver_list_revisions(project_path: string): unknown;
+  ): Promise<unknown>;
+  deliver_list_revisions(project_path: string): Promise<unknown>;
   deliver_compare_revisions(
     project_path: string,
     base_id: string,
     head_id: string,
-  ): unknown;
+  ): Promise<unknown>;
 }
 
 /**
@@ -1901,12 +1912,22 @@ function adaptNative(n: NativeApi): BridgeBackend {
         payloadHash: e.payloadHash,
         label: e.label ?? null,
       }));
-      const raw = n.deliver_create_revision(
+      // `n.deliver_create_revision` is `#[napi] async fn` on the Rust
+      // side (PR-X round 3 routed it through `spawn_blocking_napi`
+      // because it opens the encrypted project package, reads the
+      // entity table to enumerate trackable entities when the caller
+      // omits them, and writes the snapshot file to disk). The
+      // matching `NativeApi.deliver_create_revision` signature is
+      // typed `Promise<unknown>` so a missing `await` here would be a
+      // compile error rather than the silent
+      // `JSON.parse(undefined) -> SyntaxError` runtime crash that
+      // shipped to Devin Review in round 3.
+      const raw = (await n.deliver_create_revision(
         params.projectPath,
         tag,
         params.description,
         entities,
-      ) as { summaryJson: string };
+      )) as { summaryJson: string };
       return JSON.parse(raw.summaryJson) as RevisionSummary;
     },
     deliverListRevisions: async (params) => {
