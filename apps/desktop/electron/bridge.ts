@@ -1870,12 +1870,18 @@ export function inProcessBackend(): BridgeBackend {
       // the value into the project graph's `aec/property/<pset>`
       // overlay component.
       //
-      // Like `bimClassify` above, validate against
-      // `requireStringField` for dev/prod parity rather than
-      // silently coercing missing fields to `""`.
+      // Validate against `requireNonBlankStringField` for `pset`
+      // and `key` so whitespace-only inputs are rejected here the
+      // same way the native `bim_set_property` rejects them via
+      // `trim().is_empty()` (`crates/aec_bridge/src/service.rs:2209-2213`).
+      // `entityId` and `value` still use `requireStringField` —
+      // the native side does not whitespace-strip either of those
+      // (an empty `value` is a valid stored property, and
+      // `entityId` is checked separately by the entity-existence
+      // SELECT).
       const entityId = requireStringField(p, "bimSetProperty", "entityId");
-      const pset = requireStringField(p, "bimSetProperty", "pset");
-      const key = requireStringField(p, "bimSetProperty", "key");
+      const pset = requireNonBlankStringField(p, "bimSetProperty", "pset");
+      const key = requireNonBlankStringField(p, "bimSetProperty", "key");
       requireStringField(p, "bimSetProperty", "value");
       requireProjectPath(p, "bimSetProperty");
       return {
@@ -2711,6 +2717,34 @@ function requireStringField(
   const v = params[key];
   if (typeof v !== "string") {
     throw new Error(`${method}: missing required string field '${key}'`);
+  }
+  return v;
+}
+
+/**
+ * Read a **required, non-blank** `string` field. Behaves like
+ * [`requireStringField`] for absent / non-string values, but additionally
+ * rejects values that are empty or whitespace-only (matching the native
+ * service's `trim().is_empty()` checks — see `bim_set_property` at
+ * `crates/aec_bridge/src/service.rs:2209-2213`).
+ *
+ * Without this stricter helper, the in-process fallback would accept
+ * `pset: "  "` / `key: "  "` and silently echo it back, while the
+ * native backend would reject it with `BridgeServiceError::Invalid`.
+ * That dev/prod asymmetry was flagged by Devin Review (PR-W round 5):
+ * the in-process comment claims validation "mirrors the native adapter
+ * for dev/prod parity" but `requireStringField` alone leaves whitespace
+ * through. The error message format intentionally matches the native
+ * `BridgeServiceError::Invalid("<field> must not be empty")` wording.
+ */
+function requireNonBlankStringField(
+  params: Record<string, unknown>,
+  method: string,
+  key: string,
+): string {
+  const v = requireStringField(params, method, key);
+  if (v.trim().length === 0) {
+    throw new Error(`${method}: ${key} must not be empty`);
   }
   return v;
 }
