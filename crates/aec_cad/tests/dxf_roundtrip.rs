@@ -81,12 +81,16 @@ fn dxf_roundtrip_preserves_layers_blocks_dim_styles_and_entities() {
             text_height: 2.5,
             arrow_size: 2.5,
             units_scale: 1.0,
+            decimal_places: 0,
+            text_style: "STANDARD".into(),
         },
         DxfDimStyle {
             name: "ARCH-1-100".into(),
             text_height: 5.0,
             arrow_size: 5.0,
             units_scale: 2.0,
+            decimal_places: 2,
+            text_style: "TITLES".into(),
         },
     ];
     doc.dim_styles = dim_styles.clone();
@@ -233,6 +237,16 @@ fn dxf_roundtrip_preserves_layers_blocks_dim_styles_and_entities() {
         assert_eq!(got.text_height, src.text_height);
         assert_eq!(got.arrow_size, src.arrow_size);
         assert_eq!(got.units_scale, src.units_scale);
+        assert_eq!(
+            got.decimal_places, src.decimal_places,
+            "dim style {} decimal_places",
+            src.name
+        );
+        assert_eq!(
+            got.text_style, src.text_style,
+            "dim style {} text_style",
+            src.name
+        );
     }
 
     // ---- "Text style" surrogate: every authored text height must
@@ -368,4 +382,180 @@ fn dwg_roundtrip_handles_ten_thousand_entities_r2010() {
 #[test]
 fn dwg_roundtrip_handles_ten_thousand_entities_r2018() {
     dwg_ten_thousand_lines_under_thirty_seconds(DwgVersion::R2018);
+}
+
+/// Real-world DXF fixture covering the full set of entity-attribute
+/// surfaces Task 16 calls out (layer color/lineweight/linetype/
+/// freeze/thaw/off/no-plot/description, blocks with body entities and
+/// nested INSERT, ATTDEF attribute definitions with tag/prompt/flags/
+/// text-style, multiple text styles with varying font/height/width
+/// factor/oblique/bigfont, and dim styles with varying decimal places
+/// and text-style references).
+///
+/// Test sequence: read fixture → snapshot the in-memory document →
+/// write back out → re-read the written bytes → assert the second
+/// in-memory document is bit-identical to the first on every attribute
+/// surface (logical equality across `DxfDocument`'s Serialize JSON,
+/// which is structurally equivalent to byte equality on the
+/// attribute fields the round-trip is responsible for).
+#[test]
+fn dxf_roundtrip_full_fixture_preserves_every_table_and_block_attribute() {
+    let fixture = include_str!("fixtures/roundtrip_full.dxf");
+    let doc1 = DxfReader::read_str(fixture).expect("fixture parses");
+
+    // ---- Layer-table assertions on the as-read document. ----
+    let walls = doc1
+        .layers
+        .get("A-WALL")
+        .expect("A-WALL layer present in fixture");
+    assert_eq!(walls.color, LayerColor(1));
+    assert_eq!(walls.lineweight, LayerLineweight(50));
+    assert_eq!(walls.linetype, "Continuous");
+    assert!(!walls.frozen, "A-WALL not frozen");
+    assert!(!walls.locked, "A-WALL not locked");
+    assert!(walls.on, "A-WALL is on");
+    assert!(walls.plottable, "A-WALL plottable");
+    assert_eq!(
+        walls.description.as_deref(),
+        Some("Exterior structural walls")
+    );
+
+    let doors = doc1
+        .layers
+        .get("A-DOOR")
+        .expect("A-DOOR layer present in fixture");
+    assert_eq!(doors.color, LayerColor(3), "A-DOOR colour absolute");
+    assert_eq!(doors.lineweight, LayerLineweight(35));
+    assert_eq!(doors.linetype, "DASHED");
+    assert!(!doors.frozen, "A-DOOR not frozen (flag 4 = locked)");
+    assert!(doors.locked, "A-DOOR locked (flag 4)");
+    assert!(!doors.on, "A-DOOR off — encoded by negative ACI");
+    assert!(!doors.plottable, "A-DOOR no-plot (DXF 290 = 0)");
+    assert_eq!(
+        doors.description.as_deref(),
+        Some("Door symbols (frozen, off, no-plot)")
+    );
+
+    let notes = doc1
+        .layers
+        .get("A-NOTES")
+        .expect("A-NOTES layer present in fixture");
+    assert!(notes.frozen, "A-NOTES frozen via group 70 bit 0");
+
+    // ---- BLOCK_RECORD + BLOCK body assertions. ----
+    let door = doc1
+        .block_records
+        .iter()
+        .find(|b| b.name == "DOOR_900")
+        .expect("DOOR_900 block present");
+    assert_eq!(door.description.as_deref(), Some("900mm single swing"));
+    assert_eq!(
+        door.entities.len(),
+        4,
+        "DOOR_900 carries 4 body entities (LINE, ARC, 2x ATTDEF)"
+    );
+    let attdefs: Vec<_> = door
+        .entities
+        .iter()
+        .filter_map(|e| match e {
+            DxfEntity::Attdef(a) => Some(a),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(attdefs.len(), 2, "DOOR_900 has 2 ATTDEFs");
+    let tag = attdefs
+        .iter()
+        .find(|a| a.tag == "DOOR_TAG")
+        .expect("DOOR_TAG attdef present");
+    assert_eq!(tag.default_value, "D-01");
+    assert_eq!(tag.prompt, "Enter door mark");
+    assert_eq!(tag.flags, 0);
+    assert_eq!(tag.text_style, "STANDARD");
+    assert!((tag.height - 2.5).abs() < 1e-9);
+    let fire = attdefs
+        .iter()
+        .find(|a| a.tag == "FIRE_RATING")
+        .expect("FIRE_RATING attdef present");
+    assert_eq!(fire.default_value, "60min");
+    assert_eq!(fire.flags, 1, "FIRE_RATING invisible flag bit 1");
+    assert_eq!(fire.text_style, "TITLES");
+
+    let window = doc1
+        .block_records
+        .iter()
+        .find(|b| b.name == "WINDOW_DBL")
+        .expect("WINDOW_DBL block present");
+    assert_eq!(window.entities.len(), 2, "WINDOW_DBL holds LINE + INSERT");
+    let nested = window
+        .entities
+        .iter()
+        .find_map(|e| match e {
+            DxfEntity::Insert(i) => Some(i),
+            _ => None,
+        })
+        .expect("nested INSERT lives inside WINDOW_DBL");
+    assert_eq!(nested.block_name, "DOOR_900");
+    assert!((nested.scale[0] - 0.5).abs() < 1e-9);
+    assert!((nested.scale[1] - 0.5).abs() < 1e-9);
+
+    // ---- STYLE-table assertions. ----
+    let standard = doc1
+        .text_styles
+        .iter()
+        .find(|s| s.name == "STANDARD")
+        .expect("STANDARD text style");
+    assert_eq!(standard.font_filename, "txt");
+    assert!((standard.width_factor - 1.0).abs() < 1e-9);
+    let titles = doc1
+        .text_styles
+        .iter()
+        .find(|s| s.name == "TITLES")
+        .expect("TITLES text style");
+    assert!((titles.fixed_height - 5.0).abs() < 1e-9);
+    assert!((titles.width_factor - 0.85).abs() < 1e-9);
+    assert!((titles.oblique_angle - 15.0).abs() < 1e-9);
+    assert_eq!(titles.font_filename, "arial.ttf");
+    let heavy = doc1
+        .text_styles
+        .iter()
+        .find(|s| s.name == "HEAVY-TITLES")
+        .expect("HEAVY-TITLES text style");
+    assert_eq!(heavy.bigfont_filename, "bigfont.shx");
+    assert_eq!(heavy.font_filename, "arialbd.ttf");
+    assert!((heavy.width_factor - 1.2).abs() < 1e-9);
+
+    // ---- DIMSTYLE assertions. ----
+    let arch50 = doc1
+        .dim_styles
+        .iter()
+        .find(|d| d.name == "ARCH-1-50")
+        .expect("ARCH-1-50 dim style");
+    assert_eq!(
+        arch50.decimal_places, 0,
+        "1:50 architectural rounds to whole"
+    );
+    assert_eq!(arch50.text_style, "STANDARD");
+    let arch100 = doc1
+        .dim_styles
+        .iter()
+        .find(|d| d.name == "ARCH-1-100")
+        .expect("ARCH-1-100 dim style");
+    assert_eq!(arch100.decimal_places, 2, "1:100 carries 2dp");
+    assert_eq!(arch100.text_style, "TITLES");
+
+    // ---- Round-trip: write & re-read; second doc must equal first
+    //      on every Serialize-equivalent attribute. ----
+    let written = DxfWriter::write_to_string(&doc1).expect("DXF writes");
+    let doc2 = DxfReader::read_str(&written).expect("written DXF re-reads");
+
+    // Use the structural JSON projection as a byte-stable proxy for
+    // attribute-level equality: every field that survives round-trip
+    // is captured here, and any drift in a field's value or its
+    // serialisation surface flips the assertion.
+    let json1 = serde_json::to_string(&doc1).expect("doc1 serialises");
+    let json2 = serde_json::to_string(&doc2).expect("doc2 serialises");
+    assert_eq!(
+        json1, json2,
+        "DXF document not byte-stable across write→read round-trip"
+    );
 }

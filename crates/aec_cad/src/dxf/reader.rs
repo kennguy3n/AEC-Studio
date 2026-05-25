@@ -7,8 +7,9 @@
 use std::io::{BufRead, BufReader, Read};
 
 use crate::dxf::entities::{
-    DxfArc, DxfCircle, DxfDimStyle, DxfDimension, DxfDimensionKind, DxfEllipse, DxfEntity,
-    DxfHatch, DxfHatchLoop, DxfInsert, DxfLine, DxfPolyline, DxfPolylineVertex, DxfSpline, DxfText,
+    DxfArc, DxfAttdef, DxfCircle, DxfDimStyle, DxfDimension, DxfDimensionKind, DxfEllipse,
+    DxfEntity, DxfHatch, DxfHatchLoop, DxfInsert, DxfLine, DxfPolyline, DxfPolylineVertex,
+    DxfSpline, DxfText, DxfTextStyle,
 };
 use crate::dxf::tables::DxfBlockRecord;
 use crate::dxf::DxfDocument;
@@ -62,6 +63,11 @@ fn parse(groups: &[Group]) -> CadResult<DxfDocument> {
     // file. Without this the roundtrip would silently grow STANDARD on
     // every read.
     doc.dim_styles.clear();
+    // Same logic for text styles.
+    doc.text_styles.clear();
+    // Block records also come from the BLOCKS section, not the
+    // constructor.
+    doc.block_records.clear();
     let mut i = 0;
     while i < groups.len() {
         if groups[i].code == 0 && groups[i].value == "SECTION" {
@@ -73,7 +79,7 @@ fn parse(groups: &[Group]) -> CadResult<DxfDocument> {
             i += 1;
             match section_name.as_str() {
                 "TABLES" => i = parse_tables(groups, i, &mut doc)?,
-                "BLOCKS" => i = skip_until_endsec(groups, i),
+                "BLOCKS" => i = parse_blocks(groups, i, &mut doc),
                 "ENTITIES" => i = parse_entities(groups, i, &mut doc),
                 _ => i = skip_until_endsec(groups, i),
             }
@@ -169,10 +175,33 @@ fn parse_table_entries(
                             140 => dim.text_height = val.parse().unwrap_or(2.5),
                             141 => dim.arrow_size = val.parse().unwrap_or(2.5),
                             144 => dim.units_scale = val.parse().unwrap_or(1.0),
+                            271 => dim.decimal_places = val.parse().unwrap_or(4),
+                            340 => dim.text_style.clone_from(val),
                             _ => {}
                         }
                     }
                     doc.dim_styles.push(dim);
+                }
+                ("STYLE", "STYLE") => {
+                    let mut s = DxfTextStyle::standard();
+                    let mut name_seen = false;
+                    for (code, val) in &fields {
+                        match code {
+                            2 => {
+                                s.name.clone_from(val);
+                                name_seen = true;
+                            }
+                            3 => s.font_filename.clone_from(val),
+                            4 => s.bigfont_filename.clone_from(val),
+                            40 => s.fixed_height = val.parse().unwrap_or(0.0),
+                            41 => s.width_factor = val.parse().unwrap_or(1.0),
+                            50 => s.oblique_angle = val.parse().unwrap_or(0.0),
+                            _ => {}
+                        }
+                    }
+                    if name_seen {
+                        doc.text_styles.push(s);
+                    }
                 }
                 _ => {}
             }
@@ -189,18 +218,33 @@ fn parse_layer_entry(fields: &[(i32, String)]) -> CadResult<Layer> {
     let mut linetype = "CONTINUOUS".to_string();
     let mut lineweight = LayerLineweight::DEFAULT;
     let mut flags: i32 = 0;
+    let mut on = true;
+    // Per the DXF spec, plottable defaults to TRUE when the 290 code
+    // is absent (legacy DXF files predating R2000).
+    let mut plottable = true;
+    let mut description: Option<String> = None;
     for (code, val) in fields {
         match code {
             2 => name.clone_from(val),
+            // Group 4 carries our internal LAYER description payload
+            // (see writer for context). AutoCAD ignores it, our
+            // round-trip recovers it.
+            4 => description = Some(val.clone()),
             6 => linetype.clone_from(val),
             62 => {
                 let raw: i16 = val.parse().unwrap_or(7);
                 color = LayerColor(raw.abs());
+                // Negative color value signals "layer is off" in
+                // the DXF on-disk convention.
                 if raw < 0 {
-                    flags |= 1;
+                    on = false;
                 }
             }
             70 => flags = val.parse().unwrap_or(0),
+            290 => {
+                // Boolean (0/1).
+                plottable = val.parse::<i32>().unwrap_or(1) != 0;
+            }
             370 => lineweight = LayerLineweight(val.parse().unwrap_or(-3)),
             _ => {}
         }
@@ -211,7 +255,91 @@ fn parse_layer_entry(fields: &[(i32, String)]) -> CadResult<Layer> {
     layer.lineweight = lineweight;
     layer.frozen = (flags & 1) != 0;
     layer.locked = (flags & 4) != 0;
+    layer.on = on;
+    layer.plottable = plottable;
+    layer.description = description;
     Ok(layer)
+}
+
+fn parse_blocks(groups: &[Group], mut i: usize, doc: &mut DxfDocument) -> usize {
+    // Walk through BLOCK … ENDBLK pairs. Each BLOCK "opens" a fresh
+    // record (which we then augment with any pre-existing
+    // block_records entry by matching on the name, so the merged
+    // record carries both the BLOCK_RECORD-table description / flags
+    // and the BLOCK body entities). Inside a block we treat top-level
+    // code-0 keywords as entity types and let the same entity-parser
+    // consume them.
+    while i < groups.len() {
+        let g = &groups[i];
+        if g.code == 0 && g.value == "ENDSEC" {
+            return i + 1;
+        }
+        if g.code == 0 && g.value == "BLOCK" {
+            let mut name = String::new();
+            let mut flags = 0i32;
+            let mut base = [0.0; 3];
+            i += 1;
+            // Header fields up to the first nested code-0.
+            while i < groups.len() && groups[i].code != 0 {
+                match groups[i].code {
+                    2 => name.clone_from(&groups[i].value),
+                    10 => base[0] = groups[i].value.parse().unwrap_or(0.0),
+                    20 => base[1] = groups[i].value.parse().unwrap_or(0.0),
+                    30 => base[2] = groups[i].value.parse().unwrap_or(0.0),
+                    70 => flags = groups[i].value.parse().unwrap_or(0),
+                    _ => {}
+                }
+                i += 1;
+            }
+            // Body — entities until ENDBLK.
+            let mut entities: Vec<DxfEntity> = Vec::new();
+            while i < groups.len() {
+                if groups[i].code == 0 && groups[i].value == "ENDBLK" {
+                    // Consume ENDBLK + its trailing fields.
+                    i += 1;
+                    while i < groups.len() && groups[i].code != 0 {
+                        i += 1;
+                    }
+                    break;
+                }
+                if groups[i].code == 0 {
+                    let entity_type = groups[i].value.clone();
+                    let mut fields: Vec<(i32, String)> = Vec::new();
+                    i += 1;
+                    while i < groups.len() && groups[i].code != 0 {
+                        fields.push((groups[i].code, groups[i].value.clone()));
+                        i += 1;
+                    }
+                    if let Some(e) = build_entity(&entity_type, &fields, &[]) {
+                        entities.push(e);
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            if !name.is_empty() {
+                // Merge with an existing BLOCK_RECORD-table entry that
+                // declared the metadata (description, etc.) so we
+                // don't end up with two records for the same name.
+                if let Some(existing) = doc.block_records.iter_mut().find(|b| b.name == name) {
+                    existing.base_point = base;
+                    existing.entities = entities;
+                    if existing.flags == 0 {
+                        existing.flags = flags;
+                    }
+                } else {
+                    let mut br = DxfBlockRecord::new(name);
+                    br.flags = flags;
+                    br.base_point = base;
+                    br.entities = entities;
+                    doc.block_records.push(br);
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    i
 }
 
 fn parse_entities(groups: &[Group], mut i: usize, doc: &mut DxfDocument) -> usize {
@@ -353,6 +481,11 @@ fn build_entity(
     let mut dim_kind_code: i32 = 0;
     let mut measured_value: Option<f64> = None;
     let mut override_text: Option<String> = None;
+    // ATTDEF-specific accumulators — tag (code 2), prompt (code 3),
+    // and text-style name (code 7).
+    let mut attdef_tag = String::new();
+    let mut attdef_prompt = String::new();
+    let mut attdef_text_style = String::new();
 
     for (code, val) in fields {
         match code {
@@ -362,7 +495,12 @@ fn build_entity(
                     style.clone_from(val);
                 } else if kind == "HATCH" {
                     hatch_pattern.clone_from(val);
+                } else if kind == "ATTDEF" {
+                    attdef_prompt.clone_from(val);
                 }
+            }
+            7 if kind == "ATTDEF" => {
+                attdef_text_style.clone_from(val);
             }
             10 => {
                 if kind == "LWPOLYLINE" || kind == "POLYLINE" {
@@ -411,7 +549,7 @@ fn build_entity(
             23 => y4 = val.parse().unwrap_or(0.0),
             33 => z4 = val.parse().unwrap_or(0.0),
             40 => {
-                if kind == "TEXT" || kind == "MTEXT" {
+                if kind == "TEXT" || kind == "MTEXT" || kind == "ATTDEF" {
                     height = val.parse().unwrap_or(0.0);
                 } else if kind == "ELLIPSE" {
                     ratio = val.parse().unwrap_or(1.0);
@@ -447,7 +585,7 @@ fn build_entity(
             }
             43 => sz = val.parse().unwrap_or(1.0),
             50 => {
-                if kind == "TEXT" || kind == "MTEXT" || kind == "INSERT" {
+                if kind == "TEXT" || kind == "MTEXT" || kind == "INSERT" || kind == "ATTDEF" {
                     rotation = val.parse().unwrap_or(0.0);
                 } else {
                     start_angle = val.parse().unwrap_or(0.0);
@@ -480,6 +618,8 @@ fn build_entity(
                 if kind == "HATCH" {
                     // DXF spec: code 2 is the hatch pattern name.
                     hatch_pattern.clone_from(val);
+                } else if kind == "ATTDEF" {
+                    attdef_tag.clone_from(val);
                 } else {
                     block_name.clone_from(val);
                 }
@@ -570,6 +710,17 @@ fn build_entity(
                 measured_value,
             }))
         }
+        "ATTDEF" => Some(DxfEntity::Attdef(DxfAttdef {
+            layer,
+            position: [x1, y1, z1],
+            height,
+            rotation,
+            default_value: text,
+            tag: attdef_tag,
+            prompt: attdef_prompt,
+            flags,
+            text_style: attdef_text_style,
+        })),
         _ => None,
     }
 }

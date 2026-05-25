@@ -30,6 +30,12 @@ impl BlockRecord {
                 Some(self.description)
             },
             flags: i32::from(self.anonymous),
+            // The DWG path doesn't yet recover block bodies or base
+            // points (entity-graph decoding lands in a later commit);
+            // start them at the canonical defaults so the downstream
+            // DXF writer emits a syntactically-valid BLOCK … ENDBLK.
+            base_point: [0.0, 0.0, 0.0],
+            entities: Vec::new(),
         }
     }
 

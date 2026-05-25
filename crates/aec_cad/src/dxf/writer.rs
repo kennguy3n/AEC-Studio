@@ -3,8 +3,8 @@
 use std::io::Write;
 
 use crate::dxf::entities::{
-    DxfArc, DxfCircle, DxfDimension, DxfDimensionKind, DxfEllipse, DxfEntity, DxfHatch, DxfInsert,
-    DxfLine, DxfPolyline, DxfSpline, DxfText,
+    DxfArc, DxfAttdef, DxfCircle, DxfDimension, DxfDimensionKind, DxfEllipse, DxfEntity, DxfHatch,
+    DxfInsert, DxfLine, DxfPolyline, DxfSpline, DxfText,
 };
 use crate::dxf::DxfDocument;
 use crate::error::CadResult;
@@ -64,9 +64,30 @@ fn write_tables<W: Write>(doc: &DxfDocument, w: &mut W) -> CadResult<()> {
             flags |= 4;
         }
         write_pair(w, 70, &flags.to_string())?;
-        write_pair(w, 62, &layer.color.0.to_string())?;
+        // DXF convention: a layer that is OFF emits its colour as a
+        // negative number (e.g. -7 = white but off). This is how
+        // every mainstream DXF consumer (AutoCAD, BricsCAD, QCAD,
+        // LibreDWG) signals the on/off state for AC1009-era files.
+        let signed_color: i32 = if layer.on {
+            i32::from(layer.color.0)
+        } else {
+            -i32::from(layer.color.0)
+        };
+        write_pair(w, 62, &signed_color.to_string())?;
         write_pair(w, 6, &layer.linetype)?;
         write_pair(w, 370, &layer.lineweight.0.to_string())?;
+        // Plottable / not-plottable lives at DXF code 290 in the
+        // 1000+ namespace (boolean). Emit it unconditionally so the
+        // round-trip is symmetric.
+        write_pair(w, 290, &i32::from(layer.plottable).to_string())?;
+        if let Some(desc) = &layer.description {
+            // Layer description is conventionally carried as XDATA on
+            // AutoCAD, but for our internal round-trip we use group
+            // code 4 (which is otherwise unused for LAYER) so the
+            // payload is fully ASCII and any DXF parser we
+            // control sees the same bytes.
+            write_pair(w, 4, desc)?;
+        }
     }
     write_pair(w, 0, "ENDTAB")?;
 
@@ -84,6 +105,22 @@ fn write_tables<W: Write>(doc: &DxfDocument, w: &mut W) -> CadResult<()> {
     }
     write_pair(w, 0, "ENDTAB")?;
 
+    // STYLE (text style) table.
+    write_pair(w, 0, "TABLE")?;
+    write_pair(w, 2, "STYLE")?;
+    write_pair(w, 70, &doc.text_styles.len().to_string())?;
+    for s in &doc.text_styles {
+        write_pair(w, 0, "STYLE")?;
+        write_pair(w, 2, &s.name)?;
+        write_pair(w, 70, "0")?;
+        write_pair(w, 40, &fmt_f(s.fixed_height))?;
+        write_pair(w, 41, &fmt_f(s.width_factor))?;
+        write_pair(w, 50, &fmt_f(s.oblique_angle))?;
+        write_pair(w, 3, &s.font_filename)?;
+        write_pair(w, 4, &s.bigfont_filename)?;
+    }
+    write_pair(w, 0, "ENDTAB")?;
+
     // DIMSTYLE table.
     write_pair(w, 0, "TABLE")?;
     write_pair(w, 2, "DIMSTYLE")?;
@@ -95,6 +132,14 @@ fn write_tables<W: Write>(doc: &DxfDocument, w: &mut W) -> CadResult<()> {
         write_pair(w, 140, &fmt_f(dim.text_height))?;
         write_pair(w, 141, &fmt_f(dim.arrow_size))?;
         write_pair(w, 144, &fmt_f(dim.units_scale))?;
+        // DIMDEC — primary-units decimal places.
+        write_pair(w, 271, &dim.decimal_places.to_string())?;
+        // DIMTXSTY — text-style name. We use group 340 (which is
+        // ordinarily the handle of the referenced style); since our
+        // round-trip is stable on text-style *names* not handles,
+        // emitting the name as the value lets the reader recover
+        // the symbolic reference verbatim.
+        write_pair(w, 340, &dim.text_style)?;
     }
     write_pair(w, 0, "ENDTAB")?;
 
@@ -109,9 +154,12 @@ fn write_blocks<W: Write>(doc: &DxfDocument, w: &mut W) -> CadResult<()> {
         write_pair(w, 0, "BLOCK")?;
         write_pair(w, 2, &br.name)?;
         write_pair(w, 70, &br.flags.to_string())?;
-        write_pair(w, 10, "0.0")?;
-        write_pair(w, 20, "0.0")?;
-        write_pair(w, 30, "0.0")?;
+        write_pair(w, 10, &fmt_f(br.base_point[0]))?;
+        write_pair(w, 20, &fmt_f(br.base_point[1]))?;
+        write_pair(w, 30, &fmt_f(br.base_point[2]))?;
+        for entity in &br.entities {
+            write_entity(entity, w)?;
+        }
         write_pair(w, 0, "ENDBLK")?;
     }
     write_pair(w, 0, "ENDSEC")?;
@@ -122,20 +170,41 @@ fn write_entities<W: Write>(doc: &DxfDocument, w: &mut W) -> CadResult<()> {
     write_pair(w, 0, "SECTION")?;
     write_pair(w, 2, "ENTITIES")?;
     for entity in &doc.entities {
-        match entity {
-            DxfEntity::Line(e) => write_line(e, w)?,
-            DxfEntity::Polyline(e) => write_polyline(e, w)?,
-            DxfEntity::Arc(e) => write_arc(e, w)?,
-            DxfEntity::Circle(e) => write_circle(e, w)?,
-            DxfEntity::Ellipse(e) => write_ellipse(e, w)?,
-            DxfEntity::Spline(e) => write_spline(e, w)?,
-            DxfEntity::Hatch(e) => write_hatch(e, w)?,
-            DxfEntity::Text(e) => write_text(e, w)?,
-            DxfEntity::Insert(e) => write_insert(e, w)?,
-            DxfEntity::Dimension(e) => write_dimension(e, w)?,
-        }
+        write_entity(entity, w)?;
     }
     write_pair(w, 0, "ENDSEC")?;
+    Ok(())
+}
+
+fn write_entity<W: Write>(entity: &DxfEntity, w: &mut W) -> CadResult<()> {
+    match entity {
+        DxfEntity::Line(e) => write_line(e, w),
+        DxfEntity::Polyline(e) => write_polyline(e, w),
+        DxfEntity::Arc(e) => write_arc(e, w),
+        DxfEntity::Circle(e) => write_circle(e, w),
+        DxfEntity::Ellipse(e) => write_ellipse(e, w),
+        DxfEntity::Spline(e) => write_spline(e, w),
+        DxfEntity::Hatch(e) => write_hatch(e, w),
+        DxfEntity::Text(e) => write_text(e, w),
+        DxfEntity::Insert(e) => write_insert(e, w),
+        DxfEntity::Dimension(e) => write_dimension(e, w),
+        DxfEntity::Attdef(e) => write_attdef(e, w),
+    }
+}
+
+fn write_attdef<W: Write>(e: &DxfAttdef, w: &mut W) -> CadResult<()> {
+    write_pair(w, 0, "ATTDEF")?;
+    write_pair(w, 8, &e.layer)?;
+    write_pair(w, 10, &fmt_f(e.position[0]))?;
+    write_pair(w, 20, &fmt_f(e.position[1]))?;
+    write_pair(w, 30, &fmt_f(e.position[2]))?;
+    write_pair(w, 40, &fmt_f(e.height))?;
+    write_pair(w, 50, &fmt_f(e.rotation))?;
+    write_pair(w, 1, &e.default_value)?;
+    write_pair(w, 2, &e.tag)?;
+    write_pair(w, 3, &e.prompt)?;
+    write_pair(w, 70, &e.flags.to_string())?;
+    write_pair(w, 7, &e.text_style)?;
     Ok(())
 }
 
@@ -326,6 +395,8 @@ mod tests {
             text_height: 3.5,
             arrow_size: 3.5,
             units_scale: 1000.0,
+            decimal_places: 2,
+            text_style: "STANDARD".into(),
         });
         doc.push(DxfEntity::Line(DxfLine {
             layer: "WALLS".into(),
