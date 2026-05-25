@@ -15,10 +15,11 @@ import {
   ScheduleKind,
   ScheduleRow,
 } from "../components/bim/ScheduleView";
+import { ValidatorPanel } from "../components/bim/ValidatorPanel";
 import {
-  ValidatorPanel,
-  ValidationFinding,
-} from "../components/bim/ValidatorPanel";
+  bimReportToFindings,
+  type ValidationFinding,
+} from "../api/bim-validation";
 import {
   BimToolbar,
   BimAction,
@@ -126,47 +127,60 @@ export function Bim() {
           break;
         }
         case "exportIfc":
-          await aec.bim.exportIfc("demo://project.out.ifc");
+          // PR-T wired `bim_export_ifc` to the native bridge. The
+          // bridge re-serialises the parsed snapshot back to
+          // STEP-21 and writes it to `outPath`. Demo paths until a
+          // file-picker UX lands.
+          await aec.bim.exportIfc({
+            sourcePath: "demo://project.ifc",
+            outPath: "demo://project.out.ifc",
+          });
           break;
         case "validate": {
-          const result = (await aec.bim.validate()) as {
-            ok: boolean;
-            errors: ValidationFinding[];
-            warnings: ValidationFinding[];
-            info?: ValidationFinding[];
-          };
-          const merged: ValidationFinding[] = [
-            ...(result.errors ?? []).map((f) => ({
-              ...f,
-              severity: "error" as const,
-            })),
-            ...(result.warnings ?? []).map((f) => ({
-              ...f,
-              severity: "warning" as const,
-            })),
-            ...(result.info ?? []).map((f) => ({
-              ...f,
-              severity: "info" as const,
-            })),
-          ];
-          setFindings(merged);
+          // PR-T wired `bim_validate` to the native bridge. The
+          // bridge runs the rule-based BIM validator over the
+          // parsed snapshot and splits findings into three vectors
+          // (errors / warnings / infos). The wire→UI mapping lives
+          // in `api/bim-validation.ts` so this page and
+          // `ValidatorPanel` share one adapter (Devin Review
+          // ANALYSIS_pr-T_0002).
+          const result = await aec.bim.validate({
+            sourcePath: "demo://project.ifc",
+          });
+          setFindings(bimReportToFindings(result));
           break;
         }
         case "classify":
           await aec.bim.classify({ entityId: selectedId, source: "ai" });
           break;
         case "generateSchedule": {
-          const result = (await aec.bim.generateSchedule({
+          // PR-T wired `bim_generate_schedule` to the native
+          // bridge. The bridge writes the XLSX directly to disk,
+          // returning row/column counts but NOT the row data — so
+          // `setSchedules` clears any stale rows until a future PR
+          // adds an XLSX-to-row-list parse step.
+          await aec.bim.generateSchedule({
+            sourcePath: "demo://project.ifc",
+            outPath: "demo://project.rooms.xlsx",
             kind: "room",
-          })) as { scheduleId: string; rows?: ScheduleRow[] };
-          setSchedules((prev) => ({ ...prev, room: result.rows ?? [] }));
+          });
+          setSchedules((prev) => ({ ...prev, room: [] }));
           break;
         }
         case "diff":
-          await aec.bim.diff({ left: "snapshot:a", right: "snapshot:b" });
+          // PR-T wired `bim_diff` to the native bridge. Demo paths
+          // until a file-picker UX lands.
+          await aec.bim.diff({
+            beforePath: "demo://snapshot.a.ifc",
+            afterPath: "demo://snapshot.b.ifc",
+          });
           break;
         case "boq":
-          await aec.bim.generateSchedule({ kind: "material" });
+          await aec.bim.generateSchedule({
+            sourcePath: "demo://project.ifc",
+            outPath: "demo://project.materials.xlsx",
+            kind: "material",
+          });
           break;
       }
     } finally {
@@ -206,12 +220,17 @@ export function Bim() {
       </div>
       <div className="bim-bottom">
         <ScheduleView
+          sourcePath="demo://project.ifc"
+          outPathForKind={(kind) => `demo://project.${kind}.xlsx`}
           rowsByKind={schedules}
-          onGenerate={(kind, rows) =>
-            setSchedules((prev) => ({ ...prev, [kind]: rows }))
+          onGenerate={(kind) =>
+            // The native bridge writes the XLSX directly; we don't
+            // get rows back, so clear any stale row data.
+            setSchedules((prev) => ({ ...prev, [kind]: [] }))
           }
         />
         <ValidatorPanel
+          sourcePath="demo://project.ifc"
           findings={findings}
           onFindings={setFindings}
           onZoomTo={(id) => setSelectedId(id)}

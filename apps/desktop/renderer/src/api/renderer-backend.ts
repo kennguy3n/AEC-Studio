@@ -180,12 +180,58 @@ export function rendererInProcessBackend(): AecApi {
         relationsInserted: 0,
         cacheRows: 0,
       }),
-      exportIfc: async (p) => ({ exported: true, path: p }),
+      // PR-T read-only BIM ops. These mirror the electron-side
+      // in-process backend in `electron/bridge.ts` 1:1 (same field
+      // names, same zero-finding payloads) so vitest sees the
+      // exact same shape the real bridge would produce in dev
+      // mode. Both the electron-side stubs (`bridge.ts:1272-1299`)
+      // and these renderer-side mocks intentionally do NOT touch
+      // the filesystem — they return zeroed-out, wire-format-
+      // compliant payloads so the renderer can exercise its
+      // status panes against synthetic `demo://project.ifc`
+      // paths that don't exist on disk. The actual IFC pipeline
+      // is exercised end-to-end by
+      // `crates/aec_bridge/tests/bim_readonly_ops.rs`.
+      exportIfc: async (params) => ({
+        sourcePath: params.sourcePath,
+        outPath: params.outPath,
+        schema: "IFC4",
+        bytesWritten: 0,
+        parseCacheHit: false,
+      }),
       classify: async () => ({ classified: 0 }),
       setProperty: async () => ({ ok: true }),
-      generateSchedule: async () => ({ scheduleId: newId("sched") }),
-      validate: async () => ({ ok: true, errors: [], warnings: [] }),
-      diff: async () => ({ diffId: newId("diff") }),
+      generateSchedule: async (params) => ({
+        scheduleId: newId("sched"),
+        kind: params.kind,
+        sourcePath: params.sourcePath,
+        outPath: params.outPath,
+        rows: 0,
+        columns: 0,
+        bytesWritten: 0,
+        parseCacheHit: false,
+      }),
+      validate: async (params) => ({
+        ok: true,
+        sourcePath: params.sourcePath,
+        schema: "IFC4",
+        errors: [],
+        warnings: [],
+        infos: [],
+        parseCacheHit: false,
+      }),
+      diff: async (params) => ({
+        diffId: newId("diff"),
+        beforePath: params.beforePath,
+        afterPath: params.afterPath,
+        beforeSchema: "IFC4",
+        afterSchema: "IFC4",
+        added: [],
+        removed: [],
+        modified: [],
+        beforeCacheHit: false,
+        afterCacheHit: false,
+      }),
     },
     render: {
       enqueueRender: async () => ({ jobId: newId("job") }),

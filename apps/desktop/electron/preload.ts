@@ -100,15 +100,108 @@ const api = {
         relationsInserted: number;
         cacheRows: number;
       }>,
-    exportIfc: (path: string) => ipcRenderer.invoke("bim:exportIfc", { path }),
+    /**
+     * Re-serialise an IFC file via the native bridge. Same writer
+     * as `attachIfc` so the output is byte-identical to what a
+     * `bimAttachIfc` snapshot would write. The inline type mirrors
+     * `BimExportIfcSummary` in `electron/bridge.ts` 1:1 — drift
+     * here would surface as `undefined` on the export panel, so
+     * the bridge's `adaptNative` self-check guards against it.
+     */
+    exportIfc: (params: { sourcePath: string; outPath: string }) =>
+      ipcRenderer.invoke("bim:exportIfc", params) as Promise<{
+        sourcePath: string;
+        outPath: string;
+        schema: string;
+        bytesWritten: number;
+        parseCacheHit: boolean;
+      }>,
     classify: (params: Record<string, unknown>) =>
       ipcRenderer.invoke("bim:classify", params),
     setProperty: (params: Record<string, unknown>) =>
       ipcRenderer.invoke("bim:setProperty", params),
-    generateSchedule: (params: Record<string, unknown>) =>
-      ipcRenderer.invoke("bim:generateSchedule", params),
-    validate: () => ipcRenderer.invoke("bim:validate"),
-    diff: (params: Record<string, unknown>) => ipcRenderer.invoke("bim:diff", params),
+    /**
+     * Generate an XLSX schedule of a given kind (door / window /
+     * room / material). Inline type mirrors `BimScheduleSummary`
+     * in `electron/bridge.ts` 1:1.
+     */
+    generateSchedule: (params: {
+      sourcePath: string;
+      outPath: string;
+      kind: "door" | "window" | "room" | "material";
+    }) =>
+      ipcRenderer.invoke("bim:generateSchedule", params) as Promise<{
+        scheduleId: string;
+        kind: "door" | "window" | "room" | "material";
+        sourcePath: string;
+        outPath: string;
+        rows: number;
+        columns: number;
+        bytesWritten: number;
+        parseCacheHit: boolean;
+      }>,
+    /**
+     * Run the rule-based BIM validator over an IFC file. Inline
+     * type mirrors `BimValidateReport` in `electron/bridge.ts`
+     * 1:1.
+     */
+    validate: (params: { sourcePath: string }) =>
+      ipcRenderer.invoke("bim:validate", params) as Promise<{
+        ok: boolean;
+        sourcePath: string;
+        schema: string;
+        errors: Array<{
+          severity: "error" | "warning" | "info";
+          code: string;
+          element: string | null;
+          description: string;
+          suggestion: string | null;
+        }>;
+        warnings: Array<{
+          severity: "error" | "warning" | "info";
+          code: string;
+          element: string | null;
+          description: string;
+          suggestion: string | null;
+        }>;
+        infos: Array<{
+          severity: "error" | "warning" | "info";
+          code: string;
+          element: string | null;
+          description: string;
+          suggestion: string | null;
+        }>;
+        parseCacheHit: boolean;
+      }>,
+    /**
+     * Diff two IFC files. Inline type mirrors `BimDiffSummary`
+     * in `electron/bridge.ts` 1:1.
+     */
+    diff: (params: { beforePath: string; afterPath: string }) =>
+      ipcRenderer.invoke("bim:diff", params) as Promise<{
+        diffId: string;
+        beforePath: string;
+        afterPath: string;
+        beforeSchema: string;
+        afterSchema: string;
+        added: string[];
+        removed: string[];
+        modified: Array<{
+          key: string;
+          classBefore: string | null;
+          classAfter: string | null;
+          nameBefore: string | null;
+          nameAfter: string | null;
+          propertyDeltas: Array<{
+            pset: string;
+            key: string;
+            before: string | null;
+            after: string | null;
+          }>;
+        }>;
+        beforeCacheHit: boolean;
+        afterCacheHit: boolean;
+      }>,
   },
 
   // ----- Render -----

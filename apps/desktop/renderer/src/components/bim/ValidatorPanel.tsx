@@ -1,40 +1,38 @@
 import { useState } from "react";
 import { aec } from "../../api/aec";
+import {
+  bimReportToFindings,
+  type ValidationFinding,
+  type ValidationSeverity,
+} from "../../api/bim-validation";
 
-export type ValidationSeverity = "error" | "warning" | "info";
-
-export interface ValidationFinding {
-  code: string;
-  severity: ValidationSeverity;
-  message: string;
-  entityId?: string | null;
-  hint?: string | null;
-}
+// Re-exported for backwards compat with existing callers (tests,
+// `Bim.tsx`) that previously imported these types from the
+// component module. The canonical definitions now live in
+// `api/bim-validation.ts` alongside the wire-format adapter.
+export type { ValidationFinding, ValidationSeverity };
 
 interface Props {
+  /** IFC path to validate when "Re-validate" is clicked. */
+  sourcePath: string;
   findings: ValidationFinding[];
   onFindings: (next: ValidationFinding[]) => void;
   onZoomTo?: (entityId: string) => void;
 }
 
-export function ValidatorPanel({ findings, onFindings, onZoomTo }: Props) {
+export function ValidatorPanel({
+  sourcePath,
+  findings,
+  onFindings,
+  onZoomTo,
+}: Props) {
   const [busy, setBusy] = useState(false);
 
   const revalidate = async () => {
     setBusy(true);
     try {
-      const result = (await aec.bim.validate()) as {
-        ok: boolean;
-        errors: ValidationFinding[];
-        warnings: ValidationFinding[];
-        info?: ValidationFinding[];
-      };
-      const merged: ValidationFinding[] = [
-        ...(result.errors ?? []).map((f) => ({ ...f, severity: "error" as const })),
-        ...(result.warnings ?? []).map((f) => ({ ...f, severity: "warning" as const })),
-        ...(result.info ?? []).map((f) => ({ ...f, severity: "info" as const })),
-      ];
-      onFindings(merged);
+      const result = await aec.bim.validate({ sourcePath });
+      onFindings(bimReportToFindings(result));
     } finally {
       setBusy(false);
     }

@@ -14,12 +14,38 @@ export interface ScheduleRow {
   [column: string]: string | number;
 }
 
-interface Props {
-  rowsByKind: Partial<Record<ScheduleKind, ScheduleRow[]>>;
-  onGenerate: (kind: ScheduleKind, rows: ScheduleRow[]) => void;
+/**
+ * Summary returned to the parent after "Regenerate". The bridge
+ * writes the schedule directly to an XLSX file at `outPath` (via
+ * `ScheduleSheet::write_xlsx` in `aec_bim`), so the renderer just
+ * surfaces the file path and row/column counts — the inline
+ * preview table reflects whatever rows the parent retains in
+ * `rowsByKind` (typically empty until a future PR adds an
+ * XLSX-to-row-list parse step).
+ */
+export interface ScheduleGenerationSummary {
+  scheduleId: string;
+  outPath: string;
+  rows: number;
+  columns: number;
+  bytesWritten: number;
 }
 
-export function ScheduleView({ rowsByKind, onGenerate }: Props) {
+interface Props {
+  /** IFC path to read when "Regenerate" is clicked. */
+  sourcePath: string;
+  /** Path the bridge writes the XLSX to when "Regenerate" is clicked. */
+  outPathForKind: (kind: ScheduleKind) => string;
+  rowsByKind: Partial<Record<ScheduleKind, ScheduleRow[]>>;
+  onGenerate: (kind: ScheduleKind, summary: ScheduleGenerationSummary) => void;
+}
+
+export function ScheduleView({
+  sourcePath,
+  outPathForKind,
+  rowsByKind,
+  onGenerate,
+}: Props) {
   const [active, setActive] = useState<ScheduleKind>("room");
   const [busy, setBusy] = useState(false);
   const rows = rowsByKind[active] ?? [];
@@ -28,11 +54,19 @@ export function ScheduleView({ rowsByKind, onGenerate }: Props) {
   const regenerate = async () => {
     setBusy(true);
     try {
-      const result = (await aec.bim.generateSchedule({ kind: active })) as {
-        scheduleId: string;
-        rows?: ScheduleRow[];
-      };
-      onGenerate(active, result.rows ?? []);
+      const outPath = outPathForKind(active);
+      const result = await aec.bim.generateSchedule({
+        sourcePath,
+        outPath,
+        kind: active,
+      });
+      onGenerate(active, {
+        scheduleId: result.scheduleId,
+        outPath: result.outPath,
+        rows: result.rows,
+        columns: result.columns,
+        bytesWritten: result.bytesWritten,
+      });
     } finally {
       setBusy(false);
     }
