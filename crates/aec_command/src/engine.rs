@@ -262,6 +262,15 @@ impl CommandEngine {
             }
             CommandKind::UpdateCamera(c) => vec![c.to_delta(&self.graph)?],
             CommandKind::DeleteCamera(c) => vec![c.to_delta(&self.graph)?],
+            CommandKind::PlaceFurniture(c) => {
+                c.validate()?;
+                vec![c.to_delta()]
+            }
+            CommandKind::MoveFurniture(c) => {
+                c.validate()?;
+                vec![c.to_delta(&self.graph)?]
+            }
+            CommandKind::DeleteFurniture(c) => vec![c.to_delta(&self.graph)?],
         })
     }
 

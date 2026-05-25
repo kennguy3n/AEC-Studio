@@ -972,6 +972,256 @@ pub fn deliver_build_pack(params: DeliverBuildPackParamsJs) -> Result<DeliverBui
     with_service_ref_fallible(move |svc| svc.deliver_build_pack(svc_params)).map(Into::into)
 }
 
+/// JS-facing result of [`project_export_package`]. Mirrors the
+/// renderer's `ProjectExportPackageResult` TS interface — `entries`
+/// is the source-file count (excluding the auto-generated
+/// `_aec_archive_manifest.json`) and `total_bytes` is the sum of
+/// source payload bytes so the renderer's "Exported NNN files
+/// (MM MB)" status line matches the bridge's view.
+#[napi(object)]
+pub struct ProjectExportPackageResultJs {
+    pub out_path: String,
+    pub entries: u32,
+    /// `f64` so JS `number` carries the full uncompressed-bytes
+    /// value without BigInt — the largest realistic project package
+    /// is a few hundred MB, well under 2^53.
+    pub total_bytes: f64,
+}
+
+impl From<crate::service::ProjectExportPackageResult> for ProjectExportPackageResultJs {
+    fn from(r: crate::service::ProjectExportPackageResult) -> Self {
+        Self {
+            out_path: r.out_path,
+            entries: r.entries,
+            total_bytes: r.total_bytes as f64,
+        }
+    }
+}
+
+/// Pack the project package directory at `project_path` into a
+/// portable ZIP archive at `out_path`. The archive embeds the full
+/// package (encrypted `project.sqlite` + nonce + sub-directories
+/// + per-source `blake3` hashes in `_aec_archive_manifest.json`).
+/// Routes through [`crate::service::BridgeService::project_export_package`]
+/// under the singleton read lock — long archive walks don't block
+/// status polls.
+#[napi]
+pub fn project_export_package(
+    project_path: String,
+    out_path: String,
+) -> Result<ProjectExportPackageResultJs> {
+    with_service_ref_fallible(move |svc| svc.project_export_package(&project_path, &out_path))
+        .map(Into::into)
+}
+
+// ============================================================
+// design.* command façades (PR-W, Phase 1 + 2)
+// ============================================================
+//
+// These four functions are thin façades over
+// [`crate::service::BridgeService::command_apply`]. The renderer's
+// `BridgeBackend.design{PaintMaterial,SetLighting,SaveCamera,
+// PlaceFurniture}` interface predates the unified `commandApply`
+// path; rather than break the renderer surface, the napi side
+// constructs the matching `CommandKind` variant from the params
+// payload and routes through the standard persistence pipeline.
+//
+// `params_json` is a JSON-stringified object matching the
+// corresponding `aec_command::commands::{material::PaintMaterial,
+// lighting::SetLighting, camera::SaveCamera, furniture::
+// PlaceFurniture}` struct exactly — the renderer's `adaptNative()`
+// just JSON.stringify's the params object.
+
+/// JS-facing result of [`design_paint_material`] / [`design_set_lighting`].
+/// Mirrors the renderer's `{ ok: true }` shape.
+#[napi(object)]
+pub struct DesignAckJs {
+    pub ok: bool,
+}
+
+/// JS-facing result of [`design_place_furniture`]. Mirrors the
+/// renderer's `{ entityId: string }` shape.
+#[napi(object)]
+pub struct DesignEntityIdJs {
+    pub entity_id: String,
+}
+
+/// JS-facing result of [`design_save_camera`]. Mirrors the
+/// renderer's `{ cameraId: string }` shape.
+#[napi(object)]
+pub struct DesignCameraIdJs {
+    pub camera_id: String,
+}
+
+fn parse_design_params<T: serde::de::DeserializeOwned>(
+    method: &str,
+    params_json: &str,
+) -> Result<T> {
+    serde_json::from_str::<T>(params_json).map_err(|e| {
+        Error::new(
+            Status::InvalidArg,
+            format!("{method}: invalid params JSON: {e}"),
+        )
+    })
+}
+
+/// Paint a material on an existing entity. `params_json` must
+/// deserialise into [`aec_command::commands::material::PaintMaterial`].
+#[napi]
+pub fn design_paint_material(project_path: String, params_json: String) -> Result<DesignAckJs> {
+    let inner: aec_command::commands::material::PaintMaterial =
+        parse_design_params("design_paint_material", &params_json)?;
+    let cmd = aec_command::commands::Command::user(
+        aec_command::commands::CommandKind::PaintMaterial(inner),
+    );
+    with_service(|svc| svc.command_apply(&project_path, cmd))?;
+    Ok(DesignAckJs { ok: true })
+}
+
+/// Set the project's lighting preset. `params_json` must
+/// deserialise into [`aec_command::commands::lighting::SetLighting`].
+#[napi]
+pub fn design_set_lighting(project_path: String, params_json: String) -> Result<DesignAckJs> {
+    let inner: aec_command::commands::lighting::SetLighting =
+        parse_design_params("design_set_lighting", &params_json)?;
+    let cmd = aec_command::commands::Command::user(
+        aec_command::commands::CommandKind::SetLighting(inner),
+    );
+    with_service(|svc| svc.command_apply(&project_path, cmd))?;
+    Ok(DesignAckJs { ok: true })
+}
+
+/// Save a camera. `params_json` must deserialise into
+/// [`aec_command::commands::camera::SaveCamera`]. Returns the
+/// camera's entity id (echoes back the input `entity_id` so the
+/// renderer's stub shape is preserved).
+#[napi]
+pub fn design_save_camera(project_path: String, params_json: String) -> Result<DesignCameraIdJs> {
+    let inner: aec_command::commands::camera::SaveCamera =
+        parse_design_params("design_save_camera", &params_json)?;
+    let camera_id = inner.entity_id.to_string();
+    let cmd =
+        aec_command::commands::Command::user(aec_command::commands::CommandKind::SaveCamera(inner));
+    with_service(|svc| svc.command_apply(&project_path, cmd))?;
+    Ok(DesignCameraIdJs { camera_id })
+}
+
+/// Place a furniture instance referencing a catalogue asset.
+/// `params_json` must deserialise into
+/// [`aec_command::commands::furniture::PlaceFurniture`].
+#[napi]
+pub fn design_place_furniture(
+    project_path: String,
+    params_json: String,
+) -> Result<DesignEntityIdJs> {
+    let inner: aec_command::commands::furniture::PlaceFurniture =
+        parse_design_params("design_place_furniture", &params_json)?;
+    let entity_id = inner.entity_id.to_string();
+    let cmd = aec_command::commands::Command::user(
+        aec_command::commands::CommandKind::PlaceFurniture(inner),
+    );
+    with_service(|svc| svc.command_apply(&project_path, cmd))?;
+    Ok(DesignEntityIdJs { entity_id })
+}
+
+// ============================================================
+// bim.* classification + property mutation (PR-W, Phase 3 + 4)
+// ============================================================
+
+/// JS-facing per-entity classification assignment row. Mirrors the
+/// renderer's `BimClassifyAssignment` TS interface.
+#[napi(object)]
+pub struct BimClassifyAssignmentJs {
+    pub entity_id: String,
+    pub code: String,
+    pub title: String,
+}
+
+impl From<crate::service::BimClassifyAssignment> for BimClassifyAssignmentJs {
+    fn from(a: crate::service::BimClassifyAssignment) -> Self {
+        Self {
+            entity_id: a.entity_id,
+            code: a.code,
+            title: a.title,
+        }
+    }
+}
+
+/// JS-facing result of [`bim_classify`]. Mirrors the renderer's
+/// `BimClassifyResult` interface — `classified` is the count of
+/// rows touched, `skipped` is the count of entities with no
+/// matching code in the requested scheme, and `details` carries
+/// the per-entity assignments.
+#[napi(object)]
+pub struct BimClassifyResultJs {
+    pub scheme: String,
+    pub classified: u32,
+    pub skipped: u32,
+    pub details: Vec<BimClassifyAssignmentJs>,
+}
+
+impl From<crate::service::BimClassifyResult> for BimClassifyResultJs {
+    fn from(r: crate::service::BimClassifyResult) -> Self {
+        Self {
+            scheme: r.scheme,
+            classified: r.classified,
+            skipped: r.skipped,
+            details: r.details.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// Walk every entity in the project graph and assign a
+/// classification from `scheme`. Supported schemes: `"ifc"`,
+/// `"uniformat-ii"`, `"omniclass-21"`. Routes through
+/// [`crate::service::BridgeService::bim_classify`].
+#[napi]
+pub fn bim_classify(project_path: String, scheme: String) -> Result<BimClassifyResultJs> {
+    with_service_ref_fallible(move |svc| svc.bim_classify(&project_path, &scheme)).map(Into::into)
+}
+
+/// JS-facing result of [`bim_set_property`]. Mirrors the
+/// renderer's `BimSetPropertyResult` interface — `previousValue`
+/// is the prior value (if any) so the renderer can wire undo
+/// without an extra round-trip.
+#[napi(object)]
+pub struct BimSetPropertyResultJs {
+    pub entity_id: String,
+    pub pset: String,
+    pub key: String,
+    pub previous_value: Option<String>,
+}
+
+impl From<crate::service::BimSetPropertyResult> for BimSetPropertyResultJs {
+    fn from(r: crate::service::BimSetPropertyResult) -> Self {
+        Self {
+            entity_id: r.entity_id,
+            pset: r.pset,
+            key: r.key,
+            previous_value: r.previous_value,
+        }
+    }
+}
+
+/// Set a property on a BIM entity. The value lands in a
+/// `components` row of kind `aec/property/<pset>` so it survives
+/// a `bim_attach_ifc` re-attach (which wipes `bim/%` for changed
+/// entities). Routes through
+/// [`crate::service::BridgeService::bim_set_property`].
+#[napi]
+pub fn bim_set_property(
+    project_path: String,
+    entity_id: String,
+    pset: String,
+    key: String,
+    value: String,
+) -> Result<BimSetPropertyResultJs> {
+    with_service_ref_fallible(move |svc| {
+        svc.bim_set_property(&project_path, &entity_id, &pset, &key, &value)
+    })
+    .map(Into::into)
+}
+
 /// JS-facing summary of [`crate::service::BridgeService::bim_export_ifc`].
 /// Mirrors the renderer's `BimExportIfcSummary` interface in
 /// `apps/desktop/electron/bridge.ts`.

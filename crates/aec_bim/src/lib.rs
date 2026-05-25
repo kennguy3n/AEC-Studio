@@ -9,6 +9,7 @@
 pub mod boq;
 pub mod cache;
 pub mod classification;
+pub mod classification_tables;
 pub mod diff;
 pub mod drawing_gen;
 pub mod ifc;
@@ -24,6 +25,10 @@ pub use boq::{boq_for_project, BoqLine, BoqRegion, BoqReport};
 pub use cache::{BimCache, CachedElement};
 pub use classification::{
     ClassificationAssignment, ClassificationSource, ClassificationStore, IfcClass,
+};
+pub use classification_tables::{
+    classify_kind, ifc_to_omniclass, ifc_to_uniformat, lookup_omniclass, lookup_uniformat,
+    ClassificationScheme, OmniClassCode, UniformatCode, OMNICLASS_21, UNIFORMAT_II,
 };
 pub use diff::{diff_projects, ElementDelta, ProjectDiff, PropertyDelta};
 pub use drawing_gen::{
