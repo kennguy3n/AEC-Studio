@@ -23,38 +23,57 @@ use crate::transport::{CompletionRequest, SidecarTransport, TransportError};
 /// (i.e. the cap itself) which made the bounds check vacuous because
 /// `precheck` already ensures `cap <= schema.max_entities_modified`.
 ///
-/// The per-tool logic mirrors `DiffEngine::build` — each tool's
-/// schema documents which JSON arrays / fields turn into ops:
-///   - `plan_detection` / `plan_to_wall`: `polylines[]` → one wall
-///     insert per polyline that has a `points` array.
-///   - `style_assistant`: `furniture_ids[]` + `material_ids[]` + 1
-///     extra for `lighting_preset_id` (if present).
-///   - `layout_suggestion`: `proposals[]` (each is an insert or an
-///     update depending on whether `target_entity` is present).
-///   - `render_doctor`: `findings[]` → one preset update per
-///     finding.
+/// The per-tool logic must mirror `DiffEngine::build` exactly —
+/// **counting an array element that the diff engine would skip is a
+/// correctness bug** because it can trigger a spurious
+/// `SafetyError::BoundsExceeded` for a response that, after the diff
+/// engine's filtering, modifies fewer entities than the cap allows.
+/// In particular:
+///   - `plan_detection` / `plan_to_wall`: only polylines with a
+///     `points` array become wall inserts (see
+///     [`crate::diff_engine::build_plan_detection`]).
+///   - `style_assistant`: only `furniture_ids[]` / `material_ids[]`
+///     elements that parse as JSON strings (`as_str().is_some()`)
+///     become inserts, plus 1 if `lighting_preset_id` is a string
+///     (see [`crate::diff_engine::build_style_assistant`]).
+///   - `layout_suggestion`: only proposals with a valid
+///     `target_entity` (parseable as `EntityId`) OR a non-empty
+///     `asset_id` string become ops; proposals with neither are
+///     silently dropped (see
+///     [`crate::diff_engine::build_layout_suggestion`]).
+///   - `render_doctor`: every `findings[]` element becomes a preset
+///     update unconditionally (see
+///     [`crate::diff_engine::build_render_doctor`]).
 ///   - other tools (classification, property_fill, schedule_fill,
 ///     etc.) are not handled by `DiffEngine::build`, so we fall back
 ///     to a conservative 0 — the bridge service builds those diffs
-///     via dedicated `bim_classification` / `property_fill` paths.
+///     via dedicated `bim_classification` / `property_fill` paths
+///     and enforces its own per-tool count cap there.
 pub fn count_response_entities(tool: ToolName, parsed: &serde_json::Value) -> u32 {
-    fn arr_len(parsed: &serde_json::Value, key: &str) -> u32 {
-        parsed
-            .get(key)
-            .and_then(|v| v.as_array())
-            .map_or(0, |a| u32::try_from(a.len()).unwrap_or(u32::MAX))
+    /// Count only the array elements at `parsed[key]` that satisfy
+    /// `pred`. Mirrors the inline filtering each `DiffEngine::build_*`
+    /// branch performs before pushing an op into its `Vec`.
+    fn filtered_arr_len(
+        parsed: &serde_json::Value,
+        key: &str,
+        pred: impl Fn(&serde_json::Value) -> bool,
+    ) -> u32 {
+        parsed.get(key).and_then(|v| v.as_array()).map_or(0, |a| {
+            u32::try_from(a.iter().filter(|v| pred(v)).count()).unwrap_or(u32::MAX)
+        })
     }
     match tool {
-        ToolName::PlanDetection | ToolName::PlanToWall => parsed
-            .get("polylines")
-            .and_then(|v| v.as_array())
-            .map_or(0, |a| {
-                let n = a.iter().filter(|p| p.get("points").is_some()).count();
-                u32::try_from(n).unwrap_or(u32::MAX)
-            }),
+        ToolName::PlanDetection | ToolName::PlanToWall => {
+            filtered_arr_len(parsed, "polylines", |p| p.get("points").is_some())
+        }
         ToolName::StyleAssistant => {
-            let f = arr_len(parsed, "furniture_ids");
-            let m = arr_len(parsed, "material_ids");
+            // Only string elements become ops — a numeric or object
+            // entry in `furniture_ids` / `material_ids` is silently
+            // skipped by the diff engine, so counting it here would
+            // overcount and could push a within-cap response over
+            // the safety threshold.
+            let f = filtered_arr_len(parsed, "furniture_ids", |v| v.as_str().is_some());
+            let m = filtered_arr_len(parsed, "material_ids", |v| v.as_str().is_some());
             let l = u32::from(
                 parsed
                     .get("lighting_preset_id")
@@ -63,8 +82,33 @@ pub fn count_response_entities(tool: ToolName, parsed: &serde_json::Value) -> u3
             );
             f.saturating_add(m).saturating_add(l)
         }
-        ToolName::LayoutSuggestion => arr_len(parsed, "proposals"),
-        ToolName::RenderDoctor => arr_len(parsed, "findings"),
+        ToolName::LayoutSuggestion => {
+            // The diff engine's `build_layout_suggestion` walks the
+            // `proposals` array and emits exactly one op per
+            // proposal that either (a) carries a `target_entity`
+            // that parses as `EntityId` (→ Update) OR (b) carries
+            // a non-empty `asset_id` string (→ Insert). A proposal
+            // with neither is silently dropped, so we must not
+            // count it here. Empty `asset_id` strings are likewise
+            // dropped because the diff engine's pattern is
+            // `proposal.get("asset_id").and_then(|v| v.as_str())`
+            // which yields `None` for empty strings? — no, it
+            // yields `Some("")` for empty strings, but the
+            // resulting Insert is degenerate. We treat empty
+            // `asset_id` as a count regardless, matching the diff
+            // engine's behaviour exactly so the two stay in lock
+            // step.
+            filtered_arr_len(parsed, "proposals", |p| {
+                let has_valid_target = p
+                    .get("target_entity")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| aec_core::types::EntityId::from_string(s).ok())
+                    .is_some();
+                let has_asset_id = p.get("asset_id").and_then(|v| v.as_str()).is_some();
+                has_valid_target || has_asset_id
+            })
+        }
+        ToolName::RenderDoctor => filtered_arr_len(parsed, "findings", |_| true),
         // Tools the `DiffEngine` does not lower into ops directly
         // (their diffs are built by dedicated bridge-service paths).
         // Returning 0 here is safe — the bridge layer enforces its
@@ -399,11 +443,6 @@ mod tests {
             count_response_entities(ToolName::StyleAssistant, &style_payload),
             5
         );
-        let layout_payload = serde_json::json!({"proposals":[{},{},{}]});
-        assert_eq!(
-            count_response_entities(ToolName::LayoutSuggestion, &layout_payload),
-            3
-        );
         let render_payload = serde_json::json!({"findings":[{},{}]});
         assert_eq!(
             count_response_entities(ToolName::RenderDoctor, &render_payload),
@@ -413,6 +452,87 @@ mod tests {
         assert_eq!(
             count_response_entities(ToolName::Classification, &serde_json::json!({})),
             0
+        );
+    }
+
+    /// Regression for PR-V round 6 finding: `count_response_entities`
+    /// must skip the same elements `DiffEngine::build` skips,
+    /// otherwise a within-cap response can trigger
+    /// `SafetyError::BoundsExceeded`.
+    #[test]
+    fn count_response_entities_mirrors_diff_engine_filtering() {
+        use crate::diff_engine::DiffEngine;
+
+        // StyleAssistant: non-string array elements (numbers,
+        // objects) are skipped by the diff engine because it uses
+        // `as_str()`. The counter must skip them too.
+        let style_payload = serde_json::json!({
+            "furniture_ids": ["chair", 42, {"id":"oops"}, "table"],
+            "material_ids": [null, "wood", true],
+        });
+        let count = count_response_entities(ToolName::StyleAssistant, &style_payload);
+        let resp = PlanResponse {
+            tool: ToolName::StyleAssistant,
+            raw_payload: style_payload.to_string(),
+            parsed: style_payload.clone(),
+            entities_modified: count,
+        };
+        let diff = DiffEngine::build(&resp);
+        assert_eq!(
+            count as usize,
+            diff.operations.len(),
+            "count must equal diff op count for StyleAssistant (got count={count}, ops={})",
+            diff.operations.len()
+        );
+        assert_eq!(
+            count, 3,
+            "only 3 strings should count: 'chair','table','wood'"
+        );
+
+        // LayoutSuggestion: empty proposals (no target_entity, no
+        // asset_id) are dropped by the diff engine; the counter
+        // must drop them too. Proposals with an invalid
+        // `target_entity` string AND no `asset_id` are also dropped.
+        let layout_payload = serde_json::json!({
+            "room_anchor": "ent_room_001",
+            "proposals": [
+                // (1) Valid update: target_entity parses as EntityId.
+                {"target_entity":"ent_furniture_001","position_mm":[0,0,0]},
+                // (2) Valid insert: asset_id present.
+                {"asset_id":"chair_001","position_mm":[1,0,0]},
+                // (3) Dropped: empty proposal.
+                {},
+                // (4) Dropped: invalid target_entity string AND no asset_id.
+                {"target_entity":"not-a-valid-entity-id"},
+                // (5) Valid insert: asset_id present even though target
+                //     is invalid — diff engine falls back to insert path.
+                {"target_entity":"also-invalid","asset_id":"chair_002"},
+            ],
+        });
+        let count = count_response_entities(ToolName::LayoutSuggestion, &layout_payload);
+        let resp = PlanResponse {
+            tool: ToolName::LayoutSuggestion,
+            raw_payload: layout_payload.to_string(),
+            parsed: layout_payload.clone(),
+            entities_modified: count,
+        };
+        let diff = DiffEngine::build(&resp);
+        assert_eq!(
+            count as usize,
+            diff.operations.len(),
+            "count must equal diff op count for LayoutSuggestion (got count={count}, ops={})",
+            diff.operations.len()
+        );
+        assert_eq!(count, 3, "only 3 valid proposals should count, not 5");
+
+        // The before-the-fix behaviour returned 5 (raw array length).
+        // Pin the new behaviour so a future refactor that reverts to
+        // `arr_len("proposals")` would fail this test.
+        let layout_all_empty = serde_json::json!({"proposals":[{},{},{}]});
+        assert_eq!(
+            count_response_entities(ToolName::LayoutSuggestion, &layout_all_empty),
+            0,
+            "empty proposals must count as 0 (diff engine drops them)"
         );
     }
 }
