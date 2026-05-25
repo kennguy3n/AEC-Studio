@@ -255,7 +255,8 @@ mod tests {
                     Some(3),
                 );
                 assert_eq!(
-                    body.get("rotation_yaw_deg").and_then(serde_json::Value::as_f64),
+                    body.get("rotation_yaw_deg")
+                        .and_then(serde_json::Value::as_f64),
                     Some(90.0),
                 );
                 // `name` round-trips when set.
@@ -345,7 +346,9 @@ mod tests {
                     Some(5000.0),
                 );
                 assert_eq!(
-                    after.get("scale_override").and_then(serde_json::Value::as_f64),
+                    after
+                        .get("scale_override")
+                        .and_then(serde_json::Value::as_f64),
                     Some(1.5),
                 );
             }
@@ -382,7 +385,8 @@ mod tests {
     fn delete_furniture_round_trips_through_graph() {
         let mut g = ProjectGraph::new();
         let id = EntityId::new();
-        g.apply(&placement(id.clone(), "asset_z").to_delta()).unwrap();
+        g.apply(&placement(id.clone(), "asset_z").to_delta())
+            .unwrap();
         let del = DeleteFurniture {
             entity_id: id.clone(),
         };

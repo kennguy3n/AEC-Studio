@@ -1926,10 +1926,8 @@ impl BridgeService {
         project_path: &str,
         out_path: &str,
     ) -> Result<ProjectExportPackageResult, BridgeServiceError> {
-        let res = aec_export::write_project_package_zip(
-            Path::new(project_path),
-            Path::new(out_path),
-        )?;
+        let res =
+            aec_export::write_project_package_zip(Path::new(project_path), Path::new(out_path))?;
         Ok(ProjectExportPackageResult {
             out_path: res.out_path.to_string_lossy().into_owned(),
             entries: res.entries,
@@ -1971,9 +1969,8 @@ impl BridgeService {
         // statement open while we mutate via `INSERT OR REPLACE`.
         let entities: Vec<(String, String)> = {
             let mut stmt = conn.prepare("SELECT id, kind FROM entities")?;
-            let rows = stmt.query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?;
+            let rows =
+                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
         };
 
@@ -2005,8 +2002,7 @@ impl BridgeService {
                     });
                 }
                 aec_bim::classification_tables::ClassificationScheme::UniformatIi => {
-                    let Some(code) =
-                        aec_bim::classification_tables::ifc_to_uniformat(&ifc_class)
+                    let Some(code) = aec_bim::classification_tables::ifc_to_uniformat(&ifc_class)
                     else {
                         skipped += 1;
                         continue;
@@ -2028,8 +2024,7 @@ impl BridgeService {
                     });
                 }
                 aec_bim::classification_tables::ClassificationScheme::Omniclass21 => {
-                    let Some(code) =
-                        aec_bim::classification_tables::ifc_to_omniclass(&ifc_class)
+                    let Some(code) = aec_bim::classification_tables::ifc_to_omniclass(&ifc_class)
                     else {
                         skipped += 1;
                         continue;
@@ -2135,10 +2130,15 @@ impl BridgeService {
             Some(s) => serde_json::from_str(s).unwrap_or_default(),
             None => serde_json::Map::new(),
         };
-        let previous_value = body_obj
-            .get(key)
-            .and_then(|v| v.as_str().map(ToString::to_string).or_else(|| Some(v.to_string())));
-        body_obj.insert(key.to_string(), serde_json::Value::String(value.to_string()));
+        let previous_value = body_obj.get(key).and_then(|v| {
+            v.as_str()
+                .map(ToString::to_string)
+                .or_else(|| Some(v.to_string()))
+        });
+        body_obj.insert(
+            key.to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
         let new_body = serde_json::Value::Object(body_obj);
 
         let tx = conn.transaction()?;
@@ -4896,15 +4896,14 @@ END-ISO-10303-21;\n";
     fn seed_one_wall(s: &mut BridgeService, summary: &ProjectSummary) -> aec_core::types::EntityId {
         use aec_command::commands::{wall, CommandKind};
         let entity_id = aec_core::types::EntityId::new();
-        let cmd =
-            aec_command::commands::Command::user(CommandKind::CreateWall(wall::CreateWall {
-                entity_id: entity_id.clone(),
-                start_mm: [0.0, 0.0],
-                end_mm: [4500.0, 0.0],
-                height_mm: 2700.0,
-                thickness_mm: 100.0,
-                material_id: None,
-            }));
+        let cmd = aec_command::commands::Command::user(CommandKind::CreateWall(wall::CreateWall {
+            entity_id: entity_id.clone(),
+            start_mm: [0.0, 0.0],
+            end_mm: [4500.0, 0.0],
+            height_mm: 2700.0,
+            thickness_mm: 100.0,
+            material_id: None,
+        }));
         s.command_apply(&summary.path, cmd).expect("seed wall");
         entity_id
     }
@@ -4921,11 +4920,8 @@ END-ISO-10303-21;\n";
             .expect("uniformat classify");
         assert_eq!(res.scheme, "uniformat-ii");
         assert!(res.classified > 0, "seeded wall must be classified");
-        let walls: Vec<&BimClassifyAssignment> = res
-            .details
-            .iter()
-            .filter(|a| a.code == "B2010")
-            .collect();
+        let walls: Vec<&BimClassifyAssignment> =
+            res.details.iter().filter(|a| a.code == "B2010").collect();
         assert!(
             !walls.is_empty(),
             "expected at least one wall classified as B2010 (Exterior Walls)"
@@ -5028,13 +5024,7 @@ END-ISO-10303-21;\n";
             .project_create_from_template("interior.apartment", "Missing-Entity")
             .unwrap();
         let err = s
-            .bim_set_property(
-                &summary.path,
-                "ent_does_not_exist",
-                "Pset_X",
-                "Y",
-                "1",
-            )
+            .bim_set_property(&summary.path, "ent_does_not_exist", "Pset_X", "Y", "1")
             .expect_err("missing entity rejected");
         assert!(
             matches!(err, BridgeServiceError::Invalid(ref m) if m.contains("not found")),

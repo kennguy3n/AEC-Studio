@@ -66,98 +66,412 @@ pub struct OmniClassCode {
 /// (NISTIR 6389). This is the authoritative public-domain reference.
 pub const UNIFORMAT_II: &[UniformatCode] = &[
     // ----- A: Substructure -----
-    UniformatCode { code: "A",     title: "Substructure",                    level: 1 },
-    UniformatCode { code: "A10",   title: "Foundations",                      level: 2 },
-    UniformatCode { code: "A1010", title: "Standard Foundations",            level: 3 },
-    UniformatCode { code: "A1020", title: "Special Foundations",             level: 3 },
-    UniformatCode { code: "A1030", title: "Slab on Grade",                   level: 3 },
-    UniformatCode { code: "A20",   title: "Basement Construction",            level: 2 },
-    UniformatCode { code: "A2010", title: "Basement Excavation",             level: 3 },
-    UniformatCode { code: "A2020", title: "Basement Walls",                  level: 3 },
-
+    UniformatCode {
+        code: "A",
+        title: "Substructure",
+        level: 1,
+    },
+    UniformatCode {
+        code: "A10",
+        title: "Foundations",
+        level: 2,
+    },
+    UniformatCode {
+        code: "A1010",
+        title: "Standard Foundations",
+        level: 3,
+    },
+    UniformatCode {
+        code: "A1020",
+        title: "Special Foundations",
+        level: 3,
+    },
+    UniformatCode {
+        code: "A1030",
+        title: "Slab on Grade",
+        level: 3,
+    },
+    UniformatCode {
+        code: "A20",
+        title: "Basement Construction",
+        level: 2,
+    },
+    UniformatCode {
+        code: "A2010",
+        title: "Basement Excavation",
+        level: 3,
+    },
+    UniformatCode {
+        code: "A2020",
+        title: "Basement Walls",
+        level: 3,
+    },
     // ----- B: Shell -----
-    UniformatCode { code: "B",     title: "Shell",                            level: 1 },
-    UniformatCode { code: "B10",   title: "Superstructure",                   level: 2 },
-    UniformatCode { code: "B1010", title: "Floor Construction",              level: 3 },
-    UniformatCode { code: "B1020", title: "Roof Construction",               level: 3 },
-    UniformatCode { code: "B20",   title: "Exterior Enclosure",               level: 2 },
-    UniformatCode { code: "B2010", title: "Exterior Walls",                  level: 3 },
-    UniformatCode { code: "B2020", title: "Exterior Windows",                level: 3 },
-    UniformatCode { code: "B2030", title: "Exterior Doors",                  level: 3 },
-    UniformatCode { code: "B30",   title: "Roofing",                          level: 2 },
-    UniformatCode { code: "B3010", title: "Roof Coverings",                  level: 3 },
-    UniformatCode { code: "B3020", title: "Roof Openings",                   level: 3 },
-
+    UniformatCode {
+        code: "B",
+        title: "Shell",
+        level: 1,
+    },
+    UniformatCode {
+        code: "B10",
+        title: "Superstructure",
+        level: 2,
+    },
+    UniformatCode {
+        code: "B1010",
+        title: "Floor Construction",
+        level: 3,
+    },
+    UniformatCode {
+        code: "B1020",
+        title: "Roof Construction",
+        level: 3,
+    },
+    UniformatCode {
+        code: "B20",
+        title: "Exterior Enclosure",
+        level: 2,
+    },
+    UniformatCode {
+        code: "B2010",
+        title: "Exterior Walls",
+        level: 3,
+    },
+    UniformatCode {
+        code: "B2020",
+        title: "Exterior Windows",
+        level: 3,
+    },
+    UniformatCode {
+        code: "B2030",
+        title: "Exterior Doors",
+        level: 3,
+    },
+    UniformatCode {
+        code: "B30",
+        title: "Roofing",
+        level: 2,
+    },
+    UniformatCode {
+        code: "B3010",
+        title: "Roof Coverings",
+        level: 3,
+    },
+    UniformatCode {
+        code: "B3020",
+        title: "Roof Openings",
+        level: 3,
+    },
     // ----- C: Interiors -----
-    UniformatCode { code: "C",     title: "Interiors",                        level: 1 },
-    UniformatCode { code: "C10",   title: "Interior Construction",            level: 2 },
-    UniformatCode { code: "C1010", title: "Partitions",                      level: 3 },
-    UniformatCode { code: "C1020", title: "Interior Doors",                  level: 3 },
-    UniformatCode { code: "C1030", title: "Fittings",                        level: 3 },
-    UniformatCode { code: "C20",   title: "Stairs",                           level: 2 },
-    UniformatCode { code: "C2010", title: "Stair Construction",              level: 3 },
-    UniformatCode { code: "C2020", title: "Stair Finishes",                  level: 3 },
-    UniformatCode { code: "C30",   title: "Interior Finishes",                level: 2 },
-    UniformatCode { code: "C3010", title: "Wall Finishes",                   level: 3 },
-    UniformatCode { code: "C3020", title: "Floor Finishes",                  level: 3 },
-    UniformatCode { code: "C3030", title: "Ceiling Finishes",                level: 3 },
-
+    UniformatCode {
+        code: "C",
+        title: "Interiors",
+        level: 1,
+    },
+    UniformatCode {
+        code: "C10",
+        title: "Interior Construction",
+        level: 2,
+    },
+    UniformatCode {
+        code: "C1010",
+        title: "Partitions",
+        level: 3,
+    },
+    UniformatCode {
+        code: "C1020",
+        title: "Interior Doors",
+        level: 3,
+    },
+    UniformatCode {
+        code: "C1030",
+        title: "Fittings",
+        level: 3,
+    },
+    UniformatCode {
+        code: "C20",
+        title: "Stairs",
+        level: 2,
+    },
+    UniformatCode {
+        code: "C2010",
+        title: "Stair Construction",
+        level: 3,
+    },
+    UniformatCode {
+        code: "C2020",
+        title: "Stair Finishes",
+        level: 3,
+    },
+    UniformatCode {
+        code: "C30",
+        title: "Interior Finishes",
+        level: 2,
+    },
+    UniformatCode {
+        code: "C3010",
+        title: "Wall Finishes",
+        level: 3,
+    },
+    UniformatCode {
+        code: "C3020",
+        title: "Floor Finishes",
+        level: 3,
+    },
+    UniformatCode {
+        code: "C3030",
+        title: "Ceiling Finishes",
+        level: 3,
+    },
     // ----- D: Services -----
-    UniformatCode { code: "D",     title: "Services",                         level: 1 },
-    UniformatCode { code: "D10",   title: "Conveying",                        level: 2 },
-    UniformatCode { code: "D1010", title: "Elevators & Lifts",               level: 3 },
-    UniformatCode { code: "D1020", title: "Escalators & Moving Walks",       level: 3 },
-    UniformatCode { code: "D20",   title: "Plumbing",                         level: 2 },
-    UniformatCode { code: "D2010", title: "Plumbing Fixtures",               level: 3 },
-    UniformatCode { code: "D2020", title: "Domestic Water Distribution",     level: 3 },
-    UniformatCode { code: "D2030", title: "Sanitary Waste",                  level: 3 },
-    UniformatCode { code: "D2040", title: "Rain Water Drainage",             level: 3 },
-    UniformatCode { code: "D30",   title: "HVAC",                             level: 2 },
-    UniformatCode { code: "D3010", title: "Energy Supply",                   level: 3 },
-    UniformatCode { code: "D3020", title: "Heat Generating Systems",         level: 3 },
-    UniformatCode { code: "D3030", title: "Cooling Generating Systems",      level: 3 },
-    UniformatCode { code: "D3040", title: "Distribution Systems",            level: 3 },
-    UniformatCode { code: "D3050", title: "Terminal & Package Units",        level: 3 },
-    UniformatCode { code: "D40",   title: "Fire Protection",                  level: 2 },
-    UniformatCode { code: "D4010", title: "Sprinklers",                      level: 3 },
-    UniformatCode { code: "D4020", title: "Standpipes",                      level: 3 },
-    UniformatCode { code: "D50",   title: "Electrical",                       level: 2 },
-    UniformatCode { code: "D5010", title: "Electrical Service & Distribution", level: 3 },
-    UniformatCode { code: "D5020", title: "Lighting & Branch Wiring",        level: 3 },
-    UniformatCode { code: "D5030", title: "Communications & Security",       level: 3 },
-
+    UniformatCode {
+        code: "D",
+        title: "Services",
+        level: 1,
+    },
+    UniformatCode {
+        code: "D10",
+        title: "Conveying",
+        level: 2,
+    },
+    UniformatCode {
+        code: "D1010",
+        title: "Elevators & Lifts",
+        level: 3,
+    },
+    UniformatCode {
+        code: "D1020",
+        title: "Escalators & Moving Walks",
+        level: 3,
+    },
+    UniformatCode {
+        code: "D20",
+        title: "Plumbing",
+        level: 2,
+    },
+    UniformatCode {
+        code: "D2010",
+        title: "Plumbing Fixtures",
+        level: 3,
+    },
+    UniformatCode {
+        code: "D2020",
+        title: "Domestic Water Distribution",
+        level: 3,
+    },
+    UniformatCode {
+        code: "D2030",
+        title: "Sanitary Waste",
+        level: 3,
+    },
+    UniformatCode {
+        code: "D2040",
+        title: "Rain Water Drainage",
+        level: 3,
+    },
+    UniformatCode {
+        code: "D30",
+        title: "HVAC",
+        level: 2,
+    },
+    UniformatCode {
+        code: "D3010",
+        title: "Energy Supply",
+        level: 3,
+    },
+    UniformatCode {
+        code: "D3020",
+        title: "Heat Generating Systems",
+        level: 3,
+    },
+    UniformatCode {
+        code: "D3030",
+        title: "Cooling Generating Systems",
+        level: 3,
+    },
+    UniformatCode {
+        code: "D3040",
+        title: "Distribution Systems",
+        level: 3,
+    },
+    UniformatCode {
+        code: "D3050",
+        title: "Terminal & Package Units",
+        level: 3,
+    },
+    UniformatCode {
+        code: "D40",
+        title: "Fire Protection",
+        level: 2,
+    },
+    UniformatCode {
+        code: "D4010",
+        title: "Sprinklers",
+        level: 3,
+    },
+    UniformatCode {
+        code: "D4020",
+        title: "Standpipes",
+        level: 3,
+    },
+    UniformatCode {
+        code: "D50",
+        title: "Electrical",
+        level: 2,
+    },
+    UniformatCode {
+        code: "D5010",
+        title: "Electrical Service & Distribution",
+        level: 3,
+    },
+    UniformatCode {
+        code: "D5020",
+        title: "Lighting & Branch Wiring",
+        level: 3,
+    },
+    UniformatCode {
+        code: "D5030",
+        title: "Communications & Security",
+        level: 3,
+    },
     // ----- E: Equipment & Furnishings -----
-    UniformatCode { code: "E",     title: "Equipment & Furnishings",          level: 1 },
-    UniformatCode { code: "E10",   title: "Equipment",                        level: 2 },
-    UniformatCode { code: "E1010", title: "Commercial Equipment",            level: 3 },
-    UniformatCode { code: "E1020", title: "Institutional Equipment",         level: 3 },
-    UniformatCode { code: "E1030", title: "Vehicular Equipment",             level: 3 },
-    UniformatCode { code: "E1090", title: "Other Equipment",                 level: 3 },
-    UniformatCode { code: "E20",   title: "Furnishings",                      level: 2 },
-    UniformatCode { code: "E2010", title: "Fixed Furnishings",               level: 3 },
-    UniformatCode { code: "E2020", title: "Movable Furnishings",             level: 3 },
-
+    UniformatCode {
+        code: "E",
+        title: "Equipment & Furnishings",
+        level: 1,
+    },
+    UniformatCode {
+        code: "E10",
+        title: "Equipment",
+        level: 2,
+    },
+    UniformatCode {
+        code: "E1010",
+        title: "Commercial Equipment",
+        level: 3,
+    },
+    UniformatCode {
+        code: "E1020",
+        title: "Institutional Equipment",
+        level: 3,
+    },
+    UniformatCode {
+        code: "E1030",
+        title: "Vehicular Equipment",
+        level: 3,
+    },
+    UniformatCode {
+        code: "E1090",
+        title: "Other Equipment",
+        level: 3,
+    },
+    UniformatCode {
+        code: "E20",
+        title: "Furnishings",
+        level: 2,
+    },
+    UniformatCode {
+        code: "E2010",
+        title: "Fixed Furnishings",
+        level: 3,
+    },
+    UniformatCode {
+        code: "E2020",
+        title: "Movable Furnishings",
+        level: 3,
+    },
     // ----- F: Special Construction & Demolition -----
-    UniformatCode { code: "F",     title: "Special Construction & Demolition", level: 1 },
-    UniformatCode { code: "F10",   title: "Special Construction",             level: 2 },
-    UniformatCode { code: "F1010", title: "Special Structures",              level: 3 },
-    UniformatCode { code: "F1020", title: "Integrated Construction",         level: 3 },
-    UniformatCode { code: "F20",   title: "Selective Building Demolition",    level: 2 },
-    UniformatCode { code: "F2010", title: "Building Elements Demolition",    level: 3 },
-    UniformatCode { code: "F2020", title: "Hazardous Components Abatement",  level: 3 },
-
+    UniformatCode {
+        code: "F",
+        title: "Special Construction & Demolition",
+        level: 1,
+    },
+    UniformatCode {
+        code: "F10",
+        title: "Special Construction",
+        level: 2,
+    },
+    UniformatCode {
+        code: "F1010",
+        title: "Special Structures",
+        level: 3,
+    },
+    UniformatCode {
+        code: "F1020",
+        title: "Integrated Construction",
+        level: 3,
+    },
+    UniformatCode {
+        code: "F20",
+        title: "Selective Building Demolition",
+        level: 2,
+    },
+    UniformatCode {
+        code: "F2010",
+        title: "Building Elements Demolition",
+        level: 3,
+    },
+    UniformatCode {
+        code: "F2020",
+        title: "Hazardous Components Abatement",
+        level: 3,
+    },
     // ----- G: Building Sitework -----
-    UniformatCode { code: "G",     title: "Building Sitework",                level: 1 },
-    UniformatCode { code: "G10",   title: "Site Preparation",                 level: 2 },
-    UniformatCode { code: "G1010", title: "Site Clearing",                   level: 3 },
-    UniformatCode { code: "G1020", title: "Site Demolition & Relocations",   level: 3 },
-    UniformatCode { code: "G1030", title: "Site Earthwork",                  level: 3 },
-    UniformatCode { code: "G20",   title: "Site Improvements",                level: 2 },
-    UniformatCode { code: "G2010", title: "Roadways",                        level: 3 },
-    UniformatCode { code: "G2020", title: "Parking Lots",                    level: 3 },
-    UniformatCode { code: "G2030", title: "Pedestrian Paving",               level: 3 },
-    UniformatCode { code: "G2040", title: "Site Development",                level: 3 },
-    UniformatCode { code: "G2050", title: "Landscaping",                     level: 3 },
+    UniformatCode {
+        code: "G",
+        title: "Building Sitework",
+        level: 1,
+    },
+    UniformatCode {
+        code: "G10",
+        title: "Site Preparation",
+        level: 2,
+    },
+    UniformatCode {
+        code: "G1010",
+        title: "Site Clearing",
+        level: 3,
+    },
+    UniformatCode {
+        code: "G1020",
+        title: "Site Demolition & Relocations",
+        level: 3,
+    },
+    UniformatCode {
+        code: "G1030",
+        title: "Site Earthwork",
+        level: 3,
+    },
+    UniformatCode {
+        code: "G20",
+        title: "Site Improvements",
+        level: 2,
+    },
+    UniformatCode {
+        code: "G2010",
+        title: "Roadways",
+        level: 3,
+    },
+    UniformatCode {
+        code: "G2020",
+        title: "Parking Lots",
+        level: 3,
+    },
+    UniformatCode {
+        code: "G2030",
+        title: "Pedestrian Paving",
+        level: 3,
+    },
+    UniformatCode {
+        code: "G2040",
+        title: "Site Development",
+        level: 3,
+    },
+    UniformatCode {
+        code: "G2050",
+        title: "Landscaping",
+        level: 3,
+    },
 ];
 
 /// OmniClass Table 21 (Construction Elements) — curated subset
@@ -165,65 +479,247 @@ pub const UNIFORMAT_II: &[UniformatCode] = &[
 /// about. Codes from CSI's published Table 21 (2019 revision).
 pub const OMNICLASS_21: &[OmniClassCode] = &[
     // ----- 21-01: Substructure -----
-    OmniClassCode { code: "21-01 00 00", title: "Substructure",                          level: 1 },
-    OmniClassCode { code: "21-01 10 00", title: "Foundations",                            level: 2 },
-    OmniClassCode { code: "21-01 10 10", title: "Standard Foundations",                  level: 3 },
-    OmniClassCode { code: "21-01 10 20", title: "Special Foundations",                   level: 3 },
-    OmniClassCode { code: "21-01 10 30", title: "Lowest Floor Construction",             level: 3 },
-    OmniClassCode { code: "21-01 20 00", title: "Subgrade Enclosures",                    level: 2 },
-    OmniClassCode { code: "21-01 20 10", title: "Walls for Subgrade Enclosures",         level: 3 },
-
+    OmniClassCode {
+        code: "21-01 00 00",
+        title: "Substructure",
+        level: 1,
+    },
+    OmniClassCode {
+        code: "21-01 10 00",
+        title: "Foundations",
+        level: 2,
+    },
+    OmniClassCode {
+        code: "21-01 10 10",
+        title: "Standard Foundations",
+        level: 3,
+    },
+    OmniClassCode {
+        code: "21-01 10 20",
+        title: "Special Foundations",
+        level: 3,
+    },
+    OmniClassCode {
+        code: "21-01 10 30",
+        title: "Lowest Floor Construction",
+        level: 3,
+    },
+    OmniClassCode {
+        code: "21-01 20 00",
+        title: "Subgrade Enclosures",
+        level: 2,
+    },
+    OmniClassCode {
+        code: "21-01 20 10",
+        title: "Walls for Subgrade Enclosures",
+        level: 3,
+    },
     // ----- 21-02: Shell -----
-    OmniClassCode { code: "21-02 00 00", title: "Shell",                                  level: 1 },
-    OmniClassCode { code: "21-02 10 00", title: "Superstructure",                         level: 2 },
-    OmniClassCode { code: "21-02 10 10", title: "Floor Construction",                    level: 3 },
-    OmniClassCode { code: "21-02 10 20", title: "Roof Construction",                     level: 3 },
-    OmniClassCode { code: "21-02 20 00", title: "Exterior Vertical Enclosures",           level: 2 },
-    OmniClassCode { code: "21-02 20 10", title: "Exterior Walls",                        level: 3 },
-    OmniClassCode { code: "21-02 20 20", title: "Exterior Windows",                      level: 3 },
-    OmniClassCode { code: "21-02 20 30", title: "Exterior Doors and Grilles",            level: 3 },
-    OmniClassCode { code: "21-02 30 00", title: "Exterior Horizontal Enclosures",         level: 2 },
-    OmniClassCode { code: "21-02 30 10", title: "Roofing",                               level: 3 },
-    OmniClassCode { code: "21-02 30 20", title: "Roof Appurtenances",                    level: 3 },
-
+    OmniClassCode {
+        code: "21-02 00 00",
+        title: "Shell",
+        level: 1,
+    },
+    OmniClassCode {
+        code: "21-02 10 00",
+        title: "Superstructure",
+        level: 2,
+    },
+    OmniClassCode {
+        code: "21-02 10 10",
+        title: "Floor Construction",
+        level: 3,
+    },
+    OmniClassCode {
+        code: "21-02 10 20",
+        title: "Roof Construction",
+        level: 3,
+    },
+    OmniClassCode {
+        code: "21-02 20 00",
+        title: "Exterior Vertical Enclosures",
+        level: 2,
+    },
+    OmniClassCode {
+        code: "21-02 20 10",
+        title: "Exterior Walls",
+        level: 3,
+    },
+    OmniClassCode {
+        code: "21-02 20 20",
+        title: "Exterior Windows",
+        level: 3,
+    },
+    OmniClassCode {
+        code: "21-02 20 30",
+        title: "Exterior Doors and Grilles",
+        level: 3,
+    },
+    OmniClassCode {
+        code: "21-02 30 00",
+        title: "Exterior Horizontal Enclosures",
+        level: 2,
+    },
+    OmniClassCode {
+        code: "21-02 30 10",
+        title: "Roofing",
+        level: 3,
+    },
+    OmniClassCode {
+        code: "21-02 30 20",
+        title: "Roof Appurtenances",
+        level: 3,
+    },
     // ----- 21-03: Interiors -----
-    OmniClassCode { code: "21-03 00 00", title: "Interiors",                              level: 1 },
-    OmniClassCode { code: "21-03 10 00", title: "Interior Construction",                  level: 2 },
-    OmniClassCode { code: "21-03 10 10", title: "Interior Partitions",                   level: 3 },
-    OmniClassCode { code: "21-03 10 20", title: "Interior Windows",                      level: 3 },
-    OmniClassCode { code: "21-03 10 30", title: "Interior Doors",                        level: 3 },
-    OmniClassCode { code: "21-03 20 00", title: "Interior Finishes",                      level: 2 },
-    OmniClassCode { code: "21-03 20 10", title: "Wall Finishes",                         level: 3 },
-    OmniClassCode { code: "21-03 20 20", title: "Floor Finishes",                        level: 3 },
-    OmniClassCode { code: "21-03 20 30", title: "Ceiling Finishes",                      level: 3 },
-
+    OmniClassCode {
+        code: "21-03 00 00",
+        title: "Interiors",
+        level: 1,
+    },
+    OmniClassCode {
+        code: "21-03 10 00",
+        title: "Interior Construction",
+        level: 2,
+    },
+    OmniClassCode {
+        code: "21-03 10 10",
+        title: "Interior Partitions",
+        level: 3,
+    },
+    OmniClassCode {
+        code: "21-03 10 20",
+        title: "Interior Windows",
+        level: 3,
+    },
+    OmniClassCode {
+        code: "21-03 10 30",
+        title: "Interior Doors",
+        level: 3,
+    },
+    OmniClassCode {
+        code: "21-03 20 00",
+        title: "Interior Finishes",
+        level: 2,
+    },
+    OmniClassCode {
+        code: "21-03 20 10",
+        title: "Wall Finishes",
+        level: 3,
+    },
+    OmniClassCode {
+        code: "21-03 20 20",
+        title: "Floor Finishes",
+        level: 3,
+    },
+    OmniClassCode {
+        code: "21-03 20 30",
+        title: "Ceiling Finishes",
+        level: 3,
+    },
     // ----- 21-04: Services -----
-    OmniClassCode { code: "21-04 00 00", title: "Services",                               level: 1 },
-    OmniClassCode { code: "21-04 10 00", title: "Conveying",                              level: 2 },
-    OmniClassCode { code: "21-04 10 10", title: "Vertical Conveying Systems",            level: 3 },
-    OmniClassCode { code: "21-04 20 00", title: "Plumbing",                               level: 2 },
-    OmniClassCode { code: "21-04 20 10", title: "Plumbing Fixtures",                     level: 3 },
-    OmniClassCode { code: "21-04 30 00", title: "HVAC",                                   level: 2 },
-    OmniClassCode { code: "21-04 40 00", title: "Fire Protection",                        level: 2 },
-    OmniClassCode { code: "21-04 50 00", title: "Electrical",                             level: 2 },
-    OmniClassCode { code: "21-04 50 30", title: "Lighting",                              level: 3 },
-
+    OmniClassCode {
+        code: "21-04 00 00",
+        title: "Services",
+        level: 1,
+    },
+    OmniClassCode {
+        code: "21-04 10 00",
+        title: "Conveying",
+        level: 2,
+    },
+    OmniClassCode {
+        code: "21-04 10 10",
+        title: "Vertical Conveying Systems",
+        level: 3,
+    },
+    OmniClassCode {
+        code: "21-04 20 00",
+        title: "Plumbing",
+        level: 2,
+    },
+    OmniClassCode {
+        code: "21-04 20 10",
+        title: "Plumbing Fixtures",
+        level: 3,
+    },
+    OmniClassCode {
+        code: "21-04 30 00",
+        title: "HVAC",
+        level: 2,
+    },
+    OmniClassCode {
+        code: "21-04 40 00",
+        title: "Fire Protection",
+        level: 2,
+    },
+    OmniClassCode {
+        code: "21-04 50 00",
+        title: "Electrical",
+        level: 2,
+    },
+    OmniClassCode {
+        code: "21-04 50 30",
+        title: "Lighting",
+        level: 3,
+    },
     // ----- 21-05: Equipment and Furnishings -----
-    OmniClassCode { code: "21-05 00 00", title: "Equipment and Furnishings",              level: 1 },
-    OmniClassCode { code: "21-05 10 00", title: "Equipment",                              level: 2 },
-    OmniClassCode { code: "21-05 20 00", title: "Furnishings",                            level: 2 },
-    OmniClassCode { code: "21-05 20 10", title: "Fixed Furnishings",                     level: 3 },
-    OmniClassCode { code: "21-05 20 20", title: "Movable Furnishings",                   level: 3 },
-
+    OmniClassCode {
+        code: "21-05 00 00",
+        title: "Equipment and Furnishings",
+        level: 1,
+    },
+    OmniClassCode {
+        code: "21-05 10 00",
+        title: "Equipment",
+        level: 2,
+    },
+    OmniClassCode {
+        code: "21-05 20 00",
+        title: "Furnishings",
+        level: 2,
+    },
+    OmniClassCode {
+        code: "21-05 20 10",
+        title: "Fixed Furnishings",
+        level: 3,
+    },
+    OmniClassCode {
+        code: "21-05 20 20",
+        title: "Movable Furnishings",
+        level: 3,
+    },
     // ----- 21-06: Special Construction -----
-    OmniClassCode { code: "21-06 00 00", title: "Special Construction and Demolition",    level: 1 },
-    OmniClassCode { code: "21-06 10 00", title: "Special Construction",                   level: 2 },
-    OmniClassCode { code: "21-06 20 00", title: "Selective Demolition",                   level: 2 },
-
+    OmniClassCode {
+        code: "21-06 00 00",
+        title: "Special Construction and Demolition",
+        level: 1,
+    },
+    OmniClassCode {
+        code: "21-06 10 00",
+        title: "Special Construction",
+        level: 2,
+    },
+    OmniClassCode {
+        code: "21-06 20 00",
+        title: "Selective Demolition",
+        level: 2,
+    },
     // ----- 21-07: Sitework -----
-    OmniClassCode { code: "21-07 00 00", title: "Sitework",                               level: 1 },
-    OmniClassCode { code: "21-07 10 00", title: "Site Preparation",                       level: 2 },
-    OmniClassCode { code: "21-07 20 00", title: "Site Improvements",                      level: 2 },
+    OmniClassCode {
+        code: "21-07 00 00",
+        title: "Sitework",
+        level: 1,
+    },
+    OmniClassCode {
+        code: "21-07 10 00",
+        title: "Site Preparation",
+        level: 2,
+    },
+    OmniClassCode {
+        code: "21-07 20 00",
+        title: "Site Improvements",
+        level: 2,
+    },
 ];
 
 /// Look up a Uniformat-II code by its canonical string. Returns
@@ -455,7 +951,10 @@ mod tests {
     #[test]
     fn ifc_to_uniformat_returns_b2030_for_door_b2020_for_window() {
         assert_eq!(ifc_to_uniformat(&IfcClass::IfcDoor).unwrap().code, "B2030");
-        assert_eq!(ifc_to_uniformat(&IfcClass::IfcWindow).unwrap().code, "B2020");
+        assert_eq!(
+            ifc_to_uniformat(&IfcClass::IfcWindow).unwrap().code,
+            "B2020"
+        );
     }
 
     #[test]
@@ -500,7 +999,13 @@ mod tests {
 
     #[test]
     fn classification_scheme_parse_round_trips() {
-        for s in &["ifc", "uniformat-ii", "uniformat", "omniclass-21", "omniclass"] {
+        for s in &[
+            "ifc",
+            "uniformat-ii",
+            "uniformat",
+            "omniclass-21",
+            "omniclass",
+        ] {
             let parsed = ClassificationScheme::parse(s).expect(s);
             // Round-trip via canonical name is always valid.
             assert_eq!(

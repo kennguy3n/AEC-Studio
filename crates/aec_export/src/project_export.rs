@@ -653,8 +653,8 @@ fn collect_files_sorted(
     dir: &Path,
     out: &mut Vec<PathBuf>,
 ) -> Result<(), ProjectExportError> {
-    let mut entries: Vec<std::fs::DirEntry> = std::fs::read_dir(dir)?
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut entries: Vec<std::fs::DirEntry> =
+        std::fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(std::fs::DirEntry::file_name);
     for entry in entries {
         let path = entry.path();
