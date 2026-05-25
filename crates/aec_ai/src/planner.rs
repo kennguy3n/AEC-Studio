@@ -14,6 +14,71 @@ use crate::safety_validator::{SafetyError, SafetyValidator, ValidationContext};
 use crate::tool_schema::{ToolName, ToolSchema, ToolSchemaRegistry};
 use crate::transport::{CompletionRequest, SidecarTransport, TransportError};
 
+/// Count the number of entities a tool response will modify when
+/// the [`crate::diff_engine::DiffEngine`] turns it into a `Diff`.
+///
+/// This is the **runtime** entity count the safety validator must
+/// check against the schema cap and the caller's runtime cap —
+/// `dispatch` previously passed `request.max_entities_modified`
+/// (i.e. the cap itself) which made the bounds check vacuous because
+/// `precheck` already ensures `cap <= schema.max_entities_modified`.
+///
+/// The per-tool logic mirrors `DiffEngine::build` — each tool's
+/// schema documents which JSON arrays / fields turn into ops:
+///   - `plan_detection` / `plan_to_wall`: `polylines[]` → one wall
+///     insert per polyline that has a `points` array.
+///   - `style_assistant`: `furniture_ids[]` + `material_ids[]` + 1
+///     extra for `lighting_preset_id` (if present).
+///   - `layout_suggestion`: `proposals[]` (each is an insert or an
+///     update depending on whether `target_entity` is present).
+///   - `render_doctor`: `findings[]` → one preset update per
+///     finding.
+///   - other tools (classification, property_fill, schedule_fill,
+///     etc.) are not handled by `DiffEngine::build`, so we fall back
+///     to a conservative 0 — the bridge service builds those diffs
+///     via dedicated `bim_classification` / `property_fill` paths.
+pub fn count_response_entities(tool: ToolName, parsed: &serde_json::Value) -> u32 {
+    fn arr_len(parsed: &serde_json::Value, key: &str) -> u32 {
+        parsed
+            .get(key)
+            .and_then(|v| v.as_array())
+            .map_or(0, |a| u32::try_from(a.len()).unwrap_or(u32::MAX))
+    }
+    match tool {
+        ToolName::PlanDetection | ToolName::PlanToWall => parsed
+            .get("polylines")
+            .and_then(|v| v.as_array())
+            .map_or(0, |a| {
+                let n = a.iter().filter(|p| p.get("points").is_some()).count();
+                u32::try_from(n).unwrap_or(u32::MAX)
+            }),
+        ToolName::StyleAssistant => {
+            let f = arr_len(parsed, "furniture_ids");
+            let m = arr_len(parsed, "material_ids");
+            let l = u32::from(
+                parsed
+                    .get("lighting_preset_id")
+                    .and_then(|v| v.as_str())
+                    .is_some(),
+            );
+            f.saturating_add(m).saturating_add(l)
+        }
+        ToolName::LayoutSuggestion => arr_len(parsed, "proposals"),
+        ToolName::RenderDoctor => arr_len(parsed, "findings"),
+        // Tools the `DiffEngine` does not lower into ops directly
+        // (their diffs are built by dedicated bridge-service paths).
+        // Returning 0 here is safe — the bridge layer enforces its
+        // own per-tool count check via `diff.operations.len()`.
+        ToolName::CadCleanup
+        | ToolName::ScheduleFill
+        | ToolName::Classification
+        | ToolName::PropertyFill
+        | ToolName::ValidationHelp
+        | ToolName::CoverPageDraft
+        | ToolName::LightingBalance => 0,
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum PlanError {
     #[error("safety violation: {0}")]
@@ -82,28 +147,62 @@ impl<'a> ToolPlanner<'a> {
 
     /// Wrap a raw sidecar response into a typed [`PlanResponse`] after
     /// running it through the [`SafetyValidator`].
+    ///
+    /// `request_cap` is the caller's runtime safety budget
+    /// (`PlanRequest::max_entities_modified`). The validator checks
+    /// the *actual* count from the parsed payload against both the
+    /// schema's hard cap (`SafetyError::BoundsExceeded`) and the
+    /// request's runtime cap (same variant, different `max` field) —
+    /// previously this code passed `request_cap` as the value to
+    /// check, making the bounds check vacuous because
+    /// `precheck` already enforces `request_cap <= schema_cap`, so a
+    /// model that emitted more entities than the cap would still slip
+    /// through.
     pub fn finalize(
         &self,
         tool: ToolName,
         scope: Scope,
-        entities_modified: u32,
+        request_cap: u32,
         raw_payload: String,
     ) -> Result<PlanResponse, PlanError> {
+        // Parse the payload *before* validating so we can count the
+        // actual number of entities the response would touch. The
+        // grammar match in `SafetyValidator::validate` will catch any
+        // serde parse error anyway, but we need the parsed form here
+        // to count entities per-tool.
+        let parsed: serde_json::Value = serde_json::from_str(&raw_payload)
+            .map_err(|e| SafetyError::Malformed(e.to_string()))?;
+        let actual_entities = count_response_entities(tool, &parsed);
+
+        // Enforce the caller's runtime cap explicitly. The validator
+        // below also checks against `schema.max_entities_modified`
+        // (the hard cap), so a response that exceeds either limit is
+        // rejected. This is the layer the bot-flagged bypass lived
+        // at — previously we passed `request_cap` itself as
+        // `entities_modified`, so `actual_entities > request_cap`
+        // was never tested.
+        if actual_entities > request_cap {
+            return Err(SafetyError::BoundsExceeded {
+                tool: tool.as_str().into(),
+                entities: actual_entities,
+                max: request_cap,
+            }
+            .into());
+        }
+
         let validator = SafetyValidator::new(self.schemas, self.grammars);
         let ctx = ValidationContext {
             scope,
             tool,
-            entities_modified,
+            entities_modified: actual_entities,
             payload: raw_payload.clone(),
         };
         validator.validate(&ctx)?;
-        let parsed: serde_json::Value = serde_json::from_str(&raw_payload)
-            .map_err(|e| SafetyError::Malformed(e.to_string()))?;
         Ok(PlanResponse {
             tool,
             raw_payload,
             parsed,
-            entities_modified,
+            entities_modified: actual_entities,
         })
     }
 
@@ -242,5 +341,78 @@ mod tests {
             .finalize(ToolName::LayoutSuggestion, Scope::Design, 1, payload.into())
             .unwrap_err();
         assert!(matches!(err, PlanError::Safety(_)));
+    }
+
+    #[test]
+    fn finalize_enforces_request_cap_against_actual_entity_count() {
+        // The model emits 4 furniture entities + 1 lighting preset = 5
+        // entities, but the caller's runtime cap is 3. The validator
+        // MUST reject with `SafetyError::BoundsExceeded`. The previous
+        // code passed `request_cap` itself as the count so this check
+        // was vacuous — every payload passed bounds checking.
+        let s = ToolSchemaRegistry::defaults();
+        let g = GrammarRegistry::defaults();
+        let planner = ToolPlanner::new(&s, &g);
+        let payload = r#"{"furniture_ids":["a","b","c","d"],"material_ids":[],"lighting_preset_id":"warm_evening"}"#;
+        let err = planner
+            .finalize(ToolName::StyleAssistant, Scope::Design, 3, payload.into())
+            .unwrap_err();
+        let PlanError::Safety(SafetyError::BoundsExceeded { entities, max, .. }) = err else {
+            panic!("expected BoundsExceeded, got {err:?}");
+        };
+        assert_eq!(entities, 5, "actual entity count not threaded through");
+        assert_eq!(max, 3, "runtime cap not threaded through");
+    }
+
+    #[test]
+    fn finalize_reports_actual_entity_count_not_request_cap() {
+        // 2 furniture + 1 material + 1 lighting = 4 entities, cap = 16.
+        // The returned `entities_modified` must be the *actual* count
+        // (4), not the cap (16). Bridge service consumers of this
+        // field downstream rely on it being honest.
+        let s = ToolSchemaRegistry::defaults();
+        let g = GrammarRegistry::defaults();
+        let planner = ToolPlanner::new(&s, &g);
+        let payload = r#"{"furniture_ids":["a","b"],"material_ids":["m1"],"lighting_preset_id":"warm_evening"}"#;
+        let r = planner
+            .finalize(ToolName::StyleAssistant, Scope::Design, 16, payload.into())
+            .unwrap();
+        assert_eq!(r.entities_modified, 4);
+    }
+
+    #[test]
+    fn count_response_entities_per_tool_shapes() {
+        // Spot-check the count helper against each shape the
+        // diff_engine knows how to build.
+        let plan_payload = serde_json::json!({"polylines":[{"points":[]},{"points":[]},{}]});
+        assert_eq!(
+            count_response_entities(ToolName::PlanDetection, &plan_payload),
+            2,
+            "polylines without `points` are skipped (mirrors DiffEngine)"
+        );
+        let style_payload = serde_json::json!({
+            "furniture_ids": ["a","b","c"],
+            "material_ids": ["m"],
+            "lighting_preset_id": "warm",
+        });
+        assert_eq!(
+            count_response_entities(ToolName::StyleAssistant, &style_payload),
+            5
+        );
+        let layout_payload = serde_json::json!({"proposals":[{},{},{}]});
+        assert_eq!(
+            count_response_entities(ToolName::LayoutSuggestion, &layout_payload),
+            3
+        );
+        let render_payload = serde_json::json!({"findings":[{},{}]});
+        assert_eq!(
+            count_response_entities(ToolName::RenderDoctor, &render_payload),
+            2
+        );
+        // Tools the diff_engine doesn't lower into ops fall back to 0.
+        assert_eq!(
+            count_response_entities(ToolName::Classification, &serde_json::json!({})),
+            0
+        );
     }
 }

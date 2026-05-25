@@ -2728,13 +2728,24 @@ impl BridgeService {
         // operations the resulting diff will apply, derived from
         // `DiffEngine::build` (which already knows the per-tool
         // shape — `proposals[]`, `furniture_ids[]`, `polylines[]`,
-        // etc.). The planner-side `response.entities_modified`
-        // currently echoes the caller's *cap* (the
-        // `max_entities_modified` safety budget), so using it here
-        // would tell the renderer "this diff touches 16 entities"
-        // when the model actually emitted 2. Reporting the diff's
-        // own operation count keeps the field honest end-to-end.
+        // etc.).
+        //
+        // `response.entities_modified` was historically the request
+        // cap, which made this field misleading; the planner now
+        // returns the actual count via
+        // `count_response_entities` (the same per-tool logic
+        // `DiffEngine::build` uses), so the two numbers SHOULD agree
+        // for the 4 tools the diff engine knows about. We still
+        // report `diff.operations.len()` here as defense in depth —
+        // if the per-tool counter and the diff builder ever diverge
+        // (e.g., one is updated and the other forgotten), the bridge
+        // continues to report what the renderer will actually
+        // observe.
         let entities = u32::try_from(diff.operations.len()).unwrap_or(u32::MAX);
+        debug_assert_eq!(
+            entities, response.entities_modified,
+            "DiffEngine::build and planner::count_response_entities must agree",
+        );
         let diff_id = {
             let mut guard = self.lock_ai_state()?;
             guard.insert_diff(diff)
