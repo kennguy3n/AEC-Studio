@@ -1015,6 +1015,23 @@ interface NativeApi {
     styleTags?: string[];
     limit?: number;
   }): unknown;
+  // AI endpoints wired in PR-V. `parsed_json` on the result of
+  // `ai_plan` is a `JSON.stringify`'d tool-specific payload; the
+  // adaptor parses it back into a typed `AiPlanParsed` for the
+  // renderer. `context_json` on the request side is the renderer's
+  // tool-specific context object, also serialised at the adaptor.
+  ai_list_tools(): unknown;
+  ai_plan(
+    tool: string,
+    scope: string,
+    prompt: string,
+    context_json: string,
+    max_entities_modified: number,
+  ): unknown;
+  ai_accept_diff(diff_id: string): unknown;
+  ai_reject_diff(diff_id: string): unknown;
+  ai_cancel_job(job_id: string): unknown;
+  ai_runtime_status(): unknown;
 }
 
 /**
@@ -1091,6 +1108,17 @@ export const NATIVE_WIRED_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   // in-process fallback used to ship, so dev/prod browsing renders
   // identical cards. See `crates/aec_bridge/src/asset_state.rs`.
   "designListAssets",
+  // AI sidecar surface wired in Phase 10 PR-V. Backed by
+  // `BridgeService::ai_state` (`Mutex<AiState>`) which owns the
+  // sidecar handle + pending diff map. All endpoints route through
+  // the read side of the napi singleton's `RwLock` so they don't
+  // block status-pane polling while a plan is in flight.
+  "aiListTools",
+  "aiPlan",
+  "aiAcceptDiff",
+  "aiRejectDiff",
+  "aiCancelJob",
+  "aiRuntimeStatus",
 ];
 
 /**
@@ -1119,12 +1147,6 @@ export const NATIVE_FALLBACK_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   "draftExportDxf",
   "bimClassify",
   "bimSetProperty",
-  "aiListTools",
-  "aiPlan",
-  "aiAcceptDiff",
-  "aiRejectDiff",
-  "aiCancelJob",
-  "aiRuntimeStatus",
   "deliverCreateRevision",
   "deliverListRevisions",
   "deliverCompareRevisions",
@@ -1333,6 +1355,113 @@ function adaptNative(n: NativeApi): BridgeBackend {
           : undefined,
         limit: typeof query.limit === "number" ? (query.limit as number) : undefined,
       }) as AssetSummary[],
+    // ----- AI endpoints (PR-V) -----
+    //
+    // `aiListTools` returns the AI tool catalogue *from the Rust side*
+    // (`AiToolSchemaRegistry::defaults()`), not the renderer-side
+    // `AI_TOOLS` constant. This keeps the wire shape pinned to the
+    // Rust enum: a renderer build that ships an out-of-date `AI_TOOLS`
+    // constant will still see the native truth in production.
+    aiListTools: async () =>
+      n.ai_list_tools() as AiTool[],
+    // `aiPlan` accepts a loose `Record<string, unknown>` for
+    // back-compat with the in-process fallback. We extract `tool`,
+    // `scope`, `prompt`, `context`, and `max_entities_modified`
+    // defensively, throwing a JS error rather than letting napi
+    // surface a confusing deserialisation message when the renderer
+    // forgets a field. `context` is serialised here because napi
+    // can't accept a `serde_json::Value` directly; the empty string
+    // is the Rust-side sentinel for "no context".
+    aiPlan: async (params) => {
+      const tool = typeof params.tool === "string" ? params.tool : "";
+      if (tool.length === 0) {
+        throw new Error("aiPlan: missing required string field 'tool'");
+      }
+      const scope = typeof params.scope === "string" ? params.scope : "";
+      if (scope.length === 0) {
+        throw new Error("aiPlan: missing required string field 'scope'");
+      }
+      const prompt = typeof params.prompt === "string" ? params.prompt : "";
+      const contextValue = params.context;
+      const contextJson =
+        contextValue === undefined || contextValue === null
+          ? ""
+          : JSON.stringify(contextValue);
+      // Accept either camelCase or snake_case for forward / backward
+      // compatibility with both the renderer's `aec.ts` shape
+      // (`maxEntitiesModified`) and the legacy in-process callers
+      // (`max_entities_modified`).
+      const max =
+        typeof params.maxEntitiesModified === "number"
+          ? params.maxEntitiesModified
+          : typeof params.max_entities_modified === "number"
+            ? (params.max_entities_modified as number)
+            : 16;
+      const result = n.ai_plan(tool, scope, prompt, contextJson, max) as {
+        diffId: string;
+        parsedJson: string;
+        tool: string;
+        entitiesModified: number;
+      };
+      let parsed: AiPlanParsed | null = null;
+      if (result.parsedJson && result.parsedJson.length > 0) {
+        try {
+          const obj = JSON.parse(result.parsedJson) as Record<string, unknown>;
+          // Tag the parsed object with the tool name so the renderer
+          // discriminant union (`AiPlanParsed`) works without the
+          // caller having to thread the tool in separately. The
+          // `tool` key must come AFTER `...obj` so the native (Rust)
+          // tool string wins over any `tool` key that snuck through
+          // the grammar-constrained model output (which uses `tool`
+          // as the discriminant for `AiPlanParsed`). A model that
+          // emits `{"tool":"layout_suggestion", ...}` for a
+          // `style_assistant` call would otherwise corrupt the
+          // discriminant and break pattern matching downstream.
+          parsed = { ...obj, tool: result.tool } as AiPlanParsed;
+        } catch {
+          // Malformed parsedJson is treated as no parse rather than a
+          // hard throw — the diff itself is still valid and the
+          // renderer can fall back to the diff_id flow.
+          parsed = null;
+        }
+      }
+      return { diffId: result.diffId, parsed };
+    },
+    aiAcceptDiff: async (diffId) => {
+      // Invoke for its side effect (remove from pending map). The TS
+      // contract is the literal `{ accepted: true }`; the native
+      // `{ ok, diff_id }` is intentionally not surfaced because the
+      // renderer's Accept button is idempotent and doesn't need the
+      // echo.
+      n.ai_accept_diff(diffId);
+      return { accepted: true };
+    },
+    aiRejectDiff: async (diffId) => {
+      // Same idempotency contract as `aiAcceptDiff`.
+      n.ai_reject_diff(diffId);
+      return { rejected: true };
+    },
+    aiCancelJob: async (jobId) => {
+      // `job_id` is accepted by the native side for forward
+      // compatibility but currently ignored — there's only one
+      // in-flight plan at a time. The TS contract collapses to the
+      // literal `{ cancelled: true }`.
+      n.ai_cancel_job(jobId);
+      return { cancelled: true };
+    },
+    aiRuntimeStatus: async () => {
+      const r = n.ai_runtime_status() as {
+        state: string;
+        lastError: string | null;
+        pendingDiffIds: string[];
+      };
+      // The `BridgeBackend.aiRuntimeStatus` contract today is
+      // `{ state, lastError }`. We deliberately drop
+      // `pendingDiffIds` here because no current renderer surface
+      // reads it; if/when the AI sidebar wants to render a
+      // "3 pending diffs" badge, widen the interface in a follow-up.
+      return { state: r.state, lastError: r.lastError };
+    },
   };
   // Self-check 0: the two catalogues must be *disjoint*. A method
   // listed in both `NATIVE_WIRED_METHODS` and `NATIVE_FALLBACK_METHODS`

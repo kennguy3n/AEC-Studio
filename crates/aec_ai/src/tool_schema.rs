@@ -61,6 +61,32 @@ impl ToolName {
             Self::LightingBalance => "lighting_balance",
         }
     }
+
+    /// Parse a wire-format tool name (the same string [`Self::as_str`]
+    /// emits) back into the typed variant. Returns `None` for any
+    /// unknown spelling — callers surface this to the renderer as a
+    /// validation error rather than silently choosing a default.
+    ///
+    /// Named `from_wire_str` (not `from_str`) so we don't shadow the
+    /// `std::str::FromStr` trait; the wire format is a stable contract
+    /// shared with the renderer, not a generic string parse.
+    pub fn from_wire_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "plan_detection" => Self::PlanDetection,
+            "plan_to_wall" => Self::PlanToWall,
+            "style_assistant" => Self::StyleAssistant,
+            "layout_suggestion" => Self::LayoutSuggestion,
+            "render_doctor" => Self::RenderDoctor,
+            "cad_cleanup" => Self::CadCleanup,
+            "schedule_fill" => Self::ScheduleFill,
+            "classification" => Self::Classification,
+            "property_fill" => Self::PropertyFill,
+            "validation_help" => Self::ValidationHelp,
+            "cover_page_draft" => Self::CoverPageDraft,
+            "lighting_balance" => Self::LightingBalance,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

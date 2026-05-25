@@ -1574,6 +1574,174 @@ pub fn render_check_materials() -> Result<RenderCheckMaterialsJs> {
     with_service_ref_fallible(super::service::BridgeService::render_check_materials).map(Into::into)
 }
 
+// ---------------------------------------------------------------
+// AI endpoints — local LLM sidecar surface (Phase 10, PR-V)
+// ---------------------------------------------------------------
+//
+// All six methods route through `with_service_ref_fallible` because
+// mutation of the sidecar handle / pending diff map happens inside
+// the inner `Mutex<AiState>` on `BridgeService`. That means:
+//
+//   * concurrent `ai_runtime_status` polls don't block one another
+//     (only the inner `Mutex` serialises them, which is microseconds)
+//   * an `ai_plan` call serialises against *every* other `ai_*` call
+//     for the lifetime of the LLM completion (seconds), which is
+//     correct — the renderer expects one in-flight plan at a time
+//   * the singleton `RwLock` is held in *read* mode the whole time,
+//     so `project_engine_status` polls keep flowing — important for
+//     the status pane while a plan is running
+
+/// JS-facing AI tool descriptor for the renderer's tool picker.
+/// Wire shape matches `AiTool` in `apps/desktop/electron/bridge.ts`.
+#[napi(object)]
+pub struct AiToolJs {
+    pub name: String,
+    pub display_name: String,
+    pub description: String,
+    pub allowed_scopes: Vec<String>,
+    pub max_entities_modified: u32,
+    pub grammar_key: String,
+    pub child_tools: Vec<String>,
+}
+
+impl From<crate::service::AiToolDescriptor> for AiToolJs {
+    fn from(d: crate::service::AiToolDescriptor) -> Self {
+        Self {
+            name: d.name,
+            display_name: d.display_name,
+            description: d.description,
+            allowed_scopes: d.allowed_scopes,
+            max_entities_modified: d.max_entities_modified,
+            grammar_key: d.grammar_key,
+            child_tools: d.child_tools,
+        }
+    }
+}
+
+/// JS-facing AI plan result. The `parsed` field is shipped to the
+/// renderer as a JSON string rather than a typed napi value because
+/// (a) the payload shape varies per-tool (each grammar emits a
+/// different schema), and (b) napi-rs `serde_json::Value` support
+/// would force a deep clone through `JsObject` — same trade-off as
+/// `CommandApplyResultJs::applied_json`. The renderer already has
+/// `JSON.parse` infrastructure for tool-call dispatch.
+#[napi(object)]
+pub struct AiPlanResultJs {
+    pub diff_id: String,
+    pub parsed_json: String,
+    pub tool: String,
+    pub entities_modified: u32,
+}
+
+#[napi(object)]
+pub struct AiDiffOutcomeJs {
+    pub ok: bool,
+    pub diff_id: String,
+}
+
+#[napi(object)]
+pub struct AiCancelResultJs {
+    pub cancelled: bool,
+}
+
+#[napi(object)]
+pub struct AiRuntimeStatusJs {
+    /// One of `"idle"`, `"loading"`, `"ready"`, `"failed"`.
+    pub state: String,
+    /// Populated only after a Failed transition. Always cleared on
+    /// the next successful `Ready` transition.
+    pub last_error: Option<String>,
+    /// Diff ids pending accept/reject. Empty after every cancel.
+    pub pending_diff_ids: Vec<String>,
+}
+
+/// Enumerate the local AI tools available to the planner. Mirrors
+/// `BridgeService::ai_list_tools` — see that doc for the contract.
+#[napi]
+pub fn ai_list_tools() -> Result<Vec<AiToolJs>> {
+    with_service_ref_fallible(super::service::BridgeService::ai_list_tools)
+        .map(|v| v.into_iter().map(Into::into).collect())
+}
+
+/// Plan a single AI action against the local LLM sidecar.
+///
+/// `tool` is the snake_case tool name (e.g. `"style_assistant"`).
+/// `scope` is one of `design` / `draft` / `bim` / `render` / `deliver`.
+/// `context_json` is the renderer's caller-supplied JSON context;
+/// empty string is treated as an empty object.
+/// `max_entities_modified` caps how many entities the resulting diff
+/// may touch (the safety validator enforces this).
+#[napi]
+pub fn ai_plan(
+    tool: String,
+    scope: String,
+    prompt: String,
+    context_json: String,
+    max_entities_modified: u32,
+) -> Result<AiPlanResultJs> {
+    let scope = parse_scope(&scope)?;
+    with_service_ref_fallible(|svc| {
+        svc.ai_plan(&tool, scope, &prompt, &context_json, max_entities_modified)
+    })
+    .and_then(|r| {
+        let parsed_json = serde_json::to_string(&r.parsed).map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("ai_plan: parsed payload re-serialise failed: {e}"),
+            )
+        })?;
+        Ok(AiPlanResultJs {
+            diff_id: r.diff_id,
+            parsed_json,
+            tool: r.tool,
+            entities_modified: r.entities_modified,
+        })
+    })
+}
+
+/// Accept a pending diff. Idempotent at the renderer level: a second
+/// accept on the same id is an error (the first removed it).
+#[napi]
+pub fn ai_accept_diff(diff_id: String) -> Result<AiDiffOutcomeJs> {
+    with_service_ref_fallible(|svc| svc.ai_accept_diff(&diff_id)).map(|r| AiDiffOutcomeJs {
+        ok: r.ok,
+        diff_id: r.diff_id,
+    })
+}
+
+/// Reject a pending diff. Same idempotency note as `ai_accept_diff`.
+#[napi]
+pub fn ai_reject_diff(diff_id: String) -> Result<AiDiffOutcomeJs> {
+    with_service_ref_fallible(|svc| svc.ai_reject_diff(&diff_id)).map(|r| AiDiffOutcomeJs {
+        ok: r.ok,
+        diff_id: r.diff_id,
+    })
+}
+
+/// Cancel any in-flight AI work by killing the sidecar process.
+/// `job_id` is accepted for forward compatibility but currently
+/// ignored — there's only one in-flight plan at a time (see the
+/// concurrency rationale on the AI endpoints block above).
+#[napi]
+pub fn ai_cancel_job(job_id: String) -> Result<AiCancelResultJs> {
+    with_service_ref_fallible(|svc| svc.ai_cancel_job(&job_id)).map(|r| AiCancelResultJs {
+        cancelled: r.cancelled,
+    })
+}
+
+/// Read the sidecar's current lifecycle state. Cheap, lock-only —
+/// the renderer polls this every ~500 ms while a plan is in flight.
+#[napi]
+pub fn ai_runtime_status() -> Result<AiRuntimeStatusJs> {
+    with_service_ref_fallible(super::service::BridgeService::ai_runtime_status).map(|r| {
+        AiRuntimeStatusJs {
+            state: r.state,
+            last_error: r.last_error,
+            pending_diff_ids: r.pending_diff_ids,
+        }
+    })
+}
+
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
     if s.len() % 2 != 0 {
         return None;

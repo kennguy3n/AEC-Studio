@@ -11,7 +11,8 @@ use aec_core::types::Scope;
 
 use crate::grammars::GrammarRegistry;
 use crate::safety_validator::{SafetyError, SafetyValidator, ValidationContext};
-use crate::tool_schema::{ToolName, ToolSchemaRegistry};
+use crate::tool_schema::{ToolName, ToolSchema, ToolSchemaRegistry};
+use crate::transport::{CompletionRequest, SidecarTransport, TransportError};
 
 #[derive(Debug, Error)]
 pub enum PlanError {
@@ -19,6 +20,10 @@ pub enum PlanError {
     Safety(#[from] SafetyError),
     #[error("sidecar offline")]
     Offline,
+    #[error("transport: {0}")]
+    Transport(#[from] TransportError),
+    #[error("grammar `{0}` not found in registry")]
+    UnknownGrammar(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -101,6 +106,79 @@ impl<'a> ToolPlanner<'a> {
             entities_modified,
         })
     }
+
+    /// Dispatch a tool-call request end-to-end through the sidecar.
+    ///
+    /// This is the only place that talks to the LLM: prompt assembly,
+    /// grammar lookup, transport call, and safety finalization all live
+    /// here so the bridge layer never sees raw model bytes.
+    ///
+    /// Flow:
+    ///   1. `precheck`  — schema lookup, scope check, bounds check.
+    ///   2. lookup the GBNF grammar that the model output must satisfy.
+    ///   3. assemble the prompt (system header + tool name + scope +
+    ///      user context as JSON).
+    ///   4. POST to the sidecar's `/completion` endpoint.
+    ///   5. `finalize` — re-run the safety validator on the raw payload
+    ///      and parse it into typed JSON.
+    pub fn dispatch(
+        &self,
+        request: &PlanRequest,
+        transport: &SidecarTransport,
+    ) -> Result<PlanResponse, PlanError> {
+        self.precheck(request)?;
+        let schema = self
+            .schemas
+            .get(request.tool)
+            .ok_or_else(|| SafetyError::UnknownTool(request.tool.as_str().into()))?;
+        let grammar = self
+            .grammars
+            .get(&schema.grammar_key)
+            .ok_or_else(|| PlanError::UnknownGrammar(schema.grammar_key.clone()))?;
+        let prompt = build_prompt(schema, request);
+        let completion_request = CompletionRequest::new(prompt, grammar.gbnf.clone());
+        let completion = transport.complete(&completion_request)?;
+        self.finalize(
+            request.tool,
+            request.scope,
+            request.max_entities_modified,
+            completion.content,
+        )
+    }
+}
+
+/// Assemble the model-facing prompt. The format is deliberately small —
+/// the GBNF grammar is doing the heavy lifting; the prompt only has to
+/// give the model enough context to fill in tool-relevant fields.
+///
+/// `pub` for visibility from the bridge integration tests; the prompt
+/// shape is part of the wire contract with the sidecar.
+pub fn build_prompt(schema: &ToolSchema, request: &PlanRequest) -> String {
+    use std::fmt::Write as _;
+    let mut buf = String::with_capacity(256 + request.prompt.len());
+    buf.push_str("[SYSTEM]\n");
+    buf.push_str("You are AEC Studio's local design assistant. Emit a single JSON object that satisfies the grammar for the requested tool. Do not include explanations.\n\n");
+    buf.push_str("[TOOL]\n");
+    buf.push_str(schema.name.as_str());
+    buf.push('\n');
+    buf.push_str("[SCOPE]\n");
+    // `write!` on a `String` never fails; using it (vs. `push_str(&format!(...))`)
+    // avoids the intermediate allocation that clippy::format_push_string flags.
+    let _ = write!(buf, "{:?}", request.scope);
+    buf.push('\n');
+    buf.push_str("[MAX_ENTITIES_MODIFIED]\n");
+    buf.push_str(&request.max_entities_modified.to_string());
+    buf.push('\n');
+    buf.push_str("[CONTEXT]\n");
+    buf.push_str(&request.context.to_string());
+    buf.push('\n');
+    if !request.prompt.is_empty() {
+        buf.push_str("[USER_PROMPT]\n");
+        buf.push_str(&request.prompt);
+        buf.push('\n');
+    }
+    buf.push_str("[RESPONSE]\n");
+    buf
 }
 
 #[cfg(test)]

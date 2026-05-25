@@ -11,6 +11,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use aec_ai::{
+    DiffEngine, GrammarRegistry as AiGrammarRegistry, PlanRequest as AiPlanRequest,
+    ToolName as AiToolName, ToolPlanner, ToolSchema as AiToolSchema,
+    ToolSchemaRegistry as AiToolSchemaRegistry,
+};
 use aec_audit::AuditLog;
 use aec_command::commands::{Command, EntityDelta, EntityRecord};
 use aec_command::engine::CommandEngine;
@@ -26,6 +31,7 @@ use aec_render::preset::RenderPresetStore;
 use aec_render::queue::{BatchProgress as CoreBatchProgress, RenderQueue};
 use aec_render::scene::RenderScene;
 
+use crate::ai_state::{AiState, AiStateError, DEFAULT_SPAWN_TIMEOUT};
 use crate::asset_state::AssetState;
 use crate::bim_attach;
 use crate::engine_status_cache::EngineStatusCache;
@@ -80,11 +86,30 @@ pub enum BridgeServiceError {
     /// `Core` failure.
     #[error("asset: {0}")]
     Asset(String),
+    /// Local-LLM (sidecar / planner / safety validator / diff engine)
+    /// failure. The error message preserves
+    /// [`crate::ai_state::AiStateError`]'s `Display` so the renderer can
+    /// distinguish a spawn failure, a transport timeout, or a safety
+    /// rejection from one another.
+    #[error("ai: {0}")]
+    Ai(String),
 }
 
 impl From<aec_assets::AssetError> for BridgeServiceError {
     fn from(e: aec_assets::AssetError) -> Self {
         Self::Asset(e.to_string())
+    }
+}
+
+impl From<AiStateError> for BridgeServiceError {
+    fn from(e: AiStateError) -> Self {
+        Self::Ai(e.to_string())
+    }
+}
+
+impl From<aec_ai::PlanError> for BridgeServiceError {
+    fn from(e: aec_ai::PlanError) -> Self {
+        Self::Ai(e.to_string())
     }
 }
 
@@ -862,6 +887,93 @@ pub struct RuntimeStatusReport {
     pub os: String,
 }
 
+/// Descriptor for one local AI tool surfaced by `ai_list_tools`.
+///
+/// Shape pinned by the TypeScript `AiTool` interface in
+/// `apps/desktop/electron/bridge.ts`. We don't reuse [`AiToolSchema`]
+/// directly because the renderer wants:
+///   * scopes as a string array, not the enum
+///   * child-tool names as strings, not the typed `ToolName`
+///   * a stable camelCase wire shape (napi-rs serialises this struct
+///     for `aiListTools`)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiToolDescriptor {
+    pub name: String,
+    pub display_name: String,
+    pub description: String,
+    pub allowed_scopes: Vec<String>,
+    pub max_entities_modified: u32,
+    pub grammar_key: String,
+    pub child_tools: Vec<String>,
+}
+
+impl From<&AiToolSchema> for AiToolDescriptor {
+    fn from(s: &AiToolSchema) -> Self {
+        Self {
+            name: s.name.as_str().to_owned(),
+            display_name: s.display_name.clone(),
+            description: s.description.clone(),
+            allowed_scopes: s
+                .allowed_scopes
+                .iter()
+                .map(|sc| sc.as_str().to_owned())
+                .collect(),
+            max_entities_modified: s.max_entities_modified,
+            grammar_key: s.grammar_key.clone(),
+            child_tools: s
+                .child_tools
+                .iter()
+                .map(|t| t.as_str().to_owned())
+                .collect(),
+        }
+    }
+}
+
+/// Result of [`BridgeService::ai_plan`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AiPlanResult {
+    /// Identifier of the pending diff. The renderer keeps this around
+    /// and passes it to `ai_accept_diff` / `ai_reject_diff`.
+    pub diff_id: String,
+    /// The parsed JSON the model emitted, after grammar matching +
+    /// safety validation. Same shape the in-process fallback returned.
+    pub parsed: serde_json::Value,
+    /// The tool that produced the diff. Surfacing it lets the renderer
+    /// route to the right preview panel without re-deriving from the
+    /// request.
+    pub tool: String,
+    /// Number of entities the planner reported the diff touches. The
+    /// renderer pins this against its UX cap when deciding whether
+    /// to render a per-entity diff list or a summarised count.
+    pub entities_modified: u32,
+}
+
+/// Result of [`BridgeService::ai_accept_diff`] / `ai_reject_diff`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiDiffOutcome {
+    /// Mirrors the TS `{ accepted: true }` / `{ rejected: true }` shape.
+    pub ok: bool,
+    pub diff_id: String,
+}
+
+/// Result of [`BridgeService::ai_cancel_job`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiCancelResult {
+    pub cancelled: bool,
+}
+
+/// Live sidecar status snapshot for `ai_runtime_status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiRuntimeStatusReport {
+    /// Lowercase variant of [`aec_ai::RuntimeState`]: one of
+    /// `"idle" | "loading" | "ready" | "failed"`.
+    pub state: String,
+    pub last_error: Option<String>,
+    /// Currently-tracked pending diff ids. Useful for the renderer's
+    /// AI sidebar to re-render on reconnect.
+    pub pending_diff_ids: Vec<String>,
+}
+
 /// Configuration for [`BridgeService`].
 #[derive(Debug, Clone)]
 pub struct BridgeConfig {
@@ -936,6 +1048,27 @@ pub struct BridgeService {
     /// `assets` table is empty so the renderer's asset browser has
     /// content on a fresh install. See [`crate::asset_state`].
     asset_state: AssetState,
+    /// Process-wide local-LLM state: the lifecycle state machine, the
+    /// optional spawned `llama-server` child handle, and the map of
+    /// pending diffs awaiting accept/reject.
+    ///
+    /// Interior-mutable behind a [`Mutex`] for the same reason as
+    /// `render_state`: every `ai_*` endpoint takes `&self` on
+    /// [`BridgeService`] so the napi singleton's outer
+    /// [`std::sync::RwLock`] doesn't force every AI mutation through
+    /// the writer side. A renderer's "AI status" poll therefore runs
+    /// concurrently with an in-flight `ai_plan` completion, because
+    /// the `RwLock::read()` held by both endpoints is non-exclusive.
+    ///
+    /// The inner [`Mutex<AiState>`] serialises the actual sidecar
+    /// invocation — only one completion may be in flight per project
+    /// session, mirroring the renderer's "one AI panel at a time" UX.
+    /// `Option`-typed so the bridge can defer sidecar config loading
+    /// until a real `ai_*` call lands (constructing a default sidecar
+    /// config is cheap, but spawning the child process is not, so
+    /// `AiState::new` only initialises the state machine; the spawn
+    /// itself is lazy inside `AiState::ensure_ready`).
+    ai_state: Mutex<AiState>,
 }
 
 /// Process-wide render state held by [`BridgeService::render_state`].
@@ -973,6 +1106,7 @@ impl BridgeService {
             snapshot_cache: SnapshotCache::new(),
             render_state: Mutex::new(RenderState::new()),
             asset_state,
+            ai_state: Mutex::new(AiState::new(default_ai_runtime_config())),
         })
     }
 
@@ -2443,6 +2577,192 @@ impl BridgeService {
             .lock()
             .map_err(|e| BridgeServiceError::Core(format!("render state poisoned: {e}")))
     }
+
+    fn lock_ai_state(&self) -> Result<std::sync::MutexGuard<'_, AiState>, BridgeServiceError> {
+        self.ai_state
+            .lock()
+            .map_err(|e| BridgeServiceError::Core(format!("ai state poisoned: {e}")))
+    }
+
+    /// Test-only accessor: replace the AI state with one pre-wired to a
+    /// caller-supplied transport (e.g. a mock TCP server). Used by the
+    /// `sidecar_mock` integration test to drive `ai_plan` end-to-end
+    /// without spawning a real `llama-server`.
+    #[doc(hidden)]
+    pub fn __test_install_ai_state(&self, state: AiState) -> Result<(), BridgeServiceError> {
+        let mut guard = self.lock_ai_state()?;
+        *guard = state;
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------
+    // AI endpoints
+    // ---------------------------------------------------------------
+    //
+    // All six methods take `&self` (read side of the napi singleton's
+    // `RwLock`) and serialise actual mutation through the inner
+    // `Mutex<AiState>`. This is the same pattern `render_*` uses; see
+    // the rationale block on `BridgeService::ai_state`.
+
+    /// Enumerate the local AI tools the planner is willing to dispatch.
+    /// The renderer's "AI sidebar" calls this once at session start to
+    /// populate the tool picker.
+    pub fn ai_list_tools(&self) -> Result<Vec<AiToolDescriptor>, BridgeServiceError> {
+        let schemas = AiToolSchemaRegistry::defaults();
+        // `iter_sorted` already orders by tool name, so the wire payload
+        // is deterministic across calls (HashMap iteration order is not).
+        let tools: Vec<AiToolDescriptor> =
+            schemas.iter_sorted().map(AiToolDescriptor::from).collect();
+        Ok(tools)
+    }
+
+    /// Plan a single AI action against the local LLM sidecar.
+    ///
+    /// On first call the sidecar is lazily spawned (cold-load ~5 s for
+    /// a 7B q4 model on SSD). Subsequent calls reuse the running
+    /// process. The full path is:
+    ///
+    ///   1. parse `tool` into [`AiToolName`]; reject unknowns
+    ///   2. ensure the sidecar is `Ready`, spawning if needed
+    ///   3. build a [`AiPlanRequest`] from the caller params
+    ///   4. dispatch through [`ToolPlanner::dispatch`] (this is the
+    ///      one place that talks to the model — see planner doc)
+    ///   5. convert the typed response into a [`Diff`] via
+    ///      [`DiffEngine::build`]
+    ///   6. register the diff in `AiState::pending_diffs` so a later
+    ///      `ai_accept_diff` / `ai_reject_diff` can resolve it
+    ///   7. return the diff id + parsed payload to the renderer
+    pub fn ai_plan(
+        &self,
+        tool: &str,
+        scope: Scope,
+        prompt: &str,
+        context_json: &str,
+        max_entities_modified: u32,
+    ) -> Result<AiPlanResult, BridgeServiceError> {
+        let tool_name = AiToolName::from_wire_str(tool)
+            .ok_or_else(|| BridgeServiceError::Ai(format!("unknown ai tool `{tool}`")))?;
+        let context: serde_json::Value = if context_json.is_empty() {
+            serde_json::Value::Object(serde_json::Map::new())
+        } else {
+            serde_json::from_str(context_json).map_err(|e| {
+                BridgeServiceError::Ai(format!("ai_plan context_json deserialisation failed: {e}"))
+            })?
+        };
+        let schemas = AiToolSchemaRegistry::defaults();
+        let grammars = AiGrammarRegistry::defaults();
+        let planner = ToolPlanner::new(&schemas, &grammars);
+        let request = AiPlanRequest {
+            tool: tool_name,
+            scope,
+            prompt: prompt.to_owned(),
+            context,
+            max_entities_modified,
+        };
+        // We split the work into three phases so the AI-state Mutex
+        // is NOT held across the blocking call into the sidecar:
+        //
+        //   1. acquire guard → `ensure_ready` (which may spawn the
+        //      sidecar, up to `DEFAULT_SPAWN_TIMEOUT`) → clone the
+        //      `SidecarTransport` handle → drop the guard
+        //   2. dispatch through the planner without holding any lock,
+        //      so concurrent `ai_runtime_status` / `ai_cancel_job`
+        //      calls can read the lifecycle state and abort the work
+        //      in flight if the user clicks "Cancel"
+        //   3. re-acquire the guard briefly to register the resulting
+        //      diff in `AiState::pending_diffs`
+        //
+        // `SidecarTransport::clone` is cheap (it's an `Arc<Sidecar>`
+        // internally; the actual process handle is shared, not
+        // duplicated). The clone is purely a borrow-checker
+        // convenience — we don't want to hold `&mut guard` across the
+        // dispatch call.
+        let transport = {
+            let mut guard = self.lock_ai_state()?;
+            guard.ensure_ready(DEFAULT_SPAWN_TIMEOUT)?.clone()
+        };
+        let response = planner.dispatch(&request, &transport)?;
+        let diff = DiffEngine::build(&response);
+        let parsed = response.parsed.clone();
+        let entities = response.entities_modified;
+        let diff_id = {
+            let mut guard = self.lock_ai_state()?;
+            guard.insert_diff(diff)
+        };
+        Ok(AiPlanResult {
+            diff_id: diff_id.as_str().to_owned(),
+            parsed,
+            tool: tool_name.as_str().to_owned(),
+            entities_modified: entities,
+        })
+    }
+
+    /// Mark a pending diff as accepted. The bridge currently drops the
+    /// diff after recording acceptance — translating the diff back into
+    /// concrete [`crate::service::Command`] sequences is a follow-up
+    /// (Phase 11 task, deliberately deferred from PR-V scope per the
+    /// scoping doc).
+    pub fn ai_accept_diff(&self, diff_id: &str) -> Result<AiDiffOutcome, BridgeServiceError> {
+        let mut guard = self.lock_ai_state()?;
+        let _ = guard.accept_diff(diff_id)?;
+        Ok(AiDiffOutcome {
+            ok: true,
+            diff_id: diff_id.to_owned(),
+        })
+    }
+
+    /// Mark a pending diff as rejected and drop it.
+    pub fn ai_reject_diff(&self, diff_id: &str) -> Result<AiDiffOutcome, BridgeServiceError> {
+        let mut guard = self.lock_ai_state()?;
+        let _ = guard.reject_diff(diff_id)?;
+        Ok(AiDiffOutcome {
+            ok: true,
+            diff_id: diff_id.to_owned(),
+        })
+    }
+
+    /// Cancel any in-flight or queued AI work by killing the sidecar
+    /// process. Idempotent: cancelling when no sidecar is running is a
+    /// no-op. The next `ai_plan` call will lazily respawn.
+    pub fn ai_cancel_job(&self, _job_id: &str) -> Result<AiCancelResult, BridgeServiceError> {
+        let mut guard = self.lock_ai_state()?;
+        guard.cancel_job();
+        Ok(AiCancelResult { cancelled: true })
+    }
+
+    /// Read the current sidecar lifecycle state. Cheap, lock-only
+    /// operation — the renderer polls this every ~500 ms while an
+    /// `ai_plan` is in flight to show the user a "model loading" or
+    /// "model ready" indicator.
+    pub fn ai_runtime_status(&self) -> Result<AiRuntimeStatusReport, BridgeServiceError> {
+        let guard = self.lock_ai_state()?;
+        let snap = guard.snapshot();
+        Ok(AiRuntimeStatusReport {
+            state: state_string(snap.state),
+            last_error: snap.last_error,
+            pending_diff_ids: snap.pending_diff_ids,
+        })
+    }
+}
+
+/// Render an [`aec_ai::RuntimeState`] as the lowercase wire string the
+/// renderer expects.
+fn state_string(s: aec_ai::RuntimeState) -> String {
+    match s {
+        aec_ai::RuntimeState::Idle => "idle".into(),
+        aec_ai::RuntimeState::Loading => "loading".into(),
+        aec_ai::RuntimeState::Ready => "ready".into(),
+        aec_ai::RuntimeState::Failed => "failed".into(),
+    }
+}
+
+/// Default sidecar runtime config: in production this comes from
+/// `workers/ai/config.json`; here we bake the same defaults so the
+/// bridge can boot without the file on disk (the renderer never
+/// reads this — the sidecar Python wrapper does — but the bridge
+/// needs a `RuntimeConfig` to drive the lifecycle state machine).
+fn default_ai_runtime_config() -> aec_ai::RuntimeConfig {
+    aec_ai::RuntimeConfig::default()
 }
 
 /// Parse a caller-supplied `scene_json` parameter into a

@@ -34,6 +34,7 @@ aec_materials = { path = "../aec_materials" }
 uuid = { workspace = true }
 aec_governor = { path = "../aec_governor" }
 aec_export = { path = "../aec_export" }
+aec_ai = { path = "../aec_ai" }
 blake3 = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
