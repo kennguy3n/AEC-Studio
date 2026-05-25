@@ -25,6 +25,7 @@ tempfile = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+gltf = { workspace = true }
 
 [lints]
 workspace = true

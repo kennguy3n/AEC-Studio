@@ -169,6 +169,7 @@ dependencies = [
  "aec_materials",
  "blake3",
  "chrono",
+ "gltf",
  "hex",
  "printpdf",
  "rust_xlsxwriter",
