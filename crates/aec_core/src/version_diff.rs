@@ -8,10 +8,15 @@
 //! tagged revisions without a full project re-load.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-use crate::revision::{Revision, RevisionEntity};
+use crate::crypto::Key32;
+use crate::db;
+use crate::error::{AecError, AecResult};
+use crate::revision::{Revision, RevisionEntity, RevisionStore};
 
 /// Per-category counts for a [`VersionDiff`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,23 +96,175 @@ impl VersionDiff {
 /// (base) and the second is the "newer" one (head). Order matters: an
 /// entity present only in `head` is reported as Added; only in `base`
 /// is Removed.
+///
+/// This variant diffs by the pre-computed `tracked_entities` carried
+/// on each [`Revision`]. For real diffs at the SQLite snapshot level
+/// see [`compare_revision_snapshots`].
 pub fn compare_revisions(base: &Revision, head: &Revision) -> VersionDiff {
-    // Group both sides by (category, id) for O(1) lookup.
+    compare_entity_lists(
+        &base.id,
+        &head.id,
+        &base.tracked_entities,
+        &head.tracked_entities,
+    )
+}
+
+/// Bucket a raw entity `kind` (the value stored in the
+/// `entities.kind` column of the project SQLite database) into one of
+/// the three diff levels the Deliver mode UI surfaces:
+///
+/// * `"geometry"` for any kind that contributes to the 3D / 2D model
+///   surface (walls, floors, ceilings, openings, primitives, …).
+/// * `"sheet"` for sheet-set entities (sheet, viewport, title block).
+/// * `"schedule_row"` for tabular schedule rows.
+///
+/// Everything else passes through as-is so e.g. a camera change shows
+/// up in a `"camera"` bucket rather than being folded into geometry —
+/// this gives the renderer more granular roll-up data without
+/// requiring the diff engine to know every domain category.
+pub fn classify_entity_kind(kind: &str) -> &str {
+    match kind {
+        // Architectural / built-form geometry
+        "wall" | "floor" | "ceiling" | "room" | "opening" | "door" | "window" => "geometry",
+        // Asset placements and CAD primitives also belong to the
+        // visible "geometry" change bucket — they are what the
+        // before/after compare overlay actually renders.
+        "furniture" | "primitive" | "line" | "polyline" | "arc" | "circle" | "ellipse"
+        | "spline" | "hatch" | "text" | "dimension" => "geometry",
+        // Sheet-set entities
+        "sheet" | "viewport" | "title_block" => "sheet",
+        // Schedule rows
+        "schedule_row" | "schedule_column" => "schedule_row",
+        // Anything else stays in its own category (camera, material,
+        // lighting, …) so the UI can show "1 camera changed".
+        other => other,
+    }
+}
+
+/// Walk the `entities` table of a project snapshot and produce a
+/// hashable [`RevisionEntity`] for every row.
+///
+/// `category` is derived from the entity's `kind` via
+/// [`classify_entity_kind`]. `payload_hash` is BLAKE3 over
+/// `kind || 0x00 || body` so that two entities with the same id but
+/// different kind hash differently. The hash also tracks `body`
+/// byte-for-byte, which is what gives the diff engine real
+/// modification detection.
+pub fn snapshot_entities(conn: &Connection) -> AecResult<Vec<RevisionEntity>> {
+    let mut stmt = conn
+        .prepare("SELECT id, kind, body FROM entities ORDER BY id")
+        .map_err(|e| AecError::Other(format!("snapshot prepare failed: {e}")))?;
+    let rows = stmt
+        .query_map([], |row| {
+            let id: String = row.get(0)?;
+            let kind: String = row.get(1)?;
+            let body: String = row.get(2)?;
+            Ok((id, kind, body))
+        })
+        .map_err(|e| AecError::Other(format!("snapshot query failed: {e}")))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, kind, body) =
+            row.map_err(|e| AecError::Other(format!("snapshot row read failed: {e}")))?;
+        let category = classify_entity_kind(&kind).to_string();
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(kind.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(body.as_bytes());
+        let payload_hash = hasher.finalize().to_hex().to_string();
+        out.push(RevisionEntity {
+            category,
+            id,
+            payload_hash,
+            label: None,
+        });
+    }
+    Ok(out)
+}
+
+/// Diff two revision snapshots that were captured by
+/// [`crate::revision::RevisionStore::create_with_snapshot`].
+///
+/// Opens each `.snap` file as a SQLCipher-encrypted SQLite database
+/// using `key`, walks the `entities` table on both sides, and
+/// produces a [`VersionDiff`] roll-up bucketed by
+/// [`classify_entity_kind`]. The resulting `VersionDiff`'s
+/// `base_revision_id` and `head_revision_id` come from the [`Revision`]
+/// metadata so the consumer can reference the diff to its source
+/// revisions without re-loading them.
+///
+/// Returns an error when either revision lacks an attached snapshot
+/// or the snapshot file is missing/unreadable, so legacy revisions
+/// (created without a snapshot) fail loud rather than silently
+/// returning a zero diff.
+pub fn compare_revision_snapshots(
+    store: &RevisionStore,
+    base: &Revision,
+    head: &Revision,
+    key: &Key32,
+) -> AecResult<VersionDiff> {
+    let base_path = store
+        .snapshot_path(base)
+        .ok_or_else(|| AecError::Other("base revision has no snapshot".into()))?;
+    let head_path = store
+        .snapshot_path(head)
+        .ok_or_else(|| AecError::Other("head revision has no snapshot".into()))?;
+    if !base_path.exists() {
+        return Err(AecError::Other(format!(
+            "base snapshot file missing: {}",
+            base_path.display()
+        )));
+    }
+    if !head_path.exists() {
+        return Err(AecError::Other(format!(
+            "head snapshot file missing: {}",
+            head_path.display()
+        )));
+    }
+
+    let base_conn = open_snapshot_db(&base_path, key)?;
+    let head_conn = open_snapshot_db(&head_path, key)?;
+    let base_entities = snapshot_entities(&base_conn)?;
+    let head_entities = snapshot_entities(&head_conn)?;
+    Ok(compare_entity_lists(
+        &base.id,
+        &head.id,
+        &base_entities,
+        &head_entities,
+    ))
+}
+
+/// Open a `.snap` SQLCipher file read-only for diffing purposes. Uses
+/// [`db::open_existing`] which validates the encryption key against
+/// the file (so a wrong key surfaces immediately rather than as a
+/// confusing "no such table" error later).
+fn open_snapshot_db(path: &Path, key: &Key32) -> AecResult<Connection> {
+    db::open_existing(path, key)
+}
+
+/// Pure-data variant of [`compare_revisions`] that takes the
+/// `(base_id, head_id)` pair and two already-loaded entity vectors.
+/// Used by both [`compare_revisions`] and
+/// [`compare_revision_snapshots`] so the actual diff arithmetic only
+/// lives in one place.
+fn compare_entity_lists(
+    base_id: &str,
+    head_id: &str,
+    base_entities: &[RevisionEntity],
+    head_entities: &[RevisionEntity],
+) -> VersionDiff {
     type Key = (String, String);
     let mut base_map: BTreeMap<Key, &RevisionEntity> = BTreeMap::new();
     let mut head_map: BTreeMap<Key, &RevisionEntity> = BTreeMap::new();
-    for e in &base.tracked_entities {
+    for e in base_entities {
         base_map.insert((e.category.clone(), e.id.clone()), e);
     }
-    for e in &head.tracked_entities {
+    for e in head_entities {
         head_map.insert((e.category.clone(), e.id.clone()), e);
     }
 
     let mut changes: Vec<EntityChange> = Vec::new();
     let mut by_category: BTreeMap<String, DiffCounts> = BTreeMap::new();
-
-    // Walk the union of keys; BTreeMap iteration order is sorted, which
-    // gives us a stable diff output for free.
     let all_keys: std::collections::BTreeSet<&Key> =
         base_map.keys().chain(head_map.keys()).collect();
     for key in all_keys {
@@ -164,8 +321,8 @@ pub fn compare_revisions(base: &Revision, head: &Revision) -> VersionDiff {
     }
 
     VersionDiff {
-        base_revision_id: base.id.clone(),
-        head_revision_id: head.id.clone(),
+        base_revision_id: base_id.to_string(),
+        head_revision_id: head_id.to_string(),
         changes,
         by_category,
     }
@@ -209,6 +366,7 @@ mod tests {
             manifest_name: draft.manifest_name,
             manifest_app_version: draft.manifest_app_version,
             tracked_entities: draft.tracked_entities,
+            snapshot: None,
         }
     }
 
