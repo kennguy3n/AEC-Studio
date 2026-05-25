@@ -183,42 +183,70 @@ fn poll_until_healthy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // Process-global lock for env-var-mutating tests. Rust runs tests in a
+    // single binary on multiple threads by default and `std::env::set_var`
+    // is process-global, so the three tests below would race without this
+    // (e.g. one test's `remove_var` clobbers another's `set_var`).
+    // Using a `Mutex` over the much-recommended `serial_test` crate keeps
+    // us dep-free — these three tests are the only env-mutating tests in
+    // the crate.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Take the env lock, returning a guard that also restores the prior
+    /// value of `SIDECAR_BIN_ENV` when it drops. Centralises the
+    /// save/restore boilerplate that all env-mutating tests need.
+    struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prev: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn acquire() -> Self {
+            // `lock().unwrap_or_else(..into_inner)` so a panicking sibling
+            // test doesn't poison the lock and cascade-fail every other
+            // env test in the same `cargo test` invocation.
+            let lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let prev = std::env::var(SIDECAR_BIN_ENV).ok();
+            std::env::remove_var(SIDECAR_BIN_ENV);
+            Self { _lock: lock, prev }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(p) => std::env::set_var(SIDECAR_BIN_ENV, p),
+                None => std::env::remove_var(SIDECAR_BIN_ENV),
+            }
+        }
+    }
 
     #[test]
     fn sidecar_bin_honours_env_override() {
-        let restore = std::env::var(SIDECAR_BIN_ENV).ok();
-        // SAFETY: tests in this binary run single-threaded under the harness;
-        // we restore the variable below.
+        let _g = EnvGuard::acquire();
         std::env::set_var(SIDECAR_BIN_ENV, "/tmp/custom-llama");
         assert_eq!(sidecar_bin(), PathBuf::from("/tmp/custom-llama"));
         std::env::remove_var(SIDECAR_BIN_ENV);
         assert_eq!(sidecar_bin(), PathBuf::from(DEFAULT_SIDECAR_BIN));
-        if let Some(prev) = restore {
-            std::env::set_var(SIDECAR_BIN_ENV, prev);
-        }
     }
 
     #[test]
     fn empty_env_var_falls_back_to_default() {
-        let restore = std::env::var(SIDECAR_BIN_ENV).ok();
+        let _g = EnvGuard::acquire();
         std::env::set_var(SIDECAR_BIN_ENV, "");
         assert_eq!(sidecar_bin(), PathBuf::from(DEFAULT_SIDECAR_BIN));
-        std::env::remove_var(SIDECAR_BIN_ENV);
-        if let Some(prev) = restore {
-            std::env::set_var(SIDECAR_BIN_ENV, prev);
-        }
     }
 
     #[test]
     fn spawn_with_missing_binary_reports_spawn_error() {
-        let restore = std::env::var(SIDECAR_BIN_ENV).ok();
+        let _g = EnvGuard::acquire();
         std::env::set_var(SIDECAR_BIN_ENV, "/nonexistent/aec-test-llama-server-xyz");
         let cfg = RuntimeConfig::default();
         let result = spawn(&cfg, Duration::from_millis(10));
-        std::env::remove_var(SIDECAR_BIN_ENV);
-        if let Some(prev) = restore {
-            std::env::set_var(SIDECAR_BIN_ENV, prev);
-        }
         assert!(matches!(result, Err(SidecarSpawnError::Spawn { .. })));
     }
 }
