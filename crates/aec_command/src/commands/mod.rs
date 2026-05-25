@@ -1,6 +1,7 @@
 //! Typed commands for AEC Studio.
 
 pub mod camera;
+pub mod ceiling;
 pub mod floor;
 pub mod furniture;
 pub mod lighting;
@@ -37,6 +38,11 @@ pub enum CommandKind {
     CreateFloor(floor::CreateFloor),
     #[serde(rename = "design.modify_floor")]
     ModifyFloor(floor::ModifyFloor),
+
+    #[serde(rename = "design.create_ceiling")]
+    CreateCeiling(ceiling::CreateCeiling),
+    #[serde(rename = "design.modify_ceiling")]
+    ModifyCeiling(ceiling::ModifyCeiling),
 
     #[serde(rename = "design.place_door")]
     PlaceDoor(opening::PlaceDoor),
@@ -84,6 +90,8 @@ impl CommandKind {
             Self::ModifyRoom(_) => "design.modify_room",
             Self::CreateFloor(_) => "design.create_floor",
             Self::ModifyFloor(_) => "design.modify_floor",
+            Self::CreateCeiling(_) => "design.create_ceiling",
+            Self::ModifyCeiling(_) => "design.modify_ceiling",
             Self::PlaceDoor(_) => "design.place_door",
             Self::PlaceWindow(_) => "design.place_window",
             Self::MoveOpening(_) => "design.move_opening",

@@ -249,6 +249,11 @@ impl CommandEngine {
                 vec![c.to_delta()]
             }
             CommandKind::ModifyFloor(c) => vec![c.to_delta(graph)?],
+            CommandKind::CreateCeiling(c) => {
+                c.validate()?;
+                vec![c.to_delta()]
+            }
+            CommandKind::ModifyCeiling(c) => vec![c.to_delta(graph)?],
             CommandKind::PlaceDoor(c) => {
                 c.validate()?;
                 vec![c.to_delta()]
