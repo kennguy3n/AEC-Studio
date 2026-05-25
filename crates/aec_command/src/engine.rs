@@ -271,6 +271,35 @@ impl CommandEngine {
                 vec![c.to_delta(&self.graph)?]
             }
             CommandKind::DeleteFurniture(c) => vec![c.to_delta(&self.graph)?],
+
+            // ----- Draft scope -----
+            CommandKind::DrawPrimitive(c) => {
+                c.validate()?;
+                vec![c.to_delta()]
+            }
+            CommandKind::EditTool(c) => {
+                c.validate()?;
+                c.to_deltas(&self.graph)?
+            }
+            CommandKind::CreateSheet(c) => {
+                c.validate()?;
+                vec![c.to_delta()?]
+            }
+            CommandKind::SetLayerState(c) => {
+                c.validate()?;
+                vec![c.to_delta(&self.graph)?]
+            }
+
+            // ----- Deliver scope -----
+            //
+            // `CreateRevision` captures the gesture in the audit chain
+            // (via `execute_persistent`) but does not mutate the
+            // project graph. The actual revision file is written by
+            // the service layer; this command is the audit-trail hook.
+            CommandKind::CreateRevision(c) => {
+                c.validate()?;
+                vec![]
+            }
         })
     }
 
@@ -839,6 +868,145 @@ mod tests {
         assert!(e.graph().contains(&wall_id));
         assert_eq!(e.undo_len(), 1);
         assert_eq!(e.redo_len(), 0);
+    }
+
+    #[test]
+    fn draft_scope_rejects_design_command() {
+        let mut e = CommandEngine::new(Scope::Draft);
+        let cmd = Command::user(CommandKind::CreateWall(wall_a()));
+        let err = e.execute(cmd).unwrap_err();
+        assert!(matches!(err, CommandError::ScopeMismatch { .. }));
+    }
+
+    #[test]
+    fn draft_scope_routes_draw_primitive() {
+        use crate::commands::draft::DrawPrimitive;
+        use aec_cad::primitives::{Line, Primitive};
+
+        let mut e = CommandEngine::new(Scope::Draft);
+        let id = EntityId::new();
+        let cmd = Command::user(CommandKind::DrawPrimitive(DrawPrimitive {
+            entity_id: id.clone(),
+            primitive: Primitive::Line(Line::new("0", [0.0, 0.0], [10.0, 0.0])),
+        }));
+        let res = e.execute(cmd).unwrap();
+        assert_eq!(res.applied.len(), 1);
+        let rec = e.graph().get(&id).unwrap();
+        assert_eq!(rec.kind, "primitive");
+    }
+
+    #[test]
+    fn draft_scope_edit_tool_translates_primitive() {
+        use crate::commands::draft::{DrawPrimitive, EditOperation, EditTool};
+        use aec_cad::primitives::{Line, Primitive};
+
+        let mut e = CommandEngine::new(Scope::Draft);
+        let id = EntityId::new();
+        e.execute(Command::user(CommandKind::DrawPrimitive(DrawPrimitive {
+            entity_id: id.clone(),
+            primitive: Primitive::Line(Line::new("0", [0.0, 0.0], [10.0, 0.0])),
+        })))
+        .unwrap();
+        let edit = EditTool {
+            operation: EditOperation::Move {
+                entity_ids: vec![id.clone()],
+                dx: 5.0,
+                dy: 0.0,
+            },
+        };
+        e.execute(Command::user(CommandKind::EditTool(edit)))
+            .unwrap();
+        let body = &e.graph().get(&id).unwrap().body;
+        let primitive: DrawPrimitive = serde_json::from_value(body.clone()).unwrap();
+        if let Primitive::Line(l) = primitive.primitive {
+            assert_eq!(l.start, [5.0, 0.0]);
+            assert_eq!(l.end, [15.0, 0.0]);
+        } else {
+            panic!("expected line");
+        }
+    }
+
+    #[test]
+    fn draft_scope_create_sheet_inserts_sheet_entity() {
+        use crate::commands::draft::CreateSheet;
+        use aec_cad::sheets::{Margins, Orientation, PaperSize};
+
+        let mut e = CommandEngine::new(Scope::Draft);
+        let id = EntityId::new();
+        e.execute(Command::user(CommandKind::CreateSheet(CreateSheet {
+            entity_id: id.clone(),
+            name: "A-101".into(),
+            paper: PaperSize::IsoA3,
+            orientation: Orientation::Landscape,
+            margins: Margins::default(),
+            title_block: None,
+            viewports: vec![],
+        })))
+        .unwrap();
+        let rec = e.graph().get(&id).unwrap();
+        assert_eq!(rec.kind, "sheet");
+    }
+
+    #[test]
+    fn draft_scope_set_layer_state_upserts() {
+        use crate::commands::draft::SetLayerState;
+        use aec_cad::layers::{LayerColor, LayerLineweight};
+
+        let mut e = CommandEngine::new(Scope::Draft);
+        let id = EntityId::new();
+        // First call: create.
+        e.execute(Command::user(CommandKind::SetLayerState(SetLayerState {
+            entity_id: id.clone(),
+            name: "WALLS".into(),
+            color: Some(LayerColor(1)),
+            linetype: Some("CONTINUOUS".into()),
+            lineweight: Some(LayerLineweight::from_mm(0.5)),
+            on: Some(true),
+            frozen: Some(false),
+            locked: Some(false),
+            plottable: Some(true),
+            description: None,
+        })))
+        .unwrap();
+        // Second call: update only `frozen`.
+        e.execute(Command::user(CommandKind::SetLayerState(SetLayerState {
+            entity_id: id.clone(),
+            name: "WALLS".into(),
+            color: None,
+            linetype: None,
+            lineweight: None,
+            on: None,
+            frozen: Some(true),
+            locked: None,
+            plottable: None,
+            description: None,
+        })))
+        .unwrap();
+        let layer: aec_cad::layers::Layer =
+            serde_json::from_value(e.graph().get(&id).unwrap().body.clone()).unwrap();
+        assert!(layer.frozen);
+        assert_eq!(layer.name, "WALLS");
+        assert_eq!(layer.color, LayerColor(1));
+    }
+
+    #[test]
+    fn deliver_scope_create_revision_is_audit_only() {
+        use crate::commands::deliver::CreateRevision;
+
+        let mut e = CommandEngine::new(Scope::Deliver);
+        let before = e.graph().len();
+        let res = e
+            .execute(Command::user(CommandKind::CreateRevision(CreateRevision {
+                tag: "r1".into(),
+                description: "first snapshot".into(),
+                revision_id: None,
+            })))
+            .unwrap();
+        // No graph delta — revision capture is audit-only.
+        assert!(res.applied.is_empty());
+        assert_eq!(e.graph().len(), before);
+        // Undo should still work (it just unwinds the journal entry).
+        e.undo().unwrap();
     }
 
     #[test]

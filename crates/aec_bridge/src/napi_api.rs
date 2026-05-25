@@ -2160,6 +2160,233 @@ pub async fn ai_runtime_status() -> Result<AiRuntimeStatusJs> {
     .await
 }
 
+// ============================================================
+// draft.* / deliver.* (Group A, Phase 10)
+// ============================================================
+
+/// JS-facing result of [`draft_import_dxf`]. Mirrors the TS
+/// `DraftImportDxfResult` interface (entityCount / layerCount /
+/// blockCount / skippedCount in camelCase).
+#[napi(object)]
+pub struct DraftImportDxfJs {
+    pub entity_count: u32,
+    pub layer_count: u32,
+    pub block_count: u32,
+    pub skipped_count: u32,
+}
+
+/// JS-facing result of [`draft_export_dxf`].
+#[napi(object)]
+pub struct DraftExportDxfJs {
+    pub path: String,
+    pub entity_count: u32,
+    pub file_size: u32,
+}
+
+#[napi(object)]
+pub struct DraftEntityIdJs {
+    pub entity_id: String,
+}
+
+#[napi(object)]
+pub struct DraftSheetIdJs {
+    pub sheet_id: String,
+}
+
+/// Draw a single primitive (line / polyline / arc / circle / ellipse
+/// / spline / hatch / text). `params_json` deserialises into
+/// [`aec_command::commands::draft::DrawPrimitive`].
+#[napi]
+pub fn draft_draw_primitive(project_path: String, params_json: String) -> Result<DraftEntityIdJs> {
+    let inner: aec_command::commands::draft::DrawPrimitive =
+        parse_design_params("draft_draw_primitive", &params_json)?;
+    let entity_id = inner.entity_id.to_string();
+    let cmd = aec_command::commands::Command::user(
+        aec_command::commands::CommandKind::DrawPrimitive(inner),
+    );
+    with_service(|svc| svc.command_apply(&project_path, cmd))?;
+    Ok(DraftEntityIdJs { entity_id })
+}
+
+/// Apply a 2D edit tool (move / copy / rotate / scale / mirror /
+/// offset / trim / extend / fillet / chamfer / stretch).
+/// `params_json` deserialises into
+/// [`aec_command::commands::draft::EditTool`].
+#[napi]
+pub fn draft_edit_tool(project_path: String, params_json: String) -> Result<DesignAckJs> {
+    let inner: aec_command::commands::draft::EditTool =
+        parse_design_params("draft_edit_tool", &params_json)?;
+    let cmd =
+        aec_command::commands::Command::user(aec_command::commands::CommandKind::EditTool(inner));
+    with_service(|svc| svc.command_apply(&project_path, cmd))?;
+    Ok(DesignAckJs { ok: true })
+}
+
+/// Create a sheet for plotting. `params_json` deserialises into
+/// [`aec_command::commands::draft::CreateSheet`].
+#[napi]
+pub fn draft_create_sheet(project_path: String, params_json: String) -> Result<DraftSheetIdJs> {
+    let inner: aec_command::commands::draft::CreateSheet =
+        parse_design_params("draft_create_sheet", &params_json)?;
+    let sheet_id = inner.entity_id.to_string();
+    let cmd = aec_command::commands::Command::user(
+        aec_command::commands::CommandKind::CreateSheet(inner),
+    );
+    with_service(|svc| svc.command_apply(&project_path, cmd))?;
+    Ok(DraftSheetIdJs { sheet_id })
+}
+
+/// Upsert layer state (color / linetype / lineweight / visibility /
+/// freeze / lock / plottable / description). `params_json`
+/// deserialises into
+/// [`aec_command::commands::draft::SetLayerState`].
+#[napi]
+pub fn draft_set_layer_state(project_path: String, params_json: String) -> Result<DesignAckJs> {
+    let inner: aec_command::commands::draft::SetLayerState =
+        parse_design_params("draft_set_layer_state", &params_json)?;
+    let cmd = aec_command::commands::Command::user(
+        aec_command::commands::CommandKind::SetLayerState(inner),
+    );
+    with_service(|svc| svc.command_apply(&project_path, cmd))?;
+    Ok(DesignAckJs { ok: true })
+}
+
+/// Import a DXF file into the project graph. Each importable DXF
+/// entity is routed through `command_apply` so the import is
+/// journaled / auditable / undo-able. Async because reads can be
+/// large (10s of MB DXF files are common).
+#[napi]
+pub async fn draft_import_dxf(project_path: String, dxf_path: String) -> Result<DraftImportDxfJs> {
+    spawn_blocking_napi(move || {
+        with_service(|svc| svc.draft_import_dxf(&project_path, &dxf_path)).map(|r| {
+            DraftImportDxfJs {
+                entity_count: r.entity_count,
+                layer_count: r.layer_count,
+                block_count: r.block_count,
+                skipped_count: r.skipped_count,
+            }
+        })
+    })
+    .await
+}
+
+/// Export the project graph's draft primitives to a DXF file.
+/// Async because writing can be large.
+#[napi]
+pub async fn draft_export_dxf(project_path: String, dxf_path: String) -> Result<DraftExportDxfJs> {
+    spawn_blocking_napi(move || {
+        with_service_ref_fallible(|svc| svc.draft_export_dxf(&project_path, &dxf_path)).map(|r| {
+            DraftExportDxfJs {
+                path: r.path,
+                entity_count: r.entity_count,
+                // u64 doesn't cross the NAPI boundary cleanly on all
+                // hosts; the renderer already shows file_size as a
+                // human-readable string and a 4 GiB cap on a draft
+                // DXF export is well beyond any reasonable project.
+                file_size: u32::try_from(r.file_size).unwrap_or(u32::MAX),
+            }
+        })
+    })
+    .await
+}
+
+/// JS-facing mirror of [`crate::service::RevisionSummary`]. The
+/// service serialises with `#[serde(rename_all = "camelCase")]` so
+/// the field order here matches the renderer's TS interface
+/// exactly. We re-serialise through JSON rather than mapping fields
+/// because the nested `tracked_entities` Vec doesn't cross NAPI
+/// directly.
+#[napi(object)]
+pub struct RevisionSummaryJs {
+    /// JSON-serialised
+    /// [`crate::service::RevisionSummary`]. The renderer
+    /// `JSON.parse`s this once on receipt to obtain a typed
+    /// `RevisionSummary`. We pass JSON instead of a flat NAPI
+    /// object because the inner `tracked_entities` list does not
+    /// flatten cleanly to a NAPI struct.
+    pub summary_json: String,
+}
+
+#[napi(object)]
+pub struct RevisionDiffJs {
+    /// JSON-serialised
+    /// [`crate::service::RevisionDiffReport`].
+    pub diff_json: String,
+}
+
+#[napi(object)]
+pub struct RevisionTrackedEntityJs {
+    pub category: String,
+    pub id: String,
+    pub payload_hash: String,
+    pub label: Option<String>,
+}
+
+/// Create a tagged revision snapshot.
+#[napi]
+pub fn deliver_create_revision(
+    project_path: String,
+    tag: String,
+    description: String,
+    entities: Option<Vec<RevisionTrackedEntityJs>>,
+) -> Result<RevisionSummaryJs> {
+    let caller = entities.map(|v| {
+        v.into_iter()
+            .map(|e| crate::service::RevisionTrackedEntity {
+                category: e.category,
+                id: e.id,
+                payload_hash: e.payload_hash,
+                label: e.label,
+            })
+            .collect()
+    });
+    let rev =
+        with_service(|svc| svc.deliver_create_revision(&project_path, &tag, &description, caller))?;
+    let summary_json = serde_json::to_string(&rev).map_err(|e| {
+        Error::new(
+            Status::GenericFailure,
+            format!("deliver_create_revision: serialize: {e}"),
+        )
+    })?;
+    Ok(RevisionSummaryJs { summary_json })
+}
+
+/// List all revision snapshots in chronological order.
+#[napi]
+pub fn deliver_list_revisions(project_path: String) -> Result<Vec<RevisionSummaryJs>> {
+    let revs = with_service_ref_fallible(|svc| svc.deliver_list_revisions(&project_path))?;
+    revs.into_iter()
+        .map(|r| {
+            let summary_json = serde_json::to_string(&r).map_err(|e| {
+                Error::new(
+                    Status::GenericFailure,
+                    format!("deliver_list_revisions: serialize: {e}"),
+                )
+            })?;
+            Ok(RevisionSummaryJs { summary_json })
+        })
+        .collect()
+}
+
+/// Diff two revisions.
+#[napi]
+pub fn deliver_compare_revisions(
+    project_path: String,
+    base_id: String,
+    head_id: String,
+) -> Result<RevisionDiffJs> {
+    let diff = with_service_ref_fallible(|svc| {
+        svc.deliver_compare_revisions(&project_path, &base_id, &head_id)
+    })?;
+    let diff_json = serde_json::to_string(&diff).map_err(|e| {
+        Error::new(
+            Status::GenericFailure,
+            format!("deliver_compare_revisions: serialize: {e}"),
+        )
+    })?;
+    Ok(RevisionDiffJs { diff_json })
+}
+
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
     if s.len() % 2 != 0 {
         return None;
