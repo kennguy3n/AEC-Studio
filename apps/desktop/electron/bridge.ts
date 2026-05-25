@@ -1076,7 +1076,13 @@ interface NativeApi {
   runtime_status(): unknown;
   project_engine_status(project_path: string): unknown;
   project_audit_sync(project_path: string): unknown;
-  bim_import_ifc(path: string): unknown;
+  // ASYNC: returns Promise<unknown> because the underlying napi
+  // function is `#[napi] async fn` (parses the IFC on a tokio
+  // blocking-pool worker so it doesn't freeze the JS event loop).
+  // Typed as `Promise<unknown>` rather than the looser `unknown`
+  // so call sites that forget `await` get a TS error instead of a
+  // pending-promise object showing up at runtime.
+  bim_import_ifc(path: string): Promise<unknown>;
   bim_check_file_size(path: string): unknown;
   bim_attach_ifc(project_path: string, ifc_path: string): unknown;
   command_apply(project_path: string, command_json: string): unknown;
@@ -1134,18 +1140,24 @@ interface NativeApi {
     styleTags?: string[];
     limit?: number;
   }): unknown;
-  // PR-W (Phase 1) — full project package ZIP archive.
+  // PR-W (Phase 1) — full project package ZIP archive. Sync on the
+  // Rust side (synchronous `std::fs::read` + `zip` walk; per the
+  // PR-W doc the largest realistic package is a few hundred MB, so
+  // it stays on the calling thread for now).
   project_export_package(project_path: string, out_path: string): unknown;
   // PR-W (Phase 1+2) — design.* command façades. `params_json` is
   // the JSON-stringified renderer-side `params` object; the napi
   // side deserialises it into the corresponding `aec_command`
   // command struct, wraps it in `Command::user(...)`, and routes
-  // through `command_apply`.
+  // through `command_apply`. All sync on the Rust side.
   design_paint_material(project_path: string, params_json: string): unknown;
   design_set_lighting(project_path: string, params_json: string): unknown;
   design_save_camera(project_path: string, params_json: string): unknown;
   design_place_furniture(project_path: string, params_json: string): unknown;
   // PR-W (Phase 3+4) — BIM classification + property mutation.
+  // Sync on the Rust side; concurrent status polls are kept
+  // responsive by SQLite's PRAGMA busy_timeout rather than by
+  // making these methods async.
   bim_classify(project_path: string, scheme: string): unknown;
   bim_set_property(
     project_path: string,
@@ -1154,23 +1166,32 @@ interface NativeApi {
     key: string,
     value: string,
   ): unknown;
-  // AI endpoints wired in PR-V. `parsed_json` on the result of
-  // `ai_plan` is a `JSON.stringify`'d tool-specific payload; the
-  // adaptor parses it back into a typed `AiPlanParsed` for the
-  // renderer. `context_json` on the request side is the renderer's
+  // AI endpoints wired in PR-V and made async in the async-napi
+  // follow-up. All six are `#[napi] async fn` on the Rust side —
+  // they route through `spawn_blocking_napi` so the libuv main
+  // thread is never blocked, even during the up-to-30 s cold-spawn
+  // of the llama-server child. Typed as `Promise<unknown>` rather
+  // than the looser `unknown` so a future contributor who writes
+  // `n.ai_runtime_status()` without `await` gets a TS error rather
+  // than silently consuming a pending-promise object.
+  //
+  // `parsed_json` on the result of `ai_plan` is a
+  // `JSON.stringify`'d tool-specific payload; the adaptor parses
+  // it back into a typed `AiPlanParsed` for the renderer.
+  // `context_json` on the request side is the renderer's
   // tool-specific context object, also serialised at the adaptor.
-  ai_list_tools(): unknown;
+  ai_list_tools(): Promise<unknown>;
   ai_plan(
     tool: string,
     scope: string,
     prompt: string,
     context_json: string,
     max_entities_modified: number,
-  ): unknown;
-  ai_accept_diff(diff_id: string): unknown;
-  ai_reject_diff(diff_id: string): unknown;
-  ai_cancel_job(job_id: string): unknown;
-  ai_runtime_status(): unknown;
+  ): Promise<unknown>;
+  ai_accept_diff(diff_id: string): Promise<unknown>;
+  ai_reject_diff(diff_id: string): Promise<unknown>;
+  ai_cancel_job(job_id: string): Promise<unknown>;
+  ai_runtime_status(): Promise<unknown>;
 }
 
 /**
@@ -1268,11 +1289,18 @@ export const NATIVE_WIRED_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   "designSaveCamera",
   "bimClassify",
   "bimSetProperty",
-  // AI sidecar surface wired in Phase 10 PR-V. Backed by
-  // `BridgeService::ai_state` (`Mutex<AiState>`) which owns the
-  // sidecar handle + pending diff map. All endpoints route through
-  // the read side of the napi singleton's `RwLock` so they don't
-  // block status-pane polling while a plan is in flight.
+  // AI sidecar surface wired in Phase 10 PR-V and refactored in the
+  // async-napi follow-up. Backed by `BridgeService::ai_state`
+  // (`AiState` by value — interior mutability via per-piece locks:
+  // `RwLock<SidecarRuntime>` + `Mutex<Option<SidecarHandle>>` +
+  // `Mutex<HashMap<DiffId, Diff>>`) which owns the sidecar handle +
+  // pending diff map. All six methods are `#[napi] async fn` and
+  // route through `spawn_blocking_napi`, so the libuv main thread
+  // never blocks on sidecar I/O. Cold-spawn status polls observe
+  // the published `Loading` state in microseconds because
+  // `AiState::snapshot()` reads `runtime` + `pending_diffs` but
+  // deliberately does NOT touch `handle_slot`. See
+  // `crates/aec_bridge/src/ai_state.rs` module doc.
   "aiListTools",
   "aiPlan",
   "aiAcceptDiff",
@@ -1603,7 +1631,7 @@ function adaptNative(n: NativeApi): BridgeBackend {
     // Rust enum: a renderer build that ships an out-of-date `AI_TOOLS`
     // constant will still see the native truth in production.
     aiListTools: async () =>
-      n.ai_list_tools() as AiTool[],
+      (await n.ai_list_tools()) as AiTool[],
     // `aiPlan` accepts a loose `Record<string, unknown>` for
     // back-compat with the in-process fallback. We extract `tool`,
     // `scope`, `prompt`, `context`, and `max_entities_modified`
@@ -1683,29 +1711,35 @@ function adaptNative(n: NativeApi): BridgeBackend {
       return { diffId: result.diffId, parsed };
     },
     aiAcceptDiff: async (diffId) => {
-      // Invoke for its side effect (remove from pending map). The TS
-      // contract is the literal `{ accepted: true }`; the native
-      // `{ ok, diff_id }` is intentionally not surfaced because the
-      // renderer's Accept button is idempotent and doesn't need the
-      // echo.
-      n.ai_accept_diff(diffId);
+      // Awaited so the native Promise's rejection (e.g. unknown
+      // diff id) surfaces here as a real `throw` rather than an
+      // unhandled rejection on a later tick. The TS contract is the
+      // literal `{ accepted: true }`; the native `{ ok, diff_id }`
+      // is intentionally not surfaced because the renderer's
+      // Accept button is idempotent and doesn't need the echo.
+      await n.ai_accept_diff(diffId);
       return { accepted: true };
     },
     aiRejectDiff: async (diffId) => {
-      // Same idempotency contract as `aiAcceptDiff`.
-      n.ai_reject_diff(diffId);
+      // Same idempotency / error-propagation contract as
+      // `aiAcceptDiff`.
+      await n.ai_reject_diff(diffId);
       return { rejected: true };
     },
     aiCancelJob: async (jobId) => {
       // `job_id` is accepted by the native side for forward
       // compatibility but currently ignored — there's only one
       // in-flight plan at a time. The TS contract collapses to the
-      // literal `{ cancelled: true }`.
-      n.ai_cancel_job(jobId);
+      // literal `{ cancelled: true }`. Awaited so the renderer
+      // knows the cancel actually landed (during a cold-spawn this
+      // can take up to `DEFAULT_SPAWN_TIMEOUT`; the napi side runs
+      // it on the tokio blocking thread pool so the JS event loop
+      // stays free during the wait).
+      await n.ai_cancel_job(jobId);
       return { cancelled: true };
     },
     aiRuntimeStatus: async () => {
-      const r = n.ai_runtime_status() as {
+      const r = (await n.ai_runtime_status()) as {
         state: string;
         lastError: string | null;
         pendingDiffIds: string[];

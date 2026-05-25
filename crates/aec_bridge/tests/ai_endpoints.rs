@@ -18,10 +18,11 @@
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use aec_ai::{RuntimeConfig, SidecarTransport};
+use aec_ai::{RuntimeConfig, RuntimeState, SidecarTransport};
 use aec_bridge::{ai_state::AiState, BridgeConfig, BridgeService};
 use aec_core::Scope;
 use tempfile::TempDir;
@@ -70,12 +71,12 @@ fn spawn_mock_sidecar(
     })
 }
 
-fn wire_ai_state_to_mock(service: &BridgeService, port: u16) {
+fn wire_ai_state_to_mock(service: &mut BridgeService, port: u16) {
     // Use the test-only helper to swap in an AiState that's pre-attached
     // to the mock TCP server — no real `llama-server` spawn.
     let transport = SidecarTransport::new(port, Duration::from_secs(5));
     let state = AiState::__test_with_transport(RuntimeConfig::default(), transport);
-    service.__test_install_ai_state(state).unwrap();
+    service.__test_install_ai_state(state);
 }
 
 /// Wire-format HTTP response for a successful style-assistant
@@ -145,12 +146,12 @@ fn ai_runtime_status_reports_idle_by_default() {
 
 #[test]
 fn ai_plan_dispatches_through_mock_sidecar_and_registers_diff() {
-    let (s, _g) = make_service();
+    let (mut s, _g) = make_service();
     let listener = bind_loopback();
     let port = listener.local_addr().unwrap().port();
     let resp = canned_response(valid_style_assistant_response_bytes());
     let join = spawn_mock_sidecar(listener, resp, 1);
-    wire_ai_state_to_mock(&s, port);
+    wire_ai_state_to_mock(&mut s, port);
 
     let result = s
         .ai_plan("style_assistant", Scope::Design, "a warm evening", "{}", 5)
@@ -192,12 +193,12 @@ fn ai_plan_rejects_malformed_context_json() {
 
 #[test]
 fn ai_accept_diff_removes_pending_diff() {
-    let (s, _g) = make_service();
+    let (mut s, _g) = make_service();
     let listener = bind_loopback();
     let port = listener.local_addr().unwrap().port();
     let resp = canned_response(valid_style_assistant_response_bytes());
     let _join = spawn_mock_sidecar(listener, resp, 1);
-    wire_ai_state_to_mock(&s, port);
+    wire_ai_state_to_mock(&mut s, port);
 
     let result = s
         .ai_plan("style_assistant", Scope::Design, "", "{}", 5)
@@ -217,12 +218,12 @@ fn ai_accept_diff_removes_pending_diff() {
 
 #[test]
 fn ai_reject_diff_removes_pending_diff() {
-    let (s, _g) = make_service();
+    let (mut s, _g) = make_service();
     let listener = bind_loopback();
     let port = listener.local_addr().unwrap().port();
     let resp = canned_response(valid_style_assistant_response_bytes());
     let _join = spawn_mock_sidecar(listener, resp, 1);
-    wire_ai_state_to_mock(&s, port);
+    wire_ai_state_to_mock(&mut s, port);
 
     let result = s
         .ai_plan("style_assistant", Scope::Design, "", "{}", 5)
@@ -252,12 +253,12 @@ fn ai_accept_diff_rejects_malformed_id() {
 
 #[test]
 fn ai_cancel_job_resets_runtime_to_idle() {
-    let (s, _g) = make_service();
+    let (mut s, _g) = make_service();
     let listener = bind_loopback();
     let port = listener.local_addr().unwrap().port();
     let resp = canned_response(valid_style_assistant_response_bytes());
     let _join = spawn_mock_sidecar(listener, resp, 1);
-    wire_ai_state_to_mock(&s, port);
+    wire_ai_state_to_mock(&mut s, port);
 
     // Drive the runtime to Ready via a successful plan.
     let _ = s
@@ -286,7 +287,7 @@ fn ai_cancel_job_is_idempotent_when_no_sidecar_running() {
 
 #[test]
 fn ai_plan_routes_a_failed_safety_validation_back_as_ai_error() {
-    let (s, _g) = make_service();
+    let (mut s, _g) = make_service();
     let listener = bind_loopback();
     let port = listener.local_addr().unwrap().port();
 
@@ -301,7 +302,7 @@ fn ai_plan_routes_a_failed_safety_validation_back_as_ai_error() {
     bytes.extend_from_slice(body);
     let response: &'static [u8] = bytes.leak();
     let _join = spawn_mock_sidecar(listener, response, 1);
-    wire_ai_state_to_mock(&s, port);
+    wire_ai_state_to_mock(&mut s, port);
 
     let err = s
         .ai_plan("style_assistant", Scope::Design, "", "{}", 5)
@@ -321,12 +322,12 @@ fn ai_plan_serialises_to_finite_json_numbers() {
     // shape only has strings + an integer, so serialisation cannot
     // fail; once we add a confidence field, this test catches a
     // regression.
-    let (s, _g) = make_service();
+    let (mut s, _g) = make_service();
     let listener = bind_loopback();
     let port = listener.local_addr().unwrap().port();
     let resp = canned_response(valid_style_assistant_response_bytes());
     let _join = spawn_mock_sidecar(listener, resp, 1);
-    wire_ai_state_to_mock(&s, port);
+    wire_ai_state_to_mock(&mut s, port);
 
     let result = s
         .ai_plan("style_assistant", Scope::Design, "", "{}", 5)
@@ -334,4 +335,65 @@ fn ai_plan_serialises_to_finite_json_numbers() {
     let json = serde_json::to_string(&result).expect("AiPlanResult must serialise");
     assert!(!json.contains("inf"));
     assert!(!json.contains("NaN"));
+}
+
+/// Cold-spawn responsiveness contract.
+///
+/// The architectural fix at the heart of this PR is the split-`AiState`
+/// design: lifecycle state (`runtime: RwLock`), spawn slot
+/// (`handle_slot: Mutex`), and diff registry (`pending_diffs: Mutex`)
+/// each have their own primitive. `AiState::snapshot()` — which
+/// backs `BridgeService::ai_runtime_status` and therefore the
+/// renderer's status pane — reads `runtime` and `pending_diffs` but
+/// deliberately does NOT touch `handle_slot`.
+///
+/// This test pins that contract: even if some other thread is
+/// holding `handle_slot` for an arbitrarily long time (the real
+/// scenario being `ensure_ready` blocking on `/health` for up to 30
+/// s during cold-spawn), `snapshot()` must still return in
+/// microseconds with the published `Loading` state.
+///
+/// Implementation note: we hold `handle_slot` for 500 ms on a
+/// background thread and assert the foreground `snapshot()` resolves
+/// in under 100 ms. The 100 ms bound is generous enough to absorb
+/// scheduler jitter on a loaded CI host while still being **5x
+/// tighter** than the 500 ms hold — a regression that re-introduces
+/// the outer `Mutex<AiState>` would block `snapshot()` for the full
+/// 500 ms and fail this assertion by an order of magnitude.
+#[test]
+fn ai_runtime_status_returns_loading_instantly_during_cold_spawn() {
+    let state = Arc::new(AiState::new(RuntimeConfig::default()));
+    // Set up the world: state is `Loading` (just like the cold-spawn
+    // path between `begin_load` and `mark_ready`/`mark_failed`).
+    state.__test_begin_load();
+
+    // Background thread holds `handle_slot` for 500 ms, mimicking
+    // `ensure_ready` blocking on `/health`.
+    let blocker = {
+        let s = state.clone();
+        thread::spawn(move || s.__test_hold_handle_slot_for(Duration::from_millis(500)))
+    };
+
+    // Give the blocker enough time to actually acquire the lock
+    // before we measure. 50 ms is well above the cost of a thread
+    // spawn + lock acquisition on any reasonable CI host.
+    thread::sleep(Duration::from_millis(50));
+
+    let start = Instant::now();
+    let snap = state
+        .snapshot()
+        .expect("snapshot must not block on handle_slot");
+    let elapsed = start.elapsed();
+
+    assert_eq!(
+        snap.state,
+        RuntimeState::Loading,
+        "snapshot must observe the published Loading state, not stale Idle",
+    );
+    assert!(
+        elapsed < Duration::from_millis(100),
+        "snapshot took {elapsed:?}; expected < 100 ms. Did the outer Mutex<AiState> creep back in?",
+    );
+
+    blocker.join().expect("blocker thread");
 }

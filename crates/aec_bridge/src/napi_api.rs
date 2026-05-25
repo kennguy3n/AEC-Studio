@@ -1910,32 +1910,43 @@ pub fn render_check_materials() -> Result<RenderCheckMaterialsJs> {
 // ---------------------------------------------------------------
 //
 // All six methods route through `with_service_ref_fallible` because
-// mutation of the sidecar handle / pending diff map happens inside
-// the inner `Mutex<AiState>` on `BridgeService`. That means:
+// mutation of the sidecar handle / pending diff map happens behind
+// [`AiState`]'s interior synchronisation (per-field `Mutex`/`RwLock`).
+// That means:
 //
-//   * the singleton `RwLock` is held in *read* mode the whole time,
-//     so `project_engine_status` polls keep flowing — important for
-//     the status pane while a plan is running
+//   * the singleton `RwLock<BridgeService>` is held in *read* mode
+//     the whole time, so unrelated read-only endpoints
+//     (`project_engine_status` polls, `bim_export_ifc`, etc.) keep
+//     flowing — important for the status pane while a plan is
+//     running.
 //
-// `ai_plan` is the only blocking caller in the set — its sidecar HTTP
-// completion can take up to `request_timeout` (default 120 s). It is
-// therefore declared `async` and routed through `spawn_blocking_napi`
-// so the Electron main process's JS event loop stays free for the
-// duration. `ai_runtime_status`, `ai_cancel_job`, `ai_list_tools`,
-// `ai_accept_diff`, and `ai_reject_diff` all complete in microseconds
-// (lock acquire + small memory ops) — they stay synchronous because
-// the napi-rs `Promise<T>` wrapping would add observable overhead
-// against zero benefit. The renderer can still poll them WHILE an
-// `ai_plan` is in flight because the blocking work is on the tokio
-// blocking-pool thread, not the libuv main thread.
+// **All six AI endpoints are `#[napi] async fn`** routed through
+// `spawn_blocking_napi`, even the ones whose hot path completes in
+// microseconds. The reason is the **first call** of a session:
+// `ensure_ready` synchronously spawns the `llama-server` child and
+// waits up to `DEFAULT_SPAWN_TIMEOUT` (30 s) for its `/health`
+// probe. While that spawn is in flight, `ai_cancel_job` blocks on
+// the handle-slot mutex inside [`AiState`] (it must, to avoid
+// racing `take()` against a freshly-`Some()` write). Were
+// `ai_cancel_job` a synchronous napi function, the libuv main
+// thread would freeze for the entire 30 s window — the user's
+// "Stop" click would not be processed, the Electron UI would hang,
+// and the JS-side IPC queue would back up.
 //
-// Inside `BridgeService`, the `Mutex<AiState>` guard is also dropped
-// before `planner.dispatch()` (see `service.rs:lock_ai_state` +
-// `ai_plan`), so concurrent `ai_runtime_status` / `ai_cancel_job`
-// calls don't have to wait for the LLM completion to acquire the
-// state mutex either. The two are complementary fixes — the napi
-// `async` flip unblocks the JS event loop; the bridge-side guard
-// drop unblocks the AiState mutex.
+// Wrapping in `spawn_blocking_napi` moves the blocking work to the
+// tokio blocking thread pool. The libuv main thread stays free; the
+// renderer can keep polling `ai_runtime_status` (which returns
+// `"loading"` from the `runtime` `RwLock` read side instantly —
+// see the [`AiState`] module doc on lock granularity) and keep
+// processing user input. The cancel itself still has to wait for
+// the spawn to complete before it can `take()` the handle, but
+// that wait happens on a worker thread, not the JS event loop.
+//
+// The cost of the `Promise<T>` wrapping is one tokio task hop per
+// call (~microseconds). For status polls firing every ~500 ms this
+// is invisible against the IPC round-trip cost. We accept it to
+// get unconditional JS event-loop responsiveness, which is the
+// architecturally correct fix for the cold-spawn UI freeze.
 
 /// JS-facing AI tool descriptor for the renderer's tool picker.
 /// Wire shape matches `AiTool` in `apps/desktop/electron/bridge.ts`.
@@ -2008,10 +2019,17 @@ pub struct AiRuntimeStatusJs {
 
 /// Enumerate the local AI tools available to the planner. Mirrors
 /// `BridgeService::ai_list_tools` — see that doc for the contract.
+///
+/// Declared `async` and routed through `spawn_blocking_napi` for
+/// consistency with the rest of the AI surface; see the AI
+/// endpoints concurrency block above for the rationale.
 #[napi]
-pub fn ai_list_tools() -> Result<Vec<AiToolJs>> {
-    with_service_ref_fallible(super::service::BridgeService::ai_list_tools)
-        .map(|v| v.into_iter().map(Into::into).collect())
+pub async fn ai_list_tools() -> Result<Vec<AiToolJs>> {
+    spawn_blocking_napi(move || {
+        with_service_ref_fallible(super::service::BridgeService::ai_list_tools)
+            .map(|v| v.into_iter().map(Into::into).collect::<Vec<AiToolJs>>())
+    })
+    .await
 }
 
 /// Plan a single AI action against the local LLM sidecar.
@@ -2071,45 +2089,75 @@ pub async fn ai_plan(
 
 /// Accept a pending diff. Idempotent at the renderer level: a second
 /// accept on the same id is an error (the first removed it).
+///
+/// `async` for the cold-spawn responsiveness reason in the AI
+/// endpoints block above. The actual diff-map mutation is
+/// O(microseconds), but if a cold-spawn happens to be racing on
+/// the same `BridgeService` we still want the JS event loop free.
 #[napi]
-pub fn ai_accept_diff(diff_id: String) -> Result<AiDiffOutcomeJs> {
-    with_service_ref_fallible(|svc| svc.ai_accept_diff(&diff_id)).map(|r| AiDiffOutcomeJs {
-        ok: r.ok,
-        diff_id: r.diff_id,
+pub async fn ai_accept_diff(diff_id: String) -> Result<AiDiffOutcomeJs> {
+    spawn_blocking_napi(move || {
+        with_service_ref_fallible(|svc| svc.ai_accept_diff(&diff_id)).map(|r| AiDiffOutcomeJs {
+            ok: r.ok,
+            diff_id: r.diff_id,
+        })
     })
+    .await
 }
 
 /// Reject a pending diff. Same idempotency note as `ai_accept_diff`.
 #[napi]
-pub fn ai_reject_diff(diff_id: String) -> Result<AiDiffOutcomeJs> {
-    with_service_ref_fallible(|svc| svc.ai_reject_diff(&diff_id)).map(|r| AiDiffOutcomeJs {
-        ok: r.ok,
-        diff_id: r.diff_id,
+pub async fn ai_reject_diff(diff_id: String) -> Result<AiDiffOutcomeJs> {
+    spawn_blocking_napi(move || {
+        with_service_ref_fallible(|svc| svc.ai_reject_diff(&diff_id)).map(|r| AiDiffOutcomeJs {
+            ok: r.ok,
+            diff_id: r.diff_id,
+        })
     })
+    .await
 }
 
 /// Cancel any in-flight AI work by killing the sidecar process.
 /// `job_id` is accepted for forward compatibility but currently
 /// ignored — there's only one in-flight plan at a time (see the
 /// concurrency rationale on the AI endpoints block above).
+///
+/// `async` and routed through `spawn_blocking_napi` because during
+/// a cold-spawn this call blocks on the handle-slot mutex inside
+/// [`AiState`] for the full `DEFAULT_SPAWN_TIMEOUT` window
+/// (~30 s). The blocking-pool wrapper keeps the libuv main thread
+/// free during that wait so the renderer UI stays responsive.
 #[napi]
-pub fn ai_cancel_job(job_id: String) -> Result<AiCancelResultJs> {
-    with_service_ref_fallible(|svc| svc.ai_cancel_job(&job_id)).map(|r| AiCancelResultJs {
-        cancelled: r.cancelled,
+pub async fn ai_cancel_job(job_id: String) -> Result<AiCancelResultJs> {
+    spawn_blocking_napi(move || {
+        with_service_ref_fallible(|svc| svc.ai_cancel_job(&job_id)).map(|r| AiCancelResultJs {
+            cancelled: r.cancelled,
+        })
     })
+    .await
 }
 
-/// Read the sidecar's current lifecycle state. Cheap, lock-only —
-/// the renderer polls this every ~500 ms while a plan is in flight.
+/// Read the sidecar's current lifecycle state. The renderer polls
+/// this every ~500 ms while a plan is in flight to drive the model
+/// loading indicator.
+///
+/// `async` and routed through `spawn_blocking_napi` so the libuv
+/// main thread is never blocked, even by the
+/// `RwLockReadGuard::lock()` syscall during a state transition. On
+/// the hot path the actual work is O(microseconds); the blocking-
+/// pool hop is the cost of unconditional UI responsiveness.
 #[napi]
-pub fn ai_runtime_status() -> Result<AiRuntimeStatusJs> {
-    with_service_ref_fallible(super::service::BridgeService::ai_runtime_status).map(|r| {
-        AiRuntimeStatusJs {
-            state: r.state,
-            last_error: r.last_error,
-            pending_diff_ids: r.pending_diff_ids,
-        }
+pub async fn ai_runtime_status() -> Result<AiRuntimeStatusJs> {
+    spawn_blocking_napi(move || {
+        with_service_ref_fallible(super::service::BridgeService::ai_runtime_status).map(|r| {
+            AiRuntimeStatusJs {
+                state: r.state,
+                last_error: r.last_error,
+                pending_diff_ids: r.pending_diff_ids,
+            }
+        })
     })
+    .await
 }
 
 fn hex_decode(s: &str) -> Option<Vec<u8>> {

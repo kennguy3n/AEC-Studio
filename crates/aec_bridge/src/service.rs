@@ -1163,23 +1163,17 @@ pub struct BridgeService {
     /// optional spawned `llama-server` child handle, and the map of
     /// pending diffs awaiting accept/reject.
     ///
-    /// Interior-mutable behind a [`Mutex`] for the same reason as
-    /// `render_state`: every `ai_*` endpoint takes `&self` on
-    /// [`BridgeService`] so the napi singleton's outer
-    /// [`std::sync::RwLock`] doesn't force every AI mutation through
-    /// the writer side. A renderer's "AI status" poll therefore runs
-    /// concurrently with an in-flight `ai_plan` completion, because
-    /// the `RwLock::read()` held by both endpoints is non-exclusive.
-    ///
-    /// The inner [`Mutex<AiState>`] serialises the actual sidecar
-    /// invocation — only one completion may be in flight per project
-    /// session, mirroring the renderer's "one AI panel at a time" UX.
-    /// `Option`-typed so the bridge can defer sidecar config loading
-    /// until a real `ai_*` call lands (constructing a default sidecar
-    /// config is cheap, but spawning the child process is not, so
-    /// `AiState::new` only initialises the state machine; the spawn
-    /// itself is lazy inside `AiState::ensure_ready`).
-    ai_state: Mutex<AiState>,
+    /// Held **by value** rather than behind an outer `Mutex` because
+    /// [`AiState`] provides per-field interior mutability (an
+    /// `RwLock` for lifecycle state, a `Mutex` for the spawn slot,
+    /// and a `Mutex` for the diff registry). This means an in-flight
+    /// `ai_plan` cold-spawn holds only the spawn-slot mutex —
+    /// concurrent `ai_runtime_status` polls take the runtime
+    /// `RwLock` *read* side and observe the published `Loading`
+    /// state instantly, and `ai_accept_diff` / `ai_reject_diff`
+    /// touch only the diff registry. See `crate::ai_state` module
+    /// doc for the full concurrency rationale.
+    ai_state: AiState,
 }
 
 /// Process-wide render state held by [`BridgeService::render_state`].
@@ -1263,7 +1257,7 @@ impl BridgeService {
             snapshot_cache: SnapshotCache::new(),
             render_state: Mutex::new(RenderState::new()),
             asset_state,
-            ai_state: Mutex::new(AiState::new(default_ai_runtime_config())),
+            ai_state: AiState::new(default_ai_runtime_config()),
         })
     }
 
@@ -3084,31 +3078,47 @@ impl BridgeService {
             .map_err(|e| BridgeServiceError::Core(format!("render state poisoned: {e}")))
     }
 
-    fn lock_ai_state(&self) -> Result<std::sync::MutexGuard<'_, AiState>, BridgeServiceError> {
-        self.ai_state
-            .lock()
-            .map_err(|e| BridgeServiceError::Core(format!("ai state poisoned: {e}")))
-    }
-
     /// Test-only accessor: replace the AI state with one pre-wired to a
     /// caller-supplied transport (e.g. a mock TCP server). Used by the
     /// `sidecar_mock` integration test to drive `ai_plan` end-to-end
     /// without spawning a real `llama-server`.
+    ///
+    /// Takes `&mut self` because [`AiState`] is held by value on
+    /// [`BridgeService`]; the test harness has unique ownership of
+    /// the service for the duration of the install.
     #[doc(hidden)]
-    pub fn __test_install_ai_state(&self, state: AiState) -> Result<(), BridgeServiceError> {
-        let mut guard = self.lock_ai_state()?;
-        *guard = state;
-        Ok(())
+    pub fn __test_install_ai_state(&mut self, state: AiState) {
+        self.ai_state = state;
     }
 
     // ---------------------------------------------------------------
     // AI endpoints
     // ---------------------------------------------------------------
     //
-    // All six methods take `&self` (read side of the napi singleton's
-    // `RwLock`) and serialise actual mutation through the inner
-    // `Mutex<AiState>`. This is the same pattern `render_*` uses; see
-    // the rationale block on `BridgeService::ai_state`.
+    // All six methods take `&self`. They do NOT serialise against one
+    // another — the three internal primitives on [`AiState`] (an
+    // `RwLock` for lifecycle state, a `Mutex` for the spawn slot, a
+    // `Mutex` for the diff registry) are independent, so:
+    //
+    //  - `ai_runtime_status` polls (the hot path: every ~500 ms while
+    //    a plan is in flight) only take the `runtime` `RwLock` *read*
+    //    side and run fully concurrent with everything else.
+    //  - `ai_accept_diff` / `ai_reject_diff` only take the
+    //    `pending_diffs` mutex, never touching sidecar state.
+    //  - `ai_plan` holds the spawn-slot mutex only across
+    //    `ensure_ready` (typically microseconds on the warm path, up
+    //    to `DEFAULT_SPAWN_TIMEOUT` on the first call), then drops
+    //    it before the blocking sidecar HTTP completion.
+    //  - `ai_cancel_job` takes the spawn-slot mutex to terminate the
+    //    handle, so it serialises with `ensure_ready` (correct: we
+    //    must not race a `take()` against a freshly-`Some()` write).
+    //
+    // The napi layer adds the second half of the fix: every blocking
+    // AI endpoint is `#[napi] async fn` routed through
+    // `spawn_blocking_napi`, so even when a cold-spawn is in flight
+    // the Electron main process's JS event loop stays free for
+    // unrelated work. See [`crate::ai_state`] module doc and
+    // [`crate::napi_api`] AI endpoints block for the full design.
 
     /// Enumerate the local AI tools the planner is willing to dispatch.
     /// The renderer's "AI sidebar" calls this once at session start to
@@ -3170,42 +3180,42 @@ impl BridgeService {
             context,
             max_entities_modified,
         };
-        // We split the work into three phases so the AI-state Mutex
-        // is NOT held across the blocking call into the sidecar:
+        // We split the work into three phases so no AiState lock is
+        // held across the blocking call into the sidecar:
         //
-        //   1. acquire guard → `ensure_ready` (which may spawn the
-        //      sidecar, up to `DEFAULT_SPAWN_TIMEOUT`) → clone the
-        //      `SidecarTransport` handle → drop the guard
-        //   2. dispatch through the planner without holding any lock,
-        //      so concurrent `ai_runtime_status` / `ai_cancel_job`
-        //      calls can read the lifecycle state and abort the work
-        //      in flight if the user clicks "Cancel"
-        //   3. re-acquire the guard briefly to register the resulting
-        //      diff in `AiState::pending_diffs`
+        //   1. `ensure_ready` (which may spawn the sidecar, up to
+        //      `DEFAULT_SPAWN_TIMEOUT`) returns an owned
+        //      `SidecarTransport`. During the spawn it holds the
+        //      handle-slot mutex internally; the `runtime` `RwLock`
+        //      is only briefly acquired to publish state transitions
+        //      (`Idle` → `Loading` → `Ready`/`Failed`), and is
+        //      *released* before the spawn blocks on `/health`.
+        //      Concurrent `ai_runtime_status` polls therefore observe
+        //      `Loading` immediately and never block on the spawn.
+        //   2. dispatch through the planner without holding any
+        //      AiState lock at all — the transport is an owned
+        //      stateless dial-out descriptor.
+        //   3. insert the resulting diff into `pending_diffs` (its
+        //      own mutex, independent of sidecar lifecycle).
         //
-        // `SidecarTransport::clone` is cheap — the struct is just
-        // `{ port: u16, request_timeout: Duration }` (see
-        // `aec_ai::transport::SidecarTransport`), so cloning is a
-        // 12-byte memcpy. The owning `SidecarHandle` (which holds the
-        // child process) stays inside `AiState`; the transport handle
-        // we hand to the planner is a stateless dial-out descriptor
-        // that opens a fresh `TcpStream` per request. The clone here
-        // is purely a borrow-checker convenience so we can drop the
-        // mutex guard before the blocking dispatch.
+        // `SidecarTransport` is `{ port: u16, request_timeout:
+        // Duration }` (see `aec_ai::transport::SidecarTransport`), so
+        // taking it by value is a 12-byte move. The owning
+        // `SidecarHandle` (which holds the child process) stays
+        // inside `AiState::handle_slot`.
         //
         // First-call note: on the first `ai_plan` of a session,
         // `ensure_ready` synchronously spawns the sidecar and waits
         // up to `DEFAULT_SPAWN_TIMEOUT` (30 s) for its `/health`
-        // probe — and the AI-state Mutex IS held for that window.
-        // Subsequent calls take the `else` branch of `ensure_ready`
-        // and finish in microseconds. Moving the spawn outside the
-        // lock would require splitting `AiState` into independently
-        // lockable pieces (runtime / handle / pending_diffs), which
-        // is out of scope for PR-V — see the architecture follow-up.
-        let transport = {
-            let mut guard = self.lock_ai_state()?;
-            guard.ensure_ready(DEFAULT_SPAWN_TIMEOUT)?.clone()
-        };
+        // probe. The handle-slot mutex IS held for that window, so a
+        // racing `ai_cancel_job` blocks (correctly — we must not
+        // race `take()` against a freshly-`Some()` write). Crucially
+        // the renderer's status polls are *not* blocked: the
+        // `runtime` `RwLock` is dropped before the spawn waits on
+        // `/health`, and the napi `ai_runtime_status` is
+        // `spawn_blocking`-wrapped so the libuv main thread is free
+        // throughout.
+        let transport = self.ai_state.ensure_ready(DEFAULT_SPAWN_TIMEOUT)?;
         let response = planner.dispatch(&request, &transport)?;
         let diff = DiffEngine::build(&response);
         let parsed = response.parsed.clone();
@@ -3231,10 +3241,7 @@ impl BridgeService {
             entities, response.entities_modified,
             "DiffEngine::build and planner::count_response_entities must agree",
         );
-        let diff_id = {
-            let mut guard = self.lock_ai_state()?;
-            guard.insert_diff(diff)
-        };
+        let diff_id = self.ai_state.insert_diff(diff)?;
         Ok(AiPlanResult {
             diff_id: diff_id.as_str().to_owned(),
             parsed,
@@ -3249,8 +3256,7 @@ impl BridgeService {
     /// (Phase 11 task, deliberately deferred from PR-V scope per the
     /// scoping doc).
     pub fn ai_accept_diff(&self, diff_id: &str) -> Result<AiDiffOutcome, BridgeServiceError> {
-        let mut guard = self.lock_ai_state()?;
-        let _ = guard.accept_diff(diff_id)?;
+        let _ = self.ai_state.accept_diff(diff_id)?;
         Ok(AiDiffOutcome {
             ok: true,
             diff_id: diff_id.to_owned(),
@@ -3259,8 +3265,7 @@ impl BridgeService {
 
     /// Mark a pending diff as rejected and drop it.
     pub fn ai_reject_diff(&self, diff_id: &str) -> Result<AiDiffOutcome, BridgeServiceError> {
-        let mut guard = self.lock_ai_state()?;
-        let _ = guard.reject_diff(diff_id)?;
+        let _ = self.ai_state.reject_diff(diff_id)?;
         Ok(AiDiffOutcome {
             ok: true,
             diff_id: diff_id.to_owned(),
@@ -3270,19 +3275,28 @@ impl BridgeService {
     /// Cancel any in-flight or queued AI work by killing the sidecar
     /// process. Idempotent: cancelling when no sidecar is running is a
     /// no-op. The next `ai_plan` call will lazily respawn.
+    ///
+    /// During a cold-spawn this method blocks on the `handle_slot`
+    /// mutex until the spawn completes (the spawn is non-cancellable
+    /// today; making the underlying `Child::wait` interruptible is a
+    /// follow-up). The napi `ai_cancel_job` is `spawn_blocking`-
+    /// wrapped, so the libuv main thread is free during that wait
+    /// and the renderer UI stays responsive.
     pub fn ai_cancel_job(&self, _job_id: &str) -> Result<AiCancelResult, BridgeServiceError> {
-        let mut guard = self.lock_ai_state()?;
-        guard.cancel_job();
+        self.ai_state.cancel_job()?;
         Ok(AiCancelResult { cancelled: true })
     }
 
-    /// Read the current sidecar lifecycle state. Cheap, lock-only
-    /// operation — the renderer polls this every ~500 ms while an
-    /// `ai_plan` is in flight to show the user a "model loading" or
-    /// "model ready" indicator.
+    /// Read the current sidecar lifecycle state. Cheap, lock-free in
+    /// the contention sense — takes the `runtime` `RwLock` *read*
+    /// side and the `pending_diffs` mutex, neither of which is held
+    /// for more than microseconds anywhere else in the codebase. The
+    /// renderer polls this every ~500 ms while an `ai_plan` is in
+    /// flight to show the user a "model loading" or "model ready"
+    /// indicator; concurrent polls during a cold-spawn observe the
+    /// `Loading` state immediately.
     pub fn ai_runtime_status(&self) -> Result<AiRuntimeStatusReport, BridgeServiceError> {
-        let guard = self.lock_ai_state()?;
-        let snap = guard.snapshot();
+        let snap = self.ai_state.snapshot()?;
         Ok(AiRuntimeStatusReport {
             state: state_string(snap.state),
             last_error: snap.last_error,
