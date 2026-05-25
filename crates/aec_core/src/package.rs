@@ -464,6 +464,7 @@ mod tests {
             conn.execute_batch(
                 "DROP TABLE IF EXISTS audit_chain; \
                  DROP INDEX IF EXISTS idx_undo_journal_scope; \
+                 DROP INDEX IF EXISTS idx_components_entity_kind; \
                  ALTER TABLE undo_journal DROP COLUMN scope; \
                  INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', '1');",
             )

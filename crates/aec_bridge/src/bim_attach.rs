@@ -832,7 +832,8 @@ fn insert_component(
     // with our own previous-attach row.
     let component_id = format!("{}/{}", entity_id.as_str(), kind);
     tx.execute(
-        "INSERT INTO components(id, entity_id, kind, body) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO components(id, entity_id, kind, body) VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(entity_id, kind) DO UPDATE SET id = excluded.id, body = excluded.body",
         params![component_id, entity_id.as_str(), kind, body_json],
     )?;
     Ok(())

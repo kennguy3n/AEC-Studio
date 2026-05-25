@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::{DateTime, Utc};
+use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -107,6 +108,15 @@ pub enum BridgeServiceError {
     /// `Core` failure.
     #[error("asset: {0}")]
     Asset(String),
+    /// Input-validation failure at the bridge boundary — distinct
+    /// from [`Self::Command`] (which is an `aec_command` validator)
+    /// and [`Self::Bim`] (IFC parser). Used by
+    /// [`BridgeService::bim_classify`] / [`BridgeService::bim_set_property`]
+    /// for "unknown scheme", "empty pset", "entity not in project"
+    /// etc., so the renderer can show a clean "invalid argument"
+    /// toast without scraping a parser stack trace.
+    #[error("invalid: {0}")]
+    Invalid(String),
     /// Local-LLM (sidecar / planner / safety validator / diff engine)
     /// failure. The error message preserves
     /// [`crate::ai_state::AiStateError`]'s `Display` so the renderer can
@@ -639,6 +649,86 @@ pub struct DeliverPackResult {
     pub total_bytes: u64,
 }
 
+/// Result of a successful [`BridgeService::project_export_package`]
+/// call. Mirrors the shape of the renderer's
+/// `BridgeBackend.projectExportPackage` return value
+/// (`{ outPath: string }`) with extras for the file count + payload
+/// bytes that the renderer's "Exported NNN files (MM MB)" status
+/// pane can use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectExportPackageResult {
+    pub out_path: String,
+    /// Number of source files included in the archive. Excludes the
+    /// auto-generated `_aec_archive_manifest.json` so this matches
+    /// the count the renderer's "Files: N" indicator shows.
+    pub entries: u32,
+    /// Sum of source-file payload bytes (manifest excluded). Useful
+    /// for the renderer's "Exported NNN MB" progress indicator.
+    pub total_bytes: u64,
+}
+
+/// Result of a successful [`BridgeService::bim_classify`] call.
+///
+/// `classified` is the number of entities that received an updated
+/// classification. `scheme` echoes the canonical scheme name back to
+/// the renderer so the UI status pane (`Bim.tsx`) can confirm which
+/// table was used. `details` carries per-entity assignments so the
+/// renderer can populate the property panel without a follow-up
+/// query.
+///
+/// **Counter semantics** (`classified` / `unchanged` / `skipped`):
+///
+/// * `classified` — entities whose database row was actually mutated
+///   by this call (a `kind` rewrite for IFC, a new or modified
+///   `components` row for Uniformat-II / OmniClass-21). This is the
+///   number the renderer should use to gate "Undo classify?" prompts
+///   or "N entities re-classified" toasts: it reflects real change.
+/// * `unchanged` — entities that matched the scheme's lookup table
+///   but whose database row already carried the target value, so no
+///   write was issued. Surfacing this separately lets the renderer
+///   distinguish "already-classified project, no-op rerun" from
+///   "nothing matched at all".
+/// * `skipped` — entities whose `kind` is not recognised by the
+///   scheme's lookup table at all (e.g. a custom `kind` no scheme
+///   maps). The renderer can warn about these.
+///
+/// `classified + unchanged + skipped == total_entities_walked` is the
+/// invariant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BimClassifyResult {
+    pub scheme: String,
+    pub classified: u32,
+    pub unchanged: u32,
+    pub skipped: u32,
+    pub details: Vec<BimClassifyAssignment>,
+}
+
+/// One row of the [`BimClassifyResult::details`] vector. Mirrors the
+/// renderer's `BimClassifyAssignment` interface.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BimClassifyAssignment {
+    pub entity_id: String,
+    /// For `ifc` scheme — the assigned IFC class name (`"IfcWall"`,
+    /// `"IfcDoor"`, etc.). For other schemes — the canonical code
+    /// (`"B2010"`, `"21-02 20 10"`).
+    pub code: String,
+    /// Human-readable description from the table. Empty string for
+    /// schemes where the code itself is descriptive enough.
+    pub title: String,
+}
+
+/// Result of a successful [`BridgeService::bim_set_property`] call.
+/// Echoes back the entity / pset / key the property landed on plus
+/// the **previous** value (if any) so the renderer's undo gesture
+/// has the data it needs without a follow-up query.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BimSetPropertyResult {
+    pub entity_id: String,
+    pub pset: String,
+    pub key: String,
+    pub previous_value: Option<String>,
+}
+
 /// Result of a successful [`BridgeService::bim_export_ifc`] call.
 /// The bridge parses the input IFC (hitting the snapshot cache where
 /// possible), then re-serialises the parsed `IfcSnapshot` back to a
@@ -1104,6 +1194,52 @@ impl RenderState {
             preset_store: RenderPresetStore::default(),
         }
     }
+}
+
+/// Synthesise a deterministic `components.id` for an `aec/`-prefixed
+/// overlay row from `(entity_id, component_kind)`, then upsert the
+/// row's body — but only when the prior body (if any) differs from
+/// the proposed body. Returns `Ok(true)` if a write was issued,
+/// `Ok(false)` if the existing row already matched.
+///
+/// The deterministic `id` ensures repeated classification calls
+/// update the same row instead of accumulating orphans. The "only
+/// when changed" semantic exists so [`BridgeService::bim_classify`]
+/// can report a `classified` counter that reflects real database
+/// mutations — see [`BimClassifyResult`] for the contract. The
+/// comparison is done on the serialised JSON form (`to_string()`),
+/// which is what's stored, so any whitespace differences would
+/// register as a change (serde_json's serialiser is deterministic
+/// for the inputs we feed here).
+///
+/// Uniqueness on `(entity_id, kind)` is enforced by the v4 migration
+/// (`v4_components_natural_key`) so the `ON CONFLICT(entity_id,
+/// kind)` clause is guaranteed to match at most one row.
+fn upsert_classification_component_if_changed(
+    tx: &Transaction<'_>,
+    entity_id: &str,
+    component_kind: &str,
+    body: &serde_json::Value,
+) -> rusqlite::Result<bool> {
+    let new_body = body.to_string();
+    let existing: Option<String> = tx
+        .query_row(
+            "SELECT body FROM components WHERE entity_id = ?1 AND kind = ?2",
+            params![entity_id, component_kind],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?;
+    if existing.as_deref() == Some(new_body.as_str()) {
+        return Ok(false);
+    }
+    let comp_id = format!("comp_{}_{}", entity_id, component_kind.replace('/', "_"));
+    tx.execute(
+        "INSERT INTO components(id, entity_id, kind, body) \
+         VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(entity_id, kind) DO UPDATE SET id = excluded.id, body = excluded.body",
+        params![comp_id, entity_id, component_kind, new_body],
+    )?;
+    Ok(true)
 }
 
 impl BridgeService {
@@ -1957,6 +2093,355 @@ impl BridgeService {
             out_path: res.out_path.to_string_lossy().into_owned(),
             contents: res.contents,
             total_bytes: res.total_bytes,
+        })
+    }
+
+    /// Pack the full project package directory (`.aecstudio`) at
+    /// `project_path` into a portable ZIP archive at `out_path`. The
+    /// archive includes the encrypted `project.sqlite`, `project.nonce`,
+    /// all sub-directories ([`aec_core::package::PACKAGE_DIRS`]), and
+    /// an auto-generated `_aec_archive_manifest.json` describing the
+    /// archive shape. The bytes pass the `PK\x03\x04` magic check —
+    /// see [`aec_export::write_project_package_zip`].
+    ///
+    /// Distinct from [`Self::deliver_build_pack`], which assembles a
+    /// *client-facing* PDF + render + IFC bundle. This method is the
+    /// "move this project to another machine" gesture — extract the
+    /// archive and `ProjectPackage::open` reads the package as-is
+    /// (provided the user has the same master key).
+    ///
+    /// Routed as `&self` because the export crate is stateless; no
+    /// project DB connection is opened (the encrypted `.sqlite` is
+    /// copied at the filesystem level). Mirrors [`Self::export_pdf`]
+    /// / [`Self::deliver_build_pack`] so concurrent status polls
+    /// are not blocked by long archive walks.
+    pub fn project_export_package(
+        &self,
+        project_path: &str,
+        out_path: &str,
+    ) -> Result<ProjectExportPackageResult, BridgeServiceError> {
+        let res =
+            aec_export::write_project_package_zip(Path::new(project_path), Path::new(out_path))?;
+        Ok(ProjectExportPackageResult {
+            out_path: res.out_path.to_string_lossy().into_owned(),
+            entries: res.entries,
+            total_bytes: res.total_bytes,
+        })
+    }
+
+    /// Walk every entity in the project graph and assign a
+    /// classification from `scheme`. Supported schemes are
+    /// `"ifc"` (assign / update `entities.kind` to an IFC class),
+    /// `"uniformat-ii"` (write the ASTM E1557 code as a `components`
+    /// row), and `"omniclass-21"` (write the CSI OmniClass Table-21
+    /// code as a `components` row). See
+    /// [`aec_bim::classification_tables`] for the embedded code
+    /// tables. Returns per-entity assignments so the renderer's
+    /// property panel can populate without a follow-up
+    /// `project_graph_list` call.
+    ///
+    /// Classification overrides live under the `aec/classification/`
+    /// component-kind prefix, **not** `bim/`, so they survive a
+    /// `bim_attach_ifc` re-attach (which wipes `bim/%` for changed
+    /// entities — see `bim_attach.rs:463`). The prefix is supplied
+    /// by [`aec_bim::classification_tables::ClassificationScheme::component_kind`].
+    ///
+    /// # Concurrency
+    ///
+    /// The entity scan and the per-entity writes must observe the
+    /// same DB snapshot — two concurrent `bim_classify` calls (or a
+    /// `bim_classify` interleaved with `bim_set_property` /
+    /// `command_apply`) would otherwise race: caller A reads
+    /// `(id, kind)` for every row, caller B commits a `kind` change
+    /// for some `id`, then caller A's write uses B's stale `kind`
+    /// in its `tag == *kind` comparison and overwrites B's update.
+    ///
+    /// The fix mirrors [`Self::bim_set_property`]: open the
+    /// transaction with [`TransactionBehavior::Immediate`] so the
+    /// RESERVED lock is acquired up-front, then run the entity
+    /// SELECT INSIDE that transaction. Combined with the
+    /// `busy_timeout` pragma (`apply_pragmas`), concurrent callers
+    /// serialise at SQLite's RESERVED lock and each sees the
+    /// previous caller's committed snapshot, not a stale one.
+    pub fn bim_classify(
+        &self,
+        project_path: &str,
+        scheme: &str,
+    ) -> Result<BimClassifyResult, BridgeServiceError> {
+        let scheme = aec_bim::classification_tables::ClassificationScheme::parse(scheme)
+            .ok_or_else(|| {
+                BridgeServiceError::Invalid(format!(
+                    "unknown classification scheme: {scheme} (supported: ifc, uniformat-ii, omniclass-21)"
+                ))
+            })?;
+
+        let (_pkg, mut conn) =
+            ProjectPackage::open_with_master_key_and_database(project_path, &self.master_key)?;
+
+        // Open the transaction as IMMEDIATE up-front so the
+        // RESERVED lock is acquired before the entity scan runs.
+        // This closes the TOCTOU window that a default DEFERRED
+        // transaction would leave open between the SELECT below
+        // and the per-entity UPDATE/upsert further down — see the
+        // `# Concurrency` doc on this method.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        // Collect entities first so we don't hold a prepared
+        // statement open while we mutate. The `query_map().collect()`
+        // pattern drains every row into the `Vec` before the
+        // statement is dropped, so it's safe to run inside the
+        // transaction and subsequently UPDATE / upsert the same
+        // table without statement-lifetime conflicts.
+        let entities: Vec<(String, String)> = {
+            let mut stmt = tx.prepare("SELECT id, kind FROM entities")?;
+            let rows =
+                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let mut details: Vec<BimClassifyAssignment> = Vec::with_capacity(entities.len());
+        let mut classified: u32 = 0;
+        let mut unchanged: u32 = 0;
+        let mut skipped: u32 = 0;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        for (id, kind) in &entities {
+            let Some(ifc_class) = aec_bim::classification_tables::classify_kind(kind) else {
+                skipped += 1;
+                continue;
+            };
+            match scheme {
+                aec_bim::classification_tables::ClassificationScheme::Ifc => {
+                    let tag = ifc_class.ifc_tag().to_string();
+                    // `classified` is the **change** count, not the
+                    // walk-progress count: only increment when the
+                    // DB actually moves, so a renderer using it to
+                    // gate "Undo classify?" prompts sees the right
+                    // value on a re-run of an already-classified
+                    // project (which is a no-op).
+                    if tag == *kind {
+                        unchanged += 1;
+                    } else {
+                        tx.execute(
+                            "UPDATE entities SET kind = ?1, updated_at = ?2 WHERE id = ?3",
+                            params![tag, now, id],
+                        )?;
+                        classified += 1;
+                    }
+                    details.push(BimClassifyAssignment {
+                        entity_id: id.clone(),
+                        code: tag,
+                        title: String::new(),
+                    });
+                }
+                aec_bim::classification_tables::ClassificationScheme::UniformatIi => {
+                    let Some(code) = aec_bim::classification_tables::ifc_to_uniformat(&ifc_class)
+                    else {
+                        skipped += 1;
+                        continue;
+                    };
+                    let component_kind = scheme.component_kind().expect("non-ifc scheme has kind");
+                    let body = serde_json::json!({
+                        "scheme": scheme.as_str(),
+                        "code": code.code,
+                        "title": code.title,
+                        "level": code.level,
+                        "source": "auto",
+                    });
+                    // Same change-count semantic as the IFC branch:
+                    // if a prior `components` row for this
+                    // (entity_id, kind) already carries the same
+                    // body, the upsert is a no-op and we don't
+                    // count it. Querying first costs one extra
+                    // SELECT but lets the renderer trust
+                    // `classified`.
+                    if upsert_classification_component_if_changed(&tx, id, component_kind, &body)? {
+                        classified += 1;
+                    } else {
+                        unchanged += 1;
+                    }
+                    details.push(BimClassifyAssignment {
+                        entity_id: id.clone(),
+                        code: code.code.to_string(),
+                        title: code.title.to_string(),
+                    });
+                }
+                aec_bim::classification_tables::ClassificationScheme::Omniclass21 => {
+                    let Some(code) = aec_bim::classification_tables::ifc_to_omniclass(&ifc_class)
+                    else {
+                        skipped += 1;
+                        continue;
+                    };
+                    let component_kind = scheme.component_kind().expect("non-ifc scheme has kind");
+                    let body = serde_json::json!({
+                        "scheme": scheme.as_str(),
+                        "code": code.code,
+                        "title": code.title,
+                        "level": code.level,
+                        "source": "auto",
+                    });
+                    if upsert_classification_component_if_changed(&tx, id, component_kind, &body)? {
+                        classified += 1;
+                    } else {
+                        unchanged += 1;
+                    }
+                    details.push(BimClassifyAssignment {
+                        entity_id: id.clone(),
+                        code: code.code.to_string(),
+                        title: code.title.to_string(),
+                    });
+                }
+            }
+        }
+        tx.commit()?;
+
+        // Invalidate the engine-status cache so the renderer's next
+        // status poll picks up the new entity-kind histogram. Use the
+        // shared helper that canonicalises `project_path` first —
+        // the cache is keyed on canonical paths, so passing the raw
+        // input would silently leave a stale entry for one full TTL.
+        self.invalidate_status_cache_for(project_path);
+
+        Ok(BimClassifyResult {
+            scheme: scheme.as_str().into(),
+            classified,
+            unchanged,
+            skipped,
+            details,
+        })
+    }
+
+    /// Set a single property on a BIM entity. The property lands in
+    /// a `components` row of kind `aec/property/<pset>` (NOT
+    /// `bim/property/...`) — the `aec/` prefix is what makes user
+    /// overrides survive a `bim_attach_ifc` re-attach (which wipes
+    /// `bim/%` for changed entities).
+    ///
+    /// `pset` is the Property Set name (e.g. `"Pset_WallCommon"`,
+    /// or `"AECStudio_Custom"` for free-form additions). `key` is
+    /// the property name within that set (e.g. `"FireRating"`,
+    /// `"IsExternal"`). `value` is serialised as a JSON `string`
+    /// — the renderer's property editor handles type coercion
+    /// before calling this method.
+    ///
+    /// Returns the previous value (if any) so the renderer can wire
+    /// undo via [`Self::bim_set_property`] of the prior value
+    /// without an extra round trip.
+    ///
+    /// # Concurrency
+    ///
+    /// The read-modify-write of the property `body` JSON must be
+    /// atomic across concurrent callers — two `bim_set_property`
+    /// calls targeting the same `(entity_id, pset)` but different
+    /// `key`s would otherwise race: each reads the same prior body,
+    /// merges its own key, and the second writer's `ON CONFLICT
+    /// … DO UPDATE` overwrites the first writer's result, silently
+    /// dropping one key.
+    ///
+    /// To prevent that, the prior-body read runs **inside** the same
+    /// transaction as the write, and the transaction is opened with
+    /// [`TransactionBehavior::Immediate`] so it acquires SQLite's
+    /// RESERVED lock immediately on entry (not lazily on first write).
+    /// Combined with the `busy_timeout` pragma set in
+    /// `apply_pragmas`, concurrent callers serialise cleanly: the
+    /// second caller's `BEGIN IMMEDIATE` blocks until the first
+    /// caller's transaction commits, at which point the second
+    /// caller's read sees the first caller's write.
+    pub fn bim_set_property(
+        &self,
+        project_path: &str,
+        entity_id: &str,
+        pset: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<BimSetPropertyResult, BridgeServiceError> {
+        if pset.trim().is_empty() {
+            return Err(BridgeServiceError::Invalid("pset must not be empty".into()));
+        }
+        if key.trim().is_empty() {
+            return Err(BridgeServiceError::Invalid("key must not be empty".into()));
+        }
+
+        let (_pkg, mut conn) =
+            ProjectPackage::open_with_master_key_and_database(project_path, &self.master_key)?;
+
+        let component_kind = format!("aec/property/{pset}");
+
+        // Open the transaction as IMMEDIATE so the RESERVED lock is
+        // acquired up-front — every step (entity-existence check,
+        // prior-body read, write) runs against the same locked
+        // snapshot. The deferred default would acquire the lock only
+        // on the first write, which is exactly the TOCTOU window we
+        // need to close.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        // Make sure the entity exists — silent inserts against
+        // missing IDs are a footgun (and the FK on `components` would
+        // catch it, but the error string is opaque). Caller-facing
+        // `EntityNotFound` is more useful.
+        let exists: bool = tx
+            .query_row(
+                "SELECT 1 FROM entities WHERE id = ?1",
+                params![entity_id],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        if !exists {
+            return Err(BridgeServiceError::Invalid(format!(
+                "entity {entity_id} not found in project graph"
+            )));
+        }
+
+        // Read previous body (if any) so we can extract the prior
+        // value for the response. This read must be INSIDE the
+        // IMMEDIATE transaction so concurrent writers see each
+        // other's commits before merging — see the doc comment.
+        let prev_body: Option<String> = tx
+            .query_row(
+                "SELECT body FROM components WHERE entity_id = ?1 AND kind = ?2",
+                params![entity_id, &component_kind],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        let mut body_obj: serde_json::Map<String, serde_json::Value> = match prev_body.as_deref() {
+            Some(s) => serde_json::from_str(s).unwrap_or_default(),
+            None => serde_json::Map::new(),
+        };
+        let previous_value = body_obj.get(key).and_then(|v| {
+            v.as_str()
+                .map(ToString::to_string)
+                .or_else(|| Some(v.to_string()))
+        });
+        body_obj.insert(
+            key.to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
+        let new_body = serde_json::Value::Object(body_obj);
+
+        // `(entity_id, kind)` is the natural PK for our overlay rows.
+        // `components.id` is the SQLite PK, but it doesn't carry
+        // semantic meaning — we synthesise a deterministic value
+        // from `(entity_id, kind)` so re-applying a property update
+        // doesn't accumulate orphaned rows.
+        let comp_id = format!("comp_{}_{}", entity_id, &component_kind.replace('/', "_"));
+        tx.execute(
+            "INSERT INTO components(id, entity_id, kind, body) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(entity_id, kind) DO UPDATE SET id = excluded.id, body = excluded.body",
+            params![comp_id, entity_id, component_kind, new_body.to_string()],
+        )?;
+        tx.commit()?;
+
+        // Canonicalise via the shared helper so the invalidation
+        // hits the same cache key the original `project_engine_status`
+        // call inserted (the cache is keyed on canonical paths).
+        self.invalidate_status_cache_for(project_path);
+        Ok(BimSetPropertyResult {
+            entity_id: entity_id.to_string(),
+            pset: pset.to_string(),
+            key: key.to_string(),
+            previous_value,
         })
     }
 
@@ -4901,5 +5386,312 @@ END-ISO-10303-21;\n";
             })
             .expect("no-match query is not an error");
         assert!(assets.is_empty());
+    }
+
+    // ============================================================
+    // PR-W Phase 1: project_export_package
+    // ============================================================
+
+    #[test]
+    fn project_export_package_writes_a_zip_with_all_source_files() {
+        let (mut s, _g) = service();
+        let summary = s
+            .project_create_from_template("interior.apartment", "Pack-Test")
+            .unwrap();
+        let out = tempfile::NamedTempFile::new().unwrap();
+        let out_path = out.path().with_extension("aecpkg.zip");
+        let _ = std::fs::remove_file(&out_path);
+        let res = s
+            .project_export_package(&summary.path, out_path.to_str().unwrap())
+            .expect("export package");
+        assert!(res.entries > 0, "archive must contain at least one file");
+        assert!(res.total_bytes > 0);
+        // Magic bytes — first 4 bytes of any ZIP file are `PK\x03\x04`.
+        let bytes = std::fs::read(&out_path).unwrap();
+        assert_eq!(&bytes[..4], b"PK\x03\x04");
+    }
+
+    // ============================================================
+    // PR-W Phase 3: bim_classify
+    // ============================================================
+
+    /// Seed one wall into the project so the classification /
+    /// property tests have something to operate on. The test
+    /// templates ship with empty `rooms: []` so we can't rely on
+    /// the template to provision entities.
+    fn seed_one_wall(s: &mut BridgeService, summary: &ProjectSummary) -> aec_core::types::EntityId {
+        use aec_command::commands::{wall, CommandKind};
+        let entity_id = aec_core::types::EntityId::new();
+        let cmd = aec_command::commands::Command::user(CommandKind::CreateWall(wall::CreateWall {
+            entity_id: entity_id.clone(),
+            start_mm: [0.0, 0.0],
+            end_mm: [4500.0, 0.0],
+            height_mm: 2700.0,
+            thickness_mm: 100.0,
+            material_id: None,
+        }));
+        s.command_apply(&summary.path, cmd).expect("seed wall");
+        entity_id
+    }
+
+    #[test]
+    fn bim_classify_uniformat_assigns_b2010_to_walls() {
+        let (mut s, _g) = service();
+        let summary = s
+            .project_create_from_template("interior.apartment", "Classify-Test")
+            .unwrap();
+        seed_one_wall(&mut s, &summary);
+        let res = s
+            .bim_classify(&summary.path, "uniformat-ii")
+            .expect("uniformat classify");
+        assert_eq!(res.scheme, "uniformat-ii");
+        assert!(res.classified > 0, "seeded wall must be classified");
+        let walls: Vec<&BimClassifyAssignment> =
+            res.details.iter().filter(|a| a.code == "B2010").collect();
+        assert!(
+            !walls.is_empty(),
+            "expected at least one wall classified as B2010 (Exterior Walls)"
+        );
+    }
+
+    #[test]
+    fn bim_classify_unknown_scheme_returns_invalid_error() {
+        let (mut s, _g) = service();
+        let summary = s
+            .project_create_from_template("interior.apartment", "Bad-Scheme")
+            .unwrap();
+        let err = s
+            .bim_classify(&summary.path, "masterformat")
+            .expect_err("unknown scheme is rejected");
+        assert!(
+            matches!(err, BridgeServiceError::Invalid(ref m) if m.contains("masterformat")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn bim_classify_omniclass_assigns_21_codes() {
+        let (mut s, _g) = service();
+        let summary = s
+            .project_create_from_template("interior.apartment", "OmniClass-Test")
+            .unwrap();
+        seed_one_wall(&mut s, &summary);
+        let res = s.bim_classify(&summary.path, "omniclass-21").unwrap();
+        assert!(res.classified > 0);
+        // Codes must all start with "21-" (OmniClass Table 21 prefix).
+        for d in &res.details {
+            assert!(
+                d.code.starts_with("21-"),
+                "omniclass code missing 21- prefix: {}",
+                d.code
+            );
+        }
+    }
+
+    #[test]
+    fn bim_classify_uniformat_is_idempotent() {
+        let (mut s, _g) = service();
+        let summary = s
+            .project_create_from_template("interior.apartment", "Idempotent")
+            .unwrap();
+        seed_one_wall(&mut s, &summary);
+        let first = s.bim_classify(&summary.path, "uniformat-ii").unwrap();
+        let second = s.bim_classify(&summary.path, "uniformat-ii").unwrap();
+        // The second call must see exactly the same set of
+        // recognised entities (so `details` is the same length)
+        // but no new database mutations (so `classified` is now
+        // 0 and `unchanged` carries the count). This is the
+        // "change-count" semantic of `classified`: it tracks the
+        // delta against the prior state, not the walk size.
+        assert_eq!(
+            first.details.len(),
+            second.details.len(),
+            "details rows must be stable across reruns"
+        );
+        assert!(
+            first.classified > 0,
+            "first call should report real mutations"
+        );
+        assert_eq!(
+            second.classified, 0,
+            "second call must report zero new mutations"
+        );
+        assert_eq!(
+            second.unchanged, first.classified,
+            "every previously-classified entity must show up as `unchanged` on the rerun"
+        );
+    }
+
+    #[test]
+    fn bim_classify_ifc_idempotent_no_op_reports_unchanged() {
+        let (mut s, _g) = service();
+        let summary = s
+            .project_create_from_template("interior.apartment", "Idempotent-IFC")
+            .unwrap();
+        seed_one_wall(&mut s, &summary);
+        let first = s.bim_classify(&summary.path, "ifc").unwrap();
+        let second = s.bim_classify(&summary.path, "ifc").unwrap();
+        // First IFC call rewrites `entities.kind` from "wall" to
+        // "IfcWall" — that's a real DB change. Second call sees
+        // every entity already at `IfcWall` and must report it
+        // as `unchanged`, not `classified`.
+        assert!(first.classified > 0, "first IFC call must mutate");
+        assert_eq!(
+            second.classified, 0,
+            "second IFC call must not double-count already-IFC kinds"
+        );
+        assert_eq!(
+            second.unchanged, first.classified,
+            "every IFC-rewritten entity must be `unchanged` on the rerun"
+        );
+    }
+
+    // ============================================================
+    // PR-W Phase 4: bim_set_property
+    // ============================================================
+
+    #[test]
+    fn bim_set_property_stores_then_overwrites_value() {
+        let (mut s, _g) = service();
+        let summary = s
+            .project_create_from_template("interior.apartment", "Property-Test")
+            .unwrap();
+        let entity_id = seed_one_wall(&mut s, &summary);
+        let target_id = entity_id.to_string();
+
+        let first = s
+            .bim_set_property(
+                &summary.path,
+                &target_id,
+                "Pset_WallCommon",
+                "FireRating",
+                "60min",
+            )
+            .expect("set property");
+        assert_eq!(first.previous_value, None);
+
+        // Re-set with a different value — previous_value must echo
+        // the prior write.
+        let second = s
+            .bim_set_property(
+                &summary.path,
+                &target_id,
+                "Pset_WallCommon",
+                "FireRating",
+                "120min",
+            )
+            .expect("update property");
+        assert_eq!(second.previous_value.as_deref(), Some("60min"));
+        assert_eq!(second.pset, "Pset_WallCommon");
+        assert_eq!(second.key, "FireRating");
+    }
+
+    #[test]
+    fn bim_set_property_rejects_missing_entity() {
+        let (mut s, _g) = service();
+        let summary = s
+            .project_create_from_template("interior.apartment", "Missing-Entity")
+            .unwrap();
+        let err = s
+            .bim_set_property(&summary.path, "ent_does_not_exist", "Pset_X", "Y", "1")
+            .expect_err("missing entity rejected");
+        assert!(
+            matches!(err, BridgeServiceError::Invalid(ref m) if m.contains("not found")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn bim_set_property_rejects_empty_pset_or_key() {
+        let (mut s, _g) = service();
+        let summary = s
+            .project_create_from_template("interior.apartment", "Empty-Pset")
+            .unwrap();
+        let entity_id = seed_one_wall(&mut s, &summary);
+        let target_id = entity_id.to_string();
+        assert!(matches!(
+            s.bim_set_property(&summary.path, &target_id, "  ", "k", "v"),
+            Err(BridgeServiceError::Invalid(_))
+        ));
+        assert!(matches!(
+            s.bim_set_property(&summary.path, &target_id, "Pset", "  ", "v"),
+            Err(BridgeServiceError::Invalid(_))
+        ));
+    }
+
+    /// Regression for the read-modify-write race fixed by moving the
+    /// prior-body SELECT inside an `IMMEDIATE` transaction (PR-W
+    /// round 3): two sequential `bim_set_property` calls writing
+    /// *different* keys under the same `(entity, pset)` must both
+    /// land in the merged body. Before the fix, the second call's
+    /// read happened outside the transaction, so a concurrent first
+    /// caller (or, in the sequential case, a stale read) would
+    /// silently drop one key. With the IMMEDIATE-tx fix this
+    /// sequential case is straightforward and the test pins the
+    /// merge semantics so future refactors can't regress it.
+    #[test]
+    fn bim_set_property_merges_distinct_keys_into_same_pset() {
+        let (mut s, _g) = service();
+        let summary = s
+            .project_create_from_template("interior.apartment", "Merge-Pset")
+            .unwrap();
+        let entity_id = seed_one_wall(&mut s, &summary);
+        let target_id = entity_id.to_string();
+
+        s.bim_set_property(
+            &summary.path,
+            &target_id,
+            "Pset_WallCommon",
+            "FireRating",
+            "60min",
+        )
+        .expect("set FireRating");
+        s.bim_set_property(
+            &summary.path,
+            &target_id,
+            "Pset_WallCommon",
+            "LoadBearing",
+            "true",
+        )
+        .expect("set LoadBearing");
+        s.bim_set_property(
+            &summary.path,
+            &target_id,
+            "Pset_WallCommon",
+            "IsExternal",
+            "false",
+        )
+        .expect("set IsExternal");
+
+        // Read the merged body directly from the DB and assert all
+        // three keys are present. If the TOCTOU bug regressed (or the
+        // merge dropped keys), one of these `get` calls would return
+        // `None`.
+        let (_pkg, conn) =
+            ProjectPackage::open_with_master_key_and_database(&summary.path, &s.master_key)
+                .expect("open project");
+        let body: String = conn
+            .query_row(
+                "SELECT body FROM components WHERE entity_id = ?1 AND kind = ?2",
+                params![&target_id, "aec/property/Pset_WallCommon"],
+                |r| r.get(0),
+            )
+            .expect("body present");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("body parses");
+        assert_eq!(
+            parsed.get("FireRating").and_then(|v| v.as_str()),
+            Some("60min"),
+            "FireRating preserved across distinct-key writes"
+        );
+        assert_eq!(
+            parsed.get("LoadBearing").and_then(|v| v.as_str()),
+            Some("true"),
+            "LoadBearing preserved"
+        );
+        assert_eq!(
+            parsed.get("IsExternal").and_then(|v| v.as_str()),
+            Some("false"),
+            "IsExternal preserved"
+        );
     }
 }

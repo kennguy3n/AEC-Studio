@@ -119,7 +119,19 @@ export interface BridgeBackend {
    */
   projectSave(projectPath: string): Promise<ProjectSummary>;
   projectListRecents(): Promise<ProjectSummary[]>;
-  projectExportPackage(projectPath: string, outPath: string): Promise<{ outPath: string }>;
+  /**
+   * Pack the entire project package directory at `projectPath` into
+   * a portable ZIP archive at `outPath` (PR-W Phase 1). The N-API
+   * adapter returns `{ outPath, entries, totalBytes }`; the in-
+   * process fallback returns the same shape so backends stay
+   * structurally compatible. `entries` excludes the auto-generated
+   * `_aec_archive_manifest.json` so the renderer's "N files
+   * archived" status matches what the user sees in the ZIP.
+   */
+  projectExportPackage(
+    projectPath: string,
+    outPath: string,
+  ): Promise<ProjectExportPackageResult>;
 
   designPlaceFurniture(params: Record<string, unknown>): Promise<{ entityId: string }>;
   designPaintMaterial(params: Record<string, unknown>): Promise<{ ok: true }>;
@@ -189,8 +201,25 @@ export interface BridgeBackend {
     sourcePath: string;
     outPath: string;
   }): Promise<BimExportIfcSummary>;
-  bimClassify(params: Record<string, unknown>): Promise<{ classified: number }>;
-  bimSetProperty(params: Record<string, unknown>): Promise<{ ok: true }>;
+  /**
+   * Walk every entity in the project graph and assign a
+   * classification from `scheme` (PR-W Phase 3). The N-API adapter
+   * returns a richer `BimClassifyResult` than the legacy stub did
+   * (`classified` count + per-entity assignments); the in-process
+   * fallback mirrors the new shape so backends remain
+   * interchangeable. Supported schemes: `"ifc"`, `"uniformat-ii"`,
+   * `"omniclass-21"`. Classification overrides land under the
+   * `aec/classification/` component-kind prefix so they survive a
+   * `bimAttachIfc` re-attach.
+   */
+  bimClassify(params: Record<string, unknown>): Promise<BimClassifyResult>;
+  /**
+   * Set a property on a BIM entity (PR-W Phase 4). The N-API
+   * adapter returns `{ entityId, pset, key, previousValue }` so
+   * the renderer can wire undo without a round-trip; the in-
+   * process fallback mirrors the same shape.
+   */
+  bimSetProperty(params: Record<string, unknown>): Promise<BimSetPropertyResult>;
   /**
    * Parse an IFC file and generate one of the four supported
    * schedules (`"door"` / `"window"` / `"room"` / `"material"`),
@@ -666,6 +695,96 @@ export interface BimExportIfcSummary {
 }
 
 /**
+ * Result of `projectExportPackage` (PR-W Phase 1). Field-for-field
+ * mirror of `ProjectExportPackageResultJs` in
+ * `crates/aec_bridge/src/napi_api.rs`. `entries` excludes the
+ * auto-generated `_aec_archive_manifest.json` so the renderer's
+ * "N files archived" indicator matches what the user sees.
+ */
+export interface ProjectExportPackageResult {
+  outPath: string;
+  entries: number;
+  totalBytes: number;
+}
+
+/**
+ * One row in `BimClassifyResult.details` (PR-W Phase 3).
+ * Field-for-field mirror of `BimClassifyAssignmentJs` in
+ * `crates/aec_bridge/src/napi_api.rs`.
+ *
+ * For `scheme = "ifc"`: `code` is the assigned IFC class name
+ * (e.g. `"IfcWall"`); `title` is `""` because the code is already
+ * descriptive.
+ *
+ * For `scheme = "uniformat-ii"` / `"omniclass-21"`: `code` is the
+ * canonical numeric code (e.g. `"B2010"` / `"21-02 20 10"`);
+ * `title` is the corresponding table title (e.g. `"Exterior
+ * Walls"`).
+ */
+export interface BimClassifyAssignment {
+  entityId: string;
+  code: string;
+  title: string;
+}
+
+/**
+ * Result of `bimClassify` (PR-W Phase 3). Field-for-field mirror
+ * of `BimClassifyResultJs` in `crates/aec_bridge/src/napi_api.rs`.
+ *
+ * Counter semantics:
+ * - `classified` — entities whose database row was actually
+ *   modified by this call (the count the renderer should use to
+ *   gate "Undo classify?" prompts or "N entities re-classified"
+ *   toasts). Re-running classify on an already-classified
+ *   project will report `classified === 0` and
+ *   `unchanged === <total recognised>`.
+ * - `unchanged` — entities that matched the scheme's lookup
+ *   table but whose row already carried the target value, so no
+ *   write was issued. Lets the renderer distinguish "already-
+ *   classified project, no-op rerun" from "nothing matched at
+ *   all".
+ * - `skipped` — entities whose `kind` was not recognised by the
+ *   scheme's lookup table at all.
+ *
+ * `details` carries one row per *recognised* entity (i.e. one
+ * row per entity contributing to `classified + unchanged`), so
+ * the property panel can populate without a follow-up
+ * `projectGraphList` call.
+ */
+export interface BimClassifyResult {
+  scheme: string;
+  classified: number;
+  unchanged: number;
+  skipped: number;
+  details: BimClassifyAssignment[];
+}
+
+/**
+ * Result of `bimSetProperty` (PR-W Phase 4). Field-for-field
+ * mirror of `BimSetPropertyResultJs` in
+ * `crates/aec_bridge/src/napi_api.rs`.
+ *
+ * `previousValue` is `null` for the first write to a `(pset, key)`
+ * pair so the renderer can detect "first write" and tag its
+ * UI-level undo stack accordingly.
+ *
+ * NOTE: `bimSetProperty` bypasses the bridge command engine, so
+ * property edits are **not** undo/redo-able via
+ * `commandUndo` / `commandRedo`. Renderers that want undo must
+ * re-call `bimSetProperty(..., previousValue)` themselves —
+ * this is a UI-level undo, not an engine-level one. If a future
+ * change wants engine-level undo, the underlying Rust method
+ * needs to be reframed as a `Command::user` variant and routed
+ * through `command_apply`.
+ */
+export interface BimSetPropertyResult {
+  entityId: string;
+  pset: string;
+  key: string;
+  previousValue: string | null;
+}
+
+/**
  * One finding from `bimValidate`. Field-for-field mirror of
  * `BimValidationFindingJs` in `crates/aec_bridge/src/napi_api.rs`.
  * `severity` is `"error"` / `"warning"` / `"info"` (lowercase) so
@@ -1021,6 +1140,32 @@ interface NativeApi {
     styleTags?: string[];
     limit?: number;
   }): unknown;
+  // PR-W (Phase 1) — full project package ZIP archive. Sync on the
+  // Rust side (synchronous `std::fs::read` + `zip` walk; per the
+  // PR-W doc the largest realistic package is a few hundred MB, so
+  // it stays on the calling thread for now).
+  project_export_package(project_path: string, out_path: string): unknown;
+  // PR-W (Phase 1+2) — design.* command façades. `params_json` is
+  // the JSON-stringified renderer-side `params` object; the napi
+  // side deserialises it into the corresponding `aec_command`
+  // command struct, wraps it in `Command::user(...)`, and routes
+  // through `command_apply`. All sync on the Rust side.
+  design_paint_material(project_path: string, params_json: string): unknown;
+  design_set_lighting(project_path: string, params_json: string): unknown;
+  design_save_camera(project_path: string, params_json: string): unknown;
+  design_place_furniture(project_path: string, params_json: string): unknown;
+  // PR-W (Phase 3+4) — BIM classification + property mutation.
+  // Sync on the Rust side; concurrent status polls are kept
+  // responsive by SQLite's PRAGMA busy_timeout rather than by
+  // making these methods async.
+  bim_classify(project_path: string, scheme: string): unknown;
+  bim_set_property(
+    project_path: string,
+    entity_id: string,
+    pset: string,
+    key: string,
+    value: string,
+  ): unknown;
   // AI endpoints wired in PR-V and made async in the async-napi
   // follow-up. All six are `#[napi] async fn` on the Rust side —
   // they route through `spawn_blocking_napi` so the libuv main
@@ -1123,6 +1268,27 @@ export const NATIVE_WIRED_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   // in-process fallback used to ship, so dev/prod browsing renders
   // identical cards. See `crates/aec_bridge/src/asset_state.rs`.
   "designListAssets",
+  // PR-W (Phase 10) — design / BIM / export.
+  // `projectExportPackage` writes a real ZIP archive of the
+  // project package directory. The four design.* convenience
+  // methods (`PaintMaterial`, `SetLighting`, `SaveCamera`,
+  // `PlaceFurniture`) all build a `CommandKind` from the params
+  // object and route through `command_apply` so the resulting
+  // entities are persisted into the SQLCipher project graph
+  // exactly the same way `commandApply` does. `bimClassify`
+  // walks the project graph and assigns Uniformat-II / OmniClass
+  // Table-21 codes from the embedded
+  // `aec_bim::classification_tables` tables. `bimSetProperty`
+  // persists a property value into a `components` row of kind
+  // `aec/property/<pset>` — the `aec/` prefix is what makes user
+  // overrides survive a `bim_attach_ifc` re-attach.
+  "projectExportPackage",
+  "designPlaceFurniture",
+  "designPaintMaterial",
+  "designSetLighting",
+  "designSaveCamera",
+  "bimClassify",
+  "bimSetProperty",
   // AI sidecar surface wired in Phase 10 PR-V and refactored in the
   // async-napi follow-up. Backed by `BridgeService::ai_state`
   // (`AiState` by value — interior mutability via per-piece locks:
@@ -1156,19 +1322,12 @@ export const NATIVE_WIRED_METHODS: ReadonlyArray<keyof BridgeBackend> = [
  * inside {@link adaptNative}.
  */
 export const NATIVE_FALLBACK_METHODS: ReadonlyArray<keyof BridgeBackend> = [
-  "projectExportPackage",
-  "designPlaceFurniture",
-  "designPaintMaterial",
-  "designSetLighting",
-  "designSaveCamera",
   "draftDrawPrimitive",
   "draftEditTool",
   "draftCreateSheet",
   "draftSetLayerState",
   "draftImportDxf",
   "draftExportDxf",
-  "bimClassify",
-  "bimSetProperty",
   "deliverCreateRevision",
   "deliverListRevisions",
   "deliverCompareRevisions",
@@ -1184,6 +1343,30 @@ export const NATIVE_FALLBACK_METHODS: ReadonlyArray<keyof BridgeBackend> = [
  * `console.debug` so the dev console makes the boundary obvious instead
  * of silently masking it.
  */
+/**
+ * Extract `projectPath` from a loosely-typed `Record<string, unknown>`
+ * params bag, or throw with a clear error message. All design.*
+ * and bim.* adapters use this to locate the encrypted project DB.
+ */
+function requireProjectPath(params: Record<string, unknown>, method: string): string {
+  const v = params.projectPath;
+  if (typeof v !== "string" || v.length === 0) {
+    throw new Error(`${method}: params.projectPath must be a non-empty string (got ${typeof v})`);
+  }
+  return v;
+}
+
+/**
+ * Return a shallow copy of `params` with the `projectPath` field
+ * removed. The napi side expects only the command-specific fields;
+ * `projectPath` is a renderer convention, not part of any Rust
+ * command struct.
+ */
+function withoutProjectPath(params: Record<string, unknown>): Record<string, unknown> {
+  const { projectPath: _, ...rest } = params;
+  return rest;
+}
+
 function adaptNative(n: NativeApi): BridgeBackend {
   const base = inProcessBackend();
   const fallbackNames = new Set<string>(NATIVE_FALLBACK_METHODS);
@@ -1382,6 +1565,64 @@ function adaptNative(n: NativeApi): BridgeBackend {
           : undefined,
         limit: typeof query.limit === "number" ? (query.limit as number) : undefined,
       }) as AssetSummary[],
+    // ----- PR-W (Phase 1): project package archive -----
+    projectExportPackage: async (projectPath, outPath) =>
+      n.project_export_package(projectPath, outPath) as ProjectExportPackageResult,
+    // ----- PR-W (Phase 1+2): design.* command façades -----
+    //
+    // The renderer's `BridgeBackend.design{PaintMaterial,
+    // SetLighting, SaveCamera, PlaceFurniture}` interface takes a
+    // loosely-typed `Record<string, unknown>` params object. The
+    // napi side wants typed structs (`PaintMaterial`,
+    // `SetLighting`, `SaveCamera`, `PlaceFurniture`); to bridge
+    // the two, we JSON-stringify the params on the TS side and
+    // let serde deserialise on the Rust side. Any field-shape
+    // mismatch surfaces as a `napi::Error` with `Status::InvalidArg`.
+    //
+    // The renderer-side params object MUST contain a `projectPath`
+    // field so the napi side can locate the encrypted project DB
+    // to apply the command against. This is a renderer convention
+    // (not a Rust schema field) because all design commands
+    // implicitly target the active project.
+    designPaintMaterial: async (params) => {
+      const projectPath = requireProjectPath(params, "designPaintMaterial");
+      const inner = withoutProjectPath(params);
+      return n.design_paint_material(projectPath, JSON.stringify(inner)) as { ok: true };
+    },
+    designSetLighting: async (params) => {
+      const projectPath = requireProjectPath(params, "designSetLighting");
+      const inner = withoutProjectPath(params);
+      return n.design_set_lighting(projectPath, JSON.stringify(inner)) as { ok: true };
+    },
+    designSaveCamera: async (params) => {
+      const projectPath = requireProjectPath(params, "designSaveCamera");
+      const inner = withoutProjectPath(params);
+      // napi returns `{ cameraId }` via the snake_case adapter —
+      // the typed `DesignCameraIdJs` struct is serialised
+      // camelCase-friendly by napi-rs.
+      return n.design_save_camera(projectPath, JSON.stringify(inner)) as { cameraId: string };
+    },
+    designPlaceFurniture: async (params) => {
+      const projectPath = requireProjectPath(params, "designPlaceFurniture");
+      const inner = withoutProjectPath(params);
+      return n.design_place_furniture(projectPath, JSON.stringify(inner)) as {
+        entityId: string;
+      };
+    },
+    // ----- PR-W (Phase 3+4): BIM classification + property mutation -----
+    bimClassify: async (params) => {
+      const projectPath = requireProjectPath(params, "bimClassify");
+      const scheme = requireStringField(params, "bimClassify", "scheme");
+      return n.bim_classify(projectPath, scheme) as BimClassifyResult;
+    },
+    bimSetProperty: async (params) => {
+      const projectPath = requireProjectPath(params, "bimSetProperty");
+      const entityId = requireStringField(params, "bimSetProperty", "entityId");
+      const pset = requireStringField(params, "bimSetProperty", "pset");
+      const key = requireStringField(params, "bimSetProperty", "key");
+      const value = requireStringField(params, "bimSetProperty", "value");
+      return n.bim_set_property(projectPath, entityId, pset, key, value) as BimSetPropertyResult;
+    },
     // ----- AI endpoints (PR-V) -----
     //
     // `aiListTools` returns the AI tool catalogue *from the Rust side*
@@ -1665,7 +1906,11 @@ export function inProcessBackend(): BridgeBackend {
       return [...recents];
     },
     async projectExportPackage(_p, outPath) {
-      return { outPath };
+      // In-process stub: report 0 entries / 0 bytes so the
+      // renderer's "N files archived" status badge doesn't lie.
+      // The native N-API path (PR-W) writes a real ZIP and
+      // populates the real counts.
+      return { outPath, entries: 0, totalBytes: 0 };
     },
 
     async designPlaceFurniture(_p) {
@@ -1787,11 +2032,47 @@ export function inProcessBackend(): BridgeBackend {
         parseCacheHit: false,
       };
     },
-    async bimClassify(_p) {
-      return { classified: 0 };
+    async bimClassify(p) {
+      // In-process stub: echo the requested scheme + zero
+      // assignments. The N-API path (PR-W) walks the project
+      // graph and emits real Uniformat / OmniClass codes.
+      //
+      // Argument validation mirrors the native adapter
+      // (`requireStringField` above) so dev-mode hits the same
+      // "missing required string field 'scheme'" error the
+      // packaged build would — preventing a footgun where a
+      // renderer caller forgets `scheme` and silently gets the
+      // "ifc" default in dev but a hard throw in prod.
+      const scheme = requireStringField(p, "bimClassify", "scheme");
+      requireProjectPath(p, "bimClassify");
+      return { scheme, classified: 0, unchanged: 0, skipped: 0, details: [] };
     },
-    async bimSetProperty(_p) {
-      return { ok: true };
+    async bimSetProperty(p) {
+      // In-process stub: echo back the args with a `null`
+      // previousValue. The N-API path (PR-W) actually persists
+      // the value into the project graph's `aec/property/<pset>`
+      // overlay component.
+      //
+      // Validate against `requireNonBlankStringField` for `pset`
+      // and `key` so whitespace-only inputs are rejected here the
+      // same way the native `bim_set_property` rejects them via
+      // `trim().is_empty()` (`crates/aec_bridge/src/service.rs:2209-2213`).
+      // `entityId` and `value` still use `requireStringField` —
+      // the native side does not whitespace-strip either of those
+      // (an empty `value` is a valid stored property, and
+      // `entityId` is checked separately by the entity-existence
+      // SELECT).
+      const entityId = requireStringField(p, "bimSetProperty", "entityId");
+      const pset = requireNonBlankStringField(p, "bimSetProperty", "pset");
+      const key = requireNonBlankStringField(p, "bimSetProperty", "key");
+      requireStringField(p, "bimSetProperty", "value");
+      requireProjectPath(p, "bimSetProperty");
+      return {
+        entityId,
+        pset,
+        key,
+        previousValue: null,
+      };
     },
     async bimGenerateSchedule(params) {
       return {
@@ -2619,6 +2900,34 @@ function requireStringField(
   const v = params[key];
   if (typeof v !== "string") {
     throw new Error(`${method}: missing required string field '${key}'`);
+  }
+  return v;
+}
+
+/**
+ * Read a **required, non-blank** `string` field. Behaves like
+ * [`requireStringField`] for absent / non-string values, but additionally
+ * rejects values that are empty or whitespace-only (matching the native
+ * service's `trim().is_empty()` checks — see `bim_set_property` at
+ * `crates/aec_bridge/src/service.rs:2209-2213`).
+ *
+ * Without this stricter helper, the in-process fallback would accept
+ * `pset: "  "` / `key: "  "` and silently echo it back, while the
+ * native backend would reject it with `BridgeServiceError::Invalid`.
+ * That dev/prod asymmetry was flagged by Devin Review (PR-W round 5):
+ * the in-process comment claims validation "mirrors the native adapter
+ * for dev/prod parity" but `requireStringField` alone leaves whitespace
+ * through. The error message format intentionally matches the native
+ * `BridgeServiceError::Invalid("<field> must not be empty")` wording.
+ */
+function requireNonBlankStringField(
+  params: Record<string, unknown>,
+  method: string,
+  key: string,
+): string {
+  const v = requireStringField(params, method, key);
+  if (v.trim().length === 0) {
+    throw new Error(`${method}: ${key} must not be empty`);
   }
   return v;
 }

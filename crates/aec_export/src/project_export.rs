@@ -541,6 +541,168 @@ fn ensure_parent_dir(p: &Path) -> Result<(), ProjectExportError> {
     Ok(())
 }
 
+/// Returned by [`write_project_package_zip`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WriteProjectPackageResult {
+    pub out_path: PathBuf,
+    /// Number of files included in the archive (excluding the
+    /// auto-generated `manifest.json`).
+    pub entries: u32,
+    /// Sum of uncompressed payload bytes (manifest excluded). Useful
+    /// for the renderer's "Exported NNN MB" progress indicator.
+    pub total_bytes: u64,
+}
+/// Write a portable ZIP archive containing the full contents of a
+/// project package directory (`.aecstudio`).
+///
+/// Unlike [`write_deliver_pack`] (which produces a *client-facing*
+/// PDF + render + IFC bundle), `write_project_package_zip` is the
+/// "give me everything so I can move this project to another
+/// machine" gesture: it walks the package root recursively and emits
+/// every regular file under it into a deterministic ZIP layout, plus
+/// a `manifest.json` describing the archive shape.
+///
+/// The encrypted `project.sqlite` and `project.nonce` are included
+/// verbatim — opening the archive on a target machine recovers the
+/// project bit-for-bit, provided the user has the same master key.
+/// The archive bytes pass the `PK\x03\x04` magic-number check; the
+/// test [`tests::write_project_package_zip_emits_zip_magic_and_listing`]
+/// pins this so the function can never silently regress to a stub.
+pub fn write_project_package_zip(
+    project_root: &Path,
+    out_path: &Path,
+) -> Result<WriteProjectPackageResult, ProjectExportError> {
+    if !project_root.is_dir() {
+        return Err(ProjectExportError::Invalid(format!(
+            "project_root is not a directory: {}",
+            project_root.display()
+        )));
+    }
+    ensure_parent_dir(out_path)?;
+
+    // Walk the package root recursively. We keep the list sorted so
+    // the resulting archive layout is deterministic — the same input
+    // tree always produces a byte-identical archive (modulo the
+    // `created_at` timestamp in the manifest, which we generate
+    // last). Deterministic order is what lets the renderer's diff
+    // tooling and the contractor pack consumer reason about archive
+    // bytes the same way they do for `write_deliver_pack`.
+    let mut files: Vec<PathBuf> = Vec::new();
+    collect_files_sorted(project_root, project_root, &mut files)?;
+
+    let file = std::fs::File::create(out_path)?;
+    let mut zw = ZipWriter::new(file);
+    let opts: SimpleFileOptions =
+        SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+
+    let mut total_bytes: u64 = 0;
+    let mut entries: Vec<serde_json::Value> = Vec::with_capacity(files.len());
+    for rel in &files {
+        let abs = project_root.join(rel);
+        let bytes = std::fs::read(&abs)?;
+        // ZIP file paths use forward slashes by convention; this also
+        // makes the archive portable between OSes (a `\`-using
+        // Windows-native ZIP loader still treats `/` as a separator,
+        // but a Unix-side `unzip -l` would otherwise show backslashes
+        // in entry names — visually surprising and fooling tooling
+        // that splits on `/`).
+        let zip_name = rel
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        zw.start_file(&zip_name, opts)?;
+        zw.write_all(&bytes)?;
+        total_bytes = total_bytes.saturating_add(bytes.len() as u64);
+        entries.push(serde_json::json!({
+            "name": zip_name,
+            "bytes": bytes.len() as u64,
+            "blake3": hex::encode(blake3::hash(&bytes).as_bytes()),
+        }));
+    }
+
+    let manifest = serde_json::json!({
+        "kind": "project_package",
+        "project_root": project_root.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(""),
+        "created_at": Utc::now().to_rfc3339(),
+        "entries": entries,
+    });
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest)
+        .map_err(|e| ProjectExportError::Invalid(format!("manifest serialise: {e}")))?;
+    // The source package already has its own `manifest.json` at the
+    // root (the `ProjectManifest` written by `ProjectPackage::create`).
+    // We must NOT collide on that name — using `_aec_archive_manifest
+    // .json` keeps the source's manifest intact and reachable by
+    // `ProjectPackage::open` after extraction.
+    zw.start_file("_aec_archive_manifest.json", opts)?;
+    zw.write_all(&manifest_bytes)?;
+
+    zw.finish()?;
+    Ok(WriteProjectPackageResult {
+        out_path: out_path.to_path_buf(),
+        entries: files.len() as u32,
+        total_bytes,
+    })
+}
+
+/// Walk `root` recursively, pushing every regular file's path
+/// (relative to `root`) into `out`. Output is sorted lexicographically
+/// so callers get a deterministic archive layout.
+///
+/// **Symlinks are rejected** rather than silently skipped. A
+/// `.aecstudio` project tree is created and managed exclusively
+/// by `ProjectPackage`, which never emits symlinks — if one is
+/// encountered here it was placed by the user (or by an external
+/// tool) and the right behaviour is to fail loudly, not to drop
+/// the file from the archive. The alternative (silently skipping
+/// non-`is_file()` entries on Unix) hides data loss: a project
+/// re-attached from the archive would silently be missing the
+/// linked file's content. On Windows, `file_type().is_file()`
+/// reports `false` for symlinks too, so this branch fires there
+/// as well — keeping the failure mode cross-platform.
+fn collect_files_sorted(
+    root: &Path,
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+) -> Result<(), ProjectExportError> {
+    let mut entries: Vec<std::fs::DirEntry> =
+        std::fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(ProjectExportError::Invalid(format!(
+                "refusing to archive symlink at {} — \
+                 `.aecstudio` packages must contain only regular \
+                 files and directories so the archive can be \
+                 re-attached losslessly. Remove or replace the \
+                 symlink with its target before exporting.",
+                path.display()
+            )));
+        }
+        if file_type.is_dir() {
+            collect_files_sorted(root, &path, out)?;
+        } else if file_type.is_file() {
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|e| ProjectExportError::Invalid(format!("strip_prefix: {e}")))?;
+            out.push(rel.to_path_buf());
+        } else {
+            // Defence-in-depth: an entry that's neither symlink,
+            // file, nor directory (FIFO, block device, socket on
+            // Unix) is equally suspect inside a project package.
+            return Err(ProjectExportError::Invalid(format!(
+                "refusing to archive non-regular file at {} — \
+                 `.aecstudio` packages must contain only regular \
+                 files and directories.",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn build_summary_pdf(title: &str, kind: DeliverPackKind) -> Result<Vec<u8>, ProjectExportError> {
     // Use `PdfBuilder` directly (rather than `SheetPdfBuilder`, which
     // takes a typed `Sheet` + DXF entity list) so the deliver pack's
@@ -954,6 +1116,75 @@ mod tests {
         assert!(DeliverPackKind::parse("bim").is_ok());
         match DeliverPackKind::parse("hat") {
             Err(ProjectExportError::Invalid(msg)) => assert!(msg.contains("`hat`")),
+            other => panic!("expected Invalid error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn write_project_package_zip_emits_zip_magic_and_listing() {
+        let workdir = tempfile::tempdir().unwrap();
+        let project_root = workdir.path().join("demo.aecstudio");
+        std::fs::create_dir_all(project_root.join("commands")).unwrap();
+        std::fs::create_dir_all(project_root.join("bim")).unwrap();
+        std::fs::write(project_root.join("manifest.json"), br#"{"id":"demo"}"#).unwrap();
+        std::fs::write(project_root.join("project.nonce"), b"\x01\x02\x03").unwrap();
+        std::fs::write(
+            project_root.join("commands").join("0001.json"),
+            br#"{"command_id":"a"}"#,
+        )
+        .unwrap();
+        std::fs::write(project_root.join("bim").join("note.txt"), b"hello").unwrap();
+
+        let out = workdir.path().join("demo.zip");
+        let res = write_project_package_zip(&project_root, &out).unwrap();
+        assert_eq!(res.out_path, out);
+        // 4 source files (manifest.json, project.nonce, commands/0001.json,
+        // bim/note.txt). manifest.json (the auto-generated archive
+        // manifest) is NOT counted in `entries`.
+        assert_eq!(res.entries, 4);
+        assert!(res.total_bytes > 0);
+
+        // ZIP magic: `PK\x03\x04` (local file header signature).
+        let bytes = std::fs::read(&out).unwrap();
+        assert_eq!(&bytes[..4], &[0x50, 0x4B, 0x03, 0x04]);
+
+        // Confirm the archive contains all source files + the
+        // auto-generated manifest, with paths using forward slashes.
+        let mut zr = zip::ZipArchive::new(std::fs::File::open(&out).unwrap()).unwrap();
+        let mut names: Vec<String> = (0..zr.len())
+            .map(|i| zr.by_index(i).unwrap().name().to_string())
+            .collect();
+        names.sort();
+        // The source `manifest.json` is preserved at its original
+        // path; the auto-generated archive manifest lands at a
+        // distinct name (`_aec_archive_manifest.json`) so a
+        // round-trip extract + `ProjectPackage::open` works.
+        assert_eq!(
+            names,
+            vec![
+                "_aec_archive_manifest.json".to_string(),
+                "bim/note.txt".to_string(),
+                "commands/0001.json".to_string(),
+                "manifest.json".to_string(),
+                "project.nonce".to_string(),
+            ]
+        );
+
+        // The source `manifest.json` round-trips bit-for-bit.
+        let mut src_mf = zr.by_name("manifest.json").unwrap();
+        let mut src_mf_bytes = Vec::new();
+        std::io::Read::read_to_end(&mut src_mf, &mut src_mf_bytes).unwrap();
+        assert_eq!(src_mf_bytes, br#"{"id":"demo"}"#);
+    }
+
+    #[test]
+    fn write_project_package_zip_rejects_non_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not_a_dir");
+        std::fs::write(&file, b"foo").unwrap();
+        let out = dir.path().join("out.zip");
+        match write_project_package_zip(&file, &out) {
+            Err(ProjectExportError::Invalid(msg)) => assert!(msg.contains("not a directory")),
             other => panic!("expected Invalid error, got {other:?}"),
         }
     }

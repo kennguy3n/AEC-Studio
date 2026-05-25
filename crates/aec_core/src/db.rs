@@ -61,13 +61,26 @@ fn apply_pragmas(conn: &Connection, key: &Key32) -> AecResult<()> {
     // key via BLAKE3 in `crypto::derive_project_key`.
     let pragma_key = format!("PRAGMA key = \"x'{}'\";", key.to_hex());
     conn.execute_batch(&pragma_key)?;
+    // `busy_timeout = 5000` makes every SQL statement on this connection
+    // wait up to 5 seconds for a competing writer to release the database
+    // lock before returning `SQLITE_BUSY`. This is what makes it safe for
+    // bridge entry points like `bim_classify` / `bim_set_property` to use
+    // the **read** side of the bridge-wide `RwLock<BridgeService>` even
+    // though they perform DB writes: WAL mode lets readers and writers
+    // co-exist, and `busy_timeout` lets two writers on different bridge
+    // calls serialise themselves at the SQLite layer instead of at the
+    // bridge layer. Status-poll readers (`runtime_status`,
+    // `render_list_jobs`, etc.) therefore stay responsive while a long
+    // classification walk runs. 5 seconds is the same default rusqlite
+    // uses when callers explicitly opt in to a busy_handler.
     conn.execute_batch(
         "PRAGMA cipher_page_size = 4096;
          PRAGMA kdf_iter = 256000;
          PRAGMA cipher_hmac_algorithm = HMAC_SHA512;
          PRAGMA cipher_kdf_algorithm = PBKDF2_HMAC_SHA512;
          PRAGMA foreign_keys = ON;
-         PRAGMA journal_mode = WAL;",
+         PRAGMA journal_mode = WAL;
+         PRAGMA busy_timeout = 5000;",
     )?;
     Ok(())
 }
