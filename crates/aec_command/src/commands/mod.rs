@@ -2,6 +2,7 @@
 
 pub mod camera;
 pub mod floor;
+pub mod furniture;
 pub mod lighting;
 pub mod material;
 pub mod opening;
@@ -64,6 +65,13 @@ pub enum CommandKind {
     UpdateCamera(camera::UpdateCamera),
     #[serde(rename = "design.delete_camera")]
     DeleteCamera(camera::DeleteCamera),
+
+    #[serde(rename = "design.place_furniture")]
+    PlaceFurniture(furniture::PlaceFurniture),
+    #[serde(rename = "design.move_furniture")]
+    MoveFurniture(furniture::MoveFurniture),
+    #[serde(rename = "design.delete_furniture")]
+    DeleteFurniture(furniture::DeleteFurniture),
 }
 
 impl CommandKind {
@@ -88,6 +96,9 @@ impl CommandKind {
             Self::SaveCamera(_) => "design.save_camera",
             Self::UpdateCamera(_) => "design.update_camera",
             Self::DeleteCamera(_) => "design.delete_camera",
+            Self::PlaceFurniture(_) => "design.place_furniture",
+            Self::MoveFurniture(_) => "design.move_furniture",
+            Self::DeleteFurniture(_) => "design.delete_furniture",
         }
     }
 

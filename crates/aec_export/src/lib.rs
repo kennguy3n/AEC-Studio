@@ -34,9 +34,10 @@ pub use pdf_sheet::SheetPdfBuilder;
 pub use plot_style::{PlotStyle, PlotStyleTable};
 pub use project_export::{
     write_deliver_pack, write_project_dxf, write_project_gltf, write_project_ifc,
-    write_project_pdf, write_proposal_pack, DeliverPackKind, DeliverPackOptions,
-    ProjectExportError, WriteDeliverPackResult, WriteProjectDxfResult, WriteProjectGltfResult,
-    WriteProjectIfcResult, WriteProjectPdfResult, WriteProposalPackResult,
+    write_project_package_zip, write_project_pdf, write_proposal_pack, DeliverPackKind,
+    DeliverPackOptions, ProjectExportError, WriteDeliverPackResult, WriteProjectDxfResult,
+    WriteProjectGltfResult, WriteProjectIfcResult, WriteProjectPackageResult,
+    WriteProjectPdfResult, WriteProposalPackResult,
 };
 pub use proposal::{
     ProposalAssets, ProposalBranding, ProposalPack, ProposalPageOrder, RenderAttachment,
