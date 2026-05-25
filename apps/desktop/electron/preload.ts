@@ -172,6 +172,11 @@ const api = {
     buildPack: (params: {
       kind: "concept" | "interior" | "contractor" | "bim";
       outPath: string;
+      // Project label printed on the in-archive PDF summary. Must
+      // be threaded through here (preload boundary) or the native
+      // backend falls back to the generic "Project" label — see
+      // `crates/aec_bridge/src/napi_api.rs::deliver_build_pack`.
+      projectName?: string;
       includeRenders?: boolean;
       includeSheets?: boolean;
       includeIfc?: boolean;

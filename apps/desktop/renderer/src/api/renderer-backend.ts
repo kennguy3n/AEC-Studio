@@ -15,6 +15,7 @@ import {
   diffRevisionsInProcess,
   ensureInProcessGraph,
   inProcessParsedForTool,
+  packContents,
   type Command,
   type CommandScope,
   type EntityRecord,
@@ -264,11 +265,54 @@ export function rendererInProcessBackend(): AecApi {
       runtimeStatus: async () => ({ state: "idle", lastError: null }),
     },
     export: {
-      exportPdf: async () => ({ outPath: "/exports/out.pdf", pages: 4 }),
-      exportDxf: async () => ({ outPath: "/exports/out.dxf" }),
-      exportIfc: async () => ({ outPath: "/exports/out.ifc" }),
-      exportGltf: async () => ({ outPath: "/exports/out.gltf" }),
-      buildProposalPack: async () => ({ outPath: "/exports/proposal.pdf" }),
+      // Vitest fallback for the export IPC namespace. Mirrors the
+      // shape AND the strictness of the in-process backend in
+      // `apps/desktop/electron/bridge.ts` (which itself mirrors the
+      // native napi struct contract): `outPath` and `projectName` are
+      // mandatory non-empty strings, missing fields throw the same
+      // error shape (`{method}: missing required string field
+      // '{field}'`) the electron-side fallback produces. Page count
+      // (`exportPdf`) is pinned at `2` to match
+      // `aec_export::write_project_pdf` (1 cover + 1 overview); the
+      // electron-side in-process fallback uses the same value.
+      exportPdf: async (params) => {
+        const outPath = requireStringField(params, "exportPdf", "outPath");
+        requireStringField(params, "exportPdf", "projectName");
+        return { outPath, pages: 2 };
+      },
+      exportDxf: async (params) => {
+        const outPath = requireStringField(params, "exportDxf", "outPath");
+        requireStringField(params, "exportDxf", "projectName");
+        return { outPath };
+      },
+      exportIfc: async (params) => {
+        const outPath = requireStringField(params, "exportIfc", "outPath");
+        requireStringField(params, "exportIfc", "projectName");
+        return { outPath };
+      },
+      exportGltf: async (params) => {
+        const outPath = requireStringField(params, "exportGltf", "outPath");
+        requireStringField(params, "exportGltf", "projectName");
+        return { outPath };
+      },
+      // Uses the underlying `BridgeBackend.exportBuildProposalPack`
+      // method name (NOT the renderer-surface `buildProposalPack`) so
+      // the error string matches the electron-side fallback and the
+      // native napi `ExportProposalPackParamsJs` struct. This honours
+      // the JSDoc contract below: "The error message format is
+      // identical across the three layers so renderer tests can
+      // assert on the exception text without branching on which
+      // backend produced it." Pinned by `export-in-process.test.ts`
+      // line 247 against the same regex the electron-side test uses.
+      buildProposalPack: async (params) => {
+        const outPath = requireStringField(
+          params,
+          "exportBuildProposalPack",
+          "outPath",
+        );
+        requireStringField(params, "exportBuildProposalPack", "projectName");
+        return { outPath };
+      },
     },
     deliver: deliverMock(newId),
     command: commandMock(),
@@ -291,6 +335,32 @@ export function rendererInProcessBackend(): AecApi {
       }),
     },
   };
+}
+
+/**
+ * Read a **required** `string` field from a renderer-supplied
+ * `Record<string, unknown>` params object. Throws when the field is
+ * absent / `null` / `undefined` / not a string.
+ *
+ * Mirrors the electron-side `requireStringField` in
+ * `apps/desktop/electron/bridge.ts` so the vitest fallback enforces
+ * the same mandatory-field contract as both the in-process backend
+ * and the native napi structs in
+ * `crates/aec_bridge/src/napi_api.rs`. The error message format
+ * (`{method}: missing required string field '{field}'`) is identical
+ * across the three layers so renderer tests can assert on the
+ * exception text without branching on which backend produced it.
+ */
+function requireStringField(
+  params: Record<string, unknown>,
+  method: string,
+  key: string,
+): string {
+  const v = params[key];
+  if (typeof v !== "string") {
+    throw new Error(`${method}: missing required string field '${key}'`);
+  }
+  return v;
 }
 
 /**
@@ -364,28 +434,31 @@ function deliverMock(newId: (prefix: string) => string) {
       includeProposal?: boolean;
       region?: "eu" | "na" | "apac";
     }): Promise<{ outPath: string; contents: string[]; totalBytes: number }> {
-      const contents: string[] = [];
-      if (params.kind === "concept") {
-        contents.push("concept_pack.pdf", "manifest.json");
-      } else if (params.kind === "interior") {
-        contents.push(
-          "interior_summary.pdf",
-          "schedules/materials.xlsx",
-          "manifest.json",
-        );
-      } else if (params.kind === "contractor") {
-        contents.push("sheets/A100.pdf", "schedules/boq.xlsx", "manifest.json");
-      } else {
-        contents.push(
-          "model/project.ifc",
-          "validation_report.pdf",
-          "manifest.json",
-        );
-      }
+      // Reuse the same `packContents` builder the electron in-process
+      // backend uses (and which itself pins the inventory shape to the
+      // native Rust `aec_export::write_deliver_pack`). Without this,
+      // the renderer's vitest fixture returned a simpler 2–3-file
+      // inventory while production produced the full per-kind list —
+      // flagged in PR-S round 2 "deliverMock in renderer-backend.ts
+      // uses simplified inventory that diverges from packContents".
+      // Same `?? true` defaults flow through `packContents`, so
+      // omitted `include_*` flags match the native + electron
+      // behaviour automatically. `totalBytes` is a synthetic function
+      // of the file count because the vitest fallback has no real
+      // bytes to measure — production replaces this whole call with
+      // `deliver_build_pack`'s real ZIP assembly.
+      //
+      // The formula `acc + 1024 + i * 256` is byte-identical to the
+      // electron in-process backend at `apps/desktop/electron/
+      // bridge.ts::inProcessBackend()::deliverBuildPack`. The shared
+      // shape lets a renderer regression test that covers both
+      // surfaces compare against the same synthetic number without
+      // branching on which backend is running.
+      const contents = packContents(params);
       return {
         outPath: params.outPath,
         contents,
-        totalBytes: contents.length * 4096,
+        totalBytes: contents.reduce((acc, _name, i) => acc + 1024 + i * 256, 0),
       };
     },
   };
