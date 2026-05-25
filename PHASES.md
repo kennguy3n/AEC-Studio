@@ -1,6 +1,6 @@
 # Phases
 
-High-level summary of the seven AEC Studio delivery phases. The
+High-level summary of the AEC Studio delivery phases (currently 0–11). The
 canonical, up-to-date status — including per-item check marks, exit
 criteria, and changelog — lives in
 [PROGRESS.md](PROGRESS.md). This file is intentionally short so it
@@ -18,6 +18,8 @@ stays readable as the project grows.
 | **7 — Optional KChat integration** | Teams using KChat can publish AEC Studio artifacts and route review comments back to the audit trail without giving up local-first. | `DONE` |
 | **8 — Extension system** | Asset packs, templates, schedules, export targets, AI tools, and importers ship as Ed25519-signed third-party extensions with a typed permission model. | `DONE` |
 | **9 — Native render & BIM engine** | Replace the Blender and IfcOpenShell worker processes with in-process Rust implementations (SAH BVH, wgpu compute path tracer, PBR rasterizer preview, STEP parser/writer, geometry tessellator). No external runtime dependency for rendering or IFC. | `DONE` |
+| **10 — N-API bridge completion** | Wire every `BridgeBackend` method through the N-API boundary — no more in-process fallbacks. Promote the 9 `draft.*` / `deliver.*` methods listed in `NATIVE_FALLBACK_METHODS` into the wired set so every gesture journals through `command_apply` (Immediate transaction, audit chain, undo-able). | `DONE` |
+| **11 — Real domain depth** | Replace stubs and scaffolding with real implementations across the workspace: AI accept-diff → `command_apply`, template instantiation produces real walls/floors/ceilings/rooms, filesystem revision snapshots + BLAKE3 version diff, DXF round-trip fidelity, DWG bridge wiring, real PDF / SVG / glTF exports, asset import pipeline with LOD chain + thumbnails, real IFC schedules from project data, SQLite-backed render job persistence, incremental constraint solver, IES profile parsing, BLAKE3 audit-chain verification, per-OS thermal monitor + governor backoff, and end-to-end user-journey integration tests for the interior, drafter, and PM workflows. | `DONE` |
 
 ## Cross-cutting
 
