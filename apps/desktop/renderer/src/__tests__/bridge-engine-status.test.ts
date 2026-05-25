@@ -32,4 +32,17 @@ describe("bridge in-process engine status", () => {
     const n = await bridge.projectAuditSync("/projects/anything.aecstudio");
     expect(n).toBe(0);
   });
+
+  it("projectAuditVerify returns a trivially-ok report in the in-process fallback", async () => {
+    const bridge = inProcessBackend();
+    const v = await bridge.projectAuditVerify("/projects/anything.aecstudio");
+    expect(v.status).toBe("ok");
+    expect(v.entriesChecked).toBe(0);
+    expect(v.filesChecked).toEqual([]);
+    expect(v.headHash).toBe("blake3:genesis");
+    expect(v.breakFile).toBeNull();
+    expect(v.breakLine).toBeNull();
+    expect(v.breakReason).toBeNull();
+    expect(v.breakDetail).toBeNull();
+  });
 });

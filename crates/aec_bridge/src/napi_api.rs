@@ -314,6 +314,106 @@ pub fn project_audit_sync(path: String) -> Result<u32> {
     with_service(|svc| svc.project_audit_sync(&path)).map(|n| n.min(u32::MAX as u64) as u32)
 }
 
+/// JS-facing audit chain verification report. Mirrors
+/// `aec_audit::ChainVerification` with file paths flattened to
+/// strings so the JS side doesn't need any path-handling
+/// dependencies.
+#[napi(object)]
+pub struct ChainVerificationJs {
+    /// `"ok"` if the chain verified end-to-end; otherwise
+    /// `"broken_at"`.
+    pub status: String,
+    /// Number of entries that were fully validated before the first
+    /// break (or all entries, if the chain is intact).
+    pub entries_checked: u32,
+    /// All `.jsonl` files inspected, in the order they were walked.
+    pub files_checked: Vec<String>,
+    /// The latest valid `hash` head seen. For a fully-intact chain
+    /// this equals the last entry's `hash`; for a broken chain it
+    /// is the `hash` of the last entry that did verify.
+    pub head_hash: String,
+    /// `None` if `status == "ok"`; otherwise the file the break
+    /// occurred in.
+    pub break_file: Option<String>,
+    /// `None` if `status == "ok"`; otherwise the 1-based line
+    /// number of the broken entry.
+    pub break_line: Option<u32>,
+    /// `None` if `status == "ok"`; otherwise one of
+    /// `"prev_hash_mismatch"`, `"hash_recompute_mismatch"`,
+    /// `"malformed_entry"`, `"io"`.
+    pub break_reason: Option<String>,
+    /// `None` if `status == "ok"`; otherwise a human-readable
+    /// description of the break (e.g. `"stored = blake3:dead,
+    /// recomputed = blake3:abc"`). Stable enough for the UI's
+    /// status pane; do NOT pattern-match on this string in
+    /// production code — use `break_reason` instead.
+    pub break_detail: Option<String>,
+}
+
+impl From<aec_audit::ChainVerification> for ChainVerificationJs {
+    fn from(v: aec_audit::ChainVerification) -> Self {
+        let entries_checked = v.entries_checked.min(u32::MAX as u64) as u32;
+        let files_checked = v
+            .files_checked
+            .into_iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        match v.status {
+            aec_audit::ChainStatus::Ok => Self {
+                status: "ok".to_string(),
+                entries_checked,
+                files_checked,
+                head_hash: v.head_hash,
+                break_file: None,
+                break_line: None,
+                break_reason: None,
+                break_detail: None,
+            },
+            aec_audit::ChainStatus::BrokenAt { file, line, reason } => {
+                let (reason_str, detail) = match &reason {
+                    aec_audit::BreakReason::PrevHashMismatch { expected, found } => (
+                        "prev_hash_mismatch",
+                        format!("expected = {expected}, found = {found}"),
+                    ),
+                    aec_audit::BreakReason::HashRecomputeMismatch { stored, recomputed } => (
+                        "hash_recompute_mismatch",
+                        format!("stored = {stored}, recomputed = {recomputed}"),
+                    ),
+                    aec_audit::BreakReason::MalformedEntry { message } => {
+                        ("malformed_entry", message.clone())
+                    }
+                    aec_audit::BreakReason::Io { message } => ("io", message.clone()),
+                };
+                Self {
+                    status: "broken_at".to_string(),
+                    entries_checked,
+                    files_checked,
+                    head_hash: v.head_hash,
+                    break_file: Some(file.to_string_lossy().into_owned()),
+                    break_line: Some(line.min(u32::MAX as u64) as u32),
+                    break_reason: Some(reason_str.to_string()),
+                    break_detail: Some(detail),
+                }
+            }
+        }
+    }
+}
+
+/// Verify the BLAKE3 hash chain of every `<project>/audit/*.jsonl`
+/// file. Read-only — does not touch the SQLCipher DB, does not
+/// require the master key, and does not invalidate any caches.
+/// Safe to run concurrently with other reads.
+///
+/// The CPU cost is O(total audit bytes) and dominated by BLAKE3
+/// hashing, which clocks at ~3 GiB/s on a modern laptop — so a
+/// project with 10,000 audit entries (~5 MiB) verifies in under
+/// 2 ms. We therefore run on the read side of the service lock
+/// rather than `spawn_blocking_napi`-ing it.
+#[napi]
+pub fn project_audit_verify(path: String) -> Result<ChainVerificationJs> {
+    with_service_ref_fallible(|svc| svc.project_audit_verify(&path)).map(Into::into)
+}
+
 /// JS-facing parse-only IFC import summary. Mirrors the renderer's
 /// `BimImportSummary` interface in `apps/desktop/electron/bridge.ts`.
 ///
