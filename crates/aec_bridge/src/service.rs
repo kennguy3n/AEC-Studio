@@ -1996,6 +1996,24 @@ impl BridgeService {
     /// `bim_attach_ifc` re-attach (which wipes `bim/%` for changed
     /// entities — see `bim_attach.rs:463`). The prefix is supplied
     /// by [`aec_bim::classification_tables::ClassificationScheme::component_kind`].
+    ///
+    /// # Concurrency
+    ///
+    /// The entity scan and the per-entity writes must observe the
+    /// same DB snapshot — two concurrent `bim_classify` calls (or a
+    /// `bim_classify` interleaved with `bim_set_property` /
+    /// `command_apply`) would otherwise race: caller A reads
+    /// `(id, kind)` for every row, caller B commits a `kind` change
+    /// for some `id`, then caller A's write uses B's stale `kind`
+    /// in its `tag == *kind` comparison and overwrites B's update.
+    ///
+    /// The fix mirrors [`Self::bim_set_property`]: open the
+    /// transaction with [`TransactionBehavior::Immediate`] so the
+    /// RESERVED lock is acquired up-front, then run the entity
+    /// SELECT INSIDE that transaction. Combined with the
+    /// `busy_timeout` pragma (`apply_pragmas`), concurrent callers
+    /// serialise at SQLite's RESERVED lock and each sees the
+    /// previous caller's committed snapshot, not a stale one.
     pub fn bim_classify(
         &self,
         project_path: &str,
@@ -2011,10 +2029,22 @@ impl BridgeService {
         let (_pkg, mut conn) =
             ProjectPackage::open_with_master_key_and_database(project_path, &self.master_key)?;
 
+        // Open the transaction as IMMEDIATE up-front so the
+        // RESERVED lock is acquired before the entity scan runs.
+        // This closes the TOCTOU window that a default DEFERRED
+        // transaction would leave open between the SELECT below
+        // and the per-entity UPDATE/upsert further down — see the
+        // `# Concurrency` doc on this method.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
         // Collect entities first so we don't hold a prepared
-        // statement open while we mutate via `INSERT OR REPLACE`.
+        // statement open while we mutate. The `query_map().collect()`
+        // pattern drains every row into the `Vec` before the
+        // statement is dropped, so it's safe to run inside the
+        // transaction and subsequently UPDATE / upsert the same
+        // table without statement-lifetime conflicts.
         let entities: Vec<(String, String)> = {
-            let mut stmt = conn.prepare("SELECT id, kind FROM entities")?;
+            let mut stmt = tx.prepare("SELECT id, kind FROM entities")?;
             let rows =
                 stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
             rows.collect::<rusqlite::Result<Vec<_>>>()?
@@ -2026,7 +2056,6 @@ impl BridgeService {
         let mut skipped: u32 = 0;
         let now = chrono::Utc::now().to_rfc3339();
 
-        let tx = conn.transaction()?;
         for (id, kind) in &entities {
             let Some(ifc_class) = aec_bim::classification_tables::classify_kind(kind) else {
                 skipped += 1;
