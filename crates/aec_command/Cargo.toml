@@ -9,6 +9,12 @@ description = "Command engine, undo/redo journal, and typed command structs for 
 
 [dependencies]
 aec_core = { path = "../aec_core" }
+# `aec_ai` is a hard runtime dependency (not dev-only) because the
+# `ai_apply` module converts the `Diff` shapes emitted by the AI diff
+# engine into typed `Command`s. The crate is intentionally tiny
+# (planner + diff engine + audit logger) and has no transitive deps
+# on `aec_command`, so pulling it in here doesn't create a cycle.
+aec_ai = { path = "../aec_ai" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
@@ -17,7 +23,6 @@ blake3 = { workspace = true }
 rusqlite = { workspace = true }
 
 [dev-dependencies]
-aec_ai = { path = "../aec_ai" }
 aec_audit = { path = "../aec_audit" }
 aec_bim = { path = "../aec_bim" }
 aec_cad = { path = "../aec_cad" }

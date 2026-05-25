@@ -217,9 +217,25 @@ export function registerIpcHandlers(): void {
     assertString(diffId, "diffId");
     return getBridge().aiAcceptDiff(diffId);
   });
-  ipcMain.handle("ai:rejectDiff", async (_e, { diffId }) => {
+  ipcMain.handle("ai:rejectDiff", async (_e, payload) => {
+    assertObject(payload, "params");
+    const { diffId, reason } = payload as {
+      diffId?: unknown;
+      reason?: unknown;
+    };
     assertString(diffId, "diffId");
-    return getBridge().aiRejectDiff(diffId);
+    // `reason` is optional; the renderer can omit it for silent
+    // rejections (e.g. user dismissed the panel). When present it
+    // must be a string \u2014 reject anything else loudly so the
+    // forensic log never sees `[object Object]` or NaN.
+    let reasonStr: string | null = null;
+    if (reason !== undefined && reason !== null) {
+      if (typeof reason !== "string") {
+        throw new Error("ai:rejectDiff: 'reason' must be a string when present");
+      }
+      reasonStr = reason;
+    }
+    return getBridge().aiRejectDiff(diffId, reasonStr);
   });
   ipcMain.handle("ai:cancelJob", async (_e, { jobId }) => {
     assertString(jobId, "jobId");

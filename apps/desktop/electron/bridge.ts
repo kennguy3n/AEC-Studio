@@ -305,7 +305,10 @@ export interface BridgeBackend {
    */
   aiPlan(params: Record<string, unknown>): Promise<AiPlanResponse>;
   aiAcceptDiff(diffId: string): Promise<{ accepted: true }>;
-  aiRejectDiff(diffId: string): Promise<{ rejected: true }>;
+  aiRejectDiff(
+    diffId: string,
+    reason?: string | null,
+  ): Promise<{ rejected: true }>;
   aiCancelJob(jobId: string): Promise<{ cancelled: true }>;
   aiRuntimeStatus(): Promise<{ state: string; lastError: string | null }>;
 
@@ -1182,6 +1185,7 @@ interface NativeApi {
   // tool-specific context object, also serialised at the adaptor.
   ai_list_tools(): Promise<unknown>;
   ai_plan(
+    project_path: string,
     tool: string,
     scope: string,
     prompt: string,
@@ -1189,7 +1193,7 @@ interface NativeApi {
     max_entities_modified: number,
   ): Promise<unknown>;
   ai_accept_diff(diff_id: string): Promise<unknown>;
-  ai_reject_diff(diff_id: string): Promise<unknown>;
+  ai_reject_diff(diff_id: string, reason?: string | null): Promise<unknown>;
   ai_cancel_job(job_id: string): Promise<unknown>;
   ai_runtime_status(): Promise<unknown>;
 }
@@ -1641,6 +1645,22 @@ function adaptNative(n: NativeApi): BridgeBackend {
     // can't accept a `serde_json::Value` directly; the empty string
     // is the Rust-side sentinel for "no context".
     aiPlan: async (params) => {
+      // Phase 11 task 10: the AI accept path applies commands
+      // against a specific project on disk, so the plan call has
+      // to bind a `projectPath` at registration time (NOT at
+      // accept time, which is the wrong choice if the user
+      // switches projects between plan and accept).
+      const projectPath =
+        typeof params.projectPath === "string"
+          ? params.projectPath
+          : typeof params.project_path === "string"
+            ? (params.project_path as string)
+            : "";
+      if (projectPath.length === 0) {
+        throw new Error(
+          "aiPlan: missing required string field 'projectPath'",
+        );
+      }
       const tool = typeof params.tool === "string" ? params.tool : "";
       if (tool.length === 0) {
         throw new Error("aiPlan: missing required string field 'tool'");
@@ -1675,6 +1695,7 @@ function adaptNative(n: NativeApi): BridgeBackend {
       // also rejects the Promise (rather than throwing across the
       // FFI boundary) on transport / parser errors.
       const result = (await n.ai_plan(
+        projectPath,
         tool,
         scope,
         prompt,
@@ -1720,10 +1741,15 @@ function adaptNative(n: NativeApi): BridgeBackend {
       await n.ai_accept_diff(diffId);
       return { accepted: true };
     },
-    aiRejectDiff: async (diffId) => {
+    aiRejectDiff: async (diffId, reason) => {
       // Same idempotency / error-propagation contract as
-      // `aiAcceptDiff`.
-      await n.ai_reject_diff(diffId);
+      // `aiAcceptDiff`. The renderer-supplied `reason` (when
+      // present) flows through to the forensic AI audit record
+      // so a reviewer can see *why* a proposal was rejected.
+      await n.ai_reject_diff(
+        diffId,
+        reason === undefined ? null : reason,
+      );
       return { rejected: true };
     },
     aiCancelJob: async (jobId) => {
@@ -2311,7 +2337,7 @@ export function inProcessBackend(): BridgeBackend {
     async aiAcceptDiff(_d) {
       return { accepted: true };
     },
-    async aiRejectDiff(_d) {
+    async aiRejectDiff(_d, _reason) {
       return { rejected: true };
     },
     async aiCancelJob(_j) {

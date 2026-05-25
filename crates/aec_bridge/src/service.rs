@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use aec_ai::{
-    DiffEngine, GrammarRegistry as AiGrammarRegistry, PlanRequest as AiPlanRequest,
-    ToolName as AiToolName, ToolPlanner, ToolSchema as AiToolSchema,
+    AiAuditLogger, DiffEngine, DiffStatus, GrammarRegistry as AiGrammarRegistry,
+    PlanRequest as AiPlanRequest, ToolName as AiToolName, ToolPlanner, ToolSchema as AiToolSchema,
     ToolSchemaRegistry as AiToolSchemaRegistry,
 };
 use aec_audit::AuditLog;
@@ -1059,12 +1059,70 @@ pub struct AiPlanResult {
     pub entities_modified: u32,
 }
 
-/// Result of [`BridgeService::ai_accept_diff`] / `ai_reject_diff`.
+/// Result of [`BridgeService::ai_accept_diff`].
+///
+/// Carries the full apply telemetry so the renderer can show the
+/// user exactly what landed in the project graph: how many ops the
+/// model proposed, how many were applied, how many were skipped
+/// (and why), and the resulting per-op command ids for later undo.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AiDiffOutcome {
-    /// Mirrors the TS `{ accepted: true }` / `{ rejected: true }` shape.
+pub struct AiAcceptOutcome {
+    /// Mirrors the TS `{ accepted: true }` shape (always `true` on
+    /// success; the call returns `Err` on failure).
     pub ok: bool,
     pub diff_id: String,
+    /// Total operations the diff carried (matches
+    /// `diff.operations.len()` from `ai_plan`).
+    pub op_count: u32,
+    /// Subset that the converter mapped to a typed command and that
+    /// the command engine successfully executed.
+    pub applied_count: u32,
+    /// Operations the converter could not translate — unknown
+    /// entity kinds, dangling targets, render_doctor diagnostics,
+    /// material bindings without a target entity. Surfacing these
+    /// lets the renderer show "Applied 4 of 5 — 1 skipped" instead
+    /// of silently dropping a partial accept.
+    pub skipped: Vec<AiAcceptSkippedJs>,
+    /// `Command::command_id` of every applied command, in apply
+    /// order. The renderer pins these so a later "Undo last AI
+    /// action" call can pop the matching journal entries.
+    pub command_ids: Vec<String>,
+    /// Hash chain head of the AI audit log AFTER this accept was
+    /// recorded. The renderer surfaces this in the AI panel's
+    /// provenance tooltip; verification tools can walk the chain
+    /// from genesis to this head.
+    pub audit_chain_head: String,
+}
+
+/// One skipped operation surfaced from the `ai_apply` converter.
+/// Mirrors [`aec_command::SkippedOperation`] but stays inside the
+/// service crate so the napi layer doesn't need a direct dep on
+/// `aec_command`'s internal types.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiAcceptSkippedJs {
+    pub op_index: u32,
+    pub reason: String,
+}
+
+/// Result of [`BridgeService::ai_reject_diff`].
+///
+/// Mirrors `AiAcceptOutcome` shape-wise (same `audit_chain_head`
+/// field) so the renderer can use a single "diff lifecycle" toast
+/// shape for both outcomes. `op_count` is reported so the renderer
+/// can show "Rejected (4 ops, 0 applied)" symmetrically with the
+/// accept variant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiRejectOutcome {
+    pub ok: bool,
+    pub diff_id: String,
+    pub op_count: u32,
+    /// Optional reason supplied by the renderer (`reason: "too
+    /// many entities"`, `reason: "wrong room"`, etc.). Logged into
+    /// the AI audit chain so the provenance UI can show *why* the
+    /// user rejected the suggestion. `None` is recorded as an
+    /// empty string in the audit envelope.
+    pub reason: Option<String>,
+    pub audit_chain_head: String,
 }
 
 /// Result of [`BridgeService::ai_cancel_job`].
@@ -3151,6 +3209,7 @@ impl BridgeService {
     ///   7. return the diff id + parsed payload to the renderer
     pub fn ai_plan(
         &self,
+        project_path: &str,
         tool: &str,
         scope: Scope,
         prompt: &str,
@@ -3241,7 +3300,11 @@ impl BridgeService {
             entities, response.entities_modified,
             "DiffEngine::build and planner::count_response_entities must agree",
         );
-        let diff_id = self.ai_state.insert_diff(diff)?;
+        // Capture the project path with the pending diff so the
+        // later `ai_accept_diff` / `ai_reject_diff` knows which
+        // project package to open. See `PendingDiff` rustdoc for
+        // the "plan on A, switch to B, accept the A diff" rationale.
+        let diff_id = self.ai_state.insert_diff(project_path, scope, diff)?;
         Ok(AiPlanResult {
             diff_id: diff_id.as_str().to_owned(),
             parsed,
@@ -3250,26 +3313,194 @@ impl BridgeService {
         })
     }
 
-    /// Mark a pending diff as accepted. The bridge currently drops the
-    /// diff after recording acceptance — translating the diff back into
-    /// concrete [`crate::service::Command`] sequences is a follow-up
-    /// (Phase 11 task, deliberately deferred from PR-V scope per the
-    /// scoping doc).
-    pub fn ai_accept_diff(&self, diff_id: &str) -> Result<AiDiffOutcome, BridgeServiceError> {
-        let _ = self.ai_state.accept_diff(diff_id)?;
-        Ok(AiDiffOutcome {
+    /// Apply an accepted AI diff to the project graph.
+    ///
+    /// Phase 11 task 10 — the previous incarnation of this method
+    /// just dropped the pending diff entry after marking it
+    /// accepted. That left the project graph unchanged even though
+    /// the renderer's AI panel had already moved on, which broke
+    /// every downstream contract (undo, audit, render, export).
+    ///
+    /// The real apply path is:
+    ///
+    ///   1. Pop the `PendingDiff` from `AiState::pending_diffs`
+    ///      (which yields both the `Diff` and the project path it
+    ///      was planned against).
+    ///   2. Open the project package + SQLCipher connection, then
+    ///      load the current `ProjectGraph` so the converter can
+    ///      dispatch `Update` / `Delete` operations to typed
+    ///      commands based on the target's entity `kind`.
+    ///   3. Convert the `Diff` into a `Vec<Command>` via
+    ///      [`aec_command::diff_to_commands`]. Every emitted command
+    ///      is `Command::ai(tool_name, kind)` so the audit chain
+    ///      attributes the mutation to the model.
+    ///   4. Route the batch through [`Self::command_apply_batch`]
+    ///      so the SQL transaction, journal, and audit envelope
+    ///      are all journaled atomically. The renderer's undo
+    ///      stack pops the AI batch like any other command.
+    ///   5. Append an `AiAuditRecord { status: Accepted, .. }` to
+    ///      `<project>/audit/ai_audit.jsonl` for AI-specific
+    ///      provenance. The main command audit chain already has
+    ///      the per-command entries; this second log keeps the AI
+    ///      lifecycle (plan → accept / reject) on its own chain so
+    ///      auditors can answer "how many of the model's proposals
+    ///      did the user accept?" without grepping through every
+    ///      command's actor field.
+    ///
+    /// Operations the converter could not translate (unknown
+    /// entity kind, dangling target, missing payload field) are
+    /// reported in [`AiAcceptOutcome::skipped`] rather than
+    /// erroring the whole accept — the user already reviewed the
+    /// diff and clicked Accept, so the service commits whatever
+    /// subset the schema understands.
+    pub fn ai_accept_diff(&mut self, diff_id: &str) -> Result<AiAcceptOutcome, BridgeServiceError> {
+        let pending = self.ai_state.accept_diff(diff_id)?;
+        let project_path = pending.project_path.clone();
+        let scope = pending.scope;
+        let diff = pending.diff;
+        let op_count = u32::try_from(diff.operations.len()).unwrap_or(u32::MAX);
+        // Open the package + graph once. We need the graph for the
+        // converter's `Update` / `Delete` dispatch and the
+        // connection for `command_apply_batch`.
+        let (_pkg, mut conn) =
+            ProjectPackage::open_with_master_key_and_database(&project_path, &self.master_key)?;
+        let graph = aec_command::ProjectGraph::load(&conn)
+            .map_err(|e| BridgeServiceError::Command(e.to_string()))?;
+        let conversion =
+            aec_command::diff_to_commands(&diff, &graph, aec_command::ApplyDefaults::default());
+        let skipped: Vec<AiAcceptSkippedJs> = conversion
+            .skipped
+            .iter()
+            .map(|s| AiAcceptSkippedJs {
+                op_index: u32::try_from(s.op_index).unwrap_or(u32::MAX),
+                reason: s.reason.clone(),
+            })
+            .collect();
+        // `command_apply_batch` accepts an empty Vec as a no-op,
+        // which is what we want when every operation in the diff
+        // is unsupported (e.g. all render_doctor diagnostics). The
+        // accept still completes successfully — the AI audit log
+        // will capture the attempted-but-skipped operations.
+        let applied_results: Vec<CommandApplyResult> = if conversion.commands.is_empty() {
+            Vec::new()
+        } else {
+            // Drive the batch through the same on-conn helper that
+            // single applies use so the SQL transaction stays
+            // co-extensive with the per-command engine state.
+            let scope = conversion.commands[0].scope;
+            let mut engine = aec_command::CommandEngine::open(&conn, scope)
+                .map_err(|e| BridgeServiceError::Command(e.to_string()))?;
+            let results = engine
+                .execute_persistent_batch(conversion.commands, &mut conn)
+                .map_err(|e| BridgeServiceError::Command(e.to_string()))?;
+            self.invalidate_status_cache_for(&project_path);
+            let undo_len = engine.undo_len() as u32;
+            let redo_len = engine.redo_len() as u32;
+            results
+                .into_iter()
+                .map(|r| CommandApplyResult {
+                    command_id: r.command_id,
+                    applied: r.applied,
+                    undo_len,
+                    redo_len,
+                })
+                .collect()
+        };
+        let applied_count = u32::try_from(applied_results.len()).unwrap_or(u32::MAX);
+        let command_ids: Vec<String> = applied_results
+            .iter()
+            .map(|r| r.command_id.as_str().to_owned())
+            .collect();
+        // Append the AI-specific audit envelope after the command
+        // batch has been committed. If the audit append fails we
+        // surface the error — the graph mutation is already on
+        // disk, but the renderer needs to know the provenance log
+        // is out of sync so the user can re-export the audit chain.
+        let audit_chain_head =
+            self.ai_audit_append(&project_path, scope, &diff, DiffStatus::Accepted, None)?;
+        Ok(AiAcceptOutcome {
             ok: true,
             diff_id: diff_id.to_owned(),
+            op_count,
+            applied_count,
+            skipped,
+            command_ids,
+            audit_chain_head,
         })
     }
 
-    /// Mark a pending diff as rejected and drop it.
-    pub fn ai_reject_diff(&self, diff_id: &str) -> Result<AiDiffOutcome, BridgeServiceError> {
-        let _ = self.ai_state.reject_diff(diff_id)?;
-        Ok(AiDiffOutcome {
+    /// Mark a pending diff as rejected and record the rejection in
+    /// the project's AI audit log.
+    ///
+    /// Phase 11 task 11 — the previous incarnation just dropped
+    /// the pending entry. The real reject path logs the rejection
+    /// to `<project>/audit/ai_audit.jsonl` via
+    /// [`AiAuditLogger::log_rejection`] so the AI provenance trail
+    /// retains *all* model proposals (accepted and rejected) for
+    /// later analysis. The `reason` argument is free-form text
+    /// supplied by the renderer; an empty `reason` is recorded as
+    /// the empty string rather than as missing.
+    pub fn ai_reject_diff(
+        &mut self,
+        diff_id: &str,
+        reason: Option<&str>,
+    ) -> Result<AiRejectOutcome, BridgeServiceError> {
+        let pending = self.ai_state.reject_diff(diff_id)?;
+        let project_path = pending.project_path.clone();
+        let scope = pending.scope;
+        let diff = pending.diff;
+        let op_count = u32::try_from(diff.operations.len()).unwrap_or(u32::MAX);
+        let audit_chain_head =
+            self.ai_audit_append(&project_path, scope, &diff, DiffStatus::Rejected, reason)?;
+        Ok(AiRejectOutcome {
             ok: true,
             diff_id: diff_id.to_owned(),
+            op_count,
+            reason: reason.map(std::string::ToString::to_string),
+            audit_chain_head,
         })
+    }
+
+    /// Internal helper: append an `AiAuditRecord` to the project's
+    /// AI audit log (`<project>/audit/ai_audit.jsonl`) and return
+    /// the new chain head.
+    ///
+    /// The AI audit log is a separate hash chain from the main
+    /// command audit log (`<project>/audit/log.jsonl`) so the AI
+    /// lifecycle (plan → accept / reject) lives on its own
+    /// tamper-evident trail. AI-accepted commands ALSO appear in
+    /// the main log via `command_apply_batch`; this second log
+    /// answers "how many of the model's proposals did the user
+    /// accept?" without grepping through every command's actor
+    /// field.
+    fn ai_audit_append(
+        &self,
+        project_path: &str,
+        scope: Scope,
+        diff: &aec_ai::Diff,
+        status: DiffStatus,
+        reason: Option<&str>,
+    ) -> Result<String, BridgeServiceError> {
+        let pkg = ProjectPackage::open_with_master_key(project_path, &self.master_key)?;
+        let ai_audit_path = pkg.root().join("audit").join("ai_audit.jsonl");
+        let mut logger = AiAuditLogger::open(&ai_audit_path)?;
+        match status {
+            DiffStatus::Accepted => {
+                logger.log_acceptance(diff, scope)?;
+            }
+            DiffStatus::Rejected => {
+                logger.log_rejection(diff, scope, reason.unwrap_or(""))?;
+            }
+            DiffStatus::Pending => {
+                // `Pending` is a registry-only state and never
+                // reaches this path \u2014 the audit log only records
+                // terminal transitions.
+                return Err(BridgeServiceError::Ai(
+                    "ai_audit_append called with Pending status".into(),
+                ));
+            }
+        }
+        Ok(logger.head().to_string())
     }
 
     /// Cancel any in-flight or queued AI work by killing the sidecar

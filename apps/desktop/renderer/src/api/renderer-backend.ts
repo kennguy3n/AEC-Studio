@@ -306,7 +306,9 @@ export function rendererInProcessBackend(): AecApi {
         return { diffId: newId("diff"), parsed };
       },
       acceptDiff: async () => ({ accepted: true }),
-      rejectDiff: async () => ({ rejected: true }),
+      rejectDiff: async (_diffId: string, _reason?: string | null) => ({
+        rejected: true as const,
+      }),
       cancelJob: async () => ({ cancelled: true }),
       runtimeStatus: async () => ({ state: "idle", lastError: null }),
     },

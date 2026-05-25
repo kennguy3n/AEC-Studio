@@ -1991,9 +1991,29 @@ pub struct AiPlanResultJs {
 }
 
 #[napi(object)]
-pub struct AiDiffOutcomeJs {
+pub struct AiAcceptOutcomeJs {
     pub ok: bool,
     pub diff_id: String,
+    pub op_count: u32,
+    pub applied_count: u32,
+    pub skipped: Vec<AiAcceptSkippedJsRow>,
+    pub command_ids: Vec<String>,
+    pub audit_chain_head: String,
+}
+
+#[napi(object)]
+pub struct AiAcceptSkippedJsRow {
+    pub op_index: u32,
+    pub reason: String,
+}
+
+#[napi(object)]
+pub struct AiRejectOutcomeJs {
+    pub ok: bool,
+    pub diff_id: String,
+    pub op_count: u32,
+    pub reason: Option<String>,
+    pub audit_chain_head: String,
 }
 
 #[napi(object)]
@@ -2060,6 +2080,7 @@ pub async fn ai_list_tools() -> Result<Vec<AiToolJs>> {
 /// case rather than a tail-end async error.
 #[napi]
 pub async fn ai_plan(
+    project_path: String,
     tool: String,
     scope: String,
     prompt: String,
@@ -2069,7 +2090,14 @@ pub async fn ai_plan(
     let scope = parse_scope(&scope)?;
     spawn_blocking_napi(move || {
         let r = with_service_ref_fallible(|svc| {
-            svc.ai_plan(&tool, scope, &prompt, &context_json, max_entities_modified)
+            svc.ai_plan(
+                &project_path,
+                &tool,
+                scope,
+                &prompt,
+                &context_json,
+                max_entities_modified,
+            )
         })?;
         let parsed_json = serde_json::to_string(&r.parsed).map_err(|e| {
             Error::new(
@@ -2087,31 +2115,56 @@ pub async fn ai_plan(
     .await
 }
 
-/// Accept a pending diff. Idempotent at the renderer level: a second
-/// accept on the same id is an error (the first removed it).
+/// Accept a pending diff and apply it to the project graph.
+///
+/// Phase 11 task 10: this is the entry point through which AI
+/// suggestions become real, undoable mutations. The diff is
+/// converted into a `Vec<Command>` and persisted in a single SQL
+/// transaction; the result carries the per-op apply telemetry the
+/// renderer needs to show "4 applied, 1 skipped" and to wire the
+/// command ids into its undo stack.
 ///
 /// `async` for the cold-spawn responsiveness reason in the AI
-/// endpoints block above. The actual diff-map mutation is
-/// O(microseconds), but if a cold-spawn happens to be racing on
-/// the same `BridgeService` we still want the JS event loop free.
+/// endpoints block above, AND because the apply now opens a
+/// SQLCipher connection and walks a transaction — a meaningful
+/// amount of blocking IO that must not run on the libuv main
+/// thread.
 #[napi]
-pub async fn ai_accept_diff(diff_id: String) -> Result<AiDiffOutcomeJs> {
+pub async fn ai_accept_diff(diff_id: String) -> Result<AiAcceptOutcomeJs> {
     spawn_blocking_napi(move || {
-        with_service_ref_fallible(|svc| svc.ai_accept_diff(&diff_id)).map(|r| AiDiffOutcomeJs {
+        with_service(|svc| svc.ai_accept_diff(&diff_id)).map(|r| AiAcceptOutcomeJs {
             ok: r.ok,
             diff_id: r.diff_id,
+            op_count: r.op_count,
+            applied_count: r.applied_count,
+            skipped: r
+                .skipped
+                .into_iter()
+                .map(|s| AiAcceptSkippedJsRow {
+                    op_index: s.op_index,
+                    reason: s.reason,
+                })
+                .collect(),
+            command_ids: r.command_ids,
+            audit_chain_head: r.audit_chain_head,
         })
     })
     .await
 }
 
-/// Reject a pending diff. Same idempotency note as `ai_accept_diff`.
+/// Reject a pending diff and log the rejection (with optional
+/// `reason`) to the project's AI audit trail.
 #[napi]
-pub async fn ai_reject_diff(diff_id: String) -> Result<AiDiffOutcomeJs> {
+pub async fn ai_reject_diff(diff_id: String, reason: Option<String>) -> Result<AiRejectOutcomeJs> {
     spawn_blocking_napi(move || {
-        with_service_ref_fallible(|svc| svc.ai_reject_diff(&diff_id)).map(|r| AiDiffOutcomeJs {
-            ok: r.ok,
-            diff_id: r.diff_id,
+        with_service(|svc| svc.ai_reject_diff(&diff_id, reason.as_deref())).map(|r| {
+            AiRejectOutcomeJs {
+                ok: r.ok,
+                diff_id: r.diff_id,
+                op_count: r.op_count,
+                reason: r.reason,
+                audit_chain_head: r.audit_chain_head,
+            }
         })
     })
     .await

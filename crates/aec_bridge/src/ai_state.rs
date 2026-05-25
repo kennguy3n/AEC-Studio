@@ -23,10 +23,13 @@
 //!    through the lock-free `runtime` `RwLock` and observe the
 //!    published `Loading` state instantly.
 //!
-//! 3. A `Mutex<HashMap<DiffId, Diff>>` of pending diffs. The renderer
-//!    accepts / rejects diffs by id; this mutex is uncontended in
-//!    practice (the renderer serialises its own user interactions
-//!    client-side) and is fully independent of sidecar lifecycle.
+//! 3. A `Mutex<HashMap<DiffId, PendingDiff>>` of pending diffs. The
+//!    renderer accepts / rejects diffs by id; this mutex is
+//!    uncontended in practice (the renderer serialises its own user
+//!    interactions client-side) and is fully independent of sidecar
+//!    lifecycle. Each entry pairs the diff with the project path it
+//!    targets so a later `ai_accept_diff` knows which project to
+//!    apply against — see Phase 11 task 10 in PROGRESS.md.
 //!
 //! ## Why three primitives instead of one
 //!
@@ -153,8 +156,29 @@ pub struct AiState {
     /// Spawn slot — `None` until the first `ai_plan` call. Dropping
     /// the [`SidecarHandle`] kills the `llama-server` child.
     handle_slot: Mutex<Option<SidecarHandle>>,
-    /// Diff registry; independent of sidecar lifecycle.
-    pending_diffs: Mutex<HashMap<DiffId, Diff>>,
+    /// Diff registry; independent of sidecar lifecycle. Each entry
+    /// holds the project path so [`crate::service::BridgeService::ai_accept_diff`]
+    /// can re-open the right encrypted package and route the
+    /// converted commands through the project's own command engine.
+    pending_diffs: Mutex<HashMap<DiffId, PendingDiff>>,
+}
+
+/// A diff registered by `ai_plan`, waiting for the renderer to call
+/// `ai_accept_diff` or `ai_reject_diff`. Bundles the [`Diff`] with
+/// the project path AND the scope it was planned against so the
+/// accept path can apply the resulting commands to the right project
+/// graph even if the renderer has since switched the active project
+/// (and so the AI audit log records the *planned* scope rather than
+/// the renderer's current view). The project path + scope are
+/// captured at insertion time \u2014 binding them to the diff (rather
+/// than reading the active project / scope at accept time) is what
+/// makes "plan on A in Design, switch to B in Draft, accept the A
+/// diff" deterministic.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingDiff {
+    pub project_path: String,
+    pub scope: aec_core::types::Scope,
+    pub diff: Diff,
 }
 
 /// Convenience: turn a `PoisonError<T>` (which is not `Send + 'static`
@@ -340,16 +364,32 @@ impl AiState {
     }
 
     /// Insert a diff into the pending map and return the assigned id.
-    pub fn insert_diff(&self, diff: Diff) -> Result<DiffId, AiStateError> {
+    /// The `project_path` is captured alongside the diff so the
+    /// later `ai_accept_diff` / `ai_reject_diff` calls (which only
+    /// take a `diff_id`) can route to the correct project package.
+    pub fn insert_diff(
+        &self,
+        project_path: impl Into<String>,
+        scope: aec_core::types::Scope,
+        diff: Diff,
+    ) -> Result<DiffId, AiStateError> {
         let id = diff.id.clone();
+        let pending = PendingDiff {
+            project_path: project_path.into(),
+            scope,
+            diff,
+        };
         self.pending_diffs
             .lock()
             .map_err(poisoned)?
-            .insert(id.clone(), diff);
+            .insert(id.clone(), pending);
         Ok(id)
     }
 
-    pub fn accept_diff(&self, id: &str) -> Result<Diff, AiStateError> {
+    /// Remove and return the pending diff for `id`. The returned
+    /// envelope carries both the `Diff` (for conversion to commands)
+    /// and the `project_path` (for opening the package).
+    pub fn accept_diff(&self, id: &str) -> Result<PendingDiff, AiStateError> {
         let key = DiffId::from_string(id.to_string())
             .map_err(|_| AiStateError::UnknownDiff(id.to_owned()))?;
         self.pending_diffs
@@ -359,7 +399,11 @@ impl AiState {
             .ok_or_else(|| AiStateError::UnknownDiff(id.to_owned()))
     }
 
-    pub fn reject_diff(&self, id: &str) -> Result<Diff, AiStateError> {
+    /// Symmetric counterpart to [`Self::accept_diff`] — same return
+    /// shape so the audit-logging path on the reject side can read
+    /// both the diff (for `payload_hash`) and the project path (for
+    /// the `<project>/audit/ai_audit.jsonl` destination).
+    pub fn reject_diff(&self, id: &str) -> Result<PendingDiff, AiStateError> {
         let key = DiffId::from_string(id.to_string())
             .map_err(|_| AiStateError::UnknownDiff(id.to_owned()))?;
         self.pending_diffs

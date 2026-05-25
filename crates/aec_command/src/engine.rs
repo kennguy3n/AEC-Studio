@@ -217,23 +217,38 @@ impl CommandEngine {
                 actual: self.active_scope.to_string(),
             });
         }
+        Self::compute_deltas_against_graph(&self.graph, kind)
+    }
+
+    /// Pure delta computation against an externally-supplied graph.
+    /// Used by [`Self::compute_deltas`] (with `&self.graph`) AND by
+    /// [`Self::execute_persistent_batch`] (with a forward-walking
+    /// staging clone) so each command in a batch validates against
+    /// the post-state of the previous commands.
+    ///
+    /// Does NOT enforce scope \u2014 the caller is expected to check
+    /// scope once for the whole batch.
+    fn compute_deltas_against_graph(
+        graph: &ProjectGraph,
+        kind: &CommandKind,
+    ) -> Result<Vec<EntityDelta>> {
         Ok(match kind {
             CommandKind::CreateWall(c) => {
                 c.validate()?;
                 vec![c.to_delta()]
             }
-            CommandKind::MoveWall(c) => vec![c.to_delta(&self.graph)?],
-            CommandKind::DeleteWall(c) => vec![c.to_delta(&self.graph)?],
+            CommandKind::MoveWall(c) => vec![c.to_delta(graph)?],
+            CommandKind::DeleteWall(c) => vec![c.to_delta(graph)?],
             CommandKind::CreateRoom(c) => {
                 c.validate()?;
                 vec![c.to_delta()]
             }
-            CommandKind::ModifyRoom(c) => vec![c.to_delta(&self.graph)?],
+            CommandKind::ModifyRoom(c) => vec![c.to_delta(graph)?],
             CommandKind::CreateFloor(c) => {
                 c.validate()?;
                 vec![c.to_delta()]
             }
-            CommandKind::ModifyFloor(c) => vec![c.to_delta(&self.graph)?],
+            CommandKind::ModifyFloor(c) => vec![c.to_delta(graph)?],
             CommandKind::PlaceDoor(c) => {
                 c.validate()?;
                 vec![c.to_delta()]
@@ -242,35 +257,35 @@ impl CommandEngine {
                 c.validate()?;
                 vec![c.to_delta()]
             }
-            CommandKind::MoveOpening(c) => vec![c.to_delta(&self.graph)?],
-            CommandKind::DeleteOpening(c) => vec![c.to_delta(&self.graph)?],
+            CommandKind::MoveOpening(c) => vec![c.to_delta(graph)?],
+            CommandKind::DeleteOpening(c) => vec![c.to_delta(graph)?],
             CommandKind::PaintMaterial(c) => {
                 c.validate()?;
-                vec![c.to_delta(&self.graph)?]
+                vec![c.to_delta(graph)?]
             }
-            CommandKind::SwapFinish(c) => vec![c.to_paint().to_delta(&self.graph)?],
+            CommandKind::SwapFinish(c) => vec![c.to_paint().to_delta(graph)?],
             CommandKind::SetLighting(c) => {
                 c.validate()?;
                 // Lighting preset is captured as audit-only state; no graph delta.
                 vec![]
             }
             CommandKind::AddLight(c) => vec![c.to_delta()],
-            CommandKind::RemoveLight(c) => vec![c.to_delta(&self.graph)?],
+            CommandKind::RemoveLight(c) => vec![c.to_delta(graph)?],
             CommandKind::SaveCamera(c) => {
                 c.validate()?;
                 vec![c.to_delta()]
             }
-            CommandKind::UpdateCamera(c) => vec![c.to_delta(&self.graph)?],
-            CommandKind::DeleteCamera(c) => vec![c.to_delta(&self.graph)?],
+            CommandKind::UpdateCamera(c) => vec![c.to_delta(graph)?],
+            CommandKind::DeleteCamera(c) => vec![c.to_delta(graph)?],
             CommandKind::PlaceFurniture(c) => {
                 c.validate()?;
                 vec![c.to_delta()]
             }
             CommandKind::MoveFurniture(c) => {
                 c.validate()?;
-                vec![c.to_delta(&self.graph)?]
+                vec![c.to_delta(graph)?]
             }
-            CommandKind::DeleteFurniture(c) => vec![c.to_delta(&self.graph)?],
+            CommandKind::DeleteFurniture(c) => vec![c.to_delta(graph)?],
         })
     }
 
@@ -355,8 +370,122 @@ impl CommandEngine {
         })
     }
 
+    /// Execute a *batch* of commands inside a single SQL transaction.
+    ///
+    /// Phase 11 task 10 introduced this entry point: when the AI's
+    /// `ai_accept_diff` converts a [`Diff`](aec_ai::Diff) into N
+    /// typed commands, the renderer expects "apply all of these as
+    /// one undo step" so a single Cmd-Z reverts the whole AI
+    /// suggestion. Calling [`Self::execute_persistent`] N times in
+    /// a loop would create N journal entries and N undo steps,
+    /// which is the wrong UX shape and also performs N SQL commits.
+    ///
+    /// Semantics:
+    /// * Every command in the batch must share the same scope. The
+    ///   first command's scope is taken as canonical; a mismatch
+    ///   returns [`CommandError::ScopeMismatch`] without touching
+    ///   either layer.
+    /// * Deltas from every command are computed and validated
+    ///   against a graph clone that walks forward through the
+    ///   batch -- so command #2's validation sees command #1's
+    ///   inserts. This lets a batch like
+    ///   `[create_wall_a, place_door_on_a]` validate cleanly.
+    /// * All deltas + all journal entries are persisted in **one**
+    ///   `rusqlite::Transaction`. Either every row commits or none
+    ///   do; there is no "applied the first two but not the third"
+    ///   state observable from outside this call.
+    /// * On commit success the in-memory graph + journal are
+    ///   updated in input order. The result vector is in input
+    ///   order too so callers can correlate `commands[i]` with
+    ///   `results[i]`.
+    ///
+    /// An empty batch is a no-op that returns an empty result
+    /// vector and does not open a transaction.
+    pub fn execute_persistent_batch(
+        &mut self,
+        commands: Vec<Command>,
+        conn: &mut rusqlite::Connection,
+    ) -> Result<Vec<CommandResult>> {
+        if commands.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Validate the entire batch BEFORE opening a transaction so
+        // a malformed payload doesn't waste a SQLite write lock.
+        let scope = commands[0].scope;
+        for cmd in &commands {
+            if cmd.scope != scope {
+                return Err(CommandError::ScopeMismatch {
+                    expected: scope.to_string(),
+                    actual: cmd.scope.to_string(),
+                });
+            }
+        }
+        // Pre-compute every command's deltas, validating each step
+        // against a forward-walking clone so command #2 can see
+        // command #1's inserts. We collect everything up front so
+        // the transaction window stays short -- SQLite's writer
+        // lock blocks every concurrent reader for the duration.
+        let mut staging = self.graph.clone();
+        let mut staged: Vec<(Command, Vec<EntityDelta>, Vec<EntityDelta>)> =
+            Vec::with_capacity(commands.len());
+        for cmd in commands {
+            let deltas = Self::compute_deltas_against_graph(&staging, &cmd.kind)?;
+            staging.validate_all(&deltas)?;
+            for d in &deltas {
+                staging.apply(d)?;
+            }
+            let inverse: Vec<EntityDelta> = deltas.iter().rev().map(EntityDelta::invert).collect();
+            staged.push((cmd, deltas, inverse));
+        }
+        // All commands validated against the same forward-walking
+        // staging graph. Now persist everything inside one tx.
+        let tx = conn.transaction()?;
+        for (cmd, deltas, inverse) in &staged {
+            for d in deltas {
+                crate::commands::ProjectGraph::persist_delta_in_tx(&tx, d)?;
+            }
+            let entry = JournalEntry {
+                command_id: cmd.command_id.clone(),
+                applied_at: cmd.ts,
+                scope: self.active_scope,
+                forward: deltas.clone(),
+                inverse: inverse.clone(),
+            };
+            crate::journal::UndoRedoJournal::persist_record_in_tx(&tx, &entry)?;
+        }
+        tx.commit()?;
+        // SQL is committed atomically. Mirror in-memory state and
+        // build per-command audit envelopes in the same order.
+        let mut results = Vec::with_capacity(staged.len());
+        for (cmd, deltas, inverse) in staged {
+            for d in &deltas {
+                self.graph
+                    .apply(d)
+                    .expect("validated above; apply cannot fail");
+            }
+            let envelope = self.audit.extend(
+                &cmd.command_id,
+                &serde_json::to_value(&cmd).unwrap_or(serde_json::Value::Null),
+            );
+            let entry = JournalEntry {
+                command_id: cmd.command_id.clone(),
+                applied_at: cmd.ts,
+                scope: self.active_scope,
+                forward: deltas.clone(),
+                inverse,
+            };
+            self.journal.record(entry);
+            results.push(CommandResult {
+                command_id: cmd.command_id,
+                applied: deltas,
+                audit: envelope,
+            });
+        }
+        Ok(results)
+    }
+
     /// Persistent counterpart to [`Self::undo`]. Same single-transaction
-    /// validate → SQL → commit → in-memory pipeline as
+    /// validate -> SQL -> commit -> in-memory pipeline as
     /// [`Self::execute_persistent`]: peek the top entry without
     /// removing it, validate the inverse deltas, write everything in
     /// one tx, commit, and only then move the in-memory journal stacks.
