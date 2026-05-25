@@ -2323,8 +2323,15 @@ pub struct RevisionTrackedEntityJs {
 }
 
 /// Create a tagged revision snapshot.
+///
+/// Routed through [`spawn_blocking_napi`] because the underlying
+/// service call opens the encrypted project package, reads the
+/// entire entity table to compute the tracked-entity list when the
+/// caller supplies none, and writes the snapshot file to disk — all
+/// blocking I/O that would otherwise stall the Electron main
+/// (libuv) thread on large projects.
 #[napi]
-pub fn deliver_create_revision(
+pub async fn deliver_create_revision(
     project_path: String,
     tag: String,
     description: String,
@@ -2340,51 +2347,70 @@ pub fn deliver_create_revision(
             })
             .collect()
     });
-    let rev =
-        with_service(|svc| svc.deliver_create_revision(&project_path, &tag, &description, caller))?;
-    let summary_json = serde_json::to_string(&rev).map_err(|e| {
-        Error::new(
-            Status::GenericFailure,
-            format!("deliver_create_revision: serialize: {e}"),
-        )
-    })?;
-    Ok(RevisionSummaryJs { summary_json })
+    spawn_blocking_napi(move || {
+        let rev = with_service(|svc| {
+            svc.deliver_create_revision(&project_path, &tag, &description, caller)
+        })?;
+        let summary_json = serde_json::to_string(&rev).map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("deliver_create_revision: serialize: {e}"),
+            )
+        })?;
+        Ok(RevisionSummaryJs { summary_json })
+    })
+    .await
 }
 
 /// List all revision snapshots in chronological order.
+///
+/// Routed through [`spawn_blocking_napi`] for the same reason as
+/// [`deliver_create_revision`]: enumerating revisions opens the
+/// project package and reads the on-disk snapshot index.
 #[napi]
-pub fn deliver_list_revisions(project_path: String) -> Result<Vec<RevisionSummaryJs>> {
-    let revs = with_service_ref_fallible(|svc| svc.deliver_list_revisions(&project_path))?;
-    revs.into_iter()
-        .map(|r| {
-            let summary_json = serde_json::to_string(&r).map_err(|e| {
-                Error::new(
-                    Status::GenericFailure,
-                    format!("deliver_list_revisions: serialize: {e}"),
-                )
-            })?;
-            Ok(RevisionSummaryJs { summary_json })
-        })
-        .collect()
+pub async fn deliver_list_revisions(project_path: String) -> Result<Vec<RevisionSummaryJs>> {
+    spawn_blocking_napi(move || {
+        let revs = with_service_ref_fallible(|svc| svc.deliver_list_revisions(&project_path))?;
+        revs.into_iter()
+            .map(|r| {
+                let summary_json = serde_json::to_string(&r).map_err(|e| {
+                    Error::new(
+                        Status::GenericFailure,
+                        format!("deliver_list_revisions: serialize: {e}"),
+                    )
+                })?;
+                Ok(RevisionSummaryJs { summary_json })
+            })
+            .collect()
+    })
+    .await
 }
 
 /// Diff two revisions.
+///
+/// Routed through [`spawn_blocking_napi`] because the comparison
+/// loads both snapshots from disk and walks the entity tables to
+/// classify each entity as added/removed/modified — work that grows
+/// linearly with project size.
 #[napi]
-pub fn deliver_compare_revisions(
+pub async fn deliver_compare_revisions(
     project_path: String,
     base_id: String,
     head_id: String,
 ) -> Result<RevisionDiffJs> {
-    let diff = with_service_ref_fallible(|svc| {
-        svc.deliver_compare_revisions(&project_path, &base_id, &head_id)
-    })?;
-    let diff_json = serde_json::to_string(&diff).map_err(|e| {
-        Error::new(
-            Status::GenericFailure,
-            format!("deliver_compare_revisions: serialize: {e}"),
-        )
-    })?;
-    Ok(RevisionDiffJs { diff_json })
+    spawn_blocking_napi(move || {
+        let diff = with_service_ref_fallible(|svc| {
+            svc.deliver_compare_revisions(&project_path, &base_id, &head_id)
+        })?;
+        let diff_json = serde_json::to_string(&diff).map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("deliver_compare_revisions: serialize: {e}"),
+            )
+        })?;
+        Ok(RevisionDiffJs { diff_json })
+    })
+    .await
 }
 
 fn hex_decode(s: &str) -> Option<Vec<u8>> {

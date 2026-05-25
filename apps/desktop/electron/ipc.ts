@@ -112,19 +112,33 @@ export function registerIpcHandlers(): void {
       withResolvedProjectPath(p, "draftSetLayerState"),
     );
   });
-  ipcMain.handle("draft:importDxf", async (_e, { path }) => {
-    assertString(path, "path");
-    return getBridge().draftImportDxf({
-      projectPath: getActiveProjectPath("draftImportDxf"),
-      dxfPath: path,
-    });
+  // DXF import / export use the same `withResolvedProjectPath` shape
+  // as the other `draft:*` handlers above. The renderer-facing preload
+  // signature is `importDxf({ dxfPath, projectPath? })`. If the caller
+  // supplies an explicit `projectPath` (e.g. a renderer test) it
+  // wins; otherwise the active-project tracker provides it. We
+  // additionally validate that `dxfPath` is a non-empty string so a
+  // missing field surfaces a typed error at the IPC boundary rather
+  // than as a NAPI string-conversion failure on the Rust side.
+  ipcMain.handle("draft:importDxf", async (_e, p) => {
+    assertObject(p, "params");
+    assertString((p as { dxfPath?: unknown }).dxfPath, "dxfPath");
+    return getBridge().draftImportDxf(
+      withResolvedProjectPath(p, "draftImportDxf") as {
+        projectPath: string;
+        dxfPath: string;
+      },
+    );
   });
-  ipcMain.handle("draft:exportDxf", async (_e, { path }) => {
-    assertString(path, "path");
-    return getBridge().draftExportDxf({
-      projectPath: getActiveProjectPath("draftExportDxf"),
-      dxfPath: path,
-    });
+  ipcMain.handle("draft:exportDxf", async (_e, p) => {
+    assertObject(p, "params");
+    assertString((p as { dxfPath?: unknown }).dxfPath, "dxfPath");
+    return getBridge().draftExportDxf(
+      withResolvedProjectPath(p, "draftExportDxf") as {
+        projectPath: string;
+        dxfPath: string;
+      },
+    );
   });
 
   // ----- BIM -----

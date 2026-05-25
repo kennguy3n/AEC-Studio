@@ -3424,7 +3424,7 @@ impl BridgeService {
                     commands.push(Command::user(CommandKind::DrawPrimitive(DrawPrimitive {
                         entity_id: EntityId::new(),
                         primitive: prim,
-                    })))
+                    })));
                 }
                 None => skipped += 1,
             }

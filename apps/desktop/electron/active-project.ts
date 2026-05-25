@@ -1,9 +1,9 @@
 /**
  * Active-project tracker for the Electron main process.
  *
- * The renderer's public `window.aec.*` API doesn't expose a project
- * path on every call — pages call `aec.deliver.listRevisions()` /
- * `aec.draft.importDxf(path)` etc. without threading the currently
+ * The renderer's public `window.aec.*` API doesn't always expose a
+ * project path on every call — pages call `aec.deliver.listRevisions()`
+ * or `aec.draft.importDxf({ dxfPath })` without threading the currently
  * open project's filesystem path. The Rust bridge service, however,
  * is per-project: every `draft.*` / `deliver.*` / `command.*` method
  * needs to know which encrypted SQLite database to open.

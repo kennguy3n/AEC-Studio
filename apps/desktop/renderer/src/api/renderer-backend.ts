@@ -143,7 +143,11 @@ export function rendererInProcessBackend(): AecApi {
       createSheet: async () => ({ sheetId: newId("sheet") }),
       setLayerState: async () => ({ ok: true }),
       importDxf: async () => ({ imported: 0 }),
-      exportDxf: async (p) => ({ exported: true, path: p }),
+      // The renderer-side `aec.draft.exportDxf` now takes the full
+      // bridge param object `{ dxfPath, projectPath? }` (matching the
+      // preload signature). Echo the supplied `dxfPath` so renderer
+      // tests can assert on the round-trip.
+      exportDxf: async (p) => ({ exported: true, path: p.dxfPath }),
     },
     bim: {
       importIfc: async (path) => ({

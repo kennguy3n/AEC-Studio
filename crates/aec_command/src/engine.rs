@@ -73,7 +73,7 @@ impl CommandEngine {
 
     /// Execute a command, journaling the inverse deltas for undo.
     pub fn execute(&mut self, cmd: Command) -> Result<CommandResult> {
-        let deltas = self.compute_deltas(&cmd.kind)?;
+        let deltas = self.compute_deltas(&cmd.kind, &self.graph)?;
         let applied = self.apply_deltas(&deltas)?;
         let inverse: Vec<EntityDelta> = applied.iter().rev().map(EntityDelta::invert).collect();
         let envelope = self.audit.extend(
@@ -99,7 +99,7 @@ impl CommandEngine {
 
     /// Return the deltas this command *would* produce without mutating.
     pub fn dry_run(&self, kind: &CommandKind) -> Result<Vec<EntityDelta>> {
-        self.compute_deltas(kind)
+        self.compute_deltas(kind, &self.graph)
     }
 
     /// Undo the most recently executed command.
@@ -210,7 +210,20 @@ impl CommandEngine {
         Ok(applied)
     }
 
-    fn compute_deltas(&self, kind: &CommandKind) -> Result<Vec<EntityDelta>> {
+    /// Compute the forward deltas a [`CommandKind`] would produce against
+    /// a caller-supplied graph view.
+    ///
+    /// Single-command callers ([`Self::execute`], [`Self::execute_persistent`],
+    /// [`Self::dry_run`]) pass `&self.graph`. The batch path
+    /// ([`Self::execute_persistent_batch`]) passes a forward-running
+    /// shadow clone so command `i` sees the post-state of commands
+    /// `0..i` — i.e. cross-command dependencies (e.g. one DXF command
+    /// creating a layer and a later one referencing that layer) resolve
+    /// correctly inside a batch.
+    ///
+    /// The scope-mismatch check stays on `self` because scope is engine
+    /// state, not graph state.
+    fn compute_deltas(&self, kind: &CommandKind, graph: &ProjectGraph) -> Result<Vec<EntityDelta>> {
         if kind.scope() != self.active_scope {
             return Err(CommandError::ScopeMismatch {
                 expected: kind.scope().to_string(),
@@ -222,18 +235,18 @@ impl CommandEngine {
                 c.validate()?;
                 vec![c.to_delta()]
             }
-            CommandKind::MoveWall(c) => vec![c.to_delta(&self.graph)?],
-            CommandKind::DeleteWall(c) => vec![c.to_delta(&self.graph)?],
+            CommandKind::MoveWall(c) => vec![c.to_delta(graph)?],
+            CommandKind::DeleteWall(c) => vec![c.to_delta(graph)?],
             CommandKind::CreateRoom(c) => {
                 c.validate()?;
                 vec![c.to_delta()]
             }
-            CommandKind::ModifyRoom(c) => vec![c.to_delta(&self.graph)?],
+            CommandKind::ModifyRoom(c) => vec![c.to_delta(graph)?],
             CommandKind::CreateFloor(c) => {
                 c.validate()?;
                 vec![c.to_delta()]
             }
-            CommandKind::ModifyFloor(c) => vec![c.to_delta(&self.graph)?],
+            CommandKind::ModifyFloor(c) => vec![c.to_delta(graph)?],
             CommandKind::PlaceDoor(c) => {
                 c.validate()?;
                 vec![c.to_delta()]
@@ -242,35 +255,35 @@ impl CommandEngine {
                 c.validate()?;
                 vec![c.to_delta()]
             }
-            CommandKind::MoveOpening(c) => vec![c.to_delta(&self.graph)?],
-            CommandKind::DeleteOpening(c) => vec![c.to_delta(&self.graph)?],
+            CommandKind::MoveOpening(c) => vec![c.to_delta(graph)?],
+            CommandKind::DeleteOpening(c) => vec![c.to_delta(graph)?],
             CommandKind::PaintMaterial(c) => {
                 c.validate()?;
-                vec![c.to_delta(&self.graph)?]
+                vec![c.to_delta(graph)?]
             }
-            CommandKind::SwapFinish(c) => vec![c.to_paint().to_delta(&self.graph)?],
+            CommandKind::SwapFinish(c) => vec![c.to_paint().to_delta(graph)?],
             CommandKind::SetLighting(c) => {
                 c.validate()?;
                 // Lighting preset is captured as audit-only state; no graph delta.
                 vec![]
             }
             CommandKind::AddLight(c) => vec![c.to_delta()],
-            CommandKind::RemoveLight(c) => vec![c.to_delta(&self.graph)?],
+            CommandKind::RemoveLight(c) => vec![c.to_delta(graph)?],
             CommandKind::SaveCamera(c) => {
                 c.validate()?;
                 vec![c.to_delta()]
             }
-            CommandKind::UpdateCamera(c) => vec![c.to_delta(&self.graph)?],
-            CommandKind::DeleteCamera(c) => vec![c.to_delta(&self.graph)?],
+            CommandKind::UpdateCamera(c) => vec![c.to_delta(graph)?],
+            CommandKind::DeleteCamera(c) => vec![c.to_delta(graph)?],
             CommandKind::PlaceFurniture(c) => {
                 c.validate()?;
                 vec![c.to_delta()]
             }
             CommandKind::MoveFurniture(c) => {
                 c.validate()?;
-                vec![c.to_delta(&self.graph)?]
+                vec![c.to_delta(graph)?]
             }
-            CommandKind::DeleteFurniture(c) => vec![c.to_delta(&self.graph)?],
+            CommandKind::DeleteFurniture(c) => vec![c.to_delta(graph)?],
 
             // ----- Draft scope -----
             CommandKind::DrawPrimitive(c) => {
@@ -279,7 +292,7 @@ impl CommandEngine {
             }
             CommandKind::EditTool(c) => {
                 c.validate()?;
-                c.to_deltas(&self.graph)?
+                c.to_deltas(graph)?
             }
             CommandKind::CreateSheet(c) => {
                 c.validate()?;
@@ -287,7 +300,7 @@ impl CommandEngine {
             }
             CommandKind::SetLayerState(c) => {
                 c.validate()?;
-                vec![c.to_delta(&self.graph)?]
+                vec![c.to_delta(graph)?]
             }
 
             // ----- Deliver scope -----
@@ -343,7 +356,7 @@ impl CommandEngine {
         cmd: Command,
         conn: &mut rusqlite::Connection,
     ) -> Result<CommandResult> {
-        let deltas = self.compute_deltas(&cmd.kind)?;
+        let deltas = self.compute_deltas(&cmd.kind, &self.graph)?;
         self.graph.validate_all(&deltas)?;
         let inverse: Vec<EntityDelta> = deltas.iter().rev().map(EntityDelta::invert).collect();
         let entry = JournalEntry {
@@ -422,7 +435,14 @@ impl CommandEngine {
         let mut per_command_deltas: Vec<Vec<EntityDelta>> = Vec::with_capacity(commands.len());
         let mut entries: Vec<JournalEntry> = Vec::with_capacity(commands.len());
         for cmd in &commands {
-            let deltas = self.compute_deltas(&cmd.kind)?;
+            // Compute against the forward-running shadow so command `i`
+            // sees the post-state of commands `0..i` — this is the
+            // cross-command-dependency guarantee documented in the
+            // method docs. Passing `&self.graph` here would silently
+            // break any command whose `to_delta` reads other entities
+            // (e.g. EditTool referencing a primitive created earlier
+            // in the same batch).
+            let deltas = self.compute_deltas(&cmd.kind, &shadow)?;
             shadow.validate_all(&deltas)?;
             for d in &deltas {
                 shadow
@@ -933,6 +953,50 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM entities", [], |r| r.get(0))
             .unwrap();
         assert_eq!(entity_count, 0);
+    }
+
+    #[test]
+    fn execute_persistent_batch_resolves_cross_command_dependencies() {
+        // Regression for the BUG-0001 finding: `compute_deltas` used to
+        // read from `self.graph`, which is never updated during the
+        // batch loop. A later command depending on an entity created by
+        // an earlier command in the *same* batch (e.g. EditTool::Move
+        // targeting a primitive just drawn by DrawPrimitive) would fail
+        // with EntityNotFound. After the fix, `compute_deltas` accepts
+        // an explicit `&ProjectGraph` and the batch path passes the
+        // forward-running shadow, so the dependency resolves.
+        use crate::commands::draft::{DrawPrimitive, EditOperation, EditTool};
+        use aec_cad::primitives::{Line, Primitive};
+        let mut conn = open_in_memory_persistent_db();
+        let mut e = CommandEngine::open(&conn, Scope::Draft).unwrap();
+        let id = EntityId::new();
+        let draw = Command::user(CommandKind::DrawPrimitive(DrawPrimitive {
+            entity_id: id.clone(),
+            primitive: Primitive::Line(Line::new("0", [0.0, 0.0], [10.0, 0.0])),
+        }));
+        let mv = Command::user(CommandKind::EditTool(EditTool {
+            operation: EditOperation::Move {
+                entity_ids: vec![id.clone()],
+                dx: 5.0,
+                dy: 5.0,
+            },
+        }));
+        let results = e
+            .execute_persistent_batch(vec![draw, mv], &mut conn)
+            .unwrap();
+        assert_eq!(results.len(), 2);
+        // Both commands persisted; both in-memory deltas applied.
+        assert_eq!(e.graph().len(), 1);
+        assert_eq!(e.undo_len(), 2);
+        // The moved primitive should be at the translated position.
+        let record = e.graph().get(&id).unwrap();
+        let dp = serde_json::from_value::<DrawPrimitive>(record.body.clone()).unwrap();
+        if let Primitive::Line(line) = dp.primitive {
+            assert_eq!(line.start, [5.0, 5.0]);
+            assert_eq!(line.end, [15.0, 5.0]);
+        } else {
+            panic!("expected Line primitive after Move");
+        }
     }
 
     #[test]
