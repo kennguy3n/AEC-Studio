@@ -2672,11 +2672,25 @@ impl BridgeService {
         //   3. re-acquire the guard briefly to register the resulting
         //      diff in `AiState::pending_diffs`
         //
-        // `SidecarTransport::clone` is cheap (it's an `Arc<Sidecar>`
-        // internally; the actual process handle is shared, not
-        // duplicated). The clone is purely a borrow-checker
-        // convenience — we don't want to hold `&mut guard` across the
-        // dispatch call.
+        // `SidecarTransport::clone` is cheap — the struct is just
+        // `{ port: u16, request_timeout: Duration }` (see
+        // `aec_ai::transport::SidecarTransport`), so cloning is a
+        // 12-byte memcpy. The owning `SidecarHandle` (which holds the
+        // child process) stays inside `AiState`; the transport handle
+        // we hand to the planner is a stateless dial-out descriptor
+        // that opens a fresh `TcpStream` per request. The clone here
+        // is purely a borrow-checker convenience so we can drop the
+        // mutex guard before the blocking dispatch.
+        //
+        // First-call note: on the first `ai_plan` of a session,
+        // `ensure_ready` synchronously spawns the sidecar and waits
+        // up to `DEFAULT_SPAWN_TIMEOUT` (30 s) for its `/health`
+        // probe — and the AI-state Mutex IS held for that window.
+        // Subsequent calls take the `else` branch of `ensure_ready`
+        // and finish in microseconds. Moving the spawn outside the
+        // lock would require splitting `AiState` into independently
+        // lockable pieces (runtime / handle / pending_diffs), which
+        // is out of scope for PR-V — see the architecture follow-up.
         let transport = {
             let mut guard = self.lock_ai_state()?;
             guard.ensure_ready(DEFAULT_SPAWN_TIMEOUT)?.clone()
@@ -2684,7 +2698,17 @@ impl BridgeService {
         let response = planner.dispatch(&request, &transport)?;
         let diff = DiffEngine::build(&response);
         let parsed = response.parsed.clone();
-        let entities = response.entities_modified;
+        // `entities_modified` reflects the *actual* number of
+        // operations the resulting diff will apply, derived from
+        // `DiffEngine::build` (which already knows the per-tool
+        // shape — `proposals[]`, `furniture_ids[]`, `polylines[]`,
+        // etc.). The planner-side `response.entities_modified`
+        // currently echoes the caller's *cap* (the
+        // `max_entities_modified` safety budget), so using it here
+        // would tell the renderer "this diff touches 16 entities"
+        // when the model actually emitted 2. Reporting the diff's
+        // own operation count keeps the field honest end-to-end.
+        let entities = u32::try_from(diff.operations.len()).unwrap_or(u32::MAX);
         let diff_id = {
             let mut guard = self.lock_ai_state()?;
             guard.insert_diff(diff)

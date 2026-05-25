@@ -1651,7 +1651,12 @@ pub struct AiRuntimeStatusJs {
     /// Populated only after a Failed transition. Always cleared on
     /// the next successful `Ready` transition.
     pub last_error: Option<String>,
-    /// Diff ids pending accept/reject. Empty after every cancel.
+    /// Diff ids the renderer has not yet accepted or rejected.
+    /// `ai_cancel_job` deliberately does NOT clear this list — it
+    /// only aborts the in-flight LLM completion. Pending diffs are
+    /// already-generated proposals that the user can still review
+    /// (accept / reject) after a cancel; the only way to drop them
+    /// is `ai_accept_diff` or `ai_reject_diff` on each one.
     pub pending_diff_ids: Vec<String>,
 }
 

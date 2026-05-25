@@ -107,6 +107,16 @@ impl AiState {
     ///
     /// On spawn failure the runtime transitions to `Failed` and the
     /// error is propagated; the next call retries the spawn.
+    ///
+    /// Between requests, the sidecar child may crash (OOM, segfault,
+    /// host-side `pkill`). We probe `SidecarHandle::try_exit_code`
+    /// before returning a transport so the next call sees a clean
+    /// `Failed` transition with an informative message instead of a
+    /// confusing connection-refused error from the next HTTP call.
+    /// If the probe detects an exited child, we drop the dead handle
+    /// and recursively spawn a fresh one (a single retry — if THAT
+    /// spawn also fails the runtime stays `Failed` and the error
+    /// surfaces to the caller as normal).
     pub fn ensure_ready(
         &mut self,
         spawn_timeout: Duration,
@@ -114,6 +124,23 @@ impl AiState {
         if matches!(self.runtime.state(), RuntimeState::Failed) {
             // Reset so a subsequent ensure_ready attempts to spawn again.
             self.runtime = SidecarRuntime::new(self.runtime.config().clone());
+        }
+        // Pre-flight crash check: if we have a handle but the child
+        // has exited (OOM / segfault / host `pkill`), drop the dead
+        // handle and fall through to the spawn path so the next
+        // `complete` call doesn't fail with a confusing connection-
+        // refused error. `try_exit_code` is non-blocking
+        // (`Child::try_wait`). The exit code is intentionally
+        // dropped here — by the time we observe it, the renderer's
+        // status pane has already moved on; we just want to respawn
+        // transparently. (A future improvement could record the
+        // exit code in a separate `last_exit_code` field on the
+        // runtime for diagnostics, but that's not in PR-V scope.)
+        if let Some(handle) = self.handle.as_mut() {
+            if handle.try_exit_code().is_some() {
+                self.handle = None;
+                self.runtime = SidecarRuntime::new(self.runtime.config().clone());
+            }
         }
         if self.handle.is_none() {
             self.runtime.begin_load();
