@@ -1108,11 +1108,18 @@ export const NATIVE_WIRED_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   // in-process fallback used to ship, so dev/prod browsing renders
   // identical cards. See `crates/aec_bridge/src/asset_state.rs`.
   "designListAssets",
-  // AI sidecar surface wired in Phase 10 PR-V. Backed by
-  // `BridgeService::ai_state` (`Mutex<AiState>`) which owns the
-  // sidecar handle + pending diff map. All endpoints route through
-  // the read side of the napi singleton's `RwLock` so they don't
-  // block status-pane polling while a plan is in flight.
+  // AI sidecar surface wired in Phase 10 PR-V and refactored in the
+  // async-napi follow-up. Backed by `BridgeService::ai_state`
+  // (`AiState` by value — interior mutability via per-piece locks:
+  // `RwLock<SidecarRuntime>` + `Mutex<Option<SidecarHandle>>` +
+  // `Mutex<HashMap<DiffId, Diff>>`) which owns the sidecar handle +
+  // pending diff map. All six methods are `#[napi] async fn` and
+  // route through `spawn_blocking_napi`, so the libuv main thread
+  // never blocks on sidecar I/O. Cold-spawn status polls observe
+  // the published `Loading` state in microseconds because
+  // `AiState::snapshot()` reads `runtime` + `pending_diffs` but
+  // deliberately does NOT touch `handle_slot`. See
+  // `crates/aec_bridge/src/ai_state.rs` module doc.
   "aiListTools",
   "aiPlan",
   "aiAcceptDiff",
