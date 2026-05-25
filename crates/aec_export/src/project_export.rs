@@ -648,6 +648,18 @@ pub fn write_project_package_zip(
 /// Walk `root` recursively, pushing every regular file's path
 /// (relative to `root`) into `out`. Output is sorted lexicographically
 /// so callers get a deterministic archive layout.
+///
+/// **Symlinks are rejected** rather than silently skipped. A
+/// `.aecstudio` project tree is created and managed exclusively
+/// by `ProjectPackage`, which never emits symlinks — if one is
+/// encountered here it was placed by the user (or by an external
+/// tool) and the right behaviour is to fail loudly, not to drop
+/// the file from the archive. The alternative (silently skipping
+/// non-`is_file()` entries on Unix) hides data loss: a project
+/// re-attached from the archive would silently be missing the
+/// linked file's content. On Windows, `file_type().is_file()`
+/// reports `false` for symlinks too, so this branch fires there
+/// as well — keeping the failure mode cross-platform.
 fn collect_files_sorted(
     root: &Path,
     dir: &Path,
@@ -659,6 +671,16 @@ fn collect_files_sorted(
     for entry in entries {
         let path = entry.path();
         let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            return Err(ProjectExportError::Invalid(format!(
+                "refusing to archive symlink at {} — \
+                 `.aecstudio` packages must contain only regular \
+                 files and directories so the archive can be \
+                 re-attached losslessly. Remove or replace the \
+                 symlink with its target before exporting.",
+                path.display()
+            )));
+        }
         if file_type.is_dir() {
             collect_files_sorted(root, &path, out)?;
         } else if file_type.is_file() {
@@ -666,6 +688,16 @@ fn collect_files_sorted(
                 .strip_prefix(root)
                 .map_err(|e| ProjectExportError::Invalid(format!("strip_prefix: {e}")))?;
             out.push(rel.to_path_buf());
+        } else {
+            // Defence-in-depth: an entry that's neither symlink,
+            // file, nor directory (FIFO, block device, socket on
+            // Unix) is equally suspect inside a project package.
+            return Err(ProjectExportError::Invalid(format!(
+                "refusing to archive non-regular file at {} — \
+                 `.aecstudio` packages must contain only regular \
+                 files and directories.",
+                path.display()
+            )));
         }
     }
     Ok(())

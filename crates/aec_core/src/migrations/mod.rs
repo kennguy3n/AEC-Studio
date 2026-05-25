@@ -40,6 +40,7 @@ use crate::error::{AecError, AecResult};
 
 pub mod v2_audit_chain;
 pub mod v3_undo_journal_scope;
+pub mod v4_components_natural_key;
 
 /// A forward-only DDL step that moves a database from
 /// `target - 1` to `target`. SQL is run inside the migration runner's
@@ -74,6 +75,7 @@ impl Migration {
         &[
             v2_audit_chain::V2_AUDIT_CHAIN,
             v3_undo_journal_scope::V3_UNDO_JOURNAL_SCOPE,
+            v4_components_natural_key::V4_COMPONENTS_NATURAL_KEY,
         ]
     }
 
@@ -399,11 +401,13 @@ mod tests {
         assert_eq!(exists, 1);
         // 2. Simulate a "legacy v1" database by clobbering the recorded
         //    schema_version back to 1 and rolling every post-v1 DDL
-        //    out: drop the v2 audit_chain table and the v3
-        //    `undo_journal.scope` column.
+        //    out: drop the v2 audit_chain table, the v3
+        //    `undo_journal.scope` column / index, and the v4
+        //    `idx_components_entity_kind` unique index.
         conn.execute_batch(
             "DROP TABLE audit_chain;
              DROP INDEX idx_undo_journal_scope;
+             DROP INDEX idx_components_entity_kind;
              ALTER TABLE undo_journal DROP COLUMN scope;",
         )
         .unwrap();

@@ -629,10 +629,30 @@ pub struct ProjectExportPackageResult {
 /// table was used. `details` carries per-entity assignments so the
 /// renderer can populate the property panel without a follow-up
 /// query.
+///
+/// **Counter semantics** (`classified` / `unchanged` / `skipped`):
+///
+/// * `classified` — entities whose database row was actually mutated
+///   by this call (a `kind` rewrite for IFC, a new or modified
+///   `components` row for Uniformat-II / OmniClass-21). This is the
+///   number the renderer should use to gate "Undo classify?" prompts
+///   or "N entities re-classified" toasts: it reflects real change.
+/// * `unchanged` — entities that matched the scheme's lookup table
+///   but whose database row already carried the target value, so no
+///   write was issued. Surfacing this separately lets the renderer
+///   distinguish "already-classified project, no-op rerun" from
+///   "nothing matched at all".
+/// * `skipped` — entities whose `kind` is not recognised by the
+///   scheme's lookup table at all (e.g. a custom `kind` no scheme
+///   maps). The renderer can warn about these.
+///
+/// `classified + unchanged + skipped == total_entities_walked` is the
+/// invariant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BimClassifyResult {
     pub scheme: String,
     pub classified: u32,
+    pub unchanged: u32,
     pub skipped: u32,
     pub details: Vec<BimClassifyAssignment>,
 }
@@ -1029,24 +1049,49 @@ impl RenderState {
 }
 
 /// Synthesise a deterministic `components.id` for an `aec/`-prefixed
-/// overlay row from `(entity_id, component_kind)`, then `INSERT OR
-/// REPLACE` the row's body. The deterministic key ensures repeated
-/// classification / property-set calls update the same row instead
-/// of accumulating orphans.
-fn upsert_classification_component(
+/// overlay row from `(entity_id, component_kind)`, then upsert the
+/// row's body — but only when the prior body (if any) differs from
+/// the proposed body. Returns `Ok(true)` if a write was issued,
+/// `Ok(false)` if the existing row already matched.
+///
+/// The deterministic `id` ensures repeated classification calls
+/// update the same row instead of accumulating orphans. The "only
+/// when changed" semantic exists so [`BridgeService::bim_classify`]
+/// can report a `classified` counter that reflects real database
+/// mutations — see [`BimClassifyResult`] for the contract. The
+/// comparison is done on the serialised JSON form (`to_string()`),
+/// which is what's stored, so any whitespace differences would
+/// register as a change (serde_json's serialiser is deterministic
+/// for the inputs we feed here).
+///
+/// Uniqueness on `(entity_id, kind)` is enforced by the v4 migration
+/// (`v4_components_natural_key`) so the `ON CONFLICT(entity_id,
+/// kind)` clause is guaranteed to match at most one row.
+fn upsert_classification_component_if_changed(
     tx: &Transaction<'_>,
     entity_id: &str,
     component_kind: &str,
     body: &serde_json::Value,
-) -> rusqlite::Result<()> {
+) -> rusqlite::Result<bool> {
+    let new_body = body.to_string();
+    let existing: Option<String> = tx
+        .query_row(
+            "SELECT body FROM components WHERE entity_id = ?1 AND kind = ?2",
+            params![entity_id, component_kind],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?;
+    if existing.as_deref() == Some(new_body.as_str()) {
+        return Ok(false);
+    }
     let comp_id = format!("comp_{}_{}", entity_id, component_kind.replace('/', "_"));
     tx.execute(
         "INSERT INTO components(id, entity_id, kind, body) \
          VALUES (?1, ?2, ?3, ?4) \
-         ON CONFLICT(id) DO UPDATE SET body = excluded.body",
-        params![comp_id, entity_id, component_kind, body.to_string()],
+         ON CONFLICT(entity_id, kind) DO UPDATE SET id = excluded.id, body = excluded.body",
+        params![comp_id, entity_id, component_kind, new_body],
     )?;
-    Ok(())
+    Ok(true)
 }
 
 impl BridgeService {
@@ -1977,6 +2022,7 @@ impl BridgeService {
 
         let mut details: Vec<BimClassifyAssignment> = Vec::with_capacity(entities.len());
         let mut classified: u32 = 0;
+        let mut unchanged: u32 = 0;
         let mut skipped: u32 = 0;
         let now = chrono::Utc::now().to_rfc3339();
 
@@ -1989,13 +2035,21 @@ impl BridgeService {
             match scheme {
                 aec_bim::classification_tables::ClassificationScheme::Ifc => {
                     let tag = ifc_class.ifc_tag().to_string();
-                    if tag != *kind {
+                    // `classified` is the **change** count, not the
+                    // walk-progress count: only increment when the
+                    // DB actually moves, so a renderer using it to
+                    // gate "Undo classify?" prompts sees the right
+                    // value on a re-run of an already-classified
+                    // project (which is a no-op).
+                    if tag == *kind {
+                        unchanged += 1;
+                    } else {
                         tx.execute(
                             "UPDATE entities SET kind = ?1, updated_at = ?2 WHERE id = ?3",
                             params![tag, now, id],
                         )?;
+                        classified += 1;
                     }
-                    classified += 1;
                     details.push(BimClassifyAssignment {
                         entity_id: id.clone(),
                         code: tag,
@@ -2016,8 +2070,23 @@ impl BridgeService {
                         "level": code.level,
                         "source": "auto",
                     });
-                    upsert_classification_component(&tx, id, component_kind, &body)?;
-                    classified += 1;
+                    // Same change-count semantic as the IFC branch:
+                    // if a prior `components` row for this
+                    // (entity_id, kind) already carries the same
+                    // body, the upsert is a no-op and we don't
+                    // count it. Querying first costs one extra
+                    // SELECT but lets the renderer trust
+                    // `classified`.
+                    if upsert_classification_component_if_changed(
+                        &tx,
+                        id,
+                        component_kind,
+                        &body,
+                    )? {
+                        classified += 1;
+                    } else {
+                        unchanged += 1;
+                    }
                     details.push(BimClassifyAssignment {
                         entity_id: id.clone(),
                         code: code.code.to_string(),
@@ -2038,8 +2107,16 @@ impl BridgeService {
                         "level": code.level,
                         "source": "auto",
                     });
-                    upsert_classification_component(&tx, id, component_kind, &body)?;
-                    classified += 1;
+                    if upsert_classification_component_if_changed(
+                        &tx,
+                        id,
+                        component_kind,
+                        &body,
+                    )? {
+                        classified += 1;
+                    } else {
+                        unchanged += 1;
+                    }
                     details.push(BimClassifyAssignment {
                         entity_id: id.clone(),
                         code: code.code.to_string(),
@@ -2060,6 +2137,7 @@ impl BridgeService {
         Ok(BimClassifyResult {
             scheme: scheme.as_str().into(),
             classified,
+            unchanged,
             skipped,
             details,
         })
@@ -2155,7 +2233,7 @@ impl BridgeService {
         tx.execute(
             "INSERT INTO components(id, entity_id, kind, body) \
              VALUES (?1, ?2, ?3, ?4) \
-             ON CONFLICT(id) DO UPDATE SET body = excluded.body",
+             ON CONFLICT(entity_id, kind) DO UPDATE SET id = excluded.id, body = excluded.body",
             params![comp_id, entity_id, component_kind, new_body.to_string()],
         )?;
         tx.commit()?;
@@ -4978,9 +5056,54 @@ END-ISO-10303-21;\n";
         seed_one_wall(&mut s, &summary);
         let first = s.bim_classify(&summary.path, "uniformat-ii").unwrap();
         let second = s.bim_classify(&summary.path, "uniformat-ii").unwrap();
+        // The second call must see exactly the same set of
+        // recognised entities (so `details` is the same length)
+        // but no new database mutations (so `classified` is now
+        // 0 and `unchanged` carries the count). This is the
+        // "change-count" semantic of `classified`: it tracks the
+        // delta against the prior state, not the walk size.
         assert_eq!(
-            first.classified, second.classified,
-            "second call must produce the same classification count"
+            first.details.len(),
+            second.details.len(),
+            "details rows must be stable across reruns"
+        );
+        assert!(
+            first.classified > 0,
+            "first call should report real mutations"
+        );
+        assert_eq!(
+            second.classified, 0,
+            "second call must report zero new mutations"
+        );
+        assert_eq!(
+            second.unchanged,
+            first.classified,
+            "every previously-classified entity must show up as `unchanged` on the rerun"
+        );
+    }
+
+    #[test]
+    fn bim_classify_ifc_idempotent_no_op_reports_unchanged() {
+        let (mut s, _g) = service();
+        let summary = s
+            .project_create_from_template("interior.apartment", "Idempotent-IFC")
+            .unwrap();
+        seed_one_wall(&mut s, &summary);
+        let first = s.bim_classify(&summary.path, "ifc").unwrap();
+        let second = s.bim_classify(&summary.path, "ifc").unwrap();
+        // First IFC call rewrites `entities.kind` from "wall" to
+        // "IfcWall" — that's a real DB change. Second call sees
+        // every entity already at `IfcWall` and must report it
+        // as `unchanged`, not `classified`.
+        assert!(first.classified > 0, "first IFC call must mutate");
+        assert_eq!(
+            second.classified, 0,
+            "second IFC call must not double-count already-IFC kinds"
+        );
+        assert_eq!(
+            second.unchanged,
+            first.classified,
+            "every IFC-rewritten entity must be `unchanged` on the rerun"
         );
     }
 

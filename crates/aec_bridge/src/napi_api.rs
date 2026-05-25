@@ -1148,14 +1148,25 @@ impl From<crate::service::BimClassifyAssignment> for BimClassifyAssignmentJs {
 }
 
 /// JS-facing result of [`bim_classify`]. Mirrors the renderer's
-/// `BimClassifyResult` interface — `classified` is the count of
-/// rows touched, `skipped` is the count of entities with no
-/// matching code in the requested scheme, and `details` carries
-/// the per-entity assignments.
+/// `BimClassifyResult` interface.
+///
+/// See [`crate::service::BimClassifyResult`] for the full counter
+/// contract; in summary:
+/// * `classified` — entities whose DB row was actually modified
+///   (the count the renderer should use for "Undo classify?" /
+///   "N entities re-classified" toasts).
+/// * `unchanged` — entities the scheme recognised but whose row
+///   already carried the target value (a no-op re-run).
+/// * `skipped` — entities whose `kind` wasn't recognised by the
+///   scheme's lookup table at all.
+///
+/// `details` carries one row per *recognised* entity (i.e. one
+/// row per entity contributing to `classified + unchanged`).
 #[napi(object)]
 pub struct BimClassifyResultJs {
     pub scheme: String,
     pub classified: u32,
+    pub unchanged: u32,
     pub skipped: u32,
     pub details: Vec<BimClassifyAssignmentJs>,
 }
@@ -1165,6 +1176,7 @@ impl From<crate::service::BimClassifyResult> for BimClassifyResultJs {
         Self {
             scheme: r.scheme,
             classified: r.classified,
+            unchanged: r.unchanged,
             skipped: r.skipped,
             details: r.details.into_iter().map(Into::into).collect(),
         }
@@ -1176,17 +1188,20 @@ impl From<crate::service::BimClassifyResult> for BimClassifyResultJs {
 /// `"uniformat-ii"`, `"omniclass-21"`. Routes through
 /// [`crate::service::BridgeService::bim_classify`].
 ///
-/// Routed through `with_service` (the write-lock helper) rather than
-/// `with_service_ref_fallible` because `bim_classify` mutates the
-/// project's SQLite DB via `UPDATE entities` (IFC scheme) and
-/// `INSERT INTO components` (Uniformat/OmniClass schemes). Even
-/// though `BridgeService` itself is not mutated, two concurrent
-/// classifications on the same project would race the underlying
-/// SQLCipher writes and could surface `SQLITE_BUSY`. The write lock
-/// serialises them at the bridge boundary.
+/// Routed through `with_service_ref_fallible` (read lock) because
+/// `bim_classify` only mutates the project's own SQLite DB — the
+/// `BridgeService` singleton is NOT written. Each call opens a
+/// fresh `ProjectPackage::open_with_master_key_and_database`
+/// connection, so concurrent classifications against different
+/// projects don't share a connection. Concurrent classifications
+/// against the *same* project are serialised by SQLite's WAL-mode
+/// busy-timeout (set by `bim_classify` itself), not the bridge-wide
+/// `RwLock`. This keeps the read lock free for concurrent status
+/// polls (`runtimeStatus`, `renderListJobs`, etc.) during a
+/// potentially long classification walk.
 #[napi]
 pub fn bim_classify(project_path: String, scheme: String) -> Result<BimClassifyResultJs> {
-    with_service(move |svc| svc.bim_classify(&project_path, &scheme)).map(Into::into)
+    with_service_ref_fallible(move |svc| svc.bim_classify(&project_path, &scheme)).map(Into::into)
 }
 
 /// JS-facing result of [`bim_set_property`]. Mirrors the
@@ -1218,11 +1233,14 @@ impl From<crate::service::BimSetPropertyResult> for BimSetPropertyResultJs {
 /// entities). Routes through
 /// [`crate::service::BridgeService::bim_set_property`].
 ///
-/// Routed through `with_service` (write lock) because the method
-/// mutates the project's SQLite DB via `INSERT INTO components ON
-/// CONFLICT`. Same reasoning as [`bim_classify`] above — the write
-/// lock serialises concurrent property edits at the bridge boundary
-/// so they don't race the underlying SQLCipher write.
+/// Routed through `with_service_ref_fallible` (read lock) for the
+/// same reasons as [`bim_classify`]: the `BridgeService` itself is
+/// NOT mutated (the writes go to the project's SQLite DB, not to
+/// the singleton), and each call opens its own DB connection.
+/// Concurrent property edits on the same project are serialised
+/// by SQLite's WAL-mode busy-timeout, not by the bridge-wide
+/// `RwLock`. This keeps read-only status polls responsive during
+/// a batch property update.
 ///
 /// Property edits **bypass** the [`crate::service::BridgeService`]
 /// command engine, so they do **not** participate in undo/redo at
@@ -1240,7 +1258,7 @@ pub fn bim_set_property(
     key: String,
     value: String,
 ) -> Result<BimSetPropertyResultJs> {
-    with_service(move |svc| svc.bim_set_property(&project_path, &entity_id, &pset, &key, &value))
+    with_service_ref_fallible(move |svc| svc.bim_set_property(&project_path, &entity_id, &pset, &key, &value))
         .map(Into::into)
 }
 

@@ -24,6 +24,39 @@ use aec_core::types::EntityId;
 use crate::commands::{EntityDelta, EntityRecord, ProjectGraph};
 use crate::error::{CommandError, CommandResult};
 
+/// Recognise an entity's `kind` field as referring to a piece of
+/// furniture, regardless of which classification scheme has been
+/// applied to it.
+///
+/// `PlaceFurniture` creates entities with `kind = "furniture"`.
+/// `BridgeService::bim_classify` with `scheme = "ifc"` then rewrites
+/// `entities.kind` to the IFC-aligned class name returned by
+/// [`aec_bim::classification_tables::classify_kind`] — `"furniture"`
+/// maps to `IfcFurniture`, and `"furnishing_element"` maps to
+/// `IfcFurnishingElement`. Strict equality against the literal
+/// `"furniture"` would therefore reject every `MoveFurniture` /
+/// `DeleteFurniture` issued AFTER a project-wide IFC classification
+/// pass (a realistic flow: place → classify → reposition → ERROR).
+///
+/// Accept all three known representations. Adding a new
+/// classification scheme that emits a different `kind` for furniture
+/// requires extending this helper — `classify_kind` and this matcher
+/// are intentionally co-located conceptually so the round-trip is
+/// visible at PR-review time.
+///
+/// **Why not store the original kind in a component instead of
+/// mutating `entities.kind`?** The IFC scheme deliberately rewrites
+/// `entities.kind` so downstream consumers (BIM exporters, the
+/// Uniformat / OmniClass lookup chain in
+/// `aec_bim::classification_tables`) see a single canonical class
+/// name. Carrying both a "physical" kind and a "classification"
+/// kind would double the surface area of every consumer for a
+/// modest gain. Broadening the guard here keeps the data shape
+/// simple and the command layer permissive about classified kinds.
+pub fn is_furniture_kind(kind: &str) -> bool {
+    matches!(kind, "furniture" | "IfcFurniture" | "IfcFurnishingElement")
+}
+
 /// Place a furniture instance referencing a catalogue asset from the
 /// `aec_assets` library.
 ///
@@ -157,11 +190,11 @@ impl MoveFurniture {
         let record = graph
             .get(&self.entity_id)
             .ok_or_else(|| CommandError::EntityNotFound(self.entity_id.to_string()))?;
-        if record.kind != "furniture" {
+        if !is_furniture_kind(&record.kind) {
             return Err(CommandError::InvalidArguments {
                 tool: "design.move_furniture".into(),
                 reason: format!(
-                    "target entity {} is kind={}; expected `furniture`",
+                    "target entity {} is kind={}; expected `furniture` (or its IFC equivalent)",
                     self.entity_id, record.kind
                 ),
             });
@@ -202,11 +235,11 @@ impl DeleteFurniture {
         let record = graph
             .get(&self.entity_id)
             .ok_or_else(|| CommandError::EntityNotFound(self.entity_id.to_string()))?;
-        if record.kind != "furniture" {
+        if !is_furniture_kind(&record.kind) {
             return Err(CommandError::InvalidArguments {
                 tool: "design.delete_furniture".into(),
                 reason: format!(
-                    "target entity {} is kind={}; expected `furniture`",
+                    "target entity {} is kind={}; expected `furniture` (or its IFC equivalent)",
                     self.entity_id, record.kind
                 ),
             });
@@ -394,5 +427,85 @@ mod tests {
         assert!(matches!(delta, EntityDelta::Delete { .. }));
         g.apply(&delta).unwrap();
         assert!(g.get(&id).is_none());
+    }
+
+    /// Regression: a furniture entity whose `kind` has been rewritten by
+    /// `BridgeService::bim_classify(scheme = "ifc")` to `"IfcFurniture"`
+    /// must still be a valid target for `MoveFurniture` and
+    /// `DeleteFurniture`. Reported by Devin Review PR-W round 2 as a
+    /// real bug: the prior strict equality `record.kind != "furniture"`
+    /// guard would reject the move/delete and break the realistic flow
+    /// place → classify → reposition.
+    #[test]
+    fn move_furniture_accepts_ifc_classified_furniture_entity() {
+        let mut g = ProjectGraph::new();
+        let id = EntityId::new();
+        // Simulate the post-IFC-classify state directly: place an
+        // entity whose kind is already `"IfcFurniture"`. `ProjectGraph`
+        // treats `kind` as opaque text — there's no enforcement of
+        // which kinds may appear, so this mirrors what
+        // `bim_classify`'s `UPDATE entities SET kind = ?` produces.
+        let body = serde_json::to_value(placement(id.clone(), "asset_chair_oak_01")).unwrap();
+        g.apply(&EntityDelta::Create {
+            record: EntityRecord {
+                id: id.clone(),
+                kind: "IfcFurniture".into(),
+                body,
+                parent: None,
+            },
+        })
+        .unwrap();
+        let mv = MoveFurniture {
+            entity_id: id,
+            position_mm: [3000.0, 4000.0, 0.0],
+            rotation_yaw_deg: 45.0,
+            scale_override: None,
+        };
+        let delta = mv.to_delta(&g).expect(
+            "MoveFurniture must accept a furniture entity whose kind was \
+             rewritten to IfcFurniture by bim_classify(scheme=ifc)",
+        );
+        assert!(matches!(delta, EntityDelta::Update { .. }));
+    }
+
+    #[test]
+    fn delete_furniture_accepts_ifc_furnishing_element_kind() {
+        // `aec_bim::classification_tables::classify_kind` maps
+        // `"furnishing_element"` → `IfcFurnishingElement`; the helper
+        // must accept that too so any user-authored
+        // `furnishing_element` entity survives an IFC classify pass.
+        let mut g = ProjectGraph::new();
+        let id = EntityId::new();
+        g.apply(&EntityDelta::Create {
+            record: EntityRecord {
+                id: id.clone(),
+                kind: "IfcFurnishingElement".into(),
+                body: serde_json::json!({}),
+                parent: None,
+            },
+        })
+        .unwrap();
+        let delta = DeleteFurniture {
+            entity_id: id.clone(),
+        }
+        .to_delta(&g)
+        .expect("DeleteFurniture must accept IfcFurnishingElement");
+        assert!(matches!(delta, EntityDelta::Delete { .. }));
+    }
+
+    #[test]
+    fn is_furniture_kind_recognises_all_three_canonical_forms() {
+        assert!(is_furniture_kind("furniture"));
+        assert!(is_furniture_kind("IfcFurniture"));
+        assert!(is_furniture_kind("IfcFurnishingElement"));
+        // Anything else — walls, rooms, cameras, lowercase IFC
+        // variants — must NOT match. The case-sensitive match is
+        // deliberate: `aec_bim::classify_kind`'s output is exactly
+        // `IfcXxx` (PascalCase) and the SQLite column stores that
+        // verbatim, so accepting `ifcfurniture` would only mask bugs.
+        assert!(!is_furniture_kind("wall"));
+        assert!(!is_furniture_kind("ifcfurniture"));
+        assert!(!is_furniture_kind("IFC_FURNITURE"));
+        assert!(!is_furniture_kind(""));
     }
 }

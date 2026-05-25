@@ -730,15 +730,31 @@ export interface BimClassifyAssignment {
 /**
  * Result of `bimClassify` (PR-W Phase 3). Field-for-field mirror
  * of `BimClassifyResultJs` in `crates/aec_bridge/src/napi_api.rs`.
- * `scheme` echoes the canonical scheme name; `classified` is the
- * count of rows touched; `skipped` is the count of entities with
- * no matching code in the requested scheme; `details` carries the
- * per-entity assignments so the renderer's property panel can
- * populate without a follow-up `projectGraphList` call.
+ *
+ * Counter semantics:
+ * - `classified` — entities whose database row was actually
+ *   modified by this call (the count the renderer should use to
+ *   gate "Undo classify?" prompts or "N entities re-classified"
+ *   toasts). Re-running classify on an already-classified
+ *   project will report `classified === 0` and
+ *   `unchanged === <total recognised>`.
+ * - `unchanged` — entities that matched the scheme's lookup
+ *   table but whose row already carried the target value, so no
+ *   write was issued. Lets the renderer distinguish "already-
+ *   classified project, no-op rerun" from "nothing matched at
+ *   all".
+ * - `skipped` — entities whose `kind` was not recognised by the
+ *   scheme's lookup table at all.
+ *
+ * `details` carries one row per *recognised* entity (i.e. one
+ * row per entity contributing to `classified + unchanged`), so
+ * the property panel can populate without a follow-up
+ * `projectGraphList` call.
  */
 export interface BimClassifyResult {
   scheme: string;
   classified: number;
+  unchanged: number;
   skipped: number;
   details: BimClassifyAssignment[];
 }
@@ -1837,18 +1853,35 @@ export function inProcessBackend(): BridgeBackend {
       // In-process stub: echo the requested scheme + zero
       // assignments. The N-API path (PR-W) walks the project
       // graph and emits real Uniformat / OmniClass codes.
-      const scheme = typeof p.scheme === "string" ? (p.scheme as string) : "ifc";
-      return { scheme, classified: 0, skipped: 0, details: [] };
+      //
+      // Argument validation mirrors the native adapter
+      // (`requireStringField` above) so dev-mode hits the same
+      // "missing required string field 'scheme'" error the
+      // packaged build would — preventing a footgun where a
+      // renderer caller forgets `scheme` and silently gets the
+      // "ifc" default in dev but a hard throw in prod.
+      const scheme = requireStringField(p, "bimClassify", "scheme");
+      requireProjectPath(p, "bimClassify");
+      return { scheme, classified: 0, unchanged: 0, skipped: 0, details: [] };
     },
     async bimSetProperty(p) {
       // In-process stub: echo back the args with a `null`
       // previousValue. The N-API path (PR-W) actually persists
       // the value into the project graph's `aec/property/<pset>`
       // overlay component.
+      //
+      // Like `bimClassify` above, validate against
+      // `requireStringField` for dev/prod parity rather than
+      // silently coercing missing fields to `""`.
+      const entityId = requireStringField(p, "bimSetProperty", "entityId");
+      const pset = requireStringField(p, "bimSetProperty", "pset");
+      const key = requireStringField(p, "bimSetProperty", "key");
+      requireStringField(p, "bimSetProperty", "value");
+      requireProjectPath(p, "bimSetProperty");
       return {
-        entityId: typeof p.entityId === "string" ? (p.entityId as string) : "",
-        pset: typeof p.pset === "string" ? (p.pset as string) : "",
-        key: typeof p.key === "string" ? (p.key as string) : "",
+        entityId,
+        pset,
+        key,
         previousValue: null,
       };
     },
