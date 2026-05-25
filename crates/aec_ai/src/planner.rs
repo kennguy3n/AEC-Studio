@@ -154,7 +154,6 @@ impl<'a> ToolPlanner<'a> {
 /// `pub` for visibility from the bridge integration tests; the prompt
 /// shape is part of the wire contract with the sidecar.
 pub fn build_prompt(schema: &ToolSchema, request: &PlanRequest) -> String {
-    use std::fmt::Write as _;
     let mut buf = String::with_capacity(256 + request.prompt.len());
     buf.push_str("[SYSTEM]\n");
     buf.push_str("You are AEC Studio's local design assistant. Emit a single JSON object that satisfies the grammar for the requested tool. Do not include explanations.\n\n");
@@ -162,9 +161,11 @@ pub fn build_prompt(schema: &ToolSchema, request: &PlanRequest) -> String {
     buf.push_str(schema.name.as_str());
     buf.push('\n');
     buf.push_str("[SCOPE]\n");
-    // `write!` on a `String` never fails; using it (vs. `push_str(&format!(...))`)
-    // avoids the intermediate allocation that clippy::format_push_string flags.
-    let _ = write!(buf, "{:?}", request.scope);
+    // Use the canonical lowercase wire encoding (`design` / `draft` / `bim` / ...)
+    // rather than the derived `Debug` PascalCase. The `[TOOL]` line above is
+    // snake_case (`style_assistant`); using `Debug` here would emit `Design`,
+    // mixing two casing conventions inside one prompt for no reason.
+    buf.push_str(request.scope.as_str());
     buf.push('\n');
     buf.push_str("[MAX_ENTITIES_MODIFIED]\n");
     buf.push_str(&request.max_entities_modified.to_string());
