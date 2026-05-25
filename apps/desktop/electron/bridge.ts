@@ -1368,7 +1368,7 @@ function adaptNative(n: NativeApi): BridgeBackend {
     // Rust enum: a renderer build that ships an out-of-date `AI_TOOLS`
     // constant will still see the native truth in production.
     aiListTools: async () =>
-      n.ai_list_tools() as AiTool[],
+      (await n.ai_list_tools()) as AiTool[],
     // `aiPlan` accepts a loose `Record<string, unknown>` for
     // back-compat with the in-process fallback. We extract `tool`,
     // `scope`, `prompt`, `context`, and `max_entities_modified`
@@ -1448,29 +1448,35 @@ function adaptNative(n: NativeApi): BridgeBackend {
       return { diffId: result.diffId, parsed };
     },
     aiAcceptDiff: async (diffId) => {
-      // Invoke for its side effect (remove from pending map). The TS
-      // contract is the literal `{ accepted: true }`; the native
-      // `{ ok, diff_id }` is intentionally not surfaced because the
-      // renderer's Accept button is idempotent and doesn't need the
-      // echo.
-      n.ai_accept_diff(diffId);
+      // Awaited so the native Promise's rejection (e.g. unknown
+      // diff id) surfaces here as a real `throw` rather than an
+      // unhandled rejection on a later tick. The TS contract is the
+      // literal `{ accepted: true }`; the native `{ ok, diff_id }`
+      // is intentionally not surfaced because the renderer's
+      // Accept button is idempotent and doesn't need the echo.
+      await n.ai_accept_diff(diffId);
       return { accepted: true };
     },
     aiRejectDiff: async (diffId) => {
-      // Same idempotency contract as `aiAcceptDiff`.
-      n.ai_reject_diff(diffId);
+      // Same idempotency / error-propagation contract as
+      // `aiAcceptDiff`.
+      await n.ai_reject_diff(diffId);
       return { rejected: true };
     },
     aiCancelJob: async (jobId) => {
       // `job_id` is accepted by the native side for forward
       // compatibility but currently ignored — there's only one
       // in-flight plan at a time. The TS contract collapses to the
-      // literal `{ cancelled: true }`.
-      n.ai_cancel_job(jobId);
+      // literal `{ cancelled: true }`. Awaited so the renderer
+      // knows the cancel actually landed (during a cold-spawn this
+      // can take up to `DEFAULT_SPAWN_TIMEOUT`; the napi side runs
+      // it on the tokio blocking thread pool so the JS event loop
+      // stays free during the wait).
+      await n.ai_cancel_job(jobId);
       return { cancelled: true };
     },
     aiRuntimeStatus: async () => {
-      const r = n.ai_runtime_status() as {
+      const r = (await n.ai_runtime_status()) as {
         state: string;
         lastError: string | null;
         pendingDiffIds: string[];

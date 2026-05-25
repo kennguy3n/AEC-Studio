@@ -1,24 +1,65 @@
 //! Process-wide AI runtime state held by [`crate::service::BridgeService`].
 //!
-//! Owns three pieces of state behind a single [`Mutex`]:
+//! Owns three pieces of state, each behind its **own** synchronisation
+//! primitive so that the JS-facing AI surface stays responsive even
+//! while a cold-spawn is in flight:
 //!
-//! 1. A [`SidecarRuntime`] state machine (Idle / Loading / Ready / Failed).
-//! 2. An optional [`SidecarHandle`] — the spawned `llama-server` child
-//!    process + its loopback transport. `None` until the first
-//!    `ai_plan` call lazily spawns it.
-//! 3. A `HashMap<DiffId, Diff>` of pending diffs. The renderer accepts /
-//!    rejects diffs by id; the bridge keeps the in-memory diff alive
-//!    until accept/reject so the command engine has a chance to convert
-//!    it into a real apply.
+//! 1. A [`SidecarRuntime`] state machine (Idle / Loading / Ready / Failed)
+//!    behind an [`RwLock`]. The state is mutated briefly during
+//!    [`AiState::ensure_ready`] (`begin_load` → `mark_ready` /
+//!    `mark_failed`) and read by [`AiState::snapshot`] on every
+//!    `ai_runtime_status` poll. The renderer polls status every ~500 ms
+//!    while a plan is in flight, so this is the contended read path —
+//!    [`RwLock`] lets every poll proceed concurrently with every other
+//!    poll, and only briefly blocks during a state transition.
 //!
-//! The same single-`Mutex` rationale that applies to `RenderState` applies
-//! here: every AI endpoint touches at least two of (runtime / handle /
-//! pending diffs), and the renderer never benefits from "the diff map is
-//! free while a completion is in flight" because a single AI panel
-//! serialises its own user interactions client-side. See `service.rs`
-//! lock-ordering doc for the broader pattern.
+//! 2. A `Mutex<Option<SidecarHandle>>` — the spawned `llama-server`
+//!    child process. The [`Mutex`] serialises concurrent
+//!    [`AiState::ensure_ready`] callers (only one cold-spawn at a
+//!    time) and is also taken by [`AiState::cancel_job`] to terminate
+//!    the running child. During a cold-spawn this [`Mutex`] IS held
+//!    for the full `spawn_timeout` window, but the only methods that
+//!    touch it are `ensure_ready` and `cancel_job`. Status polls go
+//!    through the lock-free `runtime` `RwLock` and observe the
+//!    published `Loading` state instantly.
+//!
+//! 3. A `Mutex<HashMap<DiffId, Diff>>` of pending diffs. The renderer
+//!    accepts / rejects diffs by id; this mutex is uncontended in
+//!    practice (the renderer serialises its own user interactions
+//!    client-side) and is fully independent of sidecar lifecycle.
+//!
+//! ## Why three primitives instead of one
+//!
+//! The earlier design held all three pieces behind a single
+//! `Mutex<AiState>`. That meant the **first** `ai_plan` of a session
+//! — which has to spawn the sidecar and wait up to `spawn_timeout`
+//! (30 s by default) for its `/health` probe — held the mutex for
+//! the entire spawn window, and every concurrent `ai_runtime_status`
+//! / `ai_cancel_job` / `ai_accept_diff` call blocked on it. Combined
+//! with `#[napi]` sync functions running on the libuv main thread,
+//! that froze the Electron UI for the full 30 s.
+//!
+//! Splitting along the *natural* concurrency boundaries (lifecycle
+//! state is read by polling, diff registry is independent, spawn
+//! exclusivity is the only thing that needs serialisation) lets:
+//!
+//! - `ai_runtime_status` polls return in O(microseconds) even during
+//!   a cold-spawn (they take the `runtime` `RwLock` *read* side, and
+//!   `Loading` is already published).
+//! - `ai_accept_diff` / `ai_reject_diff` execute concurrently with
+//!   a cold-spawn (they only touch `pending_diffs`).
+//! - `ai_cancel_job` still serialises against `ensure_ready` (they
+//!   share the `handle_slot` mutex), which is correct: terminating
+//!   the handle while the spawn is racing to populate it would be a
+//!   use-after-free shaped bug.
+//!
+//! Together with the napi-layer `spawn_blocking_napi` wrapping (see
+//! `crate::napi_api` module doc on the AI endpoints), this means the
+//! libuv main thread is never blocked by AI work, *and* the
+//! renderer's status pane keeps refreshing during cold-spawn.
 
 use std::collections::HashMap;
+use std::sync::{Mutex, RwLock};
 use std::time::Duration;
 
 use aec_ai::{
@@ -44,11 +85,13 @@ pub enum AiStateError {
     UnknownDiff(String),
     #[error("ai plan: {0}")]
     Plan(#[from] aec_ai::PlanError),
+    #[error("ai state lock poisoned: {0}")]
+    Poisoned(String),
 }
 
 /// Snapshot of `[AiState`] suitable for returning to the renderer.
 /// Carrying it as an owned struct (rather than a `&AiState`) frees the
-/// caller to drop the mutex guard before serialising.
+/// caller to drop any internal guards before serialising.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AiStatusSnapshot {
     pub state: RuntimeState,
@@ -58,14 +101,25 @@ pub struct AiStatusSnapshot {
     pub pending_diff_ids: Vec<String>,
 }
 
-/// Process-wide AI state. Held inside a `Mutex<AiState>` on the bridge.
+/// Process-wide AI state. All methods take `&self` because the three
+/// internal primitives provide the synchronisation directly. This
+/// means [`crate::service::BridgeService`] can hold `AiState` by
+/// value rather than wrapping it in an outer `Mutex`, and every AI
+/// endpoint runs without serialising against unrelated AI traffic.
 pub struct AiState {
-    runtime: SidecarRuntime,
-    /// `None` until the first `ai_plan` call. Dropping it on shutdown
-    /// kills the underlying `llama-server` child via
-    /// `SidecarHandle::Drop`.
-    handle: Option<SidecarHandle>,
-    pending_diffs: HashMap<DiffId, Diff>,
+    /// Lifecycle state machine + last_error. See module doc.
+    runtime: RwLock<SidecarRuntime>,
+    /// Spawn slot — `None` until the first `ai_plan` call. Dropping
+    /// the [`SidecarHandle`] kills the `llama-server` child.
+    handle_slot: Mutex<Option<SidecarHandle>>,
+    /// Diff registry; independent of sidecar lifecycle.
+    pending_diffs: Mutex<HashMap<DiffId, Diff>>,
+}
+
+/// Convenience: turn a `PoisonError<T>` (which is not `Send + 'static`
+/// in a generic way) into our owned [`AiStateError::Poisoned`].
+fn poisoned<T>(err: std::sync::PoisonError<T>) -> AiStateError {
+    AiStateError::Poisoned(format!("{err}"))
 }
 
 impl AiState {
@@ -75,90 +129,135 @@ impl AiState {
     /// renderer can boot without paying the model-load cost.
     pub fn new(config: RuntimeConfig) -> Self {
         Self {
-            runtime: SidecarRuntime::new(config),
-            handle: None,
-            pending_diffs: HashMap::new(),
+            runtime: RwLock::new(SidecarRuntime::new(config)),
+            handle_slot: Mutex::new(None),
+            pending_diffs: Mutex::new(HashMap::new()),
         }
     }
 
-    pub fn state(&self) -> RuntimeState {
-        self.runtime.state()
+    /// Current lifecycle state. Lock-free (RwLock read).
+    pub fn state(&self) -> Result<RuntimeState, AiStateError> {
+        Ok(self.runtime.read().map_err(poisoned)?.state())
     }
 
-    pub fn last_error(&self) -> Option<&str> {
-        self.runtime.last_error()
+    /// Last failure message, if the runtime is in `Failed`. Lock-free
+    /// (RwLock read).
+    pub fn last_error(&self) -> Result<Option<String>, AiStateError> {
+        Ok(self
+            .runtime
+            .read()
+            .map_err(poisoned)?
+            .last_error()
+            .map(str::to_owned))
     }
 
-    pub fn snapshot(&self) -> AiStatusSnapshot {
-        AiStatusSnapshot {
-            state: self.runtime.state(),
-            last_error: self.runtime.last_error().map(str::to_owned),
-            pending_diff_ids: self
-                .pending_diffs
-                .keys()
-                .map(|id| id.as_str().to_owned())
-                .collect(),
-        }
+    /// Snapshot the renderer-visible state in one call. Takes the
+    /// `runtime` read lock and the `pending_diffs` mutex; both are
+    /// released before returning. **Critically, this method does NOT
+    /// touch `handle_slot`**, so it returns instantly even during a
+    /// cold-spawn — the spawn-side `Loading` write completes before
+    /// the spawn blocks on `/health`, and every read after that sees
+    /// the published `Loading` state.
+    pub fn snapshot(&self) -> Result<AiStatusSnapshot, AiStateError> {
+        let runtime = self.runtime.read().map_err(poisoned)?;
+        let diffs = self.pending_diffs.lock().map_err(poisoned)?;
+        Ok(AiStatusSnapshot {
+            state: runtime.state(),
+            last_error: runtime.last_error().map(str::to_owned),
+            pending_diff_ids: diffs.keys().map(|id| id.as_str().to_owned()).collect(),
+        })
     }
 
-    /// Lazy spawn-if-needed and return a borrowed transport. The first
-    /// call pays the cold-cache cost (`spawn_timeout`); subsequent calls
-    /// see a `Ready` runtime and short-circuit.
+    /// Lazy spawn-if-needed; returns the transport descriptor. The
+    /// first call pays the cold-cache cost (`spawn_timeout`);
+    /// subsequent calls see a `Ready` runtime and short-circuit.
     ///
     /// On spawn failure the runtime transitions to `Failed` and the
     /// error is propagated; the next call retries the spawn.
     ///
-    /// Between requests, the sidecar child may crash (OOM, segfault,
-    /// host-side `pkill`). We probe `SidecarHandle::try_exit_code`
-    /// before returning a transport so the next call sees a clean
-    /// `Failed` transition with an informative message instead of a
-    /// confusing connection-refused error from the next HTTP call.
-    /// If the probe detects an exited child, we drop the dead handle
-    /// and recursively spawn a fresh one (a single retry — if THAT
-    /// spawn also fails the runtime stays `Failed` and the error
-    /// surfaces to the caller as normal).
+    /// Concurrency model:
+    ///
+    /// 1. The `handle_slot` mutex is acquired up-front. This is the
+    ///    point at which concurrent `ensure_ready` callers serialise
+    ///    — exactly one of them does the spawn work; the others
+    ///    block here, observe `handle.is_some()`, and short-circuit.
+    /// 2. The `runtime` `RwLock` is grabbed in *write* mode only
+    ///    briefly: to reset a `Failed` runtime, to publish
+    ///    `Loading`, and to publish `Ready` / `Failed` after the
+    ///    spawn. These writes are O(microseconds); they do NOT
+    ///    span the spawn itself.
+    /// 3. Between the `Loading` write and the `Ready` write, the
+    ///    `runtime` lock is **not** held, so concurrent
+    ///    `ai_runtime_status` polls take the read side and observe
+    ///    `Loading` instantly.
     pub fn ensure_ready(
-        &mut self,
+        &self,
         spawn_timeout: Duration,
-    ) -> Result<&aec_ai::SidecarTransport, AiStateError> {
-        if matches!(self.runtime.state(), RuntimeState::Failed) {
-            // Reset so a subsequent ensure_ready attempts to spawn again.
-            self.runtime = SidecarRuntime::new(self.runtime.config().clone());
-        }
+    ) -> Result<aec_ai::SidecarTransport, AiStateError> {
+        let mut slot = self.handle_slot.lock().map_err(poisoned)?;
+
         // Pre-flight crash check: if we have a handle but the child
         // has exited (OOM / segfault / host `pkill`), drop the dead
         // handle and fall through to the spawn path so the next
         // `complete` call doesn't fail with a confusing connection-
         // refused error. `try_exit_code` is non-blocking
-        // (`Child::try_wait`). The exit code is intentionally
-        // dropped here — by the time we observe it, the renderer's
-        // status pane has already moved on; we just want to respawn
-        // transparently. (A future improvement could record the
-        // exit code in a separate `last_exit_code` field on the
-        // runtime for diagnostics, but that's not in PR-V scope.)
-        if let Some(handle) = self.handle.as_mut() {
+        // (`Child::try_wait`).
+        if let Some(handle) = slot.as_mut() {
             if handle.try_exit_code().is_some() {
-                self.handle = None;
-                self.runtime = SidecarRuntime::new(self.runtime.config().clone());
+                *slot = None;
+                // Reset runtime so the upcoming `begin_load` doesn't
+                // surface a stale `Failed` from a previous crash.
+                let cfg = {
+                    let r = self.runtime.read().map_err(poisoned)?;
+                    r.config().clone()
+                };
+                *self.runtime.write().map_err(poisoned)? = SidecarRuntime::new(cfg);
             }
         }
-        if self.handle.is_none() {
-            self.runtime.begin_load();
-            match sidecar::spawn(self.runtime.config(), spawn_timeout) {
+
+        // Failed → reset (so a subsequent ensure_ready attempts to
+        // spawn again). Done as a brief write under `runtime`.
+        {
+            let mut runtime = self.runtime.write().map_err(poisoned)?;
+            if matches!(runtime.state(), RuntimeState::Failed) {
+                let cfg = runtime.config().clone();
+                *runtime = SidecarRuntime::new(cfg);
+            }
+        }
+
+        if slot.is_none() {
+            // Publish `Loading` BEFORE blocking on the spawn so
+            // concurrent status polls see it. Drop the write guard
+            // immediately after the transition so any spawn-side
+            // panic doesn't leave the lock held.
+            let cfg = {
+                let mut runtime = self.runtime.write().map_err(poisoned)?;
+                runtime.begin_load();
+                runtime.config().clone()
+            };
+            match sidecar::spawn(&cfg, spawn_timeout) {
                 Ok(handle) => {
-                    self.handle = Some(handle);
-                    self.runtime.mark_ready();
+                    let transport = handle.transport().clone();
+                    *slot = Some(handle);
+                    self.runtime.write().map_err(poisoned)?.mark_ready();
+                    Ok(transport)
                 }
                 Err(e) => {
                     let msg = e.to_string();
-                    self.runtime.mark_failed(msg.clone());
-                    return Err(e.into());
+                    self.runtime.write().map_err(poisoned)?.mark_failed(msg);
+                    Err(e.into())
                 }
             }
         } else {
-            self.runtime.record_use();
+            // Fast path: handle alive, runtime already `Ready`. Just
+            // bump the `last_used` timestamp.
+            self.runtime.write().map_err(poisoned)?.record_use();
+            Ok(slot
+                .as_ref()
+                .expect("handle is Some by branch condition")
+                .transport()
+                .clone())
         }
-        Ok(self.handle.as_ref().expect("handle set above").transport())
     }
 
     /// Test-only constructor: attach a pre-existing transport (e.g.
@@ -172,47 +271,85 @@ impl AiState {
         let mut runtime = SidecarRuntime::new(config);
         runtime.mark_ready();
         Self {
-            runtime,
-            handle: Some(sidecar::adopt(transport)),
-            pending_diffs: HashMap::new(),
+            runtime: RwLock::new(runtime),
+            handle_slot: Mutex::new(Some(sidecar::adopt(transport))),
+            pending_diffs: Mutex::new(HashMap::new()),
         }
     }
 
+    /// Test-only: transition the runtime to `Loading` without going
+    /// through `ensure_ready` (which would also do the blocking
+    /// spawn). Used by the cold-spawn regression test to set up the
+    /// "spawn in flight" world without a real child process.
+    #[doc(hidden)]
+    pub fn __test_begin_load(&self) {
+        self.runtime.write().expect("runtime lock").begin_load();
+    }
+
+    /// Test-only: hold the `handle_slot` mutex for the given duration.
+    /// Used by the cold-spawn regression test to simulate a spawn
+    /// blocking on `/health` — any concurrent `snapshot()` call must
+    /// still return instantly because it does NOT touch
+    /// `handle_slot`. Run this on a background thread; the caller's
+    /// thread then validates the latency of `snapshot()`.
+    #[doc(hidden)]
+    pub fn __test_hold_handle_slot_for(&self, dur: Duration) {
+        let _guard = self.handle_slot.lock().expect("handle_slot lock");
+        std::thread::sleep(dur);
+    }
+
     /// Insert a diff into the pending map and return the assigned id.
-    pub fn insert_diff(&mut self, diff: Diff) -> DiffId {
+    pub fn insert_diff(&self, diff: Diff) -> Result<DiffId, AiStateError> {
         let id = diff.id.clone();
-        self.pending_diffs.insert(id.clone(), diff);
-        id
+        self.pending_diffs
+            .lock()
+            .map_err(poisoned)?
+            .insert(id.clone(), diff);
+        Ok(id)
     }
 
-    pub fn accept_diff(&mut self, id: &str) -> Result<Diff, AiStateError> {
+    pub fn accept_diff(&self, id: &str) -> Result<Diff, AiStateError> {
         let key = DiffId::from_string(id.to_string())
             .map_err(|_| AiStateError::UnknownDiff(id.to_owned()))?;
         self.pending_diffs
+            .lock()
+            .map_err(poisoned)?
             .remove(&key)
             .ok_or_else(|| AiStateError::UnknownDiff(id.to_owned()))
     }
 
-    pub fn reject_diff(&mut self, id: &str) -> Result<Diff, AiStateError> {
+    pub fn reject_diff(&self, id: &str) -> Result<Diff, AiStateError> {
         let key = DiffId::from_string(id.to_string())
             .map_err(|_| AiStateError::UnknownDiff(id.to_owned()))?;
         self.pending_diffs
+            .lock()
+            .map_err(poisoned)?
             .remove(&key)
             .ok_or_else(|| AiStateError::UnknownDiff(id.to_owned()))
     }
 
-    pub fn pending_diff_count(&self) -> usize {
-        self.pending_diffs.len()
+    pub fn pending_diff_count(&self) -> Result<usize, AiStateError> {
+        Ok(self.pending_diffs.lock().map_err(poisoned)?.len())
     }
 
     /// Force the sidecar to unload — called when the user explicitly
     /// cancels a long-running plan job, or when the bridge shuts down.
-    /// Idempotent: dropping the handle a second time is a no-op.
-    pub fn cancel_job(&mut self) {
-        if let Some(handle) = self.handle.take() {
+    /// Idempotent: cancelling when no sidecar is running is a no-op.
+    ///
+    /// Note: during a cold-spawn, `cancel_job` blocks on `handle_slot`
+    /// until the spawn completes (success or failure). The cancel
+    /// then drops the just-spawned handle and marks the runtime
+    /// unloaded. From the renderer's perspective the UI stays
+    /// responsive throughout — the napi `ai_cancel_job` runs on a
+    /// blocking-pool worker thread (see [`crate::napi_api`]), so the
+    /// libuv main thread is free during the wait.
+    pub fn cancel_job(&self) -> Result<(), AiStateError> {
+        let mut slot = self.handle_slot.lock().map_err(poisoned)?;
+        if let Some(handle) = slot.take() {
             handle.shutdown();
-            self.runtime.mark_unloaded();
+            self.runtime.write().map_err(poisoned)?.mark_unloaded();
         }
+        Ok(())
     }
 }
 
@@ -220,10 +357,12 @@ impl Drop for AiState {
     /// On shutdown we kill the sidecar via `SidecarHandle::Drop`. Diffs
     /// are dropped naturally — they live in memory, not on disk.
     fn drop(&mut self) {
-        if let Some(h) = self.handle.take() {
-            // Explicitly invoke shutdown so we observe any kill errors
-            // via panic-unsafe paths; `Drop` swallows them.
-            h.shutdown();
+        if let Ok(mut slot) = self.handle_slot.lock() {
+            if let Some(h) = slot.take() {
+                // Explicitly invoke shutdown so we observe any kill
+                // errors via panic-unsafe paths; `Drop` swallows them.
+                h.shutdown();
+            }
         }
     }
 }
