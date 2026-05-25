@@ -3490,6 +3490,137 @@ impl BridgeService {
         })
     }
 
+    /// Import a DWG file (R12-R2018) into the project graph. Mirrors
+    /// the DXF importer's command-journaled, audit-trail-preserving
+    /// flow: every importable entity is converted through
+    /// [`aec_cad::dxf::dxf_to_primitive`] (the DWG codec lowers to
+    /// [`DxfDocument`] first, so the same primitive bridge applies)
+    /// and applied as a [`DrawPrimitive`] command via
+    /// [`Self::command_apply_batch`].
+    ///
+    /// The DWG version is auto-detected from the file's `AC10xx`
+    /// signature and reported in the result so callers can confirm
+    /// what they imported (R12 -> AC1009, R2018 -> AC1032, etc.).
+    pub fn draft_import_dwg(
+        &mut self,
+        project_path: &str,
+        dwg_path: &str,
+    ) -> Result<DraftImportDwgResult, BridgeServiceError> {
+        use aec_cad::dwg::DwgReader;
+        use aec_cad::dxf::dxf_to_primitive;
+        use aec_command::commands::draft::DrawPrimitive;
+        use aec_command::commands::CommandKind;
+        use aec_core::types::EntityId;
+        use std::fs;
+
+        let bytes = fs::read(dwg_path).map_err(|e| {
+            BridgeServiceError::Io(std::io::Error::other(format!(
+                "draft_import_dwg: open {dwg_path}: {e}"
+            )))
+        })?;
+        let reader = DwgReader::new(&bytes)
+            .map_err(|e| BridgeServiceError::Invalid(format!("draft_import_dwg: parse: {e}")))?;
+        let version = reader.version;
+        let doc = reader
+            .into_document()
+            .map_err(|e| BridgeServiceError::Invalid(format!("draft_import_dwg: decode: {e}")))?;
+        let mut layer_count = doc.layers.len() as u32;
+        let block_count = doc.block_records.len() as u32;
+        let mut commands = Vec::with_capacity(doc.entities.len());
+        let mut skipped = 0u32;
+        for entity in &doc.entities {
+            match dxf_to_primitive(entity) {
+                Some(prim) => {
+                    commands.push(Command::user(CommandKind::DrawPrimitive(DrawPrimitive {
+                        entity_id: EntityId::new(),
+                        primitive: prim,
+                    })));
+                }
+                None => skipped += 1,
+            }
+        }
+        let entity_count = commands.len() as u32;
+        self.command_apply_batch(project_path, commands)?;
+        // Like the DXF importer, the "0" layer is guaranteed to
+        // exist on any document so we surface at least 1.
+        if layer_count == 0 {
+            layer_count = 1;
+        }
+        Ok(DraftImportDwgResult {
+            entity_count,
+            layer_count,
+            block_count,
+            skipped_count: skipped,
+            version: version.signature_string(),
+        })
+    }
+
+    /// Export the project's draft primitives to a DWG file at
+    /// `dwg_path`, encoded for the requested DWG `version_signature`
+    /// (one of `AC1009` / `AC1014` / `AC1015` / `AC1018` / `AC1021`
+    /// / `AC1024` / `AC1027` / `AC1032`). Unknown signatures produce
+    /// a structured `Invalid` error so the renderer can fall back
+    /// to the default version.
+    pub fn draft_export_dwg(
+        &self,
+        project_path: &str,
+        dwg_path: &str,
+        version_signature: &str,
+    ) -> Result<DraftExportDwgResult, BridgeServiceError> {
+        use aec_cad::dwg::{DwgVersion, DwgWriter};
+        use aec_cad::dxf::{primitive_to_dxf, DxfDocument};
+        use aec_command::commands::draft::DrawPrimitive;
+        use std::fs;
+
+        let mut sig = [0u8; 6];
+        let bytes = version_signature.as_bytes();
+        if bytes.len() != 6 {
+            return Err(BridgeServiceError::Invalid(format!(
+                "draft_export_dwg: version signature must be exactly 6 ASCII bytes (got {} bytes: {:?})",
+                bytes.len(),
+                version_signature
+            )));
+        }
+        sig.copy_from_slice(bytes);
+        let version = DwgVersion::from_signature(&sig).map_err(|e| {
+            BridgeServiceError::Invalid(format!(
+                "draft_export_dwg: unsupported version `{version_signature}`: {e}"
+            ))
+        })?;
+
+        let (_pkg, conn) =
+            ProjectPackage::open_with_master_key_and_database(project_path, &self.master_key)?;
+        let engine = CommandEngine::open(&conn, Scope::Draft)?;
+        let mut doc = DxfDocument::default();
+        for rec in engine.graph().iter() {
+            if rec.kind != "primitive" {
+                continue;
+            }
+            let prim: DrawPrimitive = match serde_json::from_value(rec.body.clone()) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if let Some(d) = primitive_to_dxf(&prim.primitive) {
+                doc.entities.push(d);
+            }
+        }
+        let entity_count = doc.entities.len() as u32;
+        let encoded = DwgWriter::write(&doc, version)
+            .map_err(|e| BridgeServiceError::Export(format!("draft_export_dwg: encode: {e}")))?;
+        fs::write(dwg_path, &encoded).map_err(|e| {
+            BridgeServiceError::Io(std::io::Error::other(format!(
+                "draft_export_dwg: create {dwg_path}: {e}"
+            )))
+        })?;
+        let file_size = fs::metadata(dwg_path).map_or(0, |m| m.len());
+        Ok(DraftExportDwgResult {
+            path: dwg_path.to_string(),
+            entity_count,
+            file_size,
+            version: version.signature_string(),
+        })
+    }
+
     // ----- Deliver scope (revision snapshot + diff) ----- //
 
     /// Capture a revision snapshot of the project.
@@ -3712,6 +3843,31 @@ pub struct DraftExportDxfResult {
     pub path: String,
     pub entity_count: u32,
     pub file_size: u64,
+}
+
+/// Result returned by [`BridgeService::draft_import_dwg`]. Mirrors
+/// [`DraftImportDxfResult`] (entity / layer / block / skipped counts)
+/// and adds the detected DWG version signature so the renderer can
+/// confirm what it imported.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftImportDwgResult {
+    pub entity_count: u32,
+    pub layer_count: u32,
+    pub block_count: u32,
+    pub skipped_count: u32,
+    /// DWG version signature, e.g. `"AC1018"` for R2004. Six ASCII
+    /// bytes; never empty.
+    pub version: String,
+}
+
+/// Result returned by [`BridgeService::draft_export_dwg`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftExportDwgResult {
+    pub path: String,
+    pub entity_count: u32,
+    pub file_size: u64,
+    /// DWG version signature the file was encoded as.
+    pub version: String,
 }
 
 /// JSON-friendly mirror of [`aec_core::revision::Revision`] used by
@@ -6200,6 +6356,116 @@ END-ISO-10303-21;\n";
         assert_eq!(imp.entity_count, 1);
         // The "0" layer is always present.
         assert!(imp.layer_count >= 1);
+    }
+
+    #[test]
+    fn draft_export_dwg_then_reimport_round_trips_through_modern_version() {
+        // R2004 (AC1018) is the renderer's default; exercise it
+        // end-to-end so the bridge wiring + the modern codec + the
+        // primitive-to-DXF lowering all line up.
+        let (mut s, g) = service();
+        let summary = s
+            .project_create_from_template("interior.apartment", "Dwg-Roundtrip-R2004")
+            .unwrap();
+        seed_one_primitive(&mut s, &summary);
+        let dwg_path = g.path().join("export.dwg");
+        let exp = s
+            .draft_export_dwg(&summary.path, dwg_path.to_str().unwrap(), "AC1018")
+            .expect("export DWG (R2004)");
+        assert_eq!(exp.entity_count, 1);
+        assert_eq!(exp.version, "AC1018");
+        assert!(exp.file_size > 0, "DWG file is non-empty");
+
+        let imp = s
+            .draft_import_dwg(&summary.path, dwg_path.to_str().unwrap())
+            .expect("re-import DWG");
+        assert_eq!(imp.entity_count, 1, "re-import preserves the seeded line");
+        assert!(imp.layer_count >= 1);
+        assert_eq!(imp.version, "AC1018", "version round-trips");
+    }
+
+    #[test]
+    fn draft_export_dwg_round_trips_through_r12_legacy_version() {
+        // R12 is the AC1009 legacy codepath — fixed-record layout, no
+        // bit-stream codec. Exercising it ensures the bridge's
+        // version dispatch doesn't accidentally only build for the
+        // modern arms.
+        let (mut s, g) = service();
+        let summary = s
+            .project_create_from_template("interior.apartment", "Dwg-Roundtrip-R12")
+            .unwrap();
+        seed_one_primitive(&mut s, &summary);
+        let dwg_path = g.path().join("export-r12.dwg");
+        let exp = s
+            .draft_export_dwg(&summary.path, dwg_path.to_str().unwrap(), "AC1009")
+            .expect("export DWG (R12)");
+        assert_eq!(exp.entity_count, 1);
+        assert_eq!(exp.version, "AC1009");
+
+        let imp = s
+            .draft_import_dwg(&summary.path, dwg_path.to_str().unwrap())
+            .expect("re-import DWG (R12)");
+        assert_eq!(imp.entity_count, 1);
+        assert_eq!(imp.version, "AC1009");
+    }
+
+    #[test]
+    fn draft_export_dwg_rejects_unknown_version_signature() {
+        let (mut s, g) = service();
+        let summary = s
+            .project_create_from_template("interior.apartment", "Dwg-BadVersion")
+            .unwrap();
+        seed_one_primitive(&mut s, &summary);
+        let dwg_path = g.path().join("export-bad.dwg");
+        // Wrong-length signature → `Invalid`.
+        let too_short = s
+            .draft_export_dwg(&summary.path, dwg_path.to_str().unwrap(), "AC10")
+            .expect_err("4-byte signature must fail");
+        match too_short {
+            BridgeServiceError::Invalid(msg) => {
+                assert!(
+                    msg.contains("must be exactly 6"),
+                    "expected length-validation message, got `{msg}`"
+                );
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        // Right length, wrong AC tag → `Invalid`.
+        let unknown_tag = s
+            .draft_export_dwg(&summary.path, dwg_path.to_str().unwrap(), "AC9999")
+            .expect_err("unknown AC tag must fail");
+        match unknown_tag {
+            BridgeServiceError::Invalid(msg) => {
+                assert!(
+                    msg.contains("unsupported"),
+                    "expected unsupported-version message, got `{msg}`"
+                );
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn draft_import_dwg_rejects_unrecognised_file_signature() {
+        let (mut s, g) = service();
+        let summary = s
+            .project_create_from_template("interior.apartment", "Dwg-BadFile")
+            .unwrap();
+        let dwg_path = g.path().join("not-a-dwg.bin");
+        // Random bytes — not an AC10xx signature.
+        std::fs::write(&dwg_path, b"NOTDWG\x00\x00\x00\x00\x00\x00\x00").unwrap();
+        let err = s
+            .draft_import_dwg(&summary.path, dwg_path.to_str().unwrap())
+            .expect_err("non-DWG file must surface as `Invalid`");
+        match err {
+            BridgeServiceError::Invalid(msg) => {
+                assert!(
+                    msg.contains("draft_import_dwg: parse"),
+                    "expected parse-stage message, got `{msg}`"
+                );
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
     }
 
     #[test]

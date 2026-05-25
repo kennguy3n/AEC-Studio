@@ -139,6 +139,37 @@ export function registerIpcHandlers(): void {
       },
     );
   });
+  // DWG import / export mirror the DXF handlers: validate the
+  // file-path field at the IPC boundary, then defer to the active-
+  // project tracker for projectPath resolution. `version` is
+  // optional on export (defaults to `AC1018` / R2004 inside
+  // `adaptNative`) so renderer callers don't need to know about
+  // the version-signature format.
+  ipcMain.handle("draft:importDwg", async (_e, p) => {
+    assertObject(p, "params");
+    assertString((p as { dwgPath?: unknown }).dwgPath, "dwgPath");
+    return getBridge().draftImportDwg(
+      withResolvedProjectPath(p, "draftImportDwg") as {
+        projectPath: string;
+        dwgPath: string;
+      },
+    );
+  });
+  ipcMain.handle("draft:exportDwg", async (_e, p) => {
+    assertObject(p, "params");
+    assertString((p as { dwgPath?: unknown }).dwgPath, "dwgPath");
+    const version = (p as { version?: unknown }).version;
+    if (version !== undefined && typeof version !== "string") {
+      throw new Error("draft:exportDwg expected string 'version' (got non-string)");
+    }
+    return getBridge().draftExportDwg(
+      withResolvedProjectPath(p, "draftExportDwg") as {
+        projectPath: string;
+        dwgPath: string;
+        version?: string;
+      },
+    );
+  });
 
   // ----- BIM -----
   ipcMain.handle("bim:importIfc", async (_e, { path }) => {

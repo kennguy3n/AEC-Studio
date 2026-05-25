@@ -73,6 +73,40 @@ describe("draft.* in-process contract", () => {
     expect(r.exported).toBe(true);
     expect(r.path).toBe("/tmp/out.dxf");
   });
+
+  it("draftImportDwg returns { imported: number, version: string }", async () => {
+    const b = inProcessBackend();
+    const r = await b.draftImportDwg({
+      projectPath: "/projects/x.aecstudio",
+      dwgPath: "/tmp/in.dwg",
+    });
+    expect(typeof r.imported).toBe("number");
+    // The fallback uses `AC0000` as a sentinel so callers can tell the
+    // headless / no-native-artefact path apart from a real native
+    // import (which always reports a real `AC10xx` tag).
+    expect(r.version).toBe("AC0000");
+  });
+
+  it("draftExportDwg echoes back the dwgPath and the requested version", async () => {
+    const b = inProcessBackend();
+    const r = await b.draftExportDwg({
+      projectPath: "/projects/x.aecstudio",
+      dwgPath: "/tmp/out.dwg",
+      version: "AC1018",
+    });
+    expect(r.exported).toBe(true);
+    expect(r.path).toBe("/tmp/out.dwg");
+    expect(r.version).toBe("AC1018");
+  });
+
+  it("draftExportDwg defaults to R2004 (AC1018) when version is omitted", async () => {
+    const b = inProcessBackend();
+    const r = await b.draftExportDwg({
+      projectPath: "/projects/x.aecstudio",
+      dwgPath: "/tmp/out-default.dwg",
+    });
+    expect(r.version).toBe("AC1018");
+  });
 });
 
 describe("deliver.* in-process contract", () => {

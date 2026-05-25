@@ -52,6 +52,16 @@ impl Version {
         }
     }
 
+    /// The 6-byte ASCII signature as an owned [`String`] (e.g.
+    /// `"AC1009"` for R12, `"AC1032"` for R2018). The signature is
+    /// guaranteed ASCII, so this never allocates a fallback.
+    pub fn signature_string(self) -> String {
+        // SAFETY: signature() always returns 6 ASCII bytes — guaranteed
+        // by the table in `signature()` itself, and exercised by
+        // `from_signature` round-tripping every variant in unit tests.
+        String::from_utf8(self.signature().to_vec()).expect("DWG signatures are ASCII")
+    }
+
     /// Parse a 6-byte AC tag. Unknown / unsupported tags
     /// produce [`DwgError::UnsupportedVersion`].
     pub fn from_signature(sig: &[u8; 6]) -> DwgResult<Self> {

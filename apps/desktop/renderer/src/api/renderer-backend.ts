@@ -148,6 +148,16 @@ export function rendererInProcessBackend(): AecApi {
       // preload signature). Echo the supplied `dxfPath` so renderer
       // tests can assert on the round-trip.
       exportDxf: async (p) => ({ exported: true, path: p.dxfPath }),
+      // Headless / vitest fallback for DWG. The default `AC0000`
+      // version tag is the same sentinel the in-process bridge
+      // fallback uses, so a renderer test can distinguish it from a
+      // real native import (which always reports an `AC10xx` tag).
+      importDwg: async () => ({ imported: 0, version: "AC0000" }),
+      exportDwg: async (p) => ({
+        exported: true,
+        path: p.dwgPath,
+        version: p.version ?? "AC1018",
+      }),
     },
     bim: {
       importIfc: async (path) => ({
