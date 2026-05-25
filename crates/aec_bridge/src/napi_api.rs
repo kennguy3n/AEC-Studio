@@ -119,6 +119,32 @@ where
     f(svc).map_err(|e| Error::from_reason(e.to_string()))
 }
 
+/// Bridge between napi-rs's async `#[napi]` machinery and the
+/// blocking [`BridgeService`] methods that talk to SQLCipher / the
+/// LLM sidecar / the IFC parser.
+///
+/// `#[napi] async fn` runs on napi-rs's bundled tokio runtime; the
+/// closure here is then dispatched to tokio's *blocking* thread pool
+/// (the same pool used by `tokio::fs`), freeing the napi worker
+/// thread and — transitively — the Electron main-process JS event
+/// loop. The `SERVICE` `RwLockReadGuard` / `RwLockWriteGuard`
+/// acquired inside `f` lives entirely inside the closure, so it
+/// never crosses an `.await` and the std locks' lack of `Send` is
+/// not a problem.
+///
+/// If the blocking thread panics, we surface it as a generic napi
+/// error rather than letting it bubble up as an unwinding panic
+/// (which on a `#[napi]` boundary aborts the host).
+async fn spawn_blocking_napi<F, R>(f: F) -> Result<R>
+where
+    F: FnOnce() -> Result<R> + Send + 'static,
+    R: Send + 'static,
+{
+    napi::bindgen_prelude::spawn_blocking(f)
+        .await
+        .map_err(|e| Error::new(Status::GenericFailure, format!("blocking task panicked: {e}")))?
+}
+
 #[napi(object)]
 pub struct InitOptions {
     pub state_dir: String,
@@ -331,12 +357,20 @@ impl From<crate::service::BimImportSummary> for BimImportSummaryJs {
 /// panel — the file is NOT yet folded into the active project
 /// (that's the `bim_attach_*` follow-up in PR-L).
 ///
-/// Routed through `with_service_ref_fallible` (read-only) so a
-/// long IFC parse on a renderer worker thread doesn't block
-/// status polls.
+/// Declared `async` and dispatched via [`napi::tokio::task::spawn_blocking`]
+/// so the multi-second-to-multi-minute IFC parse does NOT block the
+/// Electron main process's JS event loop — concurrent N-API calls
+/// (status polls, cancel buttons, IPC) continue to schedule while the
+/// parse runs on a tokio blocking-pool thread. The acquired
+/// `SERVICE.read()` guard lives entirely inside the `spawn_blocking`
+/// closure, so it never crosses an `.await` boundary and the
+/// `std::sync::RwLockReadGuard`'s lack of `Send` is irrelevant.
 #[napi]
-pub fn bim_import_ifc(path: String) -> Result<BimImportSummaryJs> {
-    with_service_ref_fallible(|svc| svc.bim_import_ifc(&path)).map(Into::into)
+pub async fn bim_import_ifc(path: String) -> Result<BimImportSummaryJs> {
+    spawn_blocking_napi(move || {
+        with_service_ref_fallible(|svc| svc.bim_import_ifc(&path)).map(BimImportSummaryJs::from)
+    })
+    .await
 }
 
 /// JS-facing cheap file-size check. Mirrors the renderer's
@@ -1582,14 +1616,29 @@ pub fn render_check_materials() -> Result<RenderCheckMaterialsJs> {
 // mutation of the sidecar handle / pending diff map happens inside
 // the inner `Mutex<AiState>` on `BridgeService`. That means:
 //
-//   * concurrent `ai_runtime_status` polls don't block one another
-//     (only the inner `Mutex` serialises them, which is microseconds)
-//   * an `ai_plan` call serialises against *every* other `ai_*` call
-//     for the lifetime of the LLM completion (seconds), which is
-//     correct — the renderer expects one in-flight plan at a time
 //   * the singleton `RwLock` is held in *read* mode the whole time,
 //     so `project_engine_status` polls keep flowing — important for
 //     the status pane while a plan is running
+//
+// `ai_plan` is the only blocking caller in the set — its sidecar HTTP
+// completion can take up to `request_timeout` (default 120 s). It is
+// therefore declared `async` and routed through `spawn_blocking_napi`
+// so the Electron main process's JS event loop stays free for the
+// duration. `ai_runtime_status`, `ai_cancel_job`, `ai_list_tools`,
+// `ai_accept_diff`, and `ai_reject_diff` all complete in microseconds
+// (lock acquire + small memory ops) — they stay synchronous because
+// the napi-rs `Promise<T>` wrapping would add observable overhead
+// against zero benefit. The renderer can still poll them WHILE an
+// `ai_plan` is in flight because the blocking work is on the tokio
+// blocking-pool thread, not the libuv main thread.
+//
+// Inside `BridgeService`, the `Mutex<AiState>` guard is also dropped
+// before `planner.dispatch()` (see `service.rs:lock_ai_state` +
+// `ai_plan`), so concurrent `ai_runtime_status` / `ai_cancel_job`
+// calls don't have to wait for the LLM completion to acquire the
+// state mutex either. The two are complementary fixes — the napi
+// `async` flip unblocks the JS event loop; the bridge-side guard
+// drop unblocks the AiState mutex.
 
 /// JS-facing AI tool descriptor for the renderer's tool picker.
 /// Wire shape matches `AiTool` in `apps/desktop/electron/bridge.ts`.
@@ -1676,8 +1725,26 @@ pub fn ai_list_tools() -> Result<Vec<AiToolJs>> {
 /// empty string is treated as an empty object.
 /// `max_entities_modified` caps how many entities the resulting diff
 /// may touch (the safety validator enforces this).
+///
+/// Declared `async` and routed through
+/// [`napi::tokio::task::spawn_blocking`] so the up-to-120 s sidecar
+/// HTTP completion does NOT block the Electron main process's JS
+/// event loop. Concurrent N-API calls (notably [`ai_runtime_status`]
+/// polled every ~500 ms and [`ai_cancel_job`] when the user clicks
+/// "Stop") schedule on the libuv main thread *while* the plan is
+/// in flight, because the actual blocking work runs on tokio's
+/// blocking thread pool. The renderer therefore sees a responsive
+/// UI and a working cancel button — both of which were
+/// architecturally broken when `ai_plan` was synchronous, since
+/// the napi sync-fn dispatcher ran it on libuv main directly.
+///
+/// `parse_scope` is intentionally outside the `spawn_blocking`
+/// closure so an invalid `scope` argument errors immediately on
+/// the JS-facing thread without scheduling any work — the renderer
+/// sees a synchronously-rejected `Promise` for the invalid-args
+/// case rather than a tail-end async error.
 #[napi]
-pub fn ai_plan(
+pub async fn ai_plan(
     tool: String,
     scope: String,
     prompt: String,
@@ -1685,10 +1752,10 @@ pub fn ai_plan(
     max_entities_modified: u32,
 ) -> Result<AiPlanResultJs> {
     let scope = parse_scope(&scope)?;
-    with_service_ref_fallible(|svc| {
-        svc.ai_plan(&tool, scope, &prompt, &context_json, max_entities_modified)
-    })
-    .and_then(|r| {
+    spawn_blocking_napi(move || {
+        let r = with_service_ref_fallible(|svc| {
+            svc.ai_plan(&tool, scope, &prompt, &context_json, max_entities_modified)
+        })?;
         let parsed_json = serde_json::to_string(&r.parsed).map_err(|e| {
             Error::new(
                 Status::GenericFailure,
@@ -1702,6 +1769,7 @@ pub fn ai_plan(
             entities_modified: r.entities_modified,
         })
     })
+    .await
 }
 
 /// Accept a pending diff. Idempotent at the renderer level: a second

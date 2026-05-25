@@ -1193,7 +1193,12 @@ function adaptNative(n: NativeApi): BridgeBackend {
     runtimeStatus: async () => n.runtime_status() as RuntimeStatus,
     projectEngineStatus: async (p) => n.project_engine_status(p) as EngineStatus,
     projectAuditSync: async (p) => n.project_audit_sync(p) as number,
-    bimImportIfc: async (p) => n.bim_import_ifc(p) as BimImportSummary,
+    // `n.bim_import_ifc` is a native ASYNC napi function (returns
+    // a Promise) so that the multi-second IFC parse runs on the
+    // tokio blocking pool and does NOT freeze the Electron main
+    // process's JS event loop. Must be awaited.
+    bimImportIfc: async (p) =>
+      (await n.bim_import_ifc(p)) as BimImportSummary,
     bimCheckFileSize: async (p) => n.bim_check_file_size(p) as BimFileSizeCheck,
     bimAttachIfc: async (projectPath, ifcPath) =>
       n.bim_attach_ifc(projectPath, ifcPath) as BimAttachSummary,
@@ -1397,7 +1402,22 @@ function adaptNative(n: NativeApi): BridgeBackend {
           : typeof params.max_entities_modified === "number"
             ? (params.max_entities_modified as number)
             : 16;
-      const result = n.ai_plan(tool, scope, prompt, contextJson, max) as {
+      // `n.ai_plan` is a native ASYNC napi function. It returns a
+      // Promise that resolves when the LLM completion finishes on
+      // the tokio blocking thread pool. Awaiting it here is what
+      // keeps the Electron main process JS event loop free for the
+      // entire 0-120 s window — `aiRuntimeStatus` polls,
+      // `aiCancelJob`, and unrelated IPC continue to schedule on
+      // libuv main while this await is pending. The native side
+      // also rejects the Promise (rather than throwing across the
+      // FFI boundary) on transport / parser errors.
+      const result = (await n.ai_plan(
+        tool,
+        scope,
+        prompt,
+        contextJson,
+        max,
+      )) as {
         diffId: string;
         parsedJson: string;
         tool: string;
