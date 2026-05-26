@@ -362,14 +362,47 @@ impl RenderJobStore {
     ///     racy against concurrent UPDATEs even in single-process
     ///     mode. Keeping the read transactional is the cheap, correct
     ///     default.
+    ///
+    /// # Field semantics on reincarnation
+    ///
+    /// A reincarnated job is a *fresh* `Queued` attempt — the prior
+    /// `Running` incarnation never reached a terminal state. The
+    /// store therefore distinguishes between fields whose values are
+    /// **forward-looking** (useful to the next attempt) and fields
+    /// that are **artifacts of the prior attempt**:
+    ///
+    /// - **Preserved (forward-looking):**
+    ///   - `progress` — the worker uses this to skip already-rendered
+    ///     tiles; the next progress tick will overwrite it anyway.
+    ///   - `completed_frames` — walkthrough jobs use this so
+    ///     `next_walkthrough_frame()` picks the right frame to resume.
+    ///
+    /// - **Cleared (artifacts of the prior attempt):**
+    ///   - `started_at` — set by the worker when the new attempt
+    ///     begins; preserving the old timestamp would mis-report
+    ///     wall-clock duration.
+    ///   - `error` — a `Queued` job has not yet failed in the current
+    ///     incarnation; carrying the prior failure's text would make
+    ///     `WHERE error IS NOT NULL` dashboard queries report
+    ///     pending-retry jobs as failures.
+    ///   - `completed_at` — a `Queued` job has not yet completed;
+    ///     preserving this would make `WHERE completed_at IS NOT NULL`
+    ///     queries ("jobs that finished today") include pending
+    ///     retries that were running when the process died.
+    ///
+    /// This split keeps the indexed-columns-mirror-payload invariant
+    /// honest *and* keeps the `(status, error, completed_at)` triple
+    /// internally consistent: a `Queued` row has `error IS NULL` and
+    /// `completed_at IS NULL`, full stop.
     pub fn reincarnate_running_as_queued(&self) -> RenderJobStoreResult<usize> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+        let running = status_to_str(RenderJobStatus::Running);
+        let queued = status_to_str(RenderJobStatus::Queued);
         let payloads: Vec<String> = {
-            let mut stmt =
-                tx.prepare("SELECT payload FROM render_jobs WHERE status = 'running'")?;
+            let mut stmt = tx.prepare("SELECT payload FROM render_jobs WHERE status = ?1")?;
             let rows = stmt
-                .query_map([], |row| row.get::<_, String>(0))?
+                .query_map(params![running], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             rows
         };
@@ -379,27 +412,29 @@ impl RenderJobStore {
             let mut job: RenderJob = serde_json::from_str(p)?;
             job.status = RenderJobStatus::Queued;
             job.started_at = None;
-            // `progress` is intentionally preserved — the worker will
-            // overwrite it on the next progress tick. For walkthrough
-            // jobs, `completed_frames` survives so resume_from picks
-            // the right next frame.
+            // Clear artifacts of the prior `Running` attempt; see the
+            // doc-comment above for the full rationale.
+            job.error = None;
+            job.completed_at = None;
+            // `progress` and `completed_frames` are intentionally
+            // preserved so walkthrough workers can resume from the
+            // last completed frame; see doc-comment above.
             let new_payload = serde_json::to_string(&job)?;
             let completed_frames = serde_json::to_string(&job.completed_frames)?;
             tx.execute(
                 "UPDATE render_jobs SET
-                    status = 'queued',
-                    payload = ?1,
+                    status = ?1,
+                    payload = ?2,
                     started_at = NULL,
-                    progress = ?2,
-                    error = ?3,
-                    completed_at = ?4,
-                    completed_frames = ?5
-                 WHERE id = ?6",
+                    progress = ?3,
+                    error = NULL,
+                    completed_at = NULL,
+                    completed_frames = ?4
+                 WHERE id = ?5",
                 params![
+                    queued,
                     new_payload,
                     job.progress as f64,
-                    job.error,
-                    job.completed_at.map(rfc3339),
                     completed_frames,
                     job.id,
                 ],
@@ -722,6 +757,13 @@ mod tests {
         // reports) would see ghost state from the previous `Running`
         // row. This test locks the invariant "indexed columns mirror
         // payload" by reading the columns directly via SQL.
+        //
+        // It also locks the field-semantics split documented on
+        // `reincarnate_running_as_queued`: `progress` and
+        // `completed_frames` are preserved (forward-looking state for
+        // the next attempt) while `started_at`, `error`, and
+        // `completed_at` are cleared (artifacts of the prior attempt
+        // that would mislead dashboards / batch reports).
         let (_d, s) = open_store();
         let mut j = job(3);
         j.status = RenderJobStatus::Running;
@@ -771,23 +813,33 @@ mod tests {
             (progress - 0.7).abs() < 1e-5,
             "progress column must mirror the preserved payload value"
         );
-        assert_eq!(
-            error.as_deref(),
-            Some("stale prior failure"),
-            "error column must mirror payload (preserved across reincarnation)"
-        );
-        // The job still carries its prior completed_at because the
-        // payload preserves it; the column must agree with the payload.
         assert!(
-            completed_at.is_some(),
-            "completed_at column must mirror payload"
+            error.is_none(),
+            "error column must be cleared — a Queued job has not failed in the current incarnation"
+        );
+        assert!(
+            completed_at.is_none(),
+            "completed_at column must be cleared — a Queued job has not yet completed"
         );
         let parsed_frames: Vec<u32> = serde_json::from_str(&completed_frames).unwrap();
         assert_eq!(
             parsed_frames,
             vec![0, 1],
-            "completed_frames column must mirror payload"
+            "completed_frames column must mirror payload (preserved for walkthrough resume)"
         );
+
+        // The payload itself must also reflect the cleared fields so
+        // any future consumer that round-trips through the JSON sees
+        // the same Queued-clean state as the columns.
+        let got = s.get(&j.id).unwrap().unwrap();
+        assert_eq!(got.status, RenderJobStatus::Queued);
+        assert!(got.error.is_none(), "payload.error must be cleared");
+        assert!(
+            got.completed_at.is_none(),
+            "payload.completed_at must be cleared"
+        );
+        assert!((got.progress - 0.7).abs() < 1e-5);
+        assert_eq!(got.completed_frames, vec![0, 1]);
     }
 
     #[test]
