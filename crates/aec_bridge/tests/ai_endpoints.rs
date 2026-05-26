@@ -541,6 +541,112 @@ fn ai_reject_diff_failure_preserves_pending_diff_for_retry() {
     );
 }
 
+/// `BUG_0001 (round 3)` regression: if the post-commit AI audit
+/// append fails *after* `execute_persistent_batch` has already
+/// written the SQL transaction, the pending diff MUST be removed
+/// from the registry. The earlier (round 2) structure left the
+/// diff in the registry on any inner error — including audit
+/// failure — which sounds safe but actually corrupts the project
+/// on retry: `diff_to_commands` generates fresh `EntityId::new()`
+/// UUIDs for every `Insert` op, so a second successful commit
+/// would silently duplicate every inserted entity. This test
+/// pre-creates the AI audit JSONL path as a *directory* so the
+/// audit logger's `File::open` returns `EISDIR` AFTER the SQL
+/// commit has already landed, then asserts:
+///   1. `ai_accept_diff` returns Err (audit divergence surfaced).
+///   2. The pending diff is no longer in the registry (finalize
+///      ran between commit and audit).
+///   3. The graph has the expected entities (commit was durable).
+///   4. A retry returns the "diff not found" error rather than
+///      double-applying.
+#[test]
+fn ai_accept_diff_failed_audit_after_commit_finalizes_to_block_retry_duplication() {
+    let (mut s, _g, project_path) = make_service_with_project();
+    let listener = bind_loopback();
+    let port = listener.local_addr().unwrap().port();
+    let resp = canned_response(valid_style_assistant_response_bytes());
+    let _join = spawn_mock_sidecar(listener, resp, 1);
+    wire_ai_state_to_mock(&mut s, port);
+
+    let result = s
+        .ai_plan(&project_path, "style_assistant", Scope::Design, "", "{}", 5)
+        .unwrap();
+    let st = s.ai_runtime_status().unwrap();
+    assert_eq!(
+        st.pending_diff_ids,
+        vec![result.diff_id.clone()],
+        "diff must be pending after ai_plan"
+    );
+
+    // Sabotage the AI audit path: replace the would-be chain file
+    // with a *directory* of the same name. `AiAuditLogger::open`
+    // calls `File::open` on this path (via `AuditLog::open`)
+    // because it now `exists()` — and `File::open` on a directory
+    // returns EISDIR. Critically, this leaves `<project>/audit/`
+    // itself writable so `execute_persistent_batch` doesn't trip
+    // over it first; only the audit-append step (phase 4) fails.
+    let audit_dir = std::path::Path::new(&project_path).join("audit");
+    std::fs::create_dir_all(&audit_dir).expect("ensure audit dir");
+    let chain_as_dir = audit_dir.join("ai_audit.jsonl");
+    std::fs::create_dir_all(&chain_as_dir).expect("create chain path as dir");
+
+    let pre_furniture = s
+        .project_graph_list(&project_path, Some("furniture"))
+        .expect("graph list pre-accept");
+    assert!(
+        pre_furniture.is_empty(),
+        "fresh project must have no furniture yet"
+    );
+
+    let err = s.ai_accept_diff(&result.diff_id).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("not found"),
+        "the failure must come from the audit append, not the diff registry: {msg}"
+    );
+
+    // Phase 3 finalize MUST have removed the diff from the
+    // registry. If it hadn't, the renderer could retry and
+    // `diff_to_commands` would generate fresh entity UUIDs,
+    // double-applying every insert against the still-committed
+    // graph.
+    let st = s.ai_runtime_status().unwrap();
+    assert!(
+        st.pending_diff_ids.is_empty(),
+        "BUG_0001 (round 3): pending diff must be finalized once SQL is committed, even if the post-commit audit append fails; got pending={:?}",
+        st.pending_diff_ids
+    );
+
+    // Phase 2 SQL commit was durable: the furniture entities are
+    // in the graph.
+    let post_furniture = s
+        .project_graph_list(&project_path, Some("furniture"))
+        .expect("graph list post-accept");
+    assert_eq!(
+        post_furniture.len(),
+        2,
+        "the 2 furniture inserts must be on disk even though audit append failed; got {post_furniture:?}"
+    );
+
+    // A retry now is structurally impossible (the diff is gone).
+    // This is the property we want — no double-apply.
+    let retry_err = s.ai_accept_diff(&result.diff_id).unwrap_err();
+    assert!(
+        retry_err.to_string().contains("not found"),
+        "retry after failed audit must surface 'diff not found' rather than re-applying, got: {retry_err}"
+    );
+
+    // Sanity: the graph entity count didn't grow on retry.
+    let after_retry = s
+        .project_graph_list(&project_path, Some("furniture"))
+        .expect("graph list post-retry");
+    assert_eq!(
+        after_retry.len(),
+        2,
+        "retry must not have duplicated entities; got {after_retry:?}"
+    );
+}
+
 #[test]
 fn ai_accept_diff_rejects_malformed_id() {
     let (mut s, _g) = make_service();

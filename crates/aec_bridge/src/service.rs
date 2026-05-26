@@ -1125,6 +1125,31 @@ pub struct AiRejectOutcome {
     pub audit_chain_head: String,
 }
 
+/// Intermediate state produced by phases 1+2 of `ai_accept_diff`
+/// (pre-commit + SQL commit). Holds the data the post-commit
+/// phases need: the project root for the audit append, the scope
+/// the user authored the plan under, the original diff for the
+/// audit envelope, and the per-op outcome fields the final
+/// `AiAcceptOutcome` will surface.
+///
+/// Crate-private — callers outside this module never see this
+/// shape. Splitting it out is the structural piece of the
+/// `BUG_0001 (round 3)` fix: it lets `ai_accept_diff` finalize the
+/// pending-diff registry entry between the SQL commit (phase 2)
+/// and the AI audit append (phase 4) so a failed audit cannot
+/// leave the diff retry-pending after the graph has already been
+/// mutated.
+#[derive(Debug)]
+struct AiAcceptCommitted {
+    project_root: PathBuf,
+    plan_scope: Scope,
+    diff: aec_ai::Diff,
+    op_count: u32,
+    applied_count: u32,
+    skipped: Vec<AiAcceptSkippedJs>,
+    command_ids: Vec<String>,
+}
+
 /// Result of [`BridgeService::ai_cancel_job`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AiCancelResult {
@@ -3405,40 +3430,52 @@ impl BridgeService {
     /// the renderer's AI panel had already moved on, which broke
     /// every downstream contract (undo, audit, render, export).
     ///
-    /// The real apply path is:
+    /// The real apply path is a four-phase sequence:
     ///
-    ///   1. **Peek** the `PendingDiff` from `AiState::pending_diffs`
-    ///      (which yields a clone of both the `Diff` and the project
-    ///      path it was planned against) — the registry entry is
-    ///      deliberately left in place until step 6 so any failure
-    ///      in steps 2-5 leaves the diff available for retry. See
-    ///      `BUG_0001 (round 2)`.
-    ///   2. Open the project package + SQLCipher connection, then
-    ///      load the current `ProjectGraph` so the converter can
-    ///      dispatch `Update` / `Delete` operations to typed
-    ///      commands based on the target's entity `kind`.
-    ///   3. Convert the `Diff` into a `Vec<Command>` via
-    ///      [`aec_command::diff_to_commands`]. Every emitted command
-    ///      is `Command::ai(tool_name, kind)` so the audit chain
-    ///      attributes the mutation to the model.
-    ///   4. Route the batch through [`Self::command_apply_batch`]
-    ///      so the SQL transaction, journal, and audit envelope
-    ///      are all journaled atomically. The renderer's undo
-    ///      stack pops the AI batch like any other command. The
-    ///      engine is opened via [`CommandEngine::open_with_graph`]
-    ///      reusing the graph loaded in step 2 so the `entities`
-    ///      table is not re-read (see `ANALYSIS_0003 (round 2)`).
-    ///   5. Append an `AiAuditRecord { status: Accepted, .. }` to
-    ///      `<project>/audit/ai_audit.jsonl` for AI-specific
-    ///      provenance. The main command audit chain already has
-    ///      the per-command entries; this second log keeps the AI
-    ///      lifecycle (plan → accept / reject) on its own chain so
-    ///      auditors can answer "how many of the model's proposals
-    ///      did the user accept?" without grepping through every
-    ///      command's actor field.
-    ///   6. **Finalize** by removing the `PendingDiff` from the
-    ///      registry. This step runs only after every fallible
-    ///      operation above has succeeded.
+    /// **Phase 1 – pre-commit (recoverable):** Peek the
+    /// `PendingDiff` from `AiState::pending_diffs` (yielding a
+    /// clone of both the `Diff` and the project path), open the
+    /// project package + SQLCipher connection, load the current
+    /// `ProjectGraph`, convert the `Diff` into a `Vec<Command>` via
+    /// [`aec_command::diff_to_commands`], and validate the entire
+    /// batch against the engine's scope. Any failure here returns
+    /// before SQL is touched, so the pending diff stays in the
+    /// registry for retry. The graph loaded for the converter is
+    /// moved into the engine via [`CommandEngine::open_with_graph`]
+    /// so the `entities` table is not re-read — see
+    /// `ANALYSIS_0003 (round 2)`.
+    ///
+    /// **Phase 2 – commit (irreversible):** Run
+    /// [`CommandEngine::execute_persistent_batch`] which writes
+    /// every delta + journal entry in one SQL transaction. The
+    /// transaction's `commit()` is the point of no return: once it
+    /// returns Ok the graph has been mutated on disk. If `commit`
+    /// fails the whole batch is rolled back and the pending diff
+    /// stays in the registry — `diff_to_commands` is deterministic
+    /// for the same input graph so retry produces the same commands
+    /// without duplicating entity IDs.
+    ///
+    /// **Phase 3 – finalize (must run after phase 2):** Remove the
+    /// `PendingDiff` from `AiState`. This step lives between commit
+    /// and audit append because retrying the accept after a
+    /// successful commit would re-enter `diff_to_commands`, which
+    /// generates *fresh* `EntityId::new()` UUIDs for every `Insert`
+    /// op — committing a second time would duplicate every inserted
+    /// entity. Finalizing here guarantees that path is unreachable.
+    /// See `BUG_0001 (round 3)`.
+    ///
+    /// **Phase 4 – AI audit append (post-commit):** Append an
+    /// `AiAuditRecord { status: Accepted, .. }` to
+    /// `<project>/audit/ai_audit.jsonl`. The main command audit
+    /// chain already has the per-command entries from phase 2; the
+    /// AI audit chain answers "how many of the model's proposals
+    /// did the user accept?" on its own JSONL log. If this step
+    /// fails (disk full, audit dir replaced with a file, etc.) we
+    /// surface the error so the renderer can prompt for an audit
+    /// chain re-export — but the graph mutation is durable and the
+    /// pending diff is already gone, so there is no retry-induced
+    /// duplication. The chain verifier (`project_audit_chain`)
+    /// detects the missing AI envelope on next walk.
     ///
     /// Operations the converter could not translate (unknown
     /// entity kind, dangling target, missing payload field) are
@@ -3447,31 +3484,73 @@ impl BridgeService {
     /// diff and clicked Accept, so the service commits whatever
     /// subset the schema understands.
     pub fn ai_accept_diff(&mut self, diff_id: &str) -> Result<AiAcceptOutcome, BridgeServiceError> {
-        // `BUG_0001 (round 2)`: peek-then-finalize. We *clone* the
-        // pending diff up front; the registry entry is left intact
-        // until every fallible downstream step (open package, load
-        // graph, batch apply, audit append) has succeeded. Any
-        // error returned from this method preserves the pending
-        // entry so the renderer can retry — prior to this split,
-        // a transient failure (e.g. SQLCipher key mismatch on a
-        // moved project, disk-full on audit append) silently lost
-        // the diff with no recovery path.
+        // Phase 1 + Phase 2: pre-commit + commit. Any failure here
+        // leaves the pending diff in the registry so the renderer
+        // can retry — prior to the round-2 peek/finalize split, a
+        // transient failure (e.g. SQLCipher key mismatch on a
+        // moved project) silently lost the diff with no recovery
+        // path.
         let pending = self.ai_state.peek_diff(diff_id)?;
-        let outcome = self.ai_accept_diff_inner(diff_id, pending)?;
-        // Only finalize (remove from the registry) after the
-        // accept has fully committed. `finalize_diff` returning
-        // `UnknownDiff` here would mean a concurrent finalize for
-        // the same id raced ahead of us — that is genuinely
-        // anomalous so we surface it instead of silently swallowing.
+        let committed = self.ai_accept_diff_commit(pending)?;
+        // Phase 3: finalize BEFORE the post-commit audit append.
+        //
+        // `BUG_0001 (round 3)`: the previous structure ran audit
+        // append inside the commit helper and only finalized once
+        // both succeeded. That ordering broke the peek/finalize
+        // contract for retry-safety: if the audit append failed
+        // *after* the SQL commit, the diff was left in the registry
+        // for retry — but a retry would re-enter
+        // `diff_to_commands`, which generates fresh
+        // `EntityId::new()` UUIDs for every `Insert` op, and a
+        // second successful commit would silently double every
+        // inserted entity. Finalizing here closes the
+        // retry-duplication window: once SQL is committed the diff
+        // is unreachable for retry.
+        //
+        // A `finalize_diff` failure here is genuinely anomalous
+        // (would require a concurrent finalize for the same id
+        // racing ahead of us) — we surface it instead of
+        // swallowing. In that pathological case the graph is
+        // committed and the diff is *still* in the registry; the
+        // next retry would duplicate. Acceptable trade-off vs
+        // silently masking a real concurrency bug.
         self.ai_state.finalize_diff(diff_id)?;
-        Ok(outcome)
+        // Phase 4: post-commit, post-finalize audit append. If this
+        // fails, the graph is durable and the pending diff is
+        // already gone — no retry is possible (or needed). The
+        // error propagates so the renderer can re-export the audit
+        // chain (see `project_audit_sync`).
+        let audit_chain_head = Self::ai_audit_append_at_root(
+            &committed.project_root,
+            committed.plan_scope,
+            &committed.diff,
+            DiffStatus::Accepted,
+            None,
+        )?;
+        Ok(AiAcceptOutcome {
+            ok: true,
+            diff_id: diff_id.to_owned(),
+            op_count: committed.op_count,
+            applied_count: committed.applied_count,
+            skipped: committed.skipped,
+            command_ids: committed.command_ids,
+            audit_chain_head,
+        })
     }
 
-    fn ai_accept_diff_inner(
+    /// Phases 1+2 of `ai_accept_diff`: open the project, convert
+    /// the diff to commands, and commit the batch in a single SQL
+    /// transaction. Returns the post-commit data the caller needs
+    /// to (a) finalize the registry entry and (b) write the AI
+    /// audit envelope.
+    ///
+    /// Splitting this off from the audit-append step is the
+    /// `BUG_0001 (round 3)` fix — see [`Self::ai_accept_diff`] for
+    /// the four-phase rationale.
+    fn ai_accept_diff_commit(
         &mut self,
-        diff_id: &str,
         pending: PendingDiff,
-    ) -> Result<AiAcceptOutcome, BridgeServiceError> {
+    ) -> Result<AiAcceptCommitted, BridgeServiceError> {
         let project_path = pending.project_path.clone();
         // `pending.scope` is the engine scope the user invoked the
         // plan under (e.g. `Design` for a furniture-placement
@@ -3556,35 +3635,21 @@ impl BridgeService {
             .iter()
             .map(|r| r.command_id.as_str().to_owned())
             .collect();
-        // Append the AI-specific audit envelope after the command
-        // batch has been committed. If the audit append fails we
-        // surface the error — the graph mutation is already on
-        // disk, but the renderer needs to know the provenance log
-        // is out of sync so the user can re-export the audit chain.
-        //
-        // Note (`ANALYSIS_0006`): the SQL commit and the audit-log
-        // append are deliberately a two-phase write — the JSONL
-        // chain file cannot share a transaction with SQLCipher.
-        // We commit SQL first so a failed audit append leaves the
-        // graph correct and a stale audit log (which the chain
-        // verifier can detect via the next-record hash mismatch),
-        // rather than the inverse where a failed SQL commit would
-        // leave a phantom audit entry for an operation that never
-        // happened. See the design doc for the rationale.
-        //
-        // We reuse the `pkg` opened above so the audit append
-        // doesn't re-derive the project key and re-issue the
-        // `PRAGMA cipher_*` sequence — see `ANALYSIS_0003`.
-        let audit_chain_head =
-            Self::ai_audit_append_with_pkg(&pkg, plan_scope, &diff, DiffStatus::Accepted, None)?;
-        Ok(AiAcceptOutcome {
-            ok: true,
-            diff_id: diff_id.to_owned(),
+        // SQL is committed; capture the project root we already
+        // hold so phase 4 (audit append) doesn't have to re-open
+        // the package. The `pkg` binding is intentionally dropped
+        // at end of scope — the audit logger only needs the project
+        // root path, not a keyed package handle.
+        let project_root = pkg.root().to_path_buf();
+        drop(pkg);
+        Ok(AiAcceptCommitted {
+            project_root,
+            plan_scope,
+            diff,
             op_count,
             applied_count,
             skipped,
             command_ids,
-            audit_chain_head,
         })
     }
 
@@ -3611,13 +3676,17 @@ impl BridgeService {
         // renderer can retry the reject (or escalate via the
         // pending-diff inspector).
         let pending = self.ai_state.peek_diff(diff_id)?;
-        let outcome = self.ai_reject_diff_inner(diff_id, pending, reason)?;
+        let outcome = Self::ai_reject_diff_inner(diff_id, pending, reason)?;
         self.ai_state.finalize_diff(diff_id)?;
         Ok(outcome)
     }
 
+    // Static associated function: the reject path no longer needs
+    // any `BridgeService` state (the master key is no longer
+    // consulted now that we use manifest-only `ProjectPackage::open`
+    // — see `ANALYSIS_0005 (round 3)`), so leaving this as a
+    // `&mut self` method would trip `clippy::unused_self`.
     fn ai_reject_diff_inner(
-        &mut self,
         diff_id: &str,
         pending: PendingDiff,
         reason: Option<&str>,
@@ -3627,14 +3696,23 @@ impl BridgeService {
         let diff = pending.diff;
         let op_count = u32::try_from(diff.operations.len()).unwrap_or(u32::MAX);
         // Reject does not mutate the graph, so the only state it
-        // touches is the AI audit log. Open the package here
-        // (since reject doesn't have an outer `pkg` from a graph
-        // apply) and hand the package to the shared helper. The
-        // accept path reuses its already-open `pkg`, avoiding the
-        // double-open Devin Review flagged as `ANALYSIS_0003`.
-        let pkg = ProjectPackage::open_with_master_key(&project_path, &self.master_key)?;
+        // touches is the AI audit log. We open the package via the
+        // manifest-only `ProjectPackage::open` rather than
+        // `open_with_master_key`: the audit append only needs the
+        // project root path (the AI audit JSONL lives at
+        // `<root>/audit/ai_audit.jsonl`), and the manifest-only
+        // open still validates that the directory is a real
+        // project package (`is_dir` + `PACKAGE_DIRS` walk) so a
+        // stale `pending.project_path` pointing at a moved /
+        // deleted project still surfaces as an error before the
+        // audit append tries to create a phantom directory tree.
+        // This is the `ANALYSIS_0005 (round 3)` fix — the full
+        // keyed open ran `derive_project_key` + the SQLCipher
+        // `PRAGMA cipher_*` sequence + the migration walk all for
+        // a path lookup, ~1-2 ms of avoidable work per reject.
+        let pkg = ProjectPackage::open(&project_path)?;
         let audit_chain_head =
-            Self::ai_audit_append_with_pkg(&pkg, scope, &diff, DiffStatus::Rejected, reason)?;
+            Self::ai_audit_append_at_root(pkg.root(), scope, &diff, DiffStatus::Rejected, reason)?;
         Ok(AiRejectOutcome {
             ok: true,
             diff_id: diff_id.to_owned(),
@@ -3648,12 +3726,15 @@ impl BridgeService {
     /// AI audit log (`<project>/audit/ai_audit.jsonl`) and return
     /// the new chain head.
     ///
-    /// Takes an already-opened [`ProjectPackage`] by reference so
-    /// the caller's pkg handle (typically opened earlier in
-    /// `ai_accept_diff` for the graph apply) is reused instead of
-    /// re-deriving the project key and re-issuing the
-    /// `PRAGMA cipher_*` sequence. This avoids the double-open
-    /// pattern Devin Review flagged as `ANALYSIS_0003`.
+    /// Takes the project root path by reference so callers that
+    /// already validated the package (the accept path holds a
+    /// `ProjectPackage` opened for the SQL commit; the reject path
+    /// holds a manifest-only `ProjectPackage::open`) can hand the
+    /// root through without re-deriving the project key or
+    /// re-issuing the `PRAGMA cipher_*` sequence. This is the
+    /// shape `ANALYSIS_0003 (round 2)` + `ANALYSIS_0005 (round 3)`
+    /// converged to — neither caller needs a keyed package handle
+    /// for the audit append, only the root path.
     ///
     /// The AI audit log is a separate hash chain from the main
     /// command audit log (`<project>/audit/log.jsonl`) so the AI
@@ -3663,14 +3744,14 @@ impl BridgeService {
     /// answers "how many of the model's proposals did the user
     /// accept?" without grepping through every command's actor
     /// field.
-    fn ai_audit_append_with_pkg(
-        pkg: &ProjectPackage,
+    fn ai_audit_append_at_root(
+        project_root: &Path,
         scope: Scope,
         diff: &aec_ai::Diff,
         status: DiffStatus,
         reason: Option<&str>,
     ) -> Result<String, BridgeServiceError> {
-        let ai_audit_path = pkg.root().join("audit").join("ai_audit.jsonl");
+        let ai_audit_path = project_root.join("audit").join("ai_audit.jsonl");
         let mut logger = AiAuditLogger::open(&ai_audit_path)?;
         match status {
             DiffStatus::Accepted => {
