@@ -105,29 +105,52 @@ pub struct BeforeAfterPdfOptions {
 pub struct PlanOverlaySegment {
     /// Identifier for the wall this segment renders.
     ///
-    /// For [`PlanOverlayLevel::Demolition`] / [`PlanOverlayLevel::New`] /
-    /// [`PlanOverlayLevel::Unchanged`] / [`PlanOverlayLevel::Modified`]
-    /// segments this is the wall's raw `entities.id`. When a wall is
-    /// classified as `Modified` the overlay *also* emits a second
-    /// synthetic `Demolition` segment for the **old footprint** (so
-    /// architectural renovation drawings can show the previous wall
-    /// position in red beneath the new one); that synthetic ghost is
-    /// suffixed with [`PlanOverlaySegment::GHOST_SUFFIX`] (`"::prev"`)
-    /// so callers who need to distinguish *"wall removed"* from *"wall
-    /// moved"* can do so without re-running the diff — see
-    /// [`PlanOverlaySegment::is_demolition_ghost`] and
-    /// [`PlanOverlaySegment::original_entity_id`].
+    /// For real diff segments (every `New` / `Unchanged` / `Modified`
+    /// segment, and every `Demolition` segment that corresponds to an
+    /// actually-deleted wall) this is the wall's raw `entities.id`.
+    /// When a wall is classified as `Modified` the overlay *also*
+    /// emits a second synthetic `Demolition` segment for the **old
+    /// footprint** (so architectural renovation drawings can show the
+    /// previous wall position in red beneath the new one); on that
+    /// synthetic ghost the `entity_id` is the wall id with
+    /// [`PlanOverlaySegment::GHOST_SUFFIX`] (`"::prev"`) appended as
+    /// a *display convention* only — the authoritative "is this a
+    /// synthetic ghost?" predicate is the typed [`is_ghost`] field,
+    /// **not** a string suffix match on `entity_id`. This way a real
+    /// wall whose id happens to end in `"::prev"` is never
+    /// misclassified.
+    ///
+    /// [`is_ghost`]: PlanOverlaySegment::is_ghost
     pub entity_id: String,
     pub start_mm: [f64; 2],
     pub end_mm: [f64; 2],
     pub thickness_mm: f64,
     pub level: PlanOverlayLevel,
+    /// `true` when this segment is the synthetic *old-footprint*
+    /// ghost emitted alongside every `Modified` wall, `false` for
+    /// every real diff segment (including real demolitions of
+    /// actually-deleted walls).
+    ///
+    /// This is the authoritative ghost marker; never compare
+    /// [`entity_id`](Self::entity_id) against
+    /// [`GHOST_SUFFIX`](Self::GHOST_SUFFIX) to decide. Defaults to
+    /// `false` when deserialized from legacy JSON that predates the
+    /// field so external persisted reports continue to load (their
+    /// segments will all be treated as real, which matches the
+    /// pre-ghost-emission behaviour).
+    #[serde(default)]
+    pub is_ghost: bool,
 }
 
 impl PlanOverlaySegment {
     /// Suffix appended to [`PlanOverlaySegment::entity_id`] for the
     /// synthetic *old-footprint* `Demolition` segment emitted alongside
-    /// every `Modified` wall — see the field doc on `entity_id`.
+    /// every `Modified` wall — see the field doc on `entity_id`. This
+    /// is a display convention to give ghost segments a stable unique
+    /// SVG id and is **not** the predicate used to decide whether a
+    /// segment is a ghost; that is the typed [`is_ghost`] flag.
+    ///
+    /// [`is_ghost`]: PlanOverlaySegment::is_ghost
     pub const GHOST_SUFFIX: &'static str = "::prev";
 
     /// True when this segment is the synthetic ghost of a `Modified`
@@ -138,18 +161,32 @@ impl PlanOverlaySegment {
     /// but downstream consumers (e.g. a *"walls removed: N"* badge in
     /// the UI) can subtract `is_demolition_ghost` segments from the
     /// total to count *truly* deleted walls.
+    ///
+    /// The check is type-safe: it relies on the [`is_ghost`] flag,
+    /// not on string-matching `entity_id` against
+    /// [`GHOST_SUFFIX`](Self::GHOST_SUFFIX), so a real wall id that
+    /// naturally ends in `"::prev"` is never misclassified as a
+    /// synthetic ghost.
+    ///
+    /// [`is_ghost`]: Self::is_ghost
     pub fn is_demolition_ghost(&self) -> bool {
-        self.level == PlanOverlayLevel::Demolition && self.entity_id.ends_with(Self::GHOST_SUFFIX)
+        self.level == PlanOverlayLevel::Demolition && self.is_ghost
     }
 
     /// Returns the underlying wall id with the
-    /// [`GHOST_SUFFIX`](Self::GHOST_SUFFIX) stripped if present, so a
-    /// `Modified` wall and its demolition ghost both report the same
-    /// id. For non-ghost segments this returns `entity_id` unchanged.
+    /// [`GHOST_SUFFIX`](Self::GHOST_SUFFIX) stripped if this segment
+    /// is a synthetic ghost, so a `Modified` wall and its demolition
+    /// ghost both report the same id. For non-ghost segments this
+    /// returns `entity_id` unchanged — including the case where a
+    /// real wall id naturally ends in `"::prev"`.
     pub fn original_entity_id(&self) -> &str {
-        self.entity_id
-            .strip_suffix(Self::GHOST_SUFFIX)
-            .unwrap_or(&self.entity_id)
+        if self.is_ghost {
+            self.entity_id
+                .strip_suffix(Self::GHOST_SUFFIX)
+                .unwrap_or(&self.entity_id)
+        } else {
+            &self.entity_id
+        }
     }
 }
 
@@ -521,12 +558,17 @@ fn build_plan_overlay(base: &[WallBody], head: &[WallBody]) -> PlanOverlay {
                 end_mm: w.end_mm,
                 thickness_mm: w.thickness_mm,
                 level,
+                is_ghost: false,
             });
             if level == PlanOverlayLevel::Modified {
                 // Modified walls also draw the *old* position
                 // underneath in red so the demolition footprint
                 // is visible — that's what the convention asks
-                // for on architectural renovation drawings.
+                // for on architectural renovation drawings. The
+                // `::prev` suffix on `entity_id` is a display-only
+                // convention so the SVG group has a stable unique
+                // id; the authoritative ghost marker is the typed
+                // `is_ghost` flag (see `PlanOverlaySegment` docs).
                 expand(prev);
                 segments.push(PlanOverlaySegment {
                     entity_id: format!("{}{}", prev.id, PlanOverlaySegment::GHOST_SUFFIX),
@@ -534,6 +576,7 @@ fn build_plan_overlay(base: &[WallBody], head: &[WallBody]) -> PlanOverlay {
                     end_mm: prev.end_mm,
                     thickness_mm: prev.thickness_mm,
                     level: PlanOverlayLevel::Demolition,
+                    is_ghost: true,
                 });
             }
         } else {
@@ -544,6 +587,7 @@ fn build_plan_overlay(base: &[WallBody], head: &[WallBody]) -> PlanOverlay {
                 end_mm: w.end_mm,
                 thickness_mm: w.thickness_mm,
                 level: PlanOverlayLevel::New,
+                is_ghost: false,
             });
         }
     }
@@ -556,6 +600,7 @@ fn build_plan_overlay(base: &[WallBody], head: &[WallBody]) -> PlanOverlay {
                 end_mm: w.end_mm,
                 thickness_mm: w.thickness_mm,
                 level: PlanOverlayLevel::Demolition,
+                is_ghost: false,
             });
         }
     }
@@ -931,7 +976,7 @@ mod tests {
         // the synthetic old-footprint ghosts of `Modified` walls — both
         // render in red per renovation-drawing convention. Downstream
         // consumers that need to distinguish the two cases rely on the
-        // `::prev` suffix contract surfaced by
+        // typed `is_ghost` flag surfaced by
         // `PlanOverlaySegment::is_demolition_ghost` /
         // `original_entity_id`; lock that contract in here so it can't
         // silently drift.
@@ -953,12 +998,17 @@ mod tests {
         // 1 real deletion (w.B) + 1 synthetic ghost (w.A::prev).
         assert_eq!(demolitions.len(), 2);
 
-        let real_deletions: Vec<&str> = demolitions
+        let real_deletions: Vec<&PlanOverlaySegment> = demolitions
             .iter()
+            .copied()
             .filter(|s| !s.is_demolition_ghost())
-            .map(|s| s.entity_id.as_str())
             .collect();
-        assert_eq!(real_deletions, vec!["w.B"]);
+        assert_eq!(real_deletions.len(), 1);
+        assert_eq!(real_deletions[0].entity_id, "w.B");
+        // Real demolitions are *not* marked as ghosts — the typed
+        // flag distinguishes them even though they share the same
+        // `PlanOverlayLevel::Demolition` classification as ghosts.
+        assert!(!real_deletions[0].is_ghost);
 
         let ghosts: Vec<&PlanOverlaySegment> = demolitions
             .iter()
@@ -966,6 +1016,10 @@ mod tests {
             .filter(|s| s.is_demolition_ghost())
             .collect();
         assert_eq!(ghosts.len(), 1);
+        assert!(ghosts[0].is_ghost);
+        // The `::prev` suffix is a display convention so the SVG
+        // group has a stable unique id; the authoritative marker is
+        // `is_ghost`, not the suffix.
         assert_eq!(ghosts[0].entity_id, "w.A::prev");
         // original_entity_id strips the synthetic suffix so the ghost
         // and its Modified twin both report the same wall id.
@@ -980,6 +1034,71 @@ mod tests {
         assert_eq!(modified.entity_id, "w.A");
         assert_eq!(modified.original_entity_id(), "w.A");
         assert!(!modified.is_demolition_ghost());
+        assert!(!modified.is_ghost);
+    }
+
+    #[test]
+    fn plan_overlay_does_not_misclassify_real_walls_whose_id_ends_in_prev() {
+        // Regression guard for the collision risk in the old
+        // string-suffix-based ghost detection: a real wall whose
+        // `entities.id` happens to end in `"::prev"` must NOT be
+        // treated as a synthetic demolition ghost. The authoritative
+        // marker is the typed `is_ghost` flag, set only by the
+        // overlay builder when emitting an old-footprint segment for
+        // a Modified wall — `entity_id` is never consulted for the
+        // ghost decision.
+        let base = vec![
+            // Real wall whose id naturally ends in "::prev". In the
+            // old string-suffix approach this would be misclassified
+            // as a synthetic ghost when it appears as a Demolition.
+            wall("legacy::prev", [0.0, 0.0], [4000.0, 0.0], 200.0),
+            // Real wall that becomes Modified (will produce a real
+            // synthetic ghost we still expect to flag correctly).
+            wall("w.A", [0.0, 0.0], [0.0, 3000.0], 200.0),
+        ];
+        let head = vec![
+            // legacy::prev removed in head — should classify as a
+            // *real* demolition, NOT a ghost.
+            // w.A modified — should produce a real Modified segment
+            // *plus* a synthetic ghost suffixed "::prev".
+            wall("w.A", [100.0, 0.0], [100.0, 3000.0], 200.0),
+        ];
+        let overlay = build_plan_overlay(&base, &head);
+
+        let demolitions: Vec<&PlanOverlaySegment> = overlay
+            .segments
+            .iter()
+            .filter(|s| s.level == PlanOverlayLevel::Demolition)
+            .collect();
+        // 1 real deletion (legacy::prev) + 1 synthetic ghost (w.A::prev).
+        assert_eq!(demolitions.len(), 2);
+
+        // The real deletion of `legacy::prev` must report as a
+        // genuine demolition, even though its id ends in "::prev".
+        let legacy = demolitions
+            .iter()
+            .find(|s| s.entity_id == "legacy::prev")
+            .expect("legacy::prev demolition exists");
+        assert!(
+            !legacy.is_ghost,
+            "real wall whose id ends in '::prev' must not be flagged as a ghost"
+        );
+        assert!(
+            !legacy.is_demolition_ghost(),
+            "is_demolition_ghost() must not misclassify a real wall whose id ends in '::prev'"
+        );
+        // original_entity_id() must NOT strip the trailing "::prev"
+        // from a real wall id — the suffix is part of its real id.
+        assert_eq!(legacy.original_entity_id(), "legacy::prev");
+
+        // The synthetic ghost of `w.A` must still be flagged.
+        let ghost = demolitions
+            .iter()
+            .find(|s| s.entity_id == "w.A::prev")
+            .expect("w.A::prev synthetic ghost exists");
+        assert!(ghost.is_ghost);
+        assert!(ghost.is_demolition_ghost());
+        assert_eq!(ghost.original_entity_id(), "w.A");
     }
 
     #[test]
