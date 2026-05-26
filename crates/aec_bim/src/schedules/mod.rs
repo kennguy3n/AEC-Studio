@@ -9,6 +9,7 @@ pub mod door_schedule;
 pub mod extension_host;
 pub mod material_schedule;
 pub mod room_schedule;
+pub mod space_quantities;
 pub mod window_schedule;
 pub mod xlsx;
 
@@ -19,6 +20,10 @@ pub use extension_host::{
 pub use door_schedule::{generate_door_schedule, DoorScheduleEntry};
 pub use material_schedule::{generate_material_schedule, MaterialScheduleEntry};
 pub use room_schedule::{generate_room_schedule, RoomScheduleEntry};
+pub use space_quantities::{
+    backfill_space_quantities, backfill_space_quantities_forced, polygon_area_m2,
+    polygon_perimeter_m, FootprintPolygon,
+};
 pub use window_schedule::{generate_window_schedule, WindowScheduleEntry};
 
 use serde::{Deserialize, Serialize};
