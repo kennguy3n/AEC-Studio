@@ -103,11 +103,54 @@ pub struct BeforeAfterPdfOptions {
 /// precision).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlanOverlaySegment {
+    /// Identifier for the wall this segment renders.
+    ///
+    /// For [`PlanOverlayLevel::Demolition`] / [`PlanOverlayLevel::New`] /
+    /// [`PlanOverlayLevel::Unchanged`] / [`PlanOverlayLevel::Modified`]
+    /// segments this is the wall's raw `entities.id`. When a wall is
+    /// classified as `Modified` the overlay *also* emits a second
+    /// synthetic `Demolition` segment for the **old footprint** (so
+    /// architectural renovation drawings can show the previous wall
+    /// position in red beneath the new one); that synthetic ghost is
+    /// suffixed with [`PlanOverlaySegment::GHOST_SUFFIX`] (`"::prev"`)
+    /// so callers who need to distinguish *"wall removed"* from *"wall
+    /// moved"* can do so without re-running the diff — see
+    /// [`PlanOverlaySegment::is_demolition_ghost`] and
+    /// [`PlanOverlaySegment::original_entity_id`].
     pub entity_id: String,
     pub start_mm: [f64; 2],
     pub end_mm: [f64; 2],
     pub thickness_mm: f64,
     pub level: PlanOverlayLevel,
+}
+
+impl PlanOverlaySegment {
+    /// Suffix appended to [`PlanOverlaySegment::entity_id`] for the
+    /// synthetic *old-footprint* `Demolition` segment emitted alongside
+    /// every `Modified` wall — see the field doc on `entity_id`.
+    pub const GHOST_SUFFIX: &'static str = "::prev";
+
+    /// True when this segment is the synthetic ghost of a `Modified`
+    /// wall's previous footprint rather than a real demolition.
+    ///
+    /// `PlanOverlayCounts::demolition` deliberately conflates both —
+    /// the architectural drawing convention treats them identically —
+    /// but downstream consumers (e.g. a *"walls removed: N"* badge in
+    /// the UI) can subtract `is_demolition_ghost` segments from the
+    /// total to count *truly* deleted walls.
+    pub fn is_demolition_ghost(&self) -> bool {
+        self.level == PlanOverlayLevel::Demolition && self.entity_id.ends_with(Self::GHOST_SUFFIX)
+    }
+
+    /// Returns the underlying wall id with the
+    /// [`GHOST_SUFFIX`](Self::GHOST_SUFFIX) stripped if present, so a
+    /// `Modified` wall and its demolition ghost both report the same
+    /// id. For non-ghost segments this returns `entity_id` unchanged.
+    pub fn original_entity_id(&self) -> &str {
+        self.entity_id
+            .strip_suffix(Self::GHOST_SUFFIX)
+            .unwrap_or(&self.entity_id)
+    }
 }
 
 /// Classification of a wall segment in the before / after overlay.
@@ -486,7 +529,7 @@ fn build_plan_overlay(base: &[WallBody], head: &[WallBody]) -> PlanOverlay {
                 // for on architectural renovation drawings.
                 expand(prev);
                 segments.push(PlanOverlaySegment {
-                    entity_id: format!("{}::prev", prev.id),
+                    entity_id: format!("{}{}", prev.id, PlanOverlaySegment::GHOST_SUFFIX),
                     start_mm: prev.start_mm,
                     end_mm: prev.end_mm,
                     thickness_mm: prev.thickness_mm,
@@ -880,6 +923,63 @@ mod tests {
         // bbox must encompass all coords across both sides.
         let bbox = overlay.bbox_mm.expect("bbox set");
         assert_eq!(bbox, [0.0, 0.0, 4500.0, 3000.0]);
+    }
+
+    #[test]
+    fn plan_overlay_distinguishes_demolition_ghosts_from_real_deletions() {
+        // The PlanOverlayCounts API conflates *truly deleted* walls and
+        // the synthetic old-footprint ghosts of `Modified` walls — both
+        // render in red per renovation-drawing convention. Downstream
+        // consumers that need to distinguish the two cases rely on the
+        // `::prev` suffix contract surfaced by
+        // `PlanOverlaySegment::is_demolition_ghost` /
+        // `original_entity_id`; lock that contract in here so it can't
+        // silently drift.
+        let base = vec![
+            wall("w.A", [0.0, 0.0], [4000.0, 0.0], 200.0),
+            wall("w.B", [0.0, 0.0], [0.0, 3000.0], 200.0),
+        ];
+        let head = vec![
+            wall("w.A", [0.0, 0.0], [4500.0, 0.0], 200.0), // modified
+                                                           // w.B deleted
+        ];
+        let overlay = build_plan_overlay(&base, &head);
+
+        let demolitions: Vec<_> = overlay
+            .segments
+            .iter()
+            .filter(|s| s.level == PlanOverlayLevel::Demolition)
+            .collect();
+        // 1 real deletion (w.B) + 1 synthetic ghost (w.A::prev).
+        assert_eq!(demolitions.len(), 2);
+
+        let real_deletions: Vec<&str> = demolitions
+            .iter()
+            .filter(|s| !s.is_demolition_ghost())
+            .map(|s| s.entity_id.as_str())
+            .collect();
+        assert_eq!(real_deletions, vec!["w.B"]);
+
+        let ghosts: Vec<&PlanOverlaySegment> = demolitions
+            .iter()
+            .copied()
+            .filter(|s| s.is_demolition_ghost())
+            .collect();
+        assert_eq!(ghosts.len(), 1);
+        assert_eq!(ghosts[0].entity_id, "w.A::prev");
+        // original_entity_id strips the synthetic suffix so the ghost
+        // and its Modified twin both report the same wall id.
+        assert_eq!(ghosts[0].original_entity_id(), "w.A");
+
+        // Non-ghost segments are unaffected by original_entity_id.
+        let modified = overlay
+            .segments
+            .iter()
+            .find(|s| s.level == PlanOverlayLevel::Modified)
+            .expect("modified segment exists");
+        assert_eq!(modified.entity_id, "w.A");
+        assert_eq!(modified.original_entity_id(), "w.A");
+        assert!(!modified.is_demolition_ghost());
     }
 
     #[test]
