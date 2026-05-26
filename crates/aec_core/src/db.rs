@@ -26,9 +26,18 @@ use crate::error::AecResult;
 /// database to the current [`crate::manifest::SCHEMA_VERSION`] via
 /// [`crate::migrations::run_pending`].
 pub fn open_encrypted(path: &Path, key: &Key32) -> AecResult<Connection> {
+    // `SQLITE_OPEN_NO_MUTEX` selects multi-thread mode — the connection
+    // is used by at most one thread at a time and SQLite skips its per-
+    // connection mutex. This matches the threading mode that
+    // `open_existing` inherits from rusqlite's default `OpenFlags`
+    // (`Connection::open` → `READ_WRITE | CREATE | NO_MUTEX | URI`); all
+    // three `open_*` paths therefore run in the same threading mode so
+    // there are no surprising performance differences between them.
     let mut conn = Connection::open_with_flags(
         path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     apply_pragmas(&conn, key)?;
     initialize_schema(&conn)?;
@@ -40,9 +49,15 @@ pub fn open_encrypted(path: &Path, key: &Key32) -> AecResult<Connection> {
     Ok(conn)
 }
 
-/// Open an *already-initialized* encrypted database read-only. Does NOT
+/// Open an *already-initialized* encrypted database read/write. Does NOT
 /// re-apply schema; useful for inspection and tests that should fail
 /// loudly if the schema is missing.
+///
+/// For diffing snapshot files (`.snap`) that must never be mutated, use
+/// [`open_readonly`] instead — it opens the file with
+/// `SQLITE_OPEN_READ_ONLY` so a future bug can't accidentally write to
+/// the snapshot and so no `-wal` / `-shm` sidecar files are created in
+/// the revisions directory.
 pub fn open_existing(path: &Path, key: &Key32) -> AecResult<Connection> {
     let conn = Connection::open(path)?;
     apply_pragmas(&conn, key)?;
@@ -54,13 +69,51 @@ pub fn open_existing(path: &Path, key: &Key32) -> AecResult<Connection> {
     Ok(conn)
 }
 
+/// Open an already-initialized SQLCipher database **strictly read-only**
+/// — uses `SQLITE_OPEN_READ_ONLY` so the SQLite library refuses any
+/// write at the engine level (not just by convention), and skips the
+/// connection-tuning pragmas that the read-only path doesn't need:
+///
+/// * `journal_mode = WAL` requires write access to the DB header and
+///   creates `-wal` / `-shm` sidecar files, which is *exactly* the
+///   failure mode this function exists to prevent for `.snap` files.
+/// * `foreign_keys = ON` and `busy_timeout = 5000` are intentionally
+///   omitted because they only affect DML / write contention, neither
+///   of which is reachable on a `SQLITE_OPEN_READ_ONLY` handle
+///   (DML statements fail at parse time before constraint enforcement,
+///   and a read-only connection takes a SHARED lock that never
+///   conflicts with the snapshot-creation write path). Skipping them
+///   keeps the open path purely cryptographic.
+///
+/// Designed for revision snapshot (`.snap`) diffing: a future caller
+/// can't accidentally mutate the snapshot, and no `-wal` / `-shm`
+/// sidecar files get scattered in the revisions directory after a
+/// process crash.
+///
+/// The encryption key + cipher parameters are still applied so the call
+/// fails loudly on a wrong key (the key check is the same
+/// `SELECT count(*) FROM sqlite_master` probe used by
+/// [`open_existing`]).
+///
+/// `SQLITE_OPEN_NO_MUTEX` is included to keep this on the same multi-
+/// thread threading model as `open_existing` / `open_encrypted`, so all
+/// three open paths have consistent per-connection locking semantics.
+pub fn open_readonly(path: &Path, key: &Key32) -> AecResult<Connection> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    apply_cipher_pragmas(&conn, key)?;
+    // Validate key by forcing SQLCipher to decrypt page 1.
+    {
+        let mut stmt = conn.prepare("SELECT count(*) FROM sqlite_master")?;
+        let _: i64 = stmt.query_row([], |r| r.get(0))?;
+    }
+    Ok(conn)
+}
+
 fn apply_pragmas(conn: &Connection, key: &Key32) -> AecResult<()> {
-    // SQLCipher requires the key pragma before any other operation. The key
-    // is supplied as a 64-character hex string (32 raw bytes) so we don't
-    // depend on a PBKDF2 round-trip — we already derived a real 256-bit
-    // key via BLAKE3 in `crypto::derive_project_key`.
-    let pragma_key = format!("PRAGMA key = \"x'{}'\";", key.to_hex());
-    conn.execute_batch(&pragma_key)?;
+    apply_cipher_pragmas(conn, key)?;
     // `busy_timeout = 5000` makes every SQL statement on this connection
     // wait up to 5 seconds for a competing writer to release the database
     // lock before returning `SQLITE_BUSY`. This is what makes it safe for
@@ -74,13 +127,28 @@ fn apply_pragmas(conn: &Connection, key: &Key32) -> AecResult<()> {
     // classification walk runs. 5 seconds is the same default rusqlite
     // uses when callers explicitly opt in to a busy_handler.
     conn.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         PRAGMA journal_mode = WAL;
+         PRAGMA busy_timeout = 5000;",
+    )?;
+    Ok(())
+}
+
+/// Apply only the SQLCipher key + cipher-format pragmas. Safe on
+/// [`OpenFlags::SQLITE_OPEN_READ_ONLY`] connections because none of
+/// these pragmas need write access to the database file.
+fn apply_cipher_pragmas(conn: &Connection, key: &Key32) -> AecResult<()> {
+    // SQLCipher requires the key pragma before any other operation. The key
+    // is supplied as a 64-character hex string (32 raw bytes) so we don't
+    // depend on a PBKDF2 round-trip — we already derived a real 256-bit
+    // key via BLAKE3 in `crypto::derive_project_key`.
+    let pragma_key = format!("PRAGMA key = \"x'{}'\";", key.to_hex());
+    conn.execute_batch(&pragma_key)?;
+    conn.execute_batch(
         "PRAGMA cipher_page_size = 4096;
          PRAGMA kdf_iter = 256000;
          PRAGMA cipher_hmac_algorithm = HMAC_SHA512;
-         PRAGMA cipher_kdf_algorithm = PBKDF2_HMAC_SHA512;
-         PRAGMA foreign_keys = ON;
-         PRAGMA journal_mode = WAL;
-         PRAGMA busy_timeout = 5000;",
+         PRAGMA cipher_kdf_algorithm = PBKDF2_HMAC_SHA512;",
     )?;
     Ok(())
 }
