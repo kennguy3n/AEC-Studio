@@ -559,3 +559,203 @@ fn dxf_roundtrip_full_fixture_preserves_every_table_and_block_attribute() {
         "DXF document not byte-stable across write→read round-trip"
     );
 }
+
+#[test]
+fn dxf_roundtrip_preserves_hatch_loops_inside_block_bodies() {
+    // Regression: `parse_blocks` previously fed an always-empty
+    // `hatch_loops` slice to `build_entity`, silently dropping every
+    // HATCH boundary loop nested inside a BLOCK ... ENDBLK pair.
+    // `parse_one_entity` now backs both top-level and block-body
+    // entities so HATCH boundary geometry survives the round-trip
+    // regardless of where the HATCH lives.
+    let mut doc = DxfDocument::new();
+    doc.layers.upsert(Layer::new("WALLS").expect("layer name"));
+
+    let mut block = DxfBlockRecord::new("FLOOR_TILE");
+    block.base_point = [10.0, 20.0, 0.0];
+    block.entities.push(DxfEntity::Hatch(DxfHatch {
+        layer: "WALLS".into(),
+        pattern_name: "ANSI31".into(),
+        solid: false,
+        scale: 1.0,
+        angle: 45.0,
+        elevation: 0.0,
+        loops: vec![DxfHatchLoop {
+            vertices: vec![[0.0, 0.0], [100.0, 0.0], [100.0, 100.0], [0.0, 100.0]],
+        }],
+    }));
+    doc.block_records.push(block);
+
+    let written = DxfWriter::write_to_string(&doc).expect("write");
+    let parsed = DxfReader::read_str(&written).expect("read");
+
+    let block = parsed
+        .block_records
+        .iter()
+        .find(|b| b.name == "FLOOR_TILE")
+        .expect("FLOOR_TILE block survives round-trip");
+    assert_eq!(block.base_point, [10.0, 20.0, 0.0]);
+    assert_eq!(block.entities.len(), 1, "exactly one entity in block body");
+    match &block.entities[0] {
+        DxfEntity::Hatch(h) => {
+            assert_eq!(h.pattern_name, "ANSI31");
+            assert_eq!(h.angle, 45.0);
+            assert_eq!(
+                h.loops.len(),
+                1,
+                "block-body HATCH must keep its single boundary loop"
+            );
+            assert_eq!(
+                h.loops[0].vertices,
+                vec![[0.0, 0.0], [100.0, 0.0], [100.0, 100.0], [0.0, 100.0]],
+                "block-body HATCH must keep every boundary vertex"
+            );
+        }
+        other => panic!("expected HATCH inside block, got {:?}", other),
+    }
+}
+
+#[test]
+fn dxf_roundtrip_preserves_polyline_vertex_chain_inside_block_bodies() {
+    // Regression: legacy DXF emits POLYLINE as a compound entity with
+    // nested VERTEX records terminated by SEQEND. `parse_blocks` used
+    // to break out of its inner field-reader on the first VERTEX
+    // code-0, dropping every vertex. The shared `parse_one_entity`
+    // path threads the VERTEX/SEQEND chain so legacy POLYLINEs inside
+    // blocks survive intact.
+    let groups = [
+        "0", "SECTION", "2", "BLOCKS", //
+        "0", "BLOCK", "2", "STAIR", "70", "0", "10", "0.0", "20", "0.0", "30", "0.0", //
+        "0", "POLYLINE", "8", "0", "70", "1", //
+        "0", "VERTEX", "10", "0.0", "20", "0.0", //
+        "0", "VERTEX", "10", "1000.0", "20", "0.0", //
+        "0", "VERTEX", "10", "1000.0", "20", "300.0", //
+        "0", "VERTEX", "10", "0.0", "20", "300.0", //
+        "0", "SEQEND", //
+        "0", "ENDBLK", //
+        "0", "ENDSEC", //
+        "0", "EOF",
+    ];
+    let dxf = groups.join("\n");
+    let parsed = DxfReader::read_str(&dxf).expect("legacy POLYLINE-in-block parses");
+
+    let block = parsed
+        .block_records
+        .iter()
+        .find(|b| b.name == "STAIR")
+        .expect("STAIR block parsed");
+    assert_eq!(block.entities.len(), 1, "the lone POLYLINE survives");
+    match &block.entities[0] {
+        DxfEntity::Polyline(p) => {
+            assert!(p.closed, "POLYLINE flag bit 1 marks closed");
+            assert_eq!(
+                p.vertices.len(),
+                4,
+                "every VERTEX in the chain must be threaded into the polyline"
+            );
+            assert_eq!((p.vertices[0].x, p.vertices[0].y), (0.0, 0.0));
+            assert_eq!((p.vertices[1].x, p.vertices[1].y), (1000.0, 0.0));
+            assert_eq!((p.vertices[2].x, p.vertices[2].y), (1000.0, 300.0));
+            assert_eq!((p.vertices[3].x, p.vertices[3].y), (0.0, 300.0));
+        }
+        other => panic!("expected POLYLINE inside block, got {:?}", other),
+    }
+}
+
+#[test]
+fn dxf_writer_emits_dimstyle_340_as_hard_pointer_handle() {
+    // Regression for the DIMSTYLE-340 finding: the writer must emit
+    // a real DXF hard-pointer handle (uppercase hex, the same handle
+    // it emitted on the referenced STYLE record's code-5 slot), not
+    // the symbolic style name. External DXF consumers (AutoCAD,
+    // BricsCAD, LibreDWG) require a hex handle in 340 — emitting a
+    // raw name leaves the dimension's text-style reference
+    // unresolved on their side.
+    let mut doc = DxfDocument::new();
+    doc.text_styles.clear();
+    doc.text_styles.push(aec_cad::dxf::DxfTextStyle {
+        name: "TITLES".into(),
+        font_filename: "arial.ttf".into(),
+        bigfont_filename: String::new(),
+        fixed_height: 5.0,
+        width_factor: 1.0,
+        oblique_angle: 0.0,
+    });
+    doc.dim_styles.clear();
+    doc.dim_styles.push(DxfDimStyle {
+        name: "ARCH-1-50".into(),
+        text_height: 2.5,
+        arrow_size: 2.5,
+        units_scale: 1.0,
+        decimal_places: 2,
+        text_style: "TITLES".into(),
+    });
+
+    let written = DxfWriter::write_to_string(&doc).expect("write");
+
+    // Find the STYLE handle.
+    let style_lines: Vec<&str> = written.lines().collect();
+    let style_idx = style_lines
+        .iter()
+        .position(|l| l.trim() == "STYLE")
+        .and_then(|i| {
+            // Skip the "STYLE" table-name pair and locate the first
+            // record start (a second "STYLE" line after the table header).
+            style_lines[i + 1..]
+                .iter()
+                .position(|l| l.trim() == "STYLE")
+                .map(|p| i + 1 + p)
+        })
+        .expect("STYLE record present");
+    // The line two below the record's "STYLE" keyword carries the
+    // handle (code 5 emitted before any other field).
+    assert_eq!(style_lines[style_idx + 1].trim(), "5");
+    let handle = style_lines[style_idx + 2].trim().to_string();
+    assert!(
+        !handle.is_empty(),
+        "STYLE record must carry a non-empty hex handle"
+    );
+    assert!(
+        handle.chars().all(|c| c.is_ascii_hexdigit()),
+        "STYLE handle must be hex, got {handle:?}"
+    );
+
+    // Find the DIMSTYLE record and inspect its 340 emission.
+    let dimstyle_idx = style_lines
+        .iter()
+        .position(|l| l.trim() == "DIMSTYLE")
+        .and_then(|i| {
+            style_lines[i + 1..]
+                .iter()
+                .position(|l| l.trim() == "DIMSTYLE")
+                .map(|p| i + 1 + p)
+        })
+        .expect("DIMSTYLE record present");
+    let mut found_340 = false;
+    for window in style_lines[dimstyle_idx..].windows(2) {
+        if window[0].trim() == "340" {
+            assert_eq!(
+                window[1].trim(),
+                handle,
+                "DIMSTYLE 340 must emit the STYLE handle, not the style name"
+            );
+            found_340 = true;
+            break;
+        }
+    }
+    assert!(found_340, "DIMSTYLE record must emit a 340 group");
+
+    // And re-reading the written DXF must still recover the symbolic
+    // name on the in-memory struct (the reader resolves 340 handles
+    // back to names so callers continue to use names as identifiers).
+    let reparsed = DxfReader::read_str(&written).expect("re-read");
+    let dim = reparsed
+        .dim_styles
+        .iter()
+        .find(|d| d.name == "ARCH-1-50")
+        .expect("ARCH-1-50 round-trips");
+    assert_eq!(
+        dim.text_style, "TITLES",
+        "DIMSTYLE 340 hex handle resolves back to the style name on read"
+    );
+}

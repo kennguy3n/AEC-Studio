@@ -43,7 +43,13 @@ impl BlockRecord {
         Self {
             name: dxf.name.clone(),
             anonymous: dxf.flags & 1 != 0,
-            base_point: [0.0, 0.0, 0.0],
+            // Mirror the DXF-side `base_point` so that the DWG encoder
+            // can emit it once the block-body bit-codec lands. Older
+            // revisions of this function hardcoded a zero vector,
+            // which would silently lose the block's origin when any
+            // call site (none today) flows DxfBlockRecord through
+            // BlockRecord on the write side.
+            base_point: dxf.base_point,
             description: dxf.description.clone().unwrap_or_default(),
             entity_handles: Vec::new(),
         }

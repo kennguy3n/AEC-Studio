@@ -1,5 +1,6 @@
 //! DXF ASCII writer.
 
+use std::collections::HashMap;
 use std::io::Write;
 
 use crate::dxf::entities::{
@@ -8,6 +9,32 @@ use crate::dxf::entities::{
 };
 use crate::dxf::DxfDocument;
 use crate::error::CadResult;
+
+/// Lowest hex handle minted for the first STYLE table entry; subsequent
+/// entries get sequentially higher handles. Picked well above the
+/// AC1009 reserved range (0..0xF) so synthetic handles never collide
+/// with anything an external tool might have minted at the same
+/// position.
+const STYLE_HANDLE_BASE: u32 = 0x10;
+
+/// Mints a deterministic uppercase-hex handle for every text style in
+/// the document, in declaration order. Returns a map from style name
+/// to handle that the writer uses both to emit code-5 on each STYLE
+/// record and to resolve the symbolic `text_style` reference on each
+/// DIMSTYLE record into a hard-pointer handle (code 340) as the DXF
+/// specification requires for that group code.
+fn mint_text_style_handles(doc: &DxfDocument) -> HashMap<String, String> {
+    doc.text_styles
+        .iter()
+        .enumerate()
+        .map(|(idx, s)| {
+            (
+                s.name.clone(),
+                format!("{:X}", STYLE_HANDLE_BASE + idx as u32),
+            )
+        })
+        .collect()
+}
 
 pub struct DxfWriter;
 
@@ -105,12 +132,22 @@ fn write_tables<W: Write>(doc: &DxfDocument, w: &mut W) -> CadResult<()> {
     }
     write_pair(w, 0, "ENDTAB")?;
 
-    // STYLE (text style) table.
+    // STYLE (text style) table. Each entry gets a deterministic
+    // hex handle minted up-front so the DIMSTYLE 340 group code can
+    // emit a real hard-pointer handle (as the DXF spec requires)
+    // rather than the symbolic style name. Without this, third-party
+    // DXF consumers (AutoCAD, BricsCAD, QCAD, LibreDWG) see a string
+    // where they expect a hex handle on 340 and silently fall back
+    // to the default style for every dimension reference.
+    let style_handle_by_name = mint_text_style_handles(doc);
     write_pair(w, 0, "TABLE")?;
     write_pair(w, 2, "STYLE")?;
     write_pair(w, 70, &doc.text_styles.len().to_string())?;
     for s in &doc.text_styles {
         write_pair(w, 0, "STYLE")?;
+        if let Some(handle) = style_handle_by_name.get(&s.name) {
+            write_pair(w, 5, handle)?;
+        }
         write_pair(w, 2, &s.name)?;
         write_pair(w, 70, "0")?;
         write_pair(w, 40, &fmt_f(s.fixed_height))?;
@@ -134,12 +171,17 @@ fn write_tables<W: Write>(doc: &DxfDocument, w: &mut W) -> CadResult<()> {
         write_pair(w, 144, &fmt_f(dim.units_scale))?;
         // DIMDEC — primary-units decimal places.
         write_pair(w, 271, &dim.decimal_places.to_string())?;
-        // DIMTXSTY — text-style name. We use group 340 (which is
-        // ordinarily the handle of the referenced style); since our
-        // round-trip is stable on text-style *names* not handles,
-        // emitting the name as the value lets the reader recover
-        // the symbolic reference verbatim.
-        write_pair(w, 340, &dim.text_style)?;
+        // DIMTXSTY — hard-pointer handle of the referenced STYLE
+        // table entry. We resolve the symbolic `text_style` name
+        // through the same handle map we used to emit code-5 on each
+        // STYLE record above. When the name doesn't match any STYLE
+        // (e.g. a doc constructed without a STYLE table, or a
+        // back-compat fixture), we fall back to emitting the name
+        // verbatim — the reader's symmetric fallback recovers it.
+        match style_handle_by_name.get(&dim.text_style) {
+            Some(handle) => write_pair(w, 340, handle)?,
+            None => write_pair(w, 340, &dim.text_style)?,
+        }
     }
     write_pair(w, 0, "ENDTAB")?;
 

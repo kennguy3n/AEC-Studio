@@ -4,6 +4,7 @@
 //! `ELLIPSE`, `SPLINE`, `HATCH`, `TEXT`, `MTEXT`, `DIMENSION`, `INSERT`,
 //! and the `LAYER` + `BLOCK_RECORD` + `DIMSTYLE` tables.
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
 
 use crate::dxf::entities::{
@@ -68,6 +69,11 @@ fn parse(groups: &[Group]) -> CadResult<DxfDocument> {
     // Block records also come from the BLOCKS section, not the
     // constructor.
     doc.block_records.clear();
+    // Maps a STYLE record's hard-pointer handle (code 5, hex string)
+    // to its symbolic name. Populated while parsing the STYLE table
+    // and consumed when resolving DIMSTYLE code-340 references back
+    // into names — see `resolve_dim_style_handles` below.
+    let mut style_handle_to_name: HashMap<String, String> = HashMap::new();
     let mut i = 0;
     while i < groups.len() {
         if groups[i].code == 0 && groups[i].value == "SECTION" {
@@ -78,7 +84,7 @@ fn parse(groups: &[Group]) -> CadResult<DxfDocument> {
             let section_name = &groups[i].value;
             i += 1;
             match section_name.as_str() {
-                "TABLES" => i = parse_tables(groups, i, &mut doc)?,
+                "TABLES" => i = parse_tables(groups, i, &mut doc, &mut style_handle_to_name)?,
                 "BLOCKS" => i = parse_blocks(groups, i, &mut doc),
                 "ENTITIES" => i = parse_entities(groups, i, &mut doc),
                 _ => i = skip_until_endsec(groups, i),
@@ -93,7 +99,27 @@ fn parse(groups: &[Group]) -> CadResult<DxfDocument> {
     if doc.layers.get("0").is_none() {
         doc.layers.upsert(Layer::new("0")?);
     }
+    // DIMSTYLE 340 carries a hard-pointer handle of the referenced
+    // STYLE record. Resolve those handles to names now, after the
+    // entire TABLES section has been parsed (the file is free to
+    // emit DIMSTYLE before STYLE, so we cannot resolve inline).
+    resolve_dim_style_handles(&mut doc, &style_handle_to_name);
     Ok(doc)
+}
+
+/// Replaces each `DxfDimStyle.text_style` value that matches a known
+/// STYLE handle (hex string captured via group code 5 during the
+/// STYLE-table parse) with the corresponding style name. Values that
+/// don't match a handle are left verbatim — this preserves
+/// backwards-compatibility with legacy DXF emitted by our own writer
+/// (which used to put the symbolic name directly in 340) and with
+/// any external file that does the same.
+fn resolve_dim_style_handles(doc: &mut DxfDocument, handle_to_name: &HashMap<String, String>) {
+    for dim in doc.dim_styles.iter_mut() {
+        if let Some(name) = handle_to_name.get(&dim.text_style) {
+            dim.text_style.clone_from(name);
+        }
+    }
 }
 
 fn skip_until_endsec(groups: &[Group], mut i: usize) -> usize {
@@ -106,7 +132,12 @@ fn skip_until_endsec(groups: &[Group], mut i: usize) -> usize {
     i
 }
 
-fn parse_tables(groups: &[Group], mut i: usize, doc: &mut DxfDocument) -> CadResult<usize> {
+fn parse_tables(
+    groups: &[Group],
+    mut i: usize,
+    doc: &mut DxfDocument,
+    style_handle_to_name: &mut HashMap<String, String>,
+) -> CadResult<usize> {
     while i < groups.len() {
         let g = &groups[i];
         if g.code == 0 && g.value == "ENDSEC" {
@@ -121,7 +152,7 @@ fn parse_tables(groups: &[Group], mut i: usize, doc: &mut DxfDocument) -> CadRes
             } else {
                 continue;
             };
-            i = parse_table_entries(groups, i, &table_name, doc)?;
+            i = parse_table_entries(groups, i, &table_name, doc, style_handle_to_name)?;
         } else {
             i += 1;
         }
@@ -134,6 +165,7 @@ fn parse_table_entries(
     mut i: usize,
     table_name: &str,
     doc: &mut DxfDocument,
+    style_handle_to_name: &mut HashMap<String, String>,
 ) -> CadResult<usize> {
     while i < groups.len() {
         let g = &groups[i];
@@ -185,12 +217,18 @@ fn parse_table_entries(
                 ("STYLE", "STYLE") => {
                     let mut s = DxfTextStyle::standard();
                     let mut name_seen = false;
+                    let mut handle: Option<String> = None;
                     for (code, val) in &fields {
                         match code {
                             2 => {
                                 s.name.clone_from(val);
                                 name_seen = true;
                             }
+                            // Code 5 is the hard-pointer handle of the
+                            // STYLE record. We capture it so a later
+                            // DIMSTYLE-340 reference can be resolved
+                            // to this style's name.
+                            5 => handle = Some(val.clone()),
                             3 => s.font_filename.clone_from(val),
                             4 => s.bigfont_filename.clone_from(val),
                             40 => s.fixed_height = val.parse().unwrap_or(0.0),
@@ -200,6 +238,9 @@ fn parse_table_entries(
                         }
                     }
                     if name_seen {
+                        if let Some(h) = handle {
+                            style_handle_to_name.insert(h, s.name.clone());
+                        }
                         doc.text_styles.push(s);
                     }
                 }
@@ -291,7 +332,13 @@ fn parse_blocks(groups: &[Group], mut i: usize, doc: &mut DxfDocument) -> usize 
                 }
                 i += 1;
             }
-            // Body — entities until ENDBLK.
+            // Body — entities until ENDBLK. The per-entity parsing
+            // logic (HATCH boundary loop accumulation, POLYLINE
+            // VERTEX/SEQEND chain following) lives in
+            // `parse_one_entity` so block-body entities go through
+            // exactly the same path as top-level ENTITIES-section
+            // entities. Without this, a HATCH or POLYLINE nested
+            // inside a block would lose its loops / vertices on read.
             let mut entities: Vec<DxfEntity> = Vec::new();
             while i < groups.len() {
                 if groups[i].code == 0 && groups[i].value == "ENDBLK" {
@@ -303,14 +350,9 @@ fn parse_blocks(groups: &[Group], mut i: usize, doc: &mut DxfDocument) -> usize 
                     break;
                 }
                 if groups[i].code == 0 {
-                    let entity_type = groups[i].value.clone();
-                    let mut fields: Vec<(i32, String)> = Vec::new();
-                    i += 1;
-                    while i < groups.len() && groups[i].code != 0 {
-                        fields.push((groups[i].code, groups[i].value.clone()));
-                        i += 1;
-                    }
-                    if let Some(e) = build_entity(&entity_type, &fields, &[]) {
+                    let (entity, next_i) = parse_one_entity(groups, i);
+                    i = next_i;
+                    if let Some(e) = entity {
                         entities.push(e);
                     }
                 } else {
@@ -349,89 +391,107 @@ fn parse_entities(groups: &[Group], mut i: usize, doc: &mut DxfDocument) -> usiz
             return i + 1;
         }
         if g.code == 0 {
-            let entity_type = g.value.clone();
-            // HATCH has nested boundary records, which we handle below.
-            let is_polyline = entity_type == "POLYLINE";
-            let is_hatch = entity_type == "HATCH";
-            let mut fields: Vec<(i32, String)> = Vec::new();
-            // Hatch boundary loop accumulation.
-            let mut hatch_loops: Vec<DxfHatchLoop> = Vec::new();
-            let mut hatch_current_loop: Vec<[f64; 2]> = Vec::new();
-            i += 1;
-            while i < groups.len() {
-                if groups[i].code == 0 {
-                    if is_polyline && (groups[i].value == "VERTEX" || groups[i].value == "SEQEND") {
-                        if groups[i].value == "SEQEND" {
-                            i += 1;
-                            while i < groups.len() && groups[i].code != 0 {
-                                i += 1;
-                            }
-                            break;
-                        }
-                        i += 1;
-                        let mut x = 0.0;
-                        let mut y = 0.0;
-                        let mut bulge = 0.0;
-                        while i < groups.len() && groups[i].code != 0 {
-                            match groups[i].code {
-                                10 => x = groups[i].value.parse().unwrap_or(0.0),
-                                20 => y = groups[i].value.parse().unwrap_or(0.0),
-                                42 => bulge = groups[i].value.parse().unwrap_or(0.0),
-                                _ => {}
-                            }
-                            i += 1;
-                        }
-                        fields.push((10, x.to_string()));
-                        fields.push((20, y.to_string()));
-                        fields.push((42, bulge.to_string()));
-                        continue;
-                    }
-                    break;
-                }
-                // Hatch boundary loop vertices live under code-10/code-20 pairs
-                // and a code-93 vertex count terminates the loop. We capture
-                // them here.
-                if is_hatch {
-                    match groups[i].code {
-                        93 if !hatch_current_loop.is_empty() => {
-                            // New loop is starting; flush the previous one.
-                            hatch_loops.push(DxfHatchLoop {
-                                vertices: std::mem::take(&mut hatch_current_loop),
-                            });
-                        }
-                        93 => {
-                            // Empty loop counter, nothing to flush.
-                        }
-                        10 => {
-                            // Pair with the following code-20 to form a vertex.
-                            let x: f64 = groups[i].value.parse().unwrap_or(0.0);
-                            // Look ahead for the y.
-                            let mut y = 0.0;
-                            if i + 1 < groups.len() && groups[i + 1].code == 20 {
-                                y = groups[i + 1].value.parse().unwrap_or(0.0);
-                                i += 1;
-                            }
-                            hatch_current_loop.push([x, y]);
-                        }
-                        _ => {}
-                    }
-                }
-                fields.push((groups[i].code, groups[i].value.clone()));
-                i += 1;
-            }
-            if is_hatch && !hatch_current_loop.is_empty() {
-                hatch_loops.push(DxfHatchLoop {
-                    vertices: hatch_current_loop,
-                });
-            }
-            if let Some(entity) = build_entity(&entity_type, &fields, &hatch_loops) {
-                doc.entities.push(entity);
+            let (entity, next_i) = parse_one_entity(groups, i);
+            i = next_i;
+            if let Some(e) = entity {
+                doc.entities.push(e);
             }
         } else {
             i += 1;
         }
     }
     i
+}
+
+/// Parse a single entity body starting at `groups[i]` where
+/// `groups[i].code == 0` and `groups[i].value` is the entity-type
+/// keyword (e.g. `LINE`, `HATCH`, `POLYLINE`). Returns the parsed
+/// entity (or `None` if the keyword is not recognised) and the index
+/// of the next group to inspect.
+///
+/// Shared between `parse_entities` (top-level ENTITIES section) and
+/// `parse_blocks` (entities nested inside a BLOCK … ENDBLK pair) so
+/// block-body HATCHes preserve their boundary loops and block-body
+/// POLYLINEs follow their VERTEX/SEQEND chain — both of which are
+/// silently dropped if the inner loop is a plain "read fields until
+/// the next code-0" scanner.
+fn parse_one_entity(groups: &[Group], mut i: usize) -> (Option<DxfEntity>, usize) {
+    let entity_type = groups[i].value.clone();
+    // HATCH has nested boundary records, which we handle below.
+    let is_polyline = entity_type == "POLYLINE";
+    let is_hatch = entity_type == "HATCH";
+    let mut fields: Vec<(i32, String)> = Vec::new();
+    // Hatch boundary loop accumulation.
+    let mut hatch_loops: Vec<DxfHatchLoop> = Vec::new();
+    let mut hatch_current_loop: Vec<[f64; 2]> = Vec::new();
+    i += 1;
+    while i < groups.len() {
+        if groups[i].code == 0 {
+            if is_polyline && (groups[i].value == "VERTEX" || groups[i].value == "SEQEND") {
+                if groups[i].value == "SEQEND" {
+                    i += 1;
+                    while i < groups.len() && groups[i].code != 0 {
+                        i += 1;
+                    }
+                    break;
+                }
+                i += 1;
+                let mut x = 0.0;
+                let mut y = 0.0;
+                let mut bulge = 0.0;
+                while i < groups.len() && groups[i].code != 0 {
+                    match groups[i].code {
+                        10 => x = groups[i].value.parse().unwrap_or(0.0),
+                        20 => y = groups[i].value.parse().unwrap_or(0.0),
+                        42 => bulge = groups[i].value.parse().unwrap_or(0.0),
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                fields.push((10, x.to_string()));
+                fields.push((20, y.to_string()));
+                fields.push((42, bulge.to_string()));
+                continue;
+            }
+            break;
+        }
+        // Hatch boundary loop vertices live under code-10/code-20 pairs
+        // and a code-93 vertex count terminates the loop. We capture
+        // them here.
+        if is_hatch {
+            match groups[i].code {
+                93 if !hatch_current_loop.is_empty() => {
+                    // New loop is starting; flush the previous one.
+                    hatch_loops.push(DxfHatchLoop {
+                        vertices: std::mem::take(&mut hatch_current_loop),
+                    });
+                }
+                93 => {
+                    // Empty loop counter, nothing to flush.
+                }
+                10 => {
+                    // Pair with the following code-20 to form a vertex.
+                    let x: f64 = groups[i].value.parse().unwrap_or(0.0);
+                    // Look ahead for the y.
+                    let mut y = 0.0;
+                    if i + 1 < groups.len() && groups[i + 1].code == 20 {
+                        y = groups[i + 1].value.parse().unwrap_or(0.0);
+                        i += 1;
+                    }
+                    hatch_current_loop.push([x, y]);
+                }
+                _ => {}
+            }
+        }
+        fields.push((groups[i].code, groups[i].value.clone()));
+        i += 1;
+    }
+    if is_hatch && !hatch_current_loop.is_empty() {
+        hatch_loops.push(DxfHatchLoop {
+            vertices: hatch_current_loop,
+        });
+    }
+    (build_entity(&entity_type, &fields, &hatch_loops), i)
 }
 
 fn build_entity(
