@@ -215,7 +215,13 @@ fn write_blocks<W: Write>(doc: &DxfDocument, w: &mut W) -> CadResult<()> {
         for entity in &br.entities {
             write_entity(entity, w)?;
         }
+        // ENDBLK is itself an entity per the DXF spec and carries the
+        // same layer assignment (code 8) as its parent BLOCK. AutoCAD,
+        // BricsCAD, LibreDWG and QCAD all emit/expect a layer code on
+        // ENDBLK; omitting it triggers either a hard reject or a
+        // sticky "missing layer" warning at file load.
         write_pair(w, 0, "ENDBLK")?;
+        write_pair(w, 8, &br.layer)?;
     }
     write_pair(w, 0, "ENDSEC")?;
     Ok(())

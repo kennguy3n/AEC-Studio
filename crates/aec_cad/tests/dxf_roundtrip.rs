@@ -842,6 +842,37 @@ fn dxf_writer_emits_code_8_layer_on_block_entities() {
         "second BLOCK uses custom layer"
     );
 
+    // ENDBLK is also an entity per the DXF spec and must carry the
+    // same code-8 layer. Strict third-party consumers (AutoCAD,
+    // BricsCAD, LibreDWG, QCAD) reject or warn on a missing code-8
+    // on ENDBLK exactly as they do for BLOCK.
+    let mut endblk_starts = Vec::new();
+    let mut k = 0;
+    while k + 1 < lines.len() {
+        if lines[k].trim() == "0" && lines[k + 1].trim() == "ENDBLK" {
+            endblk_starts.push(k);
+            k += 2;
+        } else {
+            k += 1;
+        }
+    }
+    assert_eq!(
+        endblk_starts.len(),
+        2,
+        "expected exactly 2 ENDBLK records, got {}",
+        endblk_starts.len()
+    );
+    assert_eq!(
+        extract_layer(&lines, endblk_starts[0]),
+        "0",
+        "ENDBLK on default-layer block carries layer \"0\""
+    );
+    assert_eq!(
+        extract_layer(&lines, endblk_starts[1]),
+        "A-BLOCK-DEFS",
+        "ENDBLK on custom-layer block carries the same custom layer"
+    );
+
     // Re-read and verify the layer round-trips on the in-memory
     // struct.
     let reparsed = DxfReader::read_str(&written).expect("re-read");
