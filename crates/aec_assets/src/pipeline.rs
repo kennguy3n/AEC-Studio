@@ -181,13 +181,22 @@ impl<'a> AssetImportPipeline<'a> {
             return Err(AssetError::EmptyMesh);
         }
 
+        // Canonicalise the mesh to the asset DB's internal unit (mm).
+        // The Mesh blob bytes (and therefore its BLAKE3 hash) reflect
+        // the converted positions, so an identical mesh imported under
+        // `Mm`, `M`, `Inches`, or `Feet` dedupes to the same blob.
+        // The no-op `Mm` path borrows the caller's mesh; non-identity
+        // conversions clone-then-scale so the original is untouched.
+        let mesh_in_mm: std::borrow::Cow<'_, Mesh> =
+            canonicalise_to_mm(&req.mesh, req.source_units);
+
         // Build the LOD chain (level 0 = base mesh, level N>0 = decimated).
         // Real-mesh imports get the aggressive [1.0, 0.25, 0.05] chain so
         // LOD2 is a true far-distance view, matching the Phase 11 spec.
         // Extension-host imports keep the legacy [1.0, 0.5, 0.25] chain
         // via the separate `import()` path.
         let chain = LodChain::aggressive_for_real_mesh(base_triangles, &req.extra_ratios);
-        let base_bytes = native::encode(&req.mesh);
+        let base_bytes = native::encode(mesh_in_mm.as_ref());
         let base_hash = format!("blake3:{}", blake3::hash(&base_bytes).to_hex());
 
         // Conflict check on existing asset.
@@ -202,12 +211,26 @@ impl<'a> AssetImportPipeline<'a> {
         let deduped = !self.db.put_blob(&base_hash, &base_bytes)?;
 
         // Decimate each non-base level and store as separate blobs.
+        //
+        // Failure modes are surfaced as structured `AssetError` variants
+        // rather than silently substituting the base mesh under a
+        // degraded LOD hash (which would either duplicate the base blob
+        // or claim a triangle budget the chain cannot honour):
+        //
+        //   - `decimate()` itself errored  → `AssetError::Decimation`
+        //   - decimated triangle count is not strictly less than the
+        //     base count → `AssetError::LodNotStrictlyDecreasing`
+        //
+        // Decimation may legitimately fall short of the exact target
+        // budget (e.g. on meshes with heavy boundary constraints), so
+        // we only require strict reduction relative to the base mesh —
+        // not relative to the requested `level.triangle_count`.
         let mut lods: Vec<MeshBlob> = Vec::with_capacity(chain.levels.len());
         for level in &chain.levels {
             if level.level == 0 {
                 lods.push(MeshBlob {
                     mesh_hash: base_hash.clone(),
-                    vertex_count: req.mesh.positions.len() as u32,
+                    vertex_count: mesh_in_mm.positions.len() as u32,
                     triangle_count: base_triangles,
                 });
                 continue;
@@ -216,28 +239,35 @@ impl<'a> AssetImportPipeline<'a> {
                 target_triangle_count: level.triangle_count,
                 ..Default::default()
             };
-            // Decimation may legitimately fail to hit the exact target
-            // (e.g. on meshes with heavy boundary constraints). Fall
-            // back to the base mesh in that case so the LOD chain stays
-            // valid — the viewport will still see a chain entry with
-            // the requested triangle budget.
-            let decimated = match decimate(&req.mesh, &opts) {
-                Ok(m) => m,
-                Err(_) => req.mesh.clone(),
-            };
+            let decimated =
+                decimate(mesh_in_mm.as_ref(), &opts).map_err(|source| AssetError::Decimation {
+                    level: level.level,
+                    target: level.triangle_count,
+                    source,
+                })?;
+            let actual_triangles = (decimated.indices.len() / 3) as u32;
+            if actual_triangles >= base_triangles {
+                return Err(AssetError::LodNotStrictlyDecreasing {
+                    level: level.level,
+                    actual: actual_triangles,
+                    base: base_triangles,
+                });
+            }
             let bytes = native::encode(&decimated);
             let hash = format!("blake3:{}", blake3::hash(&bytes).to_hex());
             self.db.put_blob(&hash, &bytes)?;
             lods.push(MeshBlob {
                 mesh_hash: hash,
                 vertex_count: decimated.positions.len() as u32,
-                triangle_count: (decimated.indices.len() / 3) as u32,
+                triangle_count: actual_triangles,
             });
         }
 
-        // Render the thumbnail from the base mesh.
+        // Render the thumbnail from the canonicalised base mesh so the
+        // preview reflects the same geometry that ships in the LOD 0
+        // blob.
         let thumb_opts = req.thumbnail_opts.unwrap_or_default();
-        let thumb_bytes = render_thumbnail(&req.mesh, &thumb_opts)
+        let thumb_bytes = render_thumbnail(mesh_in_mm.as_ref(), &thumb_opts)
             .map_err(|e| AssetError::InvalidManifest(format!("thumbnail render failed: {e}")))?;
         let thumbnail_hash = format!("blake3:{}", blake3::hash(&thumb_bytes).to_hex());
         self.db.put_blob(&thumbnail_hash, &thumb_bytes)?;
@@ -281,8 +311,11 @@ impl<'a> AssetImportPipeline<'a> {
         path: &std::path::Path,
         meta: PathImportMetadata,
     ) -> AssetResult<ImportSummary> {
-        let ingested = crate::ingest::ingest_path(path)
-            .map_err(|e| AssetError::InvalidManifest(format!("ingest failed: {e}")))?;
+        // Preserve `IngestError` variant granularity via
+        // `AssetError::Ingest(#[from] IngestError)` so callers can
+        // programmatically distinguish unsupported-format / io /
+        // parse failures (not just by message text).
+        let ingested = crate::ingest::ingest_path(path)?;
         let req = RealMeshImportRequest {
             asset_id: meta.asset_id,
             name: meta.name,
@@ -343,6 +376,28 @@ pub struct RealMeshImportRequest {
     pub extra_ratios: Vec<f32>,
     /// Override thumbnail rendering options. `None` -> defaults.
     pub thumbnail_opts: Option<ThumbnailOptions>,
+}
+
+/// Convert a mesh's vertex positions from `source_units` to the asset
+/// DB's canonical internal unit (millimetres).
+///
+/// The `Cow` return type lets the hot path (`source_units == Mm`)
+/// borrow the caller's mesh and skip the allocation/copy entirely.
+/// All other unit variants clone-then-scale so the caller's mesh is
+/// untouched. Normals are scale-invariant under uniform scale and so
+/// are not re-normalised; UVs are unit-agnostic.
+fn canonicalise_to_mm(mesh: &Mesh, source_units: Units) -> std::borrow::Cow<'_, Mesh> {
+    let scale = source_units.to_mm(1.0) as f32;
+    if scale == 1.0 {
+        return std::borrow::Cow::Borrowed(mesh);
+    }
+    let mut scaled = mesh.clone();
+    for p in &mut scaled.positions {
+        p[0] *= scale;
+        p[1] *= scale;
+        p[2] *= scale;
+    }
+    std::borrow::Cow::Owned(scaled)
 }
 
 #[cfg(test)]
@@ -509,5 +564,159 @@ mod tests {
         let mesh = Mesh::new();
         let err = p.import_mesh(real_req("empty", mesh)).unwrap_err();
         assert!(matches!(err, AssetError::EmptyMesh));
+    }
+
+    #[test]
+    fn canonicalise_to_mm_borrows_when_units_are_already_mm() {
+        // Hot path: `source_units == Mm` must not clone the mesh.
+        let mesh = dense_mesh();
+        let positions_before = mesh.positions.clone();
+        let cow = canonicalise_to_mm(&mesh, Units::Mm);
+        assert!(matches!(cow, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(cow.positions, positions_before);
+    }
+
+    #[test]
+    fn canonicalise_to_mm_scales_metres_by_one_thousand() {
+        // A single triangle at (1, 0, 0), (0, 1, 0), (0, 0, 0) in metres
+        // must convert to (1000, 0, 0), (0, 1000, 0), (0, 0, 0) in mm.
+        let mut mesh = Mesh::new();
+        mesh.positions = vec![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]];
+        mesh.normals = vec![[0.0, 0.0, 1.0]; 3];
+        mesh.uvs = vec![[0.0, 0.0]; 3];
+        mesh.indices = vec![0, 1, 2];
+
+        let cow = canonicalise_to_mm(&mesh, Units::M);
+        assert!(matches!(cow, std::borrow::Cow::Owned(_)));
+        assert_eq!(
+            cow.positions,
+            vec![[1000.0, 0.0, 0.0], [0.0, 1000.0, 0.0], [0.0, 0.0, 0.0]]
+        );
+        // Original caller mesh untouched.
+        assert_eq!(
+            mesh.positions,
+            vec![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]]
+        );
+    }
+
+    #[test]
+    fn canonicalise_to_mm_scales_inches_by_twenty_five_point_four() {
+        let mut mesh = Mesh::new();
+        mesh.positions = vec![[1.0, 0.0, 0.0]];
+        mesh.normals = vec![[0.0, 0.0, 1.0]];
+        mesh.uvs = vec![[0.0, 0.0]];
+        mesh.indices = vec![0];
+
+        let cow = canonicalise_to_mm(&mesh, Units::Inches);
+        assert!((cow.positions[0][0] - 25.4).abs() < 1e-4);
+    }
+
+    fn unit_square_grid_mm() -> Mesh {
+        // 4x4 grid of unit squares (32 triangles, 25 vertices). All
+        // positions are integer multiples of 1 mm and exactly
+        // representable in f32, AND scale losslessly to/from metres
+        // (× 1/1000) since the metres values are also exact f32 values
+        // (1.0/1000.0 == 0.001 exactly... no, actually 0.001 is *not*
+        // exactly representable in f32). So instead pin positions at
+        // *thousands* of mm, which factor cleanly: 1000.0 mm == 1.0 m,
+        // both exactly representable.
+        let mut mesh = Mesh::new();
+        let n: u32 = 4;
+        for j in 0..=n {
+            for i in 0..=n {
+                mesh.positions
+                    .push([(i as f32) * 1000.0, (j as f32) * 1000.0, 0.0]);
+                mesh.normals.push([0.0, 0.0, 1.0]);
+                mesh.uvs.push([i as f32 / n as f32, j as f32 / n as f32]);
+            }
+        }
+        for j in 0..n {
+            for i in 0..n {
+                let tl = j * (n + 1) + i;
+                let tr = tl + 1;
+                let bl = tl + (n + 1);
+                let br = bl + 1;
+                mesh.indices.extend_from_slice(&[tl, tr, br, tl, br, bl]);
+            }
+        }
+        mesh
+    }
+
+    fn unit_square_grid_m() -> Mesh {
+        // Same grid expressed in metres: every position divided by 1000
+        // exactly (0..=4 metres → 0..=4000 mm).
+        let mut mesh = unit_square_grid_mm();
+        for p in &mut mesh.positions {
+            p[0] /= 1000.0;
+            p[1] /= 1000.0;
+            p[2] /= 1000.0;
+        }
+        mesh
+    }
+
+    #[test]
+    fn import_mesh_canonicalises_metres_to_mm_before_hashing() {
+        // Two meshes representing the same geometry: one tagged metres
+        // with values 0..=4, one tagged mm with values 0..=4000. After
+        // canonicalisation they must hash to the same BLAKE3 blob —
+        // proving that the pipeline actually applies `source_units`
+        // rather than just forwarding the field.
+        //
+        // Positions are pinned at integer multiples of 1000 mm / 1 m
+        // so both encodings are exactly representable in f32 (no
+        // rounding drift between the two import paths).
+        let metres_mesh = unit_square_grid_m();
+        let mm_mesh = unit_square_grid_mm();
+
+        let mut db = AssetDatabase::open_in_memory().unwrap();
+        let mut p = AssetImportPipeline::new(&mut db);
+
+        let mut metres_req = real_req("metres", metres_mesh);
+        metres_req.source_units = Units::M;
+        let metres_summary = p.import_mesh(metres_req).unwrap();
+
+        let mut mm_req = real_req("mm", mm_mesh);
+        mm_req.source_units = Units::Mm;
+        let mm_summary = p.import_mesh(mm_req).unwrap();
+
+        assert_eq!(
+            metres_summary.mesh_hash, mm_summary.mesh_hash,
+            "metres-tagged and mm-tagged imports of the same geometry \
+             must produce identical canonical hashes"
+        );
+        assert!(
+            mm_summary.deduped,
+            "second import (mm-tagged) should dedupe on the blob the \
+             metres-tagged import already wrote"
+        );
+    }
+
+    #[test]
+    fn import_mesh_surfaces_decimation_error_instead_of_silent_fallback() {
+        // A 1-triangle mesh cannot be decimated to anything smaller —
+        // the QEM impl returns `DecimateError::TargetTooLarge` (target
+        // > input). The old silent `req.mesh.clone()` fallback masked
+        // this; the new structured path surfaces it.
+        let mut mesh = Mesh::new();
+        mesh.positions = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        mesh.normals = vec![[0.0, 0.0, 1.0]; 3];
+        mesh.uvs = vec![[0.0, 0.0]; 3];
+        mesh.indices = vec![0, 1, 2];
+
+        let mut db = AssetDatabase::open_in_memory().unwrap();
+        let mut p = AssetImportPipeline::new(&mut db);
+        let err = p.import_mesh(real_req("tiny", mesh)).unwrap_err();
+        match err {
+            AssetError::Decimation { level, .. } => {
+                assert!(level >= 1, "LOD 0 is never decimated");
+            }
+            AssetError::LodNotStrictlyDecreasing { level, .. } => {
+                assert!(
+                    level >= 1,
+                    "LOD 0 is never decimated and cannot trigger the strict-decrease guard"
+                );
+            }
+            other => panic!("expected Decimation or LodNotStrictlyDecreasing, got: {other:?}"),
+        }
     }
 }

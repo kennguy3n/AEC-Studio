@@ -4,14 +4,22 @@ use std::path::Path;
 
 use aec_geometry::Mesh;
 
-use crate::error::AssetError;
-
 pub mod gltf;
 pub mod ifc;
 pub mod native;
 pub mod obj;
 
 /// Errors returned by ingest readers.
+///
+/// Note: this enum used to carry an `Asset(#[from] AssetError)` wrapper
+/// for the rare case where an ingest reader needed to surface an
+/// asset-layer error. The variant was never actually constructed, and
+/// after adding `AssetError::Ingest(#[from] IngestError)` (the
+/// opposite direction, used by `import_path`) the two types formed a
+/// mutually-recursive infinite-size cycle. We dropped the unused
+/// wrapper rather than boxing it so the error hierarchy stays
+/// strictly one-way: ingest errors flow up into asset errors, never
+/// the other direction.
 #[derive(Debug, thiserror::Error)]
 pub enum IngestError {
     #[error("unsupported or unrecognised format")]
@@ -20,8 +28,6 @@ pub enum IngestError {
     Io(#[from] std::io::Error),
     #[error("parse error: {0}")]
     Parse(String),
-    #[error("asset: {0}")]
-    Asset(#[from] AssetError),
 }
 
 /// Detected source format.

@@ -28,8 +28,11 @@ use aec_assets::{
 };
 use aec_core::types::Units;
 
-/// 96-triangle UV sphere (icosphere subdivided once) as an OBJ.
-/// Lots of triangles so decimation actually has work to do.
+/// 80-triangle UV sphere (icosphere subdivided once: 20 base faces
+/// × 4 subdivisions = 80 triangles, 42 vertices). Pinned to the
+/// fixture file's actual `f`-line count so the docstring matches
+/// reality; "lots of triangles" relative to the aggressive 5% LOD2
+/// target (4 triangles) so decimation actually has work to do.
 const OBJ_ICOSPHERE: &str = include_str!("fixtures/icosphere.obj");
 
 /// Same icosphere encoded as a minimal `.gltf` JSON + embedded `data:`
