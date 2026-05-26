@@ -26,7 +26,6 @@ use aec_assets::metadata::{License, Vendor};
 use aec_assets::{
     AssetDatabase, AssetImportPipeline, IngestFormat, PathImportMetadata, ThumbnailOptions,
 };
-use aec_core::types::Units;
 
 /// 80-triangle UV sphere (icosphere subdivided once: 20 base faces
 /// × 4 subdivisions = 80 triangles, 42 vertices). Pinned to the
@@ -57,7 +56,20 @@ fn cheap_thumb_opts() -> ThumbnailOptions {
     }
 }
 
-fn baseline_meta(asset_id: &str) -> PathImportMetadata {
+/// Build [`PathImportMetadata`] with `source_units` derived from
+/// `format.default_units()` — the canonical pattern bridge callers
+/// should follow when they have no out-of-band knowledge of the
+/// authoring unit. This is also how the test fixtures are authored:
+///
+/// * `icosphere.obj` is in millimetres (OBJ is unit-less by spec; the
+///   asset DB's canonical unit is mm so we adopt that as the OBJ
+///   default per [`IngestFormat::default_units`]).
+/// * `icosphere.gltf` is in metres (glTF 2.0 §3.5.4 mandates metres).
+///
+/// Both fixtures encode the same geometry (a 1m-radius icosphere
+/// subdivided once) in their respective natural units; after
+/// [`canonicalise_to_mm`] they land at identical positions in mm.
+fn meta_for_format(asset_id: &str, format: IngestFormat) -> PathImportMetadata {
     PathImportMetadata {
         asset_id: asset_id.to_string(),
         name: format!("Test asset {asset_id}"),
@@ -72,10 +84,20 @@ fn baseline_meta(asset_id: &str) -> PathImportMetadata {
         tags: vec!["test".into(), "icosphere".into()],
         style_tags: vec![],
         materials: vec![],
-        source_units: Units::Mm,
+        source_units: format.default_units(),
         extra_ratios: vec![],
         thumbnail_opts: Some(cheap_thumb_opts()),
     }
+}
+
+/// Shorthand for the common OBJ fixture path (mm).
+fn obj_meta(asset_id: &str) -> PathImportMetadata {
+    meta_for_format(asset_id, IngestFormat::Obj)
+}
+
+/// Shorthand for the common glTF fixture path (metres per spec).
+fn gltf_meta(asset_id: &str) -> PathImportMetadata {
+    meta_for_format(asset_id, IngestFormat::Gltf)
 }
 
 #[test]
@@ -85,7 +107,7 @@ fn obj_path_imports_with_three_lod_levels_and_real_thumbnail() {
     let mut db = AssetDatabase::open_in_memory().unwrap();
     let mut pipe = AssetImportPipeline::new(&mut db);
 
-    let summary = pipe.import_path(&p, baseline_meta("obj_phase11")).unwrap();
+    let summary = pipe.import_path(&p, obj_meta("obj_phase11")).unwrap();
 
     // Three-level chain per spec [1.0, 0.25, 0.05].
     assert_eq!(summary.lod_levels, 3, "spec demands 3 LOD levels");
@@ -143,7 +165,11 @@ fn gltf_path_imports_via_real_pipeline() {
 
     let mut db = AssetDatabase::open_in_memory().unwrap();
     let mut pipe = AssetImportPipeline::new(&mut db);
-    let summary = pipe.import_path(&p, baseline_meta("gltf_phase11")).unwrap();
+    // glTF is authored in metres per spec; `gltf_meta` derives that
+    // unit from `IngestFormat::Gltf.default_units()`, exercising the
+    // M -> mm canonicalisation path that bridge callers will hit on
+    // any conformant glTF asset.
+    let summary = pipe.import_path(&p, gltf_meta("gltf_phase11")).unwrap();
     assert_eq!(summary.lod_levels, 3);
     let stored = db.get("gltf_phase11").unwrap().unwrap();
     assert_eq!(stored.lods.len(), 3);
@@ -157,11 +183,11 @@ fn re_importing_same_file_dedupes_on_blake3_hash() {
     let mut db = AssetDatabase::open_in_memory().unwrap();
     let mut pipe = AssetImportPipeline::new(&mut db);
 
-    let s1 = pipe.import_path(&p, baseline_meta("first")).unwrap();
+    let s1 = pipe.import_path(&p, obj_meta("first")).unwrap();
     assert!(!s1.deduped, "first import should not be deduped");
 
     // Different asset_id, identical file → base blob should dedupe.
-    let s2 = pipe.import_path(&p, baseline_meta("second")).unwrap();
+    let s2 = pipe.import_path(&p, obj_meta("second")).unwrap();
     assert!(s2.deduped, "second import of same file should dedupe blob");
 
     // Both assets should reference the same LOD 0 blob hash.
@@ -182,8 +208,8 @@ fn re_importing_different_file_under_same_asset_id_is_rejected() {
     let mut db = AssetDatabase::open_in_memory().unwrap();
     let mut pipe = AssetImportPipeline::new(&mut db);
 
-    pipe.import_path(&p, baseline_meta("collide")).unwrap();
-    let err = pipe.import_path(&q, baseline_meta("collide")).unwrap_err();
+    pipe.import_path(&p, obj_meta("collide")).unwrap();
+    let err = pipe.import_path(&q, obj_meta("collide")).unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("hash") || msg.contains("conflict"),
