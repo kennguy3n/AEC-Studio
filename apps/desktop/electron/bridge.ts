@@ -963,9 +963,16 @@ export interface EngineStatus {
  * file order — `breakFile` and `breakLine` (1-based) point to the
  * offending entry, `breakReason` is one of
  * `"prev_hash_mismatch"`, `"hash_recompute_mismatch"`,
- * `"unsupported_hash_version"`, `"malformed_entry"`, or `"io"`,
- * and `breakDetail` carries a human-readable description for the
- * status pane.
+ * `"unsupported_hash_version"`, `"legacy_hash_version_rejected"`,
+ * `"malformed_entry"`, or `"io"`, and `breakDetail` carries a
+ * human-readable description for the status pane.
+ *
+ * `"legacy_hash_version_rejected"` is only producible when a caller
+ * wires `aec_audit::VerifyOptions::strict_v2_only()` through the
+ * service layer; the default `projectAuditVerify` path used by the
+ * renderer today cannot emit it. The union still includes it so that
+ * any renderer code that exhaustively switches on `breakReason` keeps
+ * compiling when strict mode is enabled.
  *
  * `entriesChecked` is the count of fully-validated entries (so a
  * break at line 5 of the first file yields 4).
@@ -998,6 +1005,7 @@ export interface AuditChainVerification {
     | "prev_hash_mismatch"
     | "hash_recompute_mismatch"
     | "unsupported_hash_version"
+    | "legacy_hash_version_rejected"
     | "malformed_entry"
     | "io"
     | null;

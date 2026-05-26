@@ -352,7 +352,11 @@ pub struct ChainVerificationJs {
     pub break_line: Option<u32>,
     /// `None` if `status == "ok"`; otherwise one of
     /// `"prev_hash_mismatch"`, `"hash_recompute_mismatch"`,
-    /// `"unsupported_hash_version"`, `"malformed_entry"`, `"io"`.
+    /// `"unsupported_hash_version"`, `"legacy_hash_version_rejected"`,
+    /// `"malformed_entry"`, `"io"`. `"legacy_hash_version_rejected"` is
+    /// only producible when a caller wires a strict
+    /// [`aec_audit::VerifyOptions`] through the service layer; the
+    /// default `verify_chain` path used by the bridge cannot emit it.
     pub break_reason: Option<String>,
     /// `None` if `status == "ok"`; otherwise a human-readable
     /// description of the break (e.g. `"stored = blake3:dead,
@@ -398,6 +402,15 @@ impl From<aec_audit::ChainVerification> for ChainVerificationJs {
                         format!(
                             "entry hash_version = {version}, this build supports {:?}",
                             supported
+                        ),
+                    ),
+                    aec_audit::BreakReason::LegacyHashVersionRejected {
+                        version,
+                        required_min,
+                    } => (
+                        "legacy_hash_version_rejected",
+                        format!(
+                            "entry hash_version = {version}, required minimum = {required_min}"
                         ),
                     ),
                     aec_audit::BreakReason::MalformedEntry { message } => {
