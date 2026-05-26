@@ -235,7 +235,8 @@ const api = {
     listTools: () => ipcRenderer.invoke("ai:listTools"),
     plan: (params: Record<string, unknown>) => ipcRenderer.invoke("ai:plan", params),
     acceptDiff: (diffId: string) => ipcRenderer.invoke("ai:acceptDiff", { diffId }),
-    rejectDiff: (diffId: string) => ipcRenderer.invoke("ai:rejectDiff", { diffId }),
+    rejectDiff: (diffId: string, reason?: string | null) =>
+      ipcRenderer.invoke("ai:rejectDiff", { diffId, reason: reason ?? null }),
     cancelJob: (jobId: string) => ipcRenderer.invoke("ai:cancelJob", { jobId }),
     runtimeStatus: () => ipcRenderer.invoke("ai:runtimeStatus"),
   },

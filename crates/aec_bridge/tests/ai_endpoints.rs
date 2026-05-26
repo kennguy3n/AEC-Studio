@@ -27,12 +27,37 @@ use aec_bridge::{ai_state::AiState, BridgeConfig, BridgeService};
 use aec_core::Scope;
 use tempfile::TempDir;
 
+fn write_template(root: &std::path::Path) {
+    let category_dir = root.join("interior");
+    std::fs::create_dir_all(&category_dir).unwrap();
+    let json = serde_json::json!({
+        "template_id": "interior.studio",
+        "name": "AI endpoints fixture",
+        "description": "in-test fixture",
+        "units": "mm",
+        "region_defaults": {
+            "EU": {"units": "mm", "standards": ["IFC4"]}
+        },
+        "rooms": [],
+        "default_walls": {
+            "exterior_thickness_mm": 250,
+            "interior_thickness_mm": 100,
+            "material": "wall_white"
+        },
+        "lighting_preset": "daylight",
+        "asset_shelf": [],
+        "camera_presets": []
+    });
+    std::fs::write(category_dir.join("studio.json"), json.to_string()).unwrap();
+}
+
 fn make_service() -> (BridgeService, TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let state = tmp.path().join("state");
     let projects = tmp.path().join("projects");
     let templates = tmp.path().join("templates");
     std::fs::create_dir_all(&templates).unwrap();
+    write_template(&templates);
     let cfg = BridgeConfig {
         state_dir: state,
         projects_dir: projects,
@@ -41,6 +66,18 @@ fn make_service() -> (BridgeService, TempDir) {
     };
     let s = BridgeService::new(cfg, [13u8; 32]).unwrap();
     (s, tmp)
+}
+
+/// Boot a service AND create a real on-disk project so the AI
+/// accept/reject path has a SQLCipher target to write commands to.
+/// Returns the bridge, the tempdir guard, and the project path.
+fn make_service_with_project() -> (BridgeService, TempDir, String) {
+    let (mut s, tmp) = make_service();
+    let summary = s
+        .project_create_from_template("interior.studio", "AI Endpoints Project")
+        .expect("create project");
+    let path = summary.path;
+    (s, tmp, path)
 }
 
 fn bind_loopback() -> TcpListener {
@@ -85,6 +122,50 @@ fn wire_ai_state_to_mock(service: &mut BridgeService, port: u16) {
 /// [`canned_response`].
 fn valid_style_assistant_response_bytes() -> Vec<u8> {
     let body = br#"{"content":"{\"furniture_ids\":[\"a\",\"b\"],\"material_ids\":[\"c\"],\"lighting_preset_id\":\"warm_evening\"}","stop":true,"tokens_predicted":42}"#;
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    let mut bytes = head.into_bytes();
+    bytes.extend_from_slice(body);
+    bytes
+}
+
+/// Wire-format HTTP response for a successful `plan_detection`
+/// completion. The payload is one polyline (two points) — the diff
+/// engine emits one wall `Insert` per polyline, which
+/// `ai_apply::diff_to_commands` converts into one `CreateWall`
+/// command (intrinsic scope = `Design`). Used by the
+/// `BUG_0001 (round 4)` regression test to drive a Draft-launched
+/// plan through the accept path.
+fn valid_plan_detection_response_bytes() -> Vec<u8> {
+    // Two-point polyline (≥ min_segment_length) — yields exactly
+    // one `CreateWall`. The `confidence` is above the default
+    // `min_confidence` so the converter does not drop it.
+    let body = br#"{"content":"{\"polylines\":[{\"points\":[[0.0,0.0],[4000.0,0.0]],\"confidence\":0.92}]}","stop":true,"tokens_predicted":42}"#;
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    let mut bytes = head.into_bytes();
+    bytes.extend_from_slice(body);
+    bytes
+}
+
+/// Wire-format HTTP response for a `plan_detection` completion
+/// whose polyline has **four** points — the diff produces a single
+/// `Insert` operation but the converter
+/// (`ai_apply::insert_walls_from_polyline`) decomposes it into
+/// `4 - 1 = 3` `CreateWall` commands (one per polyline segment).
+/// Used by the `BUG_0001 (round 5)` regression test to validate
+/// that `applied_count` is reported in *operation* units, not
+/// *command* units.
+fn valid_plan_detection_multi_segment_response_bytes() -> Vec<u8> {
+    // Four-point right-angle U: (0,0) → (4000,0) → (4000,3000) →
+    // (7000,3000). Each adjacent pair is ≥ the default
+    // `min_segment_length`, so the converter emits exactly three
+    // `CreateWall` commands from this single diff `Insert`.
+    let body = br#"{"content":"{\"polylines\":[{\"points\":[[0.0,0.0],[4000.0,0.0],[4000.0,3000.0],[7000.0,3000.0]],\"confidence\":0.92}]}","stop":true,"tokens_predicted":42}"#;
     let head = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
         body.len()
@@ -146,7 +227,7 @@ fn ai_runtime_status_reports_idle_by_default() {
 
 #[test]
 fn ai_plan_dispatches_through_mock_sidecar_and_registers_diff() {
-    let (mut s, _g) = make_service();
+    let (mut s, _g, project_path) = make_service_with_project();
     let listener = bind_loopback();
     let port = listener.local_addr().unwrap().port();
     let resp = canned_response(valid_style_assistant_response_bytes());
@@ -154,7 +235,14 @@ fn ai_plan_dispatches_through_mock_sidecar_and_registers_diff() {
     wire_ai_state_to_mock(&mut s, port);
 
     let result = s
-        .ai_plan("style_assistant", Scope::Design, "a warm evening", "{}", 5)
+        .ai_plan(
+            &project_path,
+            "style_assistant",
+            Scope::Design,
+            "a warm evening",
+            "{}",
+            5,
+        )
         .expect("ai_plan should round-trip through the mock sidecar");
 
     assert!(!result.diff_id.is_empty());
@@ -175,25 +263,32 @@ fn ai_plan_dispatches_through_mock_sidecar_and_registers_diff() {
 
 #[test]
 fn ai_plan_rejects_unknown_tool() {
-    let (s, _g) = make_service();
+    let (s, _g, project_path) = make_service_with_project();
     let err = s
-        .ai_plan("not_a_real_tool", Scope::Design, "", "{}", 1)
+        .ai_plan(&project_path, "not_a_real_tool", Scope::Design, "", "{}", 1)
         .unwrap_err();
     assert!(err.to_string().contains("unknown ai tool"));
 }
 
 #[test]
 fn ai_plan_rejects_malformed_context_json() {
-    let (s, _g) = make_service();
+    let (s, _g, project_path) = make_service_with_project();
     let err = s
-        .ai_plan("style_assistant", Scope::Design, "", "not json {{{", 1)
+        .ai_plan(
+            &project_path,
+            "style_assistant",
+            Scope::Design,
+            "",
+            "not json {{{",
+            1,
+        )
         .unwrap_err();
     assert!(err.to_string().contains("context_json"), "got error: {err}");
 }
 
 #[test]
 fn ai_accept_diff_removes_pending_diff() {
-    let (mut s, _g) = make_service();
+    let (mut s, _g, project_path) = make_service_with_project();
     let listener = bind_loopback();
     let port = listener.local_addr().unwrap().port();
     let resp = canned_response(valid_style_assistant_response_bytes());
@@ -201,7 +296,7 @@ fn ai_accept_diff_removes_pending_diff() {
     wire_ai_state_to_mock(&mut s, port);
 
     let result = s
-        .ai_plan("style_assistant", Scope::Design, "", "{}", 5)
+        .ai_plan(&project_path, "style_assistant", Scope::Design, "", "{}", 5)
         .unwrap();
     let outcome = s.ai_accept_diff(&result.diff_id).unwrap();
     assert!(outcome.ok);
@@ -218,7 +313,7 @@ fn ai_accept_diff_removes_pending_diff() {
 
 #[test]
 fn ai_reject_diff_removes_pending_diff() {
-    let (mut s, _g) = make_service();
+    let (mut s, _g, project_path) = make_service_with_project();
     let listener = bind_loopback();
     let port = listener.local_addr().unwrap().port();
     let resp = canned_response(valid_style_assistant_response_bytes());
@@ -226,9 +321,9 @@ fn ai_reject_diff_removes_pending_diff() {
     wire_ai_state_to_mock(&mut s, port);
 
     let result = s
-        .ai_plan("style_assistant", Scope::Design, "", "{}", 5)
+        .ai_plan(&project_path, "style_assistant", Scope::Design, "", "{}", 5)
         .unwrap();
-    let outcome = s.ai_reject_diff(&result.diff_id).unwrap();
+    let outcome = s.ai_reject_diff(&result.diff_id, None).unwrap();
     assert!(outcome.ok);
     assert_eq!(outcome.diff_id, result.diff_id);
 
@@ -237,15 +332,555 @@ fn ai_reject_diff_removes_pending_diff() {
 }
 
 #[test]
+fn ai_accept_diff_applies_commands_and_writes_audit() {
+    // Phase 11 task 10 end-to-end: a style_assistant plan
+    // produces 4 diff operations (2 furniture, 1 material_binding,
+    // 1 lighting_preset). The converter applies the 2 furniture
+    // and the 1 lighting_preset; the material_binding is skipped
+    // because the diff engine doesn't emit `target_entity`.
+    // After accept:
+    //   * `project_graph_list` reports 2 furniture entities.
+    //   * `outcome.command_ids` has 3 entries (2 furniture +
+    //     1 lighting_preset; SetLighting produces no delta but
+    //     still gets a journal entry).
+    //   * `outcome.skipped` has 1 entry for the material binding.
+    //   * The AI audit chain head advanced past genesis.
+    //   * The forensic `ai_records.jsonl` file exists and
+    //     contains the diff id.
+    let (mut s, _g, project_path) = make_service_with_project();
+    let listener = bind_loopback();
+    let port = listener.local_addr().unwrap().port();
+    let resp = canned_response(valid_style_assistant_response_bytes());
+    let _join = spawn_mock_sidecar(listener, resp, 1);
+    wire_ai_state_to_mock(&mut s, port);
+
+    let pre_furniture = s
+        .project_graph_list(&project_path, Some("furniture"))
+        .expect("graph list pre-accept");
+    assert!(
+        pre_furniture.is_empty(),
+        "fresh project must have no furniture yet, got {pre_furniture:?}"
+    );
+
+    let result = s
+        .ai_plan(&project_path, "style_assistant", Scope::Design, "", "{}", 5)
+        .unwrap();
+    let outcome = s.ai_accept_diff(&result.diff_id).unwrap();
+
+    assert!(outcome.ok, "accept must succeed");
+    assert_eq!(outcome.op_count, 4, "style_assistant emits 4 ops");
+    assert_eq!(
+        outcome.applied_count, 3,
+        "2 furniture + 1 lighting_preset apply; material_binding skipped (no target)"
+    );
+    assert_eq!(outcome.skipped.len(), 1, "material_binding must be skipped");
+    assert!(
+        outcome.skipped[0].reason.contains("material_binding"),
+        "skip reason must mention material_binding, got: {}",
+        outcome.skipped[0].reason
+    );
+    assert_eq!(
+        outcome.command_ids.len(),
+        3,
+        "one command per applied op (incl. SetLighting which has empty delta but a journal entry)"
+    );
+    assert_ne!(
+        outcome.audit_chain_head, "blake3:genesis",
+        "audit chain must advance past genesis after accept"
+    );
+
+    let post_furniture = s
+        .project_graph_list(&project_path, Some("furniture"))
+        .expect("graph list post-accept");
+    assert_eq!(
+        post_furniture.len(),
+        2,
+        "two furniture inserts must land in the graph, got {post_furniture:?}"
+    );
+
+    // Forensic record file must exist and contain the diff id +
+    // tool name so a security reviewer can reconstruct the AI
+    // proposal lineage even with the chained log alone.
+    let records_path = std::path::Path::new(&project_path)
+        .join("audit")
+        .join("ai_audit_records.jsonl");
+    let records = std::fs::read_to_string(&records_path)
+        .expect("ai_audit_records.jsonl must exist after accept");
+    assert!(
+        records.contains("style_assistant"),
+        "forensic record must name the tool, got: {records}"
+    );
+    assert!(
+        records.contains("\"status\":\"accepted\""),
+        "forensic record must capture the Accepted status, got: {records}"
+    );
+}
+
+#[test]
+fn ai_reject_diff_writes_reason_to_forensic_log() {
+    // Phase 11 task 11: reject path captures the renderer-supplied
+    // reason in the forensic companion file (NOT in the chained
+    // log, which only carries hashes).
+    let (mut s, _g, project_path) = make_service_with_project();
+    let listener = bind_loopback();
+    let port = listener.local_addr().unwrap().port();
+    let resp = canned_response(valid_style_assistant_response_bytes());
+    let _join = spawn_mock_sidecar(listener, resp, 1);
+    wire_ai_state_to_mock(&mut s, port);
+
+    let result = s
+        .ai_plan(&project_path, "style_assistant", Scope::Design, "", "{}", 5)
+        .unwrap();
+
+    let outcome = s
+        .ai_reject_diff(&result.diff_id, Some("doesn't match the brief"))
+        .unwrap();
+    assert!(outcome.ok);
+    assert_eq!(outcome.op_count, 4, "rejecting must still report op count");
+    assert_eq!(
+        outcome.reason.as_deref(),
+        Some("doesn't match the brief"),
+        "reject outcome echoes the renderer-supplied reason"
+    );
+    assert_ne!(
+        outcome.audit_chain_head, "blake3:genesis",
+        "audit chain must advance past genesis after reject"
+    );
+
+    // Rejected diffs MUST NOT touch the project graph.
+    let furniture = s
+        .project_graph_list(&project_path, Some("furniture"))
+        .expect("graph list");
+    assert!(
+        furniture.is_empty(),
+        "rejected diff must not mutate the graph, got {furniture:?}"
+    );
+
+    let records_path = std::path::Path::new(&project_path)
+        .join("audit")
+        .join("ai_audit_records.jsonl");
+    let records = std::fs::read_to_string(&records_path)
+        .expect("ai_audit_records.jsonl must exist after reject");
+    assert!(
+        records.contains("doesn't match the brief"),
+        "rejection reason must reach the forensic log, got: {records}"
+    );
+    assert!(
+        records.contains("\"status\":\"rejected\""),
+        "forensic record must capture the Rejected status, got: {records}"
+    );
+
+    // The chained log (`ai_audit.jsonl`) must NOT contain the
+    // reason text \u2014 chain integrity is via the hash, not the
+    // payload.
+    let chain_path = std::path::Path::new(&project_path)
+        .join("audit")
+        .join("ai_audit.jsonl");
+    let chain = std::fs::read_to_string(&chain_path).expect("ai_audit.jsonl must exist");
+    assert!(
+        !chain.contains("doesn't match the brief"),
+        "reason must NOT leak into the chained log, got: {chain}"
+    );
+}
+
+#[test]
 fn ai_accept_diff_rejects_unknown_id() {
-    let (s, _g) = make_service();
+    let (mut s, _g) = make_service();
     let err = s.ai_accept_diff("diff_does_not_exist").unwrap_err();
     assert!(err.to_string().contains("not found"));
 }
 
+/// `BUG_0001 (round 4)` regression: a Draft-launched
+/// `plan_detection` accept must succeed even though the emitted
+/// `CreateWall` commands carry intrinsic scope = `Design`. The
+/// AI tool registry (`crates/aec_ai/data/ai_tools.json`) declares
+/// `allowed_scopes: ["design", "draft"]` for `plan_detection` —
+/// a 2D drafter is allowed to detect walls in their imported plan
+/// even though the resulting walls are Design-scope objects.
+///
+/// Prior to round 4 the bridge opened the `CommandEngine` at the
+/// renderer-supplied `plan_scope` (here: `Draft`) and the batch's
+/// scope guard rejected with `ScopeMismatch` because
+/// `commands[0].scope (Design) != engine.active_scope (Draft)`.
+/// The fix derives the engine scope from
+/// `conversion.commands[0].scope` and keeps `plan_scope` only as
+/// the provenance label on the AI audit envelope.
+///
+/// The assertions cover both halves of the fix:
+///   * the accept does not raise `ScopeMismatch`,
+///   * the resulting wall lands in the graph (Design-scope query),
+///   * the AI audit chain advances past genesis (audit append
+///     ran with `plan_scope = Draft` as the launch-context label),
+///   * the forensic record retains the launch scope so the audit
+///     trail captures *which* UI mode produced the accept.
+#[test]
+fn ai_accept_diff_draft_launched_plan_detection_succeeds() {
+    let (mut s, _g, project_path) = make_service_with_project();
+    let listener = bind_loopback();
+    let port = listener.local_addr().unwrap().port();
+    let resp = canned_response(valid_plan_detection_response_bytes());
+    let _join = spawn_mock_sidecar(listener, resp, 1);
+    wire_ai_state_to_mock(&mut s, port);
+
+    let pre_walls = s
+        .project_graph_list(&project_path, Some("wall"))
+        .expect("graph list pre-accept");
+    assert!(
+        pre_walls.is_empty(),
+        "fresh project must have no walls yet, got {pre_walls:?}"
+    );
+
+    let result = s
+        .ai_plan(
+            &project_path,
+            "plan_detection",
+            // Launch from Draft — this is the leg the round-4
+            // regression covers; round-3 testing only exercised
+            // Design-launched plans.
+            Scope::Draft,
+            "",
+            "{}",
+            5,
+        )
+        .expect("plan_detection must register a pending diff under Draft scope");
+
+    let outcome = s
+        .ai_accept_diff(&result.diff_id)
+        .expect("Draft-launched plan_detection accept must NOT raise ScopeMismatch");
+
+    assert!(outcome.ok, "accept must succeed");
+    assert_eq!(
+        outcome.op_count, 1,
+        "one polyline → one wall Insert in the diff"
+    );
+    assert_eq!(
+        outcome.applied_count, 1,
+        "the wall Insert must apply (not be skipped) — got skipped={:?}",
+        outcome.skipped
+    );
+    assert_eq!(
+        outcome.command_ids.len(),
+        1,
+        "the batch must journal exactly one CreateWall command"
+    );
+    assert_ne!(
+        outcome.audit_chain_head, "blake3:genesis",
+        "audit chain must advance past genesis after a Draft-launched accept"
+    );
+
+    let post_walls = s
+        .project_graph_list(&project_path, Some("wall"))
+        .expect("graph list post-accept");
+    assert_eq!(
+        post_walls.len(),
+        1,
+        "the polyline must land as a single wall in the graph, got {post_walls:?}"
+    );
+
+    // The forensic record retains the *launch* scope (Draft) so a
+    // security reviewer can reconstruct which UI session produced
+    // the accept — even though the journal entry itself is tagged
+    // Design (the intrinsic command scope). This is the dual-scope
+    // contract documented on `ai_accept_diff_commit`.
+    let records_path = std::path::Path::new(&project_path)
+        .join("audit")
+        .join("ai_audit_records.jsonl");
+    let records = std::fs::read_to_string(&records_path)
+        .expect("ai_audit_records.jsonl must exist after accept");
+    assert!(
+        records.contains("plan_detection"),
+        "forensic record must name the tool, got: {records}"
+    );
+    assert!(
+        records.contains("\"scope\":\"draft\""),
+        "forensic record must capture the Draft launch scope, got: {records}"
+    );
+    assert!(
+        records.contains("\"status\":\"accepted\""),
+        "forensic record must capture the Accepted status, got: {records}"
+    );
+}
+
+/// `BUG_0001 (round 5)` regression: a `plan_detection` polyline
+/// with four points produces **one** diff `Insert` operation that
+/// the converter decomposes into **three** `CreateWall` commands
+/// (one per polyline segment, via
+/// `ai_apply::insert_walls_from_polyline`). Prior to round 5 the
+/// service reported `applied_count = applied_results.len() = 3`,
+/// which broke the renderer's "Applied X of Y operations" display
+/// — X (`applied_count`) could exceed Y (`op_count`) whenever the
+/// user accepted a wall plan with more than one segment.
+///
+/// The fix routes the operation count through
+/// `ApplyConversion.applied_op_count`, which the converter
+/// computes by tracking whether each diff operation produced at
+/// least one emitted command. `applied_count` is now bounded
+/// above by `op_count`, while `command_ids` continues to reflect
+/// the actual journal of emitted commands (one per segment, so 3
+/// here).
+#[test]
+fn ai_accept_diff_multi_segment_polyline_reports_operation_count() {
+    let (mut s, _g, project_path) = make_service_with_project();
+    let listener = bind_loopback();
+    let port = listener.local_addr().unwrap().port();
+    let resp = canned_response(valid_plan_detection_multi_segment_response_bytes());
+    let _join = spawn_mock_sidecar(listener, resp, 1);
+    wire_ai_state_to_mock(&mut s, port);
+
+    let result = s
+        .ai_plan(&project_path, "plan_detection", Scope::Design, "", "{}", 5)
+        .expect("plan_detection must register a pending diff");
+
+    let outcome = s
+        .ai_accept_diff(&result.diff_id)
+        .expect("multi-segment plan_detection accept must succeed");
+
+    assert!(outcome.ok, "accept must succeed");
+    assert_eq!(
+        outcome.op_count, 1,
+        "one polyline → one Insert operation in the diff (regardless of point count)"
+    );
+    assert_eq!(
+        outcome.applied_count, 1,
+        "applied_count is in OPERATION units (not command units); got skipped={:?}, \
+         command_ids={:?}",
+        outcome.skipped, outcome.command_ids
+    );
+    assert!(
+        outcome.applied_count <= outcome.op_count,
+        "documented bound applied_count <= op_count must hold; got applied_count={} \
+         op_count={}",
+        outcome.applied_count,
+        outcome.op_count
+    );
+    assert!(
+        outcome.skipped.is_empty(),
+        "no segment should be skipped on a clean polyline; got {:?}",
+        outcome.skipped
+    );
+    assert_eq!(
+        outcome.command_ids.len(),
+        3,
+        "command_ids reflects the actual journal (3 segments → 3 CreateWall commands); \
+         got {:?}",
+        outcome.command_ids
+    );
+
+    // Cross-check the graph: three walls landed in Design scope.
+    let walls = s
+        .project_graph_list(&project_path, Some("wall"))
+        .expect("graph list post-accept");
+    assert_eq!(
+        walls.len(),
+        3,
+        "the four-point polyline must land as three walls in the graph, got {walls:?}"
+    );
+}
+
+/// `BUG_0001 (round 2)` regression: if `ai_accept_diff` fails after
+/// the initial peek (e.g. the project package can no longer be
+/// opened because the on-disk files were moved/deleted), the pending
+/// diff must survive in the registry so the renderer can retry once
+/// the underlying problem is resolved. Prior to the peek/finalize
+/// split, the diff was popped up-front and any downstream error
+/// dropped it from the registry permanently.
+#[test]
+fn ai_accept_diff_failure_preserves_pending_diff_for_retry() {
+    let (mut s, _g, project_path) = make_service_with_project();
+    let listener = bind_loopback();
+    let port = listener.local_addr().unwrap().port();
+    let resp = canned_response(valid_style_assistant_response_bytes());
+    let _join = spawn_mock_sidecar(listener, resp, 1);
+    wire_ai_state_to_mock(&mut s, port);
+
+    let result = s
+        .ai_plan(&project_path, "style_assistant", Scope::Design, "", "{}", 5)
+        .unwrap();
+    // Sanity: the diff is registered before we corrupt the project.
+    let st = s.ai_runtime_status().unwrap();
+    assert_eq!(
+        st.pending_diff_ids,
+        vec![result.diff_id.clone()],
+        "diff must be pending after ai_plan"
+    );
+
+    // Force `ai_accept_diff_inner` to fail by removing the project
+    // directory. `ProjectPackage::open_with_master_key_and_database`
+    // will fail before any SQL is touched, so the inner method
+    // returns an error without committing anything.
+    std::fs::remove_dir_all(&project_path).expect("remove project dir");
+
+    let err = s.ai_accept_diff(&result.diff_id).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("not found"),
+        "the failure must come from the package open, not the diff registry: {msg}"
+    );
+
+    // The diff must STILL be in the registry so the renderer can
+    // retry after the user restores the project.
+    let st = s.ai_runtime_status().unwrap();
+    assert_eq!(
+        st.pending_diff_ids,
+        vec![result.diff_id.clone()],
+        "BUG_0001 (round 2): pending diff must survive a failed accept"
+    );
+}
+
+/// `BUG_0001 (round 2)` regression for the reject path: same
+/// invariant as the accept-path test above. The audit append is the
+/// only fallible step in reject, but any failure there must NOT
+/// drop the pending diff.
+#[test]
+fn ai_reject_diff_failure_preserves_pending_diff_for_retry() {
+    let (mut s, _g, project_path) = make_service_with_project();
+    let listener = bind_loopback();
+    let port = listener.local_addr().unwrap().port();
+    let resp = canned_response(valid_style_assistant_response_bytes());
+    let _join = spawn_mock_sidecar(listener, resp, 1);
+    wire_ai_state_to_mock(&mut s, port);
+
+    let result = s
+        .ai_plan(&project_path, "style_assistant", Scope::Design, "", "{}", 5)
+        .unwrap();
+    let st = s.ai_runtime_status().unwrap();
+    assert_eq!(
+        st.pending_diff_ids,
+        vec![result.diff_id.clone()],
+        "diff must be pending after ai_plan"
+    );
+
+    // Remove the project directory so `ProjectPackage::open_with_master_key`
+    // (called inside `ai_reject_diff_inner`) fails before any audit
+    // entry is written.
+    std::fs::remove_dir_all(&project_path).expect("remove project dir");
+
+    let err = s
+        .ai_reject_diff(&result.diff_id, Some("retry me"))
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("not found"),
+        "the failure must come from the package open, not the diff registry: {msg}"
+    );
+
+    let st = s.ai_runtime_status().unwrap();
+    assert_eq!(
+        st.pending_diff_ids,
+        vec![result.diff_id.clone()],
+        "BUG_0001 (round 2): pending diff must survive a failed reject"
+    );
+}
+
+/// `BUG_0001 (round 3)` regression: if the post-commit AI audit
+/// append fails *after* `execute_persistent_batch` has already
+/// written the SQL transaction, the pending diff MUST be removed
+/// from the registry. The earlier (round 2) structure left the
+/// diff in the registry on any inner error — including audit
+/// failure — which sounds safe but actually corrupts the project
+/// on retry: `diff_to_commands` generates fresh `EntityId::new()`
+/// UUIDs for every `Insert` op, so a second successful commit
+/// would silently duplicate every inserted entity. This test
+/// pre-creates the AI audit JSONL path as a *directory* so the
+/// audit logger's `File::open` returns `EISDIR` AFTER the SQL
+/// commit has already landed, then asserts:
+///   1. `ai_accept_diff` returns Err (audit divergence surfaced).
+///   2. The pending diff is no longer in the registry (finalize
+///      ran between commit and audit).
+///   3. The graph has the expected entities (commit was durable).
+///   4. A retry returns the "diff not found" error rather than
+///      double-applying.
+#[test]
+fn ai_accept_diff_failed_audit_after_commit_finalizes_to_block_retry_duplication() {
+    let (mut s, _g, project_path) = make_service_with_project();
+    let listener = bind_loopback();
+    let port = listener.local_addr().unwrap().port();
+    let resp = canned_response(valid_style_assistant_response_bytes());
+    let _join = spawn_mock_sidecar(listener, resp, 1);
+    wire_ai_state_to_mock(&mut s, port);
+
+    let result = s
+        .ai_plan(&project_path, "style_assistant", Scope::Design, "", "{}", 5)
+        .unwrap();
+    let st = s.ai_runtime_status().unwrap();
+    assert_eq!(
+        st.pending_diff_ids,
+        vec![result.diff_id.clone()],
+        "diff must be pending after ai_plan"
+    );
+
+    // Sabotage the AI audit path: replace the would-be chain file
+    // with a *directory* of the same name. `AiAuditLogger::open`
+    // calls `File::open` on this path (via `AuditLog::open`)
+    // because it now `exists()` — and `File::open` on a directory
+    // returns EISDIR. Critically, this leaves `<project>/audit/`
+    // itself writable so `execute_persistent_batch` doesn't trip
+    // over it first; only the audit-append step (phase 4) fails.
+    let audit_dir = std::path::Path::new(&project_path).join("audit");
+    std::fs::create_dir_all(&audit_dir).expect("ensure audit dir");
+    let chain_as_dir = audit_dir.join("ai_audit.jsonl");
+    std::fs::create_dir_all(&chain_as_dir).expect("create chain path as dir");
+
+    let pre_furniture = s
+        .project_graph_list(&project_path, Some("furniture"))
+        .expect("graph list pre-accept");
+    assert!(
+        pre_furniture.is_empty(),
+        "fresh project must have no furniture yet"
+    );
+
+    let err = s.ai_accept_diff(&result.diff_id).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("not found"),
+        "the failure must come from the audit append, not the diff registry: {msg}"
+    );
+
+    // Phase 3 finalize MUST have removed the diff from the
+    // registry. If it hadn't, the renderer could retry and
+    // `diff_to_commands` would generate fresh entity UUIDs,
+    // double-applying every insert against the still-committed
+    // graph.
+    let st = s.ai_runtime_status().unwrap();
+    assert!(
+        st.pending_diff_ids.is_empty(),
+        "BUG_0001 (round 3): pending diff must be finalized once SQL is committed, even if the post-commit audit append fails; got pending={:?}",
+        st.pending_diff_ids
+    );
+
+    // Phase 2 SQL commit was durable: the furniture entities are
+    // in the graph.
+    let post_furniture = s
+        .project_graph_list(&project_path, Some("furniture"))
+        .expect("graph list post-accept");
+    assert_eq!(
+        post_furniture.len(),
+        2,
+        "the 2 furniture inserts must be on disk even though audit append failed; got {post_furniture:?}"
+    );
+
+    // A retry now is structurally impossible (the diff is gone).
+    // This is the property we want — no double-apply.
+    let retry_err = s.ai_accept_diff(&result.diff_id).unwrap_err();
+    assert!(
+        retry_err.to_string().contains("not found"),
+        "retry after failed audit must surface 'diff not found' rather than re-applying, got: {retry_err}"
+    );
+
+    // Sanity: the graph entity count didn't grow on retry.
+    let after_retry = s
+        .project_graph_list(&project_path, Some("furniture"))
+        .expect("graph list post-retry");
+    assert_eq!(
+        after_retry.len(),
+        2,
+        "retry must not have duplicated entities; got {after_retry:?}"
+    );
+}
+
 #[test]
 fn ai_accept_diff_rejects_malformed_id() {
-    let (s, _g) = make_service();
+    let (mut s, _g) = make_service();
     // Missing the `diff_` prefix — DiffId::from_string rejects it.
     let err = s.ai_accept_diff("not-a-diff-id").unwrap_err();
     assert!(err.to_string().contains("not found"));
@@ -260,9 +895,13 @@ fn ai_cancel_job_resets_runtime_to_idle() {
     let _join = spawn_mock_sidecar(listener, resp, 1);
     wire_ai_state_to_mock(&mut s, port);
 
+    let summary = s
+        .project_create_from_template("interior.studio", "AI Endpoints Cancel")
+        .expect("create project");
+    let project_path = summary.path;
     // Drive the runtime to Ready via a successful plan.
     let _ = s
-        .ai_plan("style_assistant", Scope::Design, "", "{}", 5)
+        .ai_plan(&project_path, "style_assistant", Scope::Design, "", "{}", 5)
         .unwrap();
     assert_eq!(s.ai_runtime_status().unwrap().state, "ready");
 
@@ -304,8 +943,12 @@ fn ai_plan_routes_a_failed_safety_validation_back_as_ai_error() {
     let _join = spawn_mock_sidecar(listener, response, 1);
     wire_ai_state_to_mock(&mut s, port);
 
+    let summary = s
+        .project_create_from_template("interior.studio", "AI Endpoints Safety")
+        .expect("create project");
+    let project_path = summary.path;
     let err = s
-        .ai_plan("style_assistant", Scope::Design, "", "{}", 5)
+        .ai_plan(&project_path, "style_assistant", Scope::Design, "", "{}", 5)
         .unwrap_err();
     // Safety errors come back as BridgeServiceError::Ai (the planner
     // wraps the SafetyError in a PlanError, which `From` converts into
@@ -329,8 +972,12 @@ fn ai_plan_serialises_to_finite_json_numbers() {
     let _join = spawn_mock_sidecar(listener, resp, 1);
     wire_ai_state_to_mock(&mut s, port);
 
+    let summary = s
+        .project_create_from_template("interior.studio", "AI Endpoints Json")
+        .expect("create project");
+    let project_path = summary.path;
     let result = s
-        .ai_plan("style_assistant", Scope::Design, "", "{}", 5)
+        .ai_plan(&project_path, "style_assistant", Scope::Design, "", "{}", 5)
         .unwrap();
     let json = serde_json::to_string(&result).expect("AiPlanResult must serialise");
     assert!(!json.contains("inf"));

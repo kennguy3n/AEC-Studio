@@ -309,8 +309,22 @@ export function rendererInProcessBackend(): AecApi {
         const parsed = inProcessParsedForTool(tool, params);
         return { diffId: newId("diff"), parsed };
       },
-      acceptDiff: async () => ({ accepted: true }),
-      rejectDiff: async () => ({ rejected: true }),
+      acceptDiff: async (diffId: string) => ({
+        accepted: true as const,
+        diffId,
+        opCount: 0,
+        appliedCount: 0,
+        skipped: [] as Array<{ opIndex: number; reason: string }>,
+        commandIds: [] as string[],
+        auditChainHead: "",
+      }),
+      rejectDiff: async (diffId: string, reason?: string | null) => ({
+        rejected: true as const,
+        diffId,
+        opCount: 0,
+        reason: reason ?? null,
+        auditChainHead: "",
+      }),
       cancelJob: async () => ({ cancelled: true }),
       runtimeStatus: async () => ({ state: "idle", lastError: null }),
     },

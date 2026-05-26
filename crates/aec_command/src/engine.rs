@@ -230,6 +230,21 @@ impl CommandEngine {
                 actual: self.active_scope.to_string(),
             });
         }
+        Self::compute_deltas_against_graph(graph, kind)
+    }
+
+    /// Pure delta computation against an externally-supplied graph.
+    /// Used by [`Self::compute_deltas`] (with `&self.graph`) AND by
+    /// [`Self::execute_persistent_batch`] (with a forward-walking
+    /// staging clone) so each command in a batch validates against
+    /// the post-state of the previous commands.
+    ///
+    /// Does NOT enforce scope \u2014 the caller is expected to check
+    /// scope once for the whole batch.
+    fn compute_deltas_against_graph(
+        graph: &ProjectGraph,
+        kind: &CommandKind,
+    ) -> Result<Vec<EntityDelta>> {
         Ok(match kind {
             CommandKind::CreateWall(c) => {
                 c.validate()?;
@@ -321,8 +336,24 @@ impl CommandEngine {
     /// `undo_journal`. Use [`Self::execute_persistent`] to commit
     /// subsequent commands back to disk.
     pub fn open(conn: &rusqlite::Connection, active_scope: Scope) -> Result<Self> {
+        let graph = crate::commands::ProjectGraph::load(conn)?;
+        Self::open_with_graph(conn, active_scope, graph)
+    }
+
+    /// Like [`Self::open`] but reuses an already-loaded [`ProjectGraph`]
+    /// instead of re-reading the `entities` table. The caller must
+    /// guarantee `graph` reflects the current contents of `conn`'s
+    /// `entities` table (i.e. nothing has mutated the table between
+    /// loading the graph and this call). Used by the AI accept path
+    /// and similar flows where the graph was loaded once for diff
+    /// translation and would otherwise be re-read here.
+    pub fn open_with_graph(
+        conn: &rusqlite::Connection,
+        active_scope: Scope,
+        graph: crate::commands::ProjectGraph,
+    ) -> Result<Self> {
         Ok(Self {
-            graph: crate::commands::ProjectGraph::load(conn)?,
+            graph,
             journal: crate::journal::UndoRedoJournal::load(conn, 1024)?,
             audit: crate::audit::AuditHashChain::new(),
             active_scope,
@@ -397,28 +428,46 @@ impl CommandEngine {
         })
     }
 
-    /// Apply a sequence of commands as a single atomic batch.
+    /// Execute a *batch* of commands inside a single SQL transaction.
     ///
-    /// Same shape as [`Self::execute_persistent`] but amortises the
-    /// per-command transaction + journal overhead across an arbitrary
-    /// number of commands. Used by bulk ingest paths (e.g. DXF
-    /// import, IFC attach) where issuing N independent
-    /// `execute_persistent` calls would mean N transactions, N audit
-    /// envelope extensions, and N status-pane invalidations.
+    /// Phase 11 task 10 introduced this entry point: when the AI's
+    /// `ai_accept_diff` converts a [`Diff`](aec_ai::Diff) into N
+    /// typed commands, the renderer expects "apply all of these as
+    /// one undo step" so a single Cmd-Z reverts the whole AI
+    /// suggestion. Calling [`Self::execute_persistent`] N times in
+    /// a loop would create N journal entries and N undo steps,
+    /// which is the wrong UX shape and also performs N SQL commits.
     ///
-    /// Pipeline (all-or-nothing):
-    /// 1. Validate every command's deltas against a forward-running
-    ///    clone of the graph so command `i` sees the post-state of
-    ///    commands `0..i`.
-    /// 2. Open a single SQL transaction; write every entity delta and
-    ///    every journal entry inside it. Any failure rolls back the
-    ///    whole batch — partial batches are never visible on disk.
-    /// 3. After `commit()` succeeds, mirror the changes to the
-    ///    in-memory graph + journal in the same order. Audit envelopes
-    ///    are extended per-command so the chain still records each
-    ///    user gesture distinctly.
+    /// The same shape is used by bulk ingest paths (DXF import,
+    /// IFC attach) where issuing N independent `execute_persistent`
+    /// calls would mean N transactions, N audit envelope
+    /// extensions, and N status-pane invalidations.
     ///
-    /// Returns the per-command [`CommandResult`]s in input order.
+    /// Semantics:
+    /// * The batch's scope must match the engine's `active_scope`.
+    ///   This is the same contract enforced by
+    ///   [`Self::execute_persistent`] via [`Self::compute_deltas`];
+    ///   the batch path validates it once up front so a single
+    ///   scope mismatch surfaces before any SQL is touched.
+    /// * Every command in the batch must share the same scope as
+    ///   command #0; any internally-inconsistent batch is rejected
+    ///   with [`CommandError::ScopeMismatch`].
+    /// * Deltas from every command are computed and validated
+    ///   against a graph clone that walks forward through the
+    ///   batch — so command #2's validation sees command #1's
+    ///   inserts. This lets a batch like
+    ///   `[create_wall_a, place_door_on_a]` validate cleanly.
+    /// * All deltas + all journal entries are persisted in **one**
+    ///   `rusqlite::Transaction`. Either every row commits or none
+    ///   do; there is no "applied the first two but not the third"
+    ///   state observable from outside this call.
+    /// * On commit success the in-memory graph + journal are
+    ///   updated in input order. The result vector is in input
+    ///   order too so callers can correlate `commands[i]` with
+    ///   `results[i]`.
+    ///
+    /// An empty batch is a no-op that returns an empty result
+    /// vector and does not open a transaction.
     pub fn execute_persistent_batch(
         &mut self,
         commands: Vec<Command>,
@@ -427,74 +476,116 @@ impl CommandEngine {
         if commands.is_empty() {
             return Ok(Vec::new());
         }
-        // Phase 1: compute + validate every command's deltas against
-        // a forward-running clone. We can't validate against
-        // `self.graph` directly because the n-th command may depend
-        // on entities created by command n-1.
-        let mut shadow = self.graph.clone();
-        let mut per_command_deltas: Vec<Vec<EntityDelta>> = Vec::with_capacity(commands.len());
-        let mut entries: Vec<JournalEntry> = Vec::with_capacity(commands.len());
+        // Validate the entire batch BEFORE opening a transaction so
+        // a malformed payload doesn't waste a SQLite write lock.
+        //
+        // (1) Active-scope guard. The single-command path enforces
+        //     this implicitly through `compute_deltas`; the batch
+        //     path enforces it explicitly so a misrouted batch
+        //     (e.g. a Deliver-scope `CreateRevision` arriving on a
+        //     Design engine) is rejected with one clear error
+        //     instead of being decomposed per-command. This closes
+        //     the gap Devin Review flagged as BUG_0001.
+        let batch_scope = commands[0].scope;
+        if batch_scope != self.active_scope {
+            return Err(CommandError::ScopeMismatch {
+                expected: self.active_scope.to_string(),
+                actual: batch_scope.to_string(),
+            });
+        }
+        // (2) Internal-consistency guard. Every command must agree
+        //     with the batch's canonical scope; a mixed-scope batch
+        //     would otherwise be impossible to journal cleanly (the
+        //     `JournalEntry.scope` field is single-valued).
         for cmd in &commands {
-            // Compute against the forward-running shadow so command `i`
-            // sees the post-state of commands `0..i` — this is the
-            // cross-command-dependency guarantee documented in the
-            // method docs. Passing `&self.graph` here would silently
-            // break any command whose `to_delta` reads other entities
-            // (e.g. EditTool referencing a primitive created earlier
-            // in the same batch).
-            let deltas = self.compute_deltas(&cmd.kind, &shadow)?;
-            shadow.validate_all(&deltas)?;
+            if cmd.scope != batch_scope {
+                return Err(CommandError::ScopeMismatch {
+                    expected: batch_scope.to_string(),
+                    actual: cmd.scope.to_string(),
+                });
+            }
+        }
+        // Phase 1: pre-compute every command's deltas, validating
+        // each step against a forward-walking clone so command #2
+        // can see command #1's inserts. We collect everything up
+        // front so the transaction window stays short — SQLite's
+        // writer lock blocks every concurrent reader for the
+        // duration.
+        //
+        // `ANALYSIS_0003` fix: stage the `JournalEntry` *once* per
+        // command here. The previous shape held `(Command, deltas,
+        // inverse)` and reconstructed two separate `JournalEntry`
+        // values per command (one in phase 2 for SQL persist with
+        // `deltas.clone() + inverse.clone()`, another in phase 3
+        // for the in-memory journal with `deltas.clone() + inverse`).
+        // Constructing the entry once lets phase 2 borrow it for
+        // SQL persistence and phase 3 move it into the in-memory
+        // journal — one allocation per command instead of three,
+        // and the SQL/in-memory representations are guaranteed to
+        // be byte-identical (no risk of the two construction sites
+        // drifting under future maintenance).
+        let mut staging = self.graph.clone();
+        let mut staged: Vec<(Command, JournalEntry)> = Vec::with_capacity(commands.len());
+        for cmd in commands {
+            // `compute_deltas_against_graph` is the pure form that
+            // does NOT re-check scope; we already validated scope
+            // for the entire batch above. Using this form avoids
+            // re-running the scope guard per command and keeps the
+            // error returned by phase 1 specifically about the
+            // graph-level validation failure.
+            let deltas = Self::compute_deltas_against_graph(&staging, &cmd.kind)?;
+            staging.validate_all(&deltas)?;
             for d in &deltas {
-                shadow
-                    .apply(d)
-                    .expect("validate_all just succeeded; apply on shadow cannot fail");
+                staging.apply(d)?;
             }
             let inverse: Vec<EntityDelta> = deltas.iter().rev().map(EntityDelta::invert).collect();
-            entries.push(JournalEntry {
+            let entry = JournalEntry {
                 command_id: cmd.command_id.clone(),
                 applied_at: cmd.ts,
                 scope: self.active_scope,
-                forward: deltas.clone(),
+                forward: deltas,
                 inverse,
-            });
-            per_command_deltas.push(deltas);
+            };
+            staged.push((cmd, entry));
         }
-
-        // Phase 2: single SQL transaction covering every delta + every
-        // journal entry. If any write fails (or `commit()` itself
-        // fails) the batch is rolled back and none of the in-memory
-        // mutations from phase 3 below execute.
+        // Phase 2: single SQL transaction covering every delta +
+        // every journal entry. If any write fails (or `commit()`
+        // itself fails) the batch is rolled back and none of the
+        // in-memory mutations from phase 3 below execute.
         let tx = conn.transaction()?;
-        for deltas in &per_command_deltas {
-            for d in deltas {
+        for (_cmd, entry) in &staged {
+            for d in &entry.forward {
                 crate::commands::ProjectGraph::persist_delta_in_tx(&tx, d)?;
             }
-        }
-        for entry in &entries {
             crate::journal::UndoRedoJournal::persist_record_in_tx(&tx, entry)?;
         }
         tx.commit()?;
-
-        // Phase 3: mirror to in-memory. Each apply is guaranteed to
-        // succeed because we validated against the same starting
-        // state via the shadow graph in phase 1.
-        let mut results = Vec::with_capacity(commands.len());
-        for (cmd, deltas) in commands.into_iter().zip(per_command_deltas) {
-            for d in &deltas {
+        // Phase 3: SQL is committed atomically. Mirror in-memory
+        // state and build per-command audit envelopes in the same
+        // order so the chain still records each user gesture
+        // distinctly.
+        let mut results = Vec::with_capacity(staged.len());
+        for (cmd, entry) in staged {
+            for d in &entry.forward {
                 self.graph
                     .apply(d)
-                    .expect("shadow-validated above; apply on real graph cannot fail");
+                    .expect("validated above; apply cannot fail");
             }
             let envelope = self.audit.extend(
                 &cmd.command_id,
                 &serde_json::to_value(&cmd).unwrap_or(serde_json::Value::Null),
             );
-            // Find the entry for this command (input order preserved).
-            let entry_idx = results.len();
-            self.journal.record(entries[entry_idx].clone());
+            // The `CommandResult.applied` field is the only place
+            // outside the engine that observes the forward deltas,
+            // so we clone once for it and move the entry into the
+            // journal. The journal owns `entry.forward` for undo;
+            // callers see a copy via `CommandResult.applied` for
+            // their own observation (e.g. status pane caching).
+            let applied = entry.forward.clone();
+            self.journal.record(entry);
             results.push(CommandResult {
                 command_id: cmd.command_id,
-                applied: deltas,
+                applied,
                 audit: envelope,
             });
         }
@@ -502,7 +593,7 @@ impl CommandEngine {
     }
 
     /// Persistent counterpart to [`Self::undo`]. Same single-transaction
-    /// validate → SQL → commit → in-memory pipeline as
+    /// validate -> SQL -> commit -> in-memory pipeline as
     /// [`Self::execute_persistent`]: peek the top entry without
     /// removing it, validate the inverse deltas, write everything in
     /// one tx, commit, and only then move the in-memory journal stacks.
@@ -1005,6 +1096,98 @@ mod tests {
         let mut e = CommandEngine::open(&conn, Scope::Draft).unwrap();
         let results = e.execute_persistent_batch(vec![], &mut conn).unwrap();
         assert!(results.is_empty());
+        assert_eq!(e.graph().len(), 0);
+        assert_eq!(e.undo_len(), 0);
+    }
+
+    #[test]
+    fn execute_persistent_batch_rejects_scope_mismatch_with_active_scope() {
+        // Regression for Devin Review BUG_0001: the batch path used to
+        // only check that every command in the batch shared a scope
+        // with command #0, but never validated that the batch's scope
+        // matched the engine's `active_scope`. The single-command
+        // path enforces this implicitly through `compute_deltas` and
+        // the batch path now enforces it explicitly as a single
+        // up-front check. A misrouted batch (Design engine receiving
+        // a Draft-scope batch) must be rejected with `ScopeMismatch`
+        // BEFORE any SQL is touched, BEFORE deltas are computed, and
+        // without partially mutating either layer.
+        use crate::commands::draft::DrawPrimitive;
+        use aec_cad::primitives::{Line, Primitive};
+        let mut conn = open_in_memory_persistent_db();
+        // Engine opened in Design scope.
+        let mut e = CommandEngine::open(&conn, Scope::Design).unwrap();
+        // Batch of two Draft-scope commands. Internal consistency
+        // holds (both are Draft) but the batch as a whole disagrees
+        // with the engine's active scope.
+        let cmds = vec![
+            Command::user(CommandKind::DrawPrimitive(DrawPrimitive {
+                entity_id: EntityId::new(),
+                primitive: Primitive::Line(Line::new("0", [0.0, 0.0], [10.0, 0.0])),
+            })),
+            Command::user(CommandKind::DrawPrimitive(DrawPrimitive {
+                entity_id: EntityId::new(),
+                primitive: Primitive::Line(Line::new("0", [10.0, 0.0], [20.0, 0.0])),
+            })),
+        ];
+        let err = e.execute_persistent_batch(cmds, &mut conn).unwrap_err();
+        match err {
+            CommandError::ScopeMismatch { expected, actual } => {
+                assert_eq!(expected, Scope::Design.to_string());
+                assert_eq!(actual, Scope::Draft.to_string());
+            }
+            other => panic!("expected ScopeMismatch, got {other:?}"),
+        }
+        // All-or-nothing: nothing persisted, nothing in-memory.
+        assert_eq!(e.graph().len(), 0);
+        assert_eq!(e.undo_len(), 0);
+        let row_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entities", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(row_count, 0);
+        let journal_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM undo_journal", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(journal_count, 0);
+    }
+
+    #[test]
+    fn execute_persistent_batch_rejects_internally_inconsistent_scope() {
+        // Companion test for BUG_0001 second-stage guard: even when
+        // command #0 matches the engine's active scope, a batch where
+        // command #N has a different scope than command #0 must be
+        // rejected (mixed-scope batches can't be cleanly journaled
+        // since `JournalEntry.scope` is single-valued).
+        use crate::commands::draft::DrawPrimitive;
+        use aec_cad::primitives::{Line, Primitive};
+        let mut conn = open_in_memory_persistent_db();
+        // Engine opened in Draft scope (matches command #0).
+        let mut e = CommandEngine::open(&conn, Scope::Draft).unwrap();
+        // Command #0 is correctly Draft; we then hand-construct a
+        // second Command with `scope: Design` (artificial, since
+        // `Command::user(kind)` derives scope from `kind.scope()` —
+        // this exercises the explicit guard that protects the
+        // journal even if a caller bypasses the constructor).
+        let mut bad = Command::user(CommandKind::DrawPrimitive(DrawPrimitive {
+            entity_id: EntityId::new(),
+            primitive: Primitive::Line(Line::new("0", [10.0, 0.0], [20.0, 0.0])),
+        }));
+        bad.scope = Scope::Design;
+        let cmds = vec![
+            Command::user(CommandKind::DrawPrimitive(DrawPrimitive {
+                entity_id: EntityId::new(),
+                primitive: Primitive::Line(Line::new("0", [0.0, 0.0], [10.0, 0.0])),
+            })),
+            bad,
+        ];
+        let err = e.execute_persistent_batch(cmds, &mut conn).unwrap_err();
+        match err {
+            CommandError::ScopeMismatch { expected, actual } => {
+                assert_eq!(expected, Scope::Draft.to_string());
+                assert_eq!(actual, Scope::Design.to_string());
+            }
+            other => panic!("expected ScopeMismatch, got {other:?}"),
+        }
         assert_eq!(e.graph().len(), 0);
         assert_eq!(e.undo_len(), 0);
     }

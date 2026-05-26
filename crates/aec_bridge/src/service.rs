@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use aec_ai::{
-    DiffEngine, GrammarRegistry as AiGrammarRegistry, PlanRequest as AiPlanRequest,
-    ToolName as AiToolName, ToolPlanner, ToolSchema as AiToolSchema,
+    AiAuditLogger, DiffEngine, DiffStatus, GrammarRegistry as AiGrammarRegistry,
+    PlanRequest as AiPlanRequest, ToolName as AiToolName, ToolPlanner, ToolSchema as AiToolSchema,
     ToolSchemaRegistry as AiToolSchemaRegistry,
 };
 use aec_audit::AuditLog;
@@ -32,7 +32,7 @@ use aec_render::preset::RenderPresetStore;
 use aec_render::queue::{BatchProgress as CoreBatchProgress, RenderQueue};
 use aec_render::scene::RenderScene;
 
-use crate::ai_state::{AiState, AiStateError, DEFAULT_SPAWN_TIMEOUT};
+use crate::ai_state::{AiState, AiStateError, PendingDiff, DEFAULT_SPAWN_TIMEOUT};
 use crate::asset_state::AssetState;
 use crate::bim_attach;
 use crate::engine_status_cache::EngineStatusCache;
@@ -1059,12 +1059,110 @@ pub struct AiPlanResult {
     pub entities_modified: u32,
 }
 
-/// Result of [`BridgeService::ai_accept_diff`] / `ai_reject_diff`.
+/// Result of [`BridgeService::ai_accept_diff`].
+///
+/// Carries the full apply telemetry so the renderer can show the
+/// user exactly what landed in the project graph: how many ops the
+/// model proposed, how many were applied, how many were skipped
+/// (and why), and the resulting per-op command ids for later undo.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AiDiffOutcome {
-    /// Mirrors the TS `{ accepted: true }` / `{ rejected: true }` shape.
+pub struct AiAcceptOutcome {
+    /// Mirrors the TS `{ accepted: true }` shape (always `true` on
+    /// success; the call returns `Err` on failure).
     pub ok: bool,
     pub diff_id: String,
+    /// Total operations the diff carried (matches
+    /// `diff.operations.len()` from `ai_plan`).
+    pub op_count: u32,
+    /// Count of *operations* (not commands) that the converter
+    /// mapped to at least one typed command. Bounded above by
+    /// `op_count` and by definition `<= op_count`. The renderer
+    /// surfaces this as "Applied X of Y operations" — Y is
+    /// `op_count`, X is this field.
+    ///
+    /// Note: a single operation can expand into multiple commands
+    /// (e.g. a polyline wall `Insert` with N points emits N-1
+    /// `CreateWall` commands). `command_ids.len()` reflects the
+    /// command count; `applied_count` reflects the operation count.
+    /// The two can differ in either direction:
+    ///   * one op → many commands (multi-segment polyline);
+    ///   * one op → many `skipped` entries plus some commands (a
+    ///     polyline that mixes valid segments with zero-length
+    ///     duplicates lands its valid segments and records the
+    ///     dupes — `applied_count` still increments by one for
+    ///     that op).
+    pub applied_count: u32,
+    /// Operations the converter could not translate — unknown
+    /// entity kinds, dangling targets, render_doctor diagnostics,
+    /// material bindings without a target entity. Surfacing these
+    /// lets the renderer show "Applied 4 of 5 — 1 skipped" instead
+    /// of silently dropping a partial accept.
+    pub skipped: Vec<AiAcceptSkippedJs>,
+    /// `Command::command_id` of every applied command, in apply
+    /// order. The renderer pins these so a later "Undo last AI
+    /// action" call can pop the matching journal entries.
+    pub command_ids: Vec<String>,
+    /// Hash chain head of the AI audit log AFTER this accept was
+    /// recorded. The renderer surfaces this in the AI panel's
+    /// provenance tooltip; verification tools can walk the chain
+    /// from genesis to this head.
+    pub audit_chain_head: String,
+}
+
+/// One skipped operation surfaced from the `ai_apply` converter.
+/// Mirrors [`aec_command::SkippedOperation`] but stays inside the
+/// service crate so the napi layer doesn't need a direct dep on
+/// `aec_command`'s internal types.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiAcceptSkippedJs {
+    pub op_index: u32,
+    pub reason: String,
+}
+
+/// Result of [`BridgeService::ai_reject_diff`].
+///
+/// Mirrors `AiAcceptOutcome` shape-wise (same `audit_chain_head`
+/// field) so the renderer can use a single "diff lifecycle" toast
+/// shape for both outcomes. `op_count` is reported so the renderer
+/// can show "Rejected (4 ops, 0 applied)" symmetrically with the
+/// accept variant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiRejectOutcome {
+    pub ok: bool,
+    pub diff_id: String,
+    pub op_count: u32,
+    /// Optional reason supplied by the renderer (`reason: "too
+    /// many entities"`, `reason: "wrong room"`, etc.). Logged into
+    /// the AI audit chain so the provenance UI can show *why* the
+    /// user rejected the suggestion. `None` is recorded as an
+    /// empty string in the audit envelope.
+    pub reason: Option<String>,
+    pub audit_chain_head: String,
+}
+
+/// Intermediate state produced by phases 1+2 of `ai_accept_diff`
+/// (pre-commit + SQL commit). Holds the data the post-commit
+/// phases need: the project root for the audit append, the scope
+/// the user authored the plan under, the original diff for the
+/// audit envelope, and the per-op outcome fields the final
+/// `AiAcceptOutcome` will surface.
+///
+/// Crate-private — callers outside this module never see this
+/// shape. Splitting it out is the structural piece of the
+/// `BUG_0001 (round 3)` fix: it lets `ai_accept_diff` finalize the
+/// pending-diff registry entry between the SQL commit (phase 2)
+/// and the AI audit append (phase 4) so a failed audit cannot
+/// leave the diff retry-pending after the graph has already been
+/// mutated.
+#[derive(Debug)]
+struct AiAcceptCommitted {
+    project_root: PathBuf,
+    plan_scope: Scope,
+    diff: aec_ai::Diff,
+    op_count: u32,
+    applied_count: u32,
+    skipped: Vec<AiAcceptSkippedJs>,
+    command_ids: Vec<String>,
 }
 
 /// Result of [`BridgeService::ai_cancel_job`].
@@ -3165,16 +3263,16 @@ impl BridgeService {
     // AI endpoints
     // ---------------------------------------------------------------
     //
-    // All six methods take `&self`. They do NOT serialise against one
-    // another — the three internal primitives on [`AiState`] (an
-    // `RwLock` for lifecycle state, a `Mutex` for the spawn slot, a
-    // `Mutex` for the diff registry) are independent, so:
+    // Read-only AI endpoints (`ai_list_tools`, `ai_plan`,
+    // `ai_runtime_status`, `ai_cancel_job`) take `&self` and run
+    // fully concurrent with one another — the three internal
+    // primitives on [`AiState`] (an `RwLock` for lifecycle state,
+    // a `Mutex` for the spawn slot, a `Mutex` for the diff
+    // registry) are independent, so:
     //
     //  - `ai_runtime_status` polls (the hot path: every ~500 ms while
     //    a plan is in flight) only take the `runtime` `RwLock` *read*
     //    side and run fully concurrent with everything else.
-    //  - `ai_accept_diff` / `ai_reject_diff` only take the
-    //    `pending_diffs` mutex, never touching sidecar state.
     //  - `ai_plan` holds the spawn-slot mutex only across
     //    `ensure_ready` (typically microseconds on the warm path, up
     //    to `DEFAULT_SPAWN_TIMEOUT` on the first call), then drops
@@ -3182,6 +3280,20 @@ impl BridgeService {
     //  - `ai_cancel_job` takes the spawn-slot mutex to terminate the
     //    handle, so it serialises with `ensure_ready` (correct: we
     //    must not race a `take()` against a freshly-`Some()` write).
+    //
+    // [`Self::ai_accept_diff`] and [`Self::ai_reject_diff`] take
+    // `&mut self`. They mutate the project graph (accept) or the
+    // AI audit log (both) and therefore go through
+    // [`Self::command_apply_batch`] / [`Self::ai_audit_append`]
+    // which require unique access to the service so the SQL
+    // transaction, journal, and audit envelope are journaled
+    // atomically. The bridge's outer `RwLock<BridgeService>` (held
+    // by the napi shim) takes the write side for these two
+    // methods, serialising them against every other bridge call
+    // for the duration of the apply. This is intentional — the
+    // accept path mutates SQLCipher state behind the user's most
+    // recent gesture and must not race with concurrent reads of
+    // the same project graph.
     //
     // The napi layer adds the second half of the fix: every blocking
     // AI endpoint is `#[napi] async fn` routed through
@@ -3221,6 +3333,7 @@ impl BridgeService {
     ///   7. return the diff id + parsed payload to the renderer
     pub fn ai_plan(
         &self,
+        project_path: &str,
         tool: &str,
         scope: Scope,
         prompt: &str,
@@ -3311,7 +3424,11 @@ impl BridgeService {
             entities, response.entities_modified,
             "DiffEngine::build and planner::count_response_entities must agree",
         );
-        let diff_id = self.ai_state.insert_diff(diff)?;
+        // Capture the project path with the pending diff so the
+        // later `ai_accept_diff` / `ai_reject_diff` knows which
+        // project package to open. See `PendingDiff` rustdoc for
+        // the "plan on A, switch to B, accept the A diff" rationale.
+        let diff_id = self.ai_state.insert_diff(project_path, scope, diff)?;
         Ok(AiPlanResult {
             diff_id: diff_id.as_str().to_owned(),
             parsed,
@@ -3320,26 +3437,432 @@ impl BridgeService {
         })
     }
 
-    /// Mark a pending diff as accepted. The bridge currently drops the
-    /// diff after recording acceptance — translating the diff back into
-    /// concrete [`crate::service::Command`] sequences is a follow-up
-    /// (Phase 11 task, deliberately deferred from PR-V scope per the
-    /// scoping doc).
-    pub fn ai_accept_diff(&self, diff_id: &str) -> Result<AiDiffOutcome, BridgeServiceError> {
-        let _ = self.ai_state.accept_diff(diff_id)?;
-        Ok(AiDiffOutcome {
+    /// Apply an accepted AI diff to the project graph.
+    ///
+    /// Phase 11 task 10 — the previous incarnation of this method
+    /// just dropped the pending diff entry after marking it
+    /// accepted. That left the project graph unchanged even though
+    /// the renderer's AI panel had already moved on, which broke
+    /// every downstream contract (undo, audit, render, export).
+    ///
+    /// The real apply path is a four-phase sequence:
+    ///
+    /// **Phase 1 – pre-commit (recoverable):** Peek the
+    /// `PendingDiff` from `AiState::pending_diffs` (yielding a
+    /// clone of both the `Diff` and the project path), open the
+    /// project package + SQLCipher connection, load the current
+    /// `ProjectGraph`, convert the `Diff` into a `Vec<Command>` via
+    /// [`aec_command::diff_to_commands`], and validate the entire
+    /// batch against the engine's scope. Any failure here returns
+    /// before SQL is touched, so the pending diff stays in the
+    /// registry for retry. The graph loaded for the converter is
+    /// moved into the engine via [`CommandEngine::open_with_graph`]
+    /// so the `entities` table is not re-read — see
+    /// `ANALYSIS_0003 (round 2)`.
+    ///
+    /// **Phase 2 – commit (irreversible):** Run
+    /// [`CommandEngine::execute_persistent_batch`] which writes
+    /// every delta + journal entry in one SQL transaction. The
+    /// transaction's `commit()` is the point of no return: once it
+    /// returns Ok the graph has been mutated on disk. If `commit`
+    /// fails the whole batch is rolled back and the pending diff
+    /// stays in the registry — `diff_to_commands` is deterministic
+    /// for the same input graph so retry produces the same commands
+    /// without duplicating entity IDs.
+    ///
+    /// **Phase 3 – finalize (must run after phase 2):** Remove the
+    /// `PendingDiff` from `AiState`. This step lives between commit
+    /// and audit append because retrying the accept after a
+    /// successful commit would re-enter `diff_to_commands`, which
+    /// generates *fresh* `EntityId::new()` UUIDs for every `Insert`
+    /// op — committing a second time would duplicate every inserted
+    /// entity. Finalizing here guarantees that path is unreachable.
+    /// See `BUG_0001 (round 3)`.
+    ///
+    /// **Phase 4 – AI audit append (post-commit):** Append an
+    /// `AiAuditRecord { status: Accepted, .. }` to
+    /// `<project>/audit/ai_audit.jsonl`. The main command audit
+    /// chain already has the per-command entries from phase 2; the
+    /// AI audit chain answers "how many of the model's proposals
+    /// did the user accept?" on its own JSONL log. If this step
+    /// fails (disk full, audit dir replaced with a file, etc.) we
+    /// surface the error so the renderer can prompt for an audit
+    /// chain re-export — but the graph mutation is durable and the
+    /// pending diff is already gone, so there is no retry-induced
+    /// duplication. The chain verifier (`project_audit_chain`)
+    /// detects the missing AI envelope on next walk.
+    ///
+    /// Operations the converter could not translate (unknown
+    /// entity kind, dangling target, missing payload field) are
+    /// reported in [`AiAcceptOutcome::skipped`] rather than
+    /// erroring the whole accept — the user already reviewed the
+    /// diff and clicked Accept, so the service commits whatever
+    /// subset the schema understands.
+    pub fn ai_accept_diff(&mut self, diff_id: &str) -> Result<AiAcceptOutcome, BridgeServiceError> {
+        // Phase 1 + Phase 2: pre-commit + commit. Any failure here
+        // leaves the pending diff in the registry so the renderer
+        // can retry — prior to the round-2 peek/finalize split, a
+        // transient failure (e.g. SQLCipher key mismatch on a
+        // moved project) silently lost the diff with no recovery
+        // path.
+        let pending = self.ai_state.peek_diff(diff_id)?;
+        let committed = self.ai_accept_diff_commit(pending)?;
+        // Phase 3: finalize BEFORE the post-commit audit append.
+        //
+        // `BUG_0001 (round 3)`: the previous structure ran audit
+        // append inside the commit helper and only finalized once
+        // both succeeded. That ordering broke the peek/finalize
+        // contract for retry-safety: if the audit append failed
+        // *after* the SQL commit, the diff was left in the registry
+        // for retry — but a retry would re-enter
+        // `diff_to_commands`, which generates fresh
+        // `EntityId::new()` UUIDs for every `Insert` op, and a
+        // second successful commit would silently double every
+        // inserted entity. Finalizing here closes the
+        // retry-duplication window: once SQL is committed the diff
+        // is unreachable for retry.
+        //
+        // A `finalize_diff` failure here is genuinely anomalous
+        // (would require a concurrent finalize for the same id
+        // racing ahead of us) — we surface it instead of
+        // swallowing. In that pathological case the graph is
+        // committed and the diff is *still* in the registry; the
+        // next retry would duplicate. Acceptable trade-off vs
+        // silently masking a real concurrency bug.
+        self.ai_state.finalize_diff(diff_id)?;
+        // Phase 4: post-commit, post-finalize audit append. If this
+        // fails, the graph is durable and the pending diff is
+        // already gone — no retry is possible (or needed). The
+        // error propagates so the renderer can re-export the audit
+        // chain (see `project_audit_sync`).
+        let audit_chain_head = Self::ai_audit_append_at_root(
+            &committed.project_root,
+            committed.plan_scope,
+            &committed.diff,
+            DiffStatus::Accepted,
+            None,
+        )?;
+        Ok(AiAcceptOutcome {
             ok: true,
             diff_id: diff_id.to_owned(),
+            op_count: committed.op_count,
+            applied_count: committed.applied_count,
+            skipped: committed.skipped,
+            command_ids: committed.command_ids,
+            audit_chain_head,
         })
     }
 
-    /// Mark a pending diff as rejected and drop it.
-    pub fn ai_reject_diff(&self, diff_id: &str) -> Result<AiDiffOutcome, BridgeServiceError> {
-        let _ = self.ai_state.reject_diff(diff_id)?;
-        Ok(AiDiffOutcome {
+    /// Phases 1+2 of `ai_accept_diff`: open the project, convert
+    /// the diff to commands, and commit the batch in a single SQL
+    /// transaction. Returns the post-commit data the caller needs
+    /// to (a) finalize the registry entry and (b) write the AI
+    /// audit envelope.
+    ///
+    /// Splitting this off from the audit-append step is the
+    /// `BUG_0001 (round 3)` fix — see [`Self::ai_accept_diff`] for
+    /// the four-phase rationale.
+    fn ai_accept_diff_commit(
+        &mut self,
+        pending: PendingDiff,
+    ) -> Result<AiAcceptCommitted, BridgeServiceError> {
+        let project_path = pending.project_path.clone();
+        // There are **two** scopes in play during an AI accept, and
+        // they intentionally do not have to agree:
+        //
+        //   * `plan_scope` — the engine scope the user *invoked*
+        //     the plan from. For `plan_detection` / `plan_to_wall`
+        //     this can be `Draft` (a 2D drafter detecting walls in
+        //     an imported plan) even though the resulting commands
+        //     are `Design` walls. The AI tool registry
+        //     (`crates/aec_ai/data/ai_tools.json`) declares
+        //     `allowed_scopes: ["design", "draft"]` for exactly
+        //     this workflow. We retain it as a provenance label on
+        //     the AI audit envelope so the audit log answers "what
+        //     UI mode produced this accept?" honestly.
+        //
+        //   * `engine_scope` — the scope the `CommandEngine` must
+        //     be opened at to apply the emitted commands. This is
+        //     derived from `conversion.commands[0].scope`, which
+        //     is the intrinsic scope of the `CommandKind` itself
+        //     (`Design` for `CreateWall`, `Draft` for
+        //     `DrawPrimitive`, `Deliver` for `CreateRevision`). The
+        //     journal entries the engine writes get tagged with
+        //     this scope so undo/redo validation works: a later
+        //     `Cmd-Z` issued from a Design session can undo a
+        //     wall-create even if the original accept happened in
+        //     a Draft session.
+        //
+        // `BUG_0001 (round 4)` fix: opening the engine at
+        // `plan_scope` rather than `engine_scope` broke the
+        // Draft-launched plan_detection / plan_to_wall path
+        // because the batch-scope guard (added in round 3) rejects
+        // when `commands[0].scope (Design) != engine.active_scope
+        // (Draft)`. Splitting the two scopes here restores the
+        // intended behaviour and keeps the audit log faithful.
+        let plan_scope = pending.scope;
+        let diff = pending.diff;
+        let op_count = u32::try_from(diff.operations.len()).unwrap_or(u32::MAX);
+        // Open the package + graph once. We need the graph for the
+        // converter's `Update` / `Delete` dispatch and the
+        // connection for `command_apply_batch`. We keep the `pkg`
+        // binding (instead of `_pkg`) so the AI audit append can
+        // reuse it without a second key-derive + PRAGMA cipher
+        // dance — see `ANALYSIS_0003`.
+        let (pkg, mut conn) =
+            ProjectPackage::open_with_master_key_and_database(&project_path, &self.master_key)?;
+        let graph = aec_command::ProjectGraph::load(&conn)
+            .map_err(|e| BridgeServiceError::Command(e.to_string()))?;
+        let conversion =
+            aec_command::diff_to_commands(&diff, &graph, aec_command::ApplyDefaults::default());
+        let skipped: Vec<AiAcceptSkippedJs> = conversion
+            .skipped
+            .iter()
+            .map(|s| AiAcceptSkippedJs {
+                op_index: u32::try_from(s.op_index).unwrap_or(u32::MAX),
+                reason: s.reason.clone(),
+            })
+            .collect();
+        // Capture the operation-level applied count from the
+        // converter *before* `conversion.commands` is moved into
+        // the engine below. This is the `BUG_0001 (round 5)` fix:
+        // the converter knows which operations produced at least
+        // one command, so it reports the operation count directly
+        // rather than us trying to derive it from `commands.len()`
+        // (commands can fan out per op) or
+        // `op_count - skipped.len()` (a polyline can produce both
+        // commands and per-segment skips for the same op).
+        let applied_count = u32::try_from(conversion.applied_op_count).unwrap_or(u32::MAX);
+        // `command_apply_batch` accepts an empty Vec as a no-op,
+        // which is what we want when every operation in the diff
+        // is unsupported (e.g. all render_doctor diagnostics). The
+        // accept still completes successfully — the AI audit log
+        // will capture the attempted-but-skipped operations.
+        let applied_results: Vec<CommandApplyResult> = if conversion.commands.is_empty() {
+            Vec::new()
+        } else {
+            // Reuse the graph we already loaded for `diff_to_commands`
+            // instead of letting `CommandEngine::open` re-read the
+            // `entities` table a second time. The graph is moved
+            // into the engine here (we no longer need it after the
+            // converter ran) — this is the
+            // `ANALYSIS_0003 (round 2)` double-load fix.
+            //
+            // Engine scope = `commands[0].scope` (the intrinsic
+            // scope of the emitted commands), NOT `plan_scope`
+            // (the UI launch context). The batch's internal
+            // consistency guard already requires every command in
+            // a batch to share the same scope, so any command
+            // satisfies the role of "canonical batch scope".
+            //
+            // This is the `BUG_0001 (round 4)` fix — opening at
+            // `plan_scope` tripped the batch scope guard whenever
+            // the renderer dispatched a Draft-launched
+            // `plan_detection` (which legitimately emits Design
+            // walls).
+            let engine_scope = conversion.commands[0].scope;
+            let mut engine =
+                aec_command::CommandEngine::open_with_graph(&conn, engine_scope, graph)
+                    .map_err(|e| BridgeServiceError::Command(e.to_string()))?;
+            let results = engine
+                .execute_persistent_batch(conversion.commands, &mut conn)
+                .map_err(|e| BridgeServiceError::Command(e.to_string()))?;
+            self.invalidate_status_cache_for(&project_path);
+            let undo_len = engine.undo_len() as u32;
+            let redo_len = engine.redo_len() as u32;
+            results
+                .into_iter()
+                .map(|r| CommandApplyResult {
+                    command_id: r.command_id,
+                    applied: r.applied,
+                    undo_len,
+                    redo_len,
+                })
+                .collect()
+        };
+        let command_ids: Vec<String> = applied_results
+            .iter()
+            .map(|r| r.command_id.as_str().to_owned())
+            .collect();
+        // SQL is committed; capture the project root we already
+        // hold so phase 4 (audit append) doesn't have to re-open
+        // the package. The `pkg` binding is intentionally dropped
+        // at end of scope — the audit logger only needs the project
+        // root path, not a keyed package handle.
+        let project_root = pkg.root().to_path_buf();
+        drop(pkg);
+        Ok(AiAcceptCommitted {
+            project_root,
+            plan_scope,
+            diff,
+            op_count,
+            applied_count,
+            skipped,
+            command_ids,
+        })
+    }
+
+    /// Mark a pending diff as rejected and record the rejection in
+    /// the project's AI audit log.
+    ///
+    /// Phase 11 task 11 — the previous incarnation just dropped
+    /// the pending entry. The real reject path logs the rejection
+    /// to `<project>/audit/ai_audit.jsonl` via
+    /// [`AiAuditLogger::log_rejection`] so the AI provenance trail
+    /// retains *all* model proposals (accepted and rejected) for
+    /// later analysis. The `reason` argument is free-form text
+    /// supplied by the renderer; an empty `reason` is recorded as
+    /// the empty string rather than as missing.
+    ///
+    /// Devin Review `ANALYSIS_0001` (round 1): takes `&self`
+    /// (not `&mut self`) so the napi shim can use
+    /// `with_service_ref_fallible` (a read-lock on the service
+    /// singleton). The reject path does not mutate `BridgeService`
+    /// directly — `ai_state.peek_diff` / `finalize_diff` already
+    /// take `&self` and route all state changes through the
+    /// internal locks inside [`crate::ai_state::AiState`], and the
+    /// audit append (`Self::ai_audit_append_at_root`) is a static
+    /// associated function. Keeping reject under a *read* lock
+    /// means a renderer that fires off `status_poll` /
+    /// `list_render_jobs` while a reject is in flight no longer
+    /// serializes against the reject's disk I/O — they run
+    /// concurrently. (Accept *must* hold the write lock because
+    /// `command_apply_on_conn` mutates the project graph.)
+    pub fn ai_reject_diff(
+        &self,
+        diff_id: &str,
+        reason: Option<&str>,
+    ) -> Result<AiRejectOutcome, BridgeServiceError> {
+        // `BUG_0001 (round 2)`: same peek-then-finalize discipline
+        // as `ai_accept_diff` — see that method for the full
+        // rationale. If the audit append fails (disk-full, missing
+        // project, etc.), the pending entry survives so the
+        // renderer can retry the reject (or escalate via the
+        // pending-diff inspector).
+        //
+        // **Ordering note (`ANALYSIS_0001`):** the reject path
+        // intentionally runs *audit append before finalize*, the
+        // mirror of the accept path's *finalize before audit*. The
+        // asymmetry is by design and reflects the different
+        // worst-case failure modes:
+        //   * Accept has a SQL commit that mutates the project
+        //     graph; finalizing AFTER commit prevents a transient
+        //     audit-append failure from re-entering the converter
+        //     on retry (which generates fresh `EntityId::new()`
+        //     UUIDs and would double-insert every wall/furniture
+        //     row). Worst case the accept path defends against is
+        //     *data-integrity violation* — duplicated graph
+        //     entities.
+        //   * Reject does not mutate the graph, so the only state
+        //     at risk is the AI audit log itself. Auditing BEFORE
+        //     finalize means a transient finalize failure (rare:
+        //     would require a concurrent finalize racing this
+        //     thread) leaves the diff pending and the audit
+        //     containing a reject entry. The renderer's retry
+        //     would then write a duplicate audit entry — visible,
+        //     deduplicable by `diff_id`, but harmless. The
+        //     alternative ordering (finalize → audit) would expose
+        //     a strictly worse failure mode: an audit-append
+        //     failure after the diff is already finalized would
+        //     SILENTLY drop the rejection from the security log
+        //     with no retry path. For an audit / forensic surface,
+        //     "loud duplicate" beats "silent gap" — so this is the
+        //     correct asymmetry.
+        let pending = self.ai_state.peek_diff(diff_id)?;
+        let outcome = Self::ai_reject_diff_inner(diff_id, pending, reason)?;
+        self.ai_state.finalize_diff(diff_id)?;
+        Ok(outcome)
+    }
+
+    // Static associated function: the reject path no longer needs
+    // any `BridgeService` state (the master key is no longer
+    // consulted now that we use manifest-only `ProjectPackage::open`
+    // — see `ANALYSIS_0005 (round 3)`), so leaving this as a
+    // `&mut self` method would trip `clippy::unused_self`.
+    fn ai_reject_diff_inner(
+        diff_id: &str,
+        pending: PendingDiff,
+        reason: Option<&str>,
+    ) -> Result<AiRejectOutcome, BridgeServiceError> {
+        let project_path = pending.project_path.clone();
+        let scope = pending.scope;
+        let diff = pending.diff;
+        let op_count = u32::try_from(diff.operations.len()).unwrap_or(u32::MAX);
+        // Reject does not mutate the graph, so the only state it
+        // touches is the AI audit log. We open the package via the
+        // manifest-only `ProjectPackage::open` rather than
+        // `open_with_master_key`: the audit append only needs the
+        // project root path (the AI audit JSONL lives at
+        // `<root>/audit/ai_audit.jsonl`), and the manifest-only
+        // open still validates that the directory is a real
+        // project package (`is_dir` + `PACKAGE_DIRS` walk) so a
+        // stale `pending.project_path` pointing at a moved /
+        // deleted project still surfaces as an error before the
+        // audit append tries to create a phantom directory tree.
+        // This is the `ANALYSIS_0005 (round 3)` fix — the full
+        // keyed open ran `derive_project_key` + the SQLCipher
+        // `PRAGMA cipher_*` sequence + the migration walk all for
+        // a path lookup, ~1-2 ms of avoidable work per reject.
+        let pkg = ProjectPackage::open(&project_path)?;
+        let audit_chain_head =
+            Self::ai_audit_append_at_root(pkg.root(), scope, &diff, DiffStatus::Rejected, reason)?;
+        Ok(AiRejectOutcome {
             ok: true,
             diff_id: diff_id.to_owned(),
+            op_count,
+            reason: reason.map(std::string::ToString::to_string),
+            audit_chain_head,
         })
+    }
+
+    /// Internal helper: append an `AiAuditRecord` to the project's
+    /// AI audit log (`<project>/audit/ai_audit.jsonl`) and return
+    /// the new chain head.
+    ///
+    /// Takes the project root path by reference so callers that
+    /// already validated the package (the accept path holds a
+    /// `ProjectPackage` opened for the SQL commit; the reject path
+    /// holds a manifest-only `ProjectPackage::open`) can hand the
+    /// root through without re-deriving the project key or
+    /// re-issuing the `PRAGMA cipher_*` sequence. This is the
+    /// shape `ANALYSIS_0003 (round 2)` + `ANALYSIS_0005 (round 3)`
+    /// converged to — neither caller needs a keyed package handle
+    /// for the audit append, only the root path.
+    ///
+    /// The AI audit log is a separate hash chain from the main
+    /// command audit log (`<project>/audit/log.jsonl`) so the AI
+    /// lifecycle (plan → accept / reject) lives on its own
+    /// tamper-evident trail. AI-accepted commands ALSO appear in
+    /// the main log via `command_apply_batch`; this second log
+    /// answers "how many of the model's proposals did the user
+    /// accept?" without grepping through every command's actor
+    /// field.
+    fn ai_audit_append_at_root(
+        project_root: &Path,
+        scope: Scope,
+        diff: &aec_ai::Diff,
+        status: DiffStatus,
+        reason: Option<&str>,
+    ) -> Result<String, BridgeServiceError> {
+        let ai_audit_path = project_root.join("audit").join("ai_audit.jsonl");
+        let mut logger = AiAuditLogger::open(&ai_audit_path)?;
+        match status {
+            DiffStatus::Accepted => {
+                logger.log_acceptance(diff, scope)?;
+            }
+            DiffStatus::Rejected => {
+                logger.log_rejection(diff, scope, reason.unwrap_or(""))?;
+            }
+            DiffStatus::Pending => {
+                // `Pending` is a registry-only state and never
+                // reaches this path — the audit log only records
+                // terminal transitions.
+                return Err(BridgeServiceError::Ai(
+                    "ai_audit_append called with Pending status".into(),
+                ));
+            }
+        }
+        Ok(logger.head().to_string())
     }
 
     /// Cancel any in-flight or queued AI work by killing the sidecar

@@ -88,6 +88,67 @@ export interface AiPlanResponse {
   parsed?: AiPlanParsed | null;
 }
 
+/**
+ * Rich outcome surfaced by {@link BridgeBackend.aiAcceptDiff}.
+ *
+ * Devin Review flagged the previous `Promise<{ accepted: true }>`
+ * shape as `ANALYSIS_0002`: the native napi `AiAcceptOutcomeJs`
+ * already carries the full apply telemetry (op count, applied
+ * count, per-op skip reasons, the command IDs the engine
+ * journalled, and the AI audit chain head), but the adapter was
+ * discarding all of it and surfacing a literal `true`. The
+ * renderer cannot then show "Accepted 7 of 8 operations (1
+ * skipped: unknown entity kind `lamp`)" without re-walking the
+ * diff itself.
+ *
+ * The new shape preserves `accepted: true` so any existing
+ * `outcome.accepted` checks still work, and exposes the full
+ * telemetry alongside it. The in-process fallback returns a
+ * shape with zeroed counts — it has no real diff registry, so
+ * there is nothing to apply.
+ */
+export interface AiAcceptOutcome {
+  accepted: true;
+  diffId: string;
+  /** Total operations the diff carried. */
+  opCount: number;
+  /** Subset that the converter mapped to a typed command and that
+   *  the command engine successfully executed. */
+  appliedCount: number;
+  /** Per-op reasons the converter could not translate (unknown
+   *  entity kind, missing required field, dangling target, ...). */
+  skipped: Array<{ opIndex: number; reason: string }>;
+  /** Command IDs the journal assigned to the applied operations,
+   *  in batch order. Useful for selecting newly-created entities
+   *  in the renderer right after Accept lands. */
+  commandIds: string[];
+  /** Hex-encoded BLAKE3 hash of the final entry in the AI audit
+   *  chain after this acceptance was logged. */
+  auditChainHead: string;
+}
+
+/**
+ * Rich outcome surfaced by {@link BridgeBackend.aiRejectDiff}.
+ *
+ * Mirrors the accept outcome shape so the renderer can use a
+ * single "diff lifecycle" toast for both paths. The reject path
+ * never applies graph mutations, so it does not carry the
+ * applied/skipped/command-id fields.
+ */
+export interface AiRejectOutcome {
+  rejected: true;
+  diffId: string;
+  /** Total operations the rejected diff carried. */
+  opCount: number;
+  /** Free-form reason the renderer supplied. Logged to the AI
+   *  audit chain so the provenance UI can show *why* a proposal
+   *  was rejected. `null` when no reason was supplied. */
+  reason: string | null;
+  /** Hex-encoded BLAKE3 hash of the final entry in the AI audit
+   *  chain after this rejection was logged. */
+  auditChainHead: string;
+}
+
 /** Parsed payloads for individual AI tools, tagged by `tool`. */
 export type AiPlanParsed =
   | LayoutSuggestionParsed
@@ -328,8 +389,21 @@ export interface BridgeBackend {
    * (e.g. `LayoutSuggestionResult` for `tool = "layout_suggestion"`).
    */
   aiPlan(params: Record<string, unknown>): Promise<AiPlanResponse>;
-  aiAcceptDiff(diffId: string): Promise<{ accepted: true }>;
-  aiRejectDiff(diffId: string): Promise<{ rejected: true }>;
+  /**
+   * Apply an accepted AI diff to the project graph and return the
+   * full apply telemetry (op count, applied count, per-op skip
+   * reasons, command IDs, and the AI audit chain head). See
+   * {@link AiAcceptOutcome}.
+   */
+  aiAcceptDiff(diffId: string): Promise<AiAcceptOutcome>;
+  /**
+   * Mark an AI diff as rejected and append the rejection envelope
+   * to the project's AI audit chain. See {@link AiRejectOutcome}.
+   */
+  aiRejectDiff(
+    diffId: string,
+    reason?: string | null,
+  ): Promise<AiRejectOutcome>;
   aiCancelJob(jobId: string): Promise<{ cancelled: true }>;
   aiRuntimeStatus(): Promise<{ state: string; lastError: string | null }>;
 
@@ -1221,6 +1295,7 @@ interface NativeApi {
   // tool-specific context object, also serialised at the adaptor.
   ai_list_tools(): Promise<unknown>;
   ai_plan(
+    project_path: string,
     tool: string,
     scope: string,
     prompt: string,
@@ -1228,7 +1303,7 @@ interface NativeApi {
     max_entities_modified: number,
   ): Promise<unknown>;
   ai_accept_diff(diff_id: string): Promise<unknown>;
-  ai_reject_diff(diff_id: string): Promise<unknown>;
+  ai_reject_diff(diff_id: string, reason?: string | null): Promise<unknown>;
   ai_cancel_job(job_id: string): Promise<unknown>;
   ai_runtime_status(): Promise<unknown>;
   // Group A (Phase 10) — draft.* / deliver.*. Symmetric to the
@@ -1730,6 +1805,22 @@ function adaptNative(n: NativeApi): BridgeBackend {
     // can't accept a `serde_json::Value` directly; the empty string
     // is the Rust-side sentinel for "no context".
     aiPlan: async (params) => {
+      // Phase 11 task 10: the AI accept path applies commands
+      // against a specific project on disk, so the plan call has
+      // to bind a `projectPath` at registration time (NOT at
+      // accept time, which is the wrong choice if the user
+      // switches projects between plan and accept).
+      const projectPath =
+        typeof params.projectPath === "string"
+          ? params.projectPath
+          : typeof params.project_path === "string"
+            ? (params.project_path as string)
+            : "";
+      if (projectPath.length === 0) {
+        throw new Error(
+          "aiPlan: missing required string field 'projectPath'",
+        );
+      }
       const tool = typeof params.tool === "string" ? params.tool : "";
       if (tool.length === 0) {
         throw new Error("aiPlan: missing required string field 'tool'");
@@ -1764,6 +1855,7 @@ function adaptNative(n: NativeApi): BridgeBackend {
       // also rejects the Promise (rather than throwing across the
       // FFI boundary) on transport / parser errors.
       const result = (await n.ai_plan(
+        projectPath,
         tool,
         scope,
         prompt,
@@ -1802,18 +1894,71 @@ function adaptNative(n: NativeApi): BridgeBackend {
     aiAcceptDiff: async (diffId) => {
       // Awaited so the native Promise's rejection (e.g. unknown
       // diff id) surfaces here as a real `throw` rather than an
-      // unhandled rejection on a later tick. The TS contract is the
-      // literal `{ accepted: true }`; the native `{ ok, diff_id }`
-      // is intentionally not surfaced because the renderer's
-      // Accept button is idempotent and doesn't need the echo.
-      await n.ai_accept_diff(diffId);
-      return { accepted: true };
+      // unhandled rejection on a later tick.
+      //
+      // The native side returns the full `AiAcceptOutcomeJs`
+      // (op count, applied count, per-op skip reasons, command
+      // IDs, audit chain head). napi auto-converts snake_case
+      // field names to camelCase on the JS boundary, so the
+      // adapter just casts and reshapes. Previously the adapter
+      // discarded everything except a synthetic
+      // `{ accepted: true }`; Devin Review flagged that as
+      // `ANALYSIS_0002` ("rich telemetry computed in the napi
+      // layer but thrown away by the TS adapter"). The new
+      // shape preserves `accepted: true` for backwards
+      // compatibility AND surfaces the rich fields so the AI
+      // sidebar can render "7 of 8 applied (1 skipped: unknown
+      // entity kind `lamp`)" without re-walking the diff.
+      const r = (await n.ai_accept_diff(diffId)) as {
+        ok: boolean;
+        diffId: string;
+        opCount: number;
+        appliedCount: number;
+        skipped: Array<{ opIndex: number; reason: string }>;
+        commandIds: string[];
+        auditChainHead: string;
+      };
+      return {
+        accepted: true,
+        diffId: r.diffId,
+        opCount: r.opCount,
+        appliedCount: r.appliedCount,
+        skipped: r.skipped.map((s) => ({
+          opIndex: s.opIndex,
+          reason: s.reason,
+        })),
+        commandIds: r.commandIds,
+        auditChainHead: r.auditChainHead,
+      };
     },
-    aiRejectDiff: async (diffId) => {
+    aiRejectDiff: async (diffId, reason) => {
       // Same idempotency / error-propagation contract as
-      // `aiAcceptDiff`.
-      await n.ai_reject_diff(diffId);
-      return { rejected: true };
+      // `aiAcceptDiff`. The renderer-supplied `reason` (when
+      // present) flows through to the forensic AI audit record
+      // so a reviewer can see *why* a proposal was rejected.
+      //
+      // Like the accept path, the native side returns the full
+      // `AiRejectOutcomeJs` (op count, the recorded reason, and
+      // the audit chain head). The adapter forwards everything
+      // so the renderer can render symmetric "Rejected (4 ops,
+      // reason: ...)" toasts.
+      const r = (await n.ai_reject_diff(
+        diffId,
+        reason === undefined ? null : reason,
+      )) as {
+        ok: boolean;
+        diffId: string;
+        opCount: number;
+        reason: string | null;
+        auditChainHead: string;
+      };
+      return {
+        rejected: true,
+        diffId: r.diffId,
+        opCount: r.opCount,
+        reason: r.reason,
+        auditChainHead: r.auditChainHead,
+      };
     },
     aiCancelJob: async (jobId) => {
       // `job_id` is accepted by the native side for forward
@@ -2499,11 +2644,31 @@ export function inProcessBackend(): BridgeBackend {
       );
       return { diffId: id("diff"), parsed };
     },
-    async aiAcceptDiff(_d) {
-      return { accepted: true };
+    async aiAcceptDiff(diffId) {
+      // In-process fallback: there is no real diff registry so
+      // no operations were applied, and the AI audit chain is
+      // never opened. Surfacing zeroed counts + an empty chain
+      // head keeps the renderer's contract honest (these are
+      // the same values the native side would produce for a
+      // diff that mapped to zero typed commands).
+      return {
+        accepted: true,
+        diffId,
+        opCount: 0,
+        appliedCount: 0,
+        skipped: [],
+        commandIds: [],
+        auditChainHead: "",
+      };
     },
-    async aiRejectDiff(_d) {
-      return { rejected: true };
+    async aiRejectDiff(diffId, reason) {
+      return {
+        rejected: true,
+        diffId,
+        opCount: 0,
+        reason: reason ?? null,
+        auditChainHead: "",
+      };
     },
     async aiCancelJob(_j) {
       return { cancelled: true };
