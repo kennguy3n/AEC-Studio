@@ -152,6 +152,29 @@ fn valid_plan_detection_response_bytes() -> Vec<u8> {
     bytes
 }
 
+/// Wire-format HTTP response for a `plan_detection` completion
+/// whose polyline has **four** points — the diff produces a single
+/// `Insert` operation but the converter
+/// (`ai_apply::insert_walls_from_polyline`) decomposes it into
+/// `4 - 1 = 3` `CreateWall` commands (one per polyline segment).
+/// Used by the `BUG_0001 (round 5)` regression test to validate
+/// that `applied_count` is reported in *operation* units, not
+/// *command* units.
+fn valid_plan_detection_multi_segment_response_bytes() -> Vec<u8> {
+    // Four-point right-angle U: (0,0) → (4000,0) → (4000,3000) →
+    // (7000,3000). Each adjacent pair is ≥ the default
+    // `min_segment_length`, so the converter emits exactly three
+    // `CreateWall` commands from this single diff `Insert`.
+    let body = br#"{"content":"{\"polylines\":[{\"points\":[[0.0,0.0],[4000.0,0.0],[4000.0,3000.0],[7000.0,3000.0]],\"confidence\":0.92}]}","stop":true,"tokens_predicted":42}"#;
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    let mut bytes = head.into_bytes();
+    bytes.extend_from_slice(body);
+    bytes
+}
+
 fn canned_response(bytes: Vec<u8>) -> &'static [u8] {
     Box::leak(bytes.into_boxed_slice())
 }
@@ -575,6 +598,82 @@ fn ai_accept_diff_draft_launched_plan_detection_succeeds() {
     assert!(
         records.contains("\"status\":\"accepted\""),
         "forensic record must capture the Accepted status, got: {records}"
+    );
+}
+
+/// `BUG_0001 (round 5)` regression: a `plan_detection` polyline
+/// with four points produces **one** diff `Insert` operation that
+/// the converter decomposes into **three** `CreateWall` commands
+/// (one per polyline segment, via
+/// `ai_apply::insert_walls_from_polyline`). Prior to round 5 the
+/// service reported `applied_count = applied_results.len() = 3`,
+/// which broke the renderer's "Applied X of Y operations" display
+/// — X (`applied_count`) could exceed Y (`op_count`) whenever the
+/// user accepted a wall plan with more than one segment.
+///
+/// The fix routes the operation count through
+/// `ApplyConversion.applied_op_count`, which the converter
+/// computes by tracking whether each diff operation produced at
+/// least one emitted command. `applied_count` is now bounded
+/// above by `op_count`, while `command_ids` continues to reflect
+/// the actual journal of emitted commands (one per segment, so 3
+/// here).
+#[test]
+fn ai_accept_diff_multi_segment_polyline_reports_operation_count() {
+    let (mut s, _g, project_path) = make_service_with_project();
+    let listener = bind_loopback();
+    let port = listener.local_addr().unwrap().port();
+    let resp = canned_response(valid_plan_detection_multi_segment_response_bytes());
+    let _join = spawn_mock_sidecar(listener, resp, 1);
+    wire_ai_state_to_mock(&mut s, port);
+
+    let result = s
+        .ai_plan(&project_path, "plan_detection", Scope::Design, "", "{}", 5)
+        .expect("plan_detection must register a pending diff");
+
+    let outcome = s
+        .ai_accept_diff(&result.diff_id)
+        .expect("multi-segment plan_detection accept must succeed");
+
+    assert!(outcome.ok, "accept must succeed");
+    assert_eq!(
+        outcome.op_count, 1,
+        "one polyline → one Insert operation in the diff (regardless of point count)"
+    );
+    assert_eq!(
+        outcome.applied_count, 1,
+        "applied_count is in OPERATION units (not command units); got skipped={:?}, \
+         command_ids={:?}",
+        outcome.skipped, outcome.command_ids
+    );
+    assert!(
+        outcome.applied_count <= outcome.op_count,
+        "documented bound applied_count <= op_count must hold; got applied_count={} \
+         op_count={}",
+        outcome.applied_count,
+        outcome.op_count
+    );
+    assert!(
+        outcome.skipped.is_empty(),
+        "no segment should be skipped on a clean polyline; got {:?}",
+        outcome.skipped
+    );
+    assert_eq!(
+        outcome.command_ids.len(),
+        3,
+        "command_ids reflects the actual journal (3 segments → 3 CreateWall commands); \
+         got {:?}",
+        outcome.command_ids
+    );
+
+    // Cross-check the graph: three walls landed in Design scope.
+    let walls = s
+        .project_graph_list(&project_path, Some("wall"))
+        .expect("graph list post-accept");
+    assert_eq!(
+        walls.len(),
+        3,
+        "the four-point polyline must land as three walls in the graph, got {walls:?}"
     );
 }
 

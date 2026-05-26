@@ -107,6 +107,23 @@ pub struct SkippedOperation {
 pub struct ApplyConversion {
     pub commands: Vec<Command>,
     pub skipped: Vec<SkippedOperation>,
+    /// Number of diff operations that produced at least one
+    /// emitted command. This is **not** equal to `commands.len()`
+    /// when an operation expands into multiple commands (e.g. a
+    /// wall polyline `Insert` with `N` points becomes `N-1`
+    /// `CreateWall` commands), and it is **not** equal to
+    /// `op_count - skipped.len()` either, because a single
+    /// operation can push multiple per-segment entries into
+    /// `skipped` while still producing commands (a polyline that
+    /// mixes valid segments with zero-length duplicates lands its
+    /// valid segments and records the dupes for the audit trail).
+    ///
+    /// `BUG_0001 (round 5)` fix: the service layer reads this
+    /// directly so `AiAcceptOutcome.applied_count` carries the
+    /// operation-level number the renderer expects ("Applied X of
+    /// Y operations"), independent of how each operation
+    /// internally fans out into commands or skipped entries.
+    pub applied_op_count: usize,
 }
 
 impl ApplyConversion {
@@ -135,8 +152,19 @@ pub fn diff_to_commands(
     let tool = diff.tool.as_str().to_owned();
     let mut commands: Vec<Command> = Vec::new();
     let mut skipped: Vec<SkippedOperation> = Vec::new();
+    let mut applied_op_count: usize = 0;
 
     for (op_index, op) in diff.operations.iter().enumerate() {
+        // Snapshot before dispatching so we can attribute any newly
+        // emitted command(s) back to this operation. This is the
+        // canonical place to compute `applied_op_count` because the
+        // per-handler functions (`convert_insert`, `convert_update`,
+        // `convert_delete`, `insert_walls_from_polyline`) can each
+        // push zero, one, or many commands and zero, one, or many
+        // skipped entries — only `diff_to_commands` can decide at
+        // the operation boundary whether the op as a whole produced
+        // anything.
+        let commands_before = commands.len();
         match op {
             DiffOperation::Insert {
                 entity_kind,
@@ -164,9 +192,16 @@ pub fn diff_to_commands(
                 convert_delete(op_index, target, &tool, graph, &mut commands, &mut skipped);
             }
         }
+        if commands.len() > commands_before {
+            applied_op_count += 1;
+        }
     }
 
-    ApplyConversion { commands, skipped }
+    ApplyConversion {
+        commands,
+        skipped,
+        applied_op_count,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

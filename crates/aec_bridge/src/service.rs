@@ -1074,8 +1074,23 @@ pub struct AiAcceptOutcome {
     /// Total operations the diff carried (matches
     /// `diff.operations.len()` from `ai_plan`).
     pub op_count: u32,
-    /// Subset that the converter mapped to a typed command and that
-    /// the command engine successfully executed.
+    /// Count of *operations* (not commands) that the converter
+    /// mapped to at least one typed command. Bounded above by
+    /// `op_count` and by definition `<= op_count`. The renderer
+    /// surfaces this as "Applied X of Y operations" — Y is
+    /// `op_count`, X is this field.
+    ///
+    /// Note: a single operation can expand into multiple commands
+    /// (e.g. a polyline wall `Insert` with N points emits N-1
+    /// `CreateWall` commands). `command_ids.len()` reflects the
+    /// command count; `applied_count` reflects the operation count.
+    /// The two can differ in either direction:
+    ///   * one op → many commands (multi-segment polyline);
+    ///   * one op → many `skipped` entries plus some commands (a
+    ///     polyline that mixes valid segments with zero-length
+    ///     duplicates lands its valid segments and records the
+    ///     dupes — `applied_count` still increments by one for
+    ///     that op).
     pub applied_count: u32,
     /// Operations the converter could not translate — unknown
     /// entity kinds, dangling targets, render_doctor diagnostics,
@@ -3608,6 +3623,16 @@ impl BridgeService {
                 reason: s.reason.clone(),
             })
             .collect();
+        // Capture the operation-level applied count from the
+        // converter *before* `conversion.commands` is moved into
+        // the engine below. This is the `BUG_0001 (round 5)` fix:
+        // the converter knows which operations produced at least
+        // one command, so it reports the operation count directly
+        // rather than us trying to derive it from `commands.len()`
+        // (commands can fan out per op) or
+        // `op_count - skipped.len()` (a polyline can produce both
+        // commands and per-segment skips for the same op).
+        let applied_count = u32::try_from(conversion.applied_op_count).unwrap_or(u32::MAX);
         // `command_apply_batch` accepts an empty Vec as a no-op,
         // which is what we want when every operation in the diff
         // is unsupported (e.g. all render_doctor diagnostics). The
@@ -3655,7 +3680,6 @@ impl BridgeService {
                 })
                 .collect()
         };
-        let applied_count = u32::try_from(applied_results.len()).unwrap_or(u32::MAX);
         let command_ids: Vec<String> = applied_results
             .iter()
             .map(|r| r.command_id.as_str().to_owned())

@@ -511,9 +511,21 @@ impl CommandEngine {
         // front so the transaction window stays short — SQLite's
         // writer lock blocks every concurrent reader for the
         // duration.
+        //
+        // `ANALYSIS_0003` fix: stage the `JournalEntry` *once* per
+        // command here. The previous shape held `(Command, deltas,
+        // inverse)` and reconstructed two separate `JournalEntry`
+        // values per command (one in phase 2 for SQL persist with
+        // `deltas.clone() + inverse.clone()`, another in phase 3
+        // for the in-memory journal with `deltas.clone() + inverse`).
+        // Constructing the entry once lets phase 2 borrow it for
+        // SQL persistence and phase 3 move it into the in-memory
+        // journal — one allocation per command instead of three,
+        // and the SQL/in-memory representations are guaranteed to
+        // be byte-identical (no risk of the two construction sites
+        // drifting under future maintenance).
         let mut staging = self.graph.clone();
-        let mut staged: Vec<(Command, Vec<EntityDelta>, Vec<EntityDelta>)> =
-            Vec::with_capacity(commands.len());
+        let mut staged: Vec<(Command, JournalEntry)> = Vec::with_capacity(commands.len());
         for cmd in commands {
             // `compute_deltas_against_graph` is the pure form that
             // does NOT re-check scope; we already validated scope
@@ -527,25 +539,25 @@ impl CommandEngine {
                 staging.apply(d)?;
             }
             let inverse: Vec<EntityDelta> = deltas.iter().rev().map(EntityDelta::invert).collect();
-            staged.push((cmd, deltas, inverse));
+            let entry = JournalEntry {
+                command_id: cmd.command_id.clone(),
+                applied_at: cmd.ts,
+                scope: self.active_scope,
+                forward: deltas,
+                inverse,
+            };
+            staged.push((cmd, entry));
         }
         // Phase 2: single SQL transaction covering every delta +
         // every journal entry. If any write fails (or `commit()`
         // itself fails) the batch is rolled back and none of the
         // in-memory mutations from phase 3 below execute.
         let tx = conn.transaction()?;
-        for (cmd, deltas, inverse) in &staged {
-            for d in deltas {
+        for (_cmd, entry) in &staged {
+            for d in &entry.forward {
                 crate::commands::ProjectGraph::persist_delta_in_tx(&tx, d)?;
             }
-            let entry = JournalEntry {
-                command_id: cmd.command_id.clone(),
-                applied_at: cmd.ts,
-                scope: self.active_scope,
-                forward: deltas.clone(),
-                inverse: inverse.clone(),
-            };
-            crate::journal::UndoRedoJournal::persist_record_in_tx(&tx, &entry)?;
+            crate::journal::UndoRedoJournal::persist_record_in_tx(&tx, entry)?;
         }
         tx.commit()?;
         // Phase 3: SQL is committed atomically. Mirror in-memory
@@ -553,8 +565,8 @@ impl CommandEngine {
         // order so the chain still records each user gesture
         // distinctly.
         let mut results = Vec::with_capacity(staged.len());
-        for (cmd, deltas, inverse) in staged {
-            for d in &deltas {
+        for (cmd, entry) in staged {
+            for d in &entry.forward {
                 self.graph
                     .apply(d)
                     .expect("validated above; apply cannot fail");
@@ -563,17 +575,17 @@ impl CommandEngine {
                 &cmd.command_id,
                 &serde_json::to_value(&cmd).unwrap_or(serde_json::Value::Null),
             );
-            let entry = JournalEntry {
-                command_id: cmd.command_id.clone(),
-                applied_at: cmd.ts,
-                scope: self.active_scope,
-                forward: deltas.clone(),
-                inverse,
-            };
+            // The `CommandResult.applied` field is the only place
+            // outside the engine that observes the forward deltas,
+            // so we clone once for it and move the entry into the
+            // journal. The journal owns `entry.forward` for undo;
+            // callers see a copy via `CommandResult.applied` for
+            // their own observation (e.g. status pane caching).
+            let applied = entry.forward.clone();
             self.journal.record(entry);
             results.push(CommandResult {
                 command_id: cmd.command_id,
-                applied: deltas,
+                applied,
                 audit: envelope,
             });
         }
