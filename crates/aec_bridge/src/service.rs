@@ -3713,8 +3713,23 @@ impl BridgeService {
     /// later analysis. The `reason` argument is free-form text
     /// supplied by the renderer; an empty `reason` is recorded as
     /// the empty string rather than as missing.
+    ///
+    /// Devin Review `ANALYSIS_0001` (round 1): takes `&self`
+    /// (not `&mut self`) so the napi shim can use
+    /// `with_service_ref_fallible` (a read-lock on the service
+    /// singleton). The reject path does not mutate `BridgeService`
+    /// directly — `ai_state.peek_diff` / `finalize_diff` already
+    /// take `&self` and route all state changes through the
+    /// internal locks inside [`crate::ai_state::AiState`], and the
+    /// audit append (`Self::ai_audit_append_at_root`) is a static
+    /// associated function. Keeping reject under a *read* lock
+    /// means a renderer that fires off `status_poll` /
+    /// `list_render_jobs` while a reject is in flight no longer
+    /// serializes against the reject's disk I/O — they run
+    /// concurrently. (Accept *must* hold the write lock because
+    /// `command_apply_on_conn` mutates the project graph.)
     pub fn ai_reject_diff(
-        &mut self,
+        &self,
         diff_id: &str,
         reason: Option<&str>,
     ) -> Result<AiRejectOutcome, BridgeServiceError> {

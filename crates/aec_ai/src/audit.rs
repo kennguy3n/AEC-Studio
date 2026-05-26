@@ -8,13 +8,17 @@
 //!    chain verifier can detect tampering without reading the full
 //!    record. This is the file [`aec_audit::AuditLog`] manages.
 //!
-//! 2. **`ai_records.jsonl`** — the forensic companion. One full
-//!    [`AiAuditRecord`] per event, including the rejection reason
-//!    the renderer supplied. This file is NOT hash-chained — the
-//!    parallel `ai_audit.jsonl` entry's `payload_hash` IS the
-//!    canonical hash of the same record, so any post-hoc tampering
-//!    of `ai_records.jsonl` is detectable by recomputing the
-//!    BLAKE3 of the line and comparing against the chained entry.
+//! 2. **`ai_audit_records.jsonl`** — the forensic companion. One
+//!    full [`AiAuditRecord`] per event, including the rejection
+//!    reason the renderer supplied. The companion path is derived
+//!    from the chain path by appending `_records` to the file
+//!    stem (see [`AiAuditLogger::open`]), so `ai_audit.jsonl`
+//!    pairs with `ai_audit_records.jsonl`. This file is NOT
+//!    hash-chained — the parallel `ai_audit.jsonl` entry's
+//!    `payload_hash` IS the canonical hash of the same record,
+//!    so any post-hoc tampering of `ai_audit_records.jsonl` is
+//!    detectable by recomputing the BLAKE3 of the line and
+//!    comparing against the chained entry.
 //!
 //! Splitting the two lets the chain stay small and constant-size
 //! per entry (every line is the same shape: hashes + envelope)
@@ -261,12 +265,12 @@ mod tests {
         // The chained `ai_audit.jsonl` only carries the payload
         // *hash* (it is tamper-evident, not content-addressable);
         // the forensic reason lives in the companion
-        // `ai_records.jsonl`. Read both back and confirm the
+        // `ai_audit_records.jsonl`. Read both back and confirm the
         // reason is recoverable.
         let records = std::fs::read_to_string(logger.records_path()).unwrap();
         assert!(
             records.contains("wrong room"),
-            "expected `wrong room` in ai_records.jsonl, got: {records}"
+            "expected `wrong room` in ai_audit_records.jsonl, got: {records}"
         );
         // The chain file should NOT contain the reason text —
         // tamper-evidence is via the hash chain, not the text.
@@ -301,7 +305,7 @@ mod tests {
         let records = std::fs::read_to_string(logger.records_path()).unwrap();
         assert!(
             !records.contains("\"reason\""),
-            "empty reason must be skipped in ai_records.jsonl, got: {records}"
+            "empty reason must be skipped in ai_audit_records.jsonl, got: {records}"
         );
         let _chain = std::fs::read_to_string(&path).unwrap();
     }

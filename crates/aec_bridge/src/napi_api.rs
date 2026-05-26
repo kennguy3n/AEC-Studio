@@ -2157,7 +2157,18 @@ pub async fn ai_accept_diff(diff_id: String) -> Result<AiAcceptOutcomeJs> {
 #[napi]
 pub async fn ai_reject_diff(diff_id: String, reason: Option<String>) -> Result<AiRejectOutcomeJs> {
     spawn_blocking_napi(move || {
-        with_service(|svc| svc.ai_reject_diff(&diff_id, reason.as_deref())).map(|r| {
+        // Devin Review `ANALYSIS_0001` (round 1): use the *read*
+        // lock (`with_service_ref_fallible`) rather than the write
+        // lock (`with_service`). The reject path does not mutate
+        // `BridgeService` directly — `ai_state.peek_diff` /
+        // `finalize_diff` already take `&self` and own their own
+        // interior locks, and the audit append is a static helper.
+        // Holding only a read lock here means concurrent status
+        // polls and render-job listings no longer serialize behind
+        // a reject's audit-disk-I/O. (Accept must continue to use
+        // the write lock because `command_apply_on_conn` mutates
+        // the project graph through `&mut self`.)
+        with_service_ref_fallible(|svc| svc.ai_reject_diff(&diff_id, reason.as_deref())).map(|r| {
             AiRejectOutcomeJs {
                 ok: r.ok,
                 diff_id: r.diff_id,
