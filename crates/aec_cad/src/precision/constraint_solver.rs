@@ -117,23 +117,44 @@ impl ConstraintSolver {
     /// over-constrained and the solver doesn't fully converge, the
     /// dragged point lands as close as possible to where the user
     /// asked.
+    ///
+    /// **Out-of-bounds drag indices are silently skipped** — both the
+    /// `vars` write and the temporary `FixedPoint` constraint addition
+    /// are gated on the same `idx * 2 + 1 < vars.len()` check so the
+    /// two paths cannot diverge. Without this gate the solver would
+    /// panic in `Constraint::residual` when evaluating a `FixedPoint`
+    /// pin that referenced a point past the end of `vars`. The UI
+    /// layer is responsible for keeping `dragged` indices in range;
+    /// silent-skip is the safest fallback for a hot mouse-drag path
+    /// where a `Result` would force every caller into error plumbing
+    /// they cannot recover from mid-drag.
     pub fn solve_with_drag(
         &self,
         cs: &ConstraintSet,
         vars: &mut [f64],
         dragged: &[(PointIndex, [f64; 2])],
     ) -> SolveResult {
-        for &(idx, pos) in dragged {
-            if idx * 2 + 1 < vars.len() {
-                vars[idx * 2] = pos[0];
-                vars[idx * 2 + 1] = pos[1];
-            }
+        // Single in-range pass produces the authoritative list of
+        // drag entries that will be applied to BOTH `vars` and the
+        // augmented constraint set. Doing the bounds check once here
+        // — instead of twice at the two later use sites — guarantees
+        // the `vars` write and the `FixedPoint` constraint addition
+        // can never diverge, eliminating the OOB panic when a caller
+        // supplies an index past `vars.len() / 2`.
+        let valid: Vec<(PointIndex, [f64; 2])> = dragged
+            .iter()
+            .copied()
+            .filter(|&(idx, _)| idx * 2 + 1 < vars.len())
+            .collect();
+        for &(idx, pos) in &valid {
+            vars[idx * 2] = pos[0];
+            vars[idx * 2 + 1] = pos[1];
         }
-        if dragged.is_empty() {
+        if valid.is_empty() {
             return self.solve(cs, vars);
         }
         let mut augmented = cs.clone();
-        for &(idx, pos) in dragged {
+        for &(idx, pos) in &valid {
             augmented.add(Constraint::FixedPoint {
                 a: idx,
                 position: pos,
@@ -282,8 +303,9 @@ mod tests {
     ///   - p1–p2 vertical   (right edge),
     ///   - p3–p0 vertical   (left edge),
     ///   - p0 fixed at origin (so the rectangle has a definite location),
-    ///   - p0–p1 fixed distance = 5  (width),
-    ///   - p0–p3 fixed distance = 3  (height).
+    ///   - p0–p3 fixed distance = 3  (height — the rectangle's height
+    ///     is locked; its width is left free so the drag below can
+    ///     stretch it).
     ///
     /// Then we drag p1 (the bottom-right corner) — a "stretch the
     /// rectangle wider" operation. The solver must:
@@ -431,6 +453,69 @@ mod tests {
         });
         let mut vars = [0.0, 0.0, 7.0, 0.0];
         let r = ConstraintSolver::default().solve_with_drag(&cs, &mut vars, &[]);
+        assert!(r.is_converged());
+        let d = ((vars[2]).powi(2) + (vars[3]).powi(2)).sqrt();
+        assert!((d - 5.0).abs() < 1e-4);
+    }
+
+    /// Regression test: an out-of-bounds drag index used to add a
+    /// `FixedPoint { a: oob, .. }` constraint to the augmented set
+    /// even though the `vars` write was skipped, and then the
+    /// subsequent `solve` call would panic in `Constraint::residual`
+    /// (`vars[a * 2]` out of bounds). The fix gates both the `vars`
+    /// write and the constraint addition on the same in-range check,
+    /// so an OOB index is silently skipped end-to-end and the
+    /// solver still converges on the remaining valid drag entries.
+    #[test]
+    fn drag_with_out_of_bounds_index_is_silently_skipped_no_panic() {
+        let mut cs = ConstraintSet::new(2);
+        cs.add(Constraint::Horizontal { a: 0, b: 1 });
+        let mut vars = [0.0, 0.0, 5.0, 3.0]; // 2 points → 4 vars.
+
+        // Index 5 corresponds to vars[10..12], which is far past the
+        // end of a 4-element `vars`. Previously this would still
+        // append `FixedPoint { a: 5, .. }` to the augmented set and
+        // panic at residual eval time.
+        let drag = [(5usize, [9.0, 9.0]), (1usize, [7.0, 0.0])];
+        let r = ConstraintSolver::default().solve_with_drag(&cs, &mut vars, &drag);
+        assert!(
+            r.is_converged(),
+            "solver must converge after silently skipping OOB drag, got {r:?}"
+        );
+
+        // The in-range drag landed.
+        assert!(
+            (vars[2] - 7.0).abs() < 1e-3,
+            "p1.x should be 7, got {}",
+            vars[2]
+        );
+        assert!(vars[3].abs() < 1e-3, "p1.y should be 0, got {}", vars[3]);
+        // The Horizontal constraint pulled p0.y to match p1.y.
+        assert!((vars[1] - vars[3]).abs() < 1e-3);
+    }
+
+    /// Regression test: when EVERY drag entry is out of bounds the
+    /// augmented constraint set must not be built (otherwise the
+    /// solver would still see zero extra constraints but pay the
+    /// clone cost). The behaviour must reduce to a plain `solve` on
+    /// the original constraint set, exactly as the empty-drag-list
+    /// case does.
+    #[test]
+    fn drag_with_all_out_of_bounds_indices_reduces_to_plain_solve() {
+        let mut cs = ConstraintSet::new(2);
+        cs.add(Constraint::FixedPoint {
+            a: 0,
+            position: [0.0, 0.0],
+        });
+        cs.add(Constraint::FixedDistance {
+            a: 0,
+            b: 1,
+            distance: 5.0,
+        });
+        let mut vars = [0.0, 0.0, 7.0, 0.0];
+        // All drag indices are out of bounds for a 4-element `vars`.
+        let drag = [(99usize, [1.0, 1.0]), (100usize, [2.0, 2.0])];
+        let r = ConstraintSolver::default().solve_with_drag(&cs, &mut vars, &drag);
         assert!(r.is_converged());
         let d = ((vars[2]).powi(2) + (vars[3]).powi(2)).sqrt();
         assert!((d - 5.0).abs() < 1e-4);
