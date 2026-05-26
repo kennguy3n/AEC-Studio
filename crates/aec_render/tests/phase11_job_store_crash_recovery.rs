@@ -9,6 +9,8 @@
 //! single-job APIs see the same state.
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::thread;
 
 use aec_render::{
     queue::RenderQueue, RenderJob, RenderJobStatus, RenderJobStore, RenderPreset, RenderScene,
@@ -117,9 +119,6 @@ fn full_lifecycle_four_jobs_crash_after_two_complete() {
 
 #[test]
 fn store_supports_concurrent_upserts_from_multiple_workers() {
-    use std::sync::Arc;
-    use std::thread;
-
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("queue.sqlite");
     let store = Arc::new(RenderJobStore::open(&path).unwrap());
