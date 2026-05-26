@@ -91,6 +91,24 @@ fn backfill_inner<S: std::hash::BuildHasher>(
         let area = polygon_area_m2(footprint);
         let perimeter = polygon_perimeter_m(footprint);
 
+        // Skip when the computed area is degenerate. A polygon
+        // with `effective_len >= 3` but all vertices collinear
+        // (e.g. `[[0,0],[1,0],[2,0],[3,0]]`) still produces
+        // `area == 0.0`. Without this guard we would write
+        // `NetFloorArea = 0.0`, and on every subsequent
+        // non-forced call `existing_area > 0.0` would be false
+        // (because `0.0 > 0.0` is false), so we would re-walk
+        // the same write — making the function non-idempotent
+        // and dirtying the property store with no information.
+        // The `1e-9` m² ≈ 1 µm² threshold sits well below any
+        // meaningful BIM precision while still tolerating the
+        // floating-point residue that shoelace can produce on
+        // a near-collinear-but-not-quite ring.
+        const MIN_AREA_M2: f64 = 1e-9;
+        if area < MIN_AREA_M2 {
+            continue;
+        }
+
         let existing_area = props
             .get(&id)
             .and_then(|e| e.get("Qto_SpaceBaseQuantities", "NetFloorArea"))
@@ -364,6 +382,49 @@ mod tests {
                     .and_then(|e| e.get("Qto_SpaceBaseQuantities", "NetFloorArea"))
                     .is_none(),
             "no qto entry should be written for a degenerate polygon"
+        );
+    }
+
+    #[test]
+    fn collinear_polygon_is_skipped_and_backfill_is_idempotent() {
+        // Regression guard for the zero-area collinear-vertex case:
+        // a polygon with `effective_len >= 3` but all vertices on a
+        // single line (here: four points on the x-axis) yields
+        // `polygon_area_m2 == 0.0` and must be skipped, not written
+        // as a zero-area qto. Crucially, calling `backfill` twice
+        // must return the same `0` both times — proving the
+        // function is strictly idempotent for this case, not
+        // re-walking the same zero-write on every call.
+        let (p, s) = project_with_one_space();
+        let mut props = PropertyStore::new();
+        let mut fps = std::collections::HashMap::new();
+        // Four collinear points → effective_len 4, area 0.0.
+        fps.insert(
+            s.clone(),
+            vec![[0.0, 0.0], [1.0, 0.0], [2.0, 0.0], [3.0, 0.0]],
+        );
+
+        let n1 = backfill_space_quantities(&p, &mut props, &fps);
+        assert_eq!(n1, 0, "collinear polygon must be skipped on first call");
+        assert!(
+            props
+                .get(&s)
+                .and_then(|e| e.get("Qto_SpaceBaseQuantities", "NetFloorArea"))
+                .is_none(),
+            "no qto entry should be written for a collinear polygon",
+        );
+
+        let n2 = backfill_space_quantities(&p, &mut props, &fps);
+        assert_eq!(
+            n2, 0,
+            "second non-forced call must not re-walk the same zero-area write",
+        );
+        assert!(
+            props
+                .get(&s)
+                .and_then(|e| e.get("Qto_SpaceBaseQuantities", "NetFloorArea"))
+                .is_none(),
+            "second call must still leave no NetFloorArea on the entry",
         );
     }
 }
