@@ -174,6 +174,15 @@ pub fn classify_entity_kind(kind: &str) -> &str {
 /// Each separating `0x00` byte disambiguates adjacent fields so two
 /// snapshots can't collide just because one entity's `body` happens
 /// to start with the next field's bytes.
+///
+/// **Invariant for future schema changes:** every hashed field below
+/// comes from a SQLite `TEXT` column (UTF-8 encoded) and `serde_json`
+/// rejects raw `\0` bytes in string values, so no value reaching this
+/// hasher can contain `0x00`. If a future column is added to the hash
+/// that stores a `BLOB` (or a `TEXT` field allowed to hold arbitrary
+/// bytes), the separator becomes ambiguous — switch to a length-
+/// prefixed encoding (`len: u32 || bytes`) for that field, do **not**
+/// just sprinkle more `\0` bytes between them.
 pub fn snapshot_entities(conn: &Connection) -> AecResult<Vec<RevisionEntity>> {
     // First pass: stream every entity row, ordered by id so the
     // resulting Vec is itself in a stable order (which the diff
