@@ -131,7 +131,10 @@ fn snapshot_round_trip_preserves_entities_under_sqlcipher_key() {
         .any(|e| e.id == "schedule.row.D1" && e.category == "schedule_row"));
 
     // BLAKE3 in the metadata still matches the on-disk file.
-    assert!(store.verify_snapshot(&rev).unwrap());
+    assert_eq!(
+        store.verify_snapshot(&rev).unwrap(),
+        aec_core::revision::SnapshotVerification::Verified
+    );
     assert!(snap.size_bytes > 0);
 }
 

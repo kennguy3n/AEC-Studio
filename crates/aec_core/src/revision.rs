@@ -179,6 +179,43 @@ impl RevisionDraft {
     }
 }
 
+/// Result of [`RevisionStore::verify_snapshot`].
+///
+/// Distinguishes the three outcomes a caller might want to gate on
+/// separately: "verified clean", "verified tampered", and "nothing to
+/// verify". The previous `Result<bool, _>` shape conflated the last
+/// two — both returned `Ok(false)` — which made it impossible for a
+/// caller to tell "this revision was never snapshotted" apart from
+/// "this snapshot's bytes don't match the recorded hash anymore".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotVerification {
+    /// The on-disk `.snap` file's BLAKE3 matches the digest stored on
+    /// the revision metadata. The snapshot is byte-identical to what
+    /// was captured when the revision was sealed.
+    Verified,
+    /// The on-disk `.snap` file exists and is readable but its BLAKE3
+    /// does NOT match the digest recorded in the revision metadata.
+    /// The file was tampered with (or corrupted by an external
+    /// process) after the revision was sealed.
+    Mismatch,
+    /// The revision has no `snapshot` metadata at all — it's a legacy
+    /// / tracked-entity-only revision that was created via
+    /// [`RevisionStore::create`] rather than
+    /// [`RevisionStore::create_with_snapshot`]. There is nothing to
+    /// verify.
+    NoSnapshot,
+}
+
+impl SnapshotVerification {
+    /// `true` iff verification ran and succeeded. Returns `false` for
+    /// both [`Self::Mismatch`] and [`Self::NoSnapshot`]; integrity
+    /// callers should match on the enum directly to distinguish those
+    /// cases rather than relying on this helper.
+    pub fn is_verified(self) -> bool {
+        matches!(self, Self::Verified)
+    }
+}
+
 /// On-disk store for revisions.
 ///
 /// Backed by a `revisions/` directory inside the project package. Each
@@ -193,9 +230,25 @@ pub struct RevisionStore {
 impl RevisionStore {
     /// Open a store rooted at `<project>/revisions/`. Creates the
     /// directory if missing.
+    ///
+    /// On open the store also sweeps any orphan `.snap.tmp` and
+    /// `.json.tmp` files left behind by a process that crashed between
+    /// the temp-write and the atomic rename in
+    /// [`Self::create_with_snapshot`] / [`Self::write_atomic`]. These
+    /// orphans are invisible to [`Self::list`] (which filters for
+    /// `.json` only) and to [`Self::delete`] (which only knows about
+    /// `.json` + `.snap`), so without a sweep they accumulate forever
+    /// on disk. The sweep is conservative: it only removes files whose
+    /// extension is exactly `snap.tmp` or `json.tmp`, so a `.snap` or
+    /// `.json` file is never touched. A failure to remove an
+    /// individual orphan is logged via `eprintln!` (so the cause shows
+    /// up in the bridge service log) but does not fail the open — the
+    /// store is still usable, and the next successful sweep will
+    /// retry.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, AecError> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
+        sweep_orphan_temp_files(&dir);
         Ok(Self { dir })
     }
 
@@ -364,16 +417,38 @@ impl RevisionStore {
     }
 
     /// Re-hash the on-disk snapshot file and compare it against the
-    /// digest stored in the revision metadata. Returns `true` when the
-    /// file is byte-identical to what was captured at snapshot time.
-    /// Returns an error if the snapshot file is missing or unreadable.
-    pub fn verify_snapshot(&self, revision: &Revision) -> Result<bool, AecError> {
+    /// digest stored in the revision metadata. Returns a
+    /// [`SnapshotVerification`] that distinguishes the three
+    /// outcomes a caller may want to act on:
+    ///
+    /// * [`SnapshotVerification::Verified`] — the on-disk file is
+    ///   byte-identical to what was captured at snapshot time.
+    /// * [`SnapshotVerification::Mismatch`] — the file exists but its
+    ///   BLAKE3 differs from the stored digest. The snapshot was
+    ///   tampered with (or the file on disk was corrupted by an
+    ///   external process) after the revision was sealed.
+    /// * [`SnapshotVerification::NoSnapshot`] — the revision is a
+    ///   legacy / tracked-entity-only revision and never had an
+    ///   attached `.snap` file in the first place; there is nothing to
+    ///   verify.
+    ///
+    /// Returns an error if the snapshot file is missing or unreadable
+    /// (distinct from `NoSnapshot` — "no metadata at all" vs
+    /// "metadata says there is a snapshot but the file is gone").
+    /// Integrity-sensitive callers can match on the enum to gate
+    /// operations correctly without conflating "nothing to check" with
+    /// "file was tampered with".
+    pub fn verify_snapshot(&self, revision: &Revision) -> Result<SnapshotVerification, AecError> {
         let Some(meta) = revision.snapshot.as_ref() else {
-            return Ok(false);
+            return Ok(SnapshotVerification::NoSnapshot);
         };
         let snap_path = self.dir.join(&meta.relative_path);
         let (hex, _size) = blake3_of_file(&snap_path)?;
-        Ok(hex == meta.blake3_hex)
+        if hex == meta.blake3_hex {
+            Ok(SnapshotVerification::Verified)
+        } else {
+            Ok(SnapshotVerification::Mismatch)
+        }
     }
 
     /// List all revisions in creation-time order (oldest first).
@@ -415,9 +490,21 @@ impl RevisionStore {
     }
 
     /// Remove a revision file. Also removes the associated snapshot
-    /// file (`<id>.snap`) if one exists, so a delete leaves no orphan
-    /// snapshot bytes behind. Returns `true` if at least the metadata
-    /// file existed (and was deleted).
+    /// file if one exists, so a delete leaves no orphan snapshot bytes
+    /// behind. Returns `true` if at least the metadata file existed
+    /// (and was deleted).
+    ///
+    /// **Snapshot path resolution.** The snapshot path is read from
+    /// the revision JSON's `snapshot.relative_path` field rather than
+    /// reconstructed as `{id}.snap`. [`Self::create_with_snapshot`]
+    /// currently always writes `{id}.snap`, but reading the stored
+    /// `relative_path` keeps `delete`, [`Self::snapshot_path`], and
+    /// [`Self::verify_snapshot`] in agreement: if the naming
+    /// convention ever changes, all three see the same authoritative
+    /// path. If the JSON sidecar is unreadable / unparseable (which
+    /// would orphan its `.snap` forever otherwise), `delete` falls
+    /// back to the legacy `{id}.snap` pattern so an unrecoverable JSON
+    /// doesn't prevent the snap from being cleaned up.
     ///
     /// **Deletion ordering: snap first, then JSON.** The snapshot is
     /// the larger, more disposable file (raw encrypted bytes; the JSON
@@ -437,11 +524,27 @@ impl RevisionStore {
     /// orphaned — invisible to `list()` and silently wasting disk.
     pub fn delete(&self, id: &str) -> Result<bool, AecError> {
         let json_path = self.dir.join(format!("{id}.json"));
-        let snap_path = self.dir.join(format!("{id}.snap"));
-        let existed = json_path.exists();
-        if !existed {
+        if !json_path.exists() {
             return Ok(false);
         }
+
+        // Resolve the snapshot path from the JSON sidecar's stored
+        // `relative_path` so `delete` stays consistent with
+        // `snapshot_path` / `verify_snapshot`. If the JSON can't be
+        // parsed (corruption), fall back to the legacy `{id}.snap`
+        // pattern so an unparseable JSON can't strand its snap on
+        // disk.
+        let snap_path: PathBuf = match fs::read(&json_path) {
+            Ok(bytes) => match serde_json::from_slice::<Revision>(&bytes) {
+                Ok(rev) => rev.snapshot.as_ref().map_or_else(
+                    || self.dir.join(format!("{id}.snap")),
+                    |s| self.dir.join(&s.relative_path),
+                ),
+                Err(_) => self.dir.join(format!("{id}.snap")),
+            },
+            Err(_) => self.dir.join(format!("{id}.snap")),
+        };
+
         if snap_path.exists() {
             fs::remove_file(&snap_path)?;
         }
@@ -505,6 +608,69 @@ fn journal_max_seq(conn: &Connection) -> Result<Option<i64>, AecError> {
         .query_row([], |r| r.get::<_, Option<i64>>(0))
         .map_err(|e| AecError::Other(format!("query undo_journal head: {e}")))?;
     Ok(head)
+}
+
+/// Sweep crash-orphan `.snap.tmp` and `.json.tmp` files out of `dir`.
+///
+/// `create_with_snapshot` writes its `.snap` via a `.snap.tmp` → rename
+/// dance, and `write_atomic` does the same with `.json.tmp` → rename.
+/// If the process crashes between the temp write and the rename, those
+/// `.tmp` files are left behind. They are:
+///
+/// * Invisible to [`RevisionStore::list`], which only matches the
+///   `.json` extension.
+/// * Untouched by [`RevisionStore::delete`], which only removes the
+///   `{id}.json` and `{id}.snap` siblings.
+///
+/// Without a sweep on store open, those orphans accumulate forever on
+/// disk and silently waste storage proportional to project DB size
+/// (a `.snap.tmp` is the same size as the live project DB at crash
+/// time, which can be hundreds of MB for asset-heavy projects). The
+/// sweep matches exactly the `.snap.tmp` and `.json.tmp` suffixes so a
+/// `.snap` or `.json` file is never touched, and is tolerant of
+/// individual unlink failures (the store stays usable; the next open
+/// retries the sweep).
+fn sweep_orphan_temp_files(dir: &Path) {
+    let read_dir = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) => {
+            // Sweep is best-effort; a read failure here doesn't break
+            // the open. The directory was just successfully created
+            // by `create_dir_all` so this is unusual but recoverable.
+            eprintln!(
+                "revision store sweep: failed to read {}: {e}",
+                dir.display()
+            );
+            return;
+        }
+    };
+
+    for entry in read_dir {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("revision store sweep: read_dir entry failed: {e}");
+                continue;
+            }
+        };
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        // Match the exact two suffixes that `create_with_snapshot`
+        // and `write_atomic` produce. Using `ends_with` on the full
+        // file name (not `Path::extension`, which would give only
+        // `tmp` for both `.snap.tmp` and `.json.tmp`) keeps the sweep
+        // narrowly scoped to the temp files this store creates.
+        if name.ends_with(".snap.tmp") || name.ends_with(".json.tmp") {
+            if let Err(e) = fs::remove_file(&path) {
+                eprintln!(
+                    "revision store sweep: failed to remove orphan {}: {e}",
+                    path.display()
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -686,7 +852,10 @@ mod tests {
         assert!(snap_path.exists());
         let (recomputed, _) = blake3_of_file(&snap_path).unwrap();
         assert_eq!(recomputed, snap.blake3_hex);
-        assert!(store.verify_snapshot(&rev).unwrap());
+        assert_eq!(
+            store.verify_snapshot(&rev).unwrap(),
+            SnapshotVerification::Verified
+        );
     }
 
     #[test]
@@ -722,8 +891,14 @@ mod tests {
 
         // v1's hash still verifies — i.e. mutating the live db did NOT
         // alter the v1 .snap file on disk.
-        assert!(store.verify_snapshot(&r1).unwrap());
-        assert!(store.verify_snapshot(&r2).unwrap());
+        assert_eq!(
+            store.verify_snapshot(&r1).unwrap(),
+            SnapshotVerification::Verified
+        );
+        assert_eq!(
+            store.verify_snapshot(&r2).unwrap(),
+            SnapshotVerification::Verified
+        );
 
         // Journal head pointer advanced between snapshots.
         assert_eq!(r1.snapshot.as_ref().unwrap().journal_head_seq, None);
@@ -747,10 +922,58 @@ mod tests {
         bytes.push(0xAA);
         std::fs::write(&snap_path, bytes).unwrap();
 
-        assert!(
-            !store.verify_snapshot(&rev).unwrap(),
-            "verify_snapshot must reject a tampered .snap file"
+        assert_eq!(
+            store.verify_snapshot(&rev).unwrap(),
+            SnapshotVerification::Mismatch,
+            "verify_snapshot must report Mismatch (not just `false`) for a tampered .snap file"
         );
+    }
+
+    #[test]
+    fn verify_snapshot_distinguishes_no_snapshot_from_mismatch() {
+        let td = TempDir::new().unwrap();
+        let store = RevisionStore::open(td.path()).unwrap();
+        // A revision created via `create` (no `.snap`) returns the
+        // `NoSnapshot` variant — *not* the same value as `Mismatch`.
+        let rev = store
+            .create(fixture_draft(&ProjectId::new(), "legacy"))
+            .unwrap();
+        assert_eq!(
+            store.verify_snapshot(&rev).unwrap(),
+            SnapshotVerification::NoSnapshot
+        );
+        assert!(!store.verify_snapshot(&rev).unwrap().is_verified());
+    }
+
+    #[test]
+    fn open_sweeps_orphan_snap_tmp_and_json_tmp_files() {
+        let td = TempDir::new().unwrap();
+        // Pre-seed the directory with crash-orphan tmp files that a
+        // killed process would have left behind, plus a normal `.snap`
+        // and `.json` to confirm the sweep doesn't touch real files.
+        let orphan_snap = td.path().join("rev_abc.snap.tmp");
+        let orphan_json = td.path().join("rev_def.json.tmp");
+        let real_snap = td.path().join("rev_xyz.snap");
+        let real_json = td.path().join("rev_xyz.json");
+        std::fs::write(&orphan_snap, b"orphan snap bytes").unwrap();
+        std::fs::write(&orphan_json, b"{\"orphan\":true}").unwrap();
+        std::fs::write(&real_snap, b"real snap bytes").unwrap();
+        std::fs::write(&real_json, b"{\"real\":true}").unwrap();
+
+        let _store = RevisionStore::open(td.path()).unwrap();
+
+        // The two crash-orphans are gone.
+        assert!(
+            !orphan_snap.exists(),
+            "sweep must remove orphan .snap.tmp on open"
+        );
+        assert!(
+            !orphan_json.exists(),
+            "sweep must remove orphan .json.tmp on open"
+        );
+        // The real `.snap` / `.json` files are untouched.
+        assert!(real_snap.exists(), "sweep must NOT touch a real .snap file");
+        assert!(real_json.exists(), "sweep must NOT touch a real .json file");
     }
 
     #[test]
@@ -788,6 +1011,49 @@ mod tests {
 
         assert!(store.delete(&rev.id).unwrap());
         assert!(!snap_path.exists());
+        assert!(store.get(&rev.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_uses_stored_relative_path_not_hardcoded_id_snap() {
+        // Confirm that `delete` reads `snapshot.relative_path` from the
+        // JSON sidecar rather than reconstructing `{id}.snap`. We
+        // hand-craft a revision whose stored `.snap` lives at a path
+        // that differs from `{id}.snap` and check that `delete` still
+        // removes it. This guards against a regression where the two
+        // get out of sync (e.g. snapshot path = `{id}.snap` but the
+        // delete path = something else).
+        let proj = TempDir::new().unwrap();
+        let db_path = proj.path().join("project.sqlite");
+        let conn = write_dummy_db(&db_path);
+        let store = RevisionStore::open(proj.path().join("revisions")).unwrap();
+
+        let mut rev = store
+            .create_with_snapshot(fixture_draft(&ProjectId::new(), "renamed"), &conn, &db_path)
+            .unwrap();
+
+        // Rename the .snap file on disk and update the JSON sidecar to
+        // point at the new relative path. This simulates a future
+        // change to the snap naming convention.
+        let dir = proj.path().join("revisions");
+        let old_snap = dir.join(format!("{}.snap", rev.id));
+        let new_relative = format!("{}_renamed.snap", rev.id);
+        let new_snap = dir.join(&new_relative);
+        std::fs::rename(&old_snap, &new_snap).unwrap();
+        rev.snapshot.as_mut().unwrap().relative_path = new_relative;
+        // Re-write the JSON sidecar so the on-disk metadata matches
+        // the renamed snap.
+        store.write_atomic(&rev).unwrap();
+
+        assert!(new_snap.exists());
+        assert!(!old_snap.exists());
+
+        assert!(store.delete(&rev.id).unwrap());
+        assert!(
+            !new_snap.exists(),
+            "delete must remove the snap at the stored relative_path, \
+             not the hardcoded {{id}}.snap"
+        );
         assert!(store.get(&rev.id).unwrap().is_none());
     }
 
