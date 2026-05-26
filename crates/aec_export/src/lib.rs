@@ -51,5 +51,8 @@ pub use proposal::{
     ProposalAssets, ProposalBranding, ProposalPack, ProposalPageOrder, RenderAttachment,
 };
 pub use schedule::{ScheduleColumn, ScheduleRow, ScheduleSheet};
-pub use svg_export::{render_sheet_svg, SvgExportError, SvgExportOptions};
+pub use svg_export::{
+    render_sheet_svg, render_sheet_svg_full, BlockTable, DimStyleTable, LayerTable, SvgExportError,
+    SvgExportOptions, SvgLinetype, BLOCK_EXPANSION_MAX_DEPTH,
+};
 pub use xlsx::XlsxExportError;
