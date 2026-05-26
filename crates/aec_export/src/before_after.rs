@@ -92,10 +92,15 @@ pub struct BeforeAfterPdfOptions {
 /// One wall segment laid out for the plan overlay, with its diff
 /// classification baked in.
 ///
-/// All coordinates are in model-space millimetres. The renderer is
-/// responsible for flipping `y` (SVG has y-down, building plans are
-/// conventionally drawn y-up) and translating so the bbox sits inside
-/// the paper margin.
+/// All coordinates are in model-space millimetres with the building
+/// convention `+y` = north / "up the page". The renderer
+/// ([`render_plan_overlay_svg_impl`]) is responsible for flipping `y`
+/// at emit-time so the resulting SVG reads correctly under SVG's own
+/// `+y` = down user-coordinate system — it wraps the segment groups
+/// in a `<g transform="translate(0, min_y + max_y) scale(1, -1)">`
+/// so the segment coordinates themselves stay in plain model-space
+/// millimetres (no per-coordinate transformation, no loss of
+/// precision).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlanOverlaySegment {
     pub entity_id: String,
@@ -338,8 +343,21 @@ struct WallBody {
     start_mm: [f64; 2],
     end_mm: [f64; 2],
     thickness_mm: f64,
-    /// BLAKE3-of-body so we can detect "same id, different body" as
-    /// `Modified` without re-comparing every field.
+    /// BLAKE3 of the wall's `entities.body` JSON column so we can
+    /// detect "same id, different body" as `Modified` without
+    /// re-comparing every field.
+    ///
+    /// **Scope is intentionally geometry-only** and is *narrower* than
+    /// [`aec_core::version_diff::snapshot_entities`], which hashes
+    /// `kind || parent_id || body || components`. The plan overlay
+    /// answers a single question — *"did this wall move, change
+    /// length, or change thickness?"* — so re-parenting a wall (e.g.
+    /// reassigning it to a different room without touching the
+    /// segment endpoints) classifies the wall as `Unchanged` here
+    /// even though the version diff reports it as `Modified`. Both
+    /// classifications are correct for their respective consumers:
+    /// the overlay tracks what a contractor on-site would see, while
+    /// the version diff tracks the project's structural graph.
     body_hash: String,
 }
 
@@ -532,7 +550,15 @@ fn render_plan_overlay_svg_impl(
     let mut out = String::new();
     let margin = margin_mm.max(0.0);
 
-    let (vx, vy, vw, vh) = match overlay.bbox_mm {
+    // The viewBox is expressed in model-space millimetres. The SVG
+    // user-coordinate system has `+y` pointing *down*, but building
+    // plans are conventionally drawn with `+y` pointing *up* (north).
+    // To get the correct visual orientation without rewriting every
+    // line's coordinates (which would degrade the floating-point
+    // round-trip with `bbox_mm`), we keep the viewBox and per-segment
+    // coordinates in model-space and apply a single Y-flip transform
+    // to the wrapping `<g class="model-space">` group below.
+    let (vx, vy, vw, vh, flip_anchor) = match overlay.bbox_mm {
         Some([min_x, min_y, max_x, max_y]) => {
             let w = (max_x - min_x).max(1.0);
             let h = (max_y - min_y).max(1.0);
@@ -541,9 +567,14 @@ fn render_plan_overlay_svg_impl(
                 min_y - margin,
                 w + 2.0 * margin,
                 h + 2.0 * margin,
+                // `translate(0, min_y + max_y) scale(1, -1)` maps
+                // model y=min_y → SVG y=max_y (bottom of viewBox) and
+                // model y=max_y → SVG y=min_y (top of viewBox), which
+                // is the Y-up → Y-down flip we want.
+                Some(min_y + max_y),
             )
         }
-        None => (0.0, 0.0, 100.0, 100.0),
+        None => (0.0, 0.0, 100.0, 100.0, None),
     };
 
     writeln!(out, r#"<?xml version="1.0" encoding="UTF-8"?>"#)?;
@@ -570,6 +601,9 @@ fn render_plan_overlay_svg_impl(
     )?;
 
     if overlay.segments.is_empty() {
+        // Placeholder text deliberately renders *outside* any Y-flip
+        // group so the glyphs read normally (a flipped <text> would
+        // appear upside-down).
         writeln!(
             out,
             r##"  <text x="{}" y="{}" font-family="sans-serif" font-size="6" fill="#666">No walls in either revision</text>"##,
@@ -591,11 +625,26 @@ fn render_plan_overlay_svg_impl(
             .push(s);
     }
 
+    // Wrap every level group in a single Y-flip transform so the
+    // segment lines themselves stay in plain model-space mm. We only
+    // emit the wrapper when we actually have a bbox to anchor against
+    // (empty overlays already short-circuited above, but defensive).
+    let close_flip = if let Some(anchor) = flip_anchor {
+        writeln!(
+            out,
+            r#"  <g class="model-space" transform="translate(0 {anchor}) scale(1 -1)">"#,
+            anchor = format_mm(anchor)
+        )?;
+        true
+    } else {
+        false
+    };
+
     for (_, group) in by_level {
         let level = group[0].level;
         writeln!(
             out,
-            r#"  <g class="overlay-level" id="overlay-{group}" stroke="{stroke}" stroke-linecap="round" fill="none">"#,
+            r#"    <g class="overlay-level" id="overlay-{group}" stroke="{stroke}" stroke-linecap="round" fill="none">"#,
             group = level.group_id(),
             stroke = level.stroke()
         )?;
@@ -603,7 +652,7 @@ fn render_plan_overlay_svg_impl(
             let stroke_width = s.thickness_mm.max(20.0);
             writeln!(
                 out,
-                r#"    <line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke-width="{sw}" data-entity-id="{id}" />"#,
+                r#"      <line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke-width="{sw}" data-entity-id="{id}" />"#,
                 x1 = format_mm(s.start_mm[0]),
                 y1 = format_mm(s.start_mm[1]),
                 x2 = format_mm(s.end_mm[0]),
@@ -612,6 +661,10 @@ fn render_plan_overlay_svg_impl(
                 id = svg_escape(&s.entity_id),
             )?;
         }
+        writeln!(out, "    </g>")?;
+    }
+
+    if close_flip {
         writeln!(out, "  </g>")?;
     }
 
@@ -861,6 +914,40 @@ mod tests {
         assert!(svg.starts_with("<?xml"));
         assert!(svg.contains("No walls in either revision"));
         assert!(svg.trim_end().ends_with("</svg>"));
+        // Empty overlay has no bbox → no Y-flip wrapper emitted
+        // (otherwise the placeholder text would render upside-down).
+        assert!(!svg.contains(r#"class="model-space""#));
+    }
+
+    #[test]
+    fn plan_overlay_svg_wraps_segments_in_y_flip_transform() {
+        // Plan with walls spanning the bbox in y; the renderer must
+        // emit a single Y-flip `<g transform=...>` so SVG's y-down
+        // user-coordinate system displays the building's y-up
+        // convention correctly. Per-segment coordinates stay in plain
+        // model-space mm so the SVG round-trips with `bbox_mm`.
+        let base = vec![wall("w.south", [0.0, 0.0], [4000.0, 0.0], 200.0)];
+        let head = vec![
+            wall("w.south", [0.0, 0.0], [4000.0, 0.0], 200.0),
+            // North wall at high model-y — appears at top of viewBox
+            // post-flip.
+            wall("w.north", [0.0, 3000.0], [4000.0, 3000.0], 200.0),
+        ];
+        let overlay = build_plan_overlay(&base, &head);
+        let svg = render_plan_overlay_svg_impl(&overlay, 100.0).unwrap();
+
+        // bbox is [0, 0, 4000, 3000] → flip anchor = min_y + max_y = 3000.
+        assert!(
+            svg.contains(r#"<g class="model-space" transform="translate(0 3000) scale(1 -1)">"#),
+            "expected Y-flip wrapper anchored at min_y + max_y; got:\n{svg}"
+        );
+        // Segment coordinates remain in plain model-space mm — the
+        // north wall is still at y=3000 in the emitted <line>; the
+        // viewer flips at render-time via the wrapping <g> transform.
+        assert!(
+            svg.contains(r#"y1="3000" x2="4000" y2="3000""#),
+            "north wall must keep model-space y=3000 in the <line>; got:\n{svg}"
+        );
     }
 
     #[test]
