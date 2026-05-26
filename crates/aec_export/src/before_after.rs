@@ -375,10 +375,28 @@ impl BeforeAfterReport {
     /// callers that want accurate durations should attach pairs
     /// explicitly).
     ///
+    /// **Filename invariants** — `"__"` is the field separator, so
+    /// the convention implicitly forbids `"__"` inside any of the
+    /// three fields. In particular:
+    ///
+    /// - `<camera>` and `<preset>` are produced by [`aec_render`]
+    ///   from short, human-readable identifiers — neither contains
+    ///   `"__"` by construction.
+    /// - `<revision-id>` comes from [`RevisionStore`], which today
+    ///   only produces UUID-shaped ids (also free of `"__"`).
+    ///   `RevisionStore` itself does **not** enforce this constraint,
+    ///   so any future caller that mints custom revision ids must
+    ///   keep them `"__"`-free. Files whose stem doesn't split into
+    ///   exactly three `"__"`-separated parts are silently skipped
+    ///   (treated the same as the auto-discovery's other
+    ///   "doesn't follow the convention" cases such as `random.txt`).
+    ///
     /// Missing or unreadable directories return an empty vector
     /// rather than an error so that
     /// "no renders were captured for these revisions" is a valid
     /// state — the report still ships, just with zero render pairs.
+    ///
+    /// [`RevisionStore`]: aec_core::revision::RevisionStore
     pub fn discover_render_pairs(
         renders_dir: impl AsRef<Path>,
         base_revision_id: &str,
@@ -1243,6 +1261,40 @@ mod tests {
             "rev_head",
         );
         assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn discover_render_pairs_silently_skips_revision_ids_containing_double_underscore() {
+        // The filename convention is `<camera>__<preset>__<rev-id>` — `"__"` is the
+        // field separator, so a revision id containing `"__"` would split into more
+        // than three parts and is silently skipped (treated the same as any other
+        // file that doesn't follow the convention, like `random.txt`).
+        //
+        // This locks the documented invariant in place: future callers that mint
+        // custom (non-UUID) revision ids must keep them `"__"`-free, otherwise
+        // their renders silently disappear from the report.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // 4 parts after split — silently skipped:
+        std::fs::write(dir.join("cam01__standard__proj__abc.png"), b"a").unwrap();
+        std::fs::write(dir.join("cam01__standard__proj__xyz.png"), b"b").unwrap();
+        // Compliant pair for a different (well-formed) revision, just to prove the
+        // function still emits pairs for compliant files in the same directory:
+        std::fs::write(dir.join("cam02__standard__rev_base.png"), b"c").unwrap();
+        std::fs::write(dir.join("cam02__standard__rev_head.png"), b"d").unwrap();
+
+        // The pathological pair must NOT match, even when the requested ids look
+        // like they could be a substring of the malformed stem.
+        let pairs = discover_render_pairs_impl(dir, "proj__abc", "proj__xyz");
+        assert!(
+            pairs.is_empty(),
+            "expected no pairs for revision ids containing `__`, got {pairs:?}"
+        );
+
+        // And the compliant pair must still come through.
+        let pairs = discover_render_pairs_impl(dir, "rev_base", "rev_head");
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].label, "cam02 · standard");
     }
 
     #[test]
