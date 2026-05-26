@@ -190,6 +190,12 @@ impl DimStyleTable {
 /// Block-definition table. INSERT entities are expanded against this.
 /// Missing blocks render as a labelled bbox marker so the operator can
 /// still see where the symbol was placed.
+///
+/// DXF block names are case-insensitive per AutoCAD convention
+/// (`Window` and `WINDOW` refer to the same block). Keys are
+/// normalized to uppercase on both `insert` and `get`, matching the
+/// case-insensitivity already implemented by [`LayerTable`] and
+/// [`DimStyleTable`].
 #[derive(Debug, Clone, Default)]
 pub struct BlockTable {
     by_name: BTreeMap<String, Vec<DxfEntity>>,
@@ -201,11 +207,103 @@ impl BlockTable {
     }
 
     pub fn insert(&mut self, name: impl Into<String>, body: Vec<DxfEntity>) {
-        self.by_name.insert(name.into(), body);
+        self.by_name.insert(name.into().to_ascii_uppercase(), body);
     }
 
     pub fn get(&self, name: &str) -> Option<&[DxfEntity]> {
-        self.by_name.get(name).map(Vec::as_slice)
+        self.by_name
+            .get(&name.to_ascii_uppercase())
+            .map(Vec::as_slice)
+    }
+}
+
+/// Maximum block-expansion recursion depth. INSERT entities that
+/// reference each other in a cycle (A inserts B, B inserts A) would
+/// otherwise blow the stack — at the limit we render a labelled
+/// placeholder so the operator still sees where the symbol was
+/// placed and which cycle hit the wall.
+///
+/// 16 is well above what real drawings need (deep nesting in DXF is
+/// almost always 2-3 levels: title-block → sub-symbol → leaf), but
+/// shallow enough that a runaway cycle is caught before it produces
+/// gigabytes of SVG.
+pub const BLOCK_EXPANSION_MAX_DEPTH: u32 = 16;
+
+/// Composed insert transform applied to a block body. Captures
+/// translation, rotation, and per-axis scale; supplies the geometric
+/// transforms needed by `transform_entity` so that radii, text
+/// heights, and direction vectors all move with the insert (not just
+/// the entity center points).
+#[derive(Debug, Clone, Copy)]
+struct BlockTransform {
+    pos: [f64; 3],
+    scale: [f64; 3],
+    rot_deg: f64,
+    cos_t: f64,
+    sin_t: f64,
+}
+
+impl BlockTransform {
+    fn new(pos: [f64; 3], scale: [f64; 3], rot_deg: f64) -> Self {
+        let rot = rot_deg.to_radians();
+        Self {
+            pos,
+            scale,
+            rot_deg,
+            cos_t: rot.cos(),
+            sin_t: rot.sin(),
+        }
+    }
+
+    /// Transform a model-space point: scale → rotate → translate.
+    fn point3(&self, pt: &[f64; 3]) -> [f64; 3] {
+        let sx = pt[0] * self.scale[0];
+        let sy = pt[1] * self.scale[1];
+        let rx = sx * self.cos_t - sy * self.sin_t;
+        let ry = sx * self.sin_t + sy * self.cos_t;
+        [
+            self.pos[0] + rx,
+            self.pos[1] + ry,
+            pt[2] * self.scale[2] + self.pos[2],
+        ]
+    }
+
+    fn point2(&self, pt: &[f64; 2]) -> [f64; 2] {
+        let p = self.point3(&[pt[0], pt[1], 0.0]);
+        [p[0], p[1]]
+    }
+
+    /// Transform a direction vector (e.g. ellipse `major_axis`):
+    /// scale + rotate, but NO translation. The vector encodes both
+    /// length (`||v||`) and rotation (`atan2(v.y, v.x)`); without
+    /// applying scale+rotate to it, ellipses inside rotated /
+    /// non-unit-scale blocks render at the wrong size and angle.
+    fn vec3(&self, v: &[f64; 3]) -> [f64; 3] {
+        let sx = v[0] * self.scale[0];
+        let sy = v[1] * self.scale[1];
+        let rx = sx * self.cos_t - sy * self.sin_t;
+        let ry = sx * self.sin_t + sy * self.cos_t;
+        [rx, ry, v[2] * self.scale[2]]
+    }
+
+    /// Scalar XY scale for radii (Circle, Arc). Uses the mean of
+    /// |sx| and |sy|; for the common AutoCAD case of uniform insert
+    /// scale this is exact. Under non-uniform scaling a Circle
+    /// technically becomes an ellipse, but `DxfCircle` has no
+    /// major-axis vector so the mean is the best we can offer
+    /// without changing the entity model.
+    fn uniform_xy_scale(&self) -> f64 {
+        (self.scale[0].abs() + self.scale[1].abs()) / 2.0
+    }
+
+    /// Text/Attdef height scale. Mirrors AutoCAD's convention of
+    /// using the Y-scale for text height inside blocks.
+    fn text_height_scale(&self) -> f64 {
+        self.scale[1].abs()
+    }
+
+    fn rot_deg(&self) -> f64 {
+        self.rot_deg
     }
 }
 
@@ -251,7 +349,13 @@ pub fn render_sheet_svg_full(
 
     // <defs>: arrowhead marker + per-viewport clip-paths + hatch
     // patterns. Patterns iterate sorted so the output is deterministic.
-    write_defs(&mut out, sheet, entities, options.clip_viewports)?;
+    write_defs(
+        &mut out,
+        sheet,
+        entities,
+        options.clip_viewports,
+        options.coordinate_precision,
+    )?;
 
     if let Some([r, g, b]) = options.paper_fill {
         writeln!(
@@ -291,6 +395,7 @@ pub fn render_sheet_svg_full(
                 dim_styles,
                 blocks,
                 options,
+                BLOCK_EXPANSION_MAX_DEPTH,
             )?;
         }
         writeln!(out, "  </g>")?;
@@ -312,6 +417,7 @@ fn write_defs(
     sheet: &Sheet,
     entities: &[DxfEntity],
     clip_viewports: bool,
+    prec: u8,
 ) -> Result<(), SvgExportError> {
     writeln!(out, "  <defs>")?;
     // Closed-triangle arrowhead marker, 2.5 mm long. Used for
@@ -329,10 +435,16 @@ fn write_defs(
             writeln!(
                 out,
                 r#"    <clipPath id="vp-clip-{idx}"><rect x="{x}" y="{y}" width="{w}" height="{h}" /></clipPath>"#,
-                x = vp.paper_origin[0],
-                y = vp.paper_origin[1],
-                w = vp.paper_size[0],
-                h = vp.paper_size[1],
+                // Use `fmt_coord` for the same precision as every other
+                // numeric attribute in the document. Rust's default
+                // `Display` for f64 is deterministic but emits a variable
+                // number of decimals, which breaks the visual
+                // "same-precision-everywhere" rule that downstream SVG
+                // tooling relies on.
+                x = fmt_coord(vp.paper_origin[0], prec),
+                y = fmt_coord(vp.paper_origin[1], prec),
+                w = fmt_coord(vp.paper_size[0], prec),
+                h = fmt_coord(vp.paper_size[1], prec),
             )?;
         }
     }
@@ -529,6 +641,7 @@ fn emit_entity(
     dim_styles: &DimStyleTable,
     blocks: &BlockTable,
     opts: &SvgExportOptions,
+    depth_remaining: u32,
 ) -> Result<(), SvgExportError> {
     let style = style_for_layer(entity.layer(), layer_table, plot_table);
     let [cr, cg, cb] = screened(style.color, style.screening);
@@ -714,10 +827,27 @@ fn emit_entity(
             }
         }
         DxfEntity::Insert(e) => {
-            // Block expansion. Missing blocks render as a labelled
-            // bbox marker so the operator can still see where the
-            // symbol was placed.
-            if let Some(body) = blocks.get(&e.block_name) {
+            // Block expansion. Three branches:
+            //   1. Depth limit reached — emit a recursion-limit
+            //      placeholder. Cyclic block definitions (A inserts
+            //      B, B inserts A) would otherwise blow the stack.
+            //   2. Block found — recurse into `emit_block_body` with
+            //      the depth counter decremented.
+            //   3. Block not in the table — emit the labelled
+            //      diamond marker so the operator still sees where
+            //      the symbol was placed.
+            let p = vp.model_to_paper([e.position[0], e.position[1]]);
+            if depth_remaining == 0 {
+                writeln!(
+                    out,
+                    r#"    <g class="insert-recursion-limit" data-block="{name}" data-max-depth="{max_depth}"><circle cx="{x}" cy="{y}" r="1.5" stroke="{stroke}" stroke-width="{lw}" fill="none" /><text x="{xp2}" y="{y}" font-size="2" fill="{stroke}">[{name} ↻]</text></g>"#,
+                    max_depth = BLOCK_EXPANSION_MAX_DEPTH,
+                    name = escape_xml(&e.block_name),
+                    x = fmt_coord(p[0], prec),
+                    y = fmt_coord(p[1], prec),
+                    xp2 = fmt_coord(p[0] + 2.0, prec),
+                )?;
+            } else if let Some(body) = blocks.get(&e.block_name) {
                 emit_block_body(
                     out,
                     body,
@@ -730,9 +860,9 @@ fn emit_entity(
                     &e.position,
                     &e.scale,
                     e.rotation,
+                    depth_remaining - 1,
                 )?;
             } else {
-                let p = vp.model_to_paper([e.position[0], e.position[1]]);
                 // Diamond marker at insertion point + label.
                 writeln!(
                     out,
@@ -1007,6 +1137,10 @@ fn emit_dimension(
 }
 
 /// Emit a block body at the given insert position/scale/rotation.
+///
+/// `depth_remaining` is decremented at every nested INSERT;
+/// `emit_entity` renders a recursion-limit placeholder when it hits
+/// zero so cyclic block definitions can't blow the stack.
 #[allow(clippy::too_many_arguments)]
 fn emit_block_body(
     out: &mut String,
@@ -1020,30 +1154,14 @@ fn emit_block_body(
     insert_pos: &[f64; 3],
     insert_scale: &[f64; 3],
     insert_rot_deg: f64,
+    depth_remaining: u32,
 ) -> Result<(), SvgExportError> {
     // Apply the insertion transform to every entity in the block,
     // then delegate to `emit_entity`. We transform the entity in
     // model space (before model_to_paper).
-    let rot = insert_rot_deg.to_radians();
-    let cos_t = rot.cos();
-    let sin_t = rot.sin();
-    let transform_pt = |pt: &[f64; 3]| -> [f64; 3] {
-        let sx = pt[0] * insert_scale[0];
-        let sy = pt[1] * insert_scale[1];
-        let rx = sx * cos_t - sy * sin_t;
-        let ry = sx * sin_t + sy * cos_t;
-        [
-            insert_pos[0] + rx,
-            insert_pos[1] + ry,
-            pt[2] * insert_scale[2] + insert_pos[2],
-        ]
-    };
-    let transform_pt2 = |pt: &[f64; 2]| -> [f64; 2] {
-        let r = transform_pt(&[pt[0], pt[1], 0.0]);
-        [r[0], r[1]]
-    };
+    let xform = BlockTransform::new(*insert_pos, *insert_scale, insert_rot_deg);
     for e in body {
-        let transformed = transform_entity(e, &transform_pt, &transform_pt2);
+        let transformed = transform_entity(e, &xform);
         emit_entity(
             out,
             &transformed,
@@ -1053,32 +1171,42 @@ fn emit_block_body(
             dim_styles,
             blocks,
             opts,
+            depth_remaining,
         )?;
     }
     Ok(())
 }
 
-/// Apply an arbitrary model-space transform to an entity. The
-/// closures are split into a 3D version (for entity points stored as
-/// `[f64; 3]`) and a 2D version (for hatch loop vertices, polyline
-/// vertices etc. stored as `[f64; 2]`).
-fn transform_entity(
-    entity: &DxfEntity,
-    t3: &dyn Fn(&[f64; 3]) -> [f64; 3],
-    t2: &dyn Fn(&[f64; 2]) -> [f64; 2],
-) -> DxfEntity {
+/// Apply an insert-transform to an entity. Translation, scale, and
+/// rotation all flow through `BlockTransform`, which provides:
+///
+/// - `point3` / `point2`: scale → rotate → translate (positions),
+/// - `vec3`: scale + rotate, no translation (direction vectors such
+///   as the ellipse `major_axis`),
+/// - `uniform_xy_scale`: scalar multiplier for radii (Circle, Arc),
+/// - `text_height_scale`: scalar multiplier for text heights
+///   (matches AutoCAD's Y-scale convention),
+/// - `rot_deg`: degree offset added to entity-stored angles.
+///
+/// Without these, radii, text heights, ellipse axes, and stored
+/// rotation angles would all stay at their authored values when an
+/// INSERT was rotated or scaled — producing wrong-size geometry.
+fn transform_entity(entity: &DxfEntity, x: &BlockTransform) -> DxfEntity {
+    let rot = x.rot_deg();
+    let uniform = x.uniform_xy_scale();
+    let h_scale = x.text_height_scale();
     match entity {
         DxfEntity::Line(e) => DxfEntity::Line(aec_cad::dxf::DxfLine {
             layer: e.layer.clone(),
-            start: t3(&e.start),
-            end: t3(&e.end),
+            start: x.point3(&e.start),
+            end: x.point3(&e.end),
         }),
         DxfEntity::Polyline(e) => {
             let new_v: Vec<_> = e
                 .vertices
                 .iter()
                 .map(|v| {
-                    let p = t2(&[v.x, v.y]);
+                    let p = x.point2(&[v.x, v.y]);
                     aec_cad::dxf::DxfPolylineVertex {
                         x: p[0],
                         y: p[1],
@@ -1095,20 +1223,24 @@ fn transform_entity(
         }
         DxfEntity::Arc(e) => DxfEntity::Arc(aec_cad::dxf::DxfArc {
             layer: e.layer.clone(),
-            center: t3(&e.center),
-            radius: e.radius,
-            start_angle: e.start_angle,
-            end_angle: e.end_angle,
+            center: x.point3(&e.center),
+            radius: e.radius * uniform,
+            start_angle: e.start_angle + rot,
+            end_angle: e.end_angle + rot,
         }),
         DxfEntity::Circle(e) => DxfEntity::Circle(aec_cad::dxf::DxfCircle {
             layer: e.layer.clone(),
-            center: t3(&e.center),
-            radius: e.radius,
+            center: x.point3(&e.center),
+            radius: e.radius * uniform,
         }),
         DxfEntity::Ellipse(e) => DxfEntity::Ellipse(aec_cad::dxf::DxfEllipse {
             layer: e.layer.clone(),
-            center: t3(&e.center),
-            major_axis: e.major_axis,
+            center: x.point3(&e.center),
+            // major_axis is a direction-and-length vector — must be
+            // scaled and rotated (but NOT translated). The ellipse
+            // renderer reads its length and atan2 to size & orient
+            // the curve.
+            major_axis: x.vec3(&e.major_axis),
             ratio: e.ratio,
             start_param: e.start_param,
             end_param: e.end_param,
@@ -1117,7 +1249,7 @@ fn transform_entity(
             layer: e.layer.clone(),
             degree: e.degree,
             knots: e.knots.clone(),
-            control_points: e.control_points.iter().map(t3).collect(),
+            control_points: e.control_points.iter().map(|c| x.point3(c)).collect(),
             closed: e.closed,
         }),
         DxfEntity::Hatch(e) => {
@@ -1125,7 +1257,7 @@ fn transform_entity(
                 .loops
                 .iter()
                 .map(|l| aec_cad::dxf::DxfHatchLoop {
-                    vertices: l.vertices.iter().map(t2).collect(),
+                    vertices: l.vertices.iter().map(|v| x.point2(v)).collect(),
                 })
                 .collect();
             DxfEntity::Hatch(aec_cad::dxf::DxfHatch {
@@ -1140,34 +1272,46 @@ fn transform_entity(
         }
         DxfEntity::Text(e) => DxfEntity::Text(aec_cad::dxf::DxfText {
             layer: e.layer.clone(),
-            position: t3(&e.position),
-            height: e.height,
-            rotation: e.rotation,
+            position: x.point3(&e.position),
+            // Text height scales with the block's Y-scale and rotation
+            // composes additively with the insert's rotation.
+            height: e.height * h_scale,
+            rotation: e.rotation + rot,
             text: e.text.clone(),
         }),
         DxfEntity::Insert(e) => DxfEntity::Insert(aec_cad::dxf::DxfInsert {
             layer: e.layer.clone(),
             block_name: e.block_name.clone(),
-            position: t3(&e.position),
-            scale: e.scale,
-            rotation: e.rotation,
+            position: x.point3(&e.position),
+            // Nested-insert scale composes multiplicatively;
+            // rotation composes additively.
+            scale: [
+                e.scale[0] * x.scale[0],
+                e.scale[1] * x.scale[1],
+                e.scale[2] * x.scale[2],
+            ],
+            rotation: e.rotation + rot,
         }),
         DxfEntity::Dimension(e) => DxfEntity::Dimension(aec_cad::dxf::DxfDimension {
             layer: e.layer.clone(),
             style: e.style.clone(),
             kind: e.kind,
-            def_point: t3(&e.def_point),
-            text_position: t3(&e.text_position),
-            def_point_a: t3(&e.def_point_a),
-            def_point_b: t3(&e.def_point_b),
+            def_point: x.point3(&e.def_point),
+            text_position: x.point3(&e.text_position),
+            def_point_a: x.point3(&e.def_point_a),
+            def_point_b: x.point3(&e.def_point_b),
             override_text: e.override_text.clone(),
-            measured_value: e.measured_value,
+            // measured_value reflects the dimensioned distance in
+            // model space; under a scaled insert the visible distance
+            // between def_point_a/b scales with `uniform_xy_scale`,
+            // so the cached measurement must scale to match.
+            measured_value: e.measured_value.map(|m| m * uniform),
         }),
         DxfEntity::Attdef(e) => DxfEntity::Attdef(aec_cad::dxf::DxfAttdef {
             layer: e.layer.clone(),
-            position: t3(&e.position),
-            height: e.height,
-            rotation: e.rotation,
+            position: x.point3(&e.position),
+            height: e.height * h_scale,
+            rotation: e.rotation + rot,
             default_value: e.default_value.clone(),
             tag: e.tag.clone(),
             prompt: e.prompt.clone(),
@@ -1874,6 +2018,442 @@ mod tests {
         assert!(!svg.contains("insert-missing"));
         // The expanded block is a closed polyline → polygon.
         assert!(svg.contains("<polygon"));
+    }
+
+    #[test]
+    fn block_table_lookup_is_case_insensitive() {
+        // DXF block names are case-insensitive per AutoCAD convention.
+        // An INSERT referencing "window" must match a block stored as
+        // "WINDOW" (and vice versa).
+        let mut blocks = BlockTable::new();
+        blocks.insert(
+            "WINDOW",
+            vec![DxfEntity::Line(DxfLine {
+                layer: "WALLS".into(),
+                start: [0.0, 0.0, 0.0],
+                end: [1.0, 0.0, 0.0],
+            })],
+        );
+        // get() must hit on every case variant.
+        assert!(blocks.get("WINDOW").is_some());
+        assert!(blocks.get("window").is_some());
+        assert!(blocks.get("Window").is_some());
+        assert!(blocks.get("wIndOW").is_some());
+        // And miss when the name truly doesn't match.
+        assert!(blocks.get("door").is_none());
+    }
+
+    #[test]
+    fn insert_referencing_block_with_different_case_expands_body() {
+        // The exporter must expand the block body (not render the
+        // missing-block placeholder) when the INSERT and block name
+        // differ only in casing.
+        let mut blocks = BlockTable::new();
+        blocks.insert(
+            "WINDOW",
+            vec![DxfEntity::Polyline(DxfPolyline {
+                layer: "WALLS".into(),
+                vertices: vec![
+                    DxfPolylineVertex::new(0.0, 0.0),
+                    DxfPolylineVertex::new(2.0, 0.0),
+                    DxfPolylineVertex::new(2.0, 1.0),
+                    DxfPolylineVertex::new(0.0, 1.0),
+                ],
+                closed: true,
+                elevation: 0.0,
+            })],
+        );
+        let s = make_sheet();
+        let entities = vec![DxfEntity::Insert(DxfInsert {
+            layer: "WALLS".into(),
+            block_name: "window".into(), // lowercase!
+            position: [50.0, 25.0, 0.0],
+            scale: [1.0, 1.0, 1.0],
+            rotation: 0.0,
+        })];
+        let svg = render_sheet_svg_full(
+            &s,
+            &entities,
+            &PlotStyleTable::monochrome(),
+            &LayerTable::new(),
+            &DimStyleTable::new(),
+            &blocks,
+            &SvgExportOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            !svg.contains("insert-missing"),
+            "expected expanded body, got missing-placeholder: {svg}",
+        );
+        assert!(svg.contains("<polygon"));
+    }
+
+    #[test]
+    fn self_referencing_block_does_not_overflow_stack() {
+        // Cyclic block definitions are invalid DXF but must not crash
+        // the exporter. The recursion-limit placeholder is emitted
+        // when `BLOCK_EXPANSION_MAX_DEPTH` is exhausted.
+        let mut blocks = BlockTable::new();
+        // CYCLE -> [INSERT(CYCLE)] : direct self-reference.
+        blocks.insert(
+            "CYCLE",
+            vec![DxfEntity::Insert(DxfInsert {
+                layer: "WALLS".into(),
+                block_name: "CYCLE".into(),
+                position: [0.0, 0.0, 0.0],
+                scale: [1.0, 1.0, 1.0],
+                rotation: 0.0,
+            })],
+        );
+        let s = make_sheet();
+        let entities = vec![DxfEntity::Insert(DxfInsert {
+            layer: "WALLS".into(),
+            block_name: "CYCLE".into(),
+            position: [50.0, 25.0, 0.0],
+            scale: [1.0, 1.0, 1.0],
+            rotation: 0.0,
+        })];
+        // Should return Ok(_) (no stack overflow) and the SVG should
+        // contain the recursion-limit placeholder.
+        let svg = render_sheet_svg_full(
+            &s,
+            &entities,
+            &PlotStyleTable::monochrome(),
+            &LayerTable::new(),
+            &DimStyleTable::new(),
+            &blocks,
+            &SvgExportOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            svg.contains(r#"class="insert-recursion-limit""#),
+            "expected recursion-limit marker in: {svg}",
+        );
+        assert!(svg.contains("[CYCLE"));
+    }
+
+    #[test]
+    fn mutually_cyclic_blocks_do_not_overflow_stack() {
+        // Indirect cycle: A inserts B, B inserts A. The first INSERT
+        // in the top-level entity slice expands; further nesting
+        // unwinds the depth counter and stops at the limit.
+        let mut blocks = BlockTable::new();
+        blocks.insert(
+            "A",
+            vec![DxfEntity::Insert(DxfInsert {
+                layer: "WALLS".into(),
+                block_name: "B".into(),
+                position: [0.0, 0.0, 0.0],
+                scale: [1.0, 1.0, 1.0],
+                rotation: 0.0,
+            })],
+        );
+        blocks.insert(
+            "B",
+            vec![DxfEntity::Insert(DxfInsert {
+                layer: "WALLS".into(),
+                block_name: "A".into(),
+                position: [0.0, 0.0, 0.0],
+                scale: [1.0, 1.0, 1.0],
+                rotation: 0.0,
+            })],
+        );
+        let s = make_sheet();
+        let entities = vec![DxfEntity::Insert(DxfInsert {
+            layer: "WALLS".into(),
+            block_name: "A".into(),
+            position: [50.0, 25.0, 0.0],
+            scale: [1.0, 1.0, 1.0],
+            rotation: 0.0,
+        })];
+        let svg = render_sheet_svg_full(
+            &s,
+            &entities,
+            &PlotStyleTable::monochrome(),
+            &LayerTable::new(),
+            &DimStyleTable::new(),
+            &blocks,
+            &SvgExportOptions::default(),
+        )
+        .unwrap();
+        // The placeholder may be tagged with either "A" or "B"
+        // depending on which side of the cycle hits the wall first.
+        assert!(svg.contains(r#"class="insert-recursion-limit""#));
+    }
+
+    #[test]
+    fn circle_inside_scaled_insert_uses_scaled_radius() {
+        // A Circle of radius 5 inside a block inserted at scale 2.0
+        // must render at radius 10, not 5.
+        let mut blocks = BlockTable::new();
+        blocks.insert(
+            "PILE",
+            vec![DxfEntity::Circle(DxfCircle {
+                layer: "WALLS".into(),
+                center: [0.0, 0.0, 0.0],
+                radius: 5.0,
+            })],
+        );
+        let s = make_sheet();
+        let entities = vec![DxfEntity::Insert(DxfInsert {
+            layer: "WALLS".into(),
+            block_name: "PILE".into(),
+            position: [0.0, 0.0, 0.0],
+            scale: [2.0, 2.0, 1.0],
+            rotation: 0.0,
+        })];
+        let svg = render_sheet_svg_full(
+            &s,
+            &entities,
+            &PlotStyleTable::monochrome(),
+            &LayerTable::new(),
+            &DimStyleTable::new(),
+            &blocks,
+            &SvgExportOptions::default(),
+        )
+        .unwrap();
+        // The viewport in make_sheet() has scale 0.01 (1:100), so a
+        // model-space radius of 10 -> paper-space radius of 0.1 mm.
+        // fmt_coord emits 4 decimal places by default.
+        assert!(
+            svg.contains(r#"r="0.1000""#),
+            "expected r=0.1000 (10 mm * vp.scale 0.01) in: {svg}",
+        );
+        // And NOT the unscaled radius of 0.05 (= 5 mm * 0.01).
+        assert!(
+            !svg.contains(r#"r="0.0500""#),
+            "found unscaled radius — Circle.radius is not being multiplied by insert scale: {svg}",
+        );
+    }
+
+    #[test]
+    fn arc_inside_rotated_insert_offsets_start_and_end_angles() {
+        // An Arc with start=0°/end=90° inside a block inserted at
+        // rotation=45° must render the arc sweep from 45° to 135°.
+        // Arc is sampled as a polyline; the first/last samples are
+        // the easiest assertion points (they sit on the arc endpoints
+        // in model space → transformed → paper-space).
+        let mut blocks = BlockTable::new();
+        blocks.insert(
+            "QUARTER",
+            vec![DxfEntity::Arc(DxfArc {
+                layer: "WALLS".into(),
+                center: [0.0, 0.0, 0.0],
+                radius: 10.0,
+                start_angle: 0.0,
+                end_angle: 90.0,
+            })],
+        );
+        let s = make_sheet();
+        // Render with rotation=0 and rotation=45; the two outputs
+        // must differ. (If start_angle/end_angle were ignored, the
+        // arc would land in the same place either way.)
+        let no_rot = vec![DxfEntity::Insert(DxfInsert {
+            layer: "WALLS".into(),
+            block_name: "QUARTER".into(),
+            position: [50.0, 25.0, 0.0],
+            scale: [1.0, 1.0, 1.0],
+            rotation: 0.0,
+        })];
+        let with_rot = vec![DxfEntity::Insert(DxfInsert {
+            layer: "WALLS".into(),
+            block_name: "QUARTER".into(),
+            position: [50.0, 25.0, 0.0],
+            scale: [1.0, 1.0, 1.0],
+            rotation: 45.0,
+        })];
+        let svg_no_rot = render_sheet_svg_full(
+            &s,
+            &no_rot,
+            &PlotStyleTable::monochrome(),
+            &LayerTable::new(),
+            &DimStyleTable::new(),
+            &blocks,
+            &SvgExportOptions::default(),
+        )
+        .unwrap();
+        let svg_with_rot = render_sheet_svg_full(
+            &s,
+            &with_rot,
+            &PlotStyleTable::monochrome(),
+            &LayerTable::new(),
+            &DimStyleTable::new(),
+            &blocks,
+            &SvgExportOptions::default(),
+        )
+        .unwrap();
+        assert_ne!(
+            svg_no_rot, svg_with_rot,
+            "expected arc sweep to shift with INSERT rotation",
+        );
+    }
+
+    #[test]
+    fn ellipse_inside_rotated_insert_transforms_major_axis() {
+        // An Ellipse whose major_axis points along +X must rotate
+        // with the INSERT — render at rotation=0 and rotation=90,
+        // expect different SVG output. (If major_axis were copied
+        // unchanged, the ellipse would render identically.)
+        let mut blocks = BlockTable::new();
+        blocks.insert(
+            "OVAL",
+            vec![DxfEntity::Ellipse(DxfEllipse {
+                layer: "WALLS".into(),
+                center: [0.0, 0.0, 0.0],
+                major_axis: [5.0, 0.0, 0.0],
+                ratio: 0.5,
+                start_param: 0.0,
+                end_param: std::f64::consts::TAU,
+            })],
+        );
+        let s = make_sheet();
+        let no_rot = vec![DxfEntity::Insert(DxfInsert {
+            layer: "WALLS".into(),
+            block_name: "OVAL".into(),
+            position: [50.0, 25.0, 0.0],
+            scale: [1.0, 1.0, 1.0],
+            rotation: 0.0,
+        })];
+        let rotated = vec![DxfEntity::Insert(DxfInsert {
+            layer: "WALLS".into(),
+            block_name: "OVAL".into(),
+            position: [50.0, 25.0, 0.0],
+            scale: [1.0, 1.0, 1.0],
+            rotation: 90.0,
+        })];
+        let a = render_sheet_svg_full(
+            &s,
+            &no_rot,
+            &PlotStyleTable::monochrome(),
+            &LayerTable::new(),
+            &DimStyleTable::new(),
+            &blocks,
+            &SvgExportOptions::default(),
+        )
+        .unwrap();
+        let b = render_sheet_svg_full(
+            &s,
+            &rotated,
+            &PlotStyleTable::monochrome(),
+            &LayerTable::new(),
+            &DimStyleTable::new(),
+            &blocks,
+            &SvgExportOptions::default(),
+        )
+        .unwrap();
+        assert_ne!(
+            a, b,
+            "expected ellipse to rotate with insert; major_axis is not being transformed",
+        );
+    }
+
+    #[test]
+    fn text_inside_scaled_insert_uses_scaled_height() {
+        // Text inside a block with scale=2 must render at 2× the
+        // authored height. The renderer emits height as the font-size
+        // attribute directly, so we can assert on that value.
+        let mut blocks = BlockTable::new();
+        blocks.insert(
+            "LABEL",
+            vec![DxfEntity::Text(DxfText {
+                layer: "TEXT".into(),
+                position: [0.0, 0.0, 0.0],
+                height: 2.5,
+                rotation: 0.0,
+                text: "X".into(),
+            })],
+        );
+        let s = make_sheet();
+        let entities = vec![DxfEntity::Insert(DxfInsert {
+            layer: "TEXT".into(),
+            block_name: "LABEL".into(),
+            position: [50.0, 25.0, 0.0],
+            scale: [2.0, 2.0, 1.0],
+            rotation: 0.0,
+        })];
+        let svg = render_sheet_svg_full(
+            &s,
+            &entities,
+            &PlotStyleTable::monochrome(),
+            &LayerTable::new(),
+            &DimStyleTable::new(),
+            &blocks,
+            &SvgExportOptions::default(),
+        )
+        .unwrap();
+        // Height 2.5 * Y-scale 2.0 = 5.
+        assert!(
+            svg.contains(r#"font-size="5""#),
+            "expected scaled font-size 5 in: {svg}",
+        );
+    }
+
+    #[test]
+    fn clip_path_coordinates_use_fmt_coord_precision() {
+        // Viewport with fractional paper coordinates that would yield
+        // a long decimal representation under Display. fmt_coord
+        // clamps to the configured precision; Display would emit far
+        // more digits.
+        let mut s = make_sheet();
+        // Replace the default viewport with one whose origin and
+        // size both have many decimal places after multiplication.
+        s.viewports.clear();
+        s.viewports.push(SheetViewport::new(
+            "VP_FRAC",
+            [10.0_f64 / 3.0, 25.0_f64 / 7.0],
+            [100.1234567_f64, 50.7654321_f64],
+        ));
+        let svg = render_sheet_svg(
+            &s,
+            &[],
+            &PlotStyleTable::monochrome(),
+            &SvgExportOptions::default(),
+        )
+        .unwrap();
+        // Find the clipPath line.
+        let clip_line = svg
+            .lines()
+            .find(|l| l.contains("<clipPath id=\"vp-clip-0\""))
+            .expect("clipPath line should be present");
+        // Default coordinate_precision is 4 → at most 4 decimals on
+        // each coordinate. Display for 10.0/3.0 would emit 17 digits.
+        // Check that no coordinate value in the clip rect has more
+        // than 4 digits past the decimal point.
+        for cap in clip_line.split('"') {
+            if let Ok(v) = cap.parse::<f64>() {
+                let s = format!("{v}");
+                if let Some((_, frac)) = s.split_once('.') {
+                    assert!(
+                        frac.len() <= 4,
+                        "clip-path coord {s} has more than 4 decimals — fmt_coord not applied",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lib_re_exports_render_sheet_svg_full_and_tables() {
+        // Compile-time check: the full SVG renderer + its supporting
+        // tables must be re-exported from the crate root so external
+        // callers don't need to reach into `svg_export::` directly.
+        use crate::{
+            render_sheet_svg_full, BlockTable, DimStyleTable, LayerTable, SvgExportOptions,
+            BLOCK_EXPANSION_MAX_DEPTH,
+        };
+        let _ = BLOCK_EXPANSION_MAX_DEPTH;
+        let s = make_sheet();
+        let svg = render_sheet_svg_full(
+            &s,
+            &[],
+            &PlotStyleTable::monochrome(),
+            &LayerTable::new(),
+            &DimStyleTable::new(),
+            &BlockTable::new(),
+            &SvgExportOptions::default(),
+        )
+        .unwrap();
+        assert!(svg.starts_with("<?xml"));
     }
 
     #[test]
