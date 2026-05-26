@@ -370,10 +370,23 @@ impl RenderQueue {
         self.running.push(job);
     }
 
-    /// Restore a job in a terminal state (Completed / Failed / Cancelled)
-    /// — preserves the original status; does not coerce it.
+    /// Restore a job in a terminal state (`Completed` / `Failed` /
+    /// `Cancelled`) — preserves the original status; does not coerce
+    /// it (unlike `restore_queued` / `restore_running`, which collapse
+    /// to a single canonical status, the terminal bucket is tri-valued).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `job.status` is not terminal. This is enforced via a
+    /// runtime `assert!` (not `debug_assert!`) because the method is
+    /// part of the public crash-recovery API: a non-terminal job
+    /// landing in the `completed` partition would silently corrupt the
+    /// queue's `Queued` / `Running` / terminal invariant, and any
+    /// downstream caller iterating `completed` would see a job that
+    /// the worker pool still thinks it owns. Pre-filter the rows you
+    /// feed in (as `RenderJobStore::load_queue` does).
     pub fn restore_completed(&mut self, job: RenderJob) {
-        debug_assert!(
+        assert!(
             job.is_terminal(),
             "restore_completed expects a terminal status; got {:?}",
             job.status

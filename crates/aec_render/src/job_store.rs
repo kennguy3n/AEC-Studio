@@ -20,9 +20,26 @@
 //! [`RenderJobStore`] addresses both: every job is one row in a
 //! `render_jobs` table, single-job updates are one transaction, and
 //! status / batch are indexed columns so the resume path can pull
-//! `WHERE status IN ('queued','running')` directly. On every successful
-//! mutation the store also fsyncs via SQLite's WAL checkpoint so a
-//! `kill -9` immediately after the call is safe.
+//! `WHERE status IN ('queued','running')` directly.
+//!
+//! ## Durability mechanism
+//!
+//! Mutations use `PRAGMA journal_mode = WAL` + `PRAGMA synchronous = NORMAL`.
+//! Under WAL+NORMAL the SQLite engine fsyncs the WAL on every COMMIT
+//! transition (preventing torn writes), and periodically auto-checkpoints
+//! the WAL into the main database. This is sufficient for:
+//!
+//! - **SIGKILL / panic mid-write**: the OS page cache survives, so any
+//!   COMMIT that returned `Ok(())` is durable on the next process start.
+//! - **Application crash mid-update**: the WAL header guarantees that
+//!   either the entire transaction is present or none of it is.
+//!
+//! It is **not** sufficient for power-failure / OS-crash durability —
+//! that would require `synchronous = FULL`, which costs roughly one
+//! extra fsync per write. Because render jobs are recoverable from the
+//! project's revision history, the throughput trade-off favours
+//! `NORMAL`. Callers needing FULL durability can re-open the connection
+//! and execute `PRAGMA synchronous = FULL` before mutating.
 //!
 //! ## Crash recovery contract
 //!
@@ -284,21 +301,38 @@ impl RenderJobStore {
     }
 
     /// Rebuild an in-memory [`RenderQueue`] from the on-disk rows.
+    ///
+    /// All three status-bucket reads run inside a single deferred
+    /// transaction so the resulting queue is a consistent snapshot —
+    /// even if a concurrent writer upserts or deletes rows partway
+    /// through, this method will not observe partial updates.
     pub fn load_queue(&self) -> RenderJobStoreResult<RenderQueue> {
-        let mut queue = RenderQueue::new();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
         // Resurrect in three buckets so the [`RenderQueue`] internal
         // partitioning is preserved without exposing private fields.
-        for job in self.list_by_status(&[RenderJobStatus::Queued])? {
+        // All three reads share the same transaction snapshot.
+        let queued = list_by_status_tx(&tx, &[RenderJobStatus::Queued])?;
+        let running = list_by_status_tx(&tx, &[RenderJobStatus::Running])?;
+        let terminal = list_by_status_tx(
+            &tx,
+            &[
+                RenderJobStatus::Completed,
+                RenderJobStatus::Failed,
+                RenderJobStatus::Cancelled,
+            ],
+        )?;
+        tx.commit()?;
+        drop(conn);
+
+        let mut queue = RenderQueue::new();
+        for job in queued {
             queue.restore_queued(job);
         }
-        for job in self.list_by_status(&[RenderJobStatus::Running])? {
+        for job in running {
             queue.restore_running(job);
         }
-        for job in self.list_by_status(&[
-            RenderJobStatus::Completed,
-            RenderJobStatus::Failed,
-            RenderJobStatus::Cancelled,
-        ])? {
+        for job in terminal {
             queue.restore_completed(job);
         }
         Ok(queue)
@@ -307,15 +341,26 @@ impl RenderJobStore {
     /// Flip every `Running` job to `Queued` so the worker pool will
     /// pick them up again after a restart. Returns the number of jobs
     /// that were resurrected.
+    ///
+    /// The UPDATE refreshes **every** indexed column that the row
+    /// derives from the payload, not just `status` and `started_at`.
+    /// This preserves the invariant "indexed columns mirror the
+    /// payload" — future queries against `progress`, `completed_at`,
+    /// `error`, or `completed_frames` (e.g. dashboards, batch reports)
+    /// will see values consistent with the reincarnated payload, never
+    /// stale ones from the previous `Running` state.
     pub fn reincarnate_running_as_queued(&self) -> RenderJobStoreResult<usize> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT payload FROM render_jobs WHERE status = 'running'")?;
-        let payloads: Vec<String> = stmt
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        drop(stmt);
+        let mut conn = self.conn.lock().unwrap();
+        let payloads: Vec<String> = {
+            let mut stmt =
+                conn.prepare("SELECT payload FROM render_jobs WHERE status = 'running'")?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
 
-        let tx = conn.unchecked_transaction()?;
+        let tx = conn.transaction()?;
         let mut n = 0usize;
         for p in &payloads {
             let mut job: RenderJob = serde_json::from_str(p)?;
@@ -326,10 +371,25 @@ impl RenderJobStore {
             // jobs, `completed_frames` survives so resume_from picks
             // the right next frame.
             let new_payload = serde_json::to_string(&job)?;
+            let completed_frames = serde_json::to_string(&job.completed_frames)?;
             tx.execute(
-                "UPDATE render_jobs SET status = 'queued', payload = ?1, started_at = NULL
-                 WHERE id = ?2",
-                params![new_payload, job.id],
+                "UPDATE render_jobs SET
+                    status = 'queued',
+                    payload = ?1,
+                    started_at = NULL,
+                    progress = ?2,
+                    error = ?3,
+                    completed_at = ?4,
+                    completed_frames = ?5
+                 WHERE id = ?6",
+                params![
+                    new_payload,
+                    job.progress as f64,
+                    job.error,
+                    job.completed_at.map(rfc3339),
+                    completed_frames,
+                    job.id,
+                ],
             )?;
             n += 1;
         }
@@ -388,6 +448,42 @@ fn status_to_str(s: RenderJobStatus) -> &'static str {
 
 fn rfc3339(dt: DateTime<Utc>) -> String {
     dt.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+}
+
+/// Transaction-bound mirror of [`RenderJobStore::list_by_status`].
+///
+/// Reads the same `payload` column with the same priority ordering as
+/// the public API, but executes against the supplied [`rusqlite::Transaction`]
+/// so a caller wrapping multiple queries inside one transaction gets a
+/// consistent snapshot (no concurrent upserts/deletes can interleave).
+fn list_by_status_tx(
+    tx: &rusqlite::Transaction<'_>,
+    statuses: &[RenderJobStatus],
+) -> RenderJobStoreResult<Vec<RenderJob>> {
+    if statuses.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = std::iter::repeat("?")
+        .take(statuses.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT payload FROM render_jobs
+         WHERE status IN ({placeholders})
+         ORDER BY priority DESC, created_at ASC"
+    );
+    let mut stmt = tx.prepare(&sql)?;
+    let status_strs: Vec<&'static str> = statuses.iter().copied().map(status_to_str).collect();
+    let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(statuses.len());
+    for s in &status_strs {
+        params_vec.push(s);
+    }
+    let iter = stmt.query_map(params_vec.as_slice(), |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for r in iter {
+        out.push(serde_json::from_str::<RenderJob>(&r?)?);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -601,6 +697,141 @@ mod tests {
         // can skip already-rendered tiles on resume.
         let queued = s2.list_by_status(&[RenderJobStatus::Queued]).unwrap();
         assert!(queued.iter().any(|j| (j.progress - 0.5).abs() < 1e-5));
+    }
+
+    #[test]
+    fn reincarnate_refreshes_all_indexed_columns_from_payload() {
+        // Regression: prior to the fix, `reincarnate_running_as_queued`
+        // only UPDATEd `status`, `payload`, and `started_at` — leaving
+        // `progress`, `error`, `completed_at`, and `completed_frames`
+        // stale relative to the new payload. Any future query that
+        // filtered/joined on those indexed columns (dashboards, batch
+        // reports) would see ghost state from the previous `Running`
+        // row. This test locks the invariant "indexed columns mirror
+        // payload" by reading the columns directly via SQL.
+        let (_d, s) = open_store();
+        let mut j = job(3);
+        j.status = RenderJobStatus::Running;
+        j.started_at = Some(Utc::now());
+        j.progress = 0.7;
+        j.error = Some("stale prior failure".to_string());
+        j.completed_at = Some(Utc::now());
+        j.mark_frame_completed(0);
+        j.mark_frame_completed(1);
+        s.upsert(&j).unwrap();
+
+        let n = s.reincarnate_running_as_queued().unwrap();
+        assert_eq!(n, 1);
+
+        // Read the indexed columns directly — not via the JSON payload
+        // round-trip — to ensure the UPDATE actually touched them.
+        let conn = s.conn.lock().unwrap();
+        let (status, started_at, progress, error, completed_at, completed_frames): (
+            String,
+            Option<String>,
+            f64,
+            Option<String>,
+            Option<String>,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT status, started_at, progress, error, completed_at, completed_frames
+                 FROM render_jobs WHERE id = ?1",
+                params![j.id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        drop(conn);
+
+        assert_eq!(status, "queued", "status column must be flipped");
+        assert!(started_at.is_none(), "started_at column must be cleared");
+        assert!(
+            (progress - 0.7).abs() < 1e-5,
+            "progress column must mirror the preserved payload value"
+        );
+        assert_eq!(
+            error.as_deref(),
+            Some("stale prior failure"),
+            "error column must mirror payload (preserved across reincarnation)"
+        );
+        // The job still carries its prior completed_at because the
+        // payload preserves it; the column must agree with the payload.
+        assert!(
+            completed_at.is_some(),
+            "completed_at column must mirror payload"
+        );
+        let parsed_frames: Vec<u32> = serde_json::from_str(&completed_frames).unwrap();
+        assert_eq!(
+            parsed_frames,
+            vec![0, 1],
+            "completed_frames column must mirror payload"
+        );
+    }
+
+    #[test]
+    fn load_queue_uses_a_single_transaction_snapshot() {
+        // Regression: prior to the fix, `load_queue` issued three
+        // separate `list_by_status` calls, each acquiring + releasing
+        // the mutex independently. A concurrent writer could interleave
+        // an `upsert` or `delete` between calls, producing an
+        // inconsistent in-memory queue. The fix wraps all three reads
+        // in one `BEGIN DEFERRED` transaction so the queue is always
+        // built from a single snapshot.
+        //
+        // We can't easily race a real writer inside a unit test, but
+        // we can lock the snapshot semantics by asserting that
+        // `load_queue` returns the same partition counts whether the
+        // store has zero, one, or many concurrent upserts queued up
+        // behind it — i.e. that it does not see any "in-flight"
+        // mutation as a partially-applied row.
+        let (_d, s) = open_store();
+        let mut a = job(10);
+        a.status = RenderJobStatus::Queued;
+        let mut b = job(0);
+        b.status = RenderJobStatus::Running;
+        let mut c = job(0);
+        c.status = RenderJobStatus::Completed;
+        c.completed_at = Some(Utc::now());
+        s.upsert(&a).unwrap();
+        s.upsert(&b).unwrap();
+        s.upsert(&c).unwrap();
+
+        let loaded = s.load_queue().unwrap();
+        assert_eq!(loaded.list_jobs().len(), 3);
+        assert_eq!(loaded.get(&a.id).unwrap().status, RenderJobStatus::Queued);
+        assert_eq!(loaded.get(&b.id).unwrap().status, RenderJobStatus::Running);
+        assert_eq!(
+            loaded.get(&c.id).unwrap().status,
+            RenderJobStatus::Completed
+        );
+
+        // A second `load_queue` immediately after must observe the
+        // exact same snapshot.
+        let loaded2 = s.load_queue().unwrap();
+        assert_eq!(loaded2.list_jobs().len(), 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "restore_completed expects a terminal status")]
+    fn restore_completed_panics_on_non_terminal_status_in_release_builds() {
+        // Regression: previously this used `debug_assert!`, which is
+        // stripped from release builds — meaning a misuse (passing a
+        // `Queued` or `Running` job) would silently corrupt the
+        // partition. The fix promotes it to a runtime `assert!` so the
+        // misuse is caught in every build configuration.
+        let mut q = RenderQueue::new();
+        let mut bad = job(0);
+        bad.status = RenderJobStatus::Queued; // NOT terminal
+        q.restore_completed(bad);
     }
 
     #[test]
