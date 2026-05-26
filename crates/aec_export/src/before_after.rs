@@ -241,8 +241,17 @@ impl BeforeAfterReport {
             .into());
         }
 
-        let base_conn = aec_core::db::open_existing(&base_path, key)?;
-        let head_conn = aec_core::db::open_existing(&head_path, key)?;
+        // `.snap` files must be opened with `db::open_readonly` per the
+        // convention established in PR #52 (`crates/aec_core/src/db.rs:56-60`,
+        // `crates/aec_core/src/version_diff.rs::open_snapshot_db`, and
+        // `crates/aec_core/tests/revision_snapshots.rs:109-119`). Using
+        // `open_existing` would open the WAL-mode snapshot read-write,
+        // creating stray `-wal` / `-shm` sidecar files in the revisions
+        // directory and leaving the snapshot exposed to accidental writes.
+        // `compare_revision_snapshots` below already opens the same two
+        // snapshots correctly via `open_readonly`; this matches it.
+        let base_conn = aec_core::db::open_readonly(&base_path, key)?;
+        let head_conn = aec_core::db::open_readonly(&head_path, key)?;
 
         let base_walls = load_walls(&base_conn)?;
         let head_walls = load_walls(&head_conn)?;
