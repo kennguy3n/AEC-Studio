@@ -10,7 +10,7 @@
 //! for the small systems (< 200 points) that arise in the CAD command-
 //! line editor's constraint mode.
 
-use crate::precision::constraints::ConstraintSet;
+use crate::precision::constraints::{Constraint, ConstraintSet, PointIndex};
 
 /// Solver result.
 #[derive(Debug, Clone, PartialEq)]
@@ -97,6 +97,70 @@ impl ConstraintSolver {
             iterations: self.max_iterations,
             max_residual: max_r,
         }
+    }
+
+    /// Incremental drag entry point. Moves the listed points to their
+    /// new positions, then solves so every other constraint in `cs`
+    /// remains satisfied.
+    ///
+    /// The drag is modelled as a temporary `FixedPoint` constraint
+    /// per dragged point — this is the standard approach in 2D
+    /// parametric CAD (Solvespace, CADKit, OpenSCAD's constraint
+    /// solver, etc.). The original constraint set is **not** mutated:
+    /// the temporary pins are added to a clone and discarded after
+    /// the solve. This means a UI can repeatedly call
+    /// `solve_with_drag` during a mouse-drag without accumulating
+    /// stale pins.
+    ///
+    /// The dragged-point coordinates in `vars` are updated to the
+    /// supplied targets before solving so that even if the system is
+    /// over-constrained and the solver doesn't fully converge, the
+    /// dragged point lands as close as possible to where the user
+    /// asked.
+    ///
+    /// **Out-of-bounds drag indices are silently skipped** — both the
+    /// `vars` write and the temporary `FixedPoint` constraint addition
+    /// are gated on the same `idx * 2 + 1 < vars.len()` check so the
+    /// two paths cannot diverge. Without this gate the solver would
+    /// panic in `Constraint::residual` when evaluating a `FixedPoint`
+    /// pin that referenced a point past the end of `vars`. The UI
+    /// layer is responsible for keeping `dragged` indices in range;
+    /// silent-skip is the safest fallback for a hot mouse-drag path
+    /// where a `Result` would force every caller into error plumbing
+    /// they cannot recover from mid-drag.
+    pub fn solve_with_drag(
+        &self,
+        cs: &ConstraintSet,
+        vars: &mut [f64],
+        dragged: &[(PointIndex, [f64; 2])],
+    ) -> SolveResult {
+        // Single in-range pass produces the authoritative list of
+        // drag entries that will be applied to BOTH `vars` and the
+        // augmented constraint set. Doing the bounds check once here
+        // — instead of twice at the two later use sites — guarantees
+        // the `vars` write and the `FixedPoint` constraint addition
+        // can never diverge, eliminating the OOB panic when a caller
+        // supplies an index past `vars.len() / 2`.
+        let valid: Vec<(PointIndex, [f64; 2])> = dragged
+            .iter()
+            .copied()
+            .filter(|&(idx, _)| idx * 2 + 1 < vars.len())
+            .collect();
+        for &(idx, pos) in &valid {
+            vars[idx * 2] = pos[0];
+            vars[idx * 2 + 1] = pos[1];
+        }
+        if valid.is_empty() {
+            return self.solve(cs, vars);
+        }
+        let mut augmented = cs.clone();
+        for &(idx, pos) in &valid {
+            augmented.add(Constraint::FixedPoint {
+                a: idx,
+                position: pos,
+            });
+        }
+        self.solve(&augmented, vars)
     }
 }
 
@@ -222,6 +286,236 @@ mod tests {
         });
         let mut vars = [0.0, 0.0, 7.0, 0.0];
         let r = ConstraintSolver::default().solve(&cs, &mut vars);
+        assert!(r.is_converged());
+        let d = ((vars[2]).powi(2) + (vars[3]).powi(2)).sqrt();
+        assert!((d - 5.0).abs() < 1e-4);
+    }
+
+    /// Phase 11 Task 24 acceptance test:
+    /// > "Create a rectangle with 4 lines + horizontal/vertical/coincident
+    /// > constraints → move one corner → verify all constraints still satisfied."
+    ///
+    /// We model the rectangle as 4 points (corners). Lines are implicit
+    /// between the consecutive pairs (0,1), (1,2), (2,3), (3,0). The
+    /// constraints pin:
+    ///   - p0–p1 horizontal (bottom edge),
+    ///   - p2–p3 horizontal (top edge),
+    ///   - p1–p2 vertical   (right edge),
+    ///   - p3–p0 vertical   (left edge),
+    ///   - p0 fixed at origin (so the rectangle has a definite location),
+    ///   - p0–p3 fixed distance = 3  (height — the rectangle's height
+    ///     is locked; its width is left free so the drag below can
+    ///     stretch it).
+    ///
+    /// Then we drag p1 (the bottom-right corner) — a "stretch the
+    /// rectangle wider" operation. The solver must:
+    ///   - move p1 to its new position,
+    ///   - re-derive p2 so the top-right corner stays directly above p1
+    ///     (vertical edge) AND directly across from p3 (horizontal edge),
+    ///   - keep p0 anchored.
+    #[test]
+    fn rectangle_with_h_v_coincident_constraints_drag_corner_stays_satisfied() {
+        let mut cs = ConstraintSet::new(4);
+        // Anchor p0 at origin.
+        cs.add(Constraint::FixedPoint {
+            a: 0,
+            position: [0.0, 0.0],
+        });
+        // Bottom edge p0—p1 is horizontal.
+        cs.add(Constraint::Horizontal { a: 0, b: 1 });
+        // Top edge p2—p3 is horizontal.
+        cs.add(Constraint::Horizontal { a: 2, b: 3 });
+        // Right edge p1—p2 is vertical.
+        cs.add(Constraint::Vertical { a: 1, b: 2 });
+        // Left edge p3—p0 is vertical.
+        cs.add(Constraint::Vertical { a: 3, b: 0 });
+        // Left edge height = 3 (the rectangle's height is fixed; its
+        // width is left free so the drag below can stretch it).
+        cs.add(Constraint::FixedDistance {
+            a: 0,
+            b: 3,
+            distance: 3.0,
+        });
+        // Start from a perfect 5×3 rectangle anchored at origin.
+        let mut vars = [
+            0.0, 0.0, // p0
+            5.0, 0.0, // p1
+            5.0, 3.0, // p2
+            0.0, 3.0, // p3
+        ];
+        let solver = ConstraintSolver::default();
+        assert!(solver.solve(&cs, &mut vars).is_converged());
+
+        // Drag p1 from (5, 0) to (7, 0) — stretch the rectangle's
+        // bottom-right corner 2 m to the right. The solver must
+        // propagate that move into p2 (the top-right corner) so the
+        // Vertical { p1, p2 } edge stays vertical, and into p3 via
+        // the Horizontal { p2, p3 } + Vertical { p3, p0 } edges so
+        // the height stays exactly 3 m.
+        let drag = [(1usize, [7.0, 0.0])];
+        let r = solver.solve_with_drag(&cs, &mut vars, &drag);
+        assert!(
+            r.is_converged(),
+            "solver must converge on a satisfiable drag, got {r:?}"
+        );
+
+        // ---- Every original constraint is still satisfied. ----
+        for c in &cs.constraints {
+            assert!(
+                c.residual(&vars).abs() < 1e-3,
+                "constraint {:?} not satisfied after drag (residual={})",
+                c,
+                c.residual(&vars)
+            );
+        }
+
+        // p0 is still at the origin.
+        assert!((vars[0]).abs() < 1e-3);
+        assert!((vars[1]).abs() < 1e-3);
+        // p1 landed where the drag asked — (7, 0).
+        assert!(
+            (vars[2] - 7.0).abs() < 1e-3,
+            "p1.x should be 7, got {}",
+            vars[2]
+        );
+        assert!(vars[3].abs() < 1e-3, "p1.y should be 0, got {}", vars[3]);
+        // The top-right corner p2 followed: x ~= 7, y ~= 3.
+        assert!(
+            (vars[4] - 7.0).abs() < 1e-3,
+            "p2.x should follow drag to 7, got {}",
+            vars[4]
+        );
+        assert!(
+            (vars[5] - 3.0).abs() < 1e-3,
+            "p2.y should stay at 3, got {}",
+            vars[5]
+        );
+        // The Vertical edge between p1 and p2 still holds — they share x.
+        assert!(
+            (vars[4] - vars[2]).abs() < 1e-3,
+            "p1.x and p2.x diverged: {} vs {}",
+            vars[2],
+            vars[4]
+        );
+        // The Horizontal edge between p2 and p3 still holds — they share y.
+        assert!(
+            (vars[5] - vars[7]).abs() < 1e-3,
+            "p2.y and p3.y diverged: {} vs {}",
+            vars[5],
+            vars[7]
+        );
+        // The left edge p3—p0 is vertical — they share x.
+        assert!((vars[6] - vars[0]).abs() < 1e-3, "p3.x and p0.x diverged");
+    }
+
+    /// When the user drags a point and the system is satisfiable
+    /// without forcing it to a different position, the solver should
+    /// honour the drag target.
+    #[test]
+    fn drag_propagates_to_dependents_when_satisfiable() {
+        // Three collinear horizontal points p0—p1—p2. Drag p0 up by 5.
+        // p1 and p2 must come along since they share `y` with p0.
+        let mut cs = ConstraintSet::new(3);
+        cs.add(Constraint::Horizontal { a: 0, b: 1 });
+        cs.add(Constraint::Horizontal { a: 1, b: 2 });
+
+        let mut vars = [0.0, 0.0, 5.0, 0.0, 10.0, 0.0];
+        let r = ConstraintSolver::default().solve_with_drag(&cs, &mut vars, &[(0, [0.0, 5.0])]);
+        assert!(r.is_converged());
+
+        // p0 is where we asked.
+        assert!((vars[0] - 0.0).abs() < 1e-4);
+        assert!((vars[1] - 5.0).abs() < 1e-4);
+        // p1 + p2 followed.
+        assert!(
+            (vars[3] - 5.0).abs() < 1e-3,
+            "p1.y should follow drag, got {}",
+            vars[3]
+        );
+        assert!(
+            (vars[5] - 5.0).abs() < 1e-3,
+            "p2.y should follow drag, got {}",
+            vars[5]
+        );
+    }
+
+    #[test]
+    fn drag_with_empty_target_list_is_a_plain_solve() {
+        let mut cs = ConstraintSet::new(2);
+        cs.add(Constraint::FixedPoint {
+            a: 0,
+            position: [0.0, 0.0],
+        });
+        cs.add(Constraint::FixedDistance {
+            a: 0,
+            b: 1,
+            distance: 5.0,
+        });
+        let mut vars = [0.0, 0.0, 7.0, 0.0];
+        let r = ConstraintSolver::default().solve_with_drag(&cs, &mut vars, &[]);
+        assert!(r.is_converged());
+        let d = ((vars[2]).powi(2) + (vars[3]).powi(2)).sqrt();
+        assert!((d - 5.0).abs() < 1e-4);
+    }
+
+    /// Regression test: an out-of-bounds drag index used to add a
+    /// `FixedPoint { a: oob, .. }` constraint to the augmented set
+    /// even though the `vars` write was skipped, and then the
+    /// subsequent `solve` call would panic in `Constraint::residual`
+    /// (`vars[a * 2]` out of bounds). The fix gates both the `vars`
+    /// write and the constraint addition on the same in-range check,
+    /// so an OOB index is silently skipped end-to-end and the
+    /// solver still converges on the remaining valid drag entries.
+    #[test]
+    fn drag_with_out_of_bounds_index_is_silently_skipped_no_panic() {
+        let mut cs = ConstraintSet::new(2);
+        cs.add(Constraint::Horizontal { a: 0, b: 1 });
+        let mut vars = [0.0, 0.0, 5.0, 3.0]; // 2 points → 4 vars.
+
+        // Index 5 corresponds to vars[10..12], which is far past the
+        // end of a 4-element `vars`. Previously this would still
+        // append `FixedPoint { a: 5, .. }` to the augmented set and
+        // panic at residual eval time.
+        let drag = [(5usize, [9.0, 9.0]), (1usize, [7.0, 0.0])];
+        let r = ConstraintSolver::default().solve_with_drag(&cs, &mut vars, &drag);
+        assert!(
+            r.is_converged(),
+            "solver must converge after silently skipping OOB drag, got {r:?}"
+        );
+
+        // The in-range drag landed.
+        assert!(
+            (vars[2] - 7.0).abs() < 1e-3,
+            "p1.x should be 7, got {}",
+            vars[2]
+        );
+        assert!(vars[3].abs() < 1e-3, "p1.y should be 0, got {}", vars[3]);
+        // The Horizontal constraint pulled p0.y to match p1.y.
+        assert!((vars[1] - vars[3]).abs() < 1e-3);
+    }
+
+    /// Regression test: when EVERY drag entry is out of bounds the
+    /// augmented constraint set must not be built (otherwise the
+    /// solver would still see zero extra constraints but pay the
+    /// clone cost). The behaviour must reduce to a plain `solve` on
+    /// the original constraint set, exactly as the empty-drag-list
+    /// case does.
+    #[test]
+    fn drag_with_all_out_of_bounds_indices_reduces_to_plain_solve() {
+        let mut cs = ConstraintSet::new(2);
+        cs.add(Constraint::FixedPoint {
+            a: 0,
+            position: [0.0, 0.0],
+        });
+        cs.add(Constraint::FixedDistance {
+            a: 0,
+            b: 1,
+            distance: 5.0,
+        });
+        let mut vars = [0.0, 0.0, 7.0, 0.0];
+        // All drag indices are out of bounds for a 4-element `vars`.
+        let drag = [(99usize, [1.0, 1.0]), (100usize, [2.0, 2.0])];
+        let r = ConstraintSolver::default().solve_with_drag(&cs, &mut vars, &drag);
         assert!(r.is_converged());
         let d = ((vars[2]).powi(2) + (vars[3]).powi(2)).sqrt();
         assert!((d - 5.0).abs() < 1e-4);
