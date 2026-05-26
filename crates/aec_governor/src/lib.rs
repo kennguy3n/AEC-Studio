@@ -14,7 +14,8 @@ pub use report::ProfileReport;
 pub use scheduler::{BackoffReason, GovernorScheduler, ScheduleVerdict, SchedulerError};
 pub use thermal::{
     classify, native_sensor, LinuxSysfsSensor, MacosPmsetSensor, ManualSensor, ThermalMonitor,
-    ThermalReading, ThermalSensor, ThermalSource, ThermalThresholds, WindowsWmiSensor,
+    ThermalReading, ThermalSensor, ThermalSource, ThermalThresholds, ThresholdError,
+    WindowsWmiSensor,
 };
 pub use tier::HardwareTier;
 pub use ui_report::{GovernorState, ThermalState};
