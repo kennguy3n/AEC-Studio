@@ -1,0 +1,12 @@
+IESNA:LM-63-2002
+[TEST=Cognition AEC Studio fixture]
+[MANUFAC=ACME Lighting]
+[LUMCAT=Lambertian-1000cd-downlight]
+[LAMP=cosine ideal]
+[ISSUEDATE=2026-05-25]
+TILT=NONE
+1 3141.6 1.0 7 1 1 2 0.0 0.0 0.0
+1.0 1.0 100.0
+0.0 15.0 30.0 45.0 60.0 75.0 90.0
+0.0
+1000.0 965.93 866.03 707.11 500.0 258.82 0.0
