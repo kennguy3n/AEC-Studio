@@ -733,8 +733,23 @@ pub struct IesLookupTexture {
 
 impl IesLookupTexture {
     /// Bilinearly sample the texture at the supplied vertical /
-    /// horizontal angles in degrees. Vertical wraps via clamping;
-    /// horizontal wraps modulo 360.
+    /// horizontal angles in degrees.
+    ///
+    /// Both axes use the **endpoint-inclusive** parameterization that
+    /// [`IesProfile::to_lookup_texture`] writes: column `x` corresponds
+    /// to horizontal angle `x / (width - 1) · 360°` and row `y` to
+    /// vertical angle `y / (height - 1) · 180°`. The sampler MUST mirror
+    /// that mapping or it reads from a non-existent in-between column
+    /// — e.g. on a 4-wide texture, an input of 120° (which the bake
+    /// stored exactly in column 1) would otherwise interpolate between
+    /// columns 1 and 2, returning a blend of cd(120°) and cd(240°)
+    /// instead of cd(120°).
+    ///
+    /// Horizontal wraps via `rem_euclid` (so 360°, 720°, −10° all map
+    /// back into `[0°, 360°)`); 360° therefore samples column 0, which
+    /// the bake guarantees equals the column `width − 1` value
+    /// (since `candela_at` is periodic in horizontal). Vertical clamps
+    /// to `[0°, 180°]`.
     pub fn sample(&self, vertical_deg: f32, horizontal_deg: f32) -> f32 {
         let w = self.width.max(1) as usize;
         let h = self.height.max(1) as usize;
@@ -742,16 +757,26 @@ impl IesLookupTexture {
             return 0.0;
         }
         let vy = (vertical_deg.clamp(0.0, 180.0) / 180.0) * (h as f32 - 1.0);
-        let mut hx = horizontal_deg.rem_euclid(360.0) / 360.0 * (w as f32);
-        if hx >= w as f32 {
-            hx -= w as f32;
-        }
+        // Endpoint-inclusive: map [0°, 360°) onto [0, w-1]. With w=1
+        // there is only one column, so hx collapses to 0 regardless of
+        // the input angle. The bake stores cd(360°) in column `w-1`
+        // which equals cd(0°), so wrapping a 360° input back to column
+        // 0 preserves continuity.
+        let hx = if w > 1 {
+            horizontal_deg.rem_euclid(360.0) / 360.0 * (w as f32 - 1.0)
+        } else {
+            0.0
+        };
         let y0 = vy.floor() as usize;
         let y1 = (y0 + 1).min(h - 1);
         let ty = vy - y0 as f32;
-        let x0 = hx.floor() as usize % w;
-        let x1 = (x0 + 1) % w;
-        let tx = hx - hx.floor();
+        // Clamp (rather than modulo) so `x0`/`x1` stay inside the
+        // endpoint-inclusive column range. The `rem_euclid` above
+        // already collapses 360° back to column 0, so we never need
+        // the wraparound branch.
+        let x0 = (hx.floor() as usize).min(w.saturating_sub(1));
+        let x1 = (x0 + 1).min(w - 1);
+        let tx = hx - x0 as f32;
         let c00 = self.candela[y0 * w + x0];
         let c10 = self.candela[y0 * w + x1];
         let c01 = self.candela[y1 * w + x0];
@@ -1016,5 +1041,126 @@ TILT=NONE
 "#;
         let err = IesProfile::parse_ies(truncated).unwrap_err();
         assert!(matches!(err, IesParseError::TruncatedCandelaTable { .. }));
+    }
+
+    /// Fixture: an explicitly **asymmetric** Type-C IES distribution.
+    /// 3 vertical × 5 horizontal angles, with distinct candela per
+    /// horizontal slice at the equator (v = 90°). The H=0° and H=360°
+    /// slices are identical (the period closure required by LM-63 for
+    /// asymmetric distributions). The candela values per (H, V) are:
+    ///
+    /// ```text
+    ///                 V=0°    V=90°   V=180°
+    ///   H=0°           100     200      50
+    ///   H=90°          100     300      50
+    ///   H=180°         100     400      50
+    ///   H=270°         100     500      50
+    ///   H=360°         100     200      50   (= H=0°, period closure)
+    /// ```
+    ///
+    /// IES candela order is H-outer, V-inner, so the candela table is
+    /// emitted as five contiguous (V=0, V=90, V=180) triplets.
+    const ASYMMETRIC_IES: &str = r#"IESNA:LM-63-2002
+[TEST=Cognition AEC Studio asymmetric fixture]
+[MANUFAC=ACME]
+TILT=NONE
+1 1000.0 1.0 3 5 1 2 0.0 0.0 0.0
+1.0 1.0 100.0
+0.0 90.0 180.0
+0.0 90.0 180.0 270.0 360.0
+100.0 200.0 50.0
+100.0 300.0 50.0
+100.0 400.0 50.0
+100.0 500.0 50.0
+100.0 200.0 50.0
+"#;
+
+    #[test]
+    fn lookup_texture_sample_matches_bake_at_each_horizontal_angle() {
+        // Regression: previously `IesLookupTexture::sample` mapped
+        // `[0°, 360°)` onto `[0, width)` (circular convention), but the
+        // bake stores its samples on `[0, width − 1]` (endpoint
+        // inclusive — column `w-1` is exactly 360°). Sampling at a
+        // horizontal angle that the bake stored exactly (e.g. 90°,
+        // 180°) MUST return that stored candela byte-for-byte. Without
+        // the fix, sampling at 90° on a 5-wide texture returns
+        // `0.75 · cd(90°) + 0.25 · cd(180°)` — a blend that confuses
+        // every column with its neighbour.
+        let p = IesProfile::parse_ies(ASYMMETRIC_IES).unwrap();
+        let tex = p.to_lookup_texture(5, 3);
+        assert_eq!(tex.width, 5);
+        assert_eq!(tex.height, 3);
+
+        // Per the bake invariant, column `x` holds candela at
+        // `x / (w - 1) · 360°`. At the equator (v = 90°), the
+        // distinct cd values per horizontal slice MUST round-trip
+        // exactly.
+        let v_equator = 90.0;
+        for (h_deg, expected_cd) in [
+            (0.0_f32, 200.0_f32),
+            (90.0, 300.0),
+            (180.0, 400.0),
+            (270.0, 500.0),
+            (360.0, 200.0),
+        ] {
+            let got = tex.sample(v_equator, h_deg);
+            assert!(
+                (got - expected_cd).abs() < 1e-4,
+                "sample at v={v_equator}, h={h_deg}: expected {expected_cd}, got {got}"
+            );
+        }
+    }
+
+    #[test]
+    fn lookup_texture_sample_interpolates_between_adjacent_horizontal_columns() {
+        // Halfway between H=90° (cd=300) and H=180° (cd=400) at the
+        // equator should land on cd=350 once the endpoint-inclusive
+        // mapping is in place. Under the old (buggy) circular
+        // mapping, this would silently shift to ~362.5.
+        let p = IesProfile::parse_ies(ASYMMETRIC_IES).unwrap();
+        let tex = p.to_lookup_texture(5, 3);
+        let got = tex.sample(90.0, 135.0);
+        assert!(
+            (got - 350.0).abs() < 1e-3,
+            "expected midpoint cd=350.0 between H=90° and H=180°, got {got}"
+        );
+    }
+
+    #[test]
+    fn lookup_texture_sample_wraps_horizontal_modulo_360() {
+        // 360° and 0° must map to the same column, and negative /
+        // overshooting inputs (-45°, 405°) must wrap correctly through
+        // `rem_euclid`. We check this at the equator on the asymmetric
+        // fixture so it can catch a regression that swaps `rem_euclid`
+        // for a plain modulo (which would map -45° to -45 and panic).
+        let p = IesProfile::parse_ies(ASYMMETRIC_IES).unwrap();
+        let tex = p.to_lookup_texture(5, 3);
+        let v = 90.0;
+        let at_0 = tex.sample(v, 0.0);
+        let at_360 = tex.sample(v, 360.0);
+        let at_minus_45 = tex.sample(v, -45.0);
+        let at_315 = tex.sample(v, 315.0);
+        let at_405 = tex.sample(v, 405.0);
+        let at_45 = tex.sample(v, 45.0);
+        assert!((at_0 - at_360).abs() < 1e-4);
+        assert!((at_minus_45 - at_315).abs() < 1e-4);
+        assert!((at_405 - at_45).abs() < 1e-4);
+    }
+
+    #[test]
+    fn lookup_texture_sample_handles_width_one() {
+        // Edge case: a rotationally-symmetric profile baked at width=1
+        // (only one horizontal column = 0°/360°). Any horizontal input
+        // must read from column 0 without indexing past the end. The
+        // previous code's `(x0 + 1) % w` path also worked here, but
+        // the fix's clamp-to-`w-1` path is the one being exercised.
+        let p = IesProfile::parse_ies(SAMPLE_IES).unwrap();
+        let tex = p.to_lookup_texture(1, 5);
+        assert_eq!(tex.width, 1);
+        // SAMPLE_IES has cd(v=0°) = 10.0.
+        for h in [0.0_f32, 47.0, 180.0, 360.0, -90.0] {
+            let got = tex.sample(0.0, h);
+            assert!((got - 10.0).abs() < 1e-4, "h={h}: expected 10.0, got {got}");
+        }
     }
 }
