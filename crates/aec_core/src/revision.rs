@@ -235,12 +235,11 @@ impl RevisionStore {
     /// The flow is:
     ///
     /// 1. Reject empty / duplicate tags exactly like [`Self::create`].
-    /// 2. Run `PRAGMA wal_checkpoint(TRUNCATE)` against `live_conn` so
-    ///    every committed transaction in the WAL is folded into the
-    ///    main DB file. After this the WAL is empty and a byte-level
-    ///    copy of `live_db_path` is a consistent snapshot. The caller
-    ///    is expected to hold a write lock so no concurrent writer
-    ///    appends a new WAL frame between this step and step 3.
+    /// 2. Run `PRAGMA wal_checkpoint(TRUNCATE)` against `live_conn`
+    ///    so every committed transaction in the WAL is folded into
+    ///    the main DB file, and inspect its `(busy, log, checkpointed)`
+    ///    result row — abort with an error if `busy != 0` so a
+    ///    partial checkpoint never produces an inconsistent snapshot.
     /// 3. Read `live_db_path` and write the bytes atomically to
     ///    `<revisions-dir>/<revision-id>.snap` (write-to-`.tmp`,
     ///    rename).
@@ -249,6 +248,13 @@ impl RevisionStore {
     ///    the journal head pointer alongside the snapshot.
     /// 6. Finalise the [`Revision`] (with [`Self::write_atomic`]) and
     ///    return it.
+    ///
+    /// The caller is expected to hold a write lock for the *entire*
+    /// call — not just between the checkpoint and the file copy. The
+    /// journal-head query in step 5 reads `MAX(seq)` from the live
+    /// connection, so any concurrent writer between steps 3 and 5
+    /// would record a head pointer that's strictly ahead of what's in
+    /// the snapshot.
     ///
     /// If any step after the snapshot file is written fails, the
     /// already-written `.snap` is removed so the revisions directory
@@ -276,12 +282,30 @@ impl RevisionStore {
         //    level copy is consistent. `TRUNCATE` is the strongest
         //    checkpoint mode SQLite offers — it both folds the WAL
         //    into the main DB file and truncates the WAL file to
-        //    zero length. If a concurrent reader holds a frame open
-        //    SQLite gracefully falls back to `RESTART` semantics, so
-        //    this call is safe to issue even under contention.
-        live_conn
-            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        //    zero length.
+        //
+        //    Important: `PRAGMA wal_checkpoint` returns
+        //    `(busy, log, checkpointed)` and SQLite can fall back to
+        //    a *partial* checkpoint (e.g. PASSIVE semantics) if a
+        //    concurrent reader holds a WAL snapshot past the
+        //    `busy_timeout`. In that case the main DB file is still
+        //    missing the most-recent committed frames, so the
+        //    byte-level copy we are about to take would be an
+        //    inconsistent snapshot. We must inspect the `busy` column
+        //    and abort here rather than silently producing a
+        //    truncated snapshot whose BLAKE3 still happens to match
+        //    `verify_snapshot`.
+        let busy: i32 = live_conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
             .map_err(|e| AecError::Other(format!("WAL checkpoint failed: {e}")))?;
+        if busy != 0 {
+            return Err(AecError::Other(
+                "WAL checkpoint could not complete: a concurrent reader held a WAL snapshot \
+                 past the busy timeout, so the on-disk db file is missing recently committed \
+                 frames and a byte-level snapshot would be inconsistent"
+                    .into(),
+            ));
+        }
 
         let id = format!("rev_{}", Uuid::new_v4().simple());
         let snap_relative = format!("{id}.snap");
