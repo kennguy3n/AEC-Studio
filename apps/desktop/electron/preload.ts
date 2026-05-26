@@ -50,6 +50,16 @@ const api = {
       ipcRenderer.invoke("draft:importDxf", params),
     exportDxf: (params: { dxfPath: string; projectPath?: string }) =>
       ipcRenderer.invoke("draft:exportDxf", params),
+    // Same shape as `importDxf` / `exportDxf`. `version` is the
+    // 6-byte AC10xx tag (e.g. `"AC1018"` for R2004); the IPC handler
+    // defaults it to R2004 if the caller omits it.
+    importDwg: (params: { dwgPath: string; projectPath?: string }) =>
+      ipcRenderer.invoke("draft:importDwg", params),
+    exportDwg: (params: {
+      dwgPath: string;
+      projectPath?: string;
+      version?: string;
+    }) => ipcRenderer.invoke("draft:exportDwg", params),
   },
 
   // ----- BIM -----

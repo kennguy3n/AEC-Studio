@@ -171,6 +171,31 @@ export interface BridgeBackend {
   }): Promise<{ exported: true; path: string }>;
 
   /**
+   * Import a DWG file (R12 – R2018) into the project graph. Mirrors
+   * `draftImportDxf` semantics: every importable entity becomes a
+   * `DrawPrimitive` command, journaled and audited through
+   * `command_apply_batch`. Returns the detected DWG `version`
+   * signature (`AC1009` for R12 … `AC1032` for R2018) so the
+   * renderer can confirm what was imported.
+   */
+  draftImportDwg(params: {
+    projectPath: string;
+    dwgPath: string;
+  }): Promise<{ imported: number; version: string }>;
+
+  /**
+   * Export the project graph's draft primitives to a DWG file at
+   * `params.dwgPath`. `params.version` (default `AC1018` /
+   * R2004) selects the encoder. Returns the version the file was
+   * actually encoded as so callers can confirm.
+   */
+  draftExportDwg(params: {
+    projectPath: string;
+    dwgPath: string;
+    version?: string;
+  }): Promise<{ exported: true; path: string; version: string }>;
+
+  /**
    * Parse an IFC file and return a structured preview summary. The
    * file is NOT yet folded into the active project — that's the
    * follow-up `bimAttachIfc` call. The renderer uses this for the
@@ -1254,6 +1279,12 @@ interface NativeApi {
   draft_set_layer_state(project_path: string, params_json: string): unknown;
   draft_import_dxf(project_path: string, dxf_path: string): Promise<unknown>;
   draft_export_dxf(project_path: string, dxf_path: string): Promise<unknown>;
+  draft_import_dwg(project_path: string, dwg_path: string): Promise<unknown>;
+  draft_export_dwg(
+    project_path: string,
+    dwg_path: string,
+    version_signature: string,
+  ): Promise<unknown>;
   deliver_create_revision(
     project_path: string,
     tag: string,
@@ -1403,6 +1434,8 @@ export const NATIVE_WIRED_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   "draftSetLayerState",
   "draftImportDxf",
   "draftExportDxf",
+  "draftImportDwg",
+  "draftExportDwg",
   "deliverCreateRevision",
   "deliverListRevisions",
   "deliverCompareRevisions",
@@ -1885,6 +1918,24 @@ function adaptNative(n: NativeApi): BridgeBackend {
       };
       return { exported: true, path: r.path };
     },
+    draftImportDwg: async (params) => {
+      const r = (await n.draft_import_dwg(params.projectPath, params.dwgPath)) as {
+        entityCount: number;
+        version: string;
+      };
+      return { imported: r.entityCount, version: r.version };
+    },
+    draftExportDwg: async (params) => {
+      // R2004 (AC1018) is the de-facto interchange version: most
+      // CAD authoring tools accept it and it's small enough to
+      // ship over networks. Callers can override per-call.
+      const version = params.version ?? "AC1018";
+      const r = (await n.draft_export_dwg(params.projectPath, params.dwgPath, version)) as {
+        path: string;
+        version: string;
+      };
+      return { exported: true, path: r.path, version: r.version };
+    },
     deliverCreateRevision: async (params) => {
       // The native `deliver_create_revision` returns the same
       // `RevisionSummary` shape the renderer's TS interface uses
@@ -2137,6 +2188,20 @@ export function inProcessBackend(): BridgeBackend {
     },
     async draftExportDxf(params) {
       return { exported: true, path: params.dxfPath };
+    },
+    async draftImportDwg(_params) {
+      // Match the DXF in-process fallback: report zero imports and
+      // a sentinel version. The native path is what does real work;
+      // this lets dev/test runs without the .node artefact still
+      // exercise the renderer's plumbing.
+      return { imported: 0, version: "AC0000" };
+    },
+    async draftExportDwg(params) {
+      return {
+        exported: true,
+        path: params.dwgPath,
+        version: params.version ?? "AC1018",
+      };
     },
 
     async bimImportIfc(path) {

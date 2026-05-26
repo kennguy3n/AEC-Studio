@@ -2183,6 +2183,26 @@ pub struct DraftExportDxfJs {
     pub file_size: u32,
 }
 
+/// JS-facing result of [`draft_import_dwg`]. Mirrors
+/// [`DraftImportDxfJs`] plus the detected DWG version.
+#[napi(object)]
+pub struct DraftImportDwgJs {
+    pub entity_count: u32,
+    pub layer_count: u32,
+    pub block_count: u32,
+    pub skipped_count: u32,
+    pub version: String,
+}
+
+/// JS-facing result of [`draft_export_dwg`].
+#[napi(object)]
+pub struct DraftExportDwgJs {
+    pub path: String,
+    pub entity_count: u32,
+    pub file_size: u32,
+    pub version: String,
+}
+
 #[napi(object)]
 pub struct DraftEntityIdJs {
     pub entity_id: String,
@@ -2265,6 +2285,51 @@ pub async fn draft_import_dxf(project_path: String, dxf_path: String) -> Result<
                 block_count: r.block_count,
                 skipped_count: r.skipped_count,
             }
+        })
+    })
+    .await
+}
+
+/// Import a DWG file (R12-R2018) into the project graph. Auto-detects
+/// the version from the `AC10xx` signature, lowers through the
+/// canonical [`DxfDocument`] representation, and journals every
+/// importable entity through `command_apply_batch`.
+#[napi]
+pub async fn draft_import_dwg(project_path: String, dwg_path: String) -> Result<DraftImportDwgJs> {
+    spawn_blocking_napi(move || {
+        with_service(|svc| svc.draft_import_dwg(&project_path, &dwg_path)).map(|r| {
+            DraftImportDwgJs {
+                entity_count: r.entity_count,
+                layer_count: r.layer_count,
+                block_count: r.block_count,
+                skipped_count: r.skipped_count,
+                version: r.version,
+            }
+        })
+    })
+    .await
+}
+
+/// Export the project graph's draft primitives to a DWG file at the
+/// requested version. `version_signature` is one of `AC1009` ..
+/// `AC1032`.
+#[napi]
+pub async fn draft_export_dwg(
+    project_path: String,
+    dwg_path: String,
+    version_signature: String,
+) -> Result<DraftExportDwgJs> {
+    spawn_blocking_napi(move || {
+        with_service_ref_fallible(|svc| {
+            svc.draft_export_dwg(&project_path, &dwg_path, &version_signature)
+        })
+        .map(|r| DraftExportDwgJs {
+            path: r.path,
+            entity_count: r.entity_count,
+            // Mirrors the DXF exporter's u64 -> u32 cap; well above
+            // any realistic DWG-from-draft export size.
+            file_size: u32::try_from(r.file_size).unwrap_or(u32::MAX),
+            version: r.version,
         })
     })
     .await
