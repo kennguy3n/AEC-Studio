@@ -352,6 +352,19 @@ impl RenderQueue {
     /// recovery. The job's status is forced to `Queued` defensively;
     /// callers should pre-filter their rows.
     ///
+    /// # Performance contract
+    ///
+    /// This is the **single-job** restore path: every call scans the
+    /// three in-memory partitions linearly to enforce the duplicate-id
+    /// invariant (see [`assert_id_unique`]). Cost per call is O(N)
+    /// where N is the current queue size, so calling this method N
+    /// times to restore a full queue is O(N²). It is intended for
+    /// small, ad-hoc restores (test fixtures, replay tooling,
+    /// future plugin APIs) where N is bounded by a small constant.
+    /// For full crash-recovery loads, use
+    /// [`RenderQueue::restore_bulk_from_storage`], which amortises
+    /// uniqueness to O(N) via an interned [`HashSet`].
+    ///
     /// # Panics
     ///
     /// Panics if a job with the same `id` is already present in any
@@ -379,6 +392,13 @@ impl RenderQueue {
     /// state to the worker pool (which can then choose to flip it
     /// back to queued via the store).
     ///
+    /// # Performance contract
+    ///
+    /// Same O(N) cross-partition uniqueness scan as
+    /// [`RenderQueue::restore_queued`]; N invocations compound to
+    /// O(N²). For bulk crash-recovery loads use
+    /// [`RenderQueue::restore_bulk_from_storage`].
+    ///
     /// # Panics
     ///
     /// Panics if a job with the same `id` is already present in any
@@ -393,6 +413,13 @@ impl RenderQueue {
     /// `Cancelled`) — preserves the original status; does not coerce
     /// it (unlike `restore_queued` / `restore_running`, which collapse
     /// to a single canonical status, the terminal bucket is tri-valued).
+    ///
+    /// # Performance contract
+    ///
+    /// Same O(N) cross-partition uniqueness scan as
+    /// [`RenderQueue::restore_queued`]; N invocations compound to
+    /// O(N²). For bulk crash-recovery loads use
+    /// [`RenderQueue::restore_bulk_from_storage`].
     ///
     /// # Panics
     ///
