@@ -96,27 +96,46 @@ impl AiAuditLogger {
     /// e.g. `audit/ai_audit.jsonl` pairs with
     /// `audit/ai_audit_records.jsonl`. Both files are created
     /// lazily on first append.
+    ///
+    /// The derivation is deterministic and total: every path with
+    /// a valid UTF-8 filename produces exactly one companion path
+    /// (`{stem}_records.{ext}`, defaulting the extension to
+    /// `jsonl` if the caller passed an extension-less path). Paths
+    /// without a filename (e.g. `..`, root, or non-UTF-8 file
+    /// stems) are rejected with `ErrorKind::InvalidInput` so a
+    /// misconfigured call site surfaces loudly rather than
+    /// silently producing a surprising companion name.
+    ///
+    /// Devin Review `ANALYSIS_0001` (PR #51): the previous shape
+    /// had a fallback branch `chain_path.with_extension("records.jsonl")`
+    /// that only ran when `file_stem` returned `None`, but it
+    /// would have produced `ai_audit.records.jsonl` (note the
+    /// dot) rather than the documented `ai_audit_records.jsonl`
+    /// (note the underscore) — a silent inconsistency between
+    /// the documented contract and the fallback behaviour. The
+    /// new shape collapses both branches into a single canonical
+    /// derivation and treats the no-filename case as an error
+    /// rather than papering over it.
     pub fn open(chain_path: impl AsRef<Path>) -> Result<Self, AuditError> {
         let chain_path = chain_path.as_ref();
-        // `ai_audit.jsonl` -> `ai_audit_records.jsonl`. We derive
-        // the companion path so callers only pass one path to
-        // `open` and don't have to know about the two-file layout.
-        let records_path = match chain_path.file_stem().and_then(|s| s.to_str()) {
-            Some(stem) => {
-                let mut p = chain_path.to_path_buf();
-                let new_name = format!(
-                    "{}_records.{}",
-                    stem,
-                    chain_path
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .unwrap_or("jsonl"),
-                );
-                p.set_file_name(new_name);
-                p
-            }
-            None => chain_path.with_extension("records.jsonl"),
-        };
+        let stem = chain_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "AiAuditLogger::open: chain path {} has no UTF-8 file stem; expected something like `<dir>/ai_audit.jsonl`",
+                        chain_path.display()
+                    ),
+                )
+            })?;
+        let ext = chain_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("jsonl");
+        let mut records_path = chain_path.to_path_buf();
+        records_path.set_file_name(format!("{stem}_records.{ext}"));
         Ok(Self {
             log: AuditLog::open(chain_path)?,
             records_path,

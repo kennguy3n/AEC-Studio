@@ -1476,6 +1476,36 @@ impl BridgeService {
             Some(template.template_id.clone()),
             &self.master_key,
         )?;
+
+        // Instantiate the template into real entities on the project
+        // graph. Geometry templates (apartment / villa / office / ...)
+        // emit a batch of `CreateWall` + `CreateFloor` + `CreateCeiling`
+        // + `CreateRoom` + `SetLighting` + `SaveCamera` commands; the
+        // batch lands in a single SQL transaction via
+        // `execute_persistent_batch` so a half-failed instantiation
+        // never leaves the project graph in a partial state. Sheet-only
+        // / layer-only templates (drafting, renovation overlay) emit
+        // zero commands here — their content is realised by other
+        // mode-specific seed steps.
+        //
+        // The skipped-rooms diagnostic from
+        // `template_to_commands` is captured in the project's audit
+        // sidecar `<root>/audit/template_instantiation.json` so a
+        // user / reviewer can see exactly which rooms (if any) the
+        // instantiator declined to materialise. The file is written
+        // even on a clean batch (with `skipped: []`) so its presence
+        // is a positive signal: "this project went through the real
+        // template path, not a no-op fast path".
+        let outcome = aec_command::template_apply::template_to_commands(&template);
+        if let Err(e) = apply_template_outcome(&pkg, &self.master_key, template_key, outcome) {
+            // Roll back the half-created project so the next call to
+            // `project_create_from_template` with the same name isn't
+            // blocked by an `AlreadyExists` error against a useless
+            // shell.
+            let _ = std::fs::remove_dir_all(&root);
+            return Err(e);
+        }
+
         // Drop any stale cache entry for this path before publishing
         // the new project to the recents store. `root` is a `PathBuf`
         // and the cache key is derived via `cache_key` (which goes
@@ -4398,14 +4428,155 @@ fn slugify(name: &str) -> String {
     out
 }
 
+/// Persist the commands emitted by
+/// [`aec_command::template_apply::template_to_commands`] into the
+/// freshly-created project's SQLCipher database, then drop a JSON
+/// sidecar in `<project>/audit/template_instantiation.json` that
+/// captures the entity counts, the originating template key, and any
+/// rooms that were skipped by the fail-soft instantiator.
+///
+/// Atomicity: the whole batch lands in one SQL transaction inside
+/// `CommandEngine::execute_persistent_batch`. If any single command
+/// fails validation the transaction is rolled back and the function
+/// returns an error; the caller deletes the now-incomplete project
+/// directory in that branch.
+///
+/// Takes `outcome` **by value** (Devin Review `ANALYSIS_0005` on
+/// PR #51): the previous shape took `&InstantiationOutcome` and
+/// then deep-cloned `outcome.commands` into
+/// `execute_persistent_batch`. The villa template emits ~77
+/// commands (11 rooms × 7 commands each + lighting + cameras),
+/// each carrying a serialised JSON body, so the clone was a real
+/// allocation hot-spot dominated only by the SQL transaction that
+/// follows. Consuming the outcome lets us move
+/// `outcome.commands` straight into the engine and clone nothing.
+///
+/// Engine scope is derived from `outcome.commands[0].scope`
+/// (Devin Review `ANALYSIS_0004` on PR #51): the old shape
+/// hardcoded `Scope::Design`, which works today because every
+/// `CommandKind` emitted by the template path returns
+/// `Scope::Design` from its `scope()` method, but a future
+/// template feature emitting a non-Design command (e.g. a Draft
+/// `DrawPrimitive` for a 2D plan template, or a Render
+/// `SaveCamera` variant) would silently trip a `ScopeMismatch`
+/// inside the batch guard. Reading the scope off the commands
+/// themselves matches the AI accept path's pattern
+/// (`engine_scope = conversion.commands[0].scope`) and removes
+/// the brittle-against-extension assumption.
+fn apply_template_outcome(
+    pkg: &ProjectPackage,
+    master_key: &[u8; 32],
+    template_key: &str,
+    outcome: aec_command::template_apply::InstantiationOutcome,
+) -> Result<(), BridgeServiceError> {
+    // Destructure once so we can move `commands` into the engine
+    // and still borrow the other fields for the sidecar JSON. The
+    // batch-internal-consistency guard inside
+    // `execute_persistent_batch` will reject any command whose
+    // scope differs from `commands[0].scope`, so picking the first
+    // command's scope is both correct and uniquely defined.
+    let aec_command::template_apply::InstantiationOutcome {
+        commands,
+        rooms,
+        camera_ids,
+        lighting_preset,
+        skipped,
+    } = outcome;
+    let applied_command_count = commands.len();
+    if !commands.is_empty() {
+        let engine_scope = commands[0].scope;
+        let mut conn = pkg.open_database(master_key)?;
+        let mut engine = CommandEngine::open(&conn, engine_scope)?;
+        engine.execute_persistent_batch(commands, &mut conn)?;
+        // Drop the connection eagerly so the project package's SQLite
+        // file is closed before we touch the audit sidecar.
+        drop(engine);
+        drop(conn);
+    }
+
+    let sidecar_dir = pkg.root().join("audit");
+    std::fs::create_dir_all(&sidecar_dir)?;
+    let sidecar = sidecar_dir.join("template_instantiation.json");
+    let body = serde_json::json!({
+        "template_key": template_key,
+        "applied_command_count": applied_command_count,
+        "room_count": rooms.len(),
+        "camera_count": camera_ids.len(),
+        "lighting_preset": lighting_preset,
+        "skipped": skipped.iter().map(|s| serde_json::json!({
+            "storey": s.storey_name,
+            "room": s.room_name,
+            "reason": s.reason,
+        })).collect::<Vec<_>>(),
+        "rooms": rooms.iter().map(|r| serde_json::json!({
+            "room_id": r.room_id.as_str(),
+            "wall_ids": r.wall_ids.iter().map(aec_core::types::EntityId::as_str).collect::<Vec<_>>(),
+            "floor_id": r.floor_id.as_str(),
+            "ceiling_id": r.ceiling_id.as_str(),
+            "storey": r.storey_name,
+            "footprint_origin_mm": r.footprint_origin_mm,
+            "footprint_size_mm": r.footprint_size_mm,
+            "height_mm": r.height_mm,
+        })).collect::<Vec<_>>(),
+        "camera_ids": camera_ids.iter().map(aec_core::types::EntityId::as_str).collect::<Vec<_>>(),
+    });
+    let bytes = serde_json::to_vec_pretty(&body)
+        .map_err(|e| BridgeServiceError::Core(format!("serialise template sidecar: {e}")))?;
+    std::fs::write(&sidecar, bytes)?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn write_template(root: &std::path::Path, category: &str, id: &str) {
+        // Default: zero-room, zero-camera, no lighting preset — yields
+        // an empty command batch on instantiation so tests that focus
+        // on later command_apply / command_undo behaviour aren't
+        // perturbed by template-emitted entries in the undo journal.
+        write_template_with(root, category, id, &[], None, &[]);
+    }
+
+    /// Variant of [`write_template`] for tests that want explicit
+    /// template content (rooms / lighting preset / cameras). Returns
+    /// the template key so the call site can pass it back to
+    /// `project_create_from_template`.
+    fn write_template_with(
+        root: &std::path::Path,
+        category: &str,
+        id: &str,
+        rooms: &[(&str, f64, f64, f64)],
+        lighting_preset: Option<&str>,
+        cameras: &[(&str, [f64; 3], [f64; 3], f64)],
+    ) -> String {
         let category_dir = root.join(category);
         std::fs::create_dir_all(&category_dir).unwrap();
         let key = format!("{category}.{id}");
+        let rooms_json: Vec<serde_json::Value> = rooms
+            .iter()
+            .map(|(name, width, depth, height)| {
+                serde_json::json!({
+                    "name": name,
+                    "width_mm": width,
+                    "depth_mm": depth,
+                    "height_mm": height,
+                    "origin_mm": [0.0, 0.0, 0.0],
+                })
+            })
+            .collect();
+        let cameras_json: Vec<serde_json::Value> = cameras
+            .iter()
+            .map(|(name, loc, target, focal)| {
+                serde_json::json!({
+                    "name": name,
+                    "location_mm": loc,
+                    "target_mm": target,
+                    "focal_length_mm": focal,
+                })
+            })
+            .collect();
         let json = serde_json::json!({
             "template_id": key,
             "name": format!("Test {id}"),
@@ -4414,17 +4585,18 @@ mod tests {
             "region_defaults": {
                 "EU": {"units": "mm", "standards": ["IFC4"]}
             },
-            "rooms": [],
+            "rooms": rooms_json,
             "default_walls": {
                 "exterior_thickness_mm": 250,
                 "interior_thickness_mm": 100,
                 "material": "wall_white"
             },
-            "lighting_preset": "daylight",
+            "lighting_preset": lighting_preset,
             "asset_shelf": [],
-            "camera_presets": []
+            "camera_presets": cameras_json
         });
         std::fs::write(category_dir.join(format!("{id}.json")), json.to_string()).unwrap();
+        key
     }
 
     fn service() -> (BridgeService, tempfile::TempDir) {

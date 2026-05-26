@@ -20,16 +20,37 @@ pub struct CreateWall {
 
 impl CreateWall {
     pub fn validate(&self) -> CommandResult<()> {
-        if self.height_mm <= 0.0 {
+        // Defense-in-depth against NaN / infinity numeric inputs
+        // (Devin Review `ANALYSIS_0008` on PR #51). Plain `<= 0.0`
+        // returns `false` for `NaN` in IEEE 754, so a `NaN` height
+        // would otherwise sail through validation, reach
+        // `EntityDelta::Create`, and produce a database row with
+        // `NaN` baked into its serialised body; re-loading that
+        // row would then trip downstream geometry code with no clear
+        // attribution to the original bad input. JSON itself rejects
+        // NaN / +-inf (the spec forbids them), so this is
+        // unreachable from the AI / template / DXF paths today, but
+        // the cost of an `is_finite()` check is one float op and the
+        // failure mode it guards against is silent corruption.
+        // The asymmetry warrants a cheap guard.
+        if !self.height_mm.is_finite() || self.height_mm <= 0.0 {
             return Err(CommandError::InvalidArguments {
                 tool: "design.create_wall".into(),
-                reason: "height must be > 0".into(),
+                reason: "height must be a finite positive number".into(),
             });
         }
-        if self.thickness_mm <= 0.0 {
+        if !self.thickness_mm.is_finite() || self.thickness_mm <= 0.0 {
             return Err(CommandError::InvalidArguments {
                 tool: "design.create_wall".into(),
-                reason: "thickness must be > 0".into(),
+                reason: "thickness must be a finite positive number".into(),
+            });
+        }
+        if !self.start_mm.iter().all(|c| c.is_finite())
+            || !self.end_mm.iter().all(|c| c.is_finite())
+        {
+            return Err(CommandError::InvalidArguments {
+                tool: "design.create_wall".into(),
+                reason: "start_mm and end_mm coordinates must be finite".into(),
             });
         }
         if self.start_mm == self.end_mm {

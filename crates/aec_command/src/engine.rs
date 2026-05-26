@@ -262,6 +262,11 @@ impl CommandEngine {
                 vec![c.to_delta()]
             }
             CommandKind::ModifyFloor(c) => vec![c.to_delta(graph)?],
+            CommandKind::CreateCeiling(c) => {
+                c.validate()?;
+                vec![c.to_delta()]
+            }
+            CommandKind::ModifyCeiling(c) => vec![c.to_delta(graph)?],
             CommandKind::PlaceDoor(c) => {
                 c.validate()?;
                 vec![c.to_delta()]
@@ -457,14 +462,33 @@ impl CommandEngine {
     ///   batch — so command #2's validation sees command #1's
     ///   inserts. This lets a batch like
     ///   `[create_wall_a, place_door_on_a]` validate cleanly.
-    /// * All deltas + all journal entries are persisted in **one**
-    ///   `rusqlite::Transaction`. Either every row commits or none
-    ///   do; there is no "applied the first two but not the third"
-    ///   state observable from outside this call.
-    /// * On commit success the in-memory graph + journal are
-    ///   updated in input order. The result vector is in input
-    ///   order too so callers can correlate `commands[i]` with
-    ///   `results[i]`.
+    /// * All deltas are persisted in **one** `rusqlite::Transaction`.
+    ///   Either every row commits or none do; there is no "applied
+    ///   the first two but not the third" state observable from
+    ///   outside this call.
+    /// * The whole batch lands as **one** `JournalEntry` so a single
+    ///   Cmd-Z reverts every command together. The merged entry's
+    ///   `forward` is the concatenation of every command's deltas in
+    ///   input order; its `inverse` is the concatenation of every
+    ///   command's inverse deltas in **reverse** input order so
+    ///   replaying it on undo undoes command #N first, then N-1,
+    ///   etc. — matching the order required to roll back the
+    ///   forward-walking validation graph. The entry is keyed by a
+    ///   freshly-minted [`CommandId`] (`cmd_<uuid>`) because no
+    ///   single per-command id represents the whole batch, and the
+    ///   `applied_at` is the last command's timestamp (the moment
+    ///   the user observed the batch land).
+    /// * The audit-chain extension is still per-command (one
+    ///   envelope per gesture in input order). The audit chain is
+    ///   the forensic record of what the user/AI asked for; the
+    ///   journal is the user-facing undo stack. Merging the
+    ///   journal collapses *undo steps*, not the forensic trail.
+    /// * On commit success the in-memory graph is updated in input
+    ///   order and the merged journal entry is pushed once. The
+    ///   result vector is in input order too so callers can
+    ///   correlate `commands[i]` with `results[i]`; each result's
+    ///   `applied` is that command's own forward deltas (a slice
+    ///   of the merged entry).
     ///
     /// An empty batch is a no-op that returns an empty result
     /// vector and does not open a transaction.
@@ -511,21 +535,9 @@ impl CommandEngine {
         // front so the transaction window stays short — SQLite's
         // writer lock blocks every concurrent reader for the
         // duration.
-        //
-        // `ANALYSIS_0003` fix: stage the `JournalEntry` *once* per
-        // command here. The previous shape held `(Command, deltas,
-        // inverse)` and reconstructed two separate `JournalEntry`
-        // values per command (one in phase 2 for SQL persist with
-        // `deltas.clone() + inverse.clone()`, another in phase 3
-        // for the in-memory journal with `deltas.clone() + inverse`).
-        // Constructing the entry once lets phase 2 borrow it for
-        // SQL persistence and phase 3 move it into the in-memory
-        // journal — one allocation per command instead of three,
-        // and the SQL/in-memory representations are guaranteed to
-        // be byte-identical (no risk of the two construction sites
-        // drifting under future maintenance).
         let mut staging = self.graph.clone();
-        let mut staged: Vec<(Command, JournalEntry)> = Vec::with_capacity(commands.len());
+        let mut staged: Vec<(Command, Vec<EntityDelta>, Vec<EntityDelta>)> =
+            Vec::with_capacity(commands.len());
         for cmd in commands {
             // `compute_deltas_against_graph` is the pure form that
             // does NOT re-check scope; we already validated scope
@@ -539,56 +551,65 @@ impl CommandEngine {
                 staging.apply(d)?;
             }
             let inverse: Vec<EntityDelta> = deltas.iter().rev().map(EntityDelta::invert).collect();
-            let entry = JournalEntry {
-                command_id: cmd.command_id.clone(),
-                applied_at: cmd.ts,
-                scope: self.active_scope,
-                forward: deltas,
-                inverse,
-            };
-            staged.push((cmd, entry));
+            staged.push((cmd, deltas, inverse));
         }
-        // Phase 2: single SQL transaction covering every delta +
-        // every journal entry. If any write fails (or `commit()`
-        // itself fails) the batch is rolled back and none of the
-        // in-memory mutations from phase 3 below execute.
+        // Build the single merged `JournalEntry` representing the
+        // whole batch as one undo step. See the function docstring
+        // for the inverse-order rationale (we apply per-command
+        // inverses in reverse batch order on undo so the
+        // forward-walking validation graph rolls back in lock-step).
+        let merged_forward: Vec<EntityDelta> = staged
+            .iter()
+            .flat_map(|(_, fwd, _)| fwd.iter().cloned())
+            .collect();
+        let merged_inverse: Vec<EntityDelta> = staged
+            .iter()
+            .rev()
+            .flat_map(|(_, _, inv)| inv.iter().cloned())
+            .collect();
+        let merged_entry = JournalEntry {
+            command_id: CommandId::new(),
+            applied_at: staged
+                .last()
+                .map(|(cmd, _, _)| cmd.ts)
+                .expect("non-empty batch guard above ensures staged is non-empty"),
+            scope: self.active_scope,
+            forward: merged_forward,
+            inverse: merged_inverse,
+        };
+        // Phase 2: single SQL transaction covering every delta and
+        // the one merged journal entry. If any write fails (or
+        // `commit()` itself fails) the batch is rolled back and
+        // none of the in-memory mutations from phase 3 execute.
         let tx = conn.transaction()?;
-        for (_cmd, entry) in &staged {
-            for d in &entry.forward {
-                crate::commands::ProjectGraph::persist_delta_in_tx(&tx, d)?;
-            }
-            crate::journal::UndoRedoJournal::persist_record_in_tx(&tx, entry)?;
+        for d in &merged_entry.forward {
+            crate::commands::ProjectGraph::persist_delta_in_tx(&tx, d)?;
         }
+        crate::journal::UndoRedoJournal::persist_record_in_tx(&tx, &merged_entry)?;
         tx.commit()?;
         // Phase 3: SQL is committed atomically. Mirror in-memory
-        // state and build per-command audit envelopes in the same
-        // order so the chain still records each user gesture
-        // distinctly.
+        // state, extend the audit chain per-command (preserving the
+        // forensic per-gesture record), and build the per-command
+        // result vector. We move `merged_entry` into the journal
+        // at the end so the engine owns the entry for undo.
+        for d in &merged_entry.forward {
+            self.graph
+                .apply(d)
+                .expect("validated above; apply cannot fail");
+        }
         let mut results = Vec::with_capacity(staged.len());
-        for (cmd, entry) in staged {
-            for d in &entry.forward {
-                self.graph
-                    .apply(d)
-                    .expect("validated above; apply cannot fail");
-            }
+        for (cmd, deltas, _inv) in staged {
             let envelope = self.audit.extend(
                 &cmd.command_id,
                 &serde_json::to_value(&cmd).unwrap_or(serde_json::Value::Null),
             );
-            // The `CommandResult.applied` field is the only place
-            // outside the engine that observes the forward deltas,
-            // so we clone once for it and move the entry into the
-            // journal. The journal owns `entry.forward` for undo;
-            // callers see a copy via `CommandResult.applied` for
-            // their own observation (e.g. status pane caching).
-            let applied = entry.forward.clone();
-            self.journal.record(entry);
             results.push(CommandResult {
                 command_id: cmd.command_id,
-                applied,
+                applied: deltas,
                 audit: envelope,
             });
         }
+        self.journal.record(merged_entry);
         Ok(results)
     }
 
@@ -991,7 +1012,8 @@ mod tests {
         use aec_cad::primitives::{Line, Primitive};
         // Three independent DrawPrimitive commands. The batch must:
         // (a) end with all three entities persisted in `entities`,
-        // (b) record three journal entries,
+        // (b) record **one** merged journal entry (single Cmd-Z
+        //     reverts the whole batch),
         // (c) leave the engine's in-memory graph + journal in
         //     lock-step with the persisted state.
         let mut conn = open_in_memory_persistent_db();
@@ -1006,7 +1028,9 @@ mod tests {
         let results = e.execute_persistent_batch(cmds, &mut conn).unwrap();
         assert_eq!(results.len(), 3);
         assert_eq!(e.graph().len(), 3);
-        assert_eq!(e.undo_len(), 3);
+        // One undo step for the whole batch (single Cmd-Z reverts
+        // every command together).
+        assert_eq!(e.undo_len(), 1);
         let entity_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM entities", [], |r| r.get(0))
             .unwrap();
@@ -1014,7 +1038,7 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM undo_journal", [], |r| r.get(0))
             .unwrap();
         assert_eq!(entity_count, 3);
-        assert_eq!(journal_count, 3);
+        assert_eq!(journal_count, 1);
     }
 
     #[test]
@@ -1078,7 +1102,9 @@ mod tests {
         assert_eq!(results.len(), 2);
         // Both commands persisted; both in-memory deltas applied.
         assert_eq!(e.graph().len(), 1);
-        assert_eq!(e.undo_len(), 2);
+        // The whole batch is one undo step (draw + move reverts as
+        // a single Cmd-Z so the user-perceived gesture is atomic).
+        assert_eq!(e.undo_len(), 1);
         // The moved primitive should be at the translated position.
         let record = e.graph().get(&id).unwrap();
         let dp = serde_json::from_value::<DrawPrimitive>(record.body.clone()).unwrap();

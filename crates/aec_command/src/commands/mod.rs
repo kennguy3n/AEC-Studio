@@ -1,6 +1,7 @@
 //! Typed commands for AEC Studio.
 
 pub mod camera;
+pub mod ceiling;
 pub mod deliver;
 pub mod draft;
 pub mod floor;
@@ -39,6 +40,11 @@ pub enum CommandKind {
     CreateFloor(floor::CreateFloor),
     #[serde(rename = "design.modify_floor")]
     ModifyFloor(floor::ModifyFloor),
+
+    #[serde(rename = "design.create_ceiling")]
+    CreateCeiling(ceiling::CreateCeiling),
+    #[serde(rename = "design.modify_ceiling")]
+    ModifyCeiling(ceiling::ModifyCeiling),
 
     #[serde(rename = "design.place_door")]
     PlaceDoor(opening::PlaceDoor),
@@ -100,6 +106,8 @@ impl CommandKind {
             Self::ModifyRoom(_) => "design.modify_room",
             Self::CreateFloor(_) => "design.create_floor",
             Self::ModifyFloor(_) => "design.modify_floor",
+            Self::CreateCeiling(_) => "design.create_ceiling",
+            Self::ModifyCeiling(_) => "design.modify_ceiling",
             Self::PlaceDoor(_) => "design.place_door",
             Self::PlaceWindow(_) => "design.place_window",
             Self::MoveOpening(_) => "design.move_opening",
@@ -138,6 +146,8 @@ impl CommandKind {
             | Self::ModifyRoom(_)
             | Self::CreateFloor(_)
             | Self::ModifyFloor(_)
+            | Self::CreateCeiling(_)
+            | Self::ModifyCeiling(_)
             | Self::PlaceDoor(_)
             | Self::PlaceWindow(_)
             | Self::MoveOpening(_)
@@ -190,6 +200,30 @@ impl Command {
             ts: chrono::Utc::now(),
             scope: kind.scope(),
             actor: Actor::ai(tool),
+            kind,
+        }
+    }
+
+    /// Build a command sourced from a KChat (kennguy3n chat / review)
+    /// participant. The `commenter` argument is the chat handle of
+    /// whoever drove this command — typically a reviewer applying a
+    /// fix suggested in a review thread.
+    ///
+    /// Devin Review `ANALYSIS_0007` (PR #51): the previous shape had
+    /// no `Command::kchat` constructor, so [`crate::template_apply`]
+    /// silently downgraded `ActorKind::KChat` to `Actor::user()`
+    /// when synthesising commands. That collapsed the
+    /// KChat-vs-User distinction on the audit trail. Adding the
+    /// constructor (paralleling [`Self::user`] and [`Self::ai`])
+    /// preserves the source actor faithfully at the command layer
+    /// for any future flow that drives template instantiation
+    /// from a chat thread.
+    pub fn kchat(commenter: impl Into<String>, kind: CommandKind) -> Self {
+        Self {
+            command_id: CommandId::new(),
+            ts: chrono::Utc::now(),
+            scope: kind.scope(),
+            actor: Actor::kchat(commenter),
             kind,
         }
     }
