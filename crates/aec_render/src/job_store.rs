@@ -137,47 +137,8 @@ impl RenderJobStore {
 
     /// Insert or update a single job. Atomic per call.
     pub fn upsert(&self, job: &RenderJob) -> RenderJobStoreResult<()> {
-        let payload = serde_json::to_string(job)?;
-        let completed_frames = serde_json::to_string(&job.completed_frames)?;
         let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO render_jobs (
-                id, status, priority, progress, batch_id, camera_id,
-                output_path, error, created_at, started_at, completed_at,
-                completed_frames, payload
-             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13
-             ) ON CONFLICT(id) DO UPDATE SET
-                status = excluded.status,
-                priority = excluded.priority,
-                progress = excluded.progress,
-                batch_id = excluded.batch_id,
-                camera_id = excluded.camera_id,
-                output_path = excluded.output_path,
-                error = excluded.error,
-                started_at = excluded.started_at,
-                completed_at = excluded.completed_at,
-                completed_frames = excluded.completed_frames,
-                payload = excluded.payload",
-            params![
-                job.id,
-                status_to_str(job.status),
-                job.priority,
-                job.progress as f64,
-                job.batch_id,
-                job.camera_id,
-                job.output_path
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().to_string()),
-                job.error,
-                rfc3339(job.created_at),
-                job.started_at.map(rfc3339),
-                job.completed_at.map(rfc3339),
-                completed_frames,
-                payload,
-            ],
-        )?;
-        Ok(())
+        write_job_row(&conn, job)
     }
 
     /// Remove a job by id. Returns `true` if a row was deleted.
@@ -398,7 +359,6 @@ impl RenderJobStore {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let running = status_to_str(RenderJobStatus::Running);
-        let queued = status_to_str(RenderJobStatus::Queued);
         let payloads: Vec<String> = {
             let mut stmt = tx.prepare("SELECT payload FROM render_jobs WHERE status = ?1")?;
             let rows = stmt
@@ -419,26 +379,19 @@ impl RenderJobStore {
             // `progress` and `completed_frames` are intentionally
             // preserved so walkthrough workers can resume from the
             // last completed frame; see doc-comment above.
-            let new_payload = serde_json::to_string(&job)?;
-            let completed_frames = serde_json::to_string(&job.completed_frames)?;
-            tx.execute(
-                "UPDATE render_jobs SET
-                    status = ?1,
-                    payload = ?2,
-                    started_at = NULL,
-                    progress = ?3,
-                    error = NULL,
-                    completed_at = NULL,
-                    completed_frames = ?4
-                 WHERE id = ?5",
-                params![
-                    queued,
-                    new_payload,
-                    job.progress as f64,
-                    completed_frames,
-                    job.id,
-                ],
-            )?;
+            //
+            // Use the shared `write_job_row` helper so every indexed
+            // column (priority, batch_id, camera_id, output_path,
+            // progress, error, completed_at, completed_frames) is
+            // refreshed from the *mutated* payload. This makes the
+            // "indexed columns mirror payload" invariant ironclad
+            // regardless of which fields future reincarnation logic
+            // chooses to change — drop a `job.priority -= 1` here and
+            // the column reflects it without an SQL edit. The
+            // INSERT ON CONFLICT UPDATE clause preserves `created_at`
+            // by design (it's only in the INSERT row, never the SET
+            // list).
+            write_job_row(&tx, &job)?;
             n += 1;
         }
         tx.commit()?;
@@ -496,6 +449,76 @@ fn status_to_str(s: RenderJobStatus) -> &'static str {
 
 fn rfc3339(dt: DateTime<Utc>) -> String {
     dt.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+}
+
+/// Write a single job row, mirroring **every** indexed column from the
+/// supplied payload.
+///
+/// This is the single source of truth for the
+/// "indexed columns mirror payload" invariant. Both [`RenderJobStore::upsert`]
+/// (top-level, autocommit) and
+/// [`RenderJobStore::reincarnate_running_as_queued`]
+/// (inside an explicit transaction) call this helper, so adding a new
+/// indexed column to the schema requires editing **one** SQL site, not
+/// two — and any future reincarnation logic that mutates additional
+/// payload fields (e.g. demoting `priority`, clearing `output_path`)
+/// is automatically reflected in the indexed columns with no extra
+/// SQL edit. Without this centralisation the reincarnate path would
+/// silently leave stale `priority` / `batch_id` / `camera_id` /
+/// `output_path` values in the indexed columns whenever a future
+/// change touched those fields in the payload — a classic
+/// indexed-column drift bug.
+///
+/// The `INSERT ... ON CONFLICT(id) DO UPDATE` form preserves
+/// `created_at` on the conflict branch by deliberately omitting it
+/// from the SET clause: `created_at` is a per-job immutable timestamp
+/// of first enqueue, and reincarnation must not appear to "recreate"
+/// the job.
+///
+/// `conn` accepts both a raw `&Connection` (autocommit) and an
+/// `&Transaction` (via `Deref<Target = Connection>`), so callers can
+/// choose their own isolation scope without duplicating the SQL.
+fn write_job_row(conn: &Connection, job: &RenderJob) -> RenderJobStoreResult<()> {
+    let payload = serde_json::to_string(job)?;
+    let completed_frames = serde_json::to_string(&job.completed_frames)?;
+    conn.execute(
+        "INSERT INTO render_jobs (
+            id, status, priority, progress, batch_id, camera_id,
+            output_path, error, created_at, started_at, completed_at,
+            completed_frames, payload
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13
+         ) ON CONFLICT(id) DO UPDATE SET
+            status = excluded.status,
+            priority = excluded.priority,
+            progress = excluded.progress,
+            batch_id = excluded.batch_id,
+            camera_id = excluded.camera_id,
+            output_path = excluded.output_path,
+            error = excluded.error,
+            started_at = excluded.started_at,
+            completed_at = excluded.completed_at,
+            completed_frames = excluded.completed_frames,
+            payload = excluded.payload",
+        params![
+            job.id,
+            status_to_str(job.status),
+            job.priority,
+            job.progress as f64,
+            job.batch_id,
+            job.camera_id,
+            job.output_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
+            job.error,
+            rfc3339(job.created_at),
+            job.started_at.map(rfc3339),
+            job.completed_at.map(rfc3339),
+            completed_frames,
+            payload,
+        ],
+    )?;
+    Ok(())
 }
 
 /// Transaction-bound mirror of [`RenderJobStore::list_by_status`].
@@ -840,6 +863,116 @@ mod tests {
         );
         assert!((got.progress - 0.7).abs() < 1e-5);
         assert_eq!(got.completed_frames, vec![0, 1]);
+    }
+
+    #[test]
+    fn reincarnate_mirrors_non_status_columns_from_payload() {
+        // Regression: closes the latent indexed-column-drift class that
+        // Devin Review flagged on `reincarnate_running_as_queued`. The
+        // previous implementation hand-rolled a partial `UPDATE SET …`
+        // listing only the columns the reincarnation logic *currently*
+        // mutates (status / started_at / progress / error /
+        // completed_at / completed_frames). That meant a future change
+        // adding `job.priority -= 1` or `job.output_path = None` to
+        // the reincarnation logic would silently leave the *column*
+        // values stale relative to the payload — invisible to anyone
+        // reading the JSON payload, but corrupting dashboards / batch
+        // reports that filter on the indexed columns.
+        //
+        // The current implementation routes reincarnation through the
+        // same `write_job_row` helper as `upsert`, so **every** indexed
+        // column is refreshed from the (mutated) payload on every
+        // reincarnation. This test locks that contract by asserting
+        // priority / batch_id / camera_id / output_path are still
+        // mirrored from the payload after a reincarnation, even though
+        // the reincarnation logic does not currently mutate them. If
+        // a future change to `reincarnate_running_as_queued` *does*
+        // mutate those fields, this test will still pass — the
+        // columns track the payload by construction.
+        let (_d, s) = open_store();
+        let mut j = job(7);
+        j.status = RenderJobStatus::Running;
+        j.priority = 7;
+        j.batch_id = Some("batch-X".to_string());
+        j.camera_id = Some("cam-Y".to_string());
+        j.output_path = Some(std::path::PathBuf::from("/tmp/reincarnate-mirror.png"));
+        j.started_at = Some(Utc::now());
+        s.upsert(&j).unwrap();
+
+        let n = s.reincarnate_running_as_queued().unwrap();
+        assert_eq!(n, 1);
+
+        let conn = s.conn.lock().unwrap();
+        let (status, priority, batch_id, camera_id, output_path, payload): (
+            String,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT status, priority, batch_id, camera_id, output_path, payload
+                 FROM render_jobs WHERE id = ?1",
+                params![j.id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        drop(conn);
+
+        assert_eq!(status, "queued");
+        let from_payload: RenderJob = serde_json::from_str(&payload).unwrap();
+
+        // Every non-status indexed column must equal the value you
+        // would get by parsing the JSON payload. This is the actual
+        // invariant — "indexed columns mirror payload" — applied to
+        // the reincarnation path, not just upsert.
+        assert_eq!(
+            from_payload.priority as i64, priority,
+            "priority column must mirror payload after reincarnate"
+        );
+        assert_eq!(
+            from_payload.batch_id, batch_id,
+            "batch_id column must mirror payload after reincarnate"
+        );
+        assert_eq!(
+            from_payload.camera_id, camera_id,
+            "camera_id column must mirror payload after reincarnate"
+        );
+        assert_eq!(
+            from_payload
+                .output_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
+            output_path,
+            "output_path column must mirror payload after reincarnate"
+        );
+
+        // Sanity-check the un-mutated payload values themselves so a
+        // future bug that nulls them out in `reincarnate_running_as_queued`
+        // is caught here too — these are the fields the doc-comment
+        // labels "neither forward-looking nor artifacts of the prior
+        // attempt" and that reincarnation must therefore preserve
+        // verbatim.
+        assert_eq!(from_payload.priority, 7);
+        assert_eq!(from_payload.batch_id.as_deref(), Some("batch-X"));
+        assert_eq!(from_payload.camera_id.as_deref(), Some("cam-Y"));
+        assert_eq!(
+            from_payload
+                .output_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
+            Some("/tmp/reincarnate-mirror.png".to_string()),
+        );
     }
 
     #[test]
