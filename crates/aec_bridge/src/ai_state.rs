@@ -81,7 +81,7 @@
 //! | `snapshot`            | —           | read                  | lock          |
 //! | `state` / `last_error`| —           | read                  | —             |
 //! | `insert_diff`         | —           | —                     | lock          |
-//! | `accept_diff` / `reject_diff` | —   | —                     | lock          |
+//! | `peek_diff` / `finalize_diff` | —   | —                     | lock          |
 //!
 //! Notably, [`AiState::snapshot`] — the renderer's hot read path —
 //! deliberately does **not** touch `handle_slot`. That is what lets
@@ -386,24 +386,43 @@ impl AiState {
         Ok(id)
     }
 
-    /// Remove and return the pending diff for `id`. The returned
-    /// envelope carries both the `Diff` (for conversion to commands)
-    /// and the `project_path` (for opening the package).
-    pub fn accept_diff(&self, id: &str) -> Result<PendingDiff, AiStateError> {
+    /// Return a clone of the pending diff for `id` **without
+    /// removing it from the registry**. This is the read half of
+    /// the peek-then-finalize pattern the service uses to avoid
+    /// permanently losing a diff if downstream I/O (open package,
+    /// load graph, batch apply, audit append) fails after the
+    /// caller has begun processing the diff. The caller must call
+    /// [`Self::finalize_diff`] only after every fallible step has
+    /// succeeded; on any error, the diff stays in the registry so
+    /// the user can retry the accept / reject.
+    ///
+    /// See `BUG_0001 (round 2)`: prior to this split, the service
+    /// popped the diff up-front and any later failure dropped it
+    /// from the registry with no recovery path.
+    pub fn peek_diff(&self, id: &str) -> Result<PendingDiff, AiStateError> {
         let key = DiffId::from_string(id.to_string())
             .map_err(|_| AiStateError::UnknownDiff(id.to_owned()))?;
         self.pending_diffs
             .lock()
             .map_err(poisoned)?
-            .remove(&key)
+            .get(&key)
+            .cloned()
             .ok_or_else(|| AiStateError::UnknownDiff(id.to_owned()))
     }
 
-    /// Symmetric counterpart to [`Self::accept_diff`] — same return
-    /// shape so the audit-logging path on the reject side can read
-    /// both the diff (for `payload_hash`) and the project path (for
-    /// the `<project>/audit/ai_audit.jsonl` destination).
-    pub fn reject_diff(&self, id: &str) -> Result<PendingDiff, AiStateError> {
+    /// Remove the pending diff for `id`. The write half of the
+    /// peek-then-finalize pattern — callers invoke this only after
+    /// every fallible step has succeeded so a failure mid-accept
+    /// preserves the registry entry for retry. Returns the removed
+    /// envelope so the caller can confirm the entry was present
+    /// (any caller treating this as advisory may discard the
+    /// returned value).
+    ///
+    /// If the entry was already removed (e.g. a concurrent finalize
+    /// for the same id), this returns `AiStateError::UnknownDiff`
+    /// to surface the unexpected race rather than silently
+    /// no-op'ing.
+    pub fn finalize_diff(&self, id: &str) -> Result<PendingDiff, AiStateError> {
         let key = DiffId::from_string(id.to_string())
             .map_err(|_| AiStateError::UnknownDiff(id.to_owned()))?;
         self.pending_diffs

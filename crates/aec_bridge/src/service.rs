@@ -32,7 +32,7 @@ use aec_render::preset::RenderPresetStore;
 use aec_render::queue::{BatchProgress as CoreBatchProgress, RenderQueue};
 use aec_render::scene::RenderScene;
 
-use crate::ai_state::{AiState, AiStateError, DEFAULT_SPAWN_TIMEOUT};
+use crate::ai_state::{AiState, AiStateError, PendingDiff, DEFAULT_SPAWN_TIMEOUT};
 use crate::asset_state::AssetState;
 use crate::bim_attach;
 use crate::engine_status_cache::EngineStatusCache;
@@ -3407,9 +3407,12 @@ impl BridgeService {
     ///
     /// The real apply path is:
     ///
-    ///   1. Pop the `PendingDiff` from `AiState::pending_diffs`
-    ///      (which yields both the `Diff` and the project path it
-    ///      was planned against).
+    ///   1. **Peek** the `PendingDiff` from `AiState::pending_diffs`
+    ///      (which yields a clone of both the `Diff` and the project
+    ///      path it was planned against) — the registry entry is
+    ///      deliberately left in place until step 6 so any failure
+    ///      in steps 2-5 leaves the diff available for retry. See
+    ///      `BUG_0001 (round 2)`.
     ///   2. Open the project package + SQLCipher connection, then
     ///      load the current `ProjectGraph` so the converter can
     ///      dispatch `Update` / `Delete` operations to typed
@@ -3421,7 +3424,10 @@ impl BridgeService {
     ///   4. Route the batch through [`Self::command_apply_batch`]
     ///      so the SQL transaction, journal, and audit envelope
     ///      are all journaled atomically. The renderer's undo
-    ///      stack pops the AI batch like any other command.
+    ///      stack pops the AI batch like any other command. The
+    ///      engine is opened via [`CommandEngine::open_with_graph`]
+    ///      reusing the graph loaded in step 2 so the `entities`
+    ///      table is not re-read (see `ANALYSIS_0003 (round 2)`).
     ///   5. Append an `AiAuditRecord { status: Accepted, .. }` to
     ///      `<project>/audit/ai_audit.jsonl` for AI-specific
     ///      provenance. The main command audit chain already has
@@ -3430,6 +3436,9 @@ impl BridgeService {
     ///      auditors can answer "how many of the model's proposals
     ///      did the user accept?" without grepping through every
     ///      command's actor field.
+    ///   6. **Finalize** by removing the `PendingDiff` from the
+    ///      registry. This step runs only after every fallible
+    ///      operation above has succeeded.
     ///
     /// Operations the converter could not translate (unknown
     /// entity kind, dangling target, missing payload field) are
@@ -3438,7 +3447,31 @@ impl BridgeService {
     /// diff and clicked Accept, so the service commits whatever
     /// subset the schema understands.
     pub fn ai_accept_diff(&mut self, diff_id: &str) -> Result<AiAcceptOutcome, BridgeServiceError> {
-        let pending = self.ai_state.accept_diff(diff_id)?;
+        // `BUG_0001 (round 2)`: peek-then-finalize. We *clone* the
+        // pending diff up front; the registry entry is left intact
+        // until every fallible downstream step (open package, load
+        // graph, batch apply, audit append) has succeeded. Any
+        // error returned from this method preserves the pending
+        // entry so the renderer can retry — prior to this split,
+        // a transient failure (e.g. SQLCipher key mismatch on a
+        // moved project, disk-full on audit append) silently lost
+        // the diff with no recovery path.
+        let pending = self.ai_state.peek_diff(diff_id)?;
+        let outcome = self.ai_accept_diff_inner(diff_id, pending)?;
+        // Only finalize (remove from the registry) after the
+        // accept has fully committed. `finalize_diff` returning
+        // `UnknownDiff` here would mean a concurrent finalize for
+        // the same id raced ahead of us — that is genuinely
+        // anomalous so we surface it instead of silently swallowing.
+        self.ai_state.finalize_diff(diff_id)?;
+        Ok(outcome)
+    }
+
+    fn ai_accept_diff_inner(
+        &mut self,
+        diff_id: &str,
+        pending: PendingDiff,
+    ) -> Result<AiAcceptOutcome, BridgeServiceError> {
         let project_path = pending.project_path.clone();
         // `pending.scope` is the engine scope the user invoked the
         // plan under (e.g. `Design` for a furniture-placement
@@ -3487,16 +3520,20 @@ impl BridgeService {
         let applied_results: Vec<CommandApplyResult> = if conversion.commands.is_empty() {
             Vec::new()
         } else {
-            // Drive the batch through the same on-conn helper that
-            // single applies use so the SQL transaction stays
-            // co-extensive with the per-command engine state.
+            // Reuse the graph we already loaded for `diff_to_commands`
+            // instead of letting `CommandEngine::open` re-read the
+            // `entities` table a second time. The graph is moved
+            // into the engine here (we no longer need it after the
+            // converter ran) — this is the
+            // `ANALYSIS_0003 (round 2)` double-load fix.
+            //
             // The engine is opened with the plan's authoritative
             // scope (`plan_scope`); the batch path now enforces
             // every command match that scope (see `BUG_0001`), so
             // a model that emits an off-scope command surfaces a
             // `ScopeMismatch` before any SQL is touched rather
             // than silently mislabelling the journal entry.
-            let mut engine = aec_command::CommandEngine::open(&conn, plan_scope)
+            let mut engine = aec_command::CommandEngine::open_with_graph(&conn, plan_scope, graph)
                 .map_err(|e| BridgeServiceError::Command(e.to_string()))?;
             let results = engine
                 .execute_persistent_batch(conversion.commands, &mut conn)
@@ -3524,6 +3561,16 @@ impl BridgeService {
         // surface the error — the graph mutation is already on
         // disk, but the renderer needs to know the provenance log
         // is out of sync so the user can re-export the audit chain.
+        //
+        // Note (`ANALYSIS_0006`): the SQL commit and the audit-log
+        // append are deliberately a two-phase write — the JSONL
+        // chain file cannot share a transaction with SQLCipher.
+        // We commit SQL first so a failed audit append leaves the
+        // graph correct and a stale audit log (which the chain
+        // verifier can detect via the next-record hash mismatch),
+        // rather than the inverse where a failed SQL commit would
+        // leave a phantom audit entry for an operation that never
+        // happened. See the design doc for the rationale.
         //
         // We reuse the `pkg` opened above so the audit append
         // doesn't re-derive the project key and re-issue the
@@ -3557,7 +3604,24 @@ impl BridgeService {
         diff_id: &str,
         reason: Option<&str>,
     ) -> Result<AiRejectOutcome, BridgeServiceError> {
-        let pending = self.ai_state.reject_diff(diff_id)?;
+        // `BUG_0001 (round 2)`: same peek-then-finalize discipline
+        // as `ai_accept_diff` — see that method for the full
+        // rationale. If the audit append fails (disk-full, missing
+        // project, etc.), the pending entry survives so the
+        // renderer can retry the reject (or escalate via the
+        // pending-diff inspector).
+        let pending = self.ai_state.peek_diff(diff_id)?;
+        let outcome = self.ai_reject_diff_inner(diff_id, pending, reason)?;
+        self.ai_state.finalize_diff(diff_id)?;
+        Ok(outcome)
+    }
+
+    fn ai_reject_diff_inner(
+        &mut self,
+        diff_id: &str,
+        pending: PendingDiff,
+        reason: Option<&str>,
+    ) -> Result<AiRejectOutcome, BridgeServiceError> {
         let project_path = pending.project_path.clone();
         let scope = pending.scope;
         let diff = pending.diff;

@@ -446,6 +446,101 @@ fn ai_accept_diff_rejects_unknown_id() {
     assert!(err.to_string().contains("not found"));
 }
 
+/// `BUG_0001 (round 2)` regression: if `ai_accept_diff` fails after
+/// the initial peek (e.g. the project package can no longer be
+/// opened because the on-disk files were moved/deleted), the pending
+/// diff must survive in the registry so the renderer can retry once
+/// the underlying problem is resolved. Prior to the peek/finalize
+/// split, the diff was popped up-front and any downstream error
+/// dropped it from the registry permanently.
+#[test]
+fn ai_accept_diff_failure_preserves_pending_diff_for_retry() {
+    let (mut s, _g, project_path) = make_service_with_project();
+    let listener = bind_loopback();
+    let port = listener.local_addr().unwrap().port();
+    let resp = canned_response(valid_style_assistant_response_bytes());
+    let _join = spawn_mock_sidecar(listener, resp, 1);
+    wire_ai_state_to_mock(&mut s, port);
+
+    let result = s
+        .ai_plan(&project_path, "style_assistant", Scope::Design, "", "{}", 5)
+        .unwrap();
+    // Sanity: the diff is registered before we corrupt the project.
+    let st = s.ai_runtime_status().unwrap();
+    assert_eq!(
+        st.pending_diff_ids,
+        vec![result.diff_id.clone()],
+        "diff must be pending after ai_plan"
+    );
+
+    // Force `ai_accept_diff_inner` to fail by removing the project
+    // directory. `ProjectPackage::open_with_master_key_and_database`
+    // will fail before any SQL is touched, so the inner method
+    // returns an error without committing anything.
+    std::fs::remove_dir_all(&project_path).expect("remove project dir");
+
+    let err = s.ai_accept_diff(&result.diff_id).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("not found"),
+        "the failure must come from the package open, not the diff registry: {msg}"
+    );
+
+    // The diff must STILL be in the registry so the renderer can
+    // retry after the user restores the project.
+    let st = s.ai_runtime_status().unwrap();
+    assert_eq!(
+        st.pending_diff_ids,
+        vec![result.diff_id.clone()],
+        "BUG_0001 (round 2): pending diff must survive a failed accept"
+    );
+}
+
+/// `BUG_0001 (round 2)` regression for the reject path: same
+/// invariant as the accept-path test above. The audit append is the
+/// only fallible step in reject, but any failure there must NOT
+/// drop the pending diff.
+#[test]
+fn ai_reject_diff_failure_preserves_pending_diff_for_retry() {
+    let (mut s, _g, project_path) = make_service_with_project();
+    let listener = bind_loopback();
+    let port = listener.local_addr().unwrap().port();
+    let resp = canned_response(valid_style_assistant_response_bytes());
+    let _join = spawn_mock_sidecar(listener, resp, 1);
+    wire_ai_state_to_mock(&mut s, port);
+
+    let result = s
+        .ai_plan(&project_path, "style_assistant", Scope::Design, "", "{}", 5)
+        .unwrap();
+    let st = s.ai_runtime_status().unwrap();
+    assert_eq!(
+        st.pending_diff_ids,
+        vec![result.diff_id.clone()],
+        "diff must be pending after ai_plan"
+    );
+
+    // Remove the project directory so `ProjectPackage::open_with_master_key`
+    // (called inside `ai_reject_diff_inner`) fails before any audit
+    // entry is written.
+    std::fs::remove_dir_all(&project_path).expect("remove project dir");
+
+    let err = s
+        .ai_reject_diff(&result.diff_id, Some("retry me"))
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("not found"),
+        "the failure must come from the package open, not the diff registry: {msg}"
+    );
+
+    let st = s.ai_runtime_status().unwrap();
+    assert_eq!(
+        st.pending_diff_ids,
+        vec![result.diff_id.clone()],
+        "BUG_0001 (round 2): pending diff must survive a failed reject"
+    );
+}
+
 #[test]
 fn ai_accept_diff_rejects_malformed_id() {
     let (mut s, _g) = make_service();

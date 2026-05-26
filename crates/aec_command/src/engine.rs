@@ -336,8 +336,24 @@ impl CommandEngine {
     /// `undo_journal`. Use [`Self::execute_persistent`] to commit
     /// subsequent commands back to disk.
     pub fn open(conn: &rusqlite::Connection, active_scope: Scope) -> Result<Self> {
+        let graph = crate::commands::ProjectGraph::load(conn)?;
+        Self::open_with_graph(conn, active_scope, graph)
+    }
+
+    /// Like [`Self::open`] but reuses an already-loaded [`ProjectGraph`]
+    /// instead of re-reading the `entities` table. The caller must
+    /// guarantee `graph` reflects the current contents of `conn`'s
+    /// `entities` table (i.e. nothing has mutated the table between
+    /// loading the graph and this call). Used by the AI accept path
+    /// and similar flows where the graph was loaded once for diff
+    /// translation and would otherwise be re-read here.
+    pub fn open_with_graph(
+        conn: &rusqlite::Connection,
+        active_scope: Scope,
+        graph: crate::commands::ProjectGraph,
+    ) -> Result<Self> {
         Ok(Self {
-            graph: crate::commands::ProjectGraph::load(conn)?,
+            graph,
             journal: crate::journal::UndoRedoJournal::load(conn, 1024)?,
             audit: crate::audit::AuditHashChain::new(),
             active_scope,

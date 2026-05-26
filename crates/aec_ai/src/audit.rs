@@ -74,15 +74,16 @@ pub struct AiAuditLogger {
 
 impl AiAuditLogger {
     /// Open (or create) the AI audit log at `chain_path`. The
-    /// forensic companion file is derived from `chain_path` by
-    /// substituting the file stem: e.g. `audit/ai_audit.jsonl`
-    /// pairs with `audit/ai_records.jsonl`. Both files are created
+    /// forensic companion file is derived by appending `_records`
+    /// to the chain file's stem and keeping the same extension:
+    /// e.g. `audit/ai_audit.jsonl` pairs with
+    /// `audit/ai_audit_records.jsonl`. Both files are created
     /// lazily on first append.
     pub fn open(chain_path: impl AsRef<Path>) -> Result<Self, AuditError> {
         let chain_path = chain_path.as_ref();
-        // `ai_audit.jsonl` -> `ai_records.jsonl`. We derive the
-        // companion path so callers only pass one path to `open`
-        // and don't have to know about the two-file layout.
+        // `ai_audit.jsonl` -> `ai_audit_records.jsonl`. We derive
+        // the companion path so callers only pass one path to
+        // `open` and don't have to know about the two-file layout.
         let records_path = match chain_path.file_stem().and_then(|s| s.to_str()) {
             Some(stem) => {
                 let mut p = chain_path.to_path_buf();
