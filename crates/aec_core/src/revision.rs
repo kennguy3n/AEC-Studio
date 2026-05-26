@@ -19,7 +19,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use rusqlite::Connection;
@@ -409,11 +409,21 @@ impl RevisionStore {
     }
 
     /// Absolute path of a revision's snapshot file inside this store.
+    ///
+    /// The `relative_path` field is read from the on-disk JSON sidecar,
+    /// so it's treated as untrusted input. We pass it through
+    /// [`validate_snapshot_relative_path`] before joining against
+    /// [`Self::dir`]: a tampered sidecar that points at e.g.
+    /// `"../../etc/passwd"` cannot redirect snapshot operations outside
+    /// the revisions directory. If validation fails this method returns
+    /// `None`, matching the "no usable snapshot" semantics that
+    /// integrity-sensitive callers already gate on.
     pub fn snapshot_path(&self, revision: &Revision) -> Option<PathBuf> {
-        revision
-            .snapshot
-            .as_ref()
-            .map(|s| self.dir.join(&s.relative_path))
+        let meta = revision.snapshot.as_ref()?;
+        if validate_snapshot_relative_path(&meta.relative_path).is_err() {
+            return None;
+        }
+        Some(self.dir.join(&meta.relative_path))
     }
 
     /// Re-hash the on-disk snapshot file and compare it against the
@@ -442,6 +452,18 @@ impl RevisionStore {
         let Some(meta) = revision.snapshot.as_ref() else {
             return Ok(SnapshotVerification::NoSnapshot);
         };
+        // The `relative_path` is read from the on-disk JSON sidecar and
+        // therefore treated as untrusted: a tampered sidecar pointing at
+        // `"../../something"` is rejected as `Mismatch` (the metadata
+        // is unusable so the snapshot can't be verified) rather than
+        // letting it through to `blake3_of_file` against an arbitrary
+        // path. This is defense-in-depth — the desktop deployment
+        // doesn't currently expose this surface to untrusted input, but
+        // the check is cheap and protects future scenarios where
+        // snapshot metadata might be imported from another user.
+        if validate_snapshot_relative_path(&meta.relative_path).is_err() {
+            return Ok(SnapshotVerification::Mismatch);
+        }
         let snap_path = self.dir.join(&meta.relative_path);
         let (hex, _size) = blake3_of_file(&snap_path)?;
         if hex == meta.blake3_hex {
@@ -530,15 +552,30 @@ impl RevisionStore {
 
         // Resolve the snapshot path from the JSON sidecar's stored
         // `relative_path` so `delete` stays consistent with
-        // `snapshot_path` / `verify_snapshot`. If the JSON can't be
-        // parsed (corruption), fall back to the legacy `{id}.snap`
-        // pattern so an unparseable JSON can't strand its snap on
-        // disk.
+        // `snapshot_path` / `verify_snapshot`. The JSON sidecar is
+        // treated as untrusted (it's a plain file in a directory the
+        // user can edit, and may in future be imported from an external
+        // project package), so the `relative_path` is run through
+        // `validate_snapshot_relative_path` before being joined against
+        // `self.dir`. A tampered path that tries to escape the
+        // revisions directory (e.g. `"../OUTSIDE"`) falls back to the
+        // legacy `{id}.snap` pattern in our own dir — `delete` never
+        // chases the tampered target.
+        //
+        // If the JSON can't be parsed (corruption), we also fall back
+        // to the legacy `{id}.snap` pattern so an unparseable JSON
+        // can't strand its snap on disk.
         let snap_path: PathBuf = match fs::read(&json_path) {
             Ok(bytes) => match serde_json::from_slice::<Revision>(&bytes) {
                 Ok(rev) => rev.snapshot.as_ref().map_or_else(
                     || self.dir.join(format!("{id}.snap")),
-                    |s| self.dir.join(&s.relative_path),
+                    |s| {
+                        if validate_snapshot_relative_path(&s.relative_path).is_ok() {
+                            self.dir.join(&s.relative_path)
+                        } else {
+                            self.dir.join(format!("{id}.snap"))
+                        }
+                    },
                 ),
                 Err(_) => self.dir.join(format!("{id}.snap")),
             },
@@ -561,6 +598,60 @@ impl RevisionStore {
         fs::rename(&tmp_path, &final_path)?;
         Ok(())
     }
+}
+
+/// Validate that a `relative_path` read from snapshot metadata is
+/// strictly relative to the revisions directory — i.e. it cannot
+/// traverse upwards, isn't absolute, and doesn't contain null bytes.
+///
+/// Snapshot metadata lives in a JSON sidecar on the same filesystem
+/// the user already controls, so a tampered `relative_path` is not
+/// currently exploitable. This check is defense-in-depth for future
+/// scenarios where snapshot metadata could arrive from outside the
+/// user's own machine (e.g. imported as part of a shared project
+/// package). Without it, [`RevisionStore::delete`] /
+/// [`RevisionStore::snapshot_path`] / [`RevisionStore::verify_snapshot`]
+/// would happily resolve `"../../etc/passwd"` against the revisions
+/// directory and act on it.
+///
+/// Accepts only paths composed entirely of [`Component::Normal`]
+/// segments. Rejects:
+///
+/// * The empty string (no path at all).
+/// * Any null byte in the path (defensive — Unix syscalls reject
+///   them, Windows just treats them as a string terminator).
+/// * `Component::ParentDir` (`..`) — the explicit traversal case.
+/// * `Component::RootDir` / `Component::Prefix` — absolute paths.
+/// * `Component::CurDir` (`.`) — not strictly an attack, but `Path`
+///   normalizes these away on most inputs, so any leftover one signals
+///   an unusual / hand-crafted path that we'd rather not trust.
+///
+/// Subdirectory layouts (e.g. `"sub/{id}.snap"`) are deliberately
+/// allowed for forward compatibility — the current
+/// [`RevisionStore::create_with_snapshot`] always writes a flat
+/// `{id}.snap`, but a future migration to a sharded layout should
+/// not require touching this validator.
+fn validate_snapshot_relative_path(p: &str) -> Result<(), AecError> {
+    if p.is_empty() {
+        return Err(AecError::Other(
+            "snapshot relative_path is empty".to_string(),
+        ));
+    }
+    if p.contains('\0') {
+        return Err(AecError::Other(format!(
+            "snapshot relative_path contains null byte: {p:?}"
+        )));
+    }
+    let path = Path::new(p);
+    for comp in path.components() {
+        if !matches!(comp, Component::Normal(_)) {
+            return Err(AecError::Other(format!(
+                "snapshot relative_path is not strictly relative \
+                 (contains `..`, absolute root, or curdir): {p:?}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Compute BLAKE3 of a file in streaming fashion (no full-file
@@ -1055,6 +1146,157 @@ mod tests {
              not the hardcoded {{id}}.snap"
         );
         assert!(store.get(&rev.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn validate_snapshot_relative_path_accepts_simple_filename() {
+        assert!(validate_snapshot_relative_path("rev-1.snap").is_ok());
+        assert!(validate_snapshot_relative_path("abc123.snap").is_ok());
+    }
+
+    #[test]
+    fn validate_snapshot_relative_path_accepts_subdirectory_layout() {
+        // Forward-compatible: a future migration to a sharded layout
+        // must not require touching the validator.
+        assert!(validate_snapshot_relative_path("sub/rev-1.snap").is_ok());
+        assert!(validate_snapshot_relative_path("a/b/c/rev-1.snap").is_ok());
+    }
+
+    #[test]
+    fn validate_snapshot_relative_path_rejects_empty_string() {
+        assert!(validate_snapshot_relative_path("").is_err());
+    }
+
+    #[test]
+    fn validate_snapshot_relative_path_rejects_parent_dir_traversal() {
+        assert!(validate_snapshot_relative_path("../etc/passwd").is_err());
+        assert!(validate_snapshot_relative_path("sub/../escape").is_err());
+        assert!(validate_snapshot_relative_path("..").is_err());
+        assert!(validate_snapshot_relative_path("../../top.snap").is_err());
+    }
+
+    #[test]
+    fn validate_snapshot_relative_path_rejects_absolute_path() {
+        #[cfg(unix)]
+        {
+            assert!(validate_snapshot_relative_path("/etc/passwd").is_err());
+            assert!(validate_snapshot_relative_path("/tmp/snap").is_err());
+        }
+        #[cfg(windows)]
+        {
+            assert!(validate_snapshot_relative_path(r"C:\Windows\System32\config\sam").is_err());
+        }
+    }
+
+    #[test]
+    fn validate_snapshot_relative_path_rejects_curdir_prefix() {
+        // `./foo.snap` normalizes away to `foo.snap` on most inputs, so
+        // any leftover Component::CurDir signals an unusual / hand-crafted
+        // path we'd rather not trust.
+        let curdir_path = format!(".{sep}rev.snap", sep = std::path::MAIN_SEPARATOR);
+        assert!(validate_snapshot_relative_path(&curdir_path).is_err());
+    }
+
+    #[test]
+    fn validate_snapshot_relative_path_rejects_null_byte() {
+        assert!(validate_snapshot_relative_path("rev-1\0.snap").is_err());
+        assert!(validate_snapshot_relative_path("\0").is_err());
+    }
+
+    #[test]
+    fn delete_rejects_tampered_relative_path_and_falls_back_to_legacy_snap() {
+        // If a tampered JSON sidecar carries a `relative_path` that
+        // tries to escape the revisions directory, `delete` must NOT
+        // follow it. Instead it falls back to the legacy `{id}.snap`
+        // pattern inside its own dir so the legitimate snap is still
+        // cleaned up.
+        let proj = TempDir::new().unwrap();
+        let db_path = proj.path().join("project.sqlite");
+        let conn = write_dummy_db(&db_path);
+        let store = RevisionStore::open(proj.path().join("revisions")).unwrap();
+
+        let mut rev = store
+            .create_with_snapshot(fixture_draft(&ProjectId::new(), "tamper"), &conn, &db_path)
+            .unwrap();
+
+        let dir = proj.path().join("revisions");
+        let real_snap = dir.join(format!("{}.snap", rev.id));
+        assert!(real_snap.exists(), "fixture: real snap must exist");
+
+        // Plant a sentinel OUTSIDE the revisions directory that we
+        // never want `delete` to chase.
+        let outside = proj.path().join("DO_NOT_DELETE");
+        std::fs::write(&outside, b"sentinel").unwrap();
+
+        // Tamper: overwrite the JSON sidecar so its `relative_path`
+        // attempts to escape the revisions directory.
+        rev.snapshot.as_mut().unwrap().relative_path = "../DO_NOT_DELETE".to_string();
+        store.write_atomic(&rev).unwrap();
+
+        // Delete must remove the legitimate {id}.snap (fallback) AND
+        // the JSON sidecar, but it must NEVER touch the outside
+        // sentinel.
+        assert!(store.delete(&rev.id).unwrap());
+        assert!(
+            outside.exists(),
+            "delete chased tampered ../DO_NOT_DELETE relative_path"
+        );
+        assert!(
+            !real_snap.exists(),
+            "delete must still clean up the legitimate {{id}}.snap via the legacy fallback"
+        );
+        assert!(store.get(&rev.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn snapshot_path_returns_none_for_tampered_relative_path() {
+        // `snapshot_path` is the public API external code uses to
+        // resolve a snap on disk. A tampered `relative_path` must make
+        // it return `None` so callers don't end up acting on an
+        // arbitrary filesystem location.
+        let proj = TempDir::new().unwrap();
+        let db_path = proj.path().join("project.sqlite");
+        let conn = write_dummy_db(&db_path);
+        let store = RevisionStore::open(proj.path().join("revisions")).unwrap();
+
+        let mut rev = store
+            .create_with_snapshot(
+                fixture_draft(&ProjectId::new(), "tamper_path"),
+                &conn,
+                &db_path,
+            )
+            .unwrap();
+
+        // Tampered relative_path: `snapshot_path` should refuse to
+        // resolve it.
+        rev.snapshot.as_mut().unwrap().relative_path = "../escape.snap".to_string();
+        assert!(store.snapshot_path(&rev).is_none());
+    }
+
+    #[test]
+    fn verify_snapshot_returns_mismatch_for_tampered_relative_path() {
+        // A tampered `relative_path` must not be passed to
+        // `blake3_of_file` against an arbitrary location. The integrity
+        // result is `Mismatch` (the metadata is unusable so the snapshot
+        // can't be verified) — never `Verified`.
+        let proj = TempDir::new().unwrap();
+        let db_path = proj.path().join("project.sqlite");
+        let conn = write_dummy_db(&db_path);
+        let store = RevisionStore::open(proj.path().join("revisions")).unwrap();
+
+        let mut rev = store
+            .create_with_snapshot(
+                fixture_draft(&ProjectId::new(), "tamper_verify"),
+                &conn,
+                &db_path,
+            )
+            .unwrap();
+
+        rev.snapshot.as_mut().unwrap().relative_path = "../escape.snap".to_string();
+        assert_eq!(
+            store.verify_snapshot(&rev).unwrap(),
+            SnapshotVerification::Mismatch
+        );
     }
 
     #[test]
