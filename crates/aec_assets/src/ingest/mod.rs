@@ -2,6 +2,7 @@
 
 use std::path::Path;
 
+use aec_core::types::Units;
 use aec_geometry::Mesh;
 
 pub mod gltf;
@@ -45,6 +46,40 @@ pub enum IngestFormat {
     /// Native bincode-encoded [`Mesh`] blob; only valid inside this
     /// workspace build.
     Native,
+}
+
+impl IngestFormat {
+    /// Spec-defined default unit for this format.
+    ///
+    /// Use this to populate [`PathImportMetadata::source_units`] when
+    /// the caller has no out-of-band information about the file's
+    /// authoring unit. Callers MAY override (e.g. when a project
+    /// convention asserts a different unit), but the default returned
+    /// here matches the format's specification so that pipelines that
+    /// blindly trust `default_units(detected_format)` do not introduce
+    /// a 1000× scale error.
+    ///
+    /// Per-format rationale:
+    ///
+    /// | Format         | Default            | Source                                                 |
+    /// |----------------|--------------------|--------------------------------------------------------|
+    /// | `Gltf`, `Glb`  | [`Units::M`]       | glTF 2.0 §3.5.4: distances are in metres.              |
+    /// | `Ifc`          | [`Units::Mm`]      | We tessellate via `aec_bim` whose canonical unit is mm |
+    /// |                |                    | (matches the asset DB's internal unit and the most    |
+    /// |                |                    | common `IFCUNITASSIGNMENT(LENGTHUNIT)` we see).        |
+    /// | `Obj`          | [`Units::Mm`]      | Wavefront `.obj` is unit-less by spec; we adopt the    |
+    /// |                |                    | asset DB's canonical unit as the no-conversion default |
+    /// |                |                    | so an OBJ authored to project scale round-trips        |
+    /// |                |                    | exactly. Override when the OBJ is authored in metres   |
+    /// |                |                    | (common for game-engine exports).                      |
+    /// | `Native`       | [`Units::Mm`]      | The bincode `Mesh` blob is already in the asset DB's   |
+    /// |                |                    | canonical unit; no conversion needed.                  |
+    pub fn default_units(self) -> Units {
+        match self {
+            Self::Gltf | Self::Glb => Units::M,
+            Self::Ifc | Self::Obj | Self::Native => Units::Mm,
+        }
+    }
 }
 
 /// A mesh that has been read from a source format.

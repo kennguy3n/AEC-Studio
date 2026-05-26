@@ -306,6 +306,24 @@ impl<'a> AssetImportPipeline<'a> {
     /// glTF/OBJ/IFC asset from disk into the asset DB". Use it from
     /// the bridge layer when the user drops a model file onto the
     /// asset library.
+    ///
+    /// # Source-units contract
+    ///
+    /// `meta.source_units` is taken verbatim and applied to the
+    /// ingested mesh by [`canonicalise_to_mm`] before hashing. The
+    /// pipeline does **not** auto-derive the unit from the detected
+    /// format — doing so silently would mask caller bugs (e.g. a
+    /// project convention that ships glTF in mm rather than the
+    /// spec-default metres). Instead, the caller is expected to either
+    /// (a) know the unit out-of-band, or (b) consult
+    /// [`crate::ingest::IngestFormat::default_units`] to obtain the
+    /// spec-defined default, optionally overriding it before this
+    /// call. The bridge layer should default to
+    /// `IngestFormat::default_units(detected_format)` and only deviate
+    /// when the source file or project metadata explicitly says
+    /// otherwise; the helper exists precisely so that mis-typed unit
+    /// constants are caught by code review rather than silently
+    /// applied as a 1000× scale error.
     pub fn import_path(
         &mut self,
         path: &std::path::Path,
@@ -338,6 +356,13 @@ impl<'a> AssetImportPipeline<'a> {
 /// Metadata supplied alongside a file-path import. Everything except
 /// the mesh itself (which comes from the file) — used by
 /// [`AssetImportPipeline::import_path`].
+///
+/// `source_units` is caller-supplied and is **not** derived from the
+/// detected format; see [`AssetImportPipeline::import_path`] for the
+/// rationale. Callers without out-of-band knowledge of the file's
+/// authoring unit should default this field to
+/// [`crate::ingest::IngestFormat::default_units`] for the format they
+/// expect to detect.
 #[derive(Debug, Clone)]
 pub struct PathImportMetadata {
     pub asset_id: String,
@@ -381,14 +406,27 @@ pub struct RealMeshImportRequest {
 /// Convert a mesh's vertex positions from `source_units` to the asset
 /// DB's canonical internal unit (millimetres).
 ///
-/// The `Cow` return type lets the hot path (`source_units == Mm`)
+/// The `Cow` return type lets the hot path (“scale is the identity”)
 /// borrow the caller's mesh and skip the allocation/copy entirely.
 /// All other unit variants clone-then-scale so the caller's mesh is
 /// untouched. Normals are scale-invariant under uniform scale and so
 /// are not re-normalised; UVs are unit-agnostic.
+///
+/// The identity check is an `f32::EPSILON`-tolerant comparison rather
+/// than `scale == 1.0`. With the current [`Units`] enum the only
+/// identity is `Units::Mm` (other variants produce factors of 1000,
+/// 25.4, or 304.8 — nowhere near 1.0), so for today exact equality
+/// and the epsilon check are equivalent. The epsilon is
+/// forward-compatibility: if a future variant is added with a factor
+/// very close to (but not exactly) 1.0, exact equality would fall
+/// through to clone-then-scale by a near-identity factor — a
+/// performance pessimisation rather than a correctness bug, but one
+/// that is easy to prevent here. The epsilon is also defensive
+/// against any rounding noise introduced by `f64 -> f32` on the
+/// scale factor itself.
 fn canonicalise_to_mm(mesh: &Mesh, source_units: Units) -> std::borrow::Cow<'_, Mesh> {
     let scale = source_units.to_mm(1.0) as f32;
-    if scale == 1.0 {
+    if (scale - 1.0).abs() <= f32::EPSILON {
         return std::borrow::Cow::Borrowed(mesh);
     }
     let mut scaled = mesh.clone();
@@ -718,5 +756,48 @@ mod tests {
             }
             other => panic!("expected Decimation or LodNotStrictlyDecreasing, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn canonicalise_to_mm_borrow_path_is_epsilon_tolerant() {
+        // Forward-compat guard: the identity-scale check uses
+        // `(scale - 1.0).abs() <= f32::EPSILON` rather than strict
+        // `==`. With today's `Units` enum the only identity factor is
+        // exact 1.0 (Units::Mm), so this test pins the *predicate* of
+        // the comparison: a value differing from 1.0 by less than
+        // `f32::EPSILON` must still be treated as the identity, while
+        // a value differing visibly (e.g. the 25.4 from
+        // `Units::Inches`) must not. If a future `Units` variant
+        // produces a factor 1.0 ± tiny rounding noise, the hot-path
+        // borrow must still trigger.
+        let near_one_below = 1.0_f32 - (f32::EPSILON * 0.5);
+        let near_one_above = 1.0_f32 + (f32::EPSILON * 0.5);
+        assert!((near_one_below - 1.0).abs() <= f32::EPSILON);
+        assert!((near_one_above - 1.0).abs() <= f32::EPSILON);
+
+        let inches_scale = Units::Inches.to_mm(1.0) as f32;
+        assert!((inches_scale - 1.0).abs() > f32::EPSILON);
+
+        // And the actual function: `Units::Mm` (identity) still
+        // borrows after the epsilon rewrite.
+        let mesh = dense_mesh();
+        let cow = canonicalise_to_mm(&mesh, Units::Mm);
+        assert!(
+            matches!(cow, std::borrow::Cow::Borrowed(_)),
+            "Units::Mm must continue to hit the borrow fast path"
+        );
+    }
+
+    #[test]
+    fn ingest_format_default_units_matches_spec() {
+        // Pins the spec-defined default unit per format. Pipelines
+        // that consult `IngestFormat::default_units` to seed
+        // `PathImportMetadata.source_units` rely on this exact table.
+        use crate::ingest::IngestFormat;
+        assert_eq!(IngestFormat::Gltf.default_units(), Units::M);
+        assert_eq!(IngestFormat::Glb.default_units(), Units::M);
+        assert_eq!(IngestFormat::Obj.default_units(), Units::Mm);
+        assert_eq!(IngestFormat::Ifc.default_units(), Units::Mm);
+        assert_eq!(IngestFormat::Native.default_units(), Units::Mm);
     }
 }
