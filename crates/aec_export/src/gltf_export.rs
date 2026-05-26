@@ -807,7 +807,45 @@ fn camera_lookat_components(
         target[2] - position[2],
     ]);
     let up = normalize(up);
-    let right = normalize(cross(forward, up));
+    // When `forward` is (anti-)parallel to `up`, `cross(forward, up)`
+    // collapses to zero and the bare `normalize` fallback would not be
+    // perpendicular to `forward` — the resulting rotation matrix would
+    // not be orthonormal and the quaternion would represent a slightly
+    // distorted rotation (e.g. for a plan-view camera looking straight
+    // down at +Y world up — a very common AEC case).
+    //
+    // Pick an alternate up hint that *is* perpendicular to `forward`:
+    // the world basis axis with the smallest |forward[i]| component
+    // is guaranteed to have a nonzero `cross(forward, axis)`. Reroute
+    // through Gram-Schmidt so the final `effective_up` lies in the
+    // plane perpendicular to `forward`.
+    let dot_fwd_up = forward[0] * up[0] + forward[1] * up[1] + forward[2] * up[2];
+    let effective_up = if dot_fwd_up.abs() > 0.999_999 {
+        let abs_x = forward[0].abs();
+        let abs_y = forward[1].abs();
+        let abs_z = forward[2].abs();
+        let alt = if abs_x <= abs_y && abs_x <= abs_z {
+            [1.0, 0.0, 0.0]
+        } else if abs_y <= abs_z {
+            [0.0, 1.0, 0.0]
+        } else {
+            [0.0, 0.0, 1.0]
+        };
+        // Gram-Schmidt: remove the forward component from `alt` so the
+        // result is orthogonal to `forward`. `alt` is a world basis
+        // axis, so `dot(forward, alt) == forward[i]` for the chosen i,
+        // which is the smallest-magnitude forward component by
+        // construction — the residual is well-conditioned.
+        let proj = forward[0] * alt[0] + forward[1] * alt[1] + forward[2] * alt[2];
+        normalize([
+            alt[0] - forward[0] * proj,
+            alt[1] - forward[1] * proj,
+            alt[2] - forward[2] * proj,
+        ])
+    } else {
+        up
+    };
+    let right = normalize(cross(forward, effective_up));
     let recomputed_up = cross(right, forward);
 
     // Column-major: m[col] is the c-th column of R, i.e. the image
@@ -1597,23 +1635,93 @@ mod tests {
     #[test]
     fn camera_lookat_exactly_degenerate_forward_equals_up_returns_finite_quaternion() {
         // Pathological corner case: `forward` is exactly parallel to
-        // `up`. `cross(forward, up)` is identically zero, so the
-        // `normalize` fallback must engage. The orientation is
-        // necessarily ambiguous (no well-defined "right" axis), so the
-        // contract is weaker than the near-degenerate case above — we
-        // only require a finite unit quaternion (no panic, no NaN).
+        // `up`. The Gram-Schmidt fallback in `camera_lookat_components`
+        // selects an alternate world axis perpendicular to `forward`,
+        // so the resulting rotation matrix IS orthonormal (not just
+        // "finite"). The roll axis is arbitrary (no preferred up was
+        // supplied), but the lookAt invariant still holds: rotated
+        // local -Z must align with (target - position).
         //
-        // This case is unreachable from a sensible content pipeline but
-        // can be hit by procedurally-generated test fixtures, so the
-        // exporter must degrade gracefully.
-        let position = [0.0_f32, 5.0, 0.0];
+        // This case is hit in practice by plan-view cameras (camera
+        // looking straight down at floor plan with world +Y up).
+        let cases = [
+            // Anti-parallel: looking straight down with +Y up.
+            (
+                [0.0_f32, 5.0, 0.0_f32],
+                [0.0_f32, 0.0, 0.0_f32],
+                [0.0_f32, 1.0, 0.0_f32],
+            ),
+            // Parallel: looking straight up with +Y up.
+            (
+                [0.0_f32, -5.0, 0.0_f32],
+                [0.0_f32, 0.0, 0.0_f32],
+                [0.0_f32, 1.0, 0.0_f32],
+            ),
+            // Anti-parallel along +Z axis.
+            (
+                [0.0_f32, 0.0, 5.0_f32],
+                [0.0_f32, 0.0, 0.0_f32],
+                [0.0_f32, 0.0, 1.0_f32],
+            ),
+        ];
+        for (position, target, up) in cases {
+            let (_t, q) = camera_lookat_components(position, target, up);
+            let q_mag = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+            assert!(
+                q_mag.is_finite() && (q_mag - 1.0).abs() < 1e-4,
+                "exactly-degenerate (pos={position:?}, target={target:?}, up={up:?}): \
+                 expected unit quaternion, got {q:?} (|q|={q_mag})",
+            );
+            // Even with arbitrary roll, the lookAt invariant must hold.
+            let expected = {
+                let d = [
+                    target[0] - position[0],
+                    target[1] - position[1],
+                    target[2] - position[2],
+                ];
+                let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                [d[0] / l, d[1] / l, d[2] / l]
+            };
+            let rotated = rotate_by_quat(q, [0.0, 0.0, -1.0]);
+            let dot =
+                rotated[0] * expected[0] + rotated[1] * expected[1] + rotated[2] * expected[2];
+            assert!(
+                dot > 0.9999,
+                "exactly-degenerate (pos={position:?}, target={target:?}, up={up:?}): \
+                 rotated local -Z {rotated:?} does not align with target dir {expected:?} \
+                 (dot={dot})",
+            );
+        }
+    }
+
+    #[test]
+    fn camera_lookat_rotation_matrix_is_orthonormal_even_in_degenerate_case() {
+        // Rotation matrices must be orthonormal: each row/column has
+        // unit length, and any two columns are perpendicular. This
+        // pins the Gram-Schmidt fix: even when `forward ∥ up`, the
+        // basis is well-conditioned. We probe orthonormality by
+        // applying `rotate_by_quat` to the three local basis vectors
+        // and verifying their dot products.
+        let position = [0.0_f32, 5.0, 0.0]; // straight-down plan view
         let target = [0.0_f32, 0.0, 0.0];
-        let up = [0.0_f32, 1.0, 0.0]; // forward = [0, -1, 0], exactly anti-parallel to up.
+        let up = [0.0_f32, 1.0, 0.0]; // forward = [0, -1, 0] = -up
         let (_t, q) = camera_lookat_components(position, target, up);
-        let q_mag = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+        let rx = rotate_by_quat(q, [1.0, 0.0, 0.0]);
+        let ry = rotate_by_quat(q, [0.0, 1.0, 0.0]);
+        let rz = rotate_by_quat(q, [0.0, 0.0, 1.0]);
+        for (label, v) in [("R*ex", rx), ("R*ey", ry), ("R*ez", rz)] {
+            let mag = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+            assert!(
+                (mag - 1.0).abs() < 1e-5,
+                "{label} not unit length: {v:?} (|v|={mag})",
+            );
+        }
+        let dot_xy = rx[0] * ry[0] + rx[1] * ry[1] + rx[2] * ry[2];
+        let dot_xz = rx[0] * rz[0] + rx[1] * rz[1] + rx[2] * rz[2];
+        let dot_yz = ry[0] * rz[0] + ry[1] * rz[1] + ry[2] * rz[2];
         assert!(
-            q_mag.is_finite() && (q_mag - 1.0).abs() < 1e-4,
-            "exactly-degenerate forward∥up: expected unit quaternion, got {q:?} (|q|={q_mag})",
+            dot_xy.abs() < 1e-5 && dot_xz.abs() < 1e-5 && dot_yz.abs() < 1e-5,
+            "rotated basis vectors not mutually perpendicular: dot_xy={dot_xy}, dot_xz={dot_xz}, dot_yz={dot_yz}",
         );
     }
 
