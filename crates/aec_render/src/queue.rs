@@ -3,7 +3,7 @@
 //! governor decides how many concurrent jobs may run, and calls
 //! [`RenderQueue::admit`] to pull the next eligible job.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -414,6 +414,120 @@ impl RenderQueue {
         );
         assert_id_unique(self, &job.id, "restore_completed");
         self.completed.push(job);
+    }
+
+    /// Bulk-restore a previously-persisted queue from three
+    /// pre-partitioned, pre-sorted snapshots. Used by
+    /// [`crate::job_store::RenderJobStore::load_queue`] on crash
+    /// recovery as a O(N) alternative to N separate `restore_*` calls.
+    ///
+    /// The per-call [`RenderQueue::restore_queued`] / `restore_running` /
+    /// `restore_completed` family runs an O(N) `assert_id_unique` scan
+    /// across all three partitions on every insertion, which compounds
+    /// to **O(N²)** when N jobs are restored. For render queues with
+    /// thousands of frames (e.g. a multi-camera walkthrough at
+    /// 30 fps × tens of seconds, plus quality-matrix variants) the
+    /// quadratic term dominates startup cost. This method amortises
+    /// uniqueness to O(N) by interning every restored id into a single
+    /// [`HashSet`] up-front, then bulk-pushing into the partitions.
+    ///
+    /// # Caller contract
+    ///
+    /// - The queue **must** be empty when this method is invoked.
+    ///   This is asserted; partial-state reconstruction is intentionally
+    ///   not supported by this path (mixing a fresh DB load with a
+    ///   live in-memory queue would violate the "load_queue produces
+    ///   a fresh snapshot" contract).
+    /// - `queued` may be in any order; this method sorts it by
+    ///   priority **descending** to match the placement that
+    ///   [`RenderQueue::submit`] produces. Within the same priority,
+    ///   the input order is preserved (matching how `submit` inserts
+    ///   at the first lower-priority position, leaving same-priority
+    ///   jobs in FIFO order).
+    /// - Every job in `terminal` must satisfy `job.is_terminal()`;
+    ///   this is asserted per-job (the assertion is O(1) — it does
+    ///   not contribute to the cross-partition O(N²) issue).
+    /// - Each `job.status` is coerced defensively for the `queued` and
+    ///   `running` buckets (same as the single-job restore family) to
+    ///   protect against a malformed input vector. Terminal status is
+    ///   preserved verbatim (the tri-valued partition).
+    ///
+    /// # Panics
+    ///
+    /// - If the queue is not empty.
+    /// - If any id appears in more than one input vector or twice in
+    ///   the same vector.
+    /// - If any job in `terminal` is not in a terminal state.
+    ///
+    /// The duplicate-id check is the same correctness contract as
+    /// `assert_id_unique` in the single-job restore path — the SQLite
+    /// PRIMARY KEY on the store side already guarantees uniqueness
+    /// across rows in a single transaction snapshot, so a duplicate
+    /// here would indicate a store-layer bug (caller mis-partitioning
+    /// rows, two SELECTs sharing an id, or a future bulk-insert path
+    /// that bypasses PK enforcement). Defending in depth is cheap at
+    /// O(1) per insertion via the HashSet.
+    pub(crate) fn restore_bulk_from_storage(
+        &mut self,
+        mut queued: Vec<RenderJob>,
+        running: Vec<RenderJob>,
+        terminal: Vec<RenderJob>,
+    ) {
+        assert!(
+            self.queued.is_empty() && self.running.is_empty() && self.completed.is_empty(),
+            "restore_bulk_from_storage expects an empty queue; partial-state \
+             reconstruction is not supported (load_queue produces a fresh snapshot)"
+        );
+
+        let total = queued.len() + running.len() + terminal.len();
+        let mut seen: HashSet<String> = HashSet::with_capacity(total);
+
+        // Sort queued by priority descending; same-priority jobs keep
+        // their input order via `sort_by` (stable sort), matching the
+        // placement that `submit` produces for FIFO within a priority.
+        queued.sort_by_key(|j| std::cmp::Reverse(j.priority));
+        self.queued.reserve(queued.len());
+        for mut job in queued {
+            assert!(
+                seen.insert(job.id.clone()),
+                "restore_bulk_from_storage: duplicate job id `{}` across input vectors \
+                 — the store-layer PRIMARY KEY should make this unreachable.",
+                job.id
+            );
+            job.status = RenderJobStatus::Queued;
+            self.queued.push_back(job);
+        }
+
+        self.running.reserve(running.len());
+        for mut job in running {
+            assert!(
+                seen.insert(job.id.clone()),
+                "restore_bulk_from_storage: duplicate job id `{}` across input vectors \
+                 — the store-layer PRIMARY KEY should make this unreachable.",
+                job.id
+            );
+            job.status = RenderJobStatus::Running;
+            self.running.push(job);
+        }
+
+        self.completed.reserve(terminal.len());
+        for job in terminal {
+            assert!(
+                job.is_terminal(),
+                "restore_bulk_from_storage: non-terminal status {:?} in terminal bucket \
+                 (job id `{}`); the store-layer query should pre-filter by \
+                 status IN (Completed, Failed, Cancelled).",
+                job.status,
+                job.id
+            );
+            assert!(
+                seen.insert(job.id.clone()),
+                "restore_bulk_from_storage: duplicate job id `{}` across input vectors \
+                 — the store-layer PRIMARY KEY should make this unreachable.",
+                job.id
+            );
+            self.completed.push(job);
+        }
     }
 }
 

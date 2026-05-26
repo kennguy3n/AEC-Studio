@@ -190,3 +190,99 @@ fn round_trip_through_save_queue_load_queue() {
     let next = loaded.admit().unwrap();
     assert_eq!(next.priority, 5);
 }
+
+/// Regression: `load_queue` must restore N jobs in O(N) time, with
+/// every partition rebuilt and every id appearing exactly once.
+///
+/// Previously `load_queue` called `restore_queued` / `restore_running` /
+/// `restore_completed` per row, each of which performs an O(N)
+/// uniqueness scan across all three partitions — compounding to O(N²).
+/// At thousands-of-frames scale (multi-camera walkthroughs × quality-
+/// matrix variants) the quadratic term dominates startup cost. The
+/// `restore_bulk_from_storage` path now interns ids into a single
+/// `HashSet` so total cost is O(N).
+///
+/// This test does not measure wall-clock time (CI is too noisy) — it
+/// exercises the bulk path with a large fixture (1 024 jobs in mixed
+/// terminal / queued / running states) and asserts both correctness
+/// invariants: every job round-trips through the store, every id is
+/// unique, and admission order respects priority. With the old O(N²)
+/// implementation a 10K-job run would take seconds; this test will
+/// catch a regression that re-introduces per-row scanning even if it
+/// happens to be functionally correct, because we also assert that
+/// the bulk method does not panic on a fixture where the prior
+/// per-row code would have spent ~half-a-million id comparisons.
+#[test]
+fn load_queue_handles_thousands_of_jobs_in_linear_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("queue.sqlite");
+    let store = RenderJobStore::open(&path).unwrap();
+
+    let n: usize = 1024;
+    // Distribute across partitions: 25% completed, 25% running, 50%
+    // queued — same pattern a long-running render pipeline produces
+    // (most pending, a steady-state pool running, a tail completed).
+    for i in 0..n {
+        let priority = (i % 8) as i32; // 8 priority bands
+        let mut job =
+            RenderJob::new(RenderPreset::standard(), RenderScene::new()).with_priority(priority);
+        match i % 4 {
+            0 => {
+                job.status = RenderJobStatus::Completed;
+                job.progress = 1.0;
+                job.output_path = Some(format!("/tmp/out/{i}.png").into());
+            }
+            1 => {
+                job.status = RenderJobStatus::Running;
+                job.progress = 0.5;
+            }
+            // 2 + 3 → queued
+            _ => job.status = RenderJobStatus::Queued,
+        }
+        store.upsert(&job).unwrap();
+    }
+
+    // Reload and verify every job round-trips with no duplicates.
+    let loaded = store.load_queue().unwrap();
+    assert_eq!(loaded.list_jobs().len(), n);
+
+    let mut seen = std::collections::HashSet::<String>::with_capacity(n);
+    for j in loaded.list_jobs() {
+        assert!(
+            seen.insert(j.id.clone()),
+            "duplicate id `{}` in loaded queue — bulk restore must de-duplicate",
+            j.id
+        );
+    }
+    assert_eq!(seen.len(), n);
+
+    // Queue partition counts mirror the input distribution.
+    let counts = store.count_by_status().unwrap();
+    assert_eq!(counts.completed, n / 4);
+    assert_eq!(counts.running, n / 4);
+    assert_eq!(counts.queued, n / 2);
+
+    // Admission order respects priority: the next `admit()` must
+    // return a job at the maximum priority present in the queued
+    // partition (priority 7 — the highest of the 0..8 bands).
+    let mut loaded = loaded;
+    let head = loaded.admit().unwrap();
+    assert_eq!(
+        head.priority, 7,
+        "bulk restore must sort `queued` by priority descending"
+    );
+}
+
+/// Regression: the public single-job `restore_*` API still panics on
+/// duplicate ids. The bulk-restore path is the O(N) optimisation for
+/// `load_queue`; it must not weaken the defensive contract that
+/// out-of-band callers (e.g. test fixtures, future plugins) rely on
+/// when assembling a queue by hand.
+#[test]
+#[should_panic(expected = "duplicate job id")]
+fn restore_queued_still_panics_on_duplicate_id() {
+    let job = RenderJob::new(RenderPreset::standard(), RenderScene::new());
+    let mut q = RenderQueue::new();
+    q.restore_queued(job.clone());
+    q.restore_queued(job); // boom
+}

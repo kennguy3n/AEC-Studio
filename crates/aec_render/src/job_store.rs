@@ -253,6 +253,19 @@ impl RenderJobStore {
     /// transaction so the resulting queue is a consistent snapshot —
     /// even if a concurrent writer upserts or deletes rows partway
     /// through, this method will not observe partial updates.
+    ///
+    /// The three result vectors are handed to
+    /// [`RenderQueue::restore_bulk_from_storage`] in one shot, which
+    /// amortises the cross-partition uniqueness check to O(N). The
+    /// alternative — calling `restore_queued` / `restore_running` /
+    /// `restore_completed` N times — would scan all already-restored
+    /// jobs on every insertion, compounding to O(N²) and dominating
+    /// startup cost at thousands-of-frames scale (multi-camera
+    /// walkthroughs × quality-matrix variants). The SQLite
+    /// `PRIMARY KEY` on `id` already guarantees uniqueness across the
+    /// snapshot, and `list_by_status_tx` partitions by `status`, so
+    /// the bulk method's `HashSet` check is a defense-in-depth
+    /// invariant rather than the primary correctness mechanism.
     pub fn load_queue(&self) -> RenderJobStoreResult<RenderQueue> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
@@ -273,15 +286,7 @@ impl RenderJobStore {
         drop(conn);
 
         let mut queue = RenderQueue::new();
-        for job in queued {
-            queue.restore_queued(job);
-        }
-        for job in running {
-            queue.restore_running(job);
-        }
-        for job in terminal {
-            queue.restore_completed(job);
-        }
+        queue.restore_bulk_from_storage(queued, running, terminal);
         Ok(queue)
     }
 
