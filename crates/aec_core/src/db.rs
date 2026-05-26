@@ -26,9 +26,18 @@ use crate::error::AecResult;
 /// database to the current [`crate::manifest::SCHEMA_VERSION`] via
 /// [`crate::migrations::run_pending`].
 pub fn open_encrypted(path: &Path, key: &Key32) -> AecResult<Connection> {
+    // `SQLITE_OPEN_NO_MUTEX` selects multi-thread mode — the connection
+    // is used by at most one thread at a time and SQLite skips its per-
+    // connection mutex. This matches the threading mode that
+    // `open_existing` inherits from rusqlite's default `OpenFlags`
+    // (`Connection::open` → `READ_WRITE | CREATE | NO_MUTEX | URI`); all
+    // three `open_*` paths therefore run in the same threading mode so
+    // there are no surprising performance differences between them.
     let mut conn = Connection::open_with_flags(
         path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     apply_pragmas(&conn, key)?;
     initialize_schema(&conn)?;
@@ -85,8 +94,15 @@ pub fn open_existing(path: &Path, key: &Key32) -> AecResult<Connection> {
 /// fails loudly on a wrong key (the key check is the same
 /// `SELECT count(*) FROM sqlite_master` probe used by
 /// [`open_existing`]).
+///
+/// `SQLITE_OPEN_NO_MUTEX` is included to keep this on the same multi-
+/// thread threading model as `open_existing` / `open_encrypted`, so all
+/// three open paths have consistent per-connection locking semantics.
 pub fn open_readonly(path: &Path, key: &Key32) -> AecResult<Connection> {
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
     apply_cipher_pragmas(&conn, key)?;
     // Validate key by forcing SQLCipher to decrypt page 1.
     {
