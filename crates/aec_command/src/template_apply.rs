@@ -160,7 +160,7 @@ pub struct InstantiationOutcome {
 
 impl InstantiationOutcome {
     pub fn entity_count(&self) -> usize {
-        // 6 entities per room: 4 walls + 1 floor + 1 ceiling + 1 room
+        // 7 entities per room: 4 walls + 1 floor + 1 ceiling + 1 room
         // (the room itself is also an entity). The lighting `SetLighting`
         // command is audit-only and produces no entity.
         self.rooms.len() * 7 + self.camera_ids.len()
