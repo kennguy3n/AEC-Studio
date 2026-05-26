@@ -418,6 +418,23 @@ impl RevisionStore {
     /// file (`<id>.snap`) if one exists, so a delete leaves no orphan
     /// snapshot bytes behind. Returns `true` if at least the metadata
     /// file existed (and was deleted).
+    ///
+    /// **Deletion ordering: snap first, then JSON.** The snapshot is
+    /// the larger, more disposable file (raw encrypted bytes; the JSON
+    /// is the index that makes a revision discoverable via [`Self::list`]).
+    /// Removing the snap first means:
+    ///
+    /// * If the snap removal fails (e.g. permissions), the JSON is still
+    ///   on disk and the revision remains intact — the caller can retry
+    ///   the whole delete with no orphan files left behind.
+    /// * If the snap removal succeeds but the JSON removal fails, the
+    ///   worst case is an orphan JSON whose `.snap` is missing; that's
+    ///   surfaced as a clean error on the first diff/compare attempt
+    ///   rather than wasting disk silently.
+    ///
+    /// The reverse order (JSON first, then snap) was unsafe: a failure
+    /// during snap removal would leave the JSON gone and the snap
+    /// orphaned — invisible to `list()` and silently wasting disk.
     pub fn delete(&self, id: &str) -> Result<bool, AecError> {
         let json_path = self.dir.join(format!("{id}.json"));
         let snap_path = self.dir.join(format!("{id}.snap"));
@@ -425,10 +442,10 @@ impl RevisionStore {
         if !existed {
             return Ok(false);
         }
-        fs::remove_file(&json_path)?;
         if snap_path.exists() {
             fs::remove_file(&snap_path)?;
         }
+        fs::remove_file(&json_path)?;
         Ok(true)
     }
 

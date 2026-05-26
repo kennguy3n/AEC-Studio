@@ -63,11 +63,23 @@ pub fn open_existing(path: &Path, key: &Key32) -> AecResult<Connection> {
 /// Open an already-initialized SQLCipher database **strictly read-only**
 /// — uses `SQLITE_OPEN_READ_ONLY` so the SQLite library refuses any
 /// write at the engine level (not just by convention), and skips the
-/// pragmas that need write access (`journal_mode = WAL`,
-/// `foreign_keys = ON`). Designed for revision snapshot (`.snap`)
-/// diffing: a future caller can't accidentally mutate the snapshot, and
-/// no `-wal` / `-shm` sidecar files get scattered in the revisions
-/// directory after a process crash.
+/// connection-tuning pragmas that the read-only path doesn't need:
+///
+/// * `journal_mode = WAL` requires write access to the DB header and
+///   creates `-wal` / `-shm` sidecar files, which is *exactly* the
+///   failure mode this function exists to prevent for `.snap` files.
+/// * `foreign_keys = ON` and `busy_timeout = 5000` are intentionally
+///   omitted because they only affect DML / write contention, neither
+///   of which is reachable on a `SQLITE_OPEN_READ_ONLY` handle
+///   (DML statements fail at parse time before constraint enforcement,
+///   and a read-only connection takes a SHARED lock that never
+///   conflicts with the snapshot-creation write path). Skipping them
+///   keeps the open path purely cryptographic.
+///
+/// Designed for revision snapshot (`.snap`) diffing: a future caller
+/// can't accidentally mutate the snapshot, and no `-wal` / `-shm`
+/// sidecar files get scattered in the revisions directory after a
+/// process crash.
 ///
 /// The encryption key + cipher parameters are still applied so the call
 /// fails loudly on a wrong key (the key check is the same
