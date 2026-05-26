@@ -326,7 +326,19 @@ pub struct ChainVerificationJs {
     /// Number of entries that were fully validated before the first
     /// break (or all entries, if the chain is intact).
     pub entries_checked: u32,
-    /// All `.jsonl` files inspected, in the order they were walked.
+    /// Subset of `entries_checked` that were verified with
+    /// linkage-only checks (their `hash_version` was the legacy v1
+    /// algorithm whose stored hash requires the original payload to
+    /// reproduce). The chain still reports `ok` in this case; UI
+    /// surfaces can use this counter to gate downstream trust on
+    /// the legacy fraction.
+    pub entries_legacy_linkage_only: u32,
+    /// `.jsonl` files that were actually opened and inspected, in
+    /// the order they were walked. On a successful verification
+    /// this includes every `.jsonl` under `<project>/audit/`; on an
+    /// early break this only includes files up to and including the
+    /// one in which the break occurred. Files discovered during
+    /// directory traversal but never opened are NOT included.
     pub files_checked: Vec<String>,
     /// The latest valid `hash` head seen. For a fully-intact chain
     /// this equals the last entry's `hash`; for a broken chain it
@@ -340,7 +352,7 @@ pub struct ChainVerificationJs {
     pub break_line: Option<u32>,
     /// `None` if `status == "ok"`; otherwise one of
     /// `"prev_hash_mismatch"`, `"hash_recompute_mismatch"`,
-    /// `"malformed_entry"`, `"io"`.
+    /// `"unsupported_hash_version"`, `"malformed_entry"`, `"io"`.
     pub break_reason: Option<String>,
     /// `None` if `status == "ok"`; otherwise a human-readable
     /// description of the break (e.g. `"stored = blake3:dead,
@@ -353,6 +365,7 @@ pub struct ChainVerificationJs {
 impl From<aec_audit::ChainVerification> for ChainVerificationJs {
     fn from(v: aec_audit::ChainVerification) -> Self {
         let entries_checked = v.entries_checked.min(u32::MAX as u64) as u32;
+        let entries_legacy_linkage_only = v.entries_legacy_linkage_only.min(u32::MAX as u64) as u32;
         let files_checked = v
             .files_checked
             .into_iter()
@@ -362,6 +375,7 @@ impl From<aec_audit::ChainVerification> for ChainVerificationJs {
             aec_audit::ChainStatus::Ok => Self {
                 status: "ok".to_string(),
                 entries_checked,
+                entries_legacy_linkage_only,
                 files_checked,
                 head_hash: v.head_hash,
                 break_file: None,
@@ -379,6 +393,13 @@ impl From<aec_audit::ChainVerification> for ChainVerificationJs {
                         "hash_recompute_mismatch",
                         format!("stored = {stored}, recomputed = {recomputed}"),
                     ),
+                    aec_audit::BreakReason::UnsupportedHashVersion { version, supported } => (
+                        "unsupported_hash_version",
+                        format!(
+                            "entry hash_version = {version}, this build supports {:?}",
+                            supported
+                        ),
+                    ),
                     aec_audit::BreakReason::MalformedEntry { message } => {
                         ("malformed_entry", message.clone())
                     }
@@ -387,6 +408,7 @@ impl From<aec_audit::ChainVerification> for ChainVerificationJs {
                 Self {
                     status: "broken_at".to_string(),
                     entries_checked,
+                    entries_legacy_linkage_only,
                     files_checked,
                     head_hash: v.head_hash,
                     break_file: Some(file.to_string_lossy().into_owned()),

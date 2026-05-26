@@ -963,15 +963,33 @@ export interface EngineStatus {
  * file order — `breakFile` and `breakLine` (1-based) point to the
  * offending entry, `breakReason` is one of
  * `"prev_hash_mismatch"`, `"hash_recompute_mismatch"`,
- * `"malformed_entry"`, or `"io"`, and `breakDetail` carries a
- * human-readable description for the status pane.
+ * `"unsupported_hash_version"`, `"malformed_entry"`, or `"io"`,
+ * and `breakDetail` carries a human-readable description for the
+ * status pane.
  *
  * `entriesChecked` is the count of fully-validated entries (so a
  * break at line 5 of the first file yields 4).
+ *
+ * `entriesLegacyLinkageOnly` is the subset of `entriesChecked`
+ * that were verified with linkage-only checks because they were
+ * written under the v1 hash algorithm (which embedded the raw
+ * payload bytes into the hash — those bytes aren't persisted on
+ * the entry, so the v1 hash cannot be recomputed offline). The
+ * chain still reports `"ok"` for these entries; UI surfaces can
+ * use this counter to gate downstream trust on the legacy
+ * fraction.
+ *
+ * `filesChecked` lists only the `.jsonl` files that were
+ * actually opened and inspected (not every file in the
+ * directory). On an early break this contains files up to and
+ * including the one in which the break occurred; files
+ * discovered during directory traversal but never opened are NOT
+ * included.
  */
 export interface AuditChainVerification {
   status: "ok" | "broken_at";
   entriesChecked: number;
+  entriesLegacyLinkageOnly: number;
   filesChecked: string[];
   headHash: string;
   breakFile: string | null;
@@ -979,6 +997,7 @@ export interface AuditChainVerification {
   breakReason:
     | "prev_hash_mismatch"
     | "hash_recompute_mismatch"
+    | "unsupported_hash_version"
     | "malformed_entry"
     | "io"
     | null;
@@ -2504,6 +2523,7 @@ export function inProcessBackend(): BridgeBackend {
       return {
         status: "ok" as const,
         entriesChecked: 0,
+        entriesLegacyLinkageOnly: 0,
         filesChecked: [],
         headHash: "blake3:genesis",
         breakFile: null,

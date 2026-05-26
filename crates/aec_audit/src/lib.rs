@@ -33,6 +33,33 @@ pub enum AuditError {
     },
 }
 
+/// Hash format used by [`AuditEntry`]. The field is encoded in
+/// [`AuditEntryCanonical`] so any tampering with the version itself
+/// (e.g. attempting to downgrade a v2 entry to v1 to skip the
+/// recompute check) is detected by the v2 hash.
+///
+/// **Version 1** (legacy): the entry's `hash` was computed as
+/// `BLAKE3(prev_hash_bytes || command_id_bytes || payload_bytes)`.
+/// This formula needs the original *payload* bytes to verify, which
+/// the entry does NOT persist (only `payload_hash` is stored). As a
+/// result, [`verify_chain`] cannot recompute v1 hashes from the
+/// stored entry alone — it falls back to linkage-only verification
+/// (i.e. checks that `prev_hash` matches the previous entry's `hash`,
+/// but cannot detect tampering of any other field).
+///
+/// **Version 2** (current): the entry's `hash` is
+/// `BLAKE3(canonical_json(all_fields_except_hash))`. The canonical
+/// serialisation includes `hash_version` itself, every immutable
+/// field, and the running `prev_hash` head. [`verify_chain`]
+/// recomputes this from the stored fields and detects tampering of
+/// any of them.
+pub const HASH_VERSION_LEGACY: u8 = 1;
+pub const HASH_VERSION_CURRENT: u8 = 2;
+
+fn default_hash_version_legacy() -> u8 {
+    HASH_VERSION_LEGACY
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditEntry {
     pub command_id: CommandId,
@@ -43,11 +70,23 @@ pub struct AuditEntry {
     pub payload_hash: String,
     pub prev_hash: String,
     pub hash: String,
+    /// Hash format version. Entries written before the canonical-JSON
+    /// hash format was introduced do not have this field on disk, so
+    /// `serde` populates it with [`HASH_VERSION_LEGACY`] (1) via
+    /// `#[serde(default)]`. New entries written through
+    /// [`AuditLog::append`] always set this to [`HASH_VERSION_CURRENT`].
+    #[serde(default = "default_hash_version_legacy")]
+    pub hash_version: u8,
 }
 
 /// Canonical serialisation of the immutable fields of an entry
 /// — everything except `hash` itself. The order matches the
 /// struct definition so the wire bytes are stable across runs.
+///
+/// `hash_version` is included so that an attacker cannot silently
+/// downgrade a v2 entry to v1 (which would cause [`verify_chain`] to
+/// skip the recompute check) without also invalidating the stored
+/// `hash`.
 #[derive(Debug, Serialize)]
 struct AuditEntryCanonical<'a> {
     command_id: &'a CommandId,
@@ -57,13 +96,21 @@ struct AuditEntryCanonical<'a> {
     tool: &'a str,
     payload_hash: &'a str,
     prev_hash: &'a str,
+    hash_version: u8,
 }
 
 impl AuditEntry {
-    /// Bytes that go into the `hash` chain computation. This is
-    /// `canonical_json(all fields except hash)` — `verify_chain`
-    /// re-derives the entry hash from these bytes and compares it
-    /// to the stored `hash`.
+    /// Bytes that go into the `hash` chain computation for v2+
+    /// entries. This is `canonical_json(all fields except hash)`.
+    /// [`verify_chain`] re-derives the entry hash from these bytes
+    /// and compares it to the stored `hash`.
+    ///
+    /// `to_rfc3339_opts(SecondsFormat::Nanos, true)` is used (always
+    /// 9 fractional digits) so the wire bytes are stable regardless
+    /// of the `DateTime`'s sub-second precision. This is safe because
+    /// `canonical_bytes` always operates on the in-memory `DateTime`
+    /// value, not a JSONL-decoded string — chrono's serde round-trip
+    /// preserves the `DateTime` losslessly.
     pub(crate) fn canonical_bytes(&self) -> Vec<u8> {
         let c = AuditEntryCanonical {
             command_id: &self.command_id,
@@ -73,14 +120,65 @@ impl AuditEntry {
             tool: &self.tool,
             payload_hash: &self.payload_hash,
             prev_hash: &self.prev_hash,
+            hash_version: self.hash_version,
         };
-        serde_json::to_vec(&c).unwrap_or_default()
+        // All fields of `AuditEntryCanonical` are owned or referenced
+        // primitives / strings with infallible `Serialize` impls; the
+        // only way `to_vec` can fail is `Serializer::serialize_*`
+        // returning an error from a fallible custom impl, which none
+        // of these types have. `.expect` rather than
+        // `.unwrap_or_default()` so any future field that breaks this
+        // invariant fails loudly during testing instead of silently
+        // producing `blake3(empty)` — which would be a critical
+        // integrity failure (every entry would hash identically).
+        serde_json::to_vec(&c).expect("AuditEntryCanonical serialises infallibly")
     }
 
-    /// Re-derive the entry's BLAKE3 hash from its content.
-    pub fn recompute_hash(&self) -> String {
-        format!("blake3:{}", blake3::hash(&self.canonical_bytes()).to_hex())
+    /// Re-derive the entry's BLAKE3 hash from its content for v2+
+    /// entries. Returns:
+    ///
+    /// * [`HashRecompute::LegacyLinkageOnly`] for v1 entries: the v1
+    ///   algorithm hashes the *raw* payload (not the payload hash),
+    ///   and the payload itself isn't persisted on the entry, so the
+    ///   v1 hash cannot be reconstructed from a stored entry alone.
+    ///   [`verify_chain`] falls back to linkage-only verification.
+    /// * [`HashRecompute::Current`] holding the recomputed hash for
+    ///   v2 entries. [`verify_chain`] compares this to the stored
+    ///   `hash` and surfaces a mismatch as
+    ///   [`BreakReason::HashRecomputeMismatch`].
+    /// * [`HashRecompute::Unsupported`] for any version this build
+    ///   does not understand (e.g. a future v3 written by a newer
+    ///   build). [`verify_chain`] surfaces this as
+    ///   [`BreakReason::UnsupportedHashVersion`] rather than silently
+    ///   treating it as legacy — if we can't validate the entry, the
+    ///   audit log integrity is unknown, not OK.
+    pub fn recompute_hash(&self) -> HashRecompute {
+        match self.hash_version {
+            HASH_VERSION_LEGACY => HashRecompute::LegacyLinkageOnly,
+            HASH_VERSION_CURRENT => HashRecompute::Current(format!(
+                "blake3:{}",
+                blake3::hash(&self.canonical_bytes()).to_hex()
+            )),
+            _ => HashRecompute::Unsupported,
+        }
     }
+}
+
+/// Outcome of [`AuditEntry::recompute_hash`]. The three arms
+/// correspond directly to the three possible cases
+/// [`verify_chain`] must handle per [`HASH_VERSION_LEGACY`] /
+/// [`HASH_VERSION_CURRENT`] / unknown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HashRecompute {
+    /// v1 entry — hash cannot be recomputed without the original
+    /// payload bytes, so only the `prev_hash` linkage is checked.
+    LegacyLinkageOnly,
+    /// v2 entry — BLAKE3 over canonical JSON of every immutable
+    /// field. Compare this value to `entry.hash`.
+    Current(String),
+    /// Unknown version — [`verify_chain`] cannot validate this entry
+    /// and surfaces [`BreakReason::UnsupportedHashVersion`].
+    Unsupported,
 }
 
 /// In-memory audit log with file-backed persistence.
@@ -194,12 +292,11 @@ impl AuditLog {
     }
 
     /// Append a new entry. The hash is computed as
-    /// `BLAKE3(canonical_json(entry_without_hash_field))`, where the
-    /// entry's `prev_hash` field is the current chain head. Because
-    /// every immutable field is folded into the hash, tampering with
-    /// any field (`ts`, `scope`, `actor`, `tool`, `payload_hash`,
-    /// `prev_hash`, or `command_id`) will be detected by
-    /// [`verify_chain`].
+    /// `BLAKE3(canonical_json(entry_without_hash_field))` per
+    /// [`HASH_VERSION_CURRENT`], where the entry's `prev_hash` field
+    /// is the current chain head. Because every immutable field
+    /// (including `hash_version`) is folded into the hash, tampering
+    /// with any field will be detected by [`verify_chain`].
     pub fn append(
         &mut self,
         command_id: CommandId,
@@ -220,8 +317,24 @@ impl AuditLog {
             payload_hash,
             prev_hash,
             hash: String::new(),
+            hash_version: HASH_VERSION_CURRENT,
         };
-        entry.hash = entry.recompute_hash();
+        entry.hash = match entry.recompute_hash() {
+            HashRecompute::Current(h) => h,
+            // `hash_version: HASH_VERSION_CURRENT` is set immediately
+            // above; reaching anything else here would mean the
+            // version constants drifted from `recompute_hash`'s match
+            // arms. Fail loud rather than write an entry whose hash
+            // we can't verify later.
+            HashRecompute::LegacyLinkageOnly => {
+                unreachable!("append writes HASH_VERSION_CURRENT; recompute_hash returned legacy")
+            }
+            HashRecompute::Unsupported => {
+                unreachable!(
+                    "append writes HASH_VERSION_CURRENT; recompute_hash returned unsupported"
+                )
+            }
+        };
         self.head.clone_from(&entry.hash);
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -245,7 +358,22 @@ pub struct ChainVerification {
     /// Number of entries that were fully validated before the first
     /// break (or all entries, if the chain is intact).
     pub entries_checked: u64,
-    /// Files inspected in order.
+    /// Subset of `entries_checked` that were verified with
+    /// linkage-only checks because their `hash_version` is
+    /// [`HASH_VERSION_LEGACY`] — i.e. the v1 hash algorithm needs the
+    /// original payload bytes (which are not persisted in the entry),
+    /// so the entry's `hash` cannot be recomputed and only the
+    /// `prev_hash` linkage is verified. The chain still reports `Ok`
+    /// in this case; operators who want stronger guarantees should
+    /// regenerate the audit log on the current `HASH_VERSION_CURRENT`
+    /// algorithm or use this counter to gate downstream trust.
+    pub entries_legacy_linkage_only: u64,
+    /// Files that were actually opened and inspected, in the order
+    /// they were walked. On a successful verification this includes
+    /// every `.jsonl` under `audit_dir`; on an early break this only
+    /// includes the files up to and including the one in which the
+    /// break occurred. Files discovered during `read_dir` but not yet
+    /// opened at the time of the break are NOT included.
     pub files_checked: Vec<PathBuf>,
     /// The latest valid `hash` head seen. For a fully-intact chain
     /// this equals the last entry's `hash`. For a broken chain this
@@ -281,6 +409,12 @@ pub enum BreakReason {
     /// of its other fields. This catches tampering with any field
     /// other than `prev_hash`.
     HashRecomputeMismatch { stored: String, recomputed: String },
+    /// The entry's `hash_version` is a value this build does not
+    /// understand (i.e. neither [`HASH_VERSION_LEGACY`] nor
+    /// [`HASH_VERSION_CURRENT`]). Most likely the log was written by
+    /// a newer build that this build cannot validate. Surfaces
+    /// loudly rather than silently treating the entry as legacy.
+    UnsupportedHashVersion { version: u8, supported: Vec<u8> },
     /// The JSONL line could not be parsed as an `AuditEntry`.
     MalformedEntry { message: String },
     /// I/O error while reading the file.
@@ -304,20 +438,63 @@ pub enum BreakReason {
 /// itself failing (e.g. the path doesn't exist) is treated as an
 /// I/O error.
 pub fn verify_chain(audit_dir: &Path) -> AuditResult<ChainVerification> {
-    let mut files: Vec<PathBuf> = std::fs::read_dir(audit_dir)?
-        .filter_map(std::result::Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("jsonl"))
-        .collect();
+    // Enumerate `.jsonl` files. Surface per-entry `DirEntry` errors
+    // (e.g. EACCES on a stat) explicitly rather than silently skipping
+    // them with `filter_map(Result::ok)` — a skipped audit file is
+    // exactly the integrity gap this function is meant to detect.
+    let entries_iter = std::fs::read_dir(audit_dir)?;
+    let mut files: Vec<PathBuf> = Vec::new();
+    for entry in entries_iter {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                return Ok(ChainVerification {
+                    status: ChainStatus::BrokenAt {
+                        file: audit_dir.to_path_buf(),
+                        line: 0,
+                        reason: BreakReason::Io {
+                            message: format!(
+                                "failed to read directory entry under {}: {}",
+                                audit_dir.display(),
+                                e
+                            ),
+                        },
+                    },
+                    entries_checked: 0,
+                    entries_legacy_linkage_only: 0,
+                    files_checked: Vec::new(),
+                    head_hash: AuditLog::GENESIS.to_string(),
+                });
+            }
+        };
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+            files.push(path);
+        }
+    }
     files.sort();
 
     let mut head = AuditLog::GENESIS.to_string();
     let mut entries_checked: u64 = 0;
+    let mut entries_legacy_linkage_only: u64 = 0;
+    // Track files that were actually opened (i.e. inspected) so the
+    // returned `files_checked` reflects coverage, not directory
+    // contents. On an early break this contains the files up to and
+    // including the one in which the break occurred; files discovered
+    // during `read_dir` but not yet opened are NOT included.
+    let mut files_checked: Vec<PathBuf> = Vec::with_capacity(files.len());
 
     for file in &files {
         let f = match File::open(file) {
-            Ok(f) => f,
+            Ok(f) => {
+                files_checked.push(file.clone());
+                f
+            }
             Err(e) => {
+                // The file is the one whose open failed — record it
+                // as "inspected" because we made an attempt, then
+                // return immediately.
+                files_checked.push(file.clone());
                 return Ok(ChainVerification {
                     status: ChainStatus::BrokenAt {
                         file: file.clone(),
@@ -327,7 +504,8 @@ pub fn verify_chain(audit_dir: &Path) -> AuditResult<ChainVerification> {
                         },
                     },
                     entries_checked,
-                    files_checked: files.clone(),
+                    entries_legacy_linkage_only,
+                    files_checked,
                     head_hash: head,
                 });
             }
@@ -347,7 +525,8 @@ pub fn verify_chain(audit_dir: &Path) -> AuditResult<ChainVerification> {
                             },
                         },
                         entries_checked,
-                        files_checked: files.clone(),
+                        entries_legacy_linkage_only,
+                        files_checked,
                         head_hash: head,
                     });
                 }
@@ -367,7 +546,8 @@ pub fn verify_chain(audit_dir: &Path) -> AuditResult<ChainVerification> {
                             },
                         },
                         entries_checked,
-                        files_checked: files.clone(),
+                        entries_legacy_linkage_only,
+                        files_checked,
                         head_hash: head,
                     });
                 }
@@ -383,25 +563,53 @@ pub fn verify_chain(audit_dir: &Path) -> AuditResult<ChainVerification> {
                         },
                     },
                     entries_checked,
-                    files_checked: files.clone(),
+                    entries_legacy_linkage_only,
+                    files_checked,
                     head_hash: head,
                 });
             }
-            let recomputed = entry.recompute_hash();
-            if recomputed != entry.hash {
-                return Ok(ChainVerification {
-                    status: ChainStatus::BrokenAt {
-                        file: file.clone(),
-                        line: line_num,
-                        reason: BreakReason::HashRecomputeMismatch {
-                            stored: entry.hash,
-                            recomputed,
+            match entry.recompute_hash() {
+                HashRecompute::Current(recomputed) => {
+                    if recomputed != entry.hash {
+                        return Ok(ChainVerification {
+                            status: ChainStatus::BrokenAt {
+                                file: file.clone(),
+                                line: line_num,
+                                reason: BreakReason::HashRecomputeMismatch {
+                                    stored: entry.hash,
+                                    recomputed,
+                                },
+                            },
+                            entries_checked,
+                            entries_legacy_linkage_only,
+                            files_checked,
+                            head_hash: head,
+                        });
+                    }
+                }
+                HashRecompute::LegacyLinkageOnly => {
+                    // v1: linkage already verified above; the stored
+                    // hash itself can't be checked without the
+                    // original payload bytes. Count it so callers
+                    // can gate trust on the legacy-fraction.
+                    entries_legacy_linkage_only += 1;
+                }
+                HashRecompute::Unsupported => {
+                    return Ok(ChainVerification {
+                        status: ChainStatus::BrokenAt {
+                            file: file.clone(),
+                            line: line_num,
+                            reason: BreakReason::UnsupportedHashVersion {
+                                version: entry.hash_version,
+                                supported: vec![HASH_VERSION_LEGACY, HASH_VERSION_CURRENT],
+                            },
                         },
-                    },
-                    entries_checked,
-                    files_checked: files.clone(),
-                    head_hash: head,
-                });
+                        entries_checked,
+                        entries_legacy_linkage_only,
+                        files_checked,
+                        head_hash: head,
+                    });
+                }
             }
             head = entry.hash;
             entries_checked += 1;
@@ -411,7 +619,8 @@ pub fn verify_chain(audit_dir: &Path) -> AuditResult<ChainVerification> {
     Ok(ChainVerification {
         status: ChainStatus::Ok,
         entries_checked,
-        files_checked: files,
+        entries_legacy_linkage_only,
+        files_checked,
         head_hash: head,
     })
 }

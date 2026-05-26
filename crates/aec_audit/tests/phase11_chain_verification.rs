@@ -13,7 +13,10 @@
 use std::fs;
 use std::path::Path;
 
-use aec_audit::{verify_chain, AuditLog, BreakReason, ChainStatus, ChainVerification};
+use aec_audit::{
+    verify_chain, AuditLog, BreakReason, ChainStatus, ChainVerification, HASH_VERSION_CURRENT,
+    HASH_VERSION_LEGACY,
+};
 use aec_core::types::{Actor, CommandId, Scope};
 
 fn make_ten_entries(dir: &Path) -> Vec<String> {
@@ -212,4 +215,139 @@ fn verify_handles_blank_lines_between_entries_gracefully() {
     let v = verify_chain(dir.path()).unwrap();
     assert!(v.is_ok());
     assert_eq!(v.entries_checked, 10);
+}
+
+#[test]
+fn verify_accepts_legacy_v1_entries_with_linkage_only_check() {
+    // A v1 entry is one whose `hash_version` field equals
+    // HASH_VERSION_LEGACY (1). The stored `hash` was computed with the
+    // pre-canonical-JSON algorithm whose input includes the original
+    // payload bytes; those bytes aren't persisted on the entry, so
+    // verify_chain cannot recompute the hash. It MUST therefore fall
+    // back to linkage-only verification (i.e. checks `prev_hash`
+    // against the running head but does NOT compare the stored
+    // `hash`) — and report that fact via `entries_legacy_linkage_only`
+    // rather than silently treating the chain as fully verified.
+    let dir = tempfile::tempdir().unwrap();
+    make_ten_entries(dir.path());
+
+    let log_path = dir.path().join("log.jsonl");
+    let raw = fs::read_to_string(&log_path).unwrap();
+    let lines: Vec<&str> = raw.lines().collect();
+    // Downgrade entry 3's `hash_version` to v1. The entry's stored
+    // `hash` is still the v2 BLAKE3 (we don't touch it), but
+    // verify_chain must not attempt to recompute the v1 hash from
+    // canonical JSON — it must just verify linkage and tally it as a
+    // linkage-only entry.
+    let mut entry: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+    entry["hash_version"] = serde_json::json!(HASH_VERSION_LEGACY);
+    let mut new_lines: Vec<String> = lines.iter().map(|&s| s.to_owned()).collect();
+    new_lines[2] = serde_json::to_string(&entry).unwrap();
+    fs::write(&log_path, new_lines.join("\n") + "\n").unwrap();
+
+    let v = verify_chain(dir.path()).unwrap();
+    assert!(v.is_ok(), "got {:?}", v.status);
+    assert_eq!(v.entries_checked, 10);
+    assert_eq!(
+        v.entries_legacy_linkage_only, 1,
+        "exactly one entry was tagged v1; got {} legacy entries",
+        v.entries_legacy_linkage_only
+    );
+}
+
+#[test]
+fn verify_reports_unsupported_hash_version_on_unknown_version() {
+    // Future-proofing: an entry with a `hash_version` neither v1 nor
+    // v2 (e.g. a v99 written by a newer build) must NOT be silently
+    // accepted as legacy — verify_chain doesn't know how to validate
+    // it, so it surfaces UnsupportedHashVersion at the offending
+    // entry. This prevents an attacker from bumping `hash_version`
+    // past the validator's known set to bypass integrity checks.
+    let dir = tempfile::tempdir().unwrap();
+    make_ten_entries(dir.path());
+
+    let log_path = dir.path().join("log.jsonl");
+    let raw = fs::read_to_string(&log_path).unwrap();
+    let lines: Vec<&str> = raw.lines().collect();
+    let mut entry: serde_json::Value = serde_json::from_str(lines[5]).unwrap();
+    entry["hash_version"] = serde_json::json!(99u8);
+    let mut new_lines: Vec<String> = lines.iter().map(|&s| s.to_owned()).collect();
+    new_lines[5] = serde_json::to_string(&entry).unwrap();
+    fs::write(&log_path, new_lines.join("\n") + "\n").unwrap();
+
+    let v = verify_chain(dir.path()).unwrap();
+    match v.status {
+        ChainStatus::BrokenAt {
+            line,
+            reason:
+                BreakReason::UnsupportedHashVersion {
+                    version, supported, ..
+                },
+            ..
+        } => {
+            assert_eq!(line, 6, "break should be at line 6 (entry index 5)");
+            assert_eq!(version, 99);
+            assert!(supported.contains(&HASH_VERSION_LEGACY));
+            assert!(supported.contains(&HASH_VERSION_CURRENT));
+        }
+        other => panic!("expected UnsupportedHashVersion at line 6, got {other:?}"),
+    }
+    // 5 entries verified cleanly before the bad one (line 6 / index 5).
+    assert_eq!(v.entries_checked, 5);
+}
+
+#[test]
+fn verify_files_checked_includes_only_inspected_files_on_early_break() {
+    // Three rotated log segments; tamper a hash in the SECOND file.
+    // The break must short-circuit verification of the third file —
+    // and `files_checked` must reflect only the two files actually
+    // opened (not all three in the directory).
+    let dir = tempfile::tempdir().unwrap();
+
+    let combined = dir.path().join("combined.jsonl");
+    let mut log = AuditLog::open(&combined).unwrap();
+    for i in 0..9 {
+        log.append(
+            CommandId::new(),
+            Scope::Design,
+            Actor::user(),
+            format!("op_{i}"),
+            &serde_json::json!({"i": i}),
+        )
+        .unwrap();
+    }
+    let raw = fs::read_to_string(&combined).unwrap();
+    let lines: Vec<&str> = raw.lines().collect();
+    fs::remove_file(&combined).unwrap();
+
+    fs::write(dir.path().join("0001.jsonl"), lines[..3].join("\n") + "\n").unwrap();
+    // Tamper line 1 of the second segment (entries 3..6 inclusive).
+    let mut seg2_lines: Vec<String> = lines[3..6].iter().map(|&s| s.to_owned()).collect();
+    let mut entry: serde_json::Value = serde_json::from_str(&seg2_lines[0]).unwrap();
+    entry["tool"] = serde_json::json!("op_INJECTED");
+    seg2_lines[0] = serde_json::to_string(&entry).unwrap();
+    fs::write(dir.path().join("0002.jsonl"), seg2_lines.join("\n") + "\n").unwrap();
+    fs::write(dir.path().join("0003.jsonl"), lines[6..].join("\n") + "\n").unwrap();
+
+    let v = verify_chain(dir.path()).unwrap();
+    assert!(!v.is_ok());
+    match &v.status {
+        ChainStatus::BrokenAt {
+            file,
+            reason: BreakReason::HashRecomputeMismatch { .. },
+            ..
+        } => {
+            assert!(file.ends_with("0002.jsonl"), "break should be in segment 2");
+        }
+        other => panic!("expected HashRecomputeMismatch in 0002.jsonl, got {other:?}"),
+    }
+    assert_eq!(
+        v.files_checked.len(),
+        2,
+        "files_checked must include 0001.jsonl and 0002.jsonl (the broken one), \
+         not 0003.jsonl which was never opened — got {:?}",
+        v.files_checked
+    );
+    assert!(v.files_checked[0].ends_with("0001.jsonl"));
+    assert!(v.files_checked[1].ends_with("0002.jsonl"));
 }
