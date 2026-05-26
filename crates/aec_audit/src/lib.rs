@@ -83,10 +83,30 @@ pub struct AuditEntry {
 /// — everything except `hash` itself. The order matches the
 /// struct definition so the wire bytes are stable across runs.
 ///
-/// `hash_version` is included so that an attacker cannot silently
-/// downgrade a v2 entry to v1 (which would cause [`verify_chain`] to
-/// skip the recompute check) without also invalidating the stored
-/// `hash`.
+/// `hash_version` is included so that flipping the version field
+/// on an *otherwise-untouched* v2 entry (e.g. an attempt to mark a
+/// v2 entry as v1 in order to skip the content recompute) is caught
+/// by the v2 BLAKE3 hash check on that same entry: the stored
+/// `hash` was computed over `hash_version: 2`, so reading the entry
+/// as v2 with the version flipped to 1 first hits the `Current` arm
+/// of [`AuditEntry::recompute_hash`] and surfaces a
+/// [`BreakReason::HashRecomputeMismatch`].
+///
+/// **Important — this is NOT a defence against arbitrary v1
+/// forgery.** If an attacker controls a JSONL file, they can write a
+/// fresh entry whose `hash_version` is [`HASH_VERSION_LEGACY`] with
+/// arbitrary `tool` / `actor` / `scope` / `payload_hash` content,
+/// then set `prev_hash` to chain correctly to the surrounding
+/// entries. [`verify_chain`] cannot recompute the v1 hash (the v1
+/// algorithm needs the original payload bytes, which are not
+/// persisted on the entry), so the entry is accepted with
+/// linkage-only verification and only counted via
+/// `entries_legacy_linkage_only` in the report. For projects that
+/// have never used the v1 hash algorithm (i.e. every entry was
+/// written by [`AuditLog::append`] in this codebase, which always
+/// sets [`HASH_VERSION_CURRENT`]), callers should use
+/// [`verify_chain_with`] with [`VerifyOptions::strict_v2_only`] to
+/// reject any v1 entry as tampering.
 #[derive(Debug, Serialize)]
 struct AuditEntryCanonical<'a> {
     command_id: &'a CommandId,
@@ -335,7 +355,17 @@ impl AuditLog {
                 )
             }
         };
-        self.head.clone_from(&entry.hash);
+        // Write the entry to disk BEFORE mutating in-memory state.
+        // If any I/O step fails (parent dir create, open, writeln, or
+        // the implicit flush on drop), `self.head` and `self.entries`
+        // are left untouched — on retry the next `append` will
+        // compute the same `prev_hash` and the same `hash`, producing
+        // a bit-identical line. Updating `self.head` first would
+        // leave the in-memory chain ahead of the on-disk chain on
+        // failure: a re-`open` would replay only the entries that
+        // made it to disk and rebuild a *different* head than the
+        // one this process holds, silently breaking the chain across
+        // a process restart.
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -345,6 +375,18 @@ impl AuditLog {
             .open(&self.path)?;
         let line = serde_json::to_string(&entry)?;
         writeln!(file, "{}", line)?;
+        // `writeln!` on `File` flushes to the OS write() syscall
+        // (no userspace BufWriter), so a successful return here
+        // means a subsequent `File::open` + read in this process or
+        // any other will see the entry. Durability across a system
+        // crash is *not* guaranteed without an `fsync`, which we
+        // skip deliberately — audit append is on the hot path of
+        // every command apply, and an `fsync` per command would cap
+        // throughput at storage commit latency. A power-loss
+        // scenario can therefore lose the last few entries; that's
+        // acceptable for an append-only audit log (the chain still
+        // verifies against the prefix that did flush).
+        self.head.clone_from(&entry.hash);
         self.entries.push(entry);
         Ok(self.entries.last().expect("just pushed"))
     }
@@ -415,6 +457,18 @@ pub enum BreakReason {
     /// a newer build that this build cannot validate. Surfaces
     /// loudly rather than silently treating the entry as legacy.
     UnsupportedHashVersion { version: u8, supported: Vec<u8> },
+    /// The entry's `hash_version` is below the caller's required
+    /// minimum (see [`VerifyOptions::min_hash_version`]). For
+    /// projects that have only ever been written by
+    /// [`AuditLog::append`] in this codebase, every entry is
+    /// [`HASH_VERSION_CURRENT`] by construction, so encountering a
+    /// v1 entry necessarily means tampering or a downgrade attack.
+    /// Surfaced only when the caller uses
+    /// [`verify_chain_with`] with
+    /// [`VerifyOptions::strict_v2_only`]; the default lenient mode
+    /// accepts v1 entries with linkage-only verification (see
+    /// `entries_legacy_linkage_only`).
+    LegacyHashVersionRejected { version: u8, required_min: u8 },
     /// The JSONL line could not be parsed as an `AuditEntry`.
     MalformedEntry { message: String },
     /// I/O error while reading the file.
@@ -437,7 +491,70 @@ pub enum BreakReason {
 /// `head_hash` is the final entry's `hash`. Reading the directory
 /// itself failing (e.g. the path doesn't exist) is treated as an
 /// I/O error.
+///
+/// This call uses [`VerifyOptions::default`], which is **lenient**
+/// about [`HASH_VERSION_LEGACY`] entries (verifies linkage only and
+/// counts them in `entries_legacy_linkage_only`). Callers whose
+/// projects have only ever used [`HASH_VERSION_CURRENT`] should use
+/// [`verify_chain_with`] with [`VerifyOptions::strict_v2_only`] so
+/// any v1 entry is treated as tampering (see the doc comment on
+/// [`AuditEntryCanonical`] for the threat model).
 pub fn verify_chain(audit_dir: &Path) -> AuditResult<ChainVerification> {
+    verify_chain_with(audit_dir, VerifyOptions::default())
+}
+
+/// Verification policy for [`verify_chain_with`]. Default is the
+/// lenient policy: accept v1 entries with linkage-only verification
+/// and report them in `entries_legacy_linkage_only`. Strict mode
+/// (see [`VerifyOptions::strict_v2_only`]) rejects any v1 entry as
+/// a chain break.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyOptions {
+    /// Minimum acceptable [`AuditEntry::hash_version`]. Any entry
+    /// with `hash_version < min_hash_version` is treated as a chain
+    /// break with [`BreakReason::LegacyHashVersionRejected`].
+    ///
+    /// Defaults to [`HASH_VERSION_LEGACY`] (1), which means "accept
+    /// every known version". Setting this to [`HASH_VERSION_CURRENT`]
+    /// rejects any v1 entry — appropriate for projects that have
+    /// only ever been written by this codebase (every
+    /// [`AuditLog::append`] call writes v2), where the presence of a
+    /// v1 entry necessarily indicates either tampering or a
+    /// downgrade attack (see the doc comment on
+    /// [`AuditEntryCanonical`]).
+    pub min_hash_version: u8,
+}
+
+impl Default for VerifyOptions {
+    fn default() -> Self {
+        Self {
+            min_hash_version: HASH_VERSION_LEGACY,
+        }
+    }
+}
+
+impl VerifyOptions {
+    /// Strict policy: only [`HASH_VERSION_CURRENT`] (or later, once
+    /// added) entries are accepted. Any v1 entry causes
+    /// [`verify_chain_with`] to surface
+    /// [`BreakReason::LegacyHashVersionRejected`] at the offending
+    /// line.
+    ///
+    /// Use this for projects that have only ever been written by
+    /// this codebase. The lenient default exists for backward
+    /// compatibility with audit logs that genuinely contain v1
+    /// entries from an older release.
+    pub fn strict_v2_only() -> Self {
+        Self {
+            min_hash_version: HASH_VERSION_CURRENT,
+        }
+    }
+}
+
+/// Variant of [`verify_chain`] that takes a [`VerifyOptions`] for
+/// policy control (e.g. strict v2-only mode that rejects legacy v1
+/// entries as tampering). See [`VerifyOptions`] for details.
+pub fn verify_chain_with(audit_dir: &Path, opts: VerifyOptions) -> AuditResult<ChainVerification> {
     // Enumerate `.jsonl` files. Surface per-entry `DirEntry` errors
     // (e.g. EACCES on a stat) explicitly rather than silently skipping
     // them with `filter_map(Result::ok)` — a skipped audit file is
@@ -588,10 +705,32 @@ pub fn verify_chain(audit_dir: &Path) -> AuditResult<ChainVerification> {
                     }
                 }
                 HashRecompute::LegacyLinkageOnly => {
-                    // v1: linkage already verified above; the stored
-                    // hash itself can't be checked without the
-                    // original payload bytes. Count it so callers
-                    // can gate trust on the legacy-fraction.
+                    // v1 path. If the caller asked for strict
+                    // v2-only verification (their project has only
+                    // ever been written by this codebase), reject
+                    // here — a v1 entry in a v2-only project is
+                    // either tampering or a downgrade attack (see
+                    // `AuditEntryCanonical` doc comment for the
+                    // threat model). Otherwise fall back to
+                    // linkage-only verification (already done above)
+                    // and tally so callers can surface the legacy
+                    // fraction to operators.
+                    if entry.hash_version < opts.min_hash_version {
+                        return Ok(ChainVerification {
+                            status: ChainStatus::BrokenAt {
+                                file: file.clone(),
+                                line: line_num,
+                                reason: BreakReason::LegacyHashVersionRejected {
+                                    version: entry.hash_version,
+                                    required_min: opts.min_hash_version,
+                                },
+                            },
+                            entries_checked,
+                            entries_legacy_linkage_only,
+                            files_checked,
+                            head_hash: head,
+                        });
+                    }
                     entries_legacy_linkage_only += 1;
                 }
                 HashRecompute::Unsupported => {
