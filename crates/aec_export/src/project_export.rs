@@ -230,45 +230,111 @@ pub struct WriteProjectGltfResult {
     pub out_path: PathBuf,
 }
 
-/// Write a real glTF 2.0 JSON file.
+/// Write a real glTF 2.0 file for `project_name`.
 ///
-/// The result is a minimal-but-valid glTF document: an empty default
-/// scene with a single root node named after the project. This is
-/// enough that glTF tooling (e.g. Khronos `gltf-validator`,
-/// three.js's `GLTFLoader`) opens it without errors. Future PRs will
-/// thread real meshes (walls as extrusions) through this entry
-/// point; the JSON shape stays additive-compatible.
+/// Routes through [`crate::gltf_export::write_gltf`] with a
+/// stand-in scene: one 1m unit cube named after the project. The
+/// output is a real glTF document — meshes, materials, buffer views
+/// and accessors all wired through — that opens cleanly in Khronos
+/// `gltf-validator`, three.js's `GLTFLoader`, Blender, etc.
+///
+/// Callers that already hold a populated [`crate::gltf_export::GltfScene`]
+/// (e.g. the bridge layer when an actual project is loaded) should
+/// invoke [`crate::gltf_export::write_gltf`] directly so real walls /
+/// furniture / cameras / lights are emitted instead of the
+/// placeholder cube.
 pub fn write_project_gltf(
     out_path: &Path,
     project_name: &str,
 ) -> Result<WriteProjectGltfResult, ProjectExportError> {
+    use crate::gltf_export::{write_gltf, GltfMaterial, GltfScene, WriteGltfOptions};
+
     ensure_parent_dir(out_path)?;
-    // Use a plain `serde_json::Value` rather than a typed shape so the
-    // exact field-order matches the glTF 2.0 reference layout. The
-    // mandatory `asset.version: "2.0"` is what tooling checks first;
-    // `scenes`/`nodes` are non-empty so the file represents a real
-    // scene graph rather than an empty document.
-    let doc = serde_json::json!({
-        "asset": {
-            "version": "2.0",
-            "generator": "AEC Studio aec_export project_export",
-            "copyright": format!("AEC Studio export — {}", Utc::now().to_rfc3339()),
-        },
-        "scene": 0,
-        "scenes": [
-            { "name": project_name, "nodes": [0] }
-        ],
-        "nodes": [
-            { "name": project_name }
-        ],
-    });
-    let bytes = serde_json::to_vec_pretty(&doc)
-        .map_err(|e| ProjectExportError::Invalid(format!("failed to serialise glTF JSON: {e}")))?;
-    std::fs::write(out_path, &bytes)?;
+    let mut scene = GltfScene {
+        name: project_name.to_string(),
+        ..Default::default()
+    };
+    // Placeholder unit cube (1 m × 1 m × 1 m) so callers without a
+    // populated scene still get a renderable file rather than an
+    // empty scene graph.
+    let cube = build_unit_cube_mesh(project_name);
+    scene.meshes.push(cube);
+    scene.materials.push(
+        GltfMaterial::new("project_default", "Default").pipe(|mut m| {
+            m.base_color_factor = [0.85, 0.85, 0.85, 1.0];
+            m.roughness_factor = 0.7;
+            m
+        }),
+    );
+    scene
+        .meshes
+        .last_mut()
+        .unwrap()
+        .material_id
+        .replace("project_default".into());
+    write_gltf(out_path, &scene, &WriteGltfOptions::default())
+        .map_err(|e| ProjectExportError::Invalid(format!("glTF export failed: {e}")))?;
     Ok(WriteProjectGltfResult {
         out_path: out_path.to_path_buf(),
     })
 }
+
+fn build_unit_cube_mesh(name: &str) -> crate::gltf_export::GltfMesh {
+    let mut mesh = crate::gltf_export::GltfMesh::new(name);
+    // 1 m cube in mm; one quad per face with consistent winding/normals.
+    let s = 1000.0_f32;
+    let faces: [([f32; 3], [[f32; 3]; 4]); 6] = [
+        // -Z face (back)
+        (
+            [0.0, 0.0, -1.0],
+            [[0.0, 0.0, 0.0], [0.0, s, 0.0], [s, s, 0.0], [s, 0.0, 0.0]],
+        ),
+        // +Z face (front)
+        (
+            [0.0, 0.0, 1.0],
+            [[0.0, 0.0, s], [s, 0.0, s], [s, s, s], [0.0, s, s]],
+        ),
+        // -Y face (bottom)
+        (
+            [0.0, -1.0, 0.0],
+            [[0.0, 0.0, 0.0], [s, 0.0, 0.0], [s, 0.0, s], [0.0, 0.0, s]],
+        ),
+        // +Y face (top)
+        (
+            [0.0, 1.0, 0.0],
+            [[0.0, s, 0.0], [0.0, s, s], [s, s, s], [s, s, 0.0]],
+        ),
+        // -X face (left)
+        (
+            [-1.0, 0.0, 0.0],
+            [[0.0, 0.0, 0.0], [0.0, 0.0, s], [0.0, s, s], [0.0, s, 0.0]],
+        ),
+        // +X face (right)
+        (
+            [1.0, 0.0, 0.0],
+            [[s, 0.0, 0.0], [s, s, 0.0], [s, s, s], [s, 0.0, s]],
+        ),
+    ];
+    for (normal, quad) in faces {
+        let base = mesh.positions.len() as u32;
+        for v in quad {
+            mesh.positions.push(v);
+            mesh.normals.push(normal);
+            mesh.uvs.push([0.0, 0.0]);
+        }
+        mesh.indices
+            .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+    mesh
+}
+
+/// Tiny `pipe` helper for the local closure-style mutator above.
+trait Pipe: Sized {
+    fn pipe<F: FnOnce(Self) -> Self>(self, f: F) -> Self {
+        f(self)
+    }
+}
+impl<T> Pipe for T {}
 
 /// Returned by [`write_proposal_pack`].
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -919,8 +985,16 @@ mod tests {
         let doc: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(doc["asset"]["version"], "2.0");
         assert!(doc["scenes"].is_array());
+        assert_eq!(doc["scenes"][0]["name"], "Test Project");
         assert!(doc["nodes"].is_array());
-        assert_eq!(doc["nodes"][0]["name"], "Test Project");
+        // The placeholder geometry routes through gltf_export and
+        // emits one mesh + one material so the file is renderable.
+        assert!(doc["meshes"].is_array() && doc["meshes"][0]["name"] == "Test Project");
+        assert!(doc["materials"].is_array());
+        assert!(doc["buffers"].is_array());
+        // Sibling .bin file should accompany the .gltf.
+        let bin = out.with_extension("bin");
+        assert!(bin.exists(), "expected sibling bin file at {:?}", bin);
     }
 
     #[test]

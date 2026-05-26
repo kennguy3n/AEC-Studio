@@ -8,6 +8,7 @@ pub mod bim_pack;
 pub mod boq;
 pub mod contractor_pack;
 pub mod extension_targets;
+pub mod gltf_export;
 pub mod interior_pack;
 pub mod pdf;
 pub mod pdf_sheet;
@@ -27,6 +28,10 @@ pub use contractor_pack::{
 pub use extension_targets::{
     list_extension_export_targets, resolve_export_target, ExportFormat as ExtensionExportFormat,
     ExportTargetExtensionError, ExtensionExportTarget,
+};
+pub use gltf_export::{
+    write_gltf, GltfCamera, GltfExportError, GltfFormat, GltfLight, GltfLightKind, GltfMaterial,
+    GltfMesh, GltfScene, WriteGltfOptions, WriteGltfResult,
 };
 pub use interior_pack::{InteriorPack, InteriorPackError, InteriorRender};
 pub use pdf::{PdfBuilder, PdfBuilderError};
