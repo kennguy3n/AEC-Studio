@@ -5,9 +5,11 @@
 //! and verify that:
 //!
 //! 1. A reading above the `warm` threshold halves render-job concurrency
-//!    and pauses background AI (per the existing scheduler policy).
-//! 2. A reading above the `critical` threshold denies *all* render
-//!    admissions with `BackoffReason::Thermal`.
+//!    (AI admission is unchanged in `Warm` — see
+//!    `GovernorScheduler::admit_ai` in `src/scheduler.rs`, which only
+//!    denies AI on `ThermalState::Critical`).
+//! 2. A reading above the `critical` threshold denies *all* render and
+//!    AI admissions with `BackoffReason::Thermal`.
 //! 3. Returning to a nominal reading restores full concurrency.
 //!
 //! These complement the parser-level unit tests in
