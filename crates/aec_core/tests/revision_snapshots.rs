@@ -105,8 +105,18 @@ fn snapshot_round_trip_preserves_entities_under_sqlcipher_key() {
 
     // Reopen the snapshot file with the same key and confirm every
     // entity round-tripped through the byte-for-byte copy.
+    //
+    // We open via `open_readonly` rather than `open_existing` because
+    // production code (`version_diff::open_snapshot_db`) opens `.snap`
+    // files strictly read-only via `SQLITE_OPEN_READ_ONLY` — that's
+    // the whole point of the function. If this test opened with
+    // `open_existing` (which uses default read/write flags + applies
+    // `journal_mode = WAL`), SQLite would create `-wal`/`-shm`
+    // sidecar files next to the `.snap`, which is exactly the
+    // failure mode `open_readonly` was added to prevent. The test
+    // should exercise the same code path as production.
     let snap_path = store.snapshot_path(&rev).unwrap();
-    let snap_conn = aec_core::db::open_existing(&snap_path, &key).unwrap();
+    let snap_conn = aec_core::db::open_readonly(&snap_path, &key).unwrap();
     let entities = snapshot_entities(&snap_conn).unwrap();
 
     assert_eq!(entities.len(), 5);
@@ -325,4 +335,113 @@ fn snapshot_entities_hashes_distinguish_kind_changes_from_body_changes() {
     .unwrap();
     let snapshot_c = snapshot_entities(&conn).unwrap();
     assert_ne!(snapshot_b[0].payload_hash, snapshot_c[0].payload_hash);
+}
+
+#[test]
+fn snapshot_entities_hash_includes_parent_id_so_reparenting_is_detected() {
+    let td = TempDir::new().unwrap();
+    let (conn, _db_path, _key) = open_project(td.path());
+
+    // Seed two rooms and a wall whose parent is the first room.
+    insert_entity(&conn, "room.kitchen", "room", r#"{"area":12}"#);
+    insert_entity(&conn, "room.living", "room", r#"{"area":24}"#);
+    conn.execute(
+        "INSERT INTO entities (id, kind, parent_id, created_at, updated_at, body)
+         VALUES ('wall.W1', 'wall', 'room.kitchen', '2026-05-25T00:00:00Z', '2026-05-25T00:00:00Z', '{}')",
+        [],
+    )
+    .unwrap();
+    let snap_before = snapshot_entities(&conn).unwrap();
+    let wall_before = snap_before
+        .iter()
+        .find(|e| e.id == "wall.W1")
+        .expect("wall.W1 in baseline");
+
+    // Re-parent the wall under the other room. The body bytes are
+    // unchanged, but the topology has changed — the diff engine MUST
+    // see this as a modification (otherwise re-parenting silently
+    // disappears from the before/after report).
+    conn.execute(
+        "UPDATE entities SET parent_id = 'room.living' WHERE id = 'wall.W1'",
+        [],
+    )
+    .unwrap();
+    let snap_after = snapshot_entities(&conn).unwrap();
+    let wall_after = snap_after
+        .iter()
+        .find(|e| e.id == "wall.W1")
+        .expect("wall.W1 still present");
+
+    assert_ne!(
+        wall_before.payload_hash, wall_after.payload_hash,
+        "re-parenting must invalidate the payload hash"
+    );
+}
+
+#[test]
+fn snapshot_entities_hash_includes_components_so_component_only_edits_are_detected() {
+    let td = TempDir::new().unwrap();
+    let (conn, _db_path, _key) = open_project(td.path());
+
+    // Seed an entity with one component attached.
+    insert_entity(&conn, "wall.W1", "wall", r#"{"length_mm":4000}"#);
+    conn.execute(
+        "INSERT INTO components (id, entity_id, kind, body)
+         VALUES ('comp.geom.1', 'wall.W1', 'geometry', '{\"thickness_mm\":100}')",
+        [],
+    )
+    .unwrap();
+    let snap_before = snapshot_entities(&conn).unwrap();
+    let wall_before = snap_before
+        .iter()
+        .find(|e| e.id == "wall.W1")
+        .expect("wall.W1 in baseline");
+
+    // Mutate ONLY the component body. The entity row is untouched.
+    // Without component-aware hashing this would look identical and
+    // the diff UI would lie to the user.
+    conn.execute(
+        "UPDATE components SET body = '{\"thickness_mm\":150}' WHERE id = 'comp.geom.1'",
+        [],
+    )
+    .unwrap();
+    let snap_after_edit = snapshot_entities(&conn).unwrap();
+    let wall_after_edit = snap_after_edit
+        .iter()
+        .find(|e| e.id == "wall.W1")
+        .expect("wall.W1 still present");
+    assert_ne!(
+        wall_before.payload_hash, wall_after_edit.payload_hash,
+        "editing a component body must invalidate the parent entity's payload hash"
+    );
+
+    // Adding a new component to the entity is also a modification.
+    conn.execute(
+        "INSERT INTO components (id, entity_id, kind, body)
+         VALUES ('comp.mat.1', 'wall.W1', 'material', '{\"name\":\"oak\"}')",
+        [],
+    )
+    .unwrap();
+    let snap_after_add = snapshot_entities(&conn).unwrap();
+    let wall_after_add = snap_after_add
+        .iter()
+        .find(|e| e.id == "wall.W1")
+        .expect("wall.W1 still present");
+    assert_ne!(
+        wall_after_edit.payload_hash, wall_after_add.payload_hash,
+        "attaching a new component must invalidate the parent entity's payload hash"
+    );
+
+    // Removing a component reverts the hash to a different state too.
+    conn.execute("DELETE FROM components WHERE id = 'comp.geom.1'", [])
+        .unwrap();
+    let snap_after_remove = snapshot_entities(&conn).unwrap();
+    let wall_after_remove = snap_after_remove
+        .iter()
+        .find(|e| e.id == "wall.W1")
+        .expect("wall.W1 still present");
+    assert_ne!(
+        wall_after_add.payload_hash, wall_after_remove.payload_hash,
+        "removing a component must invalidate the parent entity's payload hash"
+    );
 }

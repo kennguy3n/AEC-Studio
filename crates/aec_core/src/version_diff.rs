@@ -141,36 +141,109 @@ pub fn classify_entity_kind(kind: &str) -> &str {
     }
 }
 
-/// Walk the `entities` table of a project snapshot and produce a
-/// hashable [`RevisionEntity`] for every row.
+/// Walk the `entities` and `components` tables of a project snapshot
+/// and produce a hashable [`RevisionEntity`] for every entity row.
 ///
 /// `category` is derived from the entity's `kind` via
-/// [`classify_entity_kind`]. `payload_hash` is BLAKE3 over
-/// `kind || 0x00 || body` so that two entities with the same id but
-/// different kind hash differently. The hash also tracks `body`
-/// byte-for-byte, which is what gives the diff engine real
-/// modification detection.
+/// [`classify_entity_kind`]. `payload_hash` is BLAKE3 over a
+/// deterministic byte stream that includes:
+///
+/// * The entity's `kind` — so a re-classification (e.g. `wall` →
+///   `camera`) hashes differently from a body-only change.
+/// * The entity's `parent_id` — so moving an entity to a different
+///   parent is detected as a structural modification even when the
+///   `body` is byte-identical to the previous revision. Without this,
+///   re-parenting a wall under a different room would silently
+///   disappear from the diff.
+/// * The entity's `body` text byte-for-byte.
+/// * Every row in `components` whose `entity_id` matches, ordered by
+///   the component's own primary key. Components carry per-entity
+///   geometry, materials, and property data (see the schema in
+///   `crates/aec_core/src/db.rs`). A geometry edit that mutates only a
+///   component row would otherwise pass through this function as if
+///   the entity were unchanged, defeating the diff UI's reason to
+///   exist.
+///
+/// `created_at` / `updated_at` are intentionally **excluded** from the
+/// hash: they're timestamps that can advance without any semantic
+/// change (e.g. on a re-save that rewrites the same body), and
+/// including them would mark every entity as "modified" across an
+/// idempotent rewrite. The diff is supposed to surface *content*
+/// changes, not file-touch metadata.
+///
+/// Each separating `0x00` byte disambiguates adjacent fields so two
+/// snapshots can't collide just because one entity's `body` happens
+/// to start with the next field's bytes.
 pub fn snapshot_entities(conn: &Connection) -> AecResult<Vec<RevisionEntity>> {
-    let mut stmt = conn
-        .prepare("SELECT id, kind, body FROM entities ORDER BY id")
+    // First pass: stream every entity row, ordered by id so the
+    // resulting Vec is itself in a stable order (which the diff
+    // engine relies on for `Vec::binary_search` and for keeping a
+    // golden-file hash stable across re-runs).
+    let mut entity_stmt = conn
+        .prepare("SELECT id, kind, parent_id, body FROM entities ORDER BY id")
         .map_err(|e| AecError::Other(format!("snapshot prepare failed: {e}")))?;
-    let rows = stmt
+    let entity_rows = entity_stmt
         .query_map([], |row| {
             let id: String = row.get(0)?;
             let kind: String = row.get(1)?;
-            let body: String = row.get(2)?;
-            Ok((id, kind, body))
+            let parent_id: Option<String> = row.get(2)?;
+            let body: String = row.get(3)?;
+            Ok((id, kind, parent_id, body))
         })
         .map_err(|e| AecError::Other(format!("snapshot query failed: {e}")))?;
-    let mut out = Vec::new();
-    for row in rows {
-        let (id, kind, body) =
-            row.map_err(|e| AecError::Other(format!("snapshot row read failed: {e}")))?;
+    let entities: Vec<(String, String, Option<String>, String)> = entity_rows
+        .collect::<rusqlite::Result<_>>()
+        .map_err(|e| AecError::Other(format!("snapshot row read failed: {e}")))?;
+
+    // Second pass: stream every component row, ordered by
+    // (entity_id, id), and group them per-entity in a BTreeMap so the
+    // per-entity hashing loop below can pick up its slice with a
+    // single map lookup. Using ORDER BY here — instead of sorting in
+    // Rust — means SQLite uses the existing `idx_components_entity`
+    // index for the grouping and the rows arrive already in the
+    // canonical hash order.
+    let mut comp_stmt = conn
+        .prepare("SELECT entity_id, id, kind, body FROM components ORDER BY entity_id, id")
+        .map_err(|e| AecError::Other(format!("snapshot components prepare failed: {e}")))?;
+    let comp_rows = comp_stmt
+        .query_map([], |row| {
+            let entity_id: String = row.get(0)?;
+            let id: String = row.get(1)?;
+            let kind: String = row.get(2)?;
+            let body: String = row.get(3)?;
+            Ok((entity_id, id, kind, body))
+        })
+        .map_err(|e| AecError::Other(format!("snapshot components query failed: {e}")))?;
+    let mut comp_groups: BTreeMap<String, Vec<(String, String, String)>> = BTreeMap::new();
+    for r in comp_rows {
+        let (entity_id, id, kind, body) =
+            r.map_err(|e| AecError::Other(format!("snapshot component read failed: {e}")))?;
+        comp_groups
+            .entry(entity_id)
+            .or_default()
+            .push((id, kind, body));
+    }
+
+    let mut out = Vec::with_capacity(entities.len());
+    for (id, kind, parent_id, body) in entities {
         let category = classify_entity_kind(&kind).to_string();
         let mut hasher = blake3::Hasher::new();
         hasher.update(kind.as_bytes());
         hasher.update(b"\0");
+        hasher.update(parent_id.as_deref().unwrap_or("").as_bytes());
+        hasher.update(b"\0");
         hasher.update(body.as_bytes());
+        hasher.update(b"\0");
+        if let Some(components) = comp_groups.get(&id) {
+            for (cid, ckind, cbody) in components {
+                hasher.update(cid.as_bytes());
+                hasher.update(b"\0");
+                hasher.update(ckind.as_bytes());
+                hasher.update(b"\0");
+                hasher.update(cbody.as_bytes());
+                hasher.update(b"\0");
+            }
+        }
         let payload_hash = hasher.finalize().to_hex().to_string();
         out.push(RevisionEntity {
             category,
