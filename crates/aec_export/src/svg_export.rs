@@ -236,10 +236,12 @@ fn emit_entity(
         DxfEntity::Ellipse(_)
         | DxfEntity::Spline(_)
         | DxfEntity::Insert(_)
-        | DxfEntity::Dimension(_) => {
+        | DxfEntity::Dimension(_)
+        | DxfEntity::Attdef(_) => {
             // Out of scope for v1 SVG — these are exported via the
             // engineering PDF path which has more control over
-            // multi-curve drawing.
+            // multi-curve drawing. ATTDEFs only render when an
+            // INSERT expands its block body.
         }
     }
     Ok(())

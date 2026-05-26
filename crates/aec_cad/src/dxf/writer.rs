@@ -1,13 +1,45 @@
 //! DXF ASCII writer.
 
+use std::collections::HashMap;
 use std::io::Write;
 
 use crate::dxf::entities::{
-    DxfArc, DxfCircle, DxfDimension, DxfDimensionKind, DxfEllipse, DxfEntity, DxfHatch, DxfInsert,
-    DxfLine, DxfPolyline, DxfSpline, DxfText,
+    DxfArc, DxfAttdef, DxfCircle, DxfDimension, DxfDimensionKind, DxfEllipse, DxfEntity, DxfHatch,
+    DxfInsert, DxfLine, DxfPolyline, DxfSpline, DxfText,
 };
 use crate::dxf::DxfDocument;
 use crate::error::CadResult;
+
+/// Lowest hex handle minted for the first STYLE table entry; subsequent
+/// entries get sequentially higher handles. Picked above the typical
+/// header / document-level reserved range (0x1–0xFF, which mainstream
+/// CAD apps use for `$HANDSEED`, document records, viewports, etc.) so
+/// synthetic handles for our STYLE table never visually collide with a
+/// document-level handle a reader might be expecting at the same
+/// position. DXF handles are file-local opaque identifiers — the
+/// numeric value carries no semantic weight — but starting high keeps
+/// our minted range cleanly separated from low handles that other
+/// writers conventionally reserve for the document header.
+const STYLE_HANDLE_BASE: u32 = 0x100;
+
+/// Mints a deterministic uppercase-hex handle for every text style in
+/// the document, in declaration order. Returns a map from style name
+/// to handle that the writer uses both to emit code-5 on each STYLE
+/// record and to resolve the symbolic `text_style` reference on each
+/// DIMSTYLE record into a hard-pointer handle (code 340) as the DXF
+/// specification requires for that group code.
+fn mint_text_style_handles(doc: &DxfDocument) -> HashMap<String, String> {
+    doc.text_styles
+        .iter()
+        .enumerate()
+        .map(|(idx, s)| {
+            (
+                s.name.clone(),
+                format!("{:X}", STYLE_HANDLE_BASE + idx as u32),
+            )
+        })
+        .collect()
+}
 
 pub struct DxfWriter;
 
@@ -64,9 +96,30 @@ fn write_tables<W: Write>(doc: &DxfDocument, w: &mut W) -> CadResult<()> {
             flags |= 4;
         }
         write_pair(w, 70, &flags.to_string())?;
-        write_pair(w, 62, &layer.color.0.to_string())?;
+        // DXF convention: a layer that is OFF emits its colour as a
+        // negative number (e.g. -7 = white but off). This is how
+        // every mainstream DXF consumer (AutoCAD, BricsCAD, QCAD,
+        // LibreDWG) signals the on/off state for AC1009-era files.
+        let signed_color: i32 = if layer.on {
+            i32::from(layer.color.0)
+        } else {
+            -i32::from(layer.color.0)
+        };
+        write_pair(w, 62, &signed_color.to_string())?;
         write_pair(w, 6, &layer.linetype)?;
         write_pair(w, 370, &layer.lineweight.0.to_string())?;
+        // Plottable / not-plottable lives at DXF code 290 in the
+        // 1000+ namespace (boolean). Emit it unconditionally so the
+        // round-trip is symmetric.
+        write_pair(w, 290, &i32::from(layer.plottable).to_string())?;
+        if let Some(desc) = &layer.description {
+            // Layer description is conventionally carried as XDATA on
+            // AutoCAD, but for our internal round-trip we use group
+            // code 4 (which is otherwise unused for LAYER) so the
+            // payload is fully ASCII and any DXF parser we
+            // control sees the same bytes.
+            write_pair(w, 4, desc)?;
+        }
     }
     write_pair(w, 0, "ENDTAB")?;
 
@@ -84,6 +137,32 @@ fn write_tables<W: Write>(doc: &DxfDocument, w: &mut W) -> CadResult<()> {
     }
     write_pair(w, 0, "ENDTAB")?;
 
+    // STYLE (text style) table. Each entry gets a deterministic
+    // hex handle minted up-front so the DIMSTYLE 340 group code can
+    // emit a real hard-pointer handle (as the DXF spec requires)
+    // rather than the symbolic style name. Without this, third-party
+    // DXF consumers (AutoCAD, BricsCAD, QCAD, LibreDWG) see a string
+    // where they expect a hex handle on 340 and silently fall back
+    // to the default style for every dimension reference.
+    let style_handle_by_name = mint_text_style_handles(doc);
+    write_pair(w, 0, "TABLE")?;
+    write_pair(w, 2, "STYLE")?;
+    write_pair(w, 70, &doc.text_styles.len().to_string())?;
+    for s in &doc.text_styles {
+        write_pair(w, 0, "STYLE")?;
+        if let Some(handle) = style_handle_by_name.get(&s.name) {
+            write_pair(w, 5, handle)?;
+        }
+        write_pair(w, 2, &s.name)?;
+        write_pair(w, 70, "0")?;
+        write_pair(w, 40, &fmt_f(s.fixed_height))?;
+        write_pair(w, 41, &fmt_f(s.width_factor))?;
+        write_pair(w, 50, &fmt_f(s.oblique_angle))?;
+        write_pair(w, 3, &s.font_filename)?;
+        write_pair(w, 4, &s.bigfont_filename)?;
+    }
+    write_pair(w, 0, "ENDTAB")?;
+
     // DIMSTYLE table.
     write_pair(w, 0, "TABLE")?;
     write_pair(w, 2, "DIMSTYLE")?;
@@ -95,6 +174,19 @@ fn write_tables<W: Write>(doc: &DxfDocument, w: &mut W) -> CadResult<()> {
         write_pair(w, 140, &fmt_f(dim.text_height))?;
         write_pair(w, 141, &fmt_f(dim.arrow_size))?;
         write_pair(w, 144, &fmt_f(dim.units_scale))?;
+        // DIMDEC — primary-units decimal places.
+        write_pair(w, 271, &dim.decimal_places.to_string())?;
+        // DIMTXSTY — hard-pointer handle of the referenced STYLE
+        // table entry. We resolve the symbolic `text_style` name
+        // through the same handle map we used to emit code-5 on each
+        // STYLE record above. When the name doesn't match any STYLE
+        // (e.g. a doc constructed without a STYLE table, or a
+        // back-compat fixture), we fall back to emitting the name
+        // verbatim — the reader's symmetric fallback recovers it.
+        match style_handle_by_name.get(&dim.text_style) {
+            Some(handle) => write_pair(w, 340, handle)?,
+            None => write_pair(w, 340, &dim.text_style)?,
+        }
     }
     write_pair(w, 0, "ENDTAB")?;
 
@@ -107,12 +199,29 @@ fn write_blocks<W: Write>(doc: &DxfDocument, w: &mut W) -> CadResult<()> {
     write_pair(w, 2, "BLOCKS")?;
     for br in &doc.block_records {
         write_pair(w, 0, "BLOCK")?;
+        // Group code 8: layer the BLOCK entity sits on. Required by
+        // the DXF spec on the BLOCK entity inside the BLOCKS section.
+        // Strict third-party consumers (AutoCAD, BricsCAD, LibreDWG,
+        // QCAD) reject or warn on a missing code-8. Defaults to "0"
+        // so that any `BYLAYER` colors on entities inside the block
+        // resolve through the insert's layer at draw time rather
+        // than being baked into the block definition.
+        write_pair(w, 8, &br.layer)?;
         write_pair(w, 2, &br.name)?;
         write_pair(w, 70, &br.flags.to_string())?;
-        write_pair(w, 10, "0.0")?;
-        write_pair(w, 20, "0.0")?;
-        write_pair(w, 30, "0.0")?;
+        write_pair(w, 10, &fmt_f(br.base_point[0]))?;
+        write_pair(w, 20, &fmt_f(br.base_point[1]))?;
+        write_pair(w, 30, &fmt_f(br.base_point[2]))?;
+        for entity in &br.entities {
+            write_entity(entity, w)?;
+        }
+        // ENDBLK is itself an entity per the DXF spec and carries the
+        // same layer assignment (code 8) as its parent BLOCK. AutoCAD,
+        // BricsCAD, LibreDWG and QCAD all emit/expect a layer code on
+        // ENDBLK; omitting it triggers either a hard reject or a
+        // sticky "missing layer" warning at file load.
         write_pair(w, 0, "ENDBLK")?;
+        write_pair(w, 8, &br.layer)?;
     }
     write_pair(w, 0, "ENDSEC")?;
     Ok(())
@@ -122,20 +231,41 @@ fn write_entities<W: Write>(doc: &DxfDocument, w: &mut W) -> CadResult<()> {
     write_pair(w, 0, "SECTION")?;
     write_pair(w, 2, "ENTITIES")?;
     for entity in &doc.entities {
-        match entity {
-            DxfEntity::Line(e) => write_line(e, w)?,
-            DxfEntity::Polyline(e) => write_polyline(e, w)?,
-            DxfEntity::Arc(e) => write_arc(e, w)?,
-            DxfEntity::Circle(e) => write_circle(e, w)?,
-            DxfEntity::Ellipse(e) => write_ellipse(e, w)?,
-            DxfEntity::Spline(e) => write_spline(e, w)?,
-            DxfEntity::Hatch(e) => write_hatch(e, w)?,
-            DxfEntity::Text(e) => write_text(e, w)?,
-            DxfEntity::Insert(e) => write_insert(e, w)?,
-            DxfEntity::Dimension(e) => write_dimension(e, w)?,
-        }
+        write_entity(entity, w)?;
     }
     write_pair(w, 0, "ENDSEC")?;
+    Ok(())
+}
+
+fn write_entity<W: Write>(entity: &DxfEntity, w: &mut W) -> CadResult<()> {
+    match entity {
+        DxfEntity::Line(e) => write_line(e, w),
+        DxfEntity::Polyline(e) => write_polyline(e, w),
+        DxfEntity::Arc(e) => write_arc(e, w),
+        DxfEntity::Circle(e) => write_circle(e, w),
+        DxfEntity::Ellipse(e) => write_ellipse(e, w),
+        DxfEntity::Spline(e) => write_spline(e, w),
+        DxfEntity::Hatch(e) => write_hatch(e, w),
+        DxfEntity::Text(e) => write_text(e, w),
+        DxfEntity::Insert(e) => write_insert(e, w),
+        DxfEntity::Dimension(e) => write_dimension(e, w),
+        DxfEntity::Attdef(e) => write_attdef(e, w),
+    }
+}
+
+fn write_attdef<W: Write>(e: &DxfAttdef, w: &mut W) -> CadResult<()> {
+    write_pair(w, 0, "ATTDEF")?;
+    write_pair(w, 8, &e.layer)?;
+    write_pair(w, 10, &fmt_f(e.position[0]))?;
+    write_pair(w, 20, &fmt_f(e.position[1]))?;
+    write_pair(w, 30, &fmt_f(e.position[2]))?;
+    write_pair(w, 40, &fmt_f(e.height))?;
+    write_pair(w, 50, &fmt_f(e.rotation))?;
+    write_pair(w, 1, &e.default_value)?;
+    write_pair(w, 2, &e.tag)?;
+    write_pair(w, 3, &e.prompt)?;
+    write_pair(w, 70, &e.flags.to_string())?;
+    write_pair(w, 7, &e.text_style)?;
     Ok(())
 }
 
@@ -326,6 +456,8 @@ mod tests {
             text_height: 3.5,
             arrow_size: 3.5,
             units_scale: 1000.0,
+            decimal_places: 2,
+            text_style: "STANDARD".into(),
         });
         doc.push(DxfEntity::Line(DxfLine {
             layer: "WALLS".into(),

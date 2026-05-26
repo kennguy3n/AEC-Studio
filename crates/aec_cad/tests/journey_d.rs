@@ -146,6 +146,8 @@ fn drafter_journey_end_to_end() {
         text_height: 3.0,
         arrow_size: 3.0,
         units_scale: 50.0,
+        decimal_places: 1,
+        text_style: "STANDARD".into(),
     });
     assert_eq!(doc.dim_styles.len(), 2);
 
@@ -436,7 +438,8 @@ fn drafter_dwg_subset(source: &DxfDocument) -> DxfDocument {
             DxfEntity::Ellipse(_)
             | DxfEntity::Spline(_)
             | DxfEntity::Hatch(_)
-            | DxfEntity::Dimension(_) => { /* not yet bridged across all 8 versions */ }
+            | DxfEntity::Dimension(_)
+            | DxfEntity::Attdef(_) => { /* not yet bridged across all 8 versions */ }
         }
     }
     doc

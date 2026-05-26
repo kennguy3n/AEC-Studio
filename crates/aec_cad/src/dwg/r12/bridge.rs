@@ -294,6 +294,27 @@ fn write_entity(out: &mut Vec<u8>, entity: &DxfEntity, maps: &IndexMaps) -> DwgR
         DxfEntity::Text(t) => write_text(out, t, layer_index)?,
         DxfEntity::Insert(i) => write_insert(out, i, layer_index, maps)?,
         DxfEntity::Polyline(p) => write_polyline(out, p, layer_index)?,
+        DxfEntity::Attdef(a) => {
+            // R12 *does* have a first-class ATTDEF entity, but our
+            // R12 codec currently only carries the geometric subset
+            // (LINE/POLYLINE/ARC/CIRCLE/TEXT/INSERT). Downgrade the
+            // attribute definition to a plain TEXT entity at the same
+            // position so the prompt/default value remains visible in
+            // an R12-targeted save; the structural metadata (tag,
+            // prompt, flags) survives the higher-fidelity DXF path.
+            let synthesized = DxfText {
+                layer: a.layer.clone(),
+                position: a.position,
+                height: a.height,
+                rotation: a.rotation,
+                text: if a.default_value.is_empty() {
+                    a.tag.clone()
+                } else {
+                    a.default_value.clone()
+                },
+            };
+            write_text(out, &synthesized, layer_index)?;
+        }
         DxfEntity::Ellipse(_)
         | DxfEntity::Spline(_)
         | DxfEntity::Hatch(_)
