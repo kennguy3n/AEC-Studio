@@ -112,12 +112,154 @@ pub trait ThermalSensor: Send + Sync {
 /// reported package temperature crosses 95 °C, so the macOS
 /// scheduler must back off even if the temperature axis still
 /// reads nominal.
+///
+/// # Invariants
+///
+/// Two ordering invariants must hold for [`classify`] to behave
+/// correctly (an inverted pair makes one branch of the `else if`
+/// chain dead code, so the wrong [`ThermalState`] is returned for
+/// readings between the two values):
+///
+/// 1. `warm_celsius` &lt; `critical_celsius` — temperatures are
+///    monotonically increasing in the *hot* direction.
+/// 2. `warm_speed_limit` &gt; `critical_speed_limit` — ratios are
+///    monotonically decreasing in the *throttled* direction (1.0 =
+///    unthrottled, 0.0 = fully clipped).
+///
+/// Both invariants must also be finite (no NaN, no ±∞), since
+/// every NaN comparison returns `false` and would also produce
+/// dead branches.
+///
+/// Construct through [`ThermalThresholds::try_new`] or
+/// [`ThermalThresholds::default`] to validate up-front. Direct
+/// struct-literal construction is still permitted (the fields are
+/// `pub` so JSON deserialization can populate them), but callers
+/// who do so should call [`validate`](Self::validate) before
+/// passing the struct to [`classify`]. In debug builds, [`classify`]
+/// includes `debug_assert!` checks against these invariants so
+/// misconfiguration is caught loudly in tests rather than
+/// silently mis-classifying in production.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ThermalThresholds {
     pub warm_celsius: f32,
     pub critical_celsius: f32,
     pub warm_speed_limit: f32,
     pub critical_speed_limit: f32,
+}
+
+/// Reasons a [`ThermalThresholds`] value is malformed. Returned by
+/// [`ThermalThresholds::try_new`] and [`ThermalThresholds::validate`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ThresholdError {
+    /// A field was NaN or ±∞. All comparisons against NaN return
+    /// `false`, which would make every `else if` arm of the
+    /// classifier dead code.
+    NonFinite { field: &'static str, value: f32 },
+    /// `warm_celsius` is not strictly less than `critical_celsius`.
+    TemperatureOrder { warm: f32, critical: f32 },
+    /// `warm_speed_limit` is not strictly greater than
+    /// `critical_speed_limit`.
+    SpeedLimitOrder { warm: f32, critical: f32 },
+    /// A speed-limit ratio is outside `[0.0, 1.0]`. The classifier
+    /// only sees readings clamped to that range
+    /// (`MacosPmsetSensor::parse` clamps with `.clamp(0.0, 1.0)`),
+    /// so out-of-range thresholds can never trip.
+    SpeedLimitOutOfRange { field: &'static str, value: f32 },
+}
+
+impl core::fmt::Display for ThresholdError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ThresholdError::NonFinite { field, value } => {
+                write!(f, "thermal threshold `{field}` is non-finite ({value})")
+            }
+            ThresholdError::TemperatureOrder { warm, critical } => write!(
+                f,
+                "thermal threshold ordering violation: \
+                 warm_celsius ({warm}) must be < critical_celsius ({critical})"
+            ),
+            ThresholdError::SpeedLimitOrder { warm, critical } => write!(
+                f,
+                "thermal threshold ordering violation: \
+                 warm_speed_limit ({warm}) must be > critical_speed_limit ({critical})"
+            ),
+            ThresholdError::SpeedLimitOutOfRange { field, value } => write!(
+                f,
+                "thermal threshold `{field}` ({value}) is outside [0.0, 1.0]"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ThresholdError {}
+
+impl ThermalThresholds {
+    /// Construct thresholds, validating both ordering invariants
+    /// and the finite/range constraints. Prefer this over struct
+    /// literals when the values come from user / operator input.
+    pub fn try_new(
+        warm_celsius: f32,
+        critical_celsius: f32,
+        warm_speed_limit: f32,
+        critical_speed_limit: f32,
+    ) -> Result<Self, ThresholdError> {
+        let t = Self {
+            warm_celsius,
+            critical_celsius,
+            warm_speed_limit,
+            critical_speed_limit,
+        };
+        t.validate()?;
+        Ok(t)
+    }
+
+    /// Check both ordering invariants and the finite/range
+    /// constraints. Cheap (four `is_finite` + two comparisons +
+    /// two range checks) so it can be called on every config
+    /// reload without measurable cost.
+    pub fn validate(&self) -> Result<(), ThresholdError> {
+        let check_finite = |field: &'static str, value: f32| -> Result<(), ThresholdError> {
+            if value.is_finite() {
+                Ok(())
+            } else {
+                Err(ThresholdError::NonFinite { field, value })
+            }
+        };
+        check_finite("warm_celsius", self.warm_celsius)?;
+        check_finite("critical_celsius", self.critical_celsius)?;
+        check_finite("warm_speed_limit", self.warm_speed_limit)?;
+        check_finite("critical_speed_limit", self.critical_speed_limit)?;
+
+        // Finiteness was just verified above, so a plain >= / <=
+        // is unambiguous here — no NaN can sneak past, and clippy's
+        // `neg_cmp_op_on_partial_ord` lint correctly rejects the
+        // `!(a < b)` form on `f32` for that exact reason.
+        if self.warm_celsius >= self.critical_celsius {
+            return Err(ThresholdError::TemperatureOrder {
+                warm: self.warm_celsius,
+                critical: self.critical_celsius,
+            });
+        }
+        if self.warm_speed_limit <= self.critical_speed_limit {
+            return Err(ThresholdError::SpeedLimitOrder {
+                warm: self.warm_speed_limit,
+                critical: self.critical_speed_limit,
+            });
+        }
+        if !(0.0..=1.0).contains(&self.warm_speed_limit) {
+            return Err(ThresholdError::SpeedLimitOutOfRange {
+                field: "warm_speed_limit",
+                value: self.warm_speed_limit,
+            });
+        }
+        if !(0.0..=1.0).contains(&self.critical_speed_limit) {
+            return Err(ThresholdError::SpeedLimitOutOfRange {
+                field: "critical_speed_limit",
+                value: self.critical_speed_limit,
+            });
+        }
+        Ok(())
+    }
 }
 
 impl Default for ThermalThresholds {
@@ -146,7 +288,19 @@ impl Default for ThermalThresholds {
 /// Classify a reading against the thresholds. Returns
 /// [`ThermalState::Nominal`] when there's nothing to classify (no
 /// reading available, no thermometers expose either axis).
+///
+/// In debug builds, asserts the [`ThermalThresholds`] invariants
+/// (see that struct's docs). If you constructed the thresholds
+/// through [`ThermalThresholds::try_new`] or [`Default`] this is
+/// a no-op; if you populated them from a struct literal or
+/// deserialization, an inverted pair will panic loudly in tests
+/// rather than silently misclassifying.
 pub fn classify(reading: Option<&ThermalReading>, thresholds: &ThermalThresholds) -> ThermalState {
+    debug_assert!(
+        thresholds.validate().is_ok(),
+        "ThermalThresholds invariants violated: {:?}",
+        thresholds.validate()
+    );
     let Some(r) = reading else {
         return ThermalState::Nominal;
     };
@@ -335,9 +489,26 @@ impl MacosPmsetSensor {
         for line in stdout.lines() {
             let line = line.trim();
             // Each line looks like `CPU_Speed_Limit      = 100`.
+            //
+            // We anchor the match on the field-name *boundary* so
+            // we never silently mis-parse a hypothetical future
+            // sibling like `CPU_Speed_Limit_Extended` or
+            // `CPU_Speed_Limit_Reason` as if it were the canonical
+            // `CPU_Speed_Limit` reading. Apple's pmset payload
+            // separates the field name from the value with one
+            // or more whitespace characters before the `=`, so
+            // requiring whitespace or `=` as the next character
+            // is sufficient (and matches the exact spec
+            // `<name><whitespace+>= <value>`).
             if let Some(rest) = line.strip_prefix("CPU_Speed_Limit") {
-                if let Some(val) = rest.split('=').nth(1) {
-                    speed_limit = val.trim().parse::<u32>().ok();
+                let boundary_ok = rest
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c == '=' || c.is_whitespace());
+                if boundary_ok {
+                    if let Some(val) = rest.split('=').nth(1) {
+                        speed_limit = val.trim().parse::<u32>().ok();
+                    }
                 }
             }
         }
@@ -730,6 +901,177 @@ mod tests {
     #[test]
     fn macos_pmset_parse_returns_none_when_field_missing() {
         assert!(MacosPmsetSensor::parse("nothing here").is_none());
+    }
+
+    #[test]
+    fn macos_pmset_parser_does_not_mis_match_extended_prefix() {
+        // A hypothetical future pmset payload that introduces a
+        // sibling field whose name shares the `CPU_Speed_Limit`
+        // prefix MUST NOT be consumed as if it were the canonical
+        // reading. We require a whitespace or `=` boundary right
+        // after the prefix, so `CPU_Speed_Limit_Extended` (no
+        // whitespace, just a `_`) is correctly skipped.
+        let r = MacosPmsetSensor::parse(
+            "CPU_Speed_Limit_Extended = 42\n\
+             CPU_Speed_Limit_Reason   = thermal\n\
+             CPU_Speed_Limit          = 75\n",
+        )
+        .unwrap();
+        // The reading must be 75/100 = 0.75 (from the real field),
+        // *not* 42/100 from `_Extended` nor a no-op from `_Reason`.
+        assert!((r.cpu_speed_limit_ratio.unwrap() - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn macos_pmset_parser_returns_none_when_only_lookalike_fields_present() {
+        // If the *only* CPU_Speed_Limit-prefixed lines in the
+        // payload are siblings (`_Extended`, `_Reason`, etc.) and
+        // the canonical `CPU_Speed_Limit` itself is missing, the
+        // parser must return None — NOT a phantom reading derived
+        // from a sibling.
+        assert!(MacosPmsetSensor::parse(
+            "CPU_Speed_Limit_Extended = 42\n\
+                 CPU_Speed_Limit_Reason   = thermal\n"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn threshold_validate_accepts_default() {
+        ThermalThresholds::default()
+            .validate()
+            .expect("the production Default impl must satisfy its own invariants");
+    }
+
+    #[test]
+    fn threshold_try_new_accepts_valid_pair() {
+        let t = ThermalThresholds::try_new(70.0, 90.0, 0.95, 0.50).unwrap();
+        assert_eq!(t.warm_celsius, 70.0);
+        assert_eq!(t.critical_celsius, 90.0);
+    }
+
+    #[test]
+    fn threshold_validate_rejects_inverted_temperature_order() {
+        // warm >= critical — the `else if c >= warm_celsius` branch
+        // would become dead code in `classify`.
+        let t = ThermalThresholds {
+            warm_celsius: 95.0,
+            critical_celsius: 80.0,
+            warm_speed_limit: 0.99,
+            critical_speed_limit: 0.60,
+        };
+        assert!(matches!(
+            t.validate(),
+            Err(ThresholdError::TemperatureOrder { .. })
+        ));
+        // Equal also fails — the boundary is strict (<, not <=) so
+        // there's always a non-empty Warm band.
+        let eq = ThermalThresholds {
+            warm_celsius: 80.0,
+            critical_celsius: 80.0,
+            warm_speed_limit: 0.99,
+            critical_speed_limit: 0.60,
+        };
+        assert!(matches!(
+            eq.validate(),
+            Err(ThresholdError::TemperatureOrder { .. })
+        ));
+    }
+
+    #[test]
+    fn threshold_validate_rejects_inverted_speed_limit_order() {
+        // warm <= critical for the speed-limit axis is the
+        // analogous bug — ratios trend *downward* under throttling.
+        let t = ThermalThresholds {
+            warm_celsius: 80.0,
+            critical_celsius: 95.0,
+            warm_speed_limit: 0.50,
+            critical_speed_limit: 0.70,
+        };
+        assert!(matches!(
+            t.validate(),
+            Err(ThresholdError::SpeedLimitOrder { .. })
+        ));
+    }
+
+    #[test]
+    fn threshold_validate_rejects_non_finite() {
+        // NaN trips every comparison — every classifier branch
+        // becomes dead code.
+        let nan = ThermalThresholds {
+            warm_celsius: f32::NAN,
+            critical_celsius: 95.0,
+            warm_speed_limit: 0.99,
+            critical_speed_limit: 0.60,
+        };
+        assert!(matches!(
+            nan.validate(),
+            Err(ThresholdError::NonFinite {
+                field: "warm_celsius",
+                ..
+            })
+        ));
+        let inf = ThermalThresholds {
+            warm_celsius: 80.0,
+            critical_celsius: f32::INFINITY,
+            warm_speed_limit: 0.99,
+            critical_speed_limit: 0.60,
+        };
+        assert!(matches!(
+            inf.validate(),
+            Err(ThresholdError::NonFinite {
+                field: "critical_celsius",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn threshold_validate_rejects_speed_limit_outside_unit_range() {
+        // Speed-limit ratios are clamped to `[0.0, 1.0]` by every
+        // sensor in this crate, so a threshold of `1.5` could never
+        // trip.
+        let above = ThermalThresholds {
+            warm_celsius: 80.0,
+            critical_celsius: 95.0,
+            warm_speed_limit: 1.5,
+            critical_speed_limit: 0.60,
+        };
+        assert!(matches!(
+            above.validate(),
+            Err(ThresholdError::SpeedLimitOutOfRange {
+                field: "warm_speed_limit",
+                ..
+            })
+        ));
+        let below = ThermalThresholds {
+            warm_celsius: 80.0,
+            critical_celsius: 95.0,
+            warm_speed_limit: 0.99,
+            critical_speed_limit: -0.1,
+        };
+        assert!(matches!(
+            below.validate(),
+            Err(ThresholdError::SpeedLimitOutOfRange {
+                field: "critical_speed_limit",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn threshold_error_display_is_informative() {
+        // The error must format with both field names and values
+        // so an operator can fix their config without a debugger.
+        let e = ThresholdError::TemperatureOrder {
+            warm: 95.0,
+            critical: 80.0,
+        };
+        let s = e.to_string();
+        assert!(s.contains("warm_celsius"));
+        assert!(s.contains("critical_celsius"));
+        assert!(s.contains("95"));
+        assert!(s.contains("80"));
     }
 
     #[test]
