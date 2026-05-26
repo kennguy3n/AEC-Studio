@@ -88,6 +88,67 @@ export interface AiPlanResponse {
   parsed?: AiPlanParsed | null;
 }
 
+/**
+ * Rich outcome surfaced by {@link BridgeBackend.aiAcceptDiff}.
+ *
+ * Devin Review flagged the previous `Promise<{ accepted: true }>`
+ * shape as `ANALYSIS_0002`: the native napi `AiAcceptOutcomeJs`
+ * already carries the full apply telemetry (op count, applied
+ * count, per-op skip reasons, the command IDs the engine
+ * journalled, and the AI audit chain head), but the adapter was
+ * discarding all of it and surfacing a literal `true`. The
+ * renderer cannot then show "Accepted 7 of 8 operations (1
+ * skipped: unknown entity kind `lamp`)" without re-walking the
+ * diff itself.
+ *
+ * The new shape preserves `accepted: true` so any existing
+ * `outcome.accepted` checks still work, and exposes the full
+ * telemetry alongside it. The in-process fallback returns a
+ * shape with zeroed counts — it has no real diff registry, so
+ * there is nothing to apply.
+ */
+export interface AiAcceptOutcome {
+  accepted: true;
+  diffId: string;
+  /** Total operations the diff carried. */
+  opCount: number;
+  /** Subset that the converter mapped to a typed command and that
+   *  the command engine successfully executed. */
+  appliedCount: number;
+  /** Per-op reasons the converter could not translate (unknown
+   *  entity kind, missing required field, dangling target, ...). */
+  skipped: Array<{ opIndex: number; reason: string }>;
+  /** Command IDs the journal assigned to the applied operations,
+   *  in batch order. Useful for selecting newly-created entities
+   *  in the renderer right after Accept lands. */
+  commandIds: string[];
+  /** Hex-encoded BLAKE3 hash of the final entry in the AI audit
+   *  chain after this acceptance was logged. */
+  auditChainHead: string;
+}
+
+/**
+ * Rich outcome surfaced by {@link BridgeBackend.aiRejectDiff}.
+ *
+ * Mirrors the accept outcome shape so the renderer can use a
+ * single "diff lifecycle" toast for both paths. The reject path
+ * never applies graph mutations, so it does not carry the
+ * applied/skipped/command-id fields.
+ */
+export interface AiRejectOutcome {
+  rejected: true;
+  diffId: string;
+  /** Total operations the rejected diff carried. */
+  opCount: number;
+  /** Free-form reason the renderer supplied. Logged to the AI
+   *  audit chain so the provenance UI can show *why* a proposal
+   *  was rejected. `null` when no reason was supplied. */
+  reason: string | null;
+  /** Hex-encoded BLAKE3 hash of the final entry in the AI audit
+   *  chain after this rejection was logged. */
+  auditChainHead: string;
+}
+
 /** Parsed payloads for individual AI tools, tagged by `tool`. */
 export type AiPlanParsed =
   | LayoutSuggestionParsed
@@ -143,8 +204,32 @@ export interface BridgeBackend {
   draftEditTool(params: Record<string, unknown>): Promise<{ ok: true }>;
   draftCreateSheet(params: Record<string, unknown>): Promise<{ sheetId: string }>;
   draftSetLayerState(params: Record<string, unknown>): Promise<{ ok: true }>;
-  draftImportDxf(path: string): Promise<{ imported: number }>;
-  draftExportDxf(path: string): Promise<{ exported: true; path: string }>;
+  /**
+   * Import a DXF file into the project graph. `params.projectPath`
+   * is the encrypted-DB path of the active project (the same convention
+   * used by every other draft.* / design.* / bim.* method); `params.dxfPath`
+   * is the on-disk DXF file the user picked from the file dialog.
+   *
+   * Returned `imported` is the count of DXF entities successfully
+   * converted to modelling primitives and journaled through
+   * `command_apply`. DXF entities without a modelling-primitive
+   * counterpart yet (Insert / Spline / Hatch with non-trivial
+   * patterns) are skipped; the native side surfaces a `skipped`
+   * count internally, but the renderer contract collapses to just
+   * `imported` for now.
+   */
+  draftImportDxf(params: {
+    projectPath: string;
+    dxfPath: string;
+  }): Promise<{ imported: number }>;
+  /**
+   * Export the project graph's draft primitives to a DXF file at
+   * `params.dxfPath`.
+   */
+  draftExportDxf(params: {
+    projectPath: string;
+    dxfPath: string;
+  }): Promise<{ exported: true; path: string }>;
 
   /**
    * Parse an IFC file and return a structured preview summary. The
@@ -304,8 +389,21 @@ export interface BridgeBackend {
    * (e.g. `LayoutSuggestionResult` for `tool = "layout_suggestion"`).
    */
   aiPlan(params: Record<string, unknown>): Promise<AiPlanResponse>;
-  aiAcceptDiff(diffId: string): Promise<{ accepted: true }>;
-  aiRejectDiff(diffId: string): Promise<{ rejected: true }>;
+  /**
+   * Apply an accepted AI diff to the project graph and return the
+   * full apply telemetry (op count, applied count, per-op skip
+   * reasons, command IDs, and the AI audit chain head). See
+   * {@link AiAcceptOutcome}.
+   */
+  aiAcceptDiff(diffId: string): Promise<AiAcceptOutcome>;
+  /**
+   * Mark an AI diff as rejected and append the rejection envelope
+   * to the project's AI audit chain. See {@link AiRejectOutcome}.
+   */
+  aiRejectDiff(
+    diffId: string,
+    reason?: string | null,
+  ): Promise<AiRejectOutcome>;
   aiCancelJob(jobId: string): Promise<{ cancelled: true }>;
   aiRuntimeStatus(): Promise<{ state: string; lastError: string | null }>;
 
@@ -317,7 +415,16 @@ export interface BridgeBackend {
 
   // ----- Deliver mode -----
 
+  /**
+   * Create a tagged revision snapshot of the project at
+   * `params.projectPath`. `params.entities` is optional —
+   * when supplied, the native side uses the caller-provided
+   * tracked-entity list (BLAKE3-hashed by the renderer);
+   * when omitted, the bridge enumerates the on-disk graph
+   * and hashes every record's canonical body.
+   */
   deliverCreateRevision(params: {
+    projectPath: string;
     tag: string;
     description: string;
     entities?: Array<{
@@ -327,8 +434,14 @@ export interface BridgeBackend {
       label?: string | null;
     }>;
   }): Promise<RevisionSummary>;
-  deliverListRevisions(): Promise<RevisionSummary[]>;
+  /** List every revision in the project at `params.projectPath`. */
+  deliverListRevisions(params: { projectPath: string }): Promise<RevisionSummary[]>;
+  /**
+   * Diff two revisions. Both must already exist in
+   * `params.projectPath`'s `revisions/` directory.
+   */
   deliverCompareRevisions(params: {
+    projectPath: string;
     baseId: string;
     headId: string;
   }): Promise<VersionDiffSummary>;
@@ -1182,6 +1295,7 @@ interface NativeApi {
   // tool-specific context object, also serialised at the adaptor.
   ai_list_tools(): Promise<unknown>;
   ai_plan(
+    project_path: string,
     tool: string,
     scope: string,
     prompt: string,
@@ -1189,9 +1303,54 @@ interface NativeApi {
     max_entities_modified: number,
   ): Promise<unknown>;
   ai_accept_diff(diff_id: string): Promise<unknown>;
-  ai_reject_diff(diff_id: string): Promise<unknown>;
+  ai_reject_diff(diff_id: string, reason?: string | null): Promise<unknown>;
   ai_cancel_job(job_id: string): Promise<unknown>;
   ai_runtime_status(): Promise<unknown>;
+  // Group A (Phase 10) — draft.* / deliver.*. Symmetric to the
+  // design.* / bim.* facades above: `params_json` is a stringified
+  // command struct, the napi side routes through `command_apply` so
+  // the gesture is journaled / auditable / undo-able. The four
+  // draft.draw/edit/sheet/layer methods are sync on the Rust side
+  // (the command-engine apply is in-memory plus a single
+  // already-`Immediate` SQL tx); the DXF and `deliver_*` methods are
+  // `#[napi] async fn` routed through `spawn_blocking_napi` because
+  // they open the encrypted project package, read the full entity
+  // table, and/or read/write large files — work that would otherwise
+  // stall the Electron main (libuv) thread on large projects. Each
+  // async method is typed `Promise<unknown>` rather than the looser
+  // `unknown` so a future contributor who writes
+  // `n.deliver_create_revision(...)` without `await` gets a TS error
+  // at compile time rather than silently consuming a pending-promise
+  // object at runtime (the missing-await trap that bit
+  // `deliverCreateRevision` in PR-X round 3).
+  draft_draw_primitive(project_path: string, params_json: string): unknown;
+  draft_edit_tool(project_path: string, params_json: string): unknown;
+  draft_create_sheet(project_path: string, params_json: string): unknown;
+  draft_set_layer_state(project_path: string, params_json: string): unknown;
+  draft_import_dxf(project_path: string, dxf_path: string): Promise<unknown>;
+  draft_export_dxf(project_path: string, dxf_path: string): Promise<unknown>;
+  deliver_create_revision(
+    project_path: string,
+    tag: string,
+    description: string,
+    // `#[napi(object)]` on `RevisionTrackedEntityJs` auto-converts the
+    // Rust `payload_hash` field to camelCase `payloadHash` on the JS
+    // side. The TS surface here mirrors what the napi runtime
+    // actually accepts — declaring `payload_hash` would compile but
+    // deserialize to `None` at runtime.
+    entities?: Array<{
+      category: string;
+      id: string;
+      payloadHash: string;
+      label?: string | null;
+    }>,
+  ): Promise<unknown>;
+  deliver_list_revisions(project_path: string): Promise<unknown>;
+  deliver_compare_revisions(
+    project_path: string,
+    base_id: string,
+    head_id: string,
+  ): Promise<unknown>;
 }
 
 /**
@@ -1307,6 +1466,21 @@ export const NATIVE_WIRED_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   "aiRejectDiff",
   "aiCancelJob",
   "aiRuntimeStatus",
+  // Group A (Phase 10) — draft.* / deliver.* parity with
+  // design.* / bim.*. Each routes through a `#[napi]` export
+  // in `crates/aec_bridge/src/napi_api.rs` that wraps the
+  // command struct in `Command::user(...)` and calls
+  // `command_apply`. DXF I/O is async on the Rust side
+  // because file sizes can be large; everything else is sync.
+  "draftDrawPrimitive",
+  "draftEditTool",
+  "draftCreateSheet",
+  "draftSetLayerState",
+  "draftImportDxf",
+  "draftExportDxf",
+  "deliverCreateRevision",
+  "deliverListRevisions",
+  "deliverCompareRevisions",
 ];
 
 /**
@@ -1321,17 +1495,7 @@ export const NATIVE_WIRED_METHODS: ReadonlyArray<keyof BridgeBackend> = [
  * is explicit and grep-able, rather than implicit in the spread operator
  * inside {@link adaptNative}.
  */
-export const NATIVE_FALLBACK_METHODS: ReadonlyArray<keyof BridgeBackend> = [
-  "draftDrawPrimitive",
-  "draftEditTool",
-  "draftCreateSheet",
-  "draftSetLayerState",
-  "draftImportDxf",
-  "draftExportDxf",
-  "deliverCreateRevision",
-  "deliverListRevisions",
-  "deliverCompareRevisions",
-];
+export const NATIVE_FALLBACK_METHODS: ReadonlyArray<keyof BridgeBackend> = [];
 
 /**
  * Wrap a freshly-loaded N-API library with the {@link BridgeBackend} shape.
@@ -1641,6 +1805,22 @@ function adaptNative(n: NativeApi): BridgeBackend {
     // can't accept a `serde_json::Value` directly; the empty string
     // is the Rust-side sentinel for "no context".
     aiPlan: async (params) => {
+      // Phase 11 task 10: the AI accept path applies commands
+      // against a specific project on disk, so the plan call has
+      // to bind a `projectPath` at registration time (NOT at
+      // accept time, which is the wrong choice if the user
+      // switches projects between plan and accept).
+      const projectPath =
+        typeof params.projectPath === "string"
+          ? params.projectPath
+          : typeof params.project_path === "string"
+            ? (params.project_path as string)
+            : "";
+      if (projectPath.length === 0) {
+        throw new Error(
+          "aiPlan: missing required string field 'projectPath'",
+        );
+      }
       const tool = typeof params.tool === "string" ? params.tool : "";
       if (tool.length === 0) {
         throw new Error("aiPlan: missing required string field 'tool'");
@@ -1675,6 +1855,7 @@ function adaptNative(n: NativeApi): BridgeBackend {
       // also rejects the Promise (rather than throwing across the
       // FFI boundary) on transport / parser errors.
       const result = (await n.ai_plan(
+        projectPath,
         tool,
         scope,
         prompt,
@@ -1713,18 +1894,71 @@ function adaptNative(n: NativeApi): BridgeBackend {
     aiAcceptDiff: async (diffId) => {
       // Awaited so the native Promise's rejection (e.g. unknown
       // diff id) surfaces here as a real `throw` rather than an
-      // unhandled rejection on a later tick. The TS contract is the
-      // literal `{ accepted: true }`; the native `{ ok, diff_id }`
-      // is intentionally not surfaced because the renderer's
-      // Accept button is idempotent and doesn't need the echo.
-      await n.ai_accept_diff(diffId);
-      return { accepted: true };
+      // unhandled rejection on a later tick.
+      //
+      // The native side returns the full `AiAcceptOutcomeJs`
+      // (op count, applied count, per-op skip reasons, command
+      // IDs, audit chain head). napi auto-converts snake_case
+      // field names to camelCase on the JS boundary, so the
+      // adapter just casts and reshapes. Previously the adapter
+      // discarded everything except a synthetic
+      // `{ accepted: true }`; Devin Review flagged that as
+      // `ANALYSIS_0002` ("rich telemetry computed in the napi
+      // layer but thrown away by the TS adapter"). The new
+      // shape preserves `accepted: true` for backwards
+      // compatibility AND surfaces the rich fields so the AI
+      // sidebar can render "7 of 8 applied (1 skipped: unknown
+      // entity kind `lamp`)" without re-walking the diff.
+      const r = (await n.ai_accept_diff(diffId)) as {
+        ok: boolean;
+        diffId: string;
+        opCount: number;
+        appliedCount: number;
+        skipped: Array<{ opIndex: number; reason: string }>;
+        commandIds: string[];
+        auditChainHead: string;
+      };
+      return {
+        accepted: true,
+        diffId: r.diffId,
+        opCount: r.opCount,
+        appliedCount: r.appliedCount,
+        skipped: r.skipped.map((s) => ({
+          opIndex: s.opIndex,
+          reason: s.reason,
+        })),
+        commandIds: r.commandIds,
+        auditChainHead: r.auditChainHead,
+      };
     },
-    aiRejectDiff: async (diffId) => {
+    aiRejectDiff: async (diffId, reason) => {
       // Same idempotency / error-propagation contract as
-      // `aiAcceptDiff`.
-      await n.ai_reject_diff(diffId);
-      return { rejected: true };
+      // `aiAcceptDiff`. The renderer-supplied `reason` (when
+      // present) flows through to the forensic AI audit record
+      // so a reviewer can see *why* a proposal was rejected.
+      //
+      // Like the accept path, the native side returns the full
+      // `AiRejectOutcomeJs` (op count, the recorded reason, and
+      // the audit chain head). The adapter forwards everything
+      // so the renderer can render symmetric "Rejected (4 ops,
+      // reason: ...)" toasts.
+      const r = (await n.ai_reject_diff(
+        diffId,
+        reason === undefined ? null : reason,
+      )) as {
+        ok: boolean;
+        diffId: string;
+        opCount: number;
+        reason: string | null;
+        auditChainHead: string;
+      };
+      return {
+        rejected: true,
+        diffId: r.diffId,
+        opCount: r.opCount,
+        reason: r.reason,
+        auditChainHead: r.auditChainHead,
+      };
     },
     aiCancelJob: async (jobId) => {
       // `job_id` is accepted by the native side for forward
@@ -1750,6 +1984,108 @@ function adaptNative(n: NativeApi): BridgeBackend {
       // reads it; if/when the AI sidebar wants to render a
       // "3 pending diffs" badge, widen the interface in a follow-up.
       return { state: r.state, lastError: r.lastError };
+    },
+    // ----- Group A (Phase 10) draft.* / deliver.* -----
+    //
+    // Symmetric to the design.* adapters above:
+    // `requireProjectPath` extracts the encrypted-DB path and we
+    // forward the rest of the renderer-side params as a
+    // JSON-stringified command struct. The renderer contract
+    // returns `{ entityId }` (DrawPrimitive) or `{ sheetId }`
+    // (CreateSheet) for ID-emitting commands; the rest return
+    // `{ ok: true }`.
+    draftDrawPrimitive: async (params) => {
+      const projectPath = requireProjectPath(params, "draftDrawPrimitive");
+      const inner = withoutProjectPath(params);
+      return n.draft_draw_primitive(projectPath, JSON.stringify(inner)) as {
+        entityId: string;
+      };
+    },
+    draftEditTool: async (params) => {
+      const projectPath = requireProjectPath(params, "draftEditTool");
+      const inner = withoutProjectPath(params);
+      return n.draft_edit_tool(projectPath, JSON.stringify(inner)) as { ok: true };
+    },
+    draftCreateSheet: async (params) => {
+      const projectPath = requireProjectPath(params, "draftCreateSheet");
+      const inner = withoutProjectPath(params);
+      return n.draft_create_sheet(projectPath, JSON.stringify(inner)) as {
+        sheetId: string;
+      };
+    },
+    draftSetLayerState: async (params) => {
+      const projectPath = requireProjectPath(params, "draftSetLayerState");
+      const inner = withoutProjectPath(params);
+      return n.draft_set_layer_state(projectPath, JSON.stringify(inner)) as { ok: true };
+    },
+    draftImportDxf: async (params) => {
+      const r = (await n.draft_import_dxf(params.projectPath, params.dxfPath)) as {
+        entityCount: number;
+      };
+      return { imported: r.entityCount };
+    },
+    draftExportDxf: async (params) => {
+      const r = (await n.draft_export_dxf(params.projectPath, params.dxfPath)) as {
+        path: string;
+      };
+      return { exported: true, path: r.path };
+    },
+    deliverCreateRevision: async (params) => {
+      // The native `deliver_create_revision` returns the same
+      // `RevisionSummary` shape the renderer's TS interface uses
+      // (via `#[serde(rename_all = "camelCase")]` on the Rust
+      // service struct), but wrapped in a `{ summaryJson }` envelope
+      // because nested `tracked_entities` doesn't flatten cleanly
+      // through napi. The renderer unwraps it here so the
+      // `BridgeBackend.deliverCreateRevision` return type stays
+      // `RevisionSummary`.
+      const tag = params.tag;
+      if (typeof tag !== "string" || tag.length === 0) {
+        throw new Error("deliverCreateRevision: missing required string field 'tag'");
+      }
+      // `#[napi(object)]` on `RevisionTrackedEntityJs` auto-converts
+      // the Rust struct's snake_case fields to camelCase on the JS
+      // side, so the napi entry point accepts `payloadHash` (not
+      // `payload_hash`). We preserve `undefined` instead of
+      // coercing to `[]` so the bridge service falls through to its
+      // graph-enumeration branch when the caller omits entities
+      // entirely — collapsing `undefined` to `[]` would silently
+      // create revisions with zero tracked entities.
+      const entities = params.entities?.map((e) => ({
+        category: e.category,
+        id: e.id,
+        payloadHash: e.payloadHash,
+        label: e.label ?? null,
+      }));
+      // `n.deliver_create_revision` is `#[napi] async fn` on the Rust
+      // side (PR-X round 3 routed it through `spawn_blocking_napi`
+      // because it opens the encrypted project package, reads the
+      // entity table to enumerate trackable entities when the caller
+      // omits them, and writes the snapshot file to disk). The
+      // matching `NativeApi.deliver_create_revision` signature is
+      // typed `Promise<unknown>` so a missing `await` here would be a
+      // compile error rather than the silent
+      // `JSON.parse(undefined) -> SyntaxError` runtime crash that
+      // shipped to Devin Review in round 3.
+      const raw = (await n.deliver_create_revision(
+        params.projectPath,
+        tag,
+        params.description,
+        entities,
+      )) as { summaryJson: string };
+      return JSON.parse(raw.summaryJson) as RevisionSummary;
+    },
+    deliverListRevisions: async (params) => {
+      const raw = (await n.deliver_list_revisions(params.projectPath)) as Array<{
+        summaryJson: string;
+      }>;
+      return raw.map((r) => JSON.parse(r.summaryJson) as RevisionSummary);
+    },
+    deliverCompareRevisions: async ({ projectPath, baseId, headId }) => {
+      const raw = (await n.deliver_compare_revisions(projectPath, baseId, headId)) as {
+        diffJson: string;
+      };
+      return JSON.parse(raw.diffJson) as VersionDiffSummary;
     },
   };
   // Self-check 0: the two catalogues must be *disjoint*. A method
@@ -1941,11 +2277,11 @@ export function inProcessBackend(): BridgeBackend {
     async draftSetLayerState(_p) {
       return { ok: true };
     },
-    async draftImportDxf(_path) {
+    async draftImportDxf(_params) {
       return { imported: 0 };
     },
-    async draftExportDxf(p) {
-      return { exported: true, path: p };
+    async draftExportDxf(params) {
+      return { exported: true, path: params.dxfPath };
     },
 
     async bimImportIfc(path) {
@@ -2308,11 +2644,31 @@ export function inProcessBackend(): BridgeBackend {
       );
       return { diffId: id("diff"), parsed };
     },
-    async aiAcceptDiff(_d) {
-      return { accepted: true };
+    async aiAcceptDiff(diffId) {
+      // In-process fallback: there is no real diff registry so
+      // no operations were applied, and the AI audit chain is
+      // never opened. Surfacing zeroed counts + an empty chain
+      // head keeps the renderer's contract honest (these are
+      // the same values the native side would produce for a
+      // diff that mapped to zero typed commands).
+      return {
+        accepted: true,
+        diffId,
+        opCount: 0,
+        appliedCount: 0,
+        skipped: [],
+        commandIds: [],
+        auditChainHead: "",
+      };
     },
-    async aiRejectDiff(_d) {
-      return { rejected: true };
+    async aiRejectDiff(diffId, reason) {
+      return {
+        rejected: true,
+        diffId,
+        opCount: 0,
+        reason: reason ?? null,
+        auditChainHead: "",
+      };
     },
     async aiCancelJob(_j) {
       return { cancelled: true };
@@ -2363,6 +2719,16 @@ export function inProcessBackend(): BridgeBackend {
     },
 
     async deliverCreateRevision(params) {
+      // `projectPath` is required at the interface level but the
+      // in-process backend doesn't own a real on-disk project — we
+      // still validate the field exists so renderer wiring bugs
+      // (missing projectPath) fail loudly here the same way they
+      // do against the native backend.
+      if (typeof params.projectPath !== "string" || params.projectPath.length === 0) {
+        throw new Error(
+          "deliverCreateRevision: params.projectPath must be a non-empty string",
+        );
+      }
       const tag = params.tag.trim();
       if (!tag) {
         throw new Error("revision tag must not be empty");
@@ -2388,12 +2754,22 @@ export function inProcessBackend(): BridgeBackend {
       revisions.push(rev);
       return rev;
     },
-    async deliverListRevisions() {
+    async deliverListRevisions(params) {
+      if (typeof params?.projectPath !== "string" || params.projectPath.length === 0) {
+        throw new Error(
+          "deliverListRevisions: params.projectPath must be a non-empty string",
+        );
+      }
       return revisions
         .slice()
         .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
     },
-    async deliverCompareRevisions({ baseId, headId }) {
+    async deliverCompareRevisions({ projectPath, baseId, headId }) {
+      if (typeof projectPath !== "string" || projectPath.length === 0) {
+        throw new Error(
+          "deliverCompareRevisions: params.projectPath must be a non-empty string",
+        );
+      }
       const base = revisions.find((r) => r.revisionId === baseId);
       const head = revisions.find((r) => r.revisionId === headId);
       if (!base) throw new Error(`unknown base revision: ${baseId}`);

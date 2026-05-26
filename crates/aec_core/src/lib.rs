@@ -61,9 +61,12 @@ pub use kchat_config::{AssetPackPublishOutcome, KChatConfig, KChatIntegration};
 pub use kchat_sync::CommentSync;
 pub use manifest::{ProjectManifest, SCHEMA_VERSION};
 pub use package::{ProjectPackage, ProjectSummary, RecentEntry, RecentsStore};
-pub use revision::{Revision, RevisionDraft, RevisionEntity, RevisionStore};
+pub use revision::{
+    Revision, RevisionDraft, RevisionEntity, RevisionSnapshot, RevisionStore, SnapshotVerification,
+};
 pub use templates::{TemplateDefinition, TemplateLoader};
 pub use types::{Actor, ActorKind, CommandId, DiffId, EntityId, ProjectId, Region, Scope, Units};
 pub use version_diff::{
-    compare_revisions, DiffCounts, EntityChange, EntityChangeKind, VersionDiff,
+    classify_entity_kind, compare_revision_snapshots, compare_revisions, snapshot_entities,
+    DiffCounts, EntityChange, EntityChangeKind, VersionDiff,
 };

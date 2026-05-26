@@ -41,8 +41,15 @@ const api = {
       ipcRenderer.invoke("draft:createSheet", params),
     setLayerState: (params: Record<string, unknown>) =>
       ipcRenderer.invoke("draft:setLayerState", params),
-    importDxf: (path: string) => ipcRenderer.invoke("draft:importDxf", { path }),
-    exportDxf: (path: string) => ipcRenderer.invoke("draft:exportDxf", { path }),
+    // Symmetric with the other `draft:*` handlers — accepts the full
+    // bridge param object `{ dxfPath, projectPath? }`. If `projectPath`
+    // is omitted, the IPC handler resolves it from the active-project
+    // tracker (same `withResolvedProjectPath` pattern as
+    // drawPrimitive / editTool / createSheet / setLayerState).
+    importDxf: (params: { dxfPath: string; projectPath?: string }) =>
+      ipcRenderer.invoke("draft:importDxf", params),
+    exportDxf: (params: { dxfPath: string; projectPath?: string }) =>
+      ipcRenderer.invoke("draft:exportDxf", params),
   },
 
   // ----- BIM -----
@@ -228,7 +235,8 @@ const api = {
     listTools: () => ipcRenderer.invoke("ai:listTools"),
     plan: (params: Record<string, unknown>) => ipcRenderer.invoke("ai:plan", params),
     acceptDiff: (diffId: string) => ipcRenderer.invoke("ai:acceptDiff", { diffId }),
-    rejectDiff: (diffId: string) => ipcRenderer.invoke("ai:rejectDiff", { diffId }),
+    rejectDiff: (diffId: string, reason?: string | null) =>
+      ipcRenderer.invoke("ai:rejectDiff", { diffId, reason: reason ?? null }),
     cancelJob: (jobId: string) => ipcRenderer.invoke("ai:cancelJob", { jobId }),
     runtimeStatus: () => ipcRenderer.invoke("ai:runtimeStatus"),
   },

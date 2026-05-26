@@ -74,6 +74,7 @@ fn plan_detection_diff_produces_wall_inserts_and_is_auditable() {
             .to_hex()
             .to_string(),
         ts: chrono::Utc::now(),
+        reason: String::new(),
     };
     let entry = logger.append(record).unwrap();
     assert!(!entry.hash.is_empty(), "audit hash must be non-empty");
@@ -166,6 +167,7 @@ fn audit_chain_advances_per_record() {
             diff_id: format!("diff-{}", tool.as_str()),
             payload_hash: blake3::hash(tool.as_str().as_bytes()).to_hex().to_string(),
             ts: chrono::Utc::now(),
+            reason: String::new(),
         };
         logger.append(r).unwrap();
         heads.push(logger.head().to_string());

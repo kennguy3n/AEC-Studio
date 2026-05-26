@@ -1,5 +1,9 @@
 import { ipcMain } from "electron";
 import { getBridge } from "./bridge";
+import {
+  peekActiveProjectPath,
+  setActiveProjectPath,
+} from "./active-project";
 
 /**
  * Register every IPC handler the preload bridge expects. Handlers are
@@ -19,11 +23,23 @@ export function registerIpcHandlers(): void {
   ipcMain.handle("project:createFromTemplate", async (_e, { templateKey, projectName }) => {
     assertString(templateKey, "templateKey");
     assertString(projectName, "projectName");
-    return getBridge().projectCreateFromTemplate(templateKey, projectName);
+    // Promote the freshly created project to "active" so subsequent
+    // draft / deliver / command handlers that don't carry an explicit
+    // `projectPath` (because the renderer's public `aec.*` API doesn't
+    // expose one) can resolve the active project path. See
+    // `active-project.ts` for the design rationale.
+    const summary = await getBridge().projectCreateFromTemplate(templateKey, projectName);
+    setActiveProjectPath(summary.path);
+    return summary;
   });
   ipcMain.handle("project:open", async (_e, { projectPath }) => {
     assertString(projectPath, "projectPath");
-    return getBridge().projectOpen(projectPath);
+    const summary = await getBridge().projectOpen(projectPath);
+    // Same active-project promotion as `createFromTemplate`. Set
+    // *after* `projectOpen` succeeds so a failed open (bad path,
+    // wrong master key, etc.) doesn't leave a stale active project.
+    setActiveProjectPath(summary.path);
+    return summary;
   });
   ipcMain.handle("project:save", async (_e, { projectPath }) => {
     assertString(projectPath, "projectPath");
@@ -64,29 +80,64 @@ export function registerIpcHandlers(): void {
   // Same object-shape validation as the Design handlers above. We don't
   // want one renderer-side bug to send `undefined` / a number across the
   // IPC boundary into the native bridge.
+  // Every `draft:*` handler resolves a `projectPath` before calling
+  // the bridge. The renderer-side `aec.draft.*` shape doesn't expose
+  // `projectPath` (pages don't track which project is open — the
+  // main process does), so we inject it from the active-project
+  // tracker. If a caller *does* include `projectPath` in the params
+  // (e.g. a renderer test that prefers to be explicit), the
+  // caller-supplied value wins.
   ipcMain.handle("draft:drawPrimitive", async (_e, p) => {
     assertObject(p, "params");
-    return getBridge().draftDrawPrimitive(p);
+    return getBridge().draftDrawPrimitive(
+      withResolvedProjectPath(p, "draftDrawPrimitive"),
+    );
   });
   ipcMain.handle("draft:editTool", async (_e, p) => {
     assertObject(p, "params");
-    return getBridge().draftEditTool(p);
+    return getBridge().draftEditTool(
+      withResolvedProjectPath(p, "draftEditTool"),
+    );
   });
   ipcMain.handle("draft:createSheet", async (_e, p) => {
     assertObject(p, "params");
-    return getBridge().draftCreateSheet(p);
+    return getBridge().draftCreateSheet(
+      withResolvedProjectPath(p, "draftCreateSheet"),
+    );
   });
   ipcMain.handle("draft:setLayerState", async (_e, p) => {
     assertObject(p, "params");
-    return getBridge().draftSetLayerState(p);
+    return getBridge().draftSetLayerState(
+      withResolvedProjectPath(p, "draftSetLayerState"),
+    );
   });
-  ipcMain.handle("draft:importDxf", async (_e, { path }) => {
-    assertString(path, "path");
-    return getBridge().draftImportDxf(path);
+  // DXF import / export use the same `withResolvedProjectPath` shape
+  // as the other `draft:*` handlers above. The renderer-facing preload
+  // signature is `importDxf({ dxfPath, projectPath? })`. If the caller
+  // supplies an explicit `projectPath` (e.g. a renderer test) it
+  // wins; otherwise the active-project tracker provides it. We
+  // additionally validate that `dxfPath` is a non-empty string so a
+  // missing field surfaces a typed error at the IPC boundary rather
+  // than as a NAPI string-conversion failure on the Rust side.
+  ipcMain.handle("draft:importDxf", async (_e, p) => {
+    assertObject(p, "params");
+    assertString((p as { dxfPath?: unknown }).dxfPath, "dxfPath");
+    return getBridge().draftImportDxf(
+      withResolvedProjectPath(p, "draftImportDxf") as {
+        projectPath: string;
+        dxfPath: string;
+      },
+    );
   });
-  ipcMain.handle("draft:exportDxf", async (_e, { path }) => {
-    assertString(path, "path");
-    return getBridge().draftExportDxf(path);
+  ipcMain.handle("draft:exportDxf", async (_e, p) => {
+    assertObject(p, "params");
+    assertString((p as { dxfPath?: unknown }).dxfPath, "dxfPath");
+    return getBridge().draftExportDxf(
+      withResolvedProjectPath(p, "draftExportDxf") as {
+        projectPath: string;
+        dxfPath: string;
+      },
+    );
   });
 
   // ----- BIM -----
@@ -209,17 +260,51 @@ export function registerIpcHandlers(): void {
 
   // ----- AI -----
   ipcMain.handle("ai:listTools", async () => getBridge().aiListTools());
+  // `ai:plan` is routed through `withResolvedProjectPath` for the same
+  // reason `draft:*` / `deliver:*` are: the renderer's public preload
+  // shape (`aec.ai.plan({ tool, scope, prompt, context,
+  // maxEntitiesModified })`) does NOT carry `projectPath`, but the
+  // native adaptor (`adaptNative.aiPlan` in `bridge.ts`) treats it
+  // as a required string and throws when it's missing. Routing
+  // through the helper injects the active project path from the
+  // tracker at *plan-time* (the moment the user pressed "Suggest
+  // layout"), which is also the binding semantics the Rust side
+  // wants: `BridgeService::ai_plan` captures `(project_path, scope)`
+  // into the `PendingDiff` registry, and `ai_accept_diff` later
+  // re-opens that exact project even if the renderer has since
+  // switched the active project. Without this injection, the
+  // renderer call at `LayoutSuggestionsPanel.tsx::suggestLayout`
+  // would surface "aiPlan: missing required string field
+  // 'projectPath'" in production while still passing the in-process
+  // backend test at `bridge-ai.test.ts:81-97` (the in-process
+  // fallback intentionally accepts missing `projectPath`).
   ipcMain.handle("ai:plan", async (_e, p) => {
     assertObject(p, "params");
-    return getBridge().aiPlan(p);
+    return getBridge().aiPlan(withResolvedProjectPath(p, "aiPlan"));
   });
   ipcMain.handle("ai:acceptDiff", async (_e, { diffId }) => {
     assertString(diffId, "diffId");
     return getBridge().aiAcceptDiff(diffId);
   });
-  ipcMain.handle("ai:rejectDiff", async (_e, { diffId }) => {
+  ipcMain.handle("ai:rejectDiff", async (_e, payload) => {
+    assertObject(payload, "params");
+    const { diffId, reason } = payload as {
+      diffId?: unknown;
+      reason?: unknown;
+    };
     assertString(diffId, "diffId");
-    return getBridge().aiRejectDiff(diffId);
+    // `reason` is optional; the renderer can omit it for silent
+    // rejections (e.g. user dismissed the panel). When present it
+    // must be a string \u2014 reject anything else loudly so the
+    // forensic log never sees `[object Object]` or NaN.
+    let reasonStr: string | null = null;
+    if (reason !== undefined && reason !== null) {
+      if (typeof reason !== "string") {
+        throw new Error("ai:rejectDiff: 'reason' must be a string when present");
+      }
+      reasonStr = reason;
+    }
+    return getBridge().aiRejectDiff(diffId, reasonStr);
   });
   ipcMain.handle("ai:cancelJob", async (_e, { jobId }) => {
     assertString(jobId, "jobId");
@@ -250,6 +335,15 @@ export function registerIpcHandlers(): void {
   });
 
   // ----- Deliver -----
+  // The three `deliver:*` handlers resolve `projectPath` through the
+  // same `withResolvedProjectPath` helper the `draft:*` handlers use
+  // above. The renderer's public preload doesn't expose `projectPath`
+  // on these channels today (so in practice the tracker always wins),
+  // but routing through the helper means a future renderer call (or
+  // a test) that *does* pass an explicit `projectPath` will have it
+  // honoured — same caller-supplied-wins semantics as `draft:*`
+  // without a special case. Resolves PR-X round 4 ANALYSIS-0002
+  // (deliver / draft handler asymmetry).
   ipcMain.handle("deliver:createRevision", async (_e, p) => {
     assertObject(p, "params");
     assertString(p.tag, "tag");
@@ -267,22 +361,40 @@ export function registerIpcHandlers(): void {
           };
         })
       : undefined;
+    const resolved = withResolvedProjectPath(
+      { ...p, description, entities },
+      "deliverCreateRevision",
+    );
     return getBridge().deliverCreateRevision({
-      tag: p.tag,
+      projectPath: resolved.projectPath as string,
+      tag: p.tag as string,
       description,
       entities,
     });
   });
-  ipcMain.handle("deliver:listRevisions", async () =>
-    getBridge().deliverListRevisions(),
-  );
+  ipcMain.handle("deliver:listRevisions", async (_e, p) => {
+    // `aec.deliver.listRevisions()` is called with no arguments from
+    // the renderer, so `p` is typically `undefined`. Normalize to an
+    // empty object before resolving the project path so the helper
+    // can apply the standard caller-supplied-wins semantics.
+    const params: Record<string, unknown> =
+      p !== null && typeof p === "object" && !Array.isArray(p)
+        ? (p as Record<string, unknown>)
+        : {};
+    const resolved = withResolvedProjectPath(params, "deliverListRevisions");
+    return getBridge().deliverListRevisions({
+      projectPath: resolved.projectPath as string,
+    });
+  });
   ipcMain.handle("deliver:compareRevisions", async (_e, p) => {
     assertObject(p, "params");
     assertString(p.baseId, "baseId");
     assertString(p.headId, "headId");
+    const resolved = withResolvedProjectPath(p, "deliverCompareRevisions");
     return getBridge().deliverCompareRevisions({
-      baseId: p.baseId,
-      headId: p.headId,
+      projectPath: resolved.projectPath as string,
+      baseId: p.baseId as string,
+      headId: p.headId as string,
     });
   });
   ipcMain.handle("deliver:buildPack", async (_e, p) => {
@@ -380,6 +492,35 @@ function assertObject(
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new IpcValidationError(`${field} must be an object`);
   }
+}
+
+/**
+ * Return a copy of `params` with `projectPath` filled in. If the
+ * caller already supplied `projectPath` in the params (e.g. a
+ * renderer test or a future page that wants to override the active
+ * project), that value is preserved; otherwise we inject the
+ * tracked active project path. Throws `IpcValidationError` if
+ * neither source has a path (i.e. no project is currently open).
+ *
+ * Centralising this here keeps every `draft:*` handler that takes
+ * a `Record<string, unknown>` from re-implementing the same merge
+ * logic (and possibly skipping it).
+ */
+function withResolvedProjectPath(
+  params: Record<string, unknown>,
+  method: string,
+): Record<string, unknown> {
+  if (typeof params.projectPath === "string" && params.projectPath.length > 0) {
+    return params;
+  }
+  const active = peekActiveProjectPath();
+  if (active === null) {
+    throw new IpcValidationError(
+      `${method}: no project is currently open. Call ` +
+        `\`project.open\` or \`project.createFromTemplate\` first.`,
+    );
+  }
+  return { ...params, projectPath: active };
 }
 
 /**

@@ -1991,9 +1991,29 @@ pub struct AiPlanResultJs {
 }
 
 #[napi(object)]
-pub struct AiDiffOutcomeJs {
+pub struct AiAcceptOutcomeJs {
     pub ok: bool,
     pub diff_id: String,
+    pub op_count: u32,
+    pub applied_count: u32,
+    pub skipped: Vec<AiAcceptSkippedJsRow>,
+    pub command_ids: Vec<String>,
+    pub audit_chain_head: String,
+}
+
+#[napi(object)]
+pub struct AiAcceptSkippedJsRow {
+    pub op_index: u32,
+    pub reason: String,
+}
+
+#[napi(object)]
+pub struct AiRejectOutcomeJs {
+    pub ok: bool,
+    pub diff_id: String,
+    pub op_count: u32,
+    pub reason: Option<String>,
+    pub audit_chain_head: String,
 }
 
 #[napi(object)]
@@ -2060,6 +2080,7 @@ pub async fn ai_list_tools() -> Result<Vec<AiToolJs>> {
 /// case rather than a tail-end async error.
 #[napi]
 pub async fn ai_plan(
+    project_path: String,
     tool: String,
     scope: String,
     prompt: String,
@@ -2069,7 +2090,14 @@ pub async fn ai_plan(
     let scope = parse_scope(&scope)?;
     spawn_blocking_napi(move || {
         let r = with_service_ref_fallible(|svc| {
-            svc.ai_plan(&tool, scope, &prompt, &context_json, max_entities_modified)
+            svc.ai_plan(
+                &project_path,
+                &tool,
+                scope,
+                &prompt,
+                &context_json,
+                max_entities_modified,
+            )
         })?;
         let parsed_json = serde_json::to_string(&r.parsed).map_err(|e| {
             Error::new(
@@ -2087,31 +2115,67 @@ pub async fn ai_plan(
     .await
 }
 
-/// Accept a pending diff. Idempotent at the renderer level: a second
-/// accept on the same id is an error (the first removed it).
+/// Accept a pending diff and apply it to the project graph.
+///
+/// Phase 11 task 10: this is the entry point through which AI
+/// suggestions become real, undoable mutations. The diff is
+/// converted into a `Vec<Command>` and persisted in a single SQL
+/// transaction; the result carries the per-op apply telemetry the
+/// renderer needs to show "4 applied, 1 skipped" and to wire the
+/// command ids into its undo stack.
 ///
 /// `async` for the cold-spawn responsiveness reason in the AI
-/// endpoints block above. The actual diff-map mutation is
-/// O(microseconds), but if a cold-spawn happens to be racing on
-/// the same `BridgeService` we still want the JS event loop free.
+/// endpoints block above, AND because the apply now opens a
+/// SQLCipher connection and walks a transaction — a meaningful
+/// amount of blocking IO that must not run on the libuv main
+/// thread.
 #[napi]
-pub async fn ai_accept_diff(diff_id: String) -> Result<AiDiffOutcomeJs> {
+pub async fn ai_accept_diff(diff_id: String) -> Result<AiAcceptOutcomeJs> {
     spawn_blocking_napi(move || {
-        with_service_ref_fallible(|svc| svc.ai_accept_diff(&diff_id)).map(|r| AiDiffOutcomeJs {
+        with_service(|svc| svc.ai_accept_diff(&diff_id)).map(|r| AiAcceptOutcomeJs {
             ok: r.ok,
             diff_id: r.diff_id,
+            op_count: r.op_count,
+            applied_count: r.applied_count,
+            skipped: r
+                .skipped
+                .into_iter()
+                .map(|s| AiAcceptSkippedJsRow {
+                    op_index: s.op_index,
+                    reason: s.reason,
+                })
+                .collect(),
+            command_ids: r.command_ids,
+            audit_chain_head: r.audit_chain_head,
         })
     })
     .await
 }
 
-/// Reject a pending diff. Same idempotency note as `ai_accept_diff`.
+/// Reject a pending diff and log the rejection (with optional
+/// `reason`) to the project's AI audit trail.
 #[napi]
-pub async fn ai_reject_diff(diff_id: String) -> Result<AiDiffOutcomeJs> {
+pub async fn ai_reject_diff(diff_id: String, reason: Option<String>) -> Result<AiRejectOutcomeJs> {
     spawn_blocking_napi(move || {
-        with_service_ref_fallible(|svc| svc.ai_reject_diff(&diff_id)).map(|r| AiDiffOutcomeJs {
-            ok: r.ok,
-            diff_id: r.diff_id,
+        // Devin Review `ANALYSIS_0001` (round 1): use the *read*
+        // lock (`with_service_ref_fallible`) rather than the write
+        // lock (`with_service`). The reject path does not mutate
+        // `BridgeService` directly — `ai_state.peek_diff` /
+        // `finalize_diff` already take `&self` and own their own
+        // interior locks, and the audit append is a static helper.
+        // Holding only a read lock here means concurrent status
+        // polls and render-job listings no longer serialize behind
+        // a reject's audit-disk-I/O. (Accept must continue to use
+        // the write lock because `command_apply_on_conn` mutates
+        // the project graph through `&mut self`.)
+        with_service_ref_fallible(|svc| svc.ai_reject_diff(&diff_id, reason.as_deref())).map(|r| {
+            AiRejectOutcomeJs {
+                ok: r.ok,
+                diff_id: r.diff_id,
+                op_count: r.op_count,
+                reason: r.reason,
+                audit_chain_head: r.audit_chain_head,
+            }
         })
     })
     .await
@@ -2156,6 +2220,259 @@ pub async fn ai_runtime_status() -> Result<AiRuntimeStatusJs> {
                 pending_diff_ids: r.pending_diff_ids,
             }
         })
+    })
+    .await
+}
+
+// ============================================================
+// draft.* / deliver.* (Group A, Phase 10)
+// ============================================================
+
+/// JS-facing result of [`draft_import_dxf`]. Mirrors the TS
+/// `DraftImportDxfResult` interface (entityCount / layerCount /
+/// blockCount / skippedCount in camelCase).
+#[napi(object)]
+pub struct DraftImportDxfJs {
+    pub entity_count: u32,
+    pub layer_count: u32,
+    pub block_count: u32,
+    pub skipped_count: u32,
+}
+
+/// JS-facing result of [`draft_export_dxf`].
+#[napi(object)]
+pub struct DraftExportDxfJs {
+    pub path: String,
+    pub entity_count: u32,
+    pub file_size: u32,
+}
+
+#[napi(object)]
+pub struct DraftEntityIdJs {
+    pub entity_id: String,
+}
+
+#[napi(object)]
+pub struct DraftSheetIdJs {
+    pub sheet_id: String,
+}
+
+/// Draw a single primitive (line / polyline / arc / circle / ellipse
+/// / spline / hatch / text). `params_json` deserialises into
+/// [`aec_command::commands::draft::DrawPrimitive`].
+#[napi]
+pub fn draft_draw_primitive(project_path: String, params_json: String) -> Result<DraftEntityIdJs> {
+    let inner: aec_command::commands::draft::DrawPrimitive =
+        parse_design_params("draft_draw_primitive", &params_json)?;
+    let entity_id = inner.entity_id.to_string();
+    let cmd = aec_command::commands::Command::user(
+        aec_command::commands::CommandKind::DrawPrimitive(inner),
+    );
+    with_service(|svc| svc.command_apply(&project_path, cmd))?;
+    Ok(DraftEntityIdJs { entity_id })
+}
+
+/// Apply a 2D edit tool (move / copy / rotate / scale / mirror /
+/// offset / trim / extend / fillet / chamfer / stretch).
+/// `params_json` deserialises into
+/// [`aec_command::commands::draft::EditTool`].
+#[napi]
+pub fn draft_edit_tool(project_path: String, params_json: String) -> Result<DesignAckJs> {
+    let inner: aec_command::commands::draft::EditTool =
+        parse_design_params("draft_edit_tool", &params_json)?;
+    let cmd =
+        aec_command::commands::Command::user(aec_command::commands::CommandKind::EditTool(inner));
+    with_service(|svc| svc.command_apply(&project_path, cmd))?;
+    Ok(DesignAckJs { ok: true })
+}
+
+/// Create a sheet for plotting. `params_json` deserialises into
+/// [`aec_command::commands::draft::CreateSheet`].
+#[napi]
+pub fn draft_create_sheet(project_path: String, params_json: String) -> Result<DraftSheetIdJs> {
+    let inner: aec_command::commands::draft::CreateSheet =
+        parse_design_params("draft_create_sheet", &params_json)?;
+    let sheet_id = inner.entity_id.to_string();
+    let cmd = aec_command::commands::Command::user(
+        aec_command::commands::CommandKind::CreateSheet(inner),
+    );
+    with_service(|svc| svc.command_apply(&project_path, cmd))?;
+    Ok(DraftSheetIdJs { sheet_id })
+}
+
+/// Upsert layer state (color / linetype / lineweight / visibility /
+/// freeze / lock / plottable / description). `params_json`
+/// deserialises into
+/// [`aec_command::commands::draft::SetLayerState`].
+#[napi]
+pub fn draft_set_layer_state(project_path: String, params_json: String) -> Result<DesignAckJs> {
+    let inner: aec_command::commands::draft::SetLayerState =
+        parse_design_params("draft_set_layer_state", &params_json)?;
+    let cmd = aec_command::commands::Command::user(
+        aec_command::commands::CommandKind::SetLayerState(inner),
+    );
+    with_service(|svc| svc.command_apply(&project_path, cmd))?;
+    Ok(DesignAckJs { ok: true })
+}
+
+/// Import a DXF file into the project graph. Each importable DXF
+/// entity is routed through `command_apply` so the import is
+/// journaled / auditable / undo-able. Async because reads can be
+/// large (10s of MB DXF files are common).
+#[napi]
+pub async fn draft_import_dxf(project_path: String, dxf_path: String) -> Result<DraftImportDxfJs> {
+    spawn_blocking_napi(move || {
+        with_service(|svc| svc.draft_import_dxf(&project_path, &dxf_path)).map(|r| {
+            DraftImportDxfJs {
+                entity_count: r.entity_count,
+                layer_count: r.layer_count,
+                block_count: r.block_count,
+                skipped_count: r.skipped_count,
+            }
+        })
+    })
+    .await
+}
+
+/// Export the project graph's draft primitives to a DXF file.
+/// Async because writing can be large.
+#[napi]
+pub async fn draft_export_dxf(project_path: String, dxf_path: String) -> Result<DraftExportDxfJs> {
+    spawn_blocking_napi(move || {
+        with_service_ref_fallible(|svc| svc.draft_export_dxf(&project_path, &dxf_path)).map(|r| {
+            DraftExportDxfJs {
+                path: r.path,
+                entity_count: r.entity_count,
+                // u64 doesn't cross the NAPI boundary cleanly on all
+                // hosts; the renderer already shows file_size as a
+                // human-readable string and a 4 GiB cap on a draft
+                // DXF export is well beyond any reasonable project.
+                file_size: u32::try_from(r.file_size).unwrap_or(u32::MAX),
+            }
+        })
+    })
+    .await
+}
+
+/// JS-facing mirror of [`crate::service::RevisionSummary`]. The
+/// service serialises with `#[serde(rename_all = "camelCase")]` so
+/// the field order here matches the renderer's TS interface
+/// exactly. We re-serialise through JSON rather than mapping fields
+/// because the nested `tracked_entities` Vec doesn't cross NAPI
+/// directly.
+#[napi(object)]
+pub struct RevisionSummaryJs {
+    /// JSON-serialised
+    /// [`crate::service::RevisionSummary`]. The renderer
+    /// `JSON.parse`s this once on receipt to obtain a typed
+    /// `RevisionSummary`. We pass JSON instead of a flat NAPI
+    /// object because the inner `tracked_entities` list does not
+    /// flatten cleanly to a NAPI struct.
+    pub summary_json: String,
+}
+
+#[napi(object)]
+pub struct RevisionDiffJs {
+    /// JSON-serialised
+    /// [`crate::service::RevisionDiffReport`].
+    pub diff_json: String,
+}
+
+#[napi(object)]
+pub struct RevisionTrackedEntityJs {
+    pub category: String,
+    pub id: String,
+    pub payload_hash: String,
+    pub label: Option<String>,
+}
+
+/// Create a tagged revision snapshot.
+///
+/// Routed through [`spawn_blocking_napi`] because the underlying
+/// service call opens the encrypted project package, reads the
+/// entire entity table to compute the tracked-entity list when the
+/// caller supplies none, and writes the snapshot file to disk — all
+/// blocking I/O that would otherwise stall the Electron main
+/// (libuv) thread on large projects.
+#[napi]
+pub async fn deliver_create_revision(
+    project_path: String,
+    tag: String,
+    description: String,
+    entities: Option<Vec<RevisionTrackedEntityJs>>,
+) -> Result<RevisionSummaryJs> {
+    let caller = entities.map(|v| {
+        v.into_iter()
+            .map(|e| crate::service::RevisionTrackedEntity {
+                category: e.category,
+                id: e.id,
+                payload_hash: e.payload_hash,
+                label: e.label,
+            })
+            .collect()
+    });
+    spawn_blocking_napi(move || {
+        let rev = with_service(|svc| {
+            svc.deliver_create_revision(&project_path, &tag, &description, caller)
+        })?;
+        let summary_json = serde_json::to_string(&rev).map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("deliver_create_revision: serialize: {e}"),
+            )
+        })?;
+        Ok(RevisionSummaryJs { summary_json })
+    })
+    .await
+}
+
+/// List all revision snapshots in chronological order.
+///
+/// Routed through [`spawn_blocking_napi`] for the same reason as
+/// [`deliver_create_revision`]: enumerating revisions opens the
+/// project package and reads the on-disk snapshot index.
+#[napi]
+pub async fn deliver_list_revisions(project_path: String) -> Result<Vec<RevisionSummaryJs>> {
+    spawn_blocking_napi(move || {
+        let revs = with_service_ref_fallible(|svc| svc.deliver_list_revisions(&project_path))?;
+        revs.into_iter()
+            .map(|r| {
+                let summary_json = serde_json::to_string(&r).map_err(|e| {
+                    Error::new(
+                        Status::GenericFailure,
+                        format!("deliver_list_revisions: serialize: {e}"),
+                    )
+                })?;
+                Ok(RevisionSummaryJs { summary_json })
+            })
+            .collect()
+    })
+    .await
+}
+
+/// Diff two revisions.
+///
+/// Routed through [`spawn_blocking_napi`] because the comparison
+/// loads both snapshots from disk and walks the entity tables to
+/// classify each entity as added/removed/modified — work that grows
+/// linearly with project size.
+#[napi]
+pub async fn deliver_compare_revisions(
+    project_path: String,
+    base_id: String,
+    head_id: String,
+) -> Result<RevisionDiffJs> {
+    spawn_blocking_napi(move || {
+        let diff = with_service_ref_fallible(|svc| {
+            svc.deliver_compare_revisions(&project_path, &base_id, &head_id)
+        })?;
+        let diff_json = serde_json::to_string(&diff).map_err(|e| {
+            Error::new(
+                Status::GenericFailure,
+                format!("deliver_compare_revisions: serialize: {e}"),
+            )
+        })?;
+        Ok(RevisionDiffJs { diff_json })
     })
     .await
 }

@@ -237,6 +237,15 @@ impl Actor {
         }
     }
 
+    /// Convenience predicate — the audit-trail UI, the AI panel's
+    /// "by" badge, and `ai_apply`'s unit tests all want a one-line
+    /// check for AI-attributed actors. Adding it here keeps the
+    /// `ActorKind` enum private to the type and prevents callers
+    /// from importing `ActorKind` just to discriminate on it.
+    pub fn is_ai(&self) -> bool {
+        self.kind == ActorKind::Ai
+    }
+
     /// Build a KChat-sourced actor. The `commenter` handle is stored
     /// in the `tool` field so the audit-trail viewer can show who
     /// posted the review comment without a separate column.

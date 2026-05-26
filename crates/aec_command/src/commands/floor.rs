@@ -18,16 +18,29 @@ pub struct CreateFloor {
 
 impl CreateFloor {
     pub fn validate(&self) -> CommandResult<()> {
+        // See `CreateWall::validate` for the rationale behind the
+        // `is_finite()` guards (Devin Review `ANALYSIS_0008` on
+        // PR #51).
         if self.boundary_mm.len() < 3 {
             return Err(CommandError::InvalidArguments {
                 tool: "design.create_floor".into(),
                 reason: "boundary needs at least 3 points".into(),
             });
         }
-        if self.thickness_mm <= 0.0 {
+        if !self
+            .boundary_mm
+            .iter()
+            .all(|p| p.iter().all(|c| c.is_finite()))
+        {
             return Err(CommandError::InvalidArguments {
                 tool: "design.create_floor".into(),
-                reason: "thickness must be > 0".into(),
+                reason: "boundary_mm coordinates must all be finite".into(),
+            });
+        }
+        if !self.thickness_mm.is_finite() || self.thickness_mm <= 0.0 {
+            return Err(CommandError::InvalidArguments {
+                tool: "design.create_floor".into(),
+                reason: "thickness must be a finite positive number".into(),
             });
         }
         Ok(())
