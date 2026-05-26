@@ -1528,6 +1528,96 @@ mod tests {
     }
 
     #[test]
+    fn camera_lookat_near_degenerate_forward_parallel_to_up_does_not_panic() {
+        // When `forward` is nearly parallel (or anti-parallel) to `up`,
+        // `cross(forward, up)` collapses toward zero and the `normalize`
+        // fallback at `gltf_export.rs:887-888` returns `[0, 0, 1]`. The
+        // function must still:
+        //
+        //   (a) return a finite unit quaternion (no `NaN` / `inf`),
+        //   (b) approximately satisfy the lookAt contract — rotated
+        //       local `-Z` points roughly toward `target - position`.
+        //
+        // This pins the contract that the fallback chooses a *consistent*
+        // up axis rather than producing an undefined rotation.
+        //
+        // Two configurations:
+        //   1. `forward ≈ -up` — camera looking straight down (position
+        //      well above target, world up is `+Y`).
+        //   2. `forward ≈ +up` — camera looking straight up (position
+        //      well below target, world up is `+Y`).
+        let cases = [
+            // Forward ≈ -up: position above target.
+            (
+                [0.0_f32, 5.0, 0.01_f32],
+                [0.0_f32, 0.0, 0.0_f32],
+                [0.0_f32, 1.0, 0.0_f32],
+            ),
+            // Forward ≈ +up: position below target.
+            (
+                [0.0_f32, -5.0, 0.01_f32],
+                [0.0_f32, 0.0, 0.0_f32],
+                [0.0_f32, 1.0, 0.0_f32],
+            ),
+        ];
+        for (position, target, up) in cases {
+            let (_t, q) = camera_lookat_components(position, target, up);
+            // The quaternion must be unit-magnitude and finite.
+            let q_mag = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+            assert!(
+                q_mag.is_finite() && (q_mag - 1.0).abs() < 1e-4,
+                "near-degenerate (pos={position:?}, target={target:?}, up={up:?}): \
+                 quaternion not unit length: {q:?} (|q|={q_mag})",
+            );
+            // The lookAt contract must still hold approximately: rotated
+            // local -Z agrees with (target - position) normalized. We use
+            // a slightly relaxed tolerance because the `normalize`
+            // fallback picks an arbitrary right axis when forward ∥ up.
+            let expected = {
+                let d = [
+                    target[0] - position[0],
+                    target[1] - position[1],
+                    target[2] - position[2],
+                ];
+                let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                [d[0] / l, d[1] / l, d[2] / l]
+            };
+            let rotated = rotate_by_quat(q, [0.0, 0.0, -1.0]);
+            let dot =
+                rotated[0] * expected[0] + rotated[1] * expected[1] + rotated[2] * expected[2];
+            assert!(
+                dot > 0.99,
+                "near-degenerate (pos={position:?}, target={target:?}, up={up:?}): \
+                 rotated local -Z {rotated:?} does not align with target dir {expected:?} \
+                 (dot={dot})",
+            );
+        }
+    }
+
+    #[test]
+    fn camera_lookat_exactly_degenerate_forward_equals_up_returns_finite_quaternion() {
+        // Pathological corner case: `forward` is exactly parallel to
+        // `up`. `cross(forward, up)` is identically zero, so the
+        // `normalize` fallback must engage. The orientation is
+        // necessarily ambiguous (no well-defined "right" axis), so the
+        // contract is weaker than the near-degenerate case above — we
+        // only require a finite unit quaternion (no panic, no NaN).
+        //
+        // This case is unreachable from a sensible content pipeline but
+        // can be hit by procedurally-generated test fixtures, so the
+        // exporter must degrade gracefully.
+        let position = [0.0_f32, 5.0, 0.0];
+        let target = [0.0_f32, 0.0, 0.0];
+        let up = [0.0_f32, 1.0, 0.0]; // forward = [0, -1, 0], exactly anti-parallel to up.
+        let (_t, q) = camera_lookat_components(position, target, up);
+        let q_mag = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+        assert!(
+            q_mag.is_finite() && (q_mag - 1.0).abs() < 1e-4,
+            "exactly-degenerate forward∥up: expected unit quaternion, got {q:?} (|q|={q_mag})",
+        );
+    }
+
+    #[test]
     fn light_index_is_unique_per_extension_lights_array() {
         // 3 lights -> 3 unique indices referenced from 3 nodes.
         let dir = tempdir().unwrap();
