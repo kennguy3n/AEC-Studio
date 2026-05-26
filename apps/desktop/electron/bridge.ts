@@ -963,7 +963,8 @@ export interface EngineStatus {
  * file order — `breakFile` and `breakLine` (1-based) point to the
  * offending entry, `breakReason` is one of
  * `"prev_hash_mismatch"`, `"hash_recompute_mismatch"`,
- * `"unsupported_hash_version"`, `"malformed_entry"`, or `"io"`,
+ * `"unsupported_hash_version"`, `"legacy_hash_version_rejected"`,
+ * `"malformed_entry"`, or `"io"`,
  * and `breakDetail` carries a human-readable description for the
  * status pane.
  *
@@ -998,6 +999,7 @@ export interface AuditChainVerification {
     | "prev_hash_mismatch"
     | "hash_recompute_mismatch"
     | "unsupported_hash_version"
+    | "legacy_hash_version_rejected"
     | "malformed_entry"
     | "io"
     | null;
