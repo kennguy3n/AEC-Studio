@@ -215,47 +215,33 @@ impl RenderJobStore {
 
     /// Save the entire queue atomically: clears the table and writes
     /// every job in one transaction.
+    ///
+    /// Each row is written via the shared [`write_job_row`] helper so
+    /// the "indexed columns mirror payload" invariant is enforced by
+    /// the same SQL site used by [`RenderJobStore::upsert`] and
+    /// [`RenderJobStore::reincarnate_running_as_queued`]. Adding a new
+    /// indexed column to the schema therefore requires editing
+    /// **one** SQL site, not three — eliminating the maintenance
+    /// asymmetry where `save_queue` could silently drift from
+    /// `upsert` (e.g. forgetting to mirror a new `tenant_id` column,
+    /// or omitting a new `paused_at` field from the bulk save path).
+    ///
+    /// `write_job_row` emits `INSERT ... ON CONFLICT(id) DO UPDATE`,
+    /// but because the loop runs after `DELETE FROM render_jobs` the
+    /// table is empty and only the INSERT branch ever fires — so the
+    /// semantic is exactly the same as the previous plain-INSERT
+    /// implementation. `created_at` is written fresh from each
+    /// in-memory job, preserving the prior behaviour (`save_queue`
+    /// has always been authoritative for `created_at` because callers
+    /// supply the full queue snapshot).
     pub fn save_queue(&self, queue: &RenderQueue) -> RenderJobStoreResult<()> {
-        let payloads: Vec<(String, String, RenderJob)> = queue
-            .list_jobs()
-            .into_iter()
-            .map(|j| -> RenderJobStoreResult<(String, String, RenderJob)> {
-                Ok((
-                    serde_json::to_string(j)?,
-                    serde_json::to_string(&j.completed_frames)?,
-                    j.clone(),
-                ))
-            })
-            .collect::<RenderJobStoreResult<Vec<_>>>()?;
+        let jobs: Vec<RenderJob> = queue.list_jobs().into_iter().cloned().collect();
 
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM render_jobs", [])?;
-        for (payload, completed_frames, j) in &payloads {
-            tx.execute(
-                "INSERT INTO render_jobs (
-                    id, status, priority, progress, batch_id, camera_id,
-                    output_path, error, created_at, started_at, completed_at,
-                    completed_frames, payload
-                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
-                params![
-                    j.id,
-                    status_to_str(j.status),
-                    j.priority,
-                    j.progress as f64,
-                    j.batch_id,
-                    j.camera_id,
-                    j.output_path
-                        .as_ref()
-                        .map(|p| p.to_string_lossy().to_string()),
-                    j.error,
-                    rfc3339(j.created_at),
-                    j.started_at.map(rfc3339),
-                    j.completed_at.map(rfc3339),
-                    completed_frames,
-                    payload,
-                ],
-            )?;
+        for j in &jobs {
+            write_job_row(&tx, j)?;
         }
         tx.commit()?;
         Ok(())
@@ -686,6 +672,252 @@ mod tests {
         assert_eq!(loaded.list_jobs().len(), q.list_jobs().len());
         assert_eq!(loaded.get(&a).unwrap().status, RenderJobStatus::Running);
         assert_eq!(loaded.get(&b).unwrap().status, RenderJobStatus::Failed);
+    }
+
+    #[test]
+    fn save_queue_mirrors_every_indexed_column_from_payload() {
+        // Regression: closes the same indexed-column-drift class that
+        // Devin Review flagged on the reincarnate path, applied to
+        // `save_queue`. The previous implementation hand-rolled its
+        // own `INSERT INTO render_jobs (…) VALUES (…)` SQL — separate
+        // from the `INSERT ON CONFLICT UPDATE` used by `upsert`. That
+        // meant adding a new indexed column (e.g. `tenant_id`,
+        // `paused_at`) required editing **two** SQL sites, and any
+        // future contributor who forgot the bulk-save site would
+        // silently leave that column NULL after every full-queue
+        // snapshot — an invisible-to-payload bug that would only
+        // surface through dashboards / batch reports filtering on the
+        // missed column.
+        //
+        // The fix routes `save_queue` through the same `write_job_row`
+        // helper as `upsert` + `reincarnate_running_as_queued`. This
+        // test locks the contract by reading **every** indexed column
+        // directly via SQL after `save_queue` and asserting it matches
+        // the in-memory payload that was saved — across all interesting
+        // states (queued, running, failed) so the lock applies to every
+        // row written by the bulk save, not just the first.
+        let (_d, s) = open_store();
+
+        // Three jobs, each populating a different mix of nullable and
+        // non-null indexed columns so the test exercises every column
+        // currently mirrored by `write_job_row`.
+        let mut q_job = job(5);
+        q_job.priority = 5;
+        q_job.batch_id = Some("batch-queued".to_string());
+        q_job.camera_id = Some("cam-Q".to_string());
+        q_job.output_path = Some(std::path::PathBuf::from("/tmp/save-queued.png"));
+        q_job.progress = 0.1;
+
+        let mut r_job = job(7);
+        r_job.priority = 7;
+        r_job.status = RenderJobStatus::Running;
+        r_job.batch_id = Some("batch-running".to_string());
+        r_job.camera_id = Some("cam-R".to_string());
+        r_job.output_path = Some(std::path::PathBuf::from("/tmp/save-running.png"));
+        r_job.progress = 0.42;
+        r_job.started_at = Some(Utc::now());
+        r_job.mark_frame_completed(0);
+
+        let mut f_job = job(0);
+        f_job.priority = 0;
+        f_job.status = RenderJobStatus::Failed;
+        f_job.batch_id = None;
+        f_job.camera_id = None;
+        f_job.output_path = None;
+        f_job.progress = 0.0;
+        f_job.error = Some("disk full".to_string());
+        f_job.completed_at = Some(Utc::now());
+
+        let mut queue = RenderQueue::new();
+        queue.restore_queued(q_job.clone());
+        queue.restore_running(r_job.clone());
+        queue.restore_completed(f_job.clone());
+
+        s.save_queue(&queue).unwrap();
+
+        // Read the indexed columns directly — not via the JSON payload
+        // round-trip — to ensure the bulk-save actually wrote them.
+        let conn = s.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, status, priority, progress, batch_id, camera_id,
+                        output_path, error, started_at, completed_at,
+                        completed_frames, payload
+                 FROM render_jobs",
+            )
+            .unwrap();
+        type Row = (
+            String,
+            String,
+            i64,
+            f64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+        );
+        let rows: Vec<Row> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        drop(stmt);
+        drop(conn);
+
+        assert_eq!(rows.len(), 3, "save_queue must persist every job");
+
+        for row in &rows {
+            let (
+                id,
+                status_col,
+                priority_col,
+                progress_col,
+                batch_col,
+                camera_col,
+                output_col,
+                error_col,
+                started_col,
+                completed_col,
+                frames_col,
+                payload_col,
+            ) = row;
+
+            // The payload itself is the ground truth for what was
+            // saved; every indexed column must mirror it byte-for-byte
+            // (modulo the rfc3339 string encoding for timestamps and
+            // the JSON encoding for the frames vector).
+            let from_payload: RenderJob = serde_json::from_str(payload_col).unwrap();
+            assert_eq!(
+                &from_payload.id, id,
+                "id column must mirror payload after save_queue"
+            );
+            assert_eq!(
+                status_to_str(from_payload.status),
+                status_col,
+                "status column must mirror payload after save_queue"
+            );
+            assert_eq!(
+                from_payload.priority as i64, *priority_col,
+                "priority column must mirror payload after save_queue"
+            );
+            assert!(
+                (from_payload.progress as f64 - *progress_col).abs() < 1e-9,
+                "progress column must mirror payload after save_queue"
+            );
+            assert_eq!(
+                from_payload.batch_id, *batch_col,
+                "batch_id column must mirror payload after save_queue"
+            );
+            assert_eq!(
+                from_payload.camera_id, *camera_col,
+                "camera_id column must mirror payload after save_queue"
+            );
+            assert_eq!(
+                from_payload
+                    .output_path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().to_string()),
+                *output_col,
+                "output_path column must mirror payload after save_queue"
+            );
+            assert_eq!(
+                from_payload.error, *error_col,
+                "error column must mirror payload after save_queue"
+            );
+            assert_eq!(
+                from_payload.started_at.map(rfc3339),
+                *started_col,
+                "started_at column must mirror payload after save_queue"
+            );
+            assert_eq!(
+                from_payload.completed_at.map(rfc3339),
+                *completed_col,
+                "completed_at column must mirror payload after save_queue"
+            );
+            let from_payload_frames: Vec<u32> =
+                serde_json::from_str(frames_col).expect("completed_frames is valid JSON");
+            assert_eq!(
+                from_payload.completed_frames, from_payload_frames,
+                "completed_frames column must mirror payload after save_queue"
+            );
+        }
+
+        // Targeted spot-check on the rich Running row: the indexed
+        // columns must equal the exact in-memory values we built it
+        // from, not just the payload that was round-tripped through
+        // serde. This catches the (otherwise plausible) bug where
+        // `write_job_row` reads from the payload string instead of
+        // the typed `&RenderJob`, which would silently work for any
+        // field whose serde representation is lossless but fail for
+        // anything with a non-trivial conversion (e.g. PathBuf, enums).
+        let running_row = rows
+            .iter()
+            .find(|r| r.0 == r_job.id)
+            .expect("running job present");
+        assert_eq!(running_row.1, "running");
+        assert_eq!(running_row.2, 7);
+        assert_eq!(running_row.4.as_deref(), Some("batch-running"));
+        assert_eq!(running_row.5.as_deref(), Some("cam-R"));
+        assert_eq!(running_row.6.as_deref(), Some("/tmp/save-running.png"));
+    }
+
+    #[test]
+    fn save_queue_round_trips_through_load_queue_with_all_columns_preserved() {
+        // Tighter contract than `save_queue_then_load_queue_round_trips`:
+        // not only must the *count* match across the round-trip, but
+        // every column the worker cares about (priority for queue
+        // ordering, batch_id for cancellation, camera_id for the
+        // walkthrough resume hook, output_path for delivery, progress
+        // for tile-skip on resume) must survive untouched. This locks
+        // `save_queue` against future changes that silently drop a
+        // column from the bulk-save path — the most common shape of
+        // the indexed-column-drift bug.
+        let (_d, s) = open_store();
+        let mut j = job(9);
+        j.priority = 9;
+        j.batch_id = Some("batch-Z".to_string());
+        j.camera_id = Some("cam-Z".to_string());
+        j.output_path = Some(std::path::PathBuf::from("/tmp/save-roundtrip.png"));
+        j.progress = 0.6;
+        j.mark_frame_completed(0);
+        j.mark_frame_completed(3);
+
+        let mut queue = RenderQueue::new();
+        queue.restore_queued(j.clone());
+        s.save_queue(&queue).unwrap();
+
+        let loaded = s.load_queue().unwrap();
+        let got = loaded.get(&j.id).expect("job present after round-trip");
+        assert_eq!(got.priority, 9);
+        assert_eq!(got.batch_id.as_deref(), Some("batch-Z"));
+        assert_eq!(got.camera_id.as_deref(), Some("cam-Z"));
+        assert_eq!(
+            got.output_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
+            Some("/tmp/save-roundtrip.png".to_string())
+        );
+        assert!((got.progress - 0.6).abs() < 1e-5);
+        assert_eq!(got.completed_frames, vec![0, 3]);
     }
 
     #[test]
