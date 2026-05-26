@@ -846,7 +846,14 @@ fn camera_lookat_components(
         up
     };
     let right = normalize(cross(forward, effective_up));
-    let recomputed_up = cross(right, forward);
+    // `recomputed_up` is analytically unit-length when `right` and
+    // `forward` are unit and orthogonal, but float rounding in the
+    // cross product can shave off a few ULPs. Normalize for symmetry
+    // with `right` and to keep the rotation matrix orthonormal to
+    // within the closest representable f32 — `mat3_to_quat` then
+    // produces a unit quaternion to within float precision rather
+    // than within a cross-product residual.
+    let recomputed_up = normalize(cross(right, forward));
 
     // Column-major: m[col] is the c-th column of R, i.e. the image
     // of local basis vector e_c under the rotation.
