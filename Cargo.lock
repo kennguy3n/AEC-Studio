@@ -232,6 +232,7 @@ dependencies = [
  "naga",
  "pollster",
  "rayon",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
