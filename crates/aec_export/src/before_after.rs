@@ -788,10 +788,16 @@ fn discover_render_pairs_impl(
     let Ok(entries) = fs::read_dir(renders_dir) else {
         return Vec::new();
     };
+    // `fs::read_dir` iteration order is OS- and filesystem-dependent. Collect the entries
+    // into a Vec and sort by path so that, when more than one file matches the same
+    // (camera, preset, revision) tuple (e.g. `cam01__standard__rev1.png` and
+    // `cam01__standard__rev1.exr`), the "last write wins" choice below is deterministic
+    // across platforms.
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    paths.sort();
     // Index files by (camera, preset) -> { base_path, head_path }.
     let mut idx: BTreeMap<(String, String), (Option<PathBuf>, Option<PathBuf>)> = BTreeMap::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
+    for path in paths {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
@@ -1191,6 +1197,41 @@ mod tests {
         assert!(pairs[0]
             .after_path
             .ends_with("cam01__standard__rev_head.png"));
+    }
+
+    #[test]
+    fn discover_render_pairs_picks_deterministic_file_for_same_camera_preset_revision() {
+        // If multiple files match the same (camera, preset, revision) tuple
+        // (e.g. PNG and EXR side-by-side), `fs::read_dir` order is OS-dependent
+        // so the "last write wins" choice would otherwise be non-deterministic.
+        // After sorting by path, the lexicographically-last filename wins on
+        // every platform.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // Two extensions for the same base tuple — both for base AND head.
+        std::fs::write(dir.join("cam01__standard__rev_base.exr"), b"a").unwrap();
+        std::fs::write(dir.join("cam01__standard__rev_base.png"), b"b").unwrap();
+        std::fs::write(dir.join("cam01__standard__rev_head.exr"), b"c").unwrap();
+        std::fs::write(dir.join("cam01__standard__rev_head.png"), b"d").unwrap();
+
+        let pairs = discover_render_pairs_impl(dir, "rev_base", "rev_head");
+        assert_eq!(pairs.len(), 1);
+        // Sorted ascending → ".png" comes after ".exr" lexicographically, so
+        // ".png" is the deterministic winner on every platform.
+        assert!(
+            pairs[0]
+                .before_path
+                .ends_with("cam01__standard__rev_base.png"),
+            "expected deterministic .png winner for base, got {:?}",
+            pairs[0].before_path
+        );
+        assert!(
+            pairs[0]
+                .after_path
+                .ends_with("cam01__standard__rev_head.png"),
+            "expected deterministic .png winner for head, got {:?}",
+            pairs[0].after_path
+        );
     }
 
     #[test]
