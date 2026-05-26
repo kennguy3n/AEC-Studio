@@ -14,8 +14,8 @@ use std::fs;
 use std::path::Path;
 
 use aec_audit::{
-    verify_chain, AuditLog, BreakReason, ChainStatus, ChainVerification, HASH_VERSION_CURRENT,
-    HASH_VERSION_LEGACY,
+    verify_chain, verify_chain_with, AuditLog, BreakReason, ChainStatus, ChainVerification,
+    VerifyOptions, HASH_VERSION_CURRENT, HASH_VERSION_LEGACY,
 };
 use aec_core::types::{Actor, CommandId, Scope};
 
@@ -350,4 +350,134 @@ fn verify_files_checked_includes_only_inspected_files_on_early_break() {
     );
     assert!(v.files_checked[0].ends_with("0001.jsonl"));
     assert!(v.files_checked[1].ends_with("0002.jsonl"));
+}
+
+#[test]
+fn strict_v2_only_rejects_v1_entry_as_downgrade_attack() {
+    // Threat model: an attacker with write access to the JSONL file
+    // can forge a v1 entry — `hash_version=1` with arbitrary content
+    // — because the v1 hash algorithm needs the original payload
+    // bytes (not persisted on the entry), so `verify_chain` cannot
+    // recompute it and falls back to linkage-only verification.
+    //
+    // For projects that have only ever been written by
+    // `AuditLog::append` in this codebase (every entry is
+    // HASH_VERSION_CURRENT by construction), encountering any v1
+    // entry necessarily indicates tampering. `verify_chain_with`
+    // with `VerifyOptions::strict_v2_only()` must surface this as a
+    // chain break at the offending line rather than silently
+    // accepting it with `entries_legacy_linkage_only += 1`.
+    let dir = tempfile::tempdir().unwrap();
+    make_ten_entries(dir.path());
+
+    let log_path = dir.path().join("log.jsonl");
+    let raw = fs::read_to_string(&log_path).unwrap();
+    let lines: Vec<&str> = raw.lines().collect();
+    // Downgrade entry 3 to v1. (The lenient `verify_chain` already
+    // accepts this — see `verify_accepts_legacy_v1_entries_*` —
+    // but strict mode must reject it.)
+    let mut entry: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+    entry["hash_version"] = serde_json::json!(HASH_VERSION_LEGACY);
+    let mut new_lines: Vec<String> = lines.iter().map(|&s| s.to_owned()).collect();
+    new_lines[2] = serde_json::to_string(&entry).unwrap();
+    fs::write(&log_path, new_lines.join("\n") + "\n").unwrap();
+
+    // Sanity-check that the lenient default still accepts this so we
+    // know the test exercises strict mode specifically (and not just
+    // the underlying chain).
+    let lenient = verify_chain(dir.path()).unwrap();
+    assert!(
+        lenient.is_ok(),
+        "lenient mode should accept the v1 entry; got {:?}",
+        lenient.status
+    );
+    assert_eq!(lenient.entries_legacy_linkage_only, 1);
+
+    let strict = verify_chain_with(dir.path(), VerifyOptions::strict_v2_only()).unwrap();
+    match strict.status {
+        ChainStatus::BrokenAt {
+            line,
+            reason:
+                BreakReason::LegacyHashVersionRejected {
+                    version,
+                    required_min,
+                },
+            ..
+        } => {
+            assert_eq!(line, 3, "break should be at line 3 (entry index 2)");
+            assert_eq!(version, HASH_VERSION_LEGACY);
+            assert_eq!(required_min, HASH_VERSION_CURRENT);
+        }
+        other => panic!("expected LegacyHashVersionRejected at line 3, got {other:?}"),
+    }
+    // 2 entries verified cleanly before the rejected one (lines 1-2).
+    assert_eq!(strict.entries_checked, 2);
+    // No v1 entry was *accepted* by the strict pass — the one v1
+    // entry was rejected, not counted.
+    assert_eq!(strict.entries_legacy_linkage_only, 0);
+}
+
+#[test]
+fn strict_v2_only_accepts_intact_v2_chain() {
+    // Strict mode must not regress lenient mode on the happy path:
+    // a chain whose every entry is HASH_VERSION_CURRENT verifies
+    // identically under both policies.
+    let dir = tempfile::tempdir().unwrap();
+    let hashes = make_ten_entries(dir.path());
+
+    let v = verify_chain_with(dir.path(), VerifyOptions::strict_v2_only()).unwrap();
+    assert!(v.is_ok(), "expected Ok, got {:?}", v.status);
+    assert_eq!(v.entries_checked, 10);
+    assert_eq!(v.entries_legacy_linkage_only, 0);
+    assert_eq!(v.head_hash, *hashes.last().unwrap());
+}
+
+#[test]
+fn append_failure_leaves_in_memory_state_consistent_with_disk() {
+    // If `AuditLog::append` cannot persist the entry to disk (e.g.
+    // the audit directory is read-only at the OS layer, or storage
+    // is full), the in-memory `head` and `entries` vector must NOT
+    // advance — otherwise a subsequent `open` of the same path
+    // would replay only the entries that did make it to disk and
+    // rebuild a *different* head than the live process holds,
+    // silently breaking chain continuity across a process restart.
+    //
+    // We simulate an unwritable target by pointing the log at a
+    // path whose *parent component* already exists as a regular
+    // file: `create_dir_all` then fails because it cannot create a
+    // directory inside a file, and the in-memory state must be
+    // untouched.
+    let dir = tempfile::tempdir().unwrap();
+    // Put a regular file where a parent directory is required to
+    // live, so `create_dir_all(parent)` inside `append` fails.
+    let blocking_file = dir.path().join("audit");
+    fs::write(&blocking_file, b"not-a-directory").unwrap();
+    let log_path = blocking_file.join("inner").join("log.jsonl");
+
+    let mut log = AuditLog::open(&log_path).unwrap();
+    let head_before = log.head().to_string();
+    let entries_before = log.entries().len();
+
+    let result = log.append(
+        CommandId::new(),
+        Scope::Design,
+        Actor::user(),
+        "design.create_wall",
+        &serde_json::json!({"x": 1}),
+    );
+    assert!(
+        result.is_err(),
+        "append should fail when the parent dir is blocked by a regular file"
+    );
+
+    // After the failure the in-memory chain must be byte-for-byte
+    // identical to its pre-call state. If `self.head` had been
+    // advanced before the file write (the pre-fix order), this
+    // assertion would fail.
+    assert_eq!(log.head(), head_before, "head must not advance on I/O fail");
+    assert_eq!(
+        log.entries().len(),
+        entries_before,
+        "entries must not be pushed on I/O fail"
+    );
 }
