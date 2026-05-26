@@ -11,11 +11,16 @@ use crate::dxf::DxfDocument;
 use crate::error::CadResult;
 
 /// Lowest hex handle minted for the first STYLE table entry; subsequent
-/// entries get sequentially higher handles. Picked well above the
-/// AC1009 reserved range (0..0xF) so synthetic handles never collide
-/// with anything an external tool might have minted at the same
-/// position.
-const STYLE_HANDLE_BASE: u32 = 0x10;
+/// entries get sequentially higher handles. Picked above the typical
+/// header / document-level reserved range (0x1–0xFF, which mainstream
+/// CAD apps use for `$HANDSEED`, document records, viewports, etc.) so
+/// synthetic handles for our STYLE table never visually collide with a
+/// document-level handle a reader might be expecting at the same
+/// position. DXF handles are file-local opaque identifiers — the
+/// numeric value carries no semantic weight — but starting high keeps
+/// our minted range cleanly separated from low handles that other
+/// writers conventionally reserve for the document header.
+const STYLE_HANDLE_BASE: u32 = 0x100;
 
 /// Mints a deterministic uppercase-hex handle for every text style in
 /// the document, in declaration order. Returns a map from style name

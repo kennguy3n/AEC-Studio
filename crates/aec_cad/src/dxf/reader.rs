@@ -114,6 +114,19 @@ fn parse(groups: &[Group]) -> CadResult<DxfDocument> {
 /// backwards-compatibility with legacy DXF emitted by our own writer
 /// (which used to put the symbolic name directly in 340) and with
 /// any external file that does the same.
+///
+/// Edge case: if a text style happens to be *named* with a string that
+/// is also a valid STYLE handle elsewhere in the same document (e.g.
+/// `name = "100"` while another record has `handle = "100"`), and the
+/// DIMSTYLE's 340 lookup goes through the fallback-name path on the
+/// write side, the inverse lookup here will incorrectly resolve to the
+/// style whose handle matches the name. In practice this collision is
+/// impossible to trigger from our own writer (we always emit handles
+/// on 340, never names) and vanishingly rare for external producers
+/// (most CAD apps disallow purely-hex style names). We accept the
+/// risk in exchange for the back-compat fallback, since fixing it
+/// would require an unambiguous "handle vs name" tag on 340 that the
+/// DXF spec doesn't provide for AC1009.
 fn resolve_dim_style_handles(doc: &mut DxfDocument, handle_to_name: &HashMap<String, String>) {
     for dim in doc.dim_styles.iter_mut() {
         if let Some(name) = handle_to_name.get(&dim.text_style) {
