@@ -1,6 +1,9 @@
 //! Typed commands for AEC Studio.
 
 pub mod camera;
+pub mod ceiling;
+pub mod deliver;
+pub mod draft;
 pub mod floor;
 pub mod furniture;
 pub mod lighting;
@@ -38,6 +41,11 @@ pub enum CommandKind {
     #[serde(rename = "design.modify_floor")]
     ModifyFloor(floor::ModifyFloor),
 
+    #[serde(rename = "design.create_ceiling")]
+    CreateCeiling(ceiling::CreateCeiling),
+    #[serde(rename = "design.modify_ceiling")]
+    ModifyCeiling(ceiling::ModifyCeiling),
+
     #[serde(rename = "design.place_door")]
     PlaceDoor(opening::PlaceDoor),
     #[serde(rename = "design.place_window")]
@@ -72,6 +80,20 @@ pub enum CommandKind {
     MoveFurniture(furniture::MoveFurniture),
     #[serde(rename = "design.delete_furniture")]
     DeleteFurniture(furniture::DeleteFurniture),
+
+    // ----- Draft scope -----
+    #[serde(rename = "draft.draw_primitive")]
+    DrawPrimitive(draft::DrawPrimitive),
+    #[serde(rename = "draft.edit_tool")]
+    EditTool(draft::EditTool),
+    #[serde(rename = "draft.create_sheet")]
+    CreateSheet(draft::CreateSheet),
+    #[serde(rename = "draft.set_layer_state")]
+    SetLayerState(draft::SetLayerState),
+
+    // ----- Deliver scope -----
+    #[serde(rename = "deliver.create_revision")]
+    CreateRevision(deliver::CreateRevision),
 }
 
 impl CommandKind {
@@ -84,6 +106,8 @@ impl CommandKind {
             Self::ModifyRoom(_) => "design.modify_room",
             Self::CreateFloor(_) => "design.create_floor",
             Self::ModifyFloor(_) => "design.modify_floor",
+            Self::CreateCeiling(_) => "design.create_ceiling",
+            Self::ModifyCeiling(_) => "design.modify_ceiling",
             Self::PlaceDoor(_) => "design.place_door",
             Self::PlaceWindow(_) => "design.place_window",
             Self::MoveOpening(_) => "design.move_opening",
@@ -99,14 +123,52 @@ impl CommandKind {
             Self::PlaceFurniture(_) => "design.place_furniture",
             Self::MoveFurniture(_) => "design.move_furniture",
             Self::DeleteFurniture(_) => "design.delete_furniture",
+            Self::DrawPrimitive(_) => "draft.draw_primitive",
+            Self::EditTool(_) => "draft.edit_tool",
+            Self::CreateSheet(_) => "draft.create_sheet",
+            Self::SetLayerState(_) => "draft.set_layer_state",
+            Self::CreateRevision(_) => "deliver.create_revision",
         }
     }
 
-    /// All commands shipped in Phase 2 are in the `Design` scope. As new
-    /// modes (Draft / Bim / Render / Deliver) gain commands, this matches
-    /// out into separate scope branches.
+    /// Active scope of this command. Phase 2 commands all sit in the
+    /// `Design` scope; Phase 3 (`Draft`) and the Deliver-mode revision
+    /// commands fan out into their own scopes so the engine's scope-
+    /// matching check (`engine.rs::compute_deltas`) refuses to apply
+    /// a `draft.*` command while the engine is in `Design` and vice
+    /// versa.
     pub fn scope(&self) -> Scope {
-        Scope::Design
+        match self {
+            Self::CreateWall(_)
+            | Self::MoveWall(_)
+            | Self::DeleteWall(_)
+            | Self::CreateRoom(_)
+            | Self::ModifyRoom(_)
+            | Self::CreateFloor(_)
+            | Self::ModifyFloor(_)
+            | Self::CreateCeiling(_)
+            | Self::ModifyCeiling(_)
+            | Self::PlaceDoor(_)
+            | Self::PlaceWindow(_)
+            | Self::MoveOpening(_)
+            | Self::DeleteOpening(_)
+            | Self::PaintMaterial(_)
+            | Self::SwapFinish(_)
+            | Self::SetLighting(_)
+            | Self::AddLight(_)
+            | Self::RemoveLight(_)
+            | Self::SaveCamera(_)
+            | Self::UpdateCamera(_)
+            | Self::DeleteCamera(_)
+            | Self::PlaceFurniture(_)
+            | Self::MoveFurniture(_)
+            | Self::DeleteFurniture(_) => Scope::Design,
+            Self::DrawPrimitive(_)
+            | Self::EditTool(_)
+            | Self::CreateSheet(_)
+            | Self::SetLayerState(_) => Scope::Draft,
+            Self::CreateRevision(_) => Scope::Deliver,
+        }
     }
 }
 
@@ -138,6 +200,30 @@ impl Command {
             ts: chrono::Utc::now(),
             scope: kind.scope(),
             actor: Actor::ai(tool),
+            kind,
+        }
+    }
+
+    /// Build a command sourced from a KChat (kennguy3n chat / review)
+    /// participant. The `commenter` argument is the chat handle of
+    /// whoever drove this command — typically a reviewer applying a
+    /// fix suggested in a review thread.
+    ///
+    /// Devin Review `ANALYSIS_0007` (PR #51): the previous shape had
+    /// no `Command::kchat` constructor, so [`crate::template_apply`]
+    /// silently downgraded `ActorKind::KChat` to `Actor::user()`
+    /// when synthesising commands. That collapsed the
+    /// KChat-vs-User distinction on the audit trail. Adding the
+    /// constructor (paralleling [`Self::user`] and [`Self::ai`])
+    /// preserves the source actor faithfully at the command layer
+    /// for any future flow that drives template instantiation
+    /// from a chat thread.
+    pub fn kchat(commenter: impl Into<String>, kind: CommandKind) -> Self {
+        Self {
+            command_id: CommandId::new(),
+            ts: chrono::Utc::now(),
+            scope: kind.scope(),
+            actor: Actor::kchat(commenter),
             kind,
         }
     }

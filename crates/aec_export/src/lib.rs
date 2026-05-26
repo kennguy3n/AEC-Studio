@@ -8,6 +8,7 @@ pub mod bim_pack;
 pub mod boq;
 pub mod contractor_pack;
 pub mod extension_targets;
+pub mod gltf_export;
 pub mod interior_pack;
 pub mod pdf;
 pub mod pdf_sheet;
@@ -18,7 +19,10 @@ pub mod schedule;
 pub mod svg_export;
 pub mod xlsx;
 
-pub use before_after::{BeforeAfterPdfError, BeforeAfterPdfOptions, BeforeAfterRenderPair};
+pub use before_after::{
+    BeforeAfterPdfError, BeforeAfterPdfOptions, BeforeAfterRenderPair, BeforeAfterReport,
+    BeforeAfterReportError, PlanOverlay, PlanOverlayCounts, PlanOverlayLevel, PlanOverlaySegment,
+};
 pub use bim_pack::{BimPack, BimPackError, ValidationReport, ValidationReportKind};
 pub use boq::{BoqExport, BoqExportError, BoqLine, BoqSection, RegionalConfig};
 pub use contractor_pack::{
@@ -27,6 +31,10 @@ pub use contractor_pack::{
 pub use extension_targets::{
     list_extension_export_targets, resolve_export_target, ExportFormat as ExtensionExportFormat,
     ExportTargetExtensionError, ExtensionExportTarget,
+};
+pub use gltf_export::{
+    write_gltf, GltfCamera, GltfExportError, GltfFormat, GltfLight, GltfLightKind, GltfMaterial,
+    GltfMesh, GltfScene, WriteGltfOptions, WriteGltfResult,
 };
 pub use interior_pack::{InteriorPack, InteriorPackError, InteriorRender};
 pub use pdf::{PdfBuilder, PdfBuilderError};
@@ -43,5 +51,8 @@ pub use proposal::{
     ProposalAssets, ProposalBranding, ProposalPack, ProposalPageOrder, RenderAttachment,
 };
 pub use schedule::{ScheduleColumn, ScheduleRow, ScheduleSheet};
-pub use svg_export::{render_sheet_svg, SvgExportError, SvgExportOptions};
+pub use svg_export::{
+    render_sheet_svg, render_sheet_svg_full, BlockTable, DimStyleTable, LayerTable, SvgExportError,
+    SvgExportOptions, SvgLinetype, BLOCK_EXPANSION_MAX_DEPTH,
+};
 pub use xlsx::XlsxExportError;

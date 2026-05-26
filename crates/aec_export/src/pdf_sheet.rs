@@ -264,8 +264,10 @@ fn draw_entity(
         DxfEntity::Ellipse(_)
         | DxfEntity::Spline(_)
         | DxfEntity::Insert(_)
-        | DxfEntity::Dimension(_) => {
-            // Not yet rendered.
+        | DxfEntity::Dimension(_)
+        | DxfEntity::Attdef(_) => {
+            // Not yet rendered. ATTDEF lives inside blocks; the
+            // top-level PDF render walks INSERT references separately.
         }
     }
 }

@@ -367,7 +367,10 @@ fn entity_to_record(entity: &DxfEntity, version: Version, handle: u64) -> DwgRes
             TextEntity::from_dxf(t).encode_payload(&mut payload, version)?;
             ObjectType::Text
         }
-        DxfEntity::Spline(_) | DxfEntity::Hatch(_) | DxfEntity::Dimension(_) => {
+        DxfEntity::Spline(_)
+        | DxfEntity::Hatch(_)
+        | DxfEntity::Dimension(_)
+        | DxfEntity::Attdef(_) => {
             return Err(DwgError::UnsupportedInVersion {
                 version,
                 what: format!(
@@ -517,6 +520,7 @@ fn entity_kind(e: &DxfEntity) -> &'static str {
         DxfEntity::Text(_) => "Text",
         DxfEntity::Insert(_) => "Insert",
         DxfEntity::Dimension(_) => "Dimension",
+        DxfEntity::Attdef(_) => "Attdef",
     }
 }
 

@@ -13,6 +13,8 @@ pub struct DimStyleRecord {
     pub text_height: f64,
     pub arrow_size: f64,
     pub units_scale: f64,
+    pub decimal_places: u8,
+    pub text_style: String,
     /// Vars that don't have a structured place in `DxfDimStyle` yet.
     /// Stored as `(name, value_as_f64)` pairs so an unmodified write
     /// can round-trip them without loss.
@@ -26,6 +28,8 @@ impl DimStyleRecord {
             text_height: self.text_height,
             arrow_size: self.arrow_size,
             units_scale: self.units_scale,
+            decimal_places: self.decimal_places,
+            text_style: self.text_style,
         }
     }
 
@@ -35,6 +39,8 @@ impl DimStyleRecord {
             text_height: dxf.text_height,
             arrow_size: dxf.arrow_size,
             units_scale: dxf.units_scale,
+            decimal_places: dxf.decimal_places,
+            text_style: dxf.text_style.clone(),
             extra_vars: Vec::new(),
         }
     }

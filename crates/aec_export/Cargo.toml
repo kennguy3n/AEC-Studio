@@ -21,10 +21,12 @@ zip = { workspace = true }
 rust_xlsxwriter = { workspace = true }
 blake3 = { workspace = true }
 hex = { workspace = true }
+rusqlite = { workspace = true }
 tempfile = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+gltf = { workspace = true }
 
 [lints]
 workspace = true

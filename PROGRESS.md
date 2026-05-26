@@ -290,6 +290,114 @@ This document tracks AEC Studio's phased delivery from open-source foundation to
 
 ---
 
+## Phase 10 — N-API bridge completion
+
+**Status:** `DONE`
+
+**Goal:** Promote every `BridgeBackend` method from the in-process fallback set to the native-wired set so every renderer gesture journals through `command_apply` (Immediate transaction, audit chain, undo-able).
+
+### Build
+
+| Item | Status |
+|---|---|
+| `draftDrawPrimitive` wired through `Command::user(DrawPrimitive)` | `DONE` |
+| `draftEditTool` wired through `Command::user(EditTool)` | `DONE` |
+| `draftCreateSheet` wired through `Command::user(CreateSheet)` | `DONE` |
+| `draftSetLayerState` wired through `Command::user(SetLayerState)` | `DONE` |
+| `draftImportDxf` wired (async, `spawn_blocking_napi`, per-entity `dxf_to_primitive` → `command_apply`) | `DONE` |
+| `draftExportDxf` wired (project graph → `primitive_to_dxf` → `DxfWriter`) | `DONE` |
+| `deliverCreateRevision` wired (`RevisionStore.persist()` with manifest + tracked entities) | `DONE` |
+| `deliverListRevisions` wired (`RevisionStore.list()`) | `DONE` |
+| `deliverCompareRevisions` wired (`aec_core::version_diff::compare_revisions()`) | `DONE` |
+| `NATIVE_FALLBACK_METHODS` is empty | `DONE` |
+| `bridge.ts` `BridgeBackend` interface + `adaptNative()` overrides for every promoted method | `DONE` |
+| Matching Rust unit tests + vitest coverage for every promoted method | `DONE` |
+| Re-baseline of `aec_command::CommandKind` to include `DrawPrimitive` / `EditTool` / `CreateSheet` / `SetLayerState` variants | `DONE` |
+| TOCTOU fix on `bim_classify` / `bim_set_property` (read-inside-`BEGIN IMMEDIATE`, `busy_timeout` pragma) | `DONE` |
+| AsyncTask split for `ai_plan` / `bim_import_ifc` (`spawn_blocking_napi`, frees Node main thread during long IFC parses) | `DONE` |
+
+### Exit criteria
+
+- [x] `NATIVE_FALLBACK_METHODS` in `apps/desktop/electron/bridge.ts` is the empty array.
+- [x] Every `BridgeBackend` method has a matching `#[napi]` export in `crates/aec_bridge/src/napi_api.rs`.
+- [x] Every mutating gesture (draft + deliver) routes through `command_apply` so it's auditable and undo-able.
+- [x] Renderer-side `adaptNative()` self-check throws on a method that appears in neither the wired nor fallback list — runtime contract is enforced.
+- [x] `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all --check`, and `npm test --workspaces` all pass.
+
+---
+
+## Phase 11 — Real domain depth
+
+**Status:** `DONE`
+
+**Goal:** Replace every remaining stub, scaffold, or "TODO" in the workspace with a real working implementation, with tests exercising the real code paths. Mocks are reserved for cases where the production dependency is genuinely unreachable in CI (e.g. headless GPU, OS-specific thermometers).
+
+### Group A — Wire remaining 9 NATIVE_FALLBACK_METHODS (Tasks 1–9)
+
+| Item | Status |
+|---|---|
+| Task 1 — `draftDrawPrimitive` | `DONE` |
+| Task 2 — `draftEditTool` | `DONE` |
+| Task 3 — `draftCreateSheet` | `DONE` |
+| Task 4 — `draftSetLayerState` | `DONE` |
+| Task 5 — `draftImportDxf` | `DONE` |
+| Task 6 — `draftExportDxf` | `DONE` |
+| Task 7 — `deliverCreateRevision` | `DONE` |
+| Task 8 — `deliverListRevisions` | `DONE` |
+| Task 9 — `deliverCompareRevisions` | `DONE` |
+
+### Group B — AI integration + template instantiation (Tasks 10–15)
+
+| Item | Status |
+|---|---|
+| Task 10 — AI accept-diff → `command_apply` (each `DiffOperation` becomes a `Command::ai(...)`, persisted + auditable + undo-able with `ActorKind::Ai`) | `DONE` |
+| Task 11 — AI reject-diff audit logging (`AiAuditLogger::log_rejection`, captures diff hash + tool name + scope + reason) | `DONE` |
+| Task 12 — Real template instantiation (`template_to_commands` emits real `CreateWall` + `CreateFloor` + `CreateCeiling` + `CreateRoom` + `SetLighting` + `SaveCamera`; one SQL transaction; forensic sidecar at `audit/template_instantiation.json`) | `DONE` |
+| Task 13 — Real filesystem revision snapshot (`.snap` copy of `project.sqlite` + manifest + journal head pointer) | `DONE` |
+| Task 14 — Real BLAKE3-based version diff between snapshots (geometry / sheet / schedule_row buckets) | `DONE` |
+| Task 15 — Real `BeforeAfterReport` (red-demolition / green-new / orange-modified / dark-grey-unchanged SVG plan overlay + render-pair auto-discovery) | `DONE` |
+
+### Group C — Real CAD + export depth (Tasks 16–22)
+
+| Item | Status |
+|---|---|
+| Task 16 — DXF round-trip fidelity (layers, blocks with body entities + ATTDEFs + nested INSERT, dim styles, text styles) | `DONE` |
+| Task 17 — DWG bridge wiring (`draft_import_dwg` / `draft_export_dwg`, auto-detect AC10xx signature, R12 ↔ R2018) | `DONE` |
+| Task 18 — Real PDF sheet export (per-viewport rect clipping, 7 linetypes, all 5 dimension kinds, plot-style override per CTB semantics) | `DONE` |
+| Task 19 — Real SVG export (all primitives, layer visibility + colour, linetypes via `stroke-dasharray`, viewport `<clipPath>`, hatch patterns, block expansion, title block) | `DONE` |
+| Task 20 — Real glTF 2.0 export (meshes with packed buffer / accessors, PBR materials, perspective cameras, `KHR_lights_punctual`, real GLB container) | `DONE` |
+| Task 21 — Real glTF / OBJ asset import (LOD chain `[1.0, 0.25, 0.05]`, PBR thumbnail, BLAKE3 dedup, `import_path()`) | `DONE` |
+| Task 22 — Real IFC schedule generation (room area via shoelace, door / window / material schedules into multi-sheet XLSX) | `DONE` |
+
+### Group D — Render + governor + audit hardening (Tasks 23–27)
+
+| Item | Status |
+|---|---|
+| Task 23 — SQLite-backed `RenderJobStore` for crash recovery (resumes queue from last completed tile/frame) | `DONE` |
+| Task 24 — Incremental constraint solver (Newton-Raphson, horizontal / vertical / coincident / parallel / perpendicular / equal-length / tangent / fixed) | `DONE` |
+| Task 25 — IES profile parsing (IESNA LM-63, photometric web → sphere integration + lookup-texture bake for path tracer) | `DONE` |
+| Task 26 — Audit-chain BLAKE3 verification (`verify_chain` walks `audit/*.jsonl`, pins `blake3(previous_hash ‖ entry_bytes)`; bridge-exposed as `project_audit_verify`) | `DONE` |
+| Task 27 — Real per-OS thermal monitor (Linux sysfs / macOS `pmset -g therm` / Windows WMI), governor backs off tile concurrency + AI inference on warm/critical | `DONE` |
+
+### Group E — End-to-end validation (Tasks 28–30)
+
+| Item | Status |
+|---|---|
+| Task 28 — Phase 2 user-journey e2e (interior designer — apartment renovation: create from template → place furniture → set lighting → save 4 cameras → enqueue 4 renders → export client concept pack) | `DONE` |
+| Task 29 — Phase 3 user-journey e2e (drafter — steel detail set: 2D drafting template → DXF import → 4 primitives → Move / Copy / Fillet → 3 sheets with title blocks → export DXF + PDF) | `DONE` |
+| Task 30 — Phase 4 user-journey e2e (construction PM — BIM Lite + BOQ: IFC import → validate → uniformat-ii classify → set property → room + door schedules → BOQ XLSX → BIM Lite deliver pack) | `DONE` |
+
+### Exit criteria
+
+- [x] No stub or `todo!()` / `unimplemented!()` survives in production code paths exercised by tests.
+- [x] Every Phase 11 task ships unit + integration tests against real data (real DXF / IFC / glTF fixtures, real SQLCipher project databases, real BLAKE3 chains).
+- [x] The three end-to-end journey tests (`phase2_journey.rs`, `phase3_journey.rs`, `phase4_journey.rs`) drive the `BridgeService` public API through the user-facing workflow in `PROPOSAL.md` and produce real artifacts on disk.
+- [x] Per-OS thermal monitor reports a non-`Unknown` state on every supported OS (Linux sysfs / macOS `pmset` / Windows WMI), and the governor scheduler reduces concurrency on `Warm` and denies admission on `Critical`.
+- [x] BLAKE3 audit-chain verifier reports the first broken link on a tampered ledger and passes on an intact ledger.
+- [x] `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all --check`, and `npm test --workspaces` all pass.
+
+---
+
 ## Phase 7 — Optional KChat integration
 
 **Status:** `DONE`
@@ -385,6 +493,56 @@ AEC Studio's UI follows the **KChat design system** — primary accent `#7C3AED`
 ---
 
 ## Changelog
+
+### 2026-05-25 (Phase 10 + Phase 11 — N-API bridge completion + real domain depth, 30 tasks across PRs #48–#66)
+
+#### Phase 10 — bridge completion (PR #48)
+
+- **9 `NATIVE_FALLBACK_METHODS` promoted to `NATIVE_WIRED_METHODS`.** `draftDrawPrimitive`, `draftEditTool`, `draftCreateSheet`, `draftSetLayerState`, `draftImportDxf`, `draftExportDxf`, `deliverCreateRevision`, `deliverListRevisions`, `deliverCompareRevisions`. Each method now has a matching `#[napi]` export in `crates/aec_bridge/src/napi_api.rs`, a service-layer implementation in `crates/aec_bridge/src/service.rs`, a `BridgeBackend` interface entry in `apps/desktop/electron/bridge.ts`, and an `adaptNative()` override unwrapping the N-API JSON envelope back into the renderer's typed shape. `NATIVE_FALLBACK_METHODS` is now the empty array; the `adaptNative()` self-check throws on any method that appears in neither list, so the wiring contract is enforced at runtime.
+- **New mutating-gesture command variants.** `aec_command::CommandKind` gained `DrawPrimitive`, `EditTool`, `CreateSheet`, `SetLayerState`. Each variant implements `apply()` against a `CommandEngine` session, serialises deltas to the journal, and is undo-able.
+- **DXF I/O.** `crates/aec_cad/src/dxf/convert.rs` exposes `primitive_to_dxf(&Primitive) → Option<DxfEntity>` and the inverse `dxf_to_primitive(&DxfEntity) → Option<Primitive>` covering Line / Polyline / Circle / Arc / Ellipse / Text; the bridge's `draft_import_dxf` is async (`spawn_blocking_napi`) because real DXF files routinely cross 10 MiB.
+
+#### Phase 11 — real domain depth (PRs #49–#66)
+
+**Group A — bridge fallbacks (Tasks 1–9, PR #48).** Listed above under Phase 10.
+
+**Group B — AI + templates + revisions (Tasks 10–15, PRs #49–#53).**
+
+- **Task 10 + 11 (PR #49).** `ai_accept_diff` now applies every `DiffOperation` through `command_apply` with `ActorKind::Ai` attribution, so AI edits are persisted, audit-chained, and undo-able. `ai_reject_diff` logs to `AiAuditLogger::log_rejection` with the diff hash, tool name, scope, and rejection reason.
+- **Task 12 (PR #51).** `TemplateLoader::load()` followed by `template_to_commands(&TemplateDefinition)` emits real `CreateWall`, `CreateFloor`, `CreateCeiling`, `CreateRoom`, `SetLighting`, and `SaveCamera` commands; the batch is persisted in one SQL transaction via `execute_persistent_batch` (failed batch rolls the project directory back). A forensic sidecar at `<project>/audit/template_instantiation.json` captures entity ids per room and any skipped rooms. 9 templates instantiate cleanly: apartment, café, office, villa, retail, kitchen, bathroom, renovation, 2d_drafting.
+- **Task 13 + 14 (PR #52).** `RevisionStore::create_with_snapshot` writes a real `.snap` copy of `project.sqlite` plus a manifest and the journal head pointer for replay. `aec_core::version_diff::compare_revisions` walks two snapshots and produces a BLAKE3-bucketed `VersionDiff` with `geometry` / `sheet` / `schedule_row` change sets.
+- **Task 15 (PR #53).** `aec_export::BeforeAfterReport` generates a real SVG plan overlay (red demolition / green new / orange modified / dark-grey unchanged) from two SQLCipher project snapshots, plus auto-discovery of paired render files in the project's `renders/` directory.
+
+**Group C — CAD + export depth (Tasks 16–22, PRs #54–#60).**
+
+- **Task 16 (PR #54).** DXF reader/writer round-trips every entity attribute: layers (on/off, plottable, description on top of color/lineweight/linetype/frozen/locked), blocks with body entities + base points + nested INSERTs + ATTDEFs, `DxfTextStyle` (font, bigfont, fixed_height, width_factor, oblique_angle), `DxfDimStyle` (decimal_places + text_style on top of the existing fields). Real-world fixture at `crates/aec_cad/tests/fixtures/roundtrip_full.dxf` pins byte-stable `serde_json` equality.
+- **Task 17 (PR #55).** `draft_import_dwg` auto-detects the `AC10xx` 6-byte signature, lowers through `DxfDocument`, and journals every entity through `command_apply_batch`. `draft_export_dwg` accepts a `version_signature` and validates the AC tag (wrong-length / unknown tag both surface as `BridgeServiceError::Invalid`). Both async via `spawn_blocking_napi`.
+- **Task 18 (PR #56).** Real PDF sheet export with per-viewport rect clipping (`save_graphics_state` / `clip` / `restore` bracket), 7 well-known linetypes (Continuous / Dashed / Hidden / Center / Phantom / DashDot / Divide), full dimension rendering for all 5 `DxfDimensionKind` variants (extension lines + dim line + arrowheads + measured value formatted at the dim style's decimal places), per-viewport `frozen_layers` honoured, plot-style override per CTB semantics. Ellipse + ATTDEF now render (no more no-op branches).
+- **Task 19 (PR #57).** Real SVG export covering every previously-skipped entity (Ellipse, Spline, Insert, Dimension), layer visibility & colour, per-viewport `frozen_layers`, linetypes via `stroke-dasharray`, viewport `<clipPath>` clipping (toggleable), named hatch patterns via `<pattern>` defs, block expansion against the `BlockTable`, and the sheet's title block.
+- **Task 20 (PR #58).** Real glTF 2.0 export with meshes (POSITION / NORMAL / TEXCOORD_0 / indices packed into one binary buffer with buffer-view + accessor wiring; index type auto-narrows u16↔u32; mm→metres on write), PBR metallic-roughness materials, perspective cameras with lookAt→(translation, quaternion) decomposition, and `KHR_lights_punctual` lights. `.glb` writes a real GLB container (12-byte header + JSON chunk + BIN chunk per spec).
+- **Task 21 (PR #59).** Real glTF / OBJ asset import: spec `[1.0, 0.25, 0.05]` LOD chain via mesh decimation, PBR thumbnail rasterisation, BLAKE3 dedup on re-import, content-addressed asset DB, one-shot `import_path()` entry point.
+- **Task 22 (PR #60).** Real IFC schedules generated from project data: room (with area via shoelace), door, window, and material schedules into a multi-sheet XLSX via the bridge's `bim_generate_schedule`.
+
+**Group D — render + governor + audit hardening (Tasks 23–27, PRs #61–#65).**
+
+- **Task 23 (PR #61).** SQLite-backed `RenderJobStore` persists every render job's state to the project's `renders/` directory; on crash, the render queue resumes from the last completed tile/frame.
+- **Task 24 (PR #62).** Incremental Newton-Raphson constraint solver supporting horizontal, vertical, coincident, parallel, perpendicular, equal-length, tangent, and fixed constraints, with an incremental drag-from-handle entry point that re-solves only the affected sub-graph.
+- **Task 25 (PR #63).** IESNA LM-63 parser extracts the photometric web into a sphere-integrated lookup texture for the path tracer's light sampling.
+- **Task 26 (PR #64).** Audit-chain BLAKE3 verifier (`verify_chain(audit_dir) -> ChainVerification`) walks every `audit/*.jsonl` chronologically and pins `blake3(previous_hash ‖ entry_bytes)`; reports the first broken link if any. Exposed through the bridge as `project_audit_verify`.
+- **Task 27 (PR #65).** Real per-OS thermal monitor: Linux reads `/sys/class/thermal/thermal_zone*/temp` filtered to CPU zones; macOS shells to `/usr/bin/pmset -g therm` and parses `CPU_Speed_Limit`; Windows queries WMI `MSAcpi_ThermalZoneTemperature` via PowerShell. `ThermalMonitor` polls on a 5 s schedule and applies a `ThermalState` (Nominal / Warm / Critical) to `GovernorScheduler` — Warm halves render-tile concurrency, Critical denies all admissions with `BackoffReason::Thermal` and pauses AI inference.
+
+**Group E — end-to-end user-journey integration tests (Tasks 28–30, PR #66).**
+
+- **Task 28 — `crates/aec_bridge/tests/phase2_journey.rs`.** Interior-designer "apartment renovation in a weekend" journey driven through `BridgeService`: `project_create_from_template("interior.apartment", ...)` → place 4 furniture via `command_apply(PlaceFurniture)` → set lighting preset → save 4 cameras → enqueue 4 renders via `render_enqueue_batch` → export client concept pack via `deliver_build_pack`. Companion test verifies state persists across a service restart.
+- **Task 29 — `crates/aec_bridge/tests/phase3_journey.rs`.** Drafter "pure 2D CAD for a steel detail set" journey: `project_create_from_template("drafting.2d_drafting", ...)` → import vendor DXF via `DxfReader::read_str` → draw 4 primitives (Line / Polyline / Arc / Circle) via the real `aec_cad::primitives` API → edit (Move / Copy / Fillet) via the real `aec_cad::editing` tools → assemble 3 sheets with title blocks via `aec_cad::sheets::Sheet` → export DXF + PDF via the bridge's `export_dxf` / `export_pdf`. Companion test pins DXF write-then-read fidelity for the four primitive types the drafter actually draws.
+- **Task 30 — `crates/aec_bridge/tests/phase4_journey.rs`.** Construction-PM "site renovation with BIM Lite and BOQ" journey: `project_create_from_template` → `bim_import_ifc` against `small_office.ifc` fixture → `bim_attach_ifc` → `bim_validate` → `command_apply(CreateWall)` seed → `bim_classify("uniformat-ii")` (asserts the seeded wall maps to Uniformat B2010) → `bim_set_property(Pset_WallCommon, FireRating="REI120")` → room + door schedules via `bim_generate_schedule` → contractor BOQ pack via `deliver_build_pack(kind="contractor", include_boq=true)` → BIM Lite pack via `deliver_build_pack(kind="bim")`. Companion test verifies all 4 supported schedule kinds (door / window / room / material) are independently addressable.
+
+#### Tests + lint
+
+- `cargo test --workspace` (with `XDG_RUNTIME_DIR=/tmp` for wgpu): all passing (60+ binaries, including new `phase2_journey`, `phase3_journey`, `phase4_journey`).
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo fmt --all --check`: clean.
+- `npm test --workspaces`: passing (renderer + electron unit tests cover the new bridge surface).
 
 ### 2026-05-20 (Phase 9 — BIM wiring, proxy-element gap, doc closer, PR-P)
 

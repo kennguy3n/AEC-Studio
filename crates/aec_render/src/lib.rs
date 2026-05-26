@@ -19,6 +19,7 @@ pub mod gpu_trace;
 pub mod history;
 pub mod intersect;
 pub mod job;
+pub mod job_store;
 pub mod light_sampling;
 pub mod lighting;
 pub mod material;
@@ -53,11 +54,12 @@ pub use history::{
 };
 pub use intersect::{any_hit, closest_hit, geom_normal, Intersection, Ray, ShadingTriangle};
 pub use job::{RenderJob, RenderJobStatus};
+pub use job_store::{JobStatusCounts, RenderJobStore, RenderJobStoreError, RenderJobStoreResult};
 pub use light_sampling::{
     environment_radiance, is_delta, power_heuristic, sample_light, LightSample, NativeLight,
 };
 pub use lighting::{
-    kelvin_to_rgb, IesParseError, IesPhotometricType, IesProfile, LightingPreset,
+    kelvin_to_rgb, IesLookupTexture, IesParseError, IesPhotometricType, IesProfile, LightingPreset,
     LightingPresetKind, LightingPresetStore, LightingValidationError, SkyParams,
 };
 pub use material::{

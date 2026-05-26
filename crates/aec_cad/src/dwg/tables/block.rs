@@ -30,6 +30,23 @@ impl BlockRecord {
                 Some(self.description)
             },
             flags: i32::from(self.anonymous),
+            // The DWG path doesn't yet recover block bodies or base
+            // points (entity-graph decoding lands in a later commit);
+            // start them at the canonical defaults so the downstream
+            // DXF writer emits a syntactically-valid BLOCK … ENDBLK.
+            base_point: [0.0, 0.0, 0.0],
+            // BLOCK entities live on layer "0" by AutoCAD convention
+            // so contained `BYLAYER` colors resolve through the
+            // INSERT's layer at draw time. DWG BLOCK_HEADER records
+            // don't carry this directly — it's a property of the
+            // emitted BLOCK entity, not the table record — so we
+            // emit the canonical default here. Recovering a
+            // non-default value from a DWG file would require the
+            // block-body codec to forward the BLOCK entity's code-8
+            // through this struct (future work, tracked alongside
+            // `entity_handles` resolution).
+            layer: "0".to_string(),
+            entities: Vec::new(),
         }
     }
 
@@ -37,7 +54,13 @@ impl BlockRecord {
         Self {
             name: dxf.name.clone(),
             anonymous: dxf.flags & 1 != 0,
-            base_point: [0.0, 0.0, 0.0],
+            // Mirror the DXF-side `base_point` so that the DWG encoder
+            // can emit it once the block-body bit-codec lands. Older
+            // revisions of this function hardcoded a zero vector,
+            // which would silently lose the block's origin when any
+            // call site (none today) flows DxfBlockRecord through
+            // BlockRecord on the write side.
+            base_point: dxf.base_point,
             description: dxf.description.clone().unwrap_or_default(),
             entity_handles: Vec::new(),
         }

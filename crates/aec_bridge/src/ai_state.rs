@@ -23,10 +23,13 @@
 //!    through the lock-free `runtime` `RwLock` and observe the
 //!    published `Loading` state instantly.
 //!
-//! 3. A `Mutex<HashMap<DiffId, Diff>>` of pending diffs. The renderer
-//!    accepts / rejects diffs by id; this mutex is uncontended in
-//!    practice (the renderer serialises its own user interactions
-//!    client-side) and is fully independent of sidecar lifecycle.
+//! 3. A `Mutex<HashMap<DiffId, PendingDiff>>` of pending diffs. The
+//!    renderer accepts / rejects diffs by id; this mutex is
+//!    uncontended in practice (the renderer serialises its own user
+//!    interactions client-side) and is fully independent of sidecar
+//!    lifecycle. Each entry pairs the diff with the project path it
+//!    targets so a later `ai_accept_diff` knows which project to
+//!    apply against — see Phase 11 task 10 in PROGRESS.md.
 //!
 //! ## Why three primitives instead of one
 //!
@@ -78,7 +81,7 @@
 //! | `snapshot`            | —           | read                  | lock          |
 //! | `state` / `last_error`| —           | read                  | —             |
 //! | `insert_diff`         | —           | —                     | lock          |
-//! | `accept_diff` / `reject_diff` | —   | —                     | lock          |
+//! | `peek_diff` / `finalize_diff` | —   | —                     | lock          |
 //!
 //! Notably, [`AiState::snapshot`] — the renderer's hot read path —
 //! deliberately does **not** touch `handle_slot`. That is what lets
@@ -153,8 +156,29 @@ pub struct AiState {
     /// Spawn slot — `None` until the first `ai_plan` call. Dropping
     /// the [`SidecarHandle`] kills the `llama-server` child.
     handle_slot: Mutex<Option<SidecarHandle>>,
-    /// Diff registry; independent of sidecar lifecycle.
-    pending_diffs: Mutex<HashMap<DiffId, Diff>>,
+    /// Diff registry; independent of sidecar lifecycle. Each entry
+    /// holds the project path so [`crate::service::BridgeService::ai_accept_diff`]
+    /// can re-open the right encrypted package and route the
+    /// converted commands through the project's own command engine.
+    pending_diffs: Mutex<HashMap<DiffId, PendingDiff>>,
+}
+
+/// A diff registered by `ai_plan`, waiting for the renderer to call
+/// `ai_accept_diff` or `ai_reject_diff`. Bundles the [`Diff`] with
+/// the project path AND the scope it was planned against so the
+/// accept path can apply the resulting commands to the right project
+/// graph even if the renderer has since switched the active project
+/// (and so the AI audit log records the *planned* scope rather than
+/// the renderer's current view). The project path + scope are
+/// captured at insertion time \u2014 binding them to the diff (rather
+/// than reading the active project / scope at accept time) is what
+/// makes "plan on A in Design, switch to B in Draft, accept the A
+/// diff" deterministic.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingDiff {
+    pub project_path: String,
+    pub scope: aec_core::types::Scope,
+    pub diff: Diff,
 }
 
 /// Convenience: turn a `PoisonError<T>` (which is not `Send + 'static`
@@ -340,26 +364,65 @@ impl AiState {
     }
 
     /// Insert a diff into the pending map and return the assigned id.
-    pub fn insert_diff(&self, diff: Diff) -> Result<DiffId, AiStateError> {
+    /// The `project_path` is captured alongside the diff so the
+    /// later `ai_accept_diff` / `ai_reject_diff` calls (which only
+    /// take a `diff_id`) can route to the correct project package.
+    pub fn insert_diff(
+        &self,
+        project_path: impl Into<String>,
+        scope: aec_core::types::Scope,
+        diff: Diff,
+    ) -> Result<DiffId, AiStateError> {
         let id = diff.id.clone();
+        let pending = PendingDiff {
+            project_path: project_path.into(),
+            scope,
+            diff,
+        };
         self.pending_diffs
             .lock()
             .map_err(poisoned)?
-            .insert(id.clone(), diff);
+            .insert(id.clone(), pending);
         Ok(id)
     }
 
-    pub fn accept_diff(&self, id: &str) -> Result<Diff, AiStateError> {
+    /// Return a clone of the pending diff for `id` **without
+    /// removing it from the registry**. This is the read half of
+    /// the peek-then-finalize pattern the service uses to avoid
+    /// permanently losing a diff if downstream I/O (open package,
+    /// load graph, batch apply, audit append) fails after the
+    /// caller has begun processing the diff. The caller must call
+    /// [`Self::finalize_diff`] only after every fallible step has
+    /// succeeded; on any error, the diff stays in the registry so
+    /// the user can retry the accept / reject.
+    ///
+    /// See `BUG_0001 (round 2)`: prior to this split, the service
+    /// popped the diff up-front and any later failure dropped it
+    /// from the registry with no recovery path.
+    pub fn peek_diff(&self, id: &str) -> Result<PendingDiff, AiStateError> {
         let key = DiffId::from_string(id.to_string())
             .map_err(|_| AiStateError::UnknownDiff(id.to_owned()))?;
         self.pending_diffs
             .lock()
             .map_err(poisoned)?
-            .remove(&key)
+            .get(&key)
+            .cloned()
             .ok_or_else(|| AiStateError::UnknownDiff(id.to_owned()))
     }
 
-    pub fn reject_diff(&self, id: &str) -> Result<Diff, AiStateError> {
+    /// Remove the pending diff for `id`. The write half of the
+    /// peek-then-finalize pattern — callers invoke this only after
+    /// every fallible step has succeeded so a failure mid-accept
+    /// preserves the registry entry for retry. Returns the removed
+    /// envelope so the caller can confirm the entry was present
+    /// (any caller treating this as advisory may discard the
+    /// returned value).
+    ///
+    /// If the entry was already removed (e.g. a concurrent finalize
+    /// for the same id), this returns `AiStateError::UnknownDiff`
+    /// to surface the unexpected race rather than silently
+    /// no-op'ing.
+    pub fn finalize_diff(&self, id: &str) -> Result<PendingDiff, AiStateError> {
         let key = DiffId::from_string(id.to_string())
             .map_err(|_| AiStateError::UnknownDiff(id.to_owned()))?;
         self.pending_diffs

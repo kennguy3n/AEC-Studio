@@ -553,19 +553,153 @@ impl IesProfile {
         self.candela.iter().copied().fold(0.0_f32, f32::max) * self.candela_multiplier
     }
 
+    /// Total luminous flux declared by the IES file, in lumens.
+    /// `lamp_count × lumens_per_lamp` per LM-63 spec. Returns `None`
+    /// when the file did not declare a positive lumen value (some
+    /// fixtures use `-1` to indicate "absolute photometry").
+    pub fn declared_lumens(&self) -> Option<f32> {
+        if self.lumens_per_lamp > 0.0 {
+            Some(self.lumens_per_lamp * self.lamp_count.max(1) as f32)
+        } else {
+            None
+        }
+    }
+
+    /// Numerically integrate the candela distribution over the full
+    /// sphere using the trapezoidal rule on the sampled (vertical,
+    /// horizontal) grid:
+    ///
+    /// ```text
+    ///   Φ = ∫₀^{2π} ∫₀^π I(θ, φ) · sin(θ) · dθ dφ
+    /// ```
+    ///
+    /// For rotationally-symmetric distributions (a single sampled
+    /// horizontal angle), the inner integral collapses to `2π · I(θ) ·
+    /// sin(θ) · dθ`. For partial horizontal sweeps (0..=90°, 0..=180°)
+    /// the result is scaled up by the implied symmetry factor (4, 2)
+    /// — matching the LM-63 convention that a `[0, 90°]` horizontal
+    /// range implies a luminaire with four-way symmetry.
+    pub fn integrate_lumens(&self) -> f32 {
+        let v = &self.vertical_angles;
+        let h = &self.horizontal_angles;
+        if v.len() < 2 || h.is_empty() {
+            return 0.0;
+        }
+        let cd = |hi: usize, vi: usize| -> f64 { self.candela[hi * v.len() + vi] as f64 };
+
+        let mut flux = 0.0_f64;
+
+        if h.len() == 1 {
+            // Rotationally symmetric — revolve around the vertical
+            // axis. Φ = 2π · Σᵢ avg(I_i, I_{i+1}) · sin(θ_avg) · dθ.
+            for i in 0..v.len() - 1 {
+                let t0 = (v[i] as f64).to_radians();
+                let t1 = (v[i + 1] as f64).to_radians();
+                let dtheta = t1 - t0;
+                // Mid-point sin(θ) is more accurate than trapezoidal
+                // sin endpoints because sin(0)=0 vanishes at the pole.
+                let sin_mid = ((t0 + t1) * 0.5).sin();
+                let cd_avg = 0.5 * (cd(0, i) + cd(0, i + 1));
+                flux += 2.0 * std::f64::consts::PI * cd_avg * sin_mid * dtheta;
+            }
+        } else {
+            for i in 0..v.len() - 1 {
+                let t0 = (v[i] as f64).to_radians();
+                let t1 = (v[i + 1] as f64).to_radians();
+                let dtheta = t1 - t0;
+                let sin_mid = ((t0 + t1) * 0.5).sin();
+                for j in 0..h.len() - 1 {
+                    let p0 = (h[j] as f64).to_radians();
+                    let p1 = (h[j + 1] as f64).to_radians();
+                    let dphi = p1 - p0;
+                    // 4-corner average over the (θ, φ) cell.
+                    let cd_avg = 0.25 * (cd(j, i) + cd(j + 1, i) + cd(j, i + 1) + cd(j + 1, i + 1));
+                    flux += cd_avg * sin_mid * dtheta * dphi;
+                }
+            }
+            // Scale up by the implied LM-63 symmetry.
+            let span = (h.last().copied().unwrap_or(0.0) - h[0]) as f64;
+            if span > 0.0 {
+                let factor = 360.0 / span;
+                flux *= factor;
+            }
+        }
+
+        (flux * self.candela_multiplier as f64) as f32
+    }
+
+    /// Bake the photometric distribution into a rectified
+    /// (`horizontal_resolution` × `vertical_resolution`) f32 candela
+    /// lookup texture. Layout is row-major with `vertical_resolution`
+    /// rows and `horizontal_resolution` columns; row `y` corresponds
+    /// to a vertical angle of `y / (height - 1) · 180°`, column `x`
+    /// to a horizontal angle of `x / (width - 1) · 360°`. The
+    /// returned buffer is `width × height` floats including the
+    /// `candela_multiplier` so a path-tracer's GPU sampler can read
+    /// it directly without further scaling.
+    ///
+    /// The bake uses the same bilinear `candela_at` interpolator that
+    /// the CPU light sampler uses, so CPU and GPU samples agree to
+    /// within float precision.
+    pub fn to_lookup_texture(
+        &self,
+        horizontal_resolution: u32,
+        vertical_resolution: u32,
+    ) -> IesLookupTexture {
+        let w = horizontal_resolution.max(1) as usize;
+        let h = vertical_resolution.max(1) as usize;
+        let mut data = vec![0.0_f32; w * h];
+        for y in 0..h {
+            let v_deg = if h > 1 {
+                (y as f32 / (h - 1) as f32) * 180.0
+            } else {
+                0.0
+            };
+            for x in 0..w {
+                let h_deg = if w > 1 {
+                    (x as f32 / (w - 1) as f32) * 360.0
+                } else {
+                    0.0
+                };
+                data[y * w + x] = self.candela_at(v_deg, h_deg);
+            }
+        }
+        IesLookupTexture {
+            width: w as u32,
+            height: h as u32,
+            candela: data,
+        }
+    }
+
     /// Bilinearly-interpolated candela value at the supplied vertical /
     /// horizontal angles, in degrees. Vertical is measured from the
     /// luminaire's downward axis; horizontal is measured around it.
     ///
-    /// Out-of-range angles clamp to the nearest sampled angle (so a
-    /// type-C distribution that only spans 0..=90° returns its boundary
-    /// value above 90°, rather than zero).
+    /// **Horizontal-plane symmetry** is applied per the LM-63 implicit
+    /// convention (encoded by the horizontal-angle span of the file):
+    ///
+    /// * a single horizontal sample (rotational symmetry): any input
+    ///   returns that single sample.
+    /// * span ≈ 90° (4-way / quadrant symmetry): inputs fold by
+    ///   reflection about the 90° and 180° axes into `[0°, 90°]`.
+    /// * span ≈ 180° (bilateral symmetry): inputs fold by reflection
+    ///   about the 180° plane into `[0°, 180°]`.
+    /// * span ≈ 360° (full sweep, no implicit symmetry): inputs wrap
+    ///   via `rem_euclid(360°)`.
+    /// * non-standard span (LM-63 doesn't define implicit symmetry for
+    ///   such files): out-of-range inputs clamp to the nearest sampled
+    ///   horizontal angle, same as vertical.
+    ///
+    /// Vertical inputs outside the sampled range clamp to the nearest
+    /// boundary (e.g. a type-C distribution sampled only on `0..=90°`
+    /// returns its 90° row for any vertical input > 90°).
     pub fn candela_at(&self, vertical_deg: f32, horizontal_deg: f32) -> f32 {
         if self.vertical_angles.is_empty() || self.horizontal_angles.is_empty() {
             return 0.0;
         }
+        let folded_h = fold_horizontal_for_symmetry(&self.horizontal_angles, horizontal_deg);
         let (v0_idx, v_t) = bracket_angle(&self.vertical_angles, vertical_deg);
-        let (h0_idx, h_t) = bracket_angle(&self.horizontal_angles, horizontal_deg);
+        let (h0_idx, h_t) = bracket_angle(&self.horizontal_angles, folded_h);
         let v_len = self.vertical_angles.len();
         let h_len = self.horizontal_angles.len();
         let v1_idx = (v0_idx + 1).min(v_len - 1);
@@ -598,6 +732,151 @@ impl IesProfile {
             photometric_type: IesPhotometricType::C,
         }
     }
+}
+
+/// Rectified candela lookup texture, ready for upload to a GPU
+/// sampler or use by the CPU path tracer. The candela values
+/// include the source IES file's `candela_multiplier`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IesLookupTexture {
+    /// Number of columns (horizontal-angle steps, spanning 0..=360°).
+    pub width: u32,
+    /// Number of rows (vertical-angle steps, spanning 0..=180°).
+    pub height: u32,
+    /// Row-major candela values: `candela[y * width + x]`.
+    pub candela: Vec<f32>,
+}
+
+impl IesLookupTexture {
+    /// Bilinearly sample the texture at the supplied vertical /
+    /// horizontal angles in degrees.
+    ///
+    /// Both axes use the **endpoint-inclusive** parameterization that
+    /// [`IesProfile::to_lookup_texture`] writes: column `x` corresponds
+    /// to horizontal angle `x / (width - 1) · 360°` and row `y` to
+    /// vertical angle `y / (height - 1) · 180°`. The sampler MUST mirror
+    /// that mapping or it reads from a non-existent in-between column
+    /// — e.g. on a 4-wide texture, an input of 120° (which the bake
+    /// stored exactly in column 1) would otherwise interpolate between
+    /// columns 1 and 2, returning a blend of cd(120°) and cd(240°)
+    /// instead of cd(120°).
+    ///
+    /// Horizontal wraps via `rem_euclid` (so 360°, 720°, −10° all map
+    /// back into `[0°, 360°)`); 360° therefore samples column 0. The
+    /// bake guarantees periodicity (column 0 == column `width − 1`)
+    /// regardless of the source IES file's horizontal span:
+    /// [`IesProfile::to_lookup_texture`] folds source samples through
+    /// the LM-63 implicit-symmetry convention
+    /// (rotational / 4-way / bilateral / full-sweep) inside
+    /// [`IesProfile::candela_at`] before writing each texel, so even
+    /// quadrant-symmetric (0..=90°) and bilaterally-symmetric (0..=180°)
+    /// profiles produce a baked texture with no wrap discontinuity at
+    /// 360°. Vertical clamps to `[0°, 180°]`.
+    pub fn sample(&self, vertical_deg: f32, horizontal_deg: f32) -> f32 {
+        // `.max(1)` guarantees both axes are at least 1; degenerate
+        // textures collapse onto column / row 0 rather than panicking.
+        let w = self.width.max(1) as usize;
+        let h = self.height.max(1) as usize;
+        // If a caller constructed `IesLookupTexture` directly with an
+        // empty `candela` buffer (the fields are `pub`), bail out
+        // rather than indexing past the end. The bake itself always
+        // allocates `w × h` floats so this only catches user error.
+        if self.candela.len() < w * h {
+            return 0.0;
+        }
+        let vy = (vertical_deg.clamp(0.0, 180.0) / 180.0) * (h as f32 - 1.0);
+        // Endpoint-inclusive: map [0°, 360°) onto [0, w-1]. With w=1
+        // there is only one column, so hx collapses to 0 regardless of
+        // the input angle. The bake stores cd(360°) in column `w-1`
+        // which equals cd(0°), so wrapping a 360° input back to column
+        // 0 preserves continuity.
+        let hx = if w > 1 {
+            horizontal_deg.rem_euclid(360.0) / 360.0 * (w as f32 - 1.0)
+        } else {
+            0.0
+        };
+        let y0 = vy.floor() as usize;
+        let y1 = (y0 + 1).min(h - 1);
+        let ty = vy - y0 as f32;
+        // Clamp (rather than modulo) so `x0`/`x1` stay inside the
+        // endpoint-inclusive column range. The `rem_euclid` above
+        // already collapses 360° back to column 0, so we never need
+        // the wraparound branch.
+        let x0 = (hx.floor() as usize).min(w.saturating_sub(1));
+        let x1 = (x0 + 1).min(w - 1);
+        let tx = hx - x0 as f32;
+        let c00 = self.candela[y0 * w + x0];
+        let c10 = self.candela[y0 * w + x1];
+        let c01 = self.candela[y1 * w + x0];
+        let c11 = self.candela[y1 * w + x1];
+        let c0 = c00 + (c10 - c00) * tx;
+        let c1 = c01 + (c11 - c01) * tx;
+        c0 + (c1 - c0) * ty
+    }
+}
+
+/// Fold an input horizontal angle into the IES file's sampled
+/// horizontal range using the LM-63 implicit-symmetry convention.
+///
+/// LM-63 IES files encode horizontal-plane symmetry implicitly via the
+/// horizontal-angle span:
+///
+/// * **single angle** (one horizontal entry): rotational symmetry —
+///   any input maps to that single sample.
+/// * **span ≈ 90°** (e.g. `[0, 45, 90]`): 4-way (quadrant) symmetry.
+///   Reflect inputs about the 90° and 180° axes to fold into `[0°, 90°]`.
+/// * **span ≈ 180°** (e.g. `[0, 90, 180]`): bilateral (left-right)
+///   symmetry about the file's reference plane. Reflect inputs about
+///   180° to fold into `[0°, 180°]`.
+/// * **span ≈ 360°**: full sweep, no implicit symmetry — wrap via
+///   `rem_euclid(360°)`.
+/// * **non-standard span**: leave the input as-is (modulo the `[first,
+///   first + 360)` window) and let [`bracket_angle`] clamp at the
+///   boundaries. The LM-63 spec doesn't define implicit symmetry for
+///   arbitrary spans, so any extrapolation would be guesswork.
+///
+/// Folding inside [`IesProfile::candela_at`] (rather than only in the
+/// GPU lookup-texture sampler) guarantees that
+/// [`IesProfile::to_lookup_texture`] produces a periodic texture by
+/// construction — column 0 and column `width − 1` agree because both
+/// resolve to the same source sample after folding. This eliminates the
+/// 360°-wrap discontinuity that would otherwise appear in the GPU
+/// sampler for partial-span profiles, since the sampler wraps via
+/// `rem_euclid(360°)` and assumes periodicity.
+fn fold_horizontal_for_symmetry(angles: &[f32], h: f32) -> f32 {
+    if angles.is_empty() {
+        return h;
+    }
+    if angles.len() == 1 {
+        return angles[0];
+    }
+    let first = angles[0];
+    let last = angles[angles.len() - 1];
+    let span = last - first;
+    // Normalise into `[first, first + 360)` so reflections work in a
+    // fixed coordinate system regardless of the file's chosen start
+    // angle (the LM-63 spec lets a file start at any angle, though 0°
+    // is overwhelmingly common in practice).
+    let mut a = (h - first).rem_euclid(360.0);
+    const EPS: f32 = 1e-3;
+    if (span - 90.0).abs() < EPS {
+        // 4-way (quadrant) symmetry: fold into `[0°, 90°]`.
+        if a > 180.0 {
+            a = 360.0 - a;
+        }
+        if a > 90.0 {
+            a = 180.0 - a;
+        }
+    } else if (span - 180.0).abs() < EPS {
+        // Bilateral symmetry: fold into `[0°, 180°]`.
+        if a > 180.0 {
+            a = 360.0 - a;
+        }
+    }
+    // For span ≈ 360° or non-standard spans, leave `a` as the
+    // wrap-normalised value. `bracket_angle` will clamp at the
+    // boundaries when needed.
+    a + first
 }
 
 /// Find `(lower_index, t)` such that `angles[lower_index] <= a <= angles[lower_index+1]`
@@ -854,5 +1133,265 @@ TILT=NONE
 "#;
         let err = IesProfile::parse_ies(truncated).unwrap_err();
         assert!(matches!(err, IesParseError::TruncatedCandelaTable { .. }));
+    }
+
+    /// Fixture: an explicitly **asymmetric** Type-C IES distribution.
+    /// 3 vertical × 5 horizontal angles, with distinct candela per
+    /// horizontal slice at the equator (v = 90°). The H=0° and H=360°
+    /// slices are identical (the period closure required by LM-63 for
+    /// asymmetric distributions). The candela values per (H, V) are:
+    ///
+    /// ```text
+    ///                 V=0°    V=90°   V=180°
+    ///   H=0°           100     200      50
+    ///   H=90°          100     300      50
+    ///   H=180°         100     400      50
+    ///   H=270°         100     500      50
+    ///   H=360°         100     200      50   (= H=0°, period closure)
+    /// ```
+    ///
+    /// IES candela order is H-outer, V-inner, so the candela table is
+    /// emitted as five contiguous (V=0, V=90, V=180) triplets.
+    const ASYMMETRIC_IES: &str = r#"IESNA:LM-63-2002
+[TEST=Cognition AEC Studio asymmetric fixture]
+[MANUFAC=ACME]
+TILT=NONE
+1 1000.0 1.0 3 5 1 2 0.0 0.0 0.0
+1.0 1.0 100.0
+0.0 90.0 180.0
+0.0 90.0 180.0 270.0 360.0
+100.0 200.0 50.0
+100.0 300.0 50.0
+100.0 400.0 50.0
+100.0 500.0 50.0
+100.0 200.0 50.0
+"#;
+
+    #[test]
+    fn lookup_texture_sample_matches_bake_at_each_horizontal_angle() {
+        // Regression: previously `IesLookupTexture::sample` mapped
+        // `[0°, 360°)` onto `[0, width)` (circular convention), but the
+        // bake stores its samples on `[0, width − 1]` (endpoint
+        // inclusive — column `w-1` is exactly 360°). Sampling at a
+        // horizontal angle that the bake stored exactly (e.g. 90°,
+        // 180°) MUST return that stored candela byte-for-byte. Without
+        // the fix, sampling at 90° on a 5-wide texture returns
+        // `0.75 · cd(90°) + 0.25 · cd(180°)` — a blend that confuses
+        // every column with its neighbour.
+        let p = IesProfile::parse_ies(ASYMMETRIC_IES).unwrap();
+        let tex = p.to_lookup_texture(5, 3);
+        assert_eq!(tex.width, 5);
+        assert_eq!(tex.height, 3);
+
+        // Per the bake invariant, column `x` holds candela at
+        // `x / (w - 1) · 360°`. At the equator (v = 90°), the
+        // distinct cd values per horizontal slice MUST round-trip
+        // exactly.
+        let v_equator = 90.0;
+        for (h_deg, expected_cd) in [
+            (0.0_f32, 200.0_f32),
+            (90.0, 300.0),
+            (180.0, 400.0),
+            (270.0, 500.0),
+            (360.0, 200.0),
+        ] {
+            let got = tex.sample(v_equator, h_deg);
+            assert!(
+                (got - expected_cd).abs() < 1e-4,
+                "sample at v={v_equator}, h={h_deg}: expected {expected_cd}, got {got}"
+            );
+        }
+    }
+
+    #[test]
+    fn lookup_texture_sample_interpolates_between_adjacent_horizontal_columns() {
+        // Halfway between H=90° (cd=300) and H=180° (cd=400) at the
+        // equator should land on cd=350 once the endpoint-inclusive
+        // mapping is in place. Under the old (buggy) circular
+        // mapping, this would silently shift to ~362.5.
+        let p = IesProfile::parse_ies(ASYMMETRIC_IES).unwrap();
+        let tex = p.to_lookup_texture(5, 3);
+        let got = tex.sample(90.0, 135.0);
+        assert!(
+            (got - 350.0).abs() < 1e-3,
+            "expected midpoint cd=350.0 between H=90° and H=180°, got {got}"
+        );
+    }
+
+    #[test]
+    fn lookup_texture_sample_wraps_horizontal_modulo_360() {
+        // 360° and 0° must map to the same column, and negative /
+        // overshooting inputs (-45°, 405°) must wrap correctly through
+        // `rem_euclid`. We check this at the equator on the asymmetric
+        // fixture so it can catch a regression that swaps `rem_euclid`
+        // for a plain modulo (which would map -45° to -45 and panic).
+        let p = IesProfile::parse_ies(ASYMMETRIC_IES).unwrap();
+        let tex = p.to_lookup_texture(5, 3);
+        let v = 90.0;
+        let at_0 = tex.sample(v, 0.0);
+        let at_360 = tex.sample(v, 360.0);
+        let at_minus_45 = tex.sample(v, -45.0);
+        let at_315 = tex.sample(v, 315.0);
+        let at_405 = tex.sample(v, 405.0);
+        let at_45 = tex.sample(v, 45.0);
+        assert!((at_0 - at_360).abs() < 1e-4);
+        assert!((at_minus_45 - at_315).abs() < 1e-4);
+        assert!((at_405 - at_45).abs() < 1e-4);
+    }
+
+    /// Quadrant-symmetric (LM-63 4-way) fixture: horizontal span 0°..=90°.
+    /// Equator candela: cd(h=0°)=100, cd(h=45°)=200, cd(h=90°)=300.
+    /// All other rows are zero (poles); only the equator is exercised
+    /// in these tests.
+    const QUADRANT_SYMMETRIC_IES: &str = r#"IESNA:LM-63-2002
+[TEST=Cognition AEC Studio quadrant symmetry fixture]
+TILT=NONE
+1 1000.0 1.0 3 3 1 2 0.0 0.0 0.0
+1.0 1.0 100.0
+0.0 90.0 180.0
+0.0 45.0 90.0
+0.0 100.0 0.0
+0.0 200.0 0.0
+0.0 300.0 0.0
+"#;
+
+    /// Bilaterally-symmetric (LM-63 2-way / plane-symmetric) fixture:
+    /// horizontal span 0°..=180°. Equator candela: cd(h=0°)=100,
+    /// cd(h=90°)=200, cd(h=180°)=300.
+    const BILATERAL_SYMMETRIC_IES: &str = r#"IESNA:LM-63-2002
+[TEST=Cognition AEC Studio bilateral symmetry fixture]
+TILT=NONE
+1 1000.0 1.0 3 3 1 2 0.0 0.0 0.0
+1.0 1.0 100.0
+0.0 90.0 180.0
+0.0 90.0 180.0
+0.0 100.0 0.0
+0.0 200.0 0.0
+0.0 300.0 0.0
+"#;
+
+    #[test]
+    fn candela_at_folds_quadrant_symmetric_profile_into_first_quadrant() {
+        // Regression: previously `candela_at` clamped horizontal inputs
+        // outside the sampled `[0°, 90°]` range to the boundary, so a
+        // 4-way-symmetric file's cd(h=135°) would return cd(h=90°)
+        // instead of cd(h=45°) (its true value by reflection symmetry).
+        // The LM-63 spec defines 4-way symmetry: cd(a) = cd(180°−a) =
+        // cd(180°+a) = cd(360°−a).
+        let p = IesProfile::parse_ies(QUADRANT_SYMMETRIC_IES).unwrap();
+        let v = 90.0;
+        // Sampled values at the equator.
+        assert!((p.candela_at(v, 0.0) - 100.0).abs() < 1e-4);
+        assert!((p.candela_at(v, 45.0) - 200.0).abs() < 1e-4);
+        assert!((p.candela_at(v, 90.0) - 300.0).abs() < 1e-4);
+        // Reflection about 90° axis: cd(135°) = cd(180°-135°) = cd(45°).
+        assert!((p.candela_at(v, 135.0) - 200.0).abs() < 1e-4);
+        // Reflection about 180° axis: cd(225°) = cd(360°-225°) = cd(135°)
+        // = cd(45°).
+        assert!((p.candela_at(v, 225.0) - 200.0).abs() < 1e-4);
+        // cd(270°) = cd(360°-270°) = cd(90°) = 300.
+        assert!((p.candela_at(v, 270.0) - 300.0).abs() < 1e-4);
+        // cd(315°) = cd(360°-315°) = cd(45°) = 200.
+        assert!((p.candela_at(v, 315.0) - 200.0).abs() < 1e-4);
+        // cd(360°) wraps to cd(0°) = 100.
+        assert!((p.candela_at(v, 360.0) - 100.0).abs() < 1e-4);
+        // cd(-45°) wraps to cd(315°) = cd(45°) = 200.
+        assert!((p.candela_at(v, -45.0) - 200.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn candela_at_folds_bilateral_symmetric_profile_about_180_plane() {
+        // LM-63 bilateral symmetry: cd(a) = cd(360°−a) for any a, but
+        // the input is folded into `[0°, 180°]` rather than `[0°, 90°]`.
+        let p = IesProfile::parse_ies(BILATERAL_SYMMETRIC_IES).unwrap();
+        let v = 90.0;
+        // Sampled values at the equator.
+        assert!((p.candela_at(v, 0.0) - 100.0).abs() < 1e-4);
+        assert!((p.candela_at(v, 90.0) - 200.0).abs() < 1e-4);
+        assert!((p.candela_at(v, 180.0) - 300.0).abs() < 1e-4);
+        // cd(270°) reflects to cd(360°-270°) = cd(90°) = 200.
+        assert!((p.candela_at(v, 270.0) - 200.0).abs() < 1e-4);
+        // cd(225°) reflects to cd(360°-225°) = cd(135°) (interp
+        // between h=90 cd=200 and h=180 cd=300 at t=0.5 → 250).
+        assert!(
+            (p.candela_at(v, 225.0) - 250.0).abs() < 1e-3,
+            "cd(225°) bilateral-folded: got {}",
+            p.candela_at(v, 225.0)
+        );
+        // cd(360°) wraps to cd(0°) = 100.
+        assert!((p.candela_at(v, 360.0) - 100.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn lookup_texture_periodic_at_360_wrap_for_quadrant_symmetric_profile() {
+        // Critical: the GPU sampler wraps horizontal via `rem_euclid`,
+        // so column 0 and column `width − 1` MUST hold the same value
+        // or the sampler will see a discontinuity at the 360° wrap.
+        // Before the LM-63 symmetry fold landed in `candela_at`, a
+        // quadrant-symmetric (0°..=90°) profile baked into a wide
+        // texture would have cd(360°) clamped to cd(90°)=300 in the
+        // last column but cd(0°)=100 in the first column — a hard
+        // step at the wrap boundary.
+        let p = IesProfile::parse_ies(QUADRANT_SYMMETRIC_IES).unwrap();
+        let tex = p.to_lookup_texture(13, 3);
+        let last_col = tex.width as usize - 1;
+        let w = tex.width as usize;
+        // Periodicity invariant: column 0 (h=0°) == column `w-1` (h=360°).
+        let v_equator_row = 1; // h=3 implies rows {0=pole, 1=equator, 2=pole}.
+        let c0 = tex.candela[v_equator_row * w];
+        let c_last = tex.candela[v_equator_row * w + last_col];
+        assert!(
+            (c0 - c_last).abs() < 1e-3,
+            "bake not periodic: col 0 = {c0}, col {last_col} = {c_last}"
+        );
+        // And the sampler must be continuous across the wrap: at
+        // equidistant offsets from the boundary, the sampled values
+        // must agree (sampling 359.99° from below the wrap must equal
+        // sampling 0.01° from above — both are ~0.0003 columns away
+        // from the shared boundary column). Without the LM-63 fold,
+        // 359.99° would sample near cd(90°)=300 while 0.01° samples
+        // near cd(0°)=100 — a 200 cd hard step across an infinitesimal
+        // input change.
+        let just_below_360 = tex.sample(90.0, 359.99);
+        let just_above_zero = tex.sample(90.0, 0.01);
+        assert!(
+            (just_below_360 - just_above_zero).abs() < 1e-3,
+            "sampler discontinuous at 360° wrap: 359.99°={just_below_360}, 0.01°={just_above_zero}"
+        );
+    }
+
+    #[test]
+    fn lookup_texture_periodic_at_360_wrap_for_bilateral_symmetric_profile() {
+        // Same periodicity invariant for the bilateral case. Without
+        // the LM-63 fold, cd(360°) would clamp to cd(180°)=300 in the
+        // last column but cd(0°)=100 in the first.
+        let p = IesProfile::parse_ies(BILATERAL_SYMMETRIC_IES).unwrap();
+        let tex = p.to_lookup_texture(13, 3);
+        let last_col = tex.width as usize - 1;
+        let w = tex.width as usize;
+        let v_equator_row = 1;
+        let c0 = tex.candela[v_equator_row * w];
+        let c_last = tex.candela[v_equator_row * w + last_col];
+        assert!(
+            (c0 - c_last).abs() < 1e-3,
+            "bake not periodic: col 0 = {c0}, col {last_col} = {c_last}"
+        );
+    }
+
+    #[test]
+    fn lookup_texture_sample_handles_width_one() {
+        // Edge case: a rotationally-symmetric profile baked at width=1
+        // (only one horizontal column = 0°/360°). Any horizontal input
+        // must read from column 0 without indexing past the end. The
+        // previous code's `(x0 + 1) % w` path also worked here, but
+        // the fix's clamp-to-`w-1` path is the one being exercised.
+        let p = IesProfile::parse_ies(SAMPLE_IES).unwrap();
+        let tex = p.to_lookup_texture(1, 5);
+        assert_eq!(tex.width, 1);
+        // SAMPLE_IES has cd(v=0°) = 10.0.
+        for h in [0.0_f32, 47.0, 180.0, 360.0, -90.0] {
+            let got = tex.sample(0.0, h);
+            assert!((got - 10.0).abs() < 1e-4, "h={h}: expected 10.0, got {got}");
+        }
     }
 }

@@ -3,7 +3,7 @@
 //! governor decides how many concurrent jobs may run, and calls
 //! [`RenderQueue::admit`] to pull the next eligible job.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -345,6 +345,237 @@ impl RenderQueue {
     pub fn get(&self, id: &str) -> Option<&RenderJob> {
         self.list_jobs().into_iter().find(|j| j.id == id)
     }
+
+    /// Restore a previously-persisted queued job into the in-memory
+    /// queue, preserving its priority placement. Used by
+    /// [`crate::job_store::RenderJobStore::load_queue`] on crash
+    /// recovery. The job's status is forced to `Queued` defensively;
+    /// callers should pre-filter their rows.
+    ///
+    /// # Performance contract
+    ///
+    /// This is the **single-job** restore path: every call scans the
+    /// three in-memory partitions linearly to enforce the duplicate-id
+    /// invariant (see [`assert_id_unique`]). Cost per call is O(N)
+    /// where N is the current queue size, so calling this method N
+    /// times to restore a full queue is O(N²). It is intended for
+    /// small, ad-hoc restores (test fixtures, replay tooling,
+    /// future plugin APIs) where N is bounded by a small constant.
+    /// For full crash-recovery loads, use
+    /// [`RenderQueue::restore_bulk_from_storage`], which amortises
+    /// uniqueness to O(N) via an interned [`HashSet`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if a job with the same `id` is already present in any
+    /// partition (`queued`, `running`, or `completed`). The job-id is
+    /// the queue's PRIMARY KEY on the SQLite side, so a duplicate
+    /// here indicates programmer error — either a caller fed the same
+    /// row in twice, or two separate rows share an id (which would
+    /// also be a store-layer bug). Allowing the insert silently would
+    /// leave the worker pool acting on two distinct in-memory entries
+    /// for one logical job. See `restore_completed` for the same
+    /// reasoning applied to terminal-status rows.
+    pub fn restore_queued(&mut self, mut job: RenderJob) {
+        assert_id_unique(self, &job.id, "restore_queued");
+        job.status = RenderJobStatus::Queued;
+        let pos = self
+            .queued
+            .iter()
+            .position(|j| j.priority < job.priority)
+            .unwrap_or(self.queued.len());
+        self.queued.insert(pos, job);
+    }
+
+    /// Restore a previously-persisted running job. Used by crash
+    /// recovery to surface the "this job was running when we died"
+    /// state to the worker pool (which can then choose to flip it
+    /// back to queued via the store).
+    ///
+    /// # Performance contract
+    ///
+    /// Same O(N) cross-partition uniqueness scan as
+    /// [`RenderQueue::restore_queued`]; N invocations compound to
+    /// O(N²). For bulk crash-recovery loads use
+    /// [`RenderQueue::restore_bulk_from_storage`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if a job with the same `id` is already present in any
+    /// partition. See `restore_queued` for the rationale.
+    pub fn restore_running(&mut self, mut job: RenderJob) {
+        assert_id_unique(self, &job.id, "restore_running");
+        job.status = RenderJobStatus::Running;
+        self.running.push(job);
+    }
+
+    /// Restore a job in a terminal state (`Completed` / `Failed` /
+    /// `Cancelled`) — preserves the original status; does not coerce
+    /// it (unlike `restore_queued` / `restore_running`, which collapse
+    /// to a single canonical status, the terminal bucket is tri-valued).
+    ///
+    /// # Performance contract
+    ///
+    /// Same O(N) cross-partition uniqueness scan as
+    /// [`RenderQueue::restore_queued`]; N invocations compound to
+    /// O(N²). For bulk crash-recovery loads use
+    /// [`RenderQueue::restore_bulk_from_storage`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `job.status` is not terminal, **or** if a job with
+    /// the same `id` is already present in any partition. The
+    /// non-terminal check guards the partition invariant (terminal
+    /// jobs only land here); the duplicate-id check guards against
+    /// two in-memory entries for one logical job (see
+    /// `restore_queued`). Both are runtime `assert!`s rather than
+    /// `debug_assert!`s because this is part of the public
+    /// crash-recovery API and a silent violation would corrupt the
+    /// queue in production. Pre-filter the rows you feed in (as
+    /// `RenderJobStore::load_queue` does).
+    pub fn restore_completed(&mut self, job: RenderJob) {
+        assert!(
+            job.is_terminal(),
+            "restore_completed expects a terminal status; got {:?}",
+            job.status
+        );
+        assert_id_unique(self, &job.id, "restore_completed");
+        self.completed.push(job);
+    }
+
+    /// Bulk-restore a previously-persisted queue from three
+    /// pre-partitioned, pre-sorted snapshots. Used by
+    /// [`crate::job_store::RenderJobStore::load_queue`] on crash
+    /// recovery as a O(N) alternative to N separate `restore_*` calls.
+    ///
+    /// The per-call [`RenderQueue::restore_queued`] / `restore_running` /
+    /// `restore_completed` family runs an O(N) `assert_id_unique` scan
+    /// across all three partitions on every insertion, which compounds
+    /// to **O(N²)** when N jobs are restored. For render queues with
+    /// thousands of frames (e.g. a multi-camera walkthrough at
+    /// 30 fps × tens of seconds, plus quality-matrix variants) the
+    /// quadratic term dominates startup cost. This method amortises
+    /// uniqueness to O(N) by interning every restored id into a single
+    /// [`HashSet`] up-front, then bulk-pushing into the partitions.
+    ///
+    /// # Caller contract
+    ///
+    /// - The queue **must** be empty when this method is invoked.
+    ///   This is asserted; partial-state reconstruction is intentionally
+    ///   not supported by this path (mixing a fresh DB load with a
+    ///   live in-memory queue would violate the "load_queue produces
+    ///   a fresh snapshot" contract).
+    /// - `queued` may be in any order; this method sorts it by
+    ///   priority **descending** to match the placement that
+    ///   [`RenderQueue::submit`] produces. Within the same priority,
+    ///   the input order is preserved (matching how `submit` inserts
+    ///   at the first lower-priority position, leaving same-priority
+    ///   jobs in FIFO order).
+    /// - Every job in `terminal` must satisfy `job.is_terminal()`;
+    ///   this is asserted per-job (the assertion is O(1) — it does
+    ///   not contribute to the cross-partition O(N²) issue).
+    /// - Each `job.status` is coerced defensively for the `queued` and
+    ///   `running` buckets (same as the single-job restore family) to
+    ///   protect against a malformed input vector. Terminal status is
+    ///   preserved verbatim (the tri-valued partition).
+    ///
+    /// # Panics
+    ///
+    /// - If the queue is not empty.
+    /// - If any id appears in more than one input vector or twice in
+    ///   the same vector.
+    /// - If any job in `terminal` is not in a terminal state.
+    ///
+    /// The duplicate-id check is the same correctness contract as
+    /// `assert_id_unique` in the single-job restore path — the SQLite
+    /// PRIMARY KEY on the store side already guarantees uniqueness
+    /// across rows in a single transaction snapshot, so a duplicate
+    /// here would indicate a store-layer bug (caller mis-partitioning
+    /// rows, two SELECTs sharing an id, or a future bulk-insert path
+    /// that bypasses PK enforcement). Defending in depth is cheap at
+    /// O(1) per insertion via the HashSet.
+    pub(crate) fn restore_bulk_from_storage(
+        &mut self,
+        mut queued: Vec<RenderJob>,
+        running: Vec<RenderJob>,
+        terminal: Vec<RenderJob>,
+    ) {
+        assert!(
+            self.queued.is_empty() && self.running.is_empty() && self.completed.is_empty(),
+            "restore_bulk_from_storage expects an empty queue; partial-state \
+             reconstruction is not supported (load_queue produces a fresh snapshot)"
+        );
+
+        let total = queued.len() + running.len() + terminal.len();
+        let mut seen: HashSet<String> = HashSet::with_capacity(total);
+
+        // Sort queued by priority descending; same-priority jobs keep
+        // their input order via `sort_by` (stable sort), matching the
+        // placement that `submit` produces for FIFO within a priority.
+        queued.sort_by_key(|j| std::cmp::Reverse(j.priority));
+        self.queued.reserve(queued.len());
+        for mut job in queued {
+            assert!(
+                seen.insert(job.id.clone()),
+                "restore_bulk_from_storage: duplicate job id `{}` across input vectors \
+                 — the store-layer PRIMARY KEY should make this unreachable.",
+                job.id
+            );
+            job.status = RenderJobStatus::Queued;
+            self.queued.push_back(job);
+        }
+
+        self.running.reserve(running.len());
+        for mut job in running {
+            assert!(
+                seen.insert(job.id.clone()),
+                "restore_bulk_from_storage: duplicate job id `{}` across input vectors \
+                 — the store-layer PRIMARY KEY should make this unreachable.",
+                job.id
+            );
+            job.status = RenderJobStatus::Running;
+            self.running.push(job);
+        }
+
+        self.completed.reserve(terminal.len());
+        for job in terminal {
+            assert!(
+                job.is_terminal(),
+                "restore_bulk_from_storage: non-terminal status {:?} in terminal bucket \
+                 (job id `{}`); the store-layer query should pre-filter by \
+                 status IN (Completed, Failed, Cancelled).",
+                job.status,
+                job.id
+            );
+            assert!(
+                seen.insert(job.id.clone()),
+                "restore_bulk_from_storage: duplicate job id `{}` across input vectors \
+                 — the store-layer PRIMARY KEY should make this unreachable.",
+                job.id
+            );
+            self.completed.push(job);
+        }
+    }
+}
+
+/// Defensive guard for the `RenderQueue::restore_*` family: panic if
+/// `id` is already present in any partition. Centralised here so all
+/// three restore paths share identical semantics and a single error
+/// message format.
+fn assert_id_unique(q: &RenderQueue, id: &str, caller: &'static str) {
+    if q.queued.iter().any(|j| j.id == id)
+        || q.running.iter().any(|j| j.id == id)
+        || q.completed.iter().any(|j| j.id == id)
+    {
+        panic!(
+            "{caller}: duplicate job id `{id}` — a job with this id is \
+             already present in the in-memory queue. This indicates the \
+             store has been fed a duplicate row (PRIMARY KEY violation on \
+             the SQLite side) or restore_* has been called twice for the \
+             same id; either case would leave two in-memory entries for \
+             one logical job."
+        );
+    }
 }
 
 #[cfg(test)]
@@ -595,5 +826,75 @@ mod tests {
         let resumed = q.get(&id).unwrap();
         assert_eq!(resumed.completed_frames, vec![0, 1, 2]);
         assert_eq!(resumed.next_walkthrough_frame(), Some(3));
+    }
+
+    // ---- duplicate-id defense for the public `restore_*` API -----------
+    //
+    // The SQLite store enforces id uniqueness via PRIMARY KEY, so in
+    // the intended `load_queue` path duplicates can't reach these
+    // methods. But the API is `pub`, and a misuse (e.g. a future
+    // direct caller, a test rig, or a custom recovery script that
+    // pre-filters wrong) would otherwise silently double-insert one
+    // logical job, leaving the worker pool acting on two in-memory
+    // entries. These tests lock the panic-on-duplicate contract for
+    // every partition crossing (queued/running/completed × itself
+    // and the other two).
+
+    fn restored_job(id_seed: &str, status: RenderJobStatus) -> RenderJob {
+        let mut j = make_job(0);
+        j.id = id_seed.to_string();
+        j.status = status;
+        if matches!(
+            status,
+            RenderJobStatus::Completed | RenderJobStatus::Failed | RenderJobStatus::Cancelled
+        ) {
+            j.completed_at = Some(chrono::Utc::now());
+        }
+        j
+    }
+
+    #[test]
+    #[should_panic(expected = "restore_queued: duplicate job id")]
+    fn restore_queued_panics_on_duplicate_in_queued_partition() {
+        let mut q = RenderQueue::new();
+        q.restore_queued(restored_job("dup-q-q", RenderJobStatus::Queued));
+        q.restore_queued(restored_job("dup-q-q", RenderJobStatus::Queued));
+    }
+
+    #[test]
+    #[should_panic(expected = "restore_queued: duplicate job id")]
+    fn restore_queued_panics_on_duplicate_in_running_partition() {
+        let mut q = RenderQueue::new();
+        q.restore_running(restored_job("dup-q-r", RenderJobStatus::Running));
+        q.restore_queued(restored_job("dup-q-r", RenderJobStatus::Queued));
+    }
+
+    #[test]
+    #[should_panic(expected = "restore_running: duplicate job id")]
+    fn restore_running_panics_on_duplicate_in_completed_partition() {
+        let mut q = RenderQueue::new();
+        q.restore_completed(restored_job("dup-r-c", RenderJobStatus::Completed));
+        q.restore_running(restored_job("dup-r-c", RenderJobStatus::Running));
+    }
+
+    #[test]
+    #[should_panic(expected = "restore_completed: duplicate job id")]
+    fn restore_completed_panics_on_duplicate_in_queued_partition() {
+        let mut q = RenderQueue::new();
+        q.restore_queued(restored_job("dup-c-q", RenderJobStatus::Queued));
+        q.restore_completed(restored_job("dup-c-q", RenderJobStatus::Failed));
+    }
+
+    #[test]
+    fn restore_methods_accept_distinct_ids_across_partitions() {
+        // Sanity: the duplicate guard fires only on actual collisions,
+        // not on legitimate cross-partition restoration of distinct ids.
+        let mut q = RenderQueue::new();
+        q.restore_queued(restored_job("ok-q", RenderJobStatus::Queued));
+        q.restore_running(restored_job("ok-r", RenderJobStatus::Running));
+        q.restore_completed(restored_job("ok-c", RenderJobStatus::Completed));
+        assert_eq!(q.queued_count(), 1);
+        assert_eq!(q.running_count(), 1);
+        assert_eq!(q.list_jobs().len(), 3);
     }
 }

@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use aec_ai::{
-    DiffEngine, GrammarRegistry as AiGrammarRegistry, PlanRequest as AiPlanRequest,
-    ToolName as AiToolName, ToolPlanner, ToolSchema as AiToolSchema,
+    AiAuditLogger, DiffEngine, DiffStatus, GrammarRegistry as AiGrammarRegistry,
+    PlanRequest as AiPlanRequest, ToolName as AiToolName, ToolPlanner, ToolSchema as AiToolSchema,
     ToolSchemaRegistry as AiToolSchemaRegistry,
 };
 use aec_audit::AuditLog;
@@ -32,7 +32,7 @@ use aec_render::preset::RenderPresetStore;
 use aec_render::queue::{BatchProgress as CoreBatchProgress, RenderQueue};
 use aec_render::scene::RenderScene;
 
-use crate::ai_state::{AiState, AiStateError, DEFAULT_SPAWN_TIMEOUT};
+use crate::ai_state::{AiState, AiStateError, PendingDiff, DEFAULT_SPAWN_TIMEOUT};
 use crate::asset_state::AssetState;
 use crate::bim_attach;
 use crate::engine_status_cache::EngineStatusCache;
@@ -1059,12 +1059,110 @@ pub struct AiPlanResult {
     pub entities_modified: u32,
 }
 
-/// Result of [`BridgeService::ai_accept_diff`] / `ai_reject_diff`.
+/// Result of [`BridgeService::ai_accept_diff`].
+///
+/// Carries the full apply telemetry so the renderer can show the
+/// user exactly what landed in the project graph: how many ops the
+/// model proposed, how many were applied, how many were skipped
+/// (and why), and the resulting per-op command ids for later undo.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AiDiffOutcome {
-    /// Mirrors the TS `{ accepted: true }` / `{ rejected: true }` shape.
+pub struct AiAcceptOutcome {
+    /// Mirrors the TS `{ accepted: true }` shape (always `true` on
+    /// success; the call returns `Err` on failure).
     pub ok: bool,
     pub diff_id: String,
+    /// Total operations the diff carried (matches
+    /// `diff.operations.len()` from `ai_plan`).
+    pub op_count: u32,
+    /// Count of *operations* (not commands) that the converter
+    /// mapped to at least one typed command. Bounded above by
+    /// `op_count` and by definition `<= op_count`. The renderer
+    /// surfaces this as "Applied X of Y operations" — Y is
+    /// `op_count`, X is this field.
+    ///
+    /// Note: a single operation can expand into multiple commands
+    /// (e.g. a polyline wall `Insert` with N points emits N-1
+    /// `CreateWall` commands). `command_ids.len()` reflects the
+    /// command count; `applied_count` reflects the operation count.
+    /// The two can differ in either direction:
+    ///   * one op → many commands (multi-segment polyline);
+    ///   * one op → many `skipped` entries plus some commands (a
+    ///     polyline that mixes valid segments with zero-length
+    ///     duplicates lands its valid segments and records the
+    ///     dupes — `applied_count` still increments by one for
+    ///     that op).
+    pub applied_count: u32,
+    /// Operations the converter could not translate — unknown
+    /// entity kinds, dangling targets, render_doctor diagnostics,
+    /// material bindings without a target entity. Surfacing these
+    /// lets the renderer show "Applied 4 of 5 — 1 skipped" instead
+    /// of silently dropping a partial accept.
+    pub skipped: Vec<AiAcceptSkippedJs>,
+    /// `Command::command_id` of every applied command, in apply
+    /// order. The renderer pins these so a later "Undo last AI
+    /// action" call can pop the matching journal entries.
+    pub command_ids: Vec<String>,
+    /// Hash chain head of the AI audit log AFTER this accept was
+    /// recorded. The renderer surfaces this in the AI panel's
+    /// provenance tooltip; verification tools can walk the chain
+    /// from genesis to this head.
+    pub audit_chain_head: String,
+}
+
+/// One skipped operation surfaced from the `ai_apply` converter.
+/// Mirrors [`aec_command::SkippedOperation`] but stays inside the
+/// service crate so the napi layer doesn't need a direct dep on
+/// `aec_command`'s internal types.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiAcceptSkippedJs {
+    pub op_index: u32,
+    pub reason: String,
+}
+
+/// Result of [`BridgeService::ai_reject_diff`].
+///
+/// Mirrors `AiAcceptOutcome` shape-wise (same `audit_chain_head`
+/// field) so the renderer can use a single "diff lifecycle" toast
+/// shape for both outcomes. `op_count` is reported so the renderer
+/// can show "Rejected (4 ops, 0 applied)" symmetrically with the
+/// accept variant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiRejectOutcome {
+    pub ok: bool,
+    pub diff_id: String,
+    pub op_count: u32,
+    /// Optional reason supplied by the renderer (`reason: "too
+    /// many entities"`, `reason: "wrong room"`, etc.). Logged into
+    /// the AI audit chain so the provenance UI can show *why* the
+    /// user rejected the suggestion. `None` is recorded as an
+    /// empty string in the audit envelope.
+    pub reason: Option<String>,
+    pub audit_chain_head: String,
+}
+
+/// Intermediate state produced by phases 1+2 of `ai_accept_diff`
+/// (pre-commit + SQL commit). Holds the data the post-commit
+/// phases need: the project root for the audit append, the scope
+/// the user authored the plan under, the original diff for the
+/// audit envelope, and the per-op outcome fields the final
+/// `AiAcceptOutcome` will surface.
+///
+/// Crate-private — callers outside this module never see this
+/// shape. Splitting it out is the structural piece of the
+/// `BUG_0001 (round 3)` fix: it lets `ai_accept_diff` finalize the
+/// pending-diff registry entry between the SQL commit (phase 2)
+/// and the AI audit append (phase 4) so a failed audit cannot
+/// leave the diff retry-pending after the graph has already been
+/// mutated.
+#[derive(Debug)]
+struct AiAcceptCommitted {
+    project_root: PathBuf,
+    plan_scope: Scope,
+    diff: aec_ai::Diff,
+    op_count: u32,
+    applied_count: u32,
+    skipped: Vec<AiAcceptSkippedJs>,
+    command_ids: Vec<String>,
 }
 
 /// Result of [`BridgeService::ai_cancel_job`].
@@ -1378,6 +1476,36 @@ impl BridgeService {
             Some(template.template_id.clone()),
             &self.master_key,
         )?;
+
+        // Instantiate the template into real entities on the project
+        // graph. Geometry templates (apartment / villa / office / ...)
+        // emit a batch of `CreateWall` + `CreateFloor` + `CreateCeiling`
+        // + `CreateRoom` + `SetLighting` + `SaveCamera` commands; the
+        // batch lands in a single SQL transaction via
+        // `execute_persistent_batch` so a half-failed instantiation
+        // never leaves the project graph in a partial state. Sheet-only
+        // / layer-only templates (drafting, renovation overlay) emit
+        // zero commands here — their content is realised by other
+        // mode-specific seed steps.
+        //
+        // The skipped-rooms diagnostic from
+        // `template_to_commands` is captured in the project's audit
+        // sidecar `<root>/audit/template_instantiation.json` so a
+        // user / reviewer can see exactly which rooms (if any) the
+        // instantiator declined to materialise. The file is written
+        // even on a clean batch (with `skipped: []`) so its presence
+        // is a positive signal: "this project went through the real
+        // template path, not a no-op fast path".
+        let outcome = aec_command::template_apply::template_to_commands(&template);
+        if let Err(e) = apply_template_outcome(&pkg, &self.master_key, template_key, outcome) {
+            // Roll back the half-created project so the next call to
+            // `project_create_from_template` with the same name isn't
+            // blocked by an `AlreadyExists` error against a useless
+            // shell.
+            let _ = std::fs::remove_dir_all(&root);
+            return Err(e);
+        }
+
         // Drop any stale cache entry for this path before publishing
         // the new project to the recents store. `root` is a `PathBuf`
         // and the cache key is derived via `cache_key` (which goes
@@ -1458,8 +1586,24 @@ impl BridgeService {
     ) -> Result<CommandApplyResult, BridgeServiceError> {
         let (_pkg, mut conn) =
             ProjectPackage::open_with_master_key_and_database(project_path, &self.master_key)?;
-        let mut engine = CommandEngine::open(&conn, command.scope)?;
-        let result = engine.execute_persistent(command, &mut conn)?;
+        self.command_apply_on_conn(project_path, &mut conn, command)
+    }
+
+    /// Internal helper: apply a single command against an already-open
+    /// SQLCipher connection. Used by `command_apply` (which opens the
+    /// connection itself) and by callers that need to share a
+    /// connection across multiple steps (e.g.
+    /// [`Self::deliver_create_revision`], which journals the
+    /// `CreateRevision` command *and* enumerates the on-disk graph
+    /// for the revision snapshot without re-opening the project).
+    fn command_apply_on_conn(
+        &mut self,
+        project_path: &str,
+        conn: &mut rusqlite::Connection,
+        command: Command,
+    ) -> Result<CommandApplyResult, BridgeServiceError> {
+        let mut engine = CommandEngine::open(&*conn, command.scope)?;
+        let result = engine.execute_persistent(command, conn)?;
         self.invalidate_status_cache_for(project_path);
         Ok(CommandApplyResult {
             command_id: result.command_id,
@@ -1467,6 +1611,60 @@ impl BridgeService {
             undo_len: engine.undo_len() as u32,
             redo_len: engine.redo_len() as u32,
         })
+    }
+
+    /// Apply a sequence of commands as a single atomic batch.
+    ///
+    /// Opens the project package once, opens one [`CommandEngine`]
+    /// for the batch's shared scope (every command must agree on
+    /// `Command::scope`), and routes the whole sequence through
+    /// [`CommandEngine::execute_persistent_batch`] so a multi-thousand
+    /// command DXF / IFC ingest collapses to a single SQL transaction,
+    /// one engine open, and one status-cache invalidation rather than
+    /// N of each.
+    ///
+    /// Returns the per-command [`CommandApplyResult`]s in input
+    /// order, matching what N back-to-back `command_apply` calls
+    /// would have produced (minus the per-command undo/redo length
+    /// snapshot — those reflect the post-batch state on every entry,
+    /// which is what every current caller wants).
+    pub fn command_apply_batch(
+        &mut self,
+        project_path: &str,
+        commands: Vec<Command>,
+    ) -> Result<Vec<CommandApplyResult>, BridgeServiceError> {
+        if commands.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Every command in the batch must agree on scope so a single
+        // engine can validate + persist them. Mixed-scope batches
+        // are rejected here rather than producing a confusing
+        // engine-level scope-mismatch error half-way through.
+        let scope = commands[0].scope;
+        for cmd in &commands {
+            if cmd.scope != scope {
+                return Err(BridgeServiceError::Command(format!(
+                    "command_apply_batch: mixed-scope batch ({scope:?} vs {:?})",
+                    cmd.scope,
+                )));
+            }
+        }
+        let (_pkg, mut conn) =
+            ProjectPackage::open_with_master_key_and_database(project_path, &self.master_key)?;
+        let mut engine = CommandEngine::open(&conn, scope)?;
+        let results = engine.execute_persistent_batch(commands, &mut conn)?;
+        self.invalidate_status_cache_for(project_path);
+        let undo_len = engine.undo_len() as u32;
+        let redo_len = engine.redo_len() as u32;
+        Ok(results
+            .into_iter()
+            .map(|r| CommandApplyResult {
+                command_id: r.command_id,
+                applied: r.applied,
+                undo_len,
+                redo_len,
+            })
+            .collect())
     }
 
     /// Undo the most recently applied command. Returns the inverse
@@ -3120,16 +3318,16 @@ impl BridgeService {
     // AI endpoints
     // ---------------------------------------------------------------
     //
-    // All six methods take `&self`. They do NOT serialise against one
-    // another — the three internal primitives on [`AiState`] (an
-    // `RwLock` for lifecycle state, a `Mutex` for the spawn slot, a
-    // `Mutex` for the diff registry) are independent, so:
+    // Read-only AI endpoints (`ai_list_tools`, `ai_plan`,
+    // `ai_runtime_status`, `ai_cancel_job`) take `&self` and run
+    // fully concurrent with one another — the three internal
+    // primitives on [`AiState`] (an `RwLock` for lifecycle state,
+    // a `Mutex` for the spawn slot, a `Mutex` for the diff
+    // registry) are independent, so:
     //
     //  - `ai_runtime_status` polls (the hot path: every ~500 ms while
     //    a plan is in flight) only take the `runtime` `RwLock` *read*
     //    side and run fully concurrent with everything else.
-    //  - `ai_accept_diff` / `ai_reject_diff` only take the
-    //    `pending_diffs` mutex, never touching sidecar state.
     //  - `ai_plan` holds the spawn-slot mutex only across
     //    `ensure_ready` (typically microseconds on the warm path, up
     //    to `DEFAULT_SPAWN_TIMEOUT` on the first call), then drops
@@ -3137,6 +3335,20 @@ impl BridgeService {
     //  - `ai_cancel_job` takes the spawn-slot mutex to terminate the
     //    handle, so it serialises with `ensure_ready` (correct: we
     //    must not race a `take()` against a freshly-`Some()` write).
+    //
+    // [`Self::ai_accept_diff`] and [`Self::ai_reject_diff`] take
+    // `&mut self`. They mutate the project graph (accept) or the
+    // AI audit log (both) and therefore go through
+    // [`Self::command_apply_batch`] / [`Self::ai_audit_append`]
+    // which require unique access to the service so the SQL
+    // transaction, journal, and audit envelope are journaled
+    // atomically. The bridge's outer `RwLock<BridgeService>` (held
+    // by the napi shim) takes the write side for these two
+    // methods, serialising them against every other bridge call
+    // for the duration of the apply. This is intentional — the
+    // accept path mutates SQLCipher state behind the user's most
+    // recent gesture and must not race with concurrent reads of
+    // the same project graph.
     //
     // The napi layer adds the second half of the fix: every blocking
     // AI endpoint is `#[napi] async fn` routed through
@@ -3176,6 +3388,7 @@ impl BridgeService {
     ///   7. return the diff id + parsed payload to the renderer
     pub fn ai_plan(
         &self,
+        project_path: &str,
         tool: &str,
         scope: Scope,
         prompt: &str,
@@ -3266,7 +3479,11 @@ impl BridgeService {
             entities, response.entities_modified,
             "DiffEngine::build and planner::count_response_entities must agree",
         );
-        let diff_id = self.ai_state.insert_diff(diff)?;
+        // Capture the project path with the pending diff so the
+        // later `ai_accept_diff` / `ai_reject_diff` knows which
+        // project package to open. See `PendingDiff` rustdoc for
+        // the "plan on A, switch to B, accept the A diff" rationale.
+        let diff_id = self.ai_state.insert_diff(project_path, scope, diff)?;
         Ok(AiPlanResult {
             diff_id: diff_id.as_str().to_owned(),
             parsed,
@@ -3275,26 +3492,432 @@ impl BridgeService {
         })
     }
 
-    /// Mark a pending diff as accepted. The bridge currently drops the
-    /// diff after recording acceptance — translating the diff back into
-    /// concrete [`crate::service::Command`] sequences is a follow-up
-    /// (Phase 11 task, deliberately deferred from PR-V scope per the
-    /// scoping doc).
-    pub fn ai_accept_diff(&self, diff_id: &str) -> Result<AiDiffOutcome, BridgeServiceError> {
-        let _ = self.ai_state.accept_diff(diff_id)?;
-        Ok(AiDiffOutcome {
+    /// Apply an accepted AI diff to the project graph.
+    ///
+    /// Phase 11 task 10 — the previous incarnation of this method
+    /// just dropped the pending diff entry after marking it
+    /// accepted. That left the project graph unchanged even though
+    /// the renderer's AI panel had already moved on, which broke
+    /// every downstream contract (undo, audit, render, export).
+    ///
+    /// The real apply path is a four-phase sequence:
+    ///
+    /// **Phase 1 – pre-commit (recoverable):** Peek the
+    /// `PendingDiff` from `AiState::pending_diffs` (yielding a
+    /// clone of both the `Diff` and the project path), open the
+    /// project package + SQLCipher connection, load the current
+    /// `ProjectGraph`, convert the `Diff` into a `Vec<Command>` via
+    /// [`aec_command::diff_to_commands`], and validate the entire
+    /// batch against the engine's scope. Any failure here returns
+    /// before SQL is touched, so the pending diff stays in the
+    /// registry for retry. The graph loaded for the converter is
+    /// moved into the engine via [`CommandEngine::open_with_graph`]
+    /// so the `entities` table is not re-read — see
+    /// `ANALYSIS_0003 (round 2)`.
+    ///
+    /// **Phase 2 – commit (irreversible):** Run
+    /// [`CommandEngine::execute_persistent_batch`] which writes
+    /// every delta + journal entry in one SQL transaction. The
+    /// transaction's `commit()` is the point of no return: once it
+    /// returns Ok the graph has been mutated on disk. If `commit`
+    /// fails the whole batch is rolled back and the pending diff
+    /// stays in the registry — `diff_to_commands` is deterministic
+    /// for the same input graph so retry produces the same commands
+    /// without duplicating entity IDs.
+    ///
+    /// **Phase 3 – finalize (must run after phase 2):** Remove the
+    /// `PendingDiff` from `AiState`. This step lives between commit
+    /// and audit append because retrying the accept after a
+    /// successful commit would re-enter `diff_to_commands`, which
+    /// generates *fresh* `EntityId::new()` UUIDs for every `Insert`
+    /// op — committing a second time would duplicate every inserted
+    /// entity. Finalizing here guarantees that path is unreachable.
+    /// See `BUG_0001 (round 3)`.
+    ///
+    /// **Phase 4 – AI audit append (post-commit):** Append an
+    /// `AiAuditRecord { status: Accepted, .. }` to
+    /// `<project>/audit/ai_audit.jsonl`. The main command audit
+    /// chain already has the per-command entries from phase 2; the
+    /// AI audit chain answers "how many of the model's proposals
+    /// did the user accept?" on its own JSONL log. If this step
+    /// fails (disk full, audit dir replaced with a file, etc.) we
+    /// surface the error so the renderer can prompt for an audit
+    /// chain re-export — but the graph mutation is durable and the
+    /// pending diff is already gone, so there is no retry-induced
+    /// duplication. The chain verifier (`project_audit_chain`)
+    /// detects the missing AI envelope on next walk.
+    ///
+    /// Operations the converter could not translate (unknown
+    /// entity kind, dangling target, missing payload field) are
+    /// reported in [`AiAcceptOutcome::skipped`] rather than
+    /// erroring the whole accept — the user already reviewed the
+    /// diff and clicked Accept, so the service commits whatever
+    /// subset the schema understands.
+    pub fn ai_accept_diff(&mut self, diff_id: &str) -> Result<AiAcceptOutcome, BridgeServiceError> {
+        // Phase 1 + Phase 2: pre-commit + commit. Any failure here
+        // leaves the pending diff in the registry so the renderer
+        // can retry — prior to the round-2 peek/finalize split, a
+        // transient failure (e.g. SQLCipher key mismatch on a
+        // moved project) silently lost the diff with no recovery
+        // path.
+        let pending = self.ai_state.peek_diff(diff_id)?;
+        let committed = self.ai_accept_diff_commit(pending)?;
+        // Phase 3: finalize BEFORE the post-commit audit append.
+        //
+        // `BUG_0001 (round 3)`: the previous structure ran audit
+        // append inside the commit helper and only finalized once
+        // both succeeded. That ordering broke the peek/finalize
+        // contract for retry-safety: if the audit append failed
+        // *after* the SQL commit, the diff was left in the registry
+        // for retry — but a retry would re-enter
+        // `diff_to_commands`, which generates fresh
+        // `EntityId::new()` UUIDs for every `Insert` op, and a
+        // second successful commit would silently double every
+        // inserted entity. Finalizing here closes the
+        // retry-duplication window: once SQL is committed the diff
+        // is unreachable for retry.
+        //
+        // A `finalize_diff` failure here is genuinely anomalous
+        // (would require a concurrent finalize for the same id
+        // racing ahead of us) — we surface it instead of
+        // swallowing. In that pathological case the graph is
+        // committed and the diff is *still* in the registry; the
+        // next retry would duplicate. Acceptable trade-off vs
+        // silently masking a real concurrency bug.
+        self.ai_state.finalize_diff(diff_id)?;
+        // Phase 4: post-commit, post-finalize audit append. If this
+        // fails, the graph is durable and the pending diff is
+        // already gone — no retry is possible (or needed). The
+        // error propagates so the renderer can re-export the audit
+        // chain (see `project_audit_sync`).
+        let audit_chain_head = Self::ai_audit_append_at_root(
+            &committed.project_root,
+            committed.plan_scope,
+            &committed.diff,
+            DiffStatus::Accepted,
+            None,
+        )?;
+        Ok(AiAcceptOutcome {
             ok: true,
             diff_id: diff_id.to_owned(),
+            op_count: committed.op_count,
+            applied_count: committed.applied_count,
+            skipped: committed.skipped,
+            command_ids: committed.command_ids,
+            audit_chain_head,
         })
     }
 
-    /// Mark a pending diff as rejected and drop it.
-    pub fn ai_reject_diff(&self, diff_id: &str) -> Result<AiDiffOutcome, BridgeServiceError> {
-        let _ = self.ai_state.reject_diff(diff_id)?;
-        Ok(AiDiffOutcome {
+    /// Phases 1+2 of `ai_accept_diff`: open the project, convert
+    /// the diff to commands, and commit the batch in a single SQL
+    /// transaction. Returns the post-commit data the caller needs
+    /// to (a) finalize the registry entry and (b) write the AI
+    /// audit envelope.
+    ///
+    /// Splitting this off from the audit-append step is the
+    /// `BUG_0001 (round 3)` fix — see [`Self::ai_accept_diff`] for
+    /// the four-phase rationale.
+    fn ai_accept_diff_commit(
+        &mut self,
+        pending: PendingDiff,
+    ) -> Result<AiAcceptCommitted, BridgeServiceError> {
+        let project_path = pending.project_path.clone();
+        // There are **two** scopes in play during an AI accept, and
+        // they intentionally do not have to agree:
+        //
+        //   * `plan_scope` — the engine scope the user *invoked*
+        //     the plan from. For `plan_detection` / `plan_to_wall`
+        //     this can be `Draft` (a 2D drafter detecting walls in
+        //     an imported plan) even though the resulting commands
+        //     are `Design` walls. The AI tool registry
+        //     (`crates/aec_ai/data/ai_tools.json`) declares
+        //     `allowed_scopes: ["design", "draft"]` for exactly
+        //     this workflow. We retain it as a provenance label on
+        //     the AI audit envelope so the audit log answers "what
+        //     UI mode produced this accept?" honestly.
+        //
+        //   * `engine_scope` — the scope the `CommandEngine` must
+        //     be opened at to apply the emitted commands. This is
+        //     derived from `conversion.commands[0].scope`, which
+        //     is the intrinsic scope of the `CommandKind` itself
+        //     (`Design` for `CreateWall`, `Draft` for
+        //     `DrawPrimitive`, `Deliver` for `CreateRevision`). The
+        //     journal entries the engine writes get tagged with
+        //     this scope so undo/redo validation works: a later
+        //     `Cmd-Z` issued from a Design session can undo a
+        //     wall-create even if the original accept happened in
+        //     a Draft session.
+        //
+        // `BUG_0001 (round 4)` fix: opening the engine at
+        // `plan_scope` rather than `engine_scope` broke the
+        // Draft-launched plan_detection / plan_to_wall path
+        // because the batch-scope guard (added in round 3) rejects
+        // when `commands[0].scope (Design) != engine.active_scope
+        // (Draft)`. Splitting the two scopes here restores the
+        // intended behaviour and keeps the audit log faithful.
+        let plan_scope = pending.scope;
+        let diff = pending.diff;
+        let op_count = u32::try_from(diff.operations.len()).unwrap_or(u32::MAX);
+        // Open the package + graph once. We need the graph for the
+        // converter's `Update` / `Delete` dispatch and the
+        // connection for `command_apply_batch`. We keep the `pkg`
+        // binding (instead of `_pkg`) so the AI audit append can
+        // reuse it without a second key-derive + PRAGMA cipher
+        // dance — see `ANALYSIS_0003`.
+        let (pkg, mut conn) =
+            ProjectPackage::open_with_master_key_and_database(&project_path, &self.master_key)?;
+        let graph = aec_command::ProjectGraph::load(&conn)
+            .map_err(|e| BridgeServiceError::Command(e.to_string()))?;
+        let conversion =
+            aec_command::diff_to_commands(&diff, &graph, aec_command::ApplyDefaults::default());
+        let skipped: Vec<AiAcceptSkippedJs> = conversion
+            .skipped
+            .iter()
+            .map(|s| AiAcceptSkippedJs {
+                op_index: u32::try_from(s.op_index).unwrap_or(u32::MAX),
+                reason: s.reason.clone(),
+            })
+            .collect();
+        // Capture the operation-level applied count from the
+        // converter *before* `conversion.commands` is moved into
+        // the engine below. This is the `BUG_0001 (round 5)` fix:
+        // the converter knows which operations produced at least
+        // one command, so it reports the operation count directly
+        // rather than us trying to derive it from `commands.len()`
+        // (commands can fan out per op) or
+        // `op_count - skipped.len()` (a polyline can produce both
+        // commands and per-segment skips for the same op).
+        let applied_count = u32::try_from(conversion.applied_op_count).unwrap_or(u32::MAX);
+        // `command_apply_batch` accepts an empty Vec as a no-op,
+        // which is what we want when every operation in the diff
+        // is unsupported (e.g. all render_doctor diagnostics). The
+        // accept still completes successfully — the AI audit log
+        // will capture the attempted-but-skipped operations.
+        let applied_results: Vec<CommandApplyResult> = if conversion.commands.is_empty() {
+            Vec::new()
+        } else {
+            // Reuse the graph we already loaded for `diff_to_commands`
+            // instead of letting `CommandEngine::open` re-read the
+            // `entities` table a second time. The graph is moved
+            // into the engine here (we no longer need it after the
+            // converter ran) — this is the
+            // `ANALYSIS_0003 (round 2)` double-load fix.
+            //
+            // Engine scope = `commands[0].scope` (the intrinsic
+            // scope of the emitted commands), NOT `plan_scope`
+            // (the UI launch context). The batch's internal
+            // consistency guard already requires every command in
+            // a batch to share the same scope, so any command
+            // satisfies the role of "canonical batch scope".
+            //
+            // This is the `BUG_0001 (round 4)` fix — opening at
+            // `plan_scope` tripped the batch scope guard whenever
+            // the renderer dispatched a Draft-launched
+            // `plan_detection` (which legitimately emits Design
+            // walls).
+            let engine_scope = conversion.commands[0].scope;
+            let mut engine =
+                aec_command::CommandEngine::open_with_graph(&conn, engine_scope, graph)
+                    .map_err(|e| BridgeServiceError::Command(e.to_string()))?;
+            let results = engine
+                .execute_persistent_batch(conversion.commands, &mut conn)
+                .map_err(|e| BridgeServiceError::Command(e.to_string()))?;
+            self.invalidate_status_cache_for(&project_path);
+            let undo_len = engine.undo_len() as u32;
+            let redo_len = engine.redo_len() as u32;
+            results
+                .into_iter()
+                .map(|r| CommandApplyResult {
+                    command_id: r.command_id,
+                    applied: r.applied,
+                    undo_len,
+                    redo_len,
+                })
+                .collect()
+        };
+        let command_ids: Vec<String> = applied_results
+            .iter()
+            .map(|r| r.command_id.as_str().to_owned())
+            .collect();
+        // SQL is committed; capture the project root we already
+        // hold so phase 4 (audit append) doesn't have to re-open
+        // the package. The `pkg` binding is intentionally dropped
+        // at end of scope — the audit logger only needs the project
+        // root path, not a keyed package handle.
+        let project_root = pkg.root().to_path_buf();
+        drop(pkg);
+        Ok(AiAcceptCommitted {
+            project_root,
+            plan_scope,
+            diff,
+            op_count,
+            applied_count,
+            skipped,
+            command_ids,
+        })
+    }
+
+    /// Mark a pending diff as rejected and record the rejection in
+    /// the project's AI audit log.
+    ///
+    /// Phase 11 task 11 — the previous incarnation just dropped
+    /// the pending entry. The real reject path logs the rejection
+    /// to `<project>/audit/ai_audit.jsonl` via
+    /// [`AiAuditLogger::log_rejection`] so the AI provenance trail
+    /// retains *all* model proposals (accepted and rejected) for
+    /// later analysis. The `reason` argument is free-form text
+    /// supplied by the renderer; an empty `reason` is recorded as
+    /// the empty string rather than as missing.
+    ///
+    /// Devin Review `ANALYSIS_0001` (round 1): takes `&self`
+    /// (not `&mut self`) so the napi shim can use
+    /// `with_service_ref_fallible` (a read-lock on the service
+    /// singleton). The reject path does not mutate `BridgeService`
+    /// directly — `ai_state.peek_diff` / `finalize_diff` already
+    /// take `&self` and route all state changes through the
+    /// internal locks inside [`crate::ai_state::AiState`], and the
+    /// audit append (`Self::ai_audit_append_at_root`) is a static
+    /// associated function. Keeping reject under a *read* lock
+    /// means a renderer that fires off `status_poll` /
+    /// `list_render_jobs` while a reject is in flight no longer
+    /// serializes against the reject's disk I/O — they run
+    /// concurrently. (Accept *must* hold the write lock because
+    /// `command_apply_on_conn` mutates the project graph.)
+    pub fn ai_reject_diff(
+        &self,
+        diff_id: &str,
+        reason: Option<&str>,
+    ) -> Result<AiRejectOutcome, BridgeServiceError> {
+        // `BUG_0001 (round 2)`: same peek-then-finalize discipline
+        // as `ai_accept_diff` — see that method for the full
+        // rationale. If the audit append fails (disk-full, missing
+        // project, etc.), the pending entry survives so the
+        // renderer can retry the reject (or escalate via the
+        // pending-diff inspector).
+        //
+        // **Ordering note (`ANALYSIS_0001`):** the reject path
+        // intentionally runs *audit append before finalize*, the
+        // mirror of the accept path's *finalize before audit*. The
+        // asymmetry is by design and reflects the different
+        // worst-case failure modes:
+        //   * Accept has a SQL commit that mutates the project
+        //     graph; finalizing AFTER commit prevents a transient
+        //     audit-append failure from re-entering the converter
+        //     on retry (which generates fresh `EntityId::new()`
+        //     UUIDs and would double-insert every wall/furniture
+        //     row). Worst case the accept path defends against is
+        //     *data-integrity violation* — duplicated graph
+        //     entities.
+        //   * Reject does not mutate the graph, so the only state
+        //     at risk is the AI audit log itself. Auditing BEFORE
+        //     finalize means a transient finalize failure (rare:
+        //     would require a concurrent finalize racing this
+        //     thread) leaves the diff pending and the audit
+        //     containing a reject entry. The renderer's retry
+        //     would then write a duplicate audit entry — visible,
+        //     deduplicable by `diff_id`, but harmless. The
+        //     alternative ordering (finalize → audit) would expose
+        //     a strictly worse failure mode: an audit-append
+        //     failure after the diff is already finalized would
+        //     SILENTLY drop the rejection from the security log
+        //     with no retry path. For an audit / forensic surface,
+        //     "loud duplicate" beats "silent gap" — so this is the
+        //     correct asymmetry.
+        let pending = self.ai_state.peek_diff(diff_id)?;
+        let outcome = Self::ai_reject_diff_inner(diff_id, pending, reason)?;
+        self.ai_state.finalize_diff(diff_id)?;
+        Ok(outcome)
+    }
+
+    // Static associated function: the reject path no longer needs
+    // any `BridgeService` state (the master key is no longer
+    // consulted now that we use manifest-only `ProjectPackage::open`
+    // — see `ANALYSIS_0005 (round 3)`), so leaving this as a
+    // `&mut self` method would trip `clippy::unused_self`.
+    fn ai_reject_diff_inner(
+        diff_id: &str,
+        pending: PendingDiff,
+        reason: Option<&str>,
+    ) -> Result<AiRejectOutcome, BridgeServiceError> {
+        let project_path = pending.project_path.clone();
+        let scope = pending.scope;
+        let diff = pending.diff;
+        let op_count = u32::try_from(diff.operations.len()).unwrap_or(u32::MAX);
+        // Reject does not mutate the graph, so the only state it
+        // touches is the AI audit log. We open the package via the
+        // manifest-only `ProjectPackage::open` rather than
+        // `open_with_master_key`: the audit append only needs the
+        // project root path (the AI audit JSONL lives at
+        // `<root>/audit/ai_audit.jsonl`), and the manifest-only
+        // open still validates that the directory is a real
+        // project package (`is_dir` + `PACKAGE_DIRS` walk) so a
+        // stale `pending.project_path` pointing at a moved /
+        // deleted project still surfaces as an error before the
+        // audit append tries to create a phantom directory tree.
+        // This is the `ANALYSIS_0005 (round 3)` fix — the full
+        // keyed open ran `derive_project_key` + the SQLCipher
+        // `PRAGMA cipher_*` sequence + the migration walk all for
+        // a path lookup, ~1-2 ms of avoidable work per reject.
+        let pkg = ProjectPackage::open(&project_path)?;
+        let audit_chain_head =
+            Self::ai_audit_append_at_root(pkg.root(), scope, &diff, DiffStatus::Rejected, reason)?;
+        Ok(AiRejectOutcome {
             ok: true,
             diff_id: diff_id.to_owned(),
+            op_count,
+            reason: reason.map(std::string::ToString::to_string),
+            audit_chain_head,
         })
+    }
+
+    /// Internal helper: append an `AiAuditRecord` to the project's
+    /// AI audit log (`<project>/audit/ai_audit.jsonl`) and return
+    /// the new chain head.
+    ///
+    /// Takes the project root path by reference so callers that
+    /// already validated the package (the accept path holds a
+    /// `ProjectPackage` opened for the SQL commit; the reject path
+    /// holds a manifest-only `ProjectPackage::open`) can hand the
+    /// root through without re-deriving the project key or
+    /// re-issuing the `PRAGMA cipher_*` sequence. This is the
+    /// shape `ANALYSIS_0003 (round 2)` + `ANALYSIS_0005 (round 3)`
+    /// converged to — neither caller needs a keyed package handle
+    /// for the audit append, only the root path.
+    ///
+    /// The AI audit log is a separate hash chain from the main
+    /// command audit log (`<project>/audit/log.jsonl`) so the AI
+    /// lifecycle (plan → accept / reject) lives on its own
+    /// tamper-evident trail. AI-accepted commands ALSO appear in
+    /// the main log via `command_apply_batch`; this second log
+    /// answers "how many of the model's proposals did the user
+    /// accept?" without grepping through every command's actor
+    /// field.
+    fn ai_audit_append_at_root(
+        project_root: &Path,
+        scope: Scope,
+        diff: &aec_ai::Diff,
+        status: DiffStatus,
+        reason: Option<&str>,
+    ) -> Result<String, BridgeServiceError> {
+        let ai_audit_path = project_root.join("audit").join("ai_audit.jsonl");
+        let mut logger = AiAuditLogger::open(&ai_audit_path)?;
+        match status {
+            DiffStatus::Accepted => {
+                logger.log_acceptance(diff, scope)?;
+            }
+            DiffStatus::Rejected => {
+                logger.log_rejection(diff, scope, reason.unwrap_or(""))?;
+            }
+            DiffStatus::Pending => {
+                // `Pending` is a registry-only state and never
+                // reaches this path — the audit log only records
+                // terminal transitions.
+                return Err(BridgeServiceError::Ai(
+                    "ai_audit_append called with Pending status".into(),
+                ));
+            }
+        }
+        Ok(logger.head().to_string())
     }
 
     /// Cancel any in-flight or queued AI work by killing the sidecar
@@ -3328,6 +3951,404 @@ impl BridgeService {
             pending_diff_ids: snap.pending_diff_ids,
         })
     }
+
+    // ----- Draft scope (DXF import/export + drawing + sheet/layer ----- //
+
+    /// Import a DXF file at `dxf_path` into the project graph. Each
+    /// importable DXF entity (line / polyline / arc / circle /
+    /// ellipse / text) is converted to a modelling
+    /// [`aec_cad::primitives::Primitive`], wrapped in
+    /// [`aec_command::commands::draft::DrawPrimitive`], and applied
+    /// through [`Self::command_apply`] so each import is journaled,
+    /// auditable, and undo-able. Entities without a modelling
+    /// counterpart (Insert / Dimension / Spline / Hatch) are skipped
+    /// for now &mdash; see [`aec_cad::dxf::dxf_to_primitive`] for the
+    /// supported set.
+    pub fn draft_import_dxf(
+        &mut self,
+        project_path: &str,
+        dxf_path: &str,
+    ) -> Result<DraftImportDxfResult, BridgeServiceError> {
+        use aec_cad::dxf::{dxf_to_primitive, DxfReader};
+        use aec_command::commands::draft::DrawPrimitive;
+        use aec_command::commands::CommandKind;
+        use aec_core::types::EntityId;
+        use std::fs::File;
+
+        let f = File::open(dxf_path).map_err(|e| {
+            BridgeServiceError::Io(std::io::Error::other(format!(
+                "draft_import_dxf: open {dxf_path}: {e}"
+            )))
+        })?;
+        let doc = DxfReader::read(f)
+            .map_err(|e| BridgeServiceError::Invalid(format!("draft_import_dxf: parse: {e}")))?;
+        let mut layer_count = doc.layers.len() as u32;
+        let block_count = doc.block_records.len() as u32;
+        // Two-pass: convert every supported DXF entity to a
+        // `DrawPrimitive` command up front, count the rest as
+        // skipped, and apply the whole batch in one SQL transaction.
+        // Earlier versions issued N independent `command_apply`
+        // calls — O(N) project-package opens, O(N) engine reads of
+        // the entire entity table, O(N) audit-chain extensions.
+        // Routing through `command_apply_batch` collapses that to a
+        // single open, a single engine load, and a single
+        // transaction; the audit chain still records each gesture
+        // distinctly (see `execute_persistent_batch` phase 3).
+        let mut commands = Vec::with_capacity(doc.entities.len());
+        let mut skipped = 0u32;
+        for entity in &doc.entities {
+            match dxf_to_primitive(entity) {
+                Some(prim) => {
+                    commands.push(Command::user(CommandKind::DrawPrimitive(DrawPrimitive {
+                        entity_id: EntityId::new(),
+                        primitive: prim,
+                    })));
+                }
+                None => skipped += 1,
+            }
+        }
+        let entity_count = commands.len() as u32;
+        self.command_apply_batch(project_path, commands)?;
+        // Ensure we always report at least one layer (the "0" layer
+        // exists by default in every DXF document).
+        if layer_count == 0 {
+            layer_count = 1;
+        }
+        Ok(DraftImportDxfResult {
+            entity_count,
+            layer_count,
+            block_count,
+            skipped_count: skipped,
+        })
+    }
+
+    /// Export the project graph's draft primitives to a DXF file at
+    /// `dxf_path`. Walks the on-disk graph (rebuilt from the
+    /// SQLCipher `entities` table), filters to primitive records, and
+    /// converts each through
+    /// [`aec_cad::dxf::primitive_to_dxf`].
+    pub fn draft_export_dxf(
+        &self,
+        project_path: &str,
+        dxf_path: &str,
+    ) -> Result<DraftExportDxfResult, BridgeServiceError> {
+        use aec_cad::dxf::{primitive_to_dxf, DxfDocument, DxfWriter};
+        use aec_command::commands::draft::DrawPrimitive;
+        use std::fs::File;
+
+        let (_pkg, conn) =
+            ProjectPackage::open_with_master_key_and_database(project_path, &self.master_key)?;
+        let engine = CommandEngine::open(&conn, Scope::Draft)?;
+        let mut doc = DxfDocument::default();
+        for rec in engine.graph().iter() {
+            if rec.kind != "primitive" {
+                continue;
+            }
+            let prim: DrawPrimitive = match serde_json::from_value(rec.body.clone()) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if let Some(d) = primitive_to_dxf(&prim.primitive) {
+                doc.entities.push(d);
+            }
+        }
+        let entity_count = doc.entities.len() as u32;
+        let mut f = File::create(dxf_path).map_err(|e| {
+            BridgeServiceError::Io(std::io::Error::other(format!(
+                "draft_export_dxf: create {dxf_path}: {e}"
+            )))
+        })?;
+        DxfWriter::write(&doc, &mut f)
+            .map_err(|e| BridgeServiceError::Export(format!("draft_export_dxf: write: {e}")))?;
+        let file_size = std::fs::metadata(dxf_path).map_or(0, |m| m.len());
+        Ok(DraftExportDxfResult {
+            path: dxf_path.to_string(),
+            entity_count,
+            file_size,
+        })
+    }
+
+    // ----- Deliver scope (revision snapshot + diff) ----- //
+
+    /// Capture a revision snapshot of the project.
+    ///
+    /// The snapshot includes (a) the project graph entities, hashed
+    /// via BLAKE3 of their canonical serialised form, (b) the audit
+    /// chain head pointer at snapshot time, and (c) manifest
+    /// metadata for UI display. The snapshot is persisted to
+    /// `<project>/revisions/<id>.json` atomically (write to .tmp,
+    /// rename). The journaled
+    /// [`aec_command::commands::deliver::CreateRevision`] command
+    /// records the user-visible gesture in the audit chain.
+    pub fn deliver_create_revision(
+        &mut self,
+        project_path: &str,
+        tag: &str,
+        description: &str,
+        caller_entities: Option<Vec<RevisionTrackedEntity>>,
+    ) -> Result<RevisionSummary, BridgeServiceError> {
+        use aec_command::commands::deliver::CreateRevision;
+        use aec_command::commands::CommandKind;
+        use aec_core::revision::{RevisionDraft, RevisionEntity, RevisionStore};
+
+        // 1) Open package + journal the command (audit trail + undo
+        //    so the gesture is reversible if a user mis-tags). We
+        //    share the same `conn` between the command-apply step
+        //    and the post-apply enumeration in (2) so the snapshot
+        //    sees exactly the state the command just committed —
+        //    `command_apply_on_conn` reuses the connection instead
+        //    of opening a second one. (Earlier iterations had two
+        //    independent opens; if `CreateRevision` ever gains
+        //    graph-mutating deltas, the outer conn would see stale
+        //    state until the next reopen.)
+        let (pkg, mut conn) =
+            ProjectPackage::open_with_master_key_and_database(project_path, &self.master_key)?;
+        let cmd = Command::user(CommandKind::CreateRevision(CreateRevision {
+            tag: tag.to_string(),
+            description: description.to_string(),
+            revision_id: None,
+        }));
+        let apply_res = self.command_apply_on_conn(project_path, &mut conn, cmd)?;
+
+        // 2) Build the tracked-entity list. Prefer caller-supplied
+        //    entries when present (so the renderer can include
+        //    domain-specific entities the bridge can't reach, e.g.
+        //    schedule rows held in renderer memory). Otherwise
+        //    enumerate the on-disk graph and hash each entity's
+        //    canonical body via BLAKE3.
+        let mut draft = RevisionDraft::new(
+            pkg.manifest().project_id.clone(),
+            tag.to_string(),
+            description.to_string(),
+            // Audit head at the moment of snapshot. We re-read the
+            // log here rather than threading it through
+            // command_apply because the JSONL is the source of
+            // truth and command_apply doesn't expose the head.
+            read_audit_head(pkg.root())?,
+            pkg.manifest().name.clone(),
+            pkg.manifest().app_version.clone(),
+        );
+        if let Some(entries) = caller_entities {
+            for e in entries {
+                draft = draft.add_entity(RevisionEntity {
+                    category: e.category,
+                    id: e.id,
+                    payload_hash: e.payload_hash,
+                    label: e.label,
+                });
+            }
+        } else {
+            // The deliver-scope command engine doesn't expose the
+            // graph, so re-open as Design (the scope that owns the
+            // entity store) to enumerate tracked entities for the
+            // snapshot.
+            let engine = CommandEngine::open(&conn, Scope::Design)?;
+            for rec in engine.graph().iter() {
+                let canonical = serde_json::to_vec(&rec.body)
+                    .map_err(|e| BridgeServiceError::Command(format!("revision serialize: {e}")))?;
+                let hash = blake3::hash(&canonical).to_hex().to_string();
+                draft = draft.add_entity(RevisionEntity {
+                    category: rec.kind.clone(),
+                    id: rec.id.to_string(),
+                    payload_hash: hash,
+                    label: None,
+                });
+            }
+        }
+
+        // 3) Persist to revisions/<id>.json.
+        let store = RevisionStore::open(pkg.root().join("revisions"))?;
+        let revision = store.create(draft)?;
+
+        // Discard the unused command result detail; we surface the
+        // revision summary instead.
+        let _ = apply_res;
+
+        Ok(revision_to_summary(revision))
+    }
+
+    /// Return the project's revision summaries in chronological
+    /// order. Suitable for the Deliver-mode "Versions" pane.
+    pub fn deliver_list_revisions(
+        &self,
+        project_path: &str,
+    ) -> Result<Vec<RevisionSummary>, BridgeServiceError> {
+        use aec_core::revision::RevisionStore;
+        let (pkg, _conn) =
+            ProjectPackage::open_with_master_key_and_database(project_path, &self.master_key)?;
+        let store = RevisionStore::open(pkg.root().join("revisions"))?;
+        Ok(store.list()?.into_iter().map(revision_to_summary).collect())
+    }
+
+    /// Diff two revisions at the tracked-entity level. Both revisions
+    /// must exist in the project's `revisions/` directory.
+    pub fn deliver_compare_revisions(
+        &self,
+        project_path: &str,
+        base_id: &str,
+        head_id: &str,
+    ) -> Result<RevisionDiffReport, BridgeServiceError> {
+        use aec_core::revision::RevisionStore;
+        use aec_core::version_diff::compare_revisions;
+
+        let (pkg, _conn) =
+            ProjectPackage::open_with_master_key_and_database(project_path, &self.master_key)?;
+        let store = RevisionStore::open(pkg.root().join("revisions"))?;
+        let base = store
+            .get(base_id)?
+            .ok_or_else(|| BridgeServiceError::Invalid(format!("revision not found: {base_id}")))?;
+        let head = store
+            .get(head_id)?
+            .ok_or_else(|| BridgeServiceError::Invalid(format!("revision not found: {head_id}")))?;
+        let diff = compare_revisions(&base, &head);
+        let mut by_category = std::collections::BTreeMap::new();
+        for (cat, counts) in &diff.by_category {
+            by_category.insert(
+                cat.clone(),
+                RevisionDiffCounts {
+                    added: counts.added as u32,
+                    removed: counts.removed as u32,
+                    modified: counts.modified as u32,
+                    unchanged: counts.unchanged as u32,
+                },
+            );
+        }
+        let changes = diff
+            .changes
+            .into_iter()
+            .map(|c| RevisionEntityChange {
+                category: c.category,
+                id: c.id,
+                kind: match c.kind {
+                    aec_core::version_diff::EntityChangeKind::Added => "added".into(),
+                    aec_core::version_diff::EntityChangeKind::Removed => "removed".into(),
+                    aec_core::version_diff::EntityChangeKind::Modified => "modified".into(),
+                    aec_core::version_diff::EntityChangeKind::Unchanged => "unchanged".into(),
+                },
+                before_hash: c.before_hash,
+                after_hash: c.after_hash,
+                label: c.label,
+            })
+            .collect();
+        Ok(RevisionDiffReport {
+            base_revision_id: base_id.to_string(),
+            head_revision_id: head_id.to_string(),
+            by_category,
+            changes,
+        })
+    }
+}
+
+fn revision_to_summary(r: aec_core::revision::Revision) -> RevisionSummary {
+    RevisionSummary {
+        revision_id: r.id,
+        tag: r.tag,
+        description: r.description,
+        created_at: r.created_at.to_rfc3339(),
+        audit_chain_head: r.audit_chain_head,
+        manifest_name: r.manifest_name,
+        manifest_app_version: r.manifest_app_version,
+        tracked_entities: r
+            .tracked_entities
+            .into_iter()
+            .map(|e| RevisionTrackedEntity {
+                category: e.category,
+                id: e.id,
+                payload_hash: e.payload_hash,
+                label: e.label,
+            })
+            .collect(),
+    }
+}
+
+/// Read the head BLAKE3 hash of the project's append-only audit log
+/// (an empty string if the chain hasn't been initialised yet — a
+/// brand-new project before its first command).
+fn read_audit_head(project_root: &Path) -> Result<String, BridgeServiceError> {
+    let path = project_root.join("audit").join("log.jsonl");
+    if !path.exists() {
+        return Ok(String::new());
+    }
+    let log = AuditLog::open(path)?;
+    Ok(log.head().to_string())
+}
+
+/// Result returned by [`BridgeService::draft_import_dxf`]. Counts are
+/// post-import; `skipped_count` covers DXF entities that don't have a
+/// modelling primitive counterpart yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftImportDxfResult {
+    pub entity_count: u32,
+    pub layer_count: u32,
+    pub block_count: u32,
+    pub skipped_count: u32,
+}
+
+/// Result returned by [`BridgeService::draft_export_dxf`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftExportDxfResult {
+    pub path: String,
+    pub entity_count: u32,
+    pub file_size: u64,
+}
+
+/// JSON-friendly mirror of [`aec_core::revision::Revision`] used by
+/// the [`BridgeService::deliver_*`] endpoints. Field names align 1:1
+/// (via serde rename) with the renderer-side `RevisionSummary`
+/// interface in `apps/desktop/electron/bridge.ts`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RevisionSummary {
+    pub revision_id: String,
+    pub tag: String,
+    pub description: String,
+    pub created_at: String,
+    pub audit_chain_head: String,
+    pub manifest_name: String,
+    pub manifest_app_version: String,
+    pub tracked_entities: Vec<RevisionTrackedEntity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RevisionTrackedEntity {
+    pub category: String,
+    pub id: String,
+    pub payload_hash: String,
+    pub label: Option<String>,
+}
+
+/// JSON-friendly mirror of [`aec_core::version_diff::VersionDiff`].
+/// Field names align 1:1 (via serde rename) with the renderer-side
+/// `VersionDiffSummary` interface in `apps/desktop/electron/bridge.ts`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RevisionDiffReport {
+    pub base_revision_id: String,
+    pub head_revision_id: String,
+    pub by_category: std::collections::BTreeMap<String, RevisionDiffCounts>,
+    pub changes: Vec<RevisionEntityChange>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RevisionDiffCounts {
+    pub added: u32,
+    pub removed: u32,
+    pub modified: u32,
+    pub unchanged: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RevisionEntityChange {
+    pub category: String,
+    pub id: String,
+    /// One of `"added"` / `"removed"` / `"modified"` / `"unchanged"`.
+    pub kind: String,
+    pub before_hash: Option<String>,
+    pub after_hash: Option<String>,
+    pub label: Option<String>,
 }
 
 /// Render an [`aec_ai::RuntimeState`] as the lowercase wire string the
@@ -3432,14 +4453,155 @@ fn slugify(name: &str) -> String {
     out
 }
 
+/// Persist the commands emitted by
+/// [`aec_command::template_apply::template_to_commands`] into the
+/// freshly-created project's SQLCipher database, then drop a JSON
+/// sidecar in `<project>/audit/template_instantiation.json` that
+/// captures the entity counts, the originating template key, and any
+/// rooms that were skipped by the fail-soft instantiator.
+///
+/// Atomicity: the whole batch lands in one SQL transaction inside
+/// `CommandEngine::execute_persistent_batch`. If any single command
+/// fails validation the transaction is rolled back and the function
+/// returns an error; the caller deletes the now-incomplete project
+/// directory in that branch.
+///
+/// Takes `outcome` **by value** (Devin Review `ANALYSIS_0005` on
+/// PR #51): the previous shape took `&InstantiationOutcome` and
+/// then deep-cloned `outcome.commands` into
+/// `execute_persistent_batch`. The villa template emits ~77
+/// commands (11 rooms × 7 commands each + lighting + cameras),
+/// each carrying a serialised JSON body, so the clone was a real
+/// allocation hot-spot dominated only by the SQL transaction that
+/// follows. Consuming the outcome lets us move
+/// `outcome.commands` straight into the engine and clone nothing.
+///
+/// Engine scope is derived from `outcome.commands[0].scope`
+/// (Devin Review `ANALYSIS_0004` on PR #51): the old shape
+/// hardcoded `Scope::Design`, which works today because every
+/// `CommandKind` emitted by the template path returns
+/// `Scope::Design` from its `scope()` method, but a future
+/// template feature emitting a non-Design command (e.g. a Draft
+/// `DrawPrimitive` for a 2D plan template, or a Render
+/// `SaveCamera` variant) would silently trip a `ScopeMismatch`
+/// inside the batch guard. Reading the scope off the commands
+/// themselves matches the AI accept path's pattern
+/// (`engine_scope = conversion.commands[0].scope`) and removes
+/// the brittle-against-extension assumption.
+fn apply_template_outcome(
+    pkg: &ProjectPackage,
+    master_key: &[u8; 32],
+    template_key: &str,
+    outcome: aec_command::template_apply::InstantiationOutcome,
+) -> Result<(), BridgeServiceError> {
+    // Destructure once so we can move `commands` into the engine
+    // and still borrow the other fields for the sidecar JSON. The
+    // batch-internal-consistency guard inside
+    // `execute_persistent_batch` will reject any command whose
+    // scope differs from `commands[0].scope`, so picking the first
+    // command's scope is both correct and uniquely defined.
+    let aec_command::template_apply::InstantiationOutcome {
+        commands,
+        rooms,
+        camera_ids,
+        lighting_preset,
+        skipped,
+    } = outcome;
+    let applied_command_count = commands.len();
+    if !commands.is_empty() {
+        let engine_scope = commands[0].scope;
+        let mut conn = pkg.open_database(master_key)?;
+        let mut engine = CommandEngine::open(&conn, engine_scope)?;
+        engine.execute_persistent_batch(commands, &mut conn)?;
+        // Drop the connection eagerly so the project package's SQLite
+        // file is closed before we touch the audit sidecar.
+        drop(engine);
+        drop(conn);
+    }
+
+    let sidecar_dir = pkg.root().join("audit");
+    std::fs::create_dir_all(&sidecar_dir)?;
+    let sidecar = sidecar_dir.join("template_instantiation.json");
+    let body = serde_json::json!({
+        "template_key": template_key,
+        "applied_command_count": applied_command_count,
+        "room_count": rooms.len(),
+        "camera_count": camera_ids.len(),
+        "lighting_preset": lighting_preset,
+        "skipped": skipped.iter().map(|s| serde_json::json!({
+            "storey": s.storey_name,
+            "room": s.room_name,
+            "reason": s.reason,
+        })).collect::<Vec<_>>(),
+        "rooms": rooms.iter().map(|r| serde_json::json!({
+            "room_id": r.room_id.as_str(),
+            "wall_ids": r.wall_ids.iter().map(aec_core::types::EntityId::as_str).collect::<Vec<_>>(),
+            "floor_id": r.floor_id.as_str(),
+            "ceiling_id": r.ceiling_id.as_str(),
+            "storey": r.storey_name,
+            "footprint_origin_mm": r.footprint_origin_mm,
+            "footprint_size_mm": r.footprint_size_mm,
+            "height_mm": r.height_mm,
+        })).collect::<Vec<_>>(),
+        "camera_ids": camera_ids.iter().map(aec_core::types::EntityId::as_str).collect::<Vec<_>>(),
+    });
+    let bytes = serde_json::to_vec_pretty(&body)
+        .map_err(|e| BridgeServiceError::Core(format!("serialise template sidecar: {e}")))?;
+    std::fs::write(&sidecar, bytes)?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn write_template(root: &std::path::Path, category: &str, id: &str) {
+        // Default: zero-room, zero-camera, no lighting preset — yields
+        // an empty command batch on instantiation so tests that focus
+        // on later command_apply / command_undo behaviour aren't
+        // perturbed by template-emitted entries in the undo journal.
+        write_template_with(root, category, id, &[], None, &[]);
+    }
+
+    /// Variant of [`write_template`] for tests that want explicit
+    /// template content (rooms / lighting preset / cameras). Returns
+    /// the template key so the call site can pass it back to
+    /// `project_create_from_template`.
+    fn write_template_with(
+        root: &std::path::Path,
+        category: &str,
+        id: &str,
+        rooms: &[(&str, f64, f64, f64)],
+        lighting_preset: Option<&str>,
+        cameras: &[(&str, [f64; 3], [f64; 3], f64)],
+    ) -> String {
         let category_dir = root.join(category);
         std::fs::create_dir_all(&category_dir).unwrap();
         let key = format!("{category}.{id}");
+        let rooms_json: Vec<serde_json::Value> = rooms
+            .iter()
+            .map(|(name, width, depth, height)| {
+                serde_json::json!({
+                    "name": name,
+                    "width_mm": width,
+                    "depth_mm": depth,
+                    "height_mm": height,
+                    "origin_mm": [0.0, 0.0, 0.0],
+                })
+            })
+            .collect();
+        let cameras_json: Vec<serde_json::Value> = cameras
+            .iter()
+            .map(|(name, loc, target, focal)| {
+                serde_json::json!({
+                    "name": name,
+                    "location_mm": loc,
+                    "target_mm": target,
+                    "focal_length_mm": focal,
+                })
+            })
+            .collect();
         let json = serde_json::json!({
             "template_id": key,
             "name": format!("Test {id}"),
@@ -3448,17 +4610,18 @@ mod tests {
             "region_defaults": {
                 "EU": {"units": "mm", "standards": ["IFC4"]}
             },
-            "rooms": [],
+            "rooms": rooms_json,
             "default_walls": {
                 "exterior_thickness_mm": 250,
                 "interior_thickness_mm": 100,
                 "material": "wall_white"
             },
-            "lighting_preset": "daylight",
+            "lighting_preset": lighting_preset,
             "asset_shelf": [],
-            "camera_presets": []
+            "camera_presets": cameras_json
         });
         std::fs::write(category_dir.join(format!("{id}.json")), json.to_string()).unwrap();
+        key
     }
 
     fn service() -> (BridgeService, tempfile::TempDir) {
@@ -5718,5 +6881,167 @@ END-ISO-10303-21;\n";
             Some("false"),
             "IsExternal preserved"
         );
+    }
+
+    // ============================================================
+    // Group A Phase 10: draft / deliver scope wiring
+    // ============================================================
+
+    fn seed_one_primitive(s: &mut BridgeService, summary: &ProjectSummary) {
+        use aec_cad::primitives::{Line, Primitive};
+        use aec_command::commands::draft::DrawPrimitive;
+        use aec_command::commands::CommandKind;
+        let cmd = aec_command::commands::Command::user(CommandKind::DrawPrimitive(DrawPrimitive {
+            entity_id: aec_core::types::EntityId::new(),
+            primitive: Primitive::Line(Line::new("0", [0.0, 0.0], [10.0, 0.0])),
+        }));
+        s.command_apply(&summary.path, cmd).expect("seed primitive");
+    }
+
+    #[test]
+    fn draft_export_dxf_emits_all_primitives_then_reimports_them() {
+        let (mut s, g) = service();
+        let summary = s
+            .project_create_from_template("interior.apartment", "Dxf-Roundtrip")
+            .unwrap();
+        seed_one_primitive(&mut s, &summary);
+        // Export to a temp DXF file.
+        let dxf_path = g.path().join("export.dxf");
+        let res = s
+            .draft_export_dxf(&summary.path, dxf_path.to_str().unwrap())
+            .expect("export DXF");
+        assert_eq!(res.entity_count, 1);
+        assert!(res.file_size > 0);
+        // Now re-import into the same project — should add one more
+        // primitive (the import is additive).
+        let imp = s
+            .draft_import_dxf(&summary.path, dxf_path.to_str().unwrap())
+            .expect("import DXF");
+        assert_eq!(imp.entity_count, 1);
+        // The "0" layer is always present.
+        assert!(imp.layer_count >= 1);
+    }
+
+    #[test]
+    fn deliver_create_then_list_revisions_returns_camelcase_summary() {
+        let (mut s, _g) = service();
+        let summary = s
+            .project_create_from_template("interior.apartment", "Revision-Test")
+            .unwrap();
+        let rev = s
+            .deliver_create_revision(&summary.path, "rev-1", "first snapshot", None)
+            .expect("create revision");
+        assert_eq!(rev.tag, "rev-1");
+        assert_eq!(rev.description, "first snapshot");
+        assert!(!rev.revision_id.is_empty(), "revision_id is generated");
+        // Empty new project — tracked_entities reflects whatever the
+        // template seeded (could be zero or more, but the field
+        // exists and serialises as `trackedEntities`).
+        let json = serde_json::to_value(&rev).unwrap();
+        assert!(json.get("trackedEntities").is_some());
+        assert!(json.get("revisionId").is_some());
+
+        // listing returns the same revision (by revision_id).
+        let list = s.deliver_list_revisions(&summary.path).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].revision_id, rev.revision_id);
+    }
+
+    #[test]
+    fn deliver_compare_revisions_reports_added_and_modified() {
+        use aec_cad::primitives::{Line, Primitive};
+        use aec_command::commands::draft::DrawPrimitive;
+        use aec_command::commands::CommandKind;
+        let (mut s, _g) = service();
+        let summary = s
+            .project_create_from_template("interior.apartment", "Diff-Test")
+            .unwrap();
+        // r1: snapshot the empty project.
+        let r1 = s
+            .deliver_create_revision(&summary.path, "r1", "empty", None)
+            .unwrap();
+        // Add a primitive between snapshots.
+        let id = aec_core::types::EntityId::new();
+        let cmd = aec_command::commands::Command::user(CommandKind::DrawPrimitive(DrawPrimitive {
+            entity_id: id.clone(),
+            primitive: Primitive::Line(Line::new("0", [0.0, 0.0], [10.0, 0.0])),
+        }));
+        s.command_apply(&summary.path, cmd).unwrap();
+        let r2 = s
+            .deliver_create_revision(&summary.path, "r2", "after add", None)
+            .unwrap();
+        // Compare.
+        let diff = s
+            .deliver_compare_revisions(&summary.path, &r1.revision_id, &r2.revision_id)
+            .expect("diff");
+        assert_eq!(diff.base_revision_id, r1.revision_id);
+        assert_eq!(diff.head_revision_id, r2.revision_id);
+        // The added line shows up either as a new entity in `head`
+        // (no entry in `base`) → Added in by_category.
+        let counts = diff.by_category.get("primitive").unwrap_or_else(|| {
+            panic!(
+                "expected `primitive` category in diff; got keys: {:?}",
+                diff.by_category.keys().collect::<Vec<_>>()
+            )
+        });
+        assert!(counts.added >= 1, "added count: {counts:?}");
+        assert_eq!(counts.removed, 0);
+    }
+
+    #[test]
+    fn revision_summary_serializes_in_camel_case() {
+        let rev = RevisionSummary {
+            revision_id: "rev_a".into(),
+            tag: "v1".into(),
+            description: "desc".into(),
+            created_at: "2026-05-25T00:00:00Z".into(),
+            audit_chain_head: "abc".into(),
+            manifest_name: "Demo".into(),
+            manifest_app_version: "0.1.0".into(),
+            tracked_entities: vec![RevisionTrackedEntity {
+                category: "wall".into(),
+                id: "e1".into(),
+                payload_hash: "h".into(),
+                label: None,
+            }],
+        };
+        let json = serde_json::to_value(&rev).unwrap();
+        assert!(json.get("revisionId").is_some());
+        assert!(json.get("trackedEntities").is_some());
+        assert!(json.get("auditChainHead").is_some());
+        assert!(json.get("manifestAppVersion").is_some());
+        // No snake_case leaks.
+        assert!(json.get("revision_id").is_none());
+        assert!(json.get("tracked_entities").is_none());
+    }
+
+    #[test]
+    fn diff_report_serializes_in_camel_case() {
+        let diff = RevisionDiffReport {
+            base_revision_id: "a".into(),
+            head_revision_id: "b".into(),
+            by_category: std::collections::BTreeMap::from([(
+                "wall".into(),
+                RevisionDiffCounts {
+                    added: 1,
+                    ..Default::default()
+                },
+            )]),
+            changes: vec![RevisionEntityChange {
+                category: "wall".into(),
+                id: "w1".into(),
+                kind: "added".into(),
+                before_hash: None,
+                after_hash: Some("h".into()),
+                label: None,
+            }],
+        };
+        let json = serde_json::to_value(&diff).unwrap();
+        assert!(json.get("baseRevisionId").is_some());
+        assert!(json.get("headRevisionId").is_some());
+        assert!(json.get("byCategory").is_some());
+        let ch = json["changes"][0].clone();
+        assert!(ch.get("beforeHash").is_some());
+        assert!(ch.get("afterHash").is_some());
     }
 }
