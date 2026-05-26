@@ -15,7 +15,7 @@ use aec_bim::classification::{ClassificationStore, IfcClass};
 use aec_bim::properties::{PropertySet, PropertyStore, PropertyValue, QuantitySet};
 use aec_bim::schedules::{
     backfill_space_quantities, generate_door_schedule, generate_material_schedule,
-    generate_room_schedule, generate_window_schedule,
+    generate_room_schedule, generate_window_schedule, ScheduleSheet,
 };
 use aec_bim::spatial::Project;
 use aec_core::types::EntityId;
@@ -262,7 +262,6 @@ fn material_schedule_aggregates_walls_by_material() {
 
 #[test]
 fn all_schedules_can_be_written_to_a_single_xlsx_workbook() {
-    use aec_bim::schedules::ScheduleSheet;
     let f = build_fixture();
     let (_, room_sheet) = generate_room_schedule(&f.project, &f.props);
     let (_, door_sheet) = generate_door_schedule(&f.classification, &f.props);

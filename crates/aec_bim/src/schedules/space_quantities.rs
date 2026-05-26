@@ -77,7 +77,14 @@ fn backfill_inner<S: std::hash::BuildHasher>(
         let Some(footprint) = footprints.get(&id) else {
             continue;
         };
-        if footprint.len() < 3 {
+        // Use `effective_len` so a closed polygon expressed with a
+        // trailing duplicate point (e.g. `[a, b, c, a]`) is recognised
+        // as a degenerate-vs-real ring consistently with
+        // `polygon_area_m2` / `polygon_perimeter_m`. Raw `len() < 3`
+        // would have let a 3-point closed polygon (effective len 2)
+        // through and then written a zero-area qto entry that adds
+        // nothing but does dirty the property store.
+        if effective_len(footprint) < 3 {
             continue;
         }
 
@@ -162,7 +169,7 @@ mod tests {
     use super::*;
 
     use crate::classification::IfcClass;
-    use crate::properties::{PropertySet, PropertyStore, PropertyValue, QuantitySet};
+    use crate::properties::{PropertyStore, PropertyValue, QuantitySet};
 
     fn square_5x4_open() -> FootprintPolygon {
         vec![[0.0, 0.0], [5.0, 0.0], [5.0, 4.0], [0.0, 4.0]]
@@ -337,8 +344,26 @@ mod tests {
         assert_eq!(backfill_space_quantities(&p, &mut props, &fps), 0);
     }
 
-    // Touch the unused import so clippy doesn't flag it for the test
-    // module — pset import is referenced indirectly through `_` below.
-    #[allow(dead_code)]
-    fn _refs_pset(_: PropertySet) {}
+    #[test]
+    fn degenerate_closed_polygon_does_not_write_zero_qto() {
+        // Regression guard for the `effective_len` guard: a polygon
+        // whose *raw* length is ≥3 but whose *effective* length
+        // (after stripping the trailing closing point) is <3 must be
+        // skipped, not written into the qto as a zero-area entry.
+        let (p, s) = project_with_one_space();
+        let mut props = PropertyStore::new();
+        let mut fps = std::collections::HashMap::new();
+        // Three raw points, two effective (last == first).
+        fps.insert(s.clone(), vec![[0.0, 0.0], [1.0, 0.0], [0.0, 0.0]]);
+        let n = backfill_space_quantities(&p, &mut props, &fps);
+        assert_eq!(n, 0, "degenerate closed polygon must be skipped");
+        assert!(
+            props.get(&s).is_none()
+                || props
+                    .get(&s)
+                    .and_then(|e| e.get("Qto_SpaceBaseQuantities", "NetFloorArea"))
+                    .is_none(),
+            "no qto entry should be written for a degenerate polygon"
+        );
+    }
 }
