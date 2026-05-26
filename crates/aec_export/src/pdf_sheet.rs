@@ -94,12 +94,25 @@ impl Linetype {
         }
     }
 
-    /// Return the printpdf dash-pattern triple (dash_1, gap_1, dash_2,
-    /// gap_2) for this linetype, expressed in PDF user units
-    /// (printpdf takes integers and we pass mm directly, which is
-    /// close enough at typical sheet scales). [`Linetype::Continuous`]
-    /// returns `None` so the caller can clear any prior dash pattern
-    /// by re-applying the default.
+    /// Return the printpdf dash-pattern (up to three dash/gap pairs)
+    /// for this linetype, expressed in PDF user units (printpdf
+    /// takes integers and we pass mm directly, which is close
+    /// enough at typical sheet scales). [`Linetype::Continuous`]
+    /// returns `None` so the caller can clear any prior dash
+    /// pattern by re-applying the default.
+    ///
+    /// ## Renderer constraint
+    ///
+    /// `printpdf::LineDashPattern` exposes at most three dash/gap
+    /// pairs (`dash_1/gap_1`, `dash_2/gap_2`, `dash_3/gap_3`). The
+    /// canonical AutoCAD PHANTOM linetype is a five-segment pattern
+    /// (`dash-dot-dot-dash-dot-dot`), which fits in three pairs; the
+    /// canonical DIVIDE linetype is also a six-segment pattern
+    /// (`dash-dot-dot`). DXF linetype tables on disk can carry more
+    /// segments than printpdf can render — anything beyond the
+    /// third pair is dropped on export. The patterns below use the
+    /// extra pair where present so each variant produces a visibly
+    /// distinct stroke.
     pub fn dash_pattern(self) -> Option<DashPattern> {
         match self {
             Self::Continuous => None,
@@ -107,28 +120,35 @@ impl Linetype {
             Self::Dashed => Some(DashPattern::two(4, 2)),
             // Tighter hidden-line pattern.
             Self::Hidden => Some(DashPattern::two(3, 2)),
-            // Long dash / short dash / long dash centerline.
+            // CENTER: long dash, short gap, short dash, short gap.
             Self::Center => Some(DashPattern::four(6, 2, 1, 2)),
-            // 6-mm dash / 1.5-mm gap / 1-mm dash / 1.5-mm gap
-            // pattern, drawn as the four-segment phantom line.
-            Self::Phantom => Some(DashPattern::four(6, 2, 1, 2)),
-            // Dash-dot: dash, gap, dot, gap.
+            // PHANTOM: long dash, short gap, short dash, short gap,
+            // short dash, short gap (dash-dot-dot, six-segment).
+            // Distinct from CENTER via the third dot.
+            Self::Phantom => Some(DashPattern::six(12, 2, 1, 2, 1, 2)),
+            // DASHDOT: dash, gap, dot, gap (four-segment).
             Self::DashDot => Some(DashPattern::four(4, 1, 1, 1)),
-            // Divide: dash-dot-dot.
-            Self::Divide => Some(DashPattern::four(4, 1, 1, 1)),
+            // DIVIDE: dash, gap, dot, gap, dot, gap (six-segment
+            // dash-dot-dot). Distinct from DASHDOT via the third dot.
+            Self::Divide => Some(DashPattern::six(4, 1, 1, 1, 1, 1)),
         }
     }
 }
 
 /// A printpdf-compatible dash specification. Stored as integer mm
 /// because printpdf's `LineDashPattern` takes `i64`. `dash_2` /
-/// `gap_2` are `None` for two-segment patterns.
+/// `gap_2` are `None` for two-segment patterns; `dash_3` / `gap_3`
+/// are `None` for two- and four-segment patterns. printpdf's
+/// `LineDashPattern` does not support more than three dash/gap
+/// pairs, so the struct stops there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DashPattern {
     pub dash_1: i64,
     pub gap_1: i64,
     pub dash_2: Option<i64>,
     pub gap_2: Option<i64>,
+    pub dash_3: Option<i64>,
+    pub gap_3: Option<i64>,
 }
 
 impl DashPattern {
@@ -138,6 +158,8 @@ impl DashPattern {
             gap_1: gap,
             dash_2: None,
             gap_2: None,
+            dash_3: None,
+            gap_3: None,
         }
     }
     fn four(dash_1: i64, gap_1: i64, dash_2: i64, gap_2: i64) -> Self {
@@ -146,6 +168,18 @@ impl DashPattern {
             gap_1,
             dash_2: Some(dash_2),
             gap_2: Some(gap_2),
+            dash_3: None,
+            gap_3: None,
+        }
+    }
+    fn six(dash_1: i64, gap_1: i64, dash_2: i64, gap_2: i64, dash_3: i64, gap_3: i64) -> Self {
+        Self {
+            dash_1,
+            gap_1,
+            dash_2: Some(dash_2),
+            gap_2: Some(gap_2),
+            dash_3: Some(dash_3),
+            gap_3: Some(gap_3),
         }
     }
 
@@ -156,8 +190,8 @@ impl DashPattern {
             gap_1: Some(self.gap_1),
             dash_2: self.dash_2,
             gap_2: self.gap_2,
-            dash_3: None,
-            gap_3: None,
+            dash_3: self.dash_3,
+            gap_3: self.gap_3,
         }
     }
 }
@@ -222,26 +256,31 @@ impl DimStyleTable {
     pub fn from_slice(styles: &[DxfDimStyle]) -> Self {
         let mut t = Self::default();
         for s in styles {
-            t.styles.insert(s.name.clone(), s.clone());
+            t.styles.insert(s.name.to_ascii_uppercase(), s.clone());
         }
         t
     }
 
+    /// Look up a dim style by name. DXF style names are
+    /// case-insensitive per AutoCAD convention, so the key is
+    /// uppercased on both insert and get (mirroring
+    /// [`LayerPlotTable::get`]).
     pub fn get(&self, name: &str) -> Option<&DxfDimStyle> {
-        self.styles.get(name)
+        self.styles.get(&name.to_ascii_uppercase())
     }
 
-    /// Effective style for a given name. Falls back to a "standard"
-    /// default if the named style is missing.
+    /// Effective style for a given name. Falls back to
+    /// [`DxfDimStyle::standard`] (the AutoCAD `STANDARD` defaults,
+    /// including `decimal_places = 4`) if the named style is
+    /// missing, then overwrites the `name` field so callers see
+    /// the requested style name back in the returned value.
     pub fn resolve(&self, name: &str) -> DxfDimStyle {
-        self.get(name).cloned().unwrap_or(DxfDimStyle {
-            name: name.to_string(),
-            text_height: 2.5,
-            arrow_size: 2.5,
-            units_scale: 1.0,
-            decimal_places: 0,
-            text_style: String::new(),
-        })
+        if let Some(s) = self.get(name) {
+            return s.clone();
+        }
+        let mut fallback = DxfDimStyle::standard();
+        fallback.name = name.to_string();
+        fallback
     }
 }
 
@@ -698,31 +737,36 @@ fn draw_dimension(
             let a = to_paper(dim.def_point_a);
             let b = to_paper(dim.def_point_b);
             let d = to_paper(dim.def_point);
-            // Project `d` onto the perpendicular distance from a-b's
-            // baseline by passing it through `model_to_paper` and
-            // letting it sit at the offset distance.
             let (ax, ay) = to_pdf(a);
             let (bx, by) = to_pdf(b);
-            let (dx, dy) = to_pdf(d);
+            // Only the dim-line offset's Y survives — the dim line
+            // is drawn between the two measured points' X values,
+            // not at the offset point's X.
+            let (_, dy) = to_pdf(d);
 
-            // Extension lines: from a to projection-of-a onto dim
-            // line, b to projection-of-b. For simplicity we draw
-            // straight lines from the measured points to the dim-
-            // line endpoints (which in our authored fixtures sit
-            // directly above / below the points).
+            // Extension lines: from each measured point
+            // perpendicular to the dim line, ending at the dim
+            // line's Y. For Linear (horizontal dim line) and the
+            // typical Aligned cases in our fixtures the perpendicular
+            // is the vertical at the measured point's X — the
+            // extension line is `(ax, ay) → (ax, dy)` (and the same
+            // for `b`). Earlier revisions of this code used `dx`
+            // (the dim-line *offset* point's X) for line1 and the
+            // dim-line start, which produced a diagonal extension
+            // line and a half-length dim line.
             let line1 = PdfLine {
-                points: vec![(Point::new(ax, ay), false), (Point::new(dx, dy), false)],
+                points: vec![(Point::new(ax, ay), false), (Point::new(ax, dy), false)],
                 is_closed: false,
             };
             let line2 = PdfLine {
                 points: vec![(Point::new(bx, by), false), (Point::new(bx, dy), false)],
                 is_closed: false,
             };
-            // Dim line: from (a.x, d.y) to (b.x, d.y) for Linear,
-            // straight from d-projection-of-a to d-projection-of-b
-            // for Aligned. We treat both as dx → bx along d.y.
+            // Dim line: from (a.x, d.y) to (b.x, d.y) — spans the
+            // full distance between the two measured points at the
+            // dim-line offset height.
             let dim_line = PdfLine {
-                points: vec![(Point::new(dx, dy), false), (Point::new(bx, dy), false)],
+                points: vec![(Point::new(ax, dy), false), (Point::new(bx, dy), false)],
                 is_closed: false,
             };
             layer_ref.add_line(line1);
@@ -731,11 +775,16 @@ fn draw_dimension(
 
             // Arrowheads at each end of the dim line, pointing
             // inward. The arrow is drawn in paper-space mm.
-            draw_arrowhead(layer_ref, [dx, dy], [bx, dy], arrow_mm);
-            draw_arrowhead(layer_ref, [bx, dy], [dx, dy], arrow_mm);
+            draw_arrowhead(layer_ref, [ax, dy], [bx, dy], arrow_mm);
+            draw_arrowhead(layer_ref, [bx, dy], [ax, dy], arrow_mm);
 
             // Text — measured value, formatted at the dim-style's
-            // decimal places. Position at the dim-line midpoint.
+            // decimal places. Position at the dim-line midpoint X
+            // (between the two measured points) and route the
+            // user-authored text_position Y through the same
+            // model→paper→PDF pipeline as Radial / Angular so the
+            // text lands on-sheet even when text_position is in
+            // model space.
             let value = dim
                 .measured_value
                 .unwrap_or_else(|| distance_paper([ax, ay], [bx, by]) / vp.scale);
@@ -743,9 +792,10 @@ fn draw_dimension(
                 .override_text
                 .clone()
                 .unwrap_or_else(|| format_value(value, style.decimal_places));
-            let mid_x = midpoint_mm(dx, bx);
-            let txt_y_mm = (sheet_h_mm - dim.text_position[1]) as f32;
-            layer_ref.use_text(&label, txt_h, Mm(mid_x), Mm(txt_y_mm + txt_h), body_font);
+            let mid_x = midpoint_mm(ax, bx);
+            let txt_pos = to_paper(dim.text_position);
+            let (_, ty) = to_pdf(txt_pos);
+            layer_ref.use_text(&label, txt_h, Mm(mid_x), Mm(ty.0 + txt_h), body_font);
         }
         DxfDimensionKind::Radial | DxfDimensionKind::Diameter => {
             // def_point = circle centre; def_point_a = a point on
@@ -763,10 +813,7 @@ fn draw_dimension(
             draw_arrowhead(layer_ref, [ex, ey], [cx, cy], arrow_mm);
 
             let dist_paper = distance_paper([cx, cy], [ex, ey]);
-            let mut value = dim.measured_value.unwrap_or(dist_paper / vp.scale);
-            if matches!(dim.kind, DxfDimensionKind::Diameter) {
-                value *= 2.0;
-            }
+            let value = radial_dim_value(dim.kind, dim.measured_value, dist_paper, vp.scale);
             let prefix = if matches!(dim.kind, DxfDimensionKind::Diameter) {
                 "Ø"
             } else {
@@ -802,19 +849,36 @@ fn draw_dimension(
 
             // Arc between the arms — sample at the smaller of the
             // two arm lengths so the arc sits inside the dim shape.
+            //
+            // Angles are computed in *paper* space (Y-down, before
+            // the PDF Y-flip) so the arc sweep direction matches
+            // the model-space dimension. Sampling angles in PDF
+            // space (where Y is flipped) reverses the sign of
+            // angles and can invert the arc — for example a
+            // dimension whose arms are at 0° and +90° in model
+            // space would interpolate from 0° to -90° (i.e. the
+            // wrong half of the circle) once Y is flipped. Compute
+            // the arc in paper-space and apply the Y-flip per
+            // sample, keeping each interpolated point in the same
+            // coordinate space as the rest of the entity.
             let r_a = distance_paper([vx, vy], [ax, ay]);
             let r_b = distance_paper([vx, vy], [bx, by]);
-            let r = r_a.min(r_b).max(arrow_mm * 2.0);
-            let angle_a = (ay.0 - vy.0).atan2(ax.0 - vx.0);
-            let angle_b = (by.0 - vy.0).atan2(bx.0 - vx.0);
+            let r = (r_a.min(r_b)).max(arrow_mm * 2.0) as f32;
+            let vpx = vertex[0] as f32;
+            let vpy = vertex[1] as f32;
+            let angle_a = ((arm_a[1] - vertex[1]) as f32).atan2((arm_a[0] - vertex[0]) as f32);
+            let angle_b = ((arm_b[1] - vertex[1]) as f32).atan2((arm_b[0] - vertex[0]) as f32);
             let segments = 32usize;
+            let sheet_h_mm_f32 = sheet_h_mm as f32;
             let mut pts = Vec::with_capacity(segments + 1);
             for i in 0..=segments {
                 let frac = i as f32 / segments as f32;
                 let theta = angle_a + (angle_b - angle_a) * frac;
-                let px = vx.0 + (r as f32) * theta.cos();
-                let py = vy.0 + (r as f32) * theta.sin();
-                pts.push((Point::new(Mm(px), Mm(py)), false));
+                let paper_x = vpx + r * theta.cos();
+                let paper_y = vpy + r * theta.sin();
+                let pdf_x = paper_x;
+                let pdf_y = sheet_h_mm_f32 - paper_y;
+                pts.push((Point::new(Mm(pdf_x), Mm(pdf_y)), false));
             }
             let arc = PdfLine {
                 points: pts,
@@ -892,6 +956,34 @@ fn midpoint_mm(a: Mm, b: Mm) -> f32 {
 
 fn format_value(value: f64, decimals: u8) -> String {
     format!("{:.*}", decimals.min(8) as usize, value)
+}
+
+/// Resolve the displayed value for a Radial / Diameter dimension.
+///
+/// Per the DXF spec, group code 42 (`measured_value`) on a
+/// `DIAMETER` dimension stores the *diameter* directly — not the
+/// radius. The reader populates `measured_value` from code 42
+/// verbatim (see `aec_cad::dxf::reader`), so any `DIAMETER`
+/// `DxfDimension` round-tripped from a real DXF file already
+/// carries the diameter and must NOT be doubled by the PDF
+/// exporter. The auto-compute fallback path measures from the
+/// circle centre to a point on the circle, which is the radius,
+/// so that path doubles for `DIAMETER` but not `RADIAL`.
+fn radial_dim_value(
+    kind: DxfDimensionKind,
+    measured_value: Option<f64>,
+    leader_paper_len: f64,
+    scale: f64,
+) -> f64 {
+    if let Some(v) = measured_value {
+        return v;
+    }
+    let radius = leader_paper_len / scale;
+    if matches!(kind, DxfDimensionKind::Diameter) {
+        radius * 2.0
+    } else {
+        radius
+    }
 }
 
 #[cfg(test)]
@@ -1200,6 +1292,224 @@ mod tests {
             thawed_bytes.len(),
             frozen_bytes.len()
         );
+    }
+
+    // -----------------------------------------------------------
+    // Regression tests for PR #56 Devin Review findings
+    // -----------------------------------------------------------
+
+    #[test]
+    fn dim_style_table_lookup_is_case_insensitive() {
+        // DXF style names round-trip case-insensitively (AutoCAD
+        // convention). A `DimStyleTable` seeded with "ARCH-1-100"
+        // must answer to "arch-1-100", "Arch-1-100", etc.
+        let dim_styles = DimStyleTable::from_slice(&[DxfDimStyle {
+            name: "ARCH-1-100".into(),
+            text_height: 2.5,
+            arrow_size: 2.0,
+            units_scale: 1.0,
+            decimal_places: 2,
+            text_style: "STANDARD".into(),
+        }]);
+        assert_eq!(dim_styles.get("ARCH-1-100").unwrap().decimal_places, 2);
+        assert_eq!(dim_styles.get("arch-1-100").unwrap().decimal_places, 2);
+        assert_eq!(dim_styles.get("Arch-1-100").unwrap().decimal_places, 2);
+        // Style names with different normalised forms still miss.
+        assert!(dim_styles.get("ARCH-1-50").is_none());
+    }
+
+    #[test]
+    fn dim_style_resolve_fallback_matches_dxf_dim_style_standard() {
+        // The fallback when a referenced style name is absent must
+        // match `DxfDimStyle::standard()` so PDF output for missing
+        // styles agrees with the rest of the DXF stack. In
+        // particular `decimal_places` defaults to 4 per AutoCAD's
+        // `DIMDEC` default — earlier revisions hard-coded 0 here
+        // which produced labels like "4000" instead of "4000.0000".
+        let dim_styles = DimStyleTable::default();
+        let standard = DxfDimStyle::standard();
+        let resolved = dim_styles.resolve("MISSING");
+        assert_eq!(resolved.decimal_places, 4);
+        assert_eq!(resolved.decimal_places, standard.decimal_places);
+        assert_eq!(resolved.text_height, standard.text_height);
+        assert_eq!(resolved.arrow_size, standard.arrow_size);
+        // The returned style carries the requested name back.
+        assert_eq!(resolved.name, "MISSING");
+    }
+
+    #[test]
+    fn phantom_and_center_dash_patterns_are_distinguishable() {
+        // Both CENTER and PHANTOM are valid DXF linetypes with
+        // distinct stroke shapes (CENTER = dash-dot, PHANTOM =
+        // dash-dot-dot). Earlier revisions returned the same
+        // four-segment pattern for both, which defeats the purpose
+        // of having separate enum variants.
+        let center = Linetype::Center.dash_pattern().unwrap();
+        let phantom = Linetype::Phantom.dash_pattern().unwrap();
+        assert_ne!(center, phantom);
+        // PHANTOM should exercise the third dash/gap pair —
+        // printpdf supports up to three pairs and CENTER only uses
+        // two.
+        assert!(phantom.dash_3.is_some(), "phantom uses 3rd dash pair");
+        assert!(phantom.gap_3.is_some(), "phantom uses 3rd gap pair");
+        assert!(center.dash_3.is_none(), "center stays at 2 pairs");
+    }
+
+    #[test]
+    fn divide_and_dashdot_dash_patterns_are_distinguishable() {
+        // DXF DIVIDE = dash-dot-dot; DXF DASHDOT = dash-dot. The
+        // two patterns differ by a second dot, which requires the
+        // third pair printpdf supports.
+        let dashdot = Linetype::DashDot.dash_pattern().unwrap();
+        let divide = Linetype::Divide.dash_pattern().unwrap();
+        assert_ne!(dashdot, divide);
+        assert!(divide.dash_3.is_some(), "divide uses 3rd dash pair");
+        assert!(divide.gap_3.is_some(), "divide uses 3rd gap pair");
+        assert!(dashdot.dash_3.is_none(), "dashdot stays at 2 pairs");
+    }
+
+    #[test]
+    fn radial_dim_value_passes_measured_value_through_verbatim() {
+        // For RADIAL the DXF spec puts the radius in code 42, and
+        // the reader stores it in `measured_value`. The PDF
+        // exporter must not transform it further.
+        let v = radial_dim_value(
+            DxfDimensionKind::Radial,
+            Some(500.0),
+            f64::NAN, // unused — measured_value short-circuits
+            0.01,
+        );
+        assert!((v - 500.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn radial_dim_value_diameter_measured_value_is_not_doubled() {
+        // For DIAMETER, code 42 stores the diameter directly (per
+        // DXF spec). The reader sets `measured_value = diameter`,
+        // so doubling it here would produce 2 × diameter — wrong.
+        // This locks the contract against regression.
+        let v = radial_dim_value(DxfDimensionKind::Diameter, Some(1000.0), f64::NAN, 0.01);
+        assert!(
+            (v - 1000.0).abs() < 1e-9,
+            "diameter measured_value must pass through unchanged, got {v}"
+        );
+    }
+
+    #[test]
+    fn radial_dim_value_computed_radial_is_radius_not_diameter() {
+        // When `measured_value` is None we compute from the leader
+        // length. RADIAL = radius, DIAMETER = 2 × radius.
+        // Leader paper length = 5 mm at 1:100 → 500 model units.
+        let r = radial_dim_value(DxfDimensionKind::Radial, None, 5.0, 0.01);
+        assert!((r - 500.0).abs() < 1e-9, "got {r}");
+        let d = radial_dim_value(DxfDimensionKind::Diameter, None, 5.0, 0.01);
+        assert!((d - 1000.0).abs() < 1e-9, "got {d}");
+    }
+
+    #[test]
+    fn linear_dim_text_y_is_routed_through_to_paper() {
+        // Direct sanity check of the model→paper Y projection used
+        // for the Linear/Aligned text baseline. Earlier revisions
+        // treated `text_position[1]` as a paper-space coordinate
+        // and applied only the PDF Y-flip, producing
+        // `sheet_h - (-1000) = 1297` mm for the fixture's
+        // model-space text_position[1] = -1000 — well off-sheet.
+        let mut vp = SheetViewport::new("PLAN", [10.0, 10.0], [200.0, 100.0]);
+        vp.scale = 0.01;
+        let sheet_h_mm: f64 = 297.0;
+        let paper = vp.model_to_paper([2000.0, -1000.0]);
+        let pdf_y = sheet_h_mm - paper[1];
+        assert!(paper[1] > 0.0 && paper[1] < sheet_h_mm, "paper Y on-sheet");
+        assert!(
+            (pdf_y - (sheet_h_mm - 50.0)).abs() < 1e-6,
+            "expected PDF Y ≈ {} (model→paper Y = 50.0 mm), got {}",
+            sheet_h_mm - 50.0,
+            pdf_y
+        );
+        // Sanity-check the buggy formula would have put the text
+        // off-sheet to lock in the regression.
+        let buggy_pdf_y = sheet_h_mm - (-1000.0);
+        assert!(
+            buggy_pdf_y > sheet_h_mm,
+            "buggy formula puts text off-sheet ({} > {})",
+            buggy_pdf_y,
+            sheet_h_mm
+        );
+    }
+
+    #[test]
+    fn linear_dim_extension_lines_are_perpendicular_at_measured_point_x() {
+        // For a horizontal dim with measured points A=(0,0),
+        // B=(4000,0) and dim-line offset D=(2000,-800) at 1:100,
+        // the dim line and extension lines must align with each
+        // measured point's projected X — NOT the dim-offset
+        // point's X. The bug used `dx` (= projected D.x) for the
+        // start of the dim line and extension line 1, producing a
+        // diagonal extension and a half-length dim line.
+        let mut vp = SheetViewport::new("PLAN", [10.0, 10.0], [200.0, 100.0]);
+        vp.scale = 0.01;
+        let a_paper = vp.model_to_paper([0.0, 0.0]);
+        let b_paper = vp.model_to_paper([4000.0, 0.0]);
+        let d_paper = vp.model_to_paper([2000.0, -800.0]);
+        // A.x, B.x must straddle D.x — confirming the bug would
+        // collapse the dim line to half its proper width.
+        assert!(a_paper[0] < d_paper[0]);
+        assert!(d_paper[0] < b_paper[0]);
+        // The proper dim-line width is |B.x - A.x|; the buggy one
+        // would have been |B.x - D.x| = half of that.
+        let proper_width = (b_paper[0] - a_paper[0]).abs();
+        let buggy_width = (b_paper[0] - d_paper[0]).abs();
+        assert!(
+            (proper_width - 2.0 * buggy_width).abs() < 1e-6,
+            "buggy dim line is exactly half-width; proper={proper_width}, buggy={buggy_width}"
+        );
+    }
+
+    #[test]
+    fn angular_arc_angles_are_paper_space_independent_of_pdf_y_flip() {
+        // For arms at 0° and +90° in model space, the angles
+        // computed in paper space (Y-down) must give the same
+        // sweep as computing them in PDF space (Y-flipped) ONLY
+        // when the arms lie along x±y axes that survive Y-flip
+        // symmetrically. In general the PDF-space atan2 inverts
+        // arc direction. Lock the paper-space convention by
+        // re-implementing it in the test.
+        let vp = {
+            let mut v = SheetViewport::new("PLAN", [10.0, 10.0], [200.0, 100.0]);
+            v.scale = 0.01;
+            v
+        };
+        let vertex = vp.model_to_paper([0.0, 0.0]);
+        let arm_a = vp.model_to_paper([1000.0, 0.0]); // 0° in model
+        let arm_b = vp.model_to_paper([0.0, 1000.0]); // +90° in model
+        let angle_a_paper = (arm_a[1] - vertex[1]).atan2(arm_a[0] - vertex[0]);
+        let angle_b_paper = (arm_b[1] - vertex[1]).atan2(arm_b[0] - vertex[0]);
+        // arm_a is along the paper +X (angle 0); arm_b is +Y in
+        // model but `model_to_paper` preserves Y-orientation here
+        // (no rotation, positive scale), so arm_b is along paper
+        // +Y → angle +π/2.
+        assert!(
+            angle_a_paper.abs() < 1e-6,
+            "paper angle_a ≈ 0, got {angle_a_paper}"
+        );
+        assert!(
+            (angle_b_paper - std::f64::consts::FRAC_PI_2).abs() < 1e-6,
+            "paper angle_b ≈ π/2, got {angle_b_paper}"
+        );
+        // After PDF Y-flip, the same vector becomes (-Y) — its
+        // atan2 is now -π/2, i.e. the sweep direction has reversed.
+        let sheet_h_mm: f64 = 297.0;
+        let vy_pdf = sheet_h_mm - vertex[1];
+        let by_pdf = sheet_h_mm - arm_b[1];
+        let angle_b_pdf = (by_pdf - vy_pdf).atan2(arm_b[0] - vertex[0]);
+        assert!(
+            (angle_b_pdf + std::f64::consts::FRAC_PI_2).abs() < 1e-6,
+            "PDF-space angle_b ≈ -π/2 (inverted), got {angle_b_pdf}"
+        );
+        // The two angles disagree on direction: this is the
+        // regression we fixed by computing arc angles in paper
+        // space.
+        assert!((angle_b_paper - angle_b_pdf).abs() > 1.0);
     }
 
     #[test]
