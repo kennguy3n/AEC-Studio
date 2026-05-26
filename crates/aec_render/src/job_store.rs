@@ -349,18 +349,31 @@ impl RenderJobStore {
     /// `error`, or `completed_frames` (e.g. dashboards, batch reports)
     /// will see values consistent with the reincarnated payload, never
     /// stale ones from the previous `Running` state.
+    ///
+    /// The SELECT that gathers the running payloads runs **inside**
+    /// the same transaction as the UPDATEs, so the read and write
+    /// observe the same snapshot. This matters for two reasons:
+    /// (1) within a single process the in-memory `Mutex` already
+    ///     serialises access, but a future multi-process deployment
+    ///     (where SQLite's WAL allows concurrent writers) needs the
+    ///     read to participate in the transactional scope; and
+    /// (2) any future addition of a SELECT that filters by an
+    ///     indexed column other than `status` would otherwise be
+    ///     racy against concurrent UPDATEs even in single-process
+    ///     mode. Keeping the read transactional is the cheap, correct
+    ///     default.
     pub fn reincarnate_running_as_queued(&self) -> RenderJobStoreResult<usize> {
         let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
         let payloads: Vec<String> = {
             let mut stmt =
-                conn.prepare("SELECT payload FROM render_jobs WHERE status = 'running'")?;
+                tx.prepare("SELECT payload FROM render_jobs WHERE status = 'running'")?;
             let rows = stmt
                 .query_map([], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             rows
         };
 
-        let tx = conn.transaction()?;
         let mut n = 0usize;
         for p in &payloads {
             let mut job: RenderJob = serde_json::from_str(p)?;
@@ -832,6 +845,183 @@ mod tests {
         let mut bad = job(0);
         bad.status = RenderJobStatus::Queued; // NOT terminal
         q.restore_completed(bad);
+    }
+
+    #[test]
+    fn upsert_refreshes_all_indexed_columns_from_payload() {
+        // Regression / invariant lock: the `reincarnate` test above
+        // covers the resurrection path, but `upsert` is the *primary*
+        // write site — every transition (Queued -> Running -> Completed
+        // -> Failed -> Cancelled) flows through it. This test asserts
+        // that updating an existing row via `upsert` keeps every
+        // indexed column (status, priority, progress, batch_id,
+        // camera_id, output_path, error, started_at, completed_at,
+        // completed_frames) in lock-step with the new payload, so a
+        // future dashboard query against any of those columns sees
+        // the same value as parsing the JSON payload would yield.
+        let (_d, s) = open_store();
+        let mut j = job(2);
+        j.status = RenderJobStatus::Queued;
+        j.progress = 0.0;
+        s.upsert(&j).unwrap();
+
+        // Mutate every payload-derived column and upsert again.
+        j.status = RenderJobStatus::Completed;
+        j.priority = 99;
+        j.progress = 1.0;
+        j.batch_id = Some("batch-A".to_string());
+        j.camera_id = Some("cam-B".to_string());
+        j.output_path = Some(std::path::PathBuf::from("/tmp/out.png"));
+        j.error = Some("warning text".to_string());
+        let now = Utc::now();
+        j.started_at = Some(now);
+        j.completed_at = Some(now);
+        j.mark_frame_completed(0);
+        j.mark_frame_completed(2);
+        s.upsert(&j).unwrap();
+
+        let conn = s.conn.lock().unwrap();
+        let (
+            status,
+            priority,
+            progress,
+            batch_id,
+            camera_id,
+            output_path,
+            error,
+            started_at,
+            completed_at,
+            completed_frames,
+            payload,
+        ): (
+            String,
+            i64,
+            f64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT status, priority, progress, batch_id, camera_id,
+                        output_path, error, started_at, completed_at,
+                        completed_frames, payload
+                 FROM render_jobs WHERE id = ?1",
+                params![j.id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                    ))
+                },
+            )
+            .unwrap();
+        drop(conn);
+
+        // Each indexed column must agree with the new payload.
+        assert_eq!(status, "completed");
+        assert_eq!(priority, 99);
+        assert!((progress - 1.0).abs() < 1e-9);
+        assert_eq!(batch_id.as_deref(), Some("batch-A"));
+        assert_eq!(camera_id.as_deref(), Some("cam-B"));
+        assert_eq!(output_path.as_deref(), Some("/tmp/out.png"));
+        assert_eq!(error.as_deref(), Some("warning text"));
+        assert!(started_at.is_some());
+        assert!(completed_at.is_some());
+        let parsed_frames: Vec<u32> = serde_json::from_str(&completed_frames).unwrap();
+        assert_eq!(parsed_frames, vec![0, 2]);
+
+        // Cross-check: every indexed column equals the value you would
+        // get by parsing the JSON payload. This is the actual
+        // invariant — "indexed columns mirror payload".
+        let from_payload: RenderJob = serde_json::from_str(&payload).unwrap();
+        assert_eq!(status_to_str(from_payload.status), status);
+        assert_eq!(from_payload.priority as i64, priority);
+        assert!((f64::from(from_payload.progress) - progress).abs() < 1e-9);
+        assert_eq!(from_payload.batch_id, batch_id);
+        assert_eq!(from_payload.camera_id, camera_id);
+        assert_eq!(
+            from_payload
+                .output_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
+            output_path
+        );
+        assert_eq!(from_payload.error, error);
+    }
+
+    #[test]
+    fn timestamp_columns_use_fixed_width_z_suffixed_rfc3339() {
+        // Regression: queue ordering and `completed_at`-bucket queries
+        // rely on lexicographic string comparison being a valid
+        // chronological order for the timestamp columns. That property
+        // only holds when every timestamp the store writes uses the
+        // same fixed-width RFC3339 shape — specifically, the
+        // `to_rfc3339_opts(SecondsFormat::Nanos, /* use_z = */ true)`
+        // format which always produces "YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ"
+        // (i.e. nanosecond precision and a literal `Z` suffix instead
+        // of a per-row `+HH:MM` offset). This test locks the shape so
+        // a future "let's use `to_rfc3339()`" refactor (which would
+        // emit variable-width offsets and break sortability) fails CI.
+        let (_d, s) = open_store();
+        let mut j = job(0);
+        let now = Utc::now();
+        j.created_at = now;
+        j.started_at = Some(now);
+        j.completed_at = Some(now);
+        s.upsert(&j).unwrap();
+
+        let conn = s.conn.lock().unwrap();
+        let (created, started, completed): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT created_at, started_at, completed_at
+                 FROM render_jobs WHERE id = ?1",
+                params![j.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        drop(conn);
+
+        for ts in [
+            Some(created.as_str()),
+            started.as_deref(),
+            completed.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            assert!(
+                ts.ends_with('Z'),
+                "timestamp `{ts}` must end with `Z` so lexicographic sort matches chronological sort",
+            );
+            // "YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ" => exactly 30 chars.
+            assert_eq!(
+                ts.len(),
+                30,
+                "timestamp `{ts}` must be fixed-width (nanosecond precision)",
+            );
+            // Cross-check sortability: two timestamps one nanosecond
+            // apart must compare in chronological order as strings.
+            let later = (now + chrono::Duration::nanoseconds(1))
+                .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+            assert!(
+                later.as_str() > ts,
+                "later timestamp `{later}` must lex-sort after `{ts}`",
+            );
+        }
     }
 
     #[test]

@@ -54,7 +54,7 @@ pub use history::{
 };
 pub use intersect::{any_hit, closest_hit, geom_normal, Intersection, Ray, ShadingTriangle};
 pub use job::{RenderJob, RenderJobStatus};
-pub use job_store::{JobStatusCounts, RenderJobStore, RenderJobStoreError};
+pub use job_store::{JobStatusCounts, RenderJobStore, RenderJobStoreError, RenderJobStoreResult};
 pub use light_sampling::{
     environment_radiance, is_delta, power_heuristic, sample_light, LightSample, NativeLight,
 };
