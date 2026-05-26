@@ -781,6 +781,21 @@ fn scale_vec(v: [f32; 3], scale: f32) -> [f32; 3] {
 /// (translation, rotation) pair. The rotation is the quaternion that
 /// rotates `(0, 0, -1)` (glTF's default forward) into the direction
 /// `(target - position)`.
+///
+/// The rotation matrix R is built with each TOP-LEVEL element of
+/// `m` as a column basis vector:
+///
+/// - `m[0]` = right       (image of local `+X` in world space),
+/// - `m[1]` = recomputed_up  (image of local `+Y`),
+/// - `m[2]` = -forward    (image of local `-Z`, since glTF cameras
+///   look down `-Z`).
+///
+/// `mat3_to_quat` indexes its input as `m[col][row]` — the standard
+/// column-major convention used by glTF, GLM, and other rendering
+/// libraries. Storing each basis vector as a top-level element
+/// produces exactly that layout, so the extracted quaternion is the
+/// rotation R (rather than its transpose `R⁻¹` we would get if we
+/// laid the matrix out row-major and fed it into the same extractor).
 fn camera_lookat_components(
     position: [f32; 3],
     target: [f32; 3],
@@ -792,16 +807,60 @@ fn camera_lookat_components(
         target[2] - position[2],
     ]);
     let up = normalize(up);
-    let right = normalize(cross(forward, up));
-    let recomputed_up = cross(right, forward);
+    // When `forward` is (anti-)parallel to `up`, `cross(forward, up)`
+    // collapses to zero and the bare `normalize` fallback would not be
+    // perpendicular to `forward` — the resulting rotation matrix would
+    // not be orthonormal and the quaternion would represent a slightly
+    // distorted rotation (e.g. for a plan-view camera looking straight
+    // down at +Y world up — a very common AEC case).
+    //
+    // Pick an alternate up hint that *is* perpendicular to `forward`:
+    // the world basis axis with the smallest |forward[i]| component
+    // is guaranteed to have a nonzero `cross(forward, axis)`. Reroute
+    // through Gram-Schmidt so the final `effective_up` lies in the
+    // plane perpendicular to `forward`.
+    let dot_fwd_up = forward[0] * up[0] + forward[1] * up[1] + forward[2] * up[2];
+    let effective_up = if dot_fwd_up.abs() > 0.999_999 {
+        let abs_x = forward[0].abs();
+        let abs_y = forward[1].abs();
+        let abs_z = forward[2].abs();
+        let alt = if abs_x <= abs_y && abs_x <= abs_z {
+            [1.0, 0.0, 0.0]
+        } else if abs_y <= abs_z {
+            [0.0, 1.0, 0.0]
+        } else {
+            [0.0, 0.0, 1.0]
+        };
+        // Gram-Schmidt: remove the forward component from `alt` so the
+        // result is orthogonal to `forward`. `alt` is a world basis
+        // axis, so `dot(forward, alt) == forward[i]` for the chosen i,
+        // which is the smallest-magnitude forward component by
+        // construction — the residual is well-conditioned.
+        let proj = forward[0] * alt[0] + forward[1] * alt[1] + forward[2] * alt[2];
+        normalize([
+            alt[0] - forward[0] * proj,
+            alt[1] - forward[1] * proj,
+            alt[2] - forward[2] * proj,
+        ])
+    } else {
+        up
+    };
+    let right = normalize(cross(forward, effective_up));
+    // `recomputed_up` is analytically unit-length when `right` and
+    // `forward` are unit and orthogonal, but float rounding in the
+    // cross product can shave off a few ULPs. Normalize for symmetry
+    // with `right` and to keep the rotation matrix orthonormal to
+    // within the closest representable f32 — `mat3_to_quat` then
+    // produces a unit quaternion to within float precision rather
+    // than within a cross-product residual.
+    let recomputed_up = normalize(cross(right, forward));
 
-    // Build the 3x3 rotation matrix M whose columns are (right, up, -forward).
-    // glTF default camera looks down -Z with +Y up; this matrix transforms
-    // local (right=+X, up=+Y, forward=-Z) into world space.
+    // Column-major: m[col] is the c-th column of R, i.e. the image
+    // of local basis vector e_c under the rotation.
     let m = [
-        [right[0], recomputed_up[0], -forward[0]],
-        [right[1], recomputed_up[1], -forward[1]],
-        [right[2], recomputed_up[2], -forward[2]],
+        right,
+        recomputed_up,
+        [-forward[0], -forward[1], -forward[2]],
     ];
     let rot = mat3_to_quat(m);
     (position, rot)
@@ -1396,6 +1455,281 @@ mod tests {
             Vec::new()
         };
         (json, bin)
+    }
+
+    /// Apply quaternion `q = (x, y, z, w)` to a vector `v`.
+    /// Standard formula: `q * v * q⁻¹` expanded for unit q.
+    fn rotate_by_quat(q: [f32; 4], v: [f32; 3]) -> [f32; 3] {
+        let (qx, qy, qz, qw) = (q[0], q[1], q[2], q[3]);
+        let (vx, vy, vz) = (v[0], v[1], v[2]);
+        // t = 2 * cross(q.xyz, v)
+        let tx = 2.0 * (qy * vz - qz * vy);
+        let ty = 2.0 * (qz * vx - qx * vz);
+        let tz = 2.0 * (qx * vy - qy * vx);
+        // v + q.w * t + cross(q.xyz, t)
+        [
+            vx + qw * tx + (qy * tz - qz * ty),
+            vy + qw * ty + (qz * tx - qx * tz),
+            vz + qw * tz + (qx * ty - qy * tx),
+        ]
+    }
+
+    #[test]
+    fn camera_lookat_quaternion_rotates_local_forward_toward_target() {
+        // The glTF default camera looks down local -Z. The
+        // quaternion produced by camera_lookat_components must
+        // rotate (0, 0, -1) onto the world-space direction
+        // (target - position) (normalized). Without the col-major
+        // fix, the quaternion was the inverse rotation, producing
+        // a vector pointing AWAY from the target.
+        //
+        // Cases include the canonical bug example (camera on +X
+        // looking at origin) plus a few more to make sure we're
+        // not accidentally fitting to a single axis.
+        let cases = [
+            // (position, target, up)
+            (
+                [5.0, 0.0, 0.0_f32],
+                [0.0, 0.0, 0.0_f32],
+                [0.0, 1.0, 0.0_f32],
+            ), // +X → -X
+            ([0.0, 0.0, 5.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]), // +Z → -Z (identity)
+            ([0.0, 5.0, 5.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+            ([-3.0, 2.0, 4.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+        ];
+        for (position, target, up) in cases {
+            let expected = {
+                let d = [
+                    target[0] - position[0],
+                    target[1] - position[1],
+                    target[2] - position[2],
+                ];
+                let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                [d[0] / l, d[1] / l, d[2] / l]
+            };
+            let (_t, q) = camera_lookat_components(position, target, up);
+            let rotated = rotate_by_quat(q, [0.0, 0.0, -1.0]);
+            // The rotated local-forward must agree with the world-
+            // space target direction to within float noise.
+            let err = [
+                rotated[0] - expected[0],
+                rotated[1] - expected[1],
+                rotated[2] - expected[2],
+            ];
+            let err_mag = (err[0] * err[0] + err[1] * err[1] + err[2] * err[2]).sqrt();
+            assert!(
+                err_mag < 1e-4,
+                "camera_lookat_components(pos={position:?}, target={target:?}, up={up:?}): \
+                 local forward rotated to {rotated:?}, expected {expected:?} (err={err_mag})",
+            );
+        }
+    }
+
+    #[test]
+    fn camera_lookat_quaternion_is_not_the_inverse_rotation() {
+        // Explicit regression for the row-major/col-major bug: the
+        // INVERSE rotation would point the local -Z AWAY from the
+        // target (i.e. its dot product with `target - position`
+        // would be negative). The fix guarantees the dot product is
+        // positive.
+        let position = [5.0_f32, 0.0, 0.0];
+        let target = [0.0_f32, 0.0, 0.0];
+        let up = [0.0_f32, 1.0, 0.0];
+        let (_t, q) = camera_lookat_components(position, target, up);
+        let rotated = rotate_by_quat(q, [0.0, 0.0, -1.0]);
+        let to_target = [
+            target[0] - position[0],
+            target[1] - position[1],
+            target[2] - position[2],
+        ];
+        let dot = rotated[0] * to_target[0] + rotated[1] * to_target[1] + rotated[2] * to_target[2];
+        assert!(
+            dot > 0.0,
+            "expected rotated local -Z to align with (target - position), got dot = {dot}",
+        );
+    }
+
+    #[test]
+    fn camera_lookat_local_up_aligns_with_world_up() {
+        // The lookAt convention also fixes the local `+Y` (camera
+        // up) to the supplied world up direction. This test pins
+        // that contract so a future quaternion refactor can't
+        // silently swap rows/columns.
+        let position = [0.0_f32, 0.0, 5.0];
+        let target = [0.0_f32, 0.0, 0.0];
+        let up = [0.0_f32, 1.0, 0.0];
+        let (_t, q) = camera_lookat_components(position, target, up);
+        let rotated_up = rotate_by_quat(q, [0.0, 1.0, 0.0]);
+        let err = [
+            rotated_up[0] - 0.0,
+            rotated_up[1] - 1.0,
+            rotated_up[2] - 0.0,
+        ];
+        let err_mag = (err[0] * err[0] + err[1] * err[1] + err[2] * err[2]).sqrt();
+        assert!(
+            err_mag < 1e-4,
+            "expected rotated local +Y to align with world +Y, got {rotated_up:?}",
+        );
+    }
+
+    #[test]
+    fn camera_lookat_near_degenerate_forward_parallel_to_up_does_not_panic() {
+        // When `forward` is nearly parallel (or anti-parallel) to `up`,
+        // `cross(forward, up)` collapses toward zero and the `normalize`
+        // fallback at `gltf_export.rs:887-888` returns `[0, 0, 1]`. The
+        // function must still:
+        //
+        //   (a) return a finite unit quaternion (no `NaN` / `inf`),
+        //   (b) approximately satisfy the lookAt contract — rotated
+        //       local `-Z` points roughly toward `target - position`.
+        //
+        // This pins the contract that the fallback chooses a *consistent*
+        // up axis rather than producing an undefined rotation.
+        //
+        // Two configurations:
+        //   1. `forward ≈ -up` — camera looking straight down (position
+        //      well above target, world up is `+Y`).
+        //   2. `forward ≈ +up` — camera looking straight up (position
+        //      well below target, world up is `+Y`).
+        let cases = [
+            // Forward ≈ -up: position above target.
+            (
+                [0.0_f32, 5.0, 0.01_f32],
+                [0.0_f32, 0.0, 0.0_f32],
+                [0.0_f32, 1.0, 0.0_f32],
+            ),
+            // Forward ≈ +up: position below target.
+            (
+                [0.0_f32, -5.0, 0.01_f32],
+                [0.0_f32, 0.0, 0.0_f32],
+                [0.0_f32, 1.0, 0.0_f32],
+            ),
+        ];
+        for (position, target, up) in cases {
+            let (_t, q) = camera_lookat_components(position, target, up);
+            // The quaternion must be unit-magnitude and finite.
+            let q_mag = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+            assert!(
+                q_mag.is_finite() && (q_mag - 1.0).abs() < 1e-4,
+                "near-degenerate (pos={position:?}, target={target:?}, up={up:?}): \
+                 quaternion not unit length: {q:?} (|q|={q_mag})",
+            );
+            // The lookAt contract must still hold approximately: rotated
+            // local -Z agrees with (target - position) normalized. We use
+            // a slightly relaxed tolerance because the `normalize`
+            // fallback picks an arbitrary right axis when forward ∥ up.
+            let expected = {
+                let d = [
+                    target[0] - position[0],
+                    target[1] - position[1],
+                    target[2] - position[2],
+                ];
+                let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                [d[0] / l, d[1] / l, d[2] / l]
+            };
+            let rotated = rotate_by_quat(q, [0.0, 0.0, -1.0]);
+            let dot =
+                rotated[0] * expected[0] + rotated[1] * expected[1] + rotated[2] * expected[2];
+            assert!(
+                dot > 0.99,
+                "near-degenerate (pos={position:?}, target={target:?}, up={up:?}): \
+                 rotated local -Z {rotated:?} does not align with target dir {expected:?} \
+                 (dot={dot})",
+            );
+        }
+    }
+
+    #[test]
+    fn camera_lookat_exactly_degenerate_forward_equals_up_returns_finite_quaternion() {
+        // Pathological corner case: `forward` is exactly parallel to
+        // `up`. The Gram-Schmidt fallback in `camera_lookat_components`
+        // selects an alternate world axis perpendicular to `forward`,
+        // so the resulting rotation matrix IS orthonormal (not just
+        // "finite"). The roll axis is arbitrary (no preferred up was
+        // supplied), but the lookAt invariant still holds: rotated
+        // local -Z must align with (target - position).
+        //
+        // This case is hit in practice by plan-view cameras (camera
+        // looking straight down at floor plan with world +Y up).
+        let cases = [
+            // Anti-parallel: looking straight down with +Y up.
+            (
+                [0.0_f32, 5.0, 0.0_f32],
+                [0.0_f32, 0.0, 0.0_f32],
+                [0.0_f32, 1.0, 0.0_f32],
+            ),
+            // Parallel: looking straight up with +Y up.
+            (
+                [0.0_f32, -5.0, 0.0_f32],
+                [0.0_f32, 0.0, 0.0_f32],
+                [0.0_f32, 1.0, 0.0_f32],
+            ),
+            // Anti-parallel along +Z axis.
+            (
+                [0.0_f32, 0.0, 5.0_f32],
+                [0.0_f32, 0.0, 0.0_f32],
+                [0.0_f32, 0.0, 1.0_f32],
+            ),
+        ];
+        for (position, target, up) in cases {
+            let (_t, q) = camera_lookat_components(position, target, up);
+            let q_mag = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+            assert!(
+                q_mag.is_finite() && (q_mag - 1.0).abs() < 1e-4,
+                "exactly-degenerate (pos={position:?}, target={target:?}, up={up:?}): \
+                 expected unit quaternion, got {q:?} (|q|={q_mag})",
+            );
+            // Even with arbitrary roll, the lookAt invariant must hold.
+            let expected = {
+                let d = [
+                    target[0] - position[0],
+                    target[1] - position[1],
+                    target[2] - position[2],
+                ];
+                let l = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+                [d[0] / l, d[1] / l, d[2] / l]
+            };
+            let rotated = rotate_by_quat(q, [0.0, 0.0, -1.0]);
+            let dot =
+                rotated[0] * expected[0] + rotated[1] * expected[1] + rotated[2] * expected[2];
+            assert!(
+                dot > 0.9999,
+                "exactly-degenerate (pos={position:?}, target={target:?}, up={up:?}): \
+                 rotated local -Z {rotated:?} does not align with target dir {expected:?} \
+                 (dot={dot})",
+            );
+        }
+    }
+
+    #[test]
+    fn camera_lookat_rotation_matrix_is_orthonormal_even_in_degenerate_case() {
+        // Rotation matrices must be orthonormal: each row/column has
+        // unit length, and any two columns are perpendicular. This
+        // pins the Gram-Schmidt fix: even when `forward ∥ up`, the
+        // basis is well-conditioned. We probe orthonormality by
+        // applying `rotate_by_quat` to the three local basis vectors
+        // and verifying their dot products.
+        let position = [0.0_f32, 5.0, 0.0]; // straight-down plan view
+        let target = [0.0_f32, 0.0, 0.0];
+        let up = [0.0_f32, 1.0, 0.0]; // forward = [0, -1, 0] = -up
+        let (_t, q) = camera_lookat_components(position, target, up);
+        let rx = rotate_by_quat(q, [1.0, 0.0, 0.0]);
+        let ry = rotate_by_quat(q, [0.0, 1.0, 0.0]);
+        let rz = rotate_by_quat(q, [0.0, 0.0, 1.0]);
+        for (label, v) in [("R*ex", rx), ("R*ey", ry), ("R*ez", rz)] {
+            let mag = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+            assert!(
+                (mag - 1.0).abs() < 1e-5,
+                "{label} not unit length: {v:?} (|v|={mag})",
+            );
+        }
+        let dot_xy = rx[0] * ry[0] + rx[1] * ry[1] + rx[2] * ry[2];
+        let dot_xz = rx[0] * rz[0] + rx[1] * rz[1] + rx[2] * rz[2];
+        let dot_yz = ry[0] * rz[0] + ry[1] * rz[1] + ry[2] * rz[2];
+        assert!(
+            dot_xy.abs() < 1e-5 && dot_xz.abs() < 1e-5 && dot_yz.abs() < 1e-5,
+            "rotated basis vectors not mutually perpendicular: dot_xy={dot_xy}, dot_xz={dot_xz}, dot_yz={dot_yz}",
+        );
     }
 
     #[test]
