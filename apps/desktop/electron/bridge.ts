@@ -491,6 +491,29 @@ export interface BridgeBackend {
   projectAuditSync(projectPath: string): Promise<number>;
 
   /**
+   * Verify the BLAKE3 hash chain integrity of every
+   * `<project>/audit/*.jsonl` file. Read-only — does not modify
+   * the project, does not touch SQLCipher, and does not require
+   * the master key (the audit log is plaintext JSONL by design;
+   * its integrity is protected by the BLAKE3 chain, not by
+   * encryption).
+   *
+   * On a fully-intact chain returns
+   * `{ status: "ok", entriesChecked: N, headHash: "blake3:...", ... }`.
+   * On a tampered chain returns
+   * `{ status: "broken_at", breakFile, breakLine, breakReason, breakDetail, ... }`
+   * with the line of the first broken entry (the chain is
+   * append-only; once one link is broken, all subsequent entries
+   * are by definition compromised — the renderer should treat the
+   * project as needing a fresh export).
+   *
+   * The in-process fallback returns an empty `"ok"` report
+   * (`entriesChecked: 0`) because it doesn't persist an audit log
+   * to disk.
+   */
+  projectAuditVerify(projectPath: string): Promise<AuditChainVerification>;
+
+  /**
    * Apply a typed command (`Command`) to the project graph. The
    * Rust side rebuilds the in-memory engine from the SQLCipher
    * `entities` + `undo_journal` tables, executes the command, and
@@ -1041,6 +1064,67 @@ export interface EngineStatus {
   auditChainByScope: Record<string, number>;
 }
 
+/**
+ * Audit chain verification result returned by
+ * {@link BridgeBackend.projectAuditVerify}. Mirrors
+ * `aec_audit::ChainVerification` (see Rust crate).
+ *
+ * `status === "ok"` means every entry in every `audit/*.jsonl`
+ * file under the project verified: linkage (`prev_hash` chain) and
+ * each entry's `hash` re-derived from its content. Otherwise the
+ * `break*` fields describe the first broken link in lexicographic
+ * file order — `breakFile` and `breakLine` (1-based) point to the
+ * offending entry, `breakReason` is one of
+ * `"prev_hash_mismatch"`, `"hash_recompute_mismatch"`,
+ * `"unsupported_hash_version"`, `"legacy_hash_version_rejected"`,
+ * `"malformed_entry"`, or `"io"`, and `breakDetail` carries a
+ * human-readable description for the status pane.
+ *
+ * `"legacy_hash_version_rejected"` is only producible when a caller
+ * wires `aec_audit::VerifyOptions::strict_v2_only()` through the
+ * service layer; the default `projectAuditVerify` path used by the
+ * renderer today cannot emit it. The union still includes it so that
+ * any renderer code that exhaustively switches on `breakReason` keeps
+ * compiling when strict mode is enabled.
+ *
+ * `entriesChecked` is the count of fully-validated entries (so a
+ * break at line 5 of the first file yields 4).
+ *
+ * `entriesLegacyLinkageOnly` is the subset of `entriesChecked`
+ * that were verified with linkage-only checks because they were
+ * written under the v1 hash algorithm (which embedded the raw
+ * payload bytes into the hash — those bytes aren't persisted on
+ * the entry, so the v1 hash cannot be recomputed offline). The
+ * chain still reports `"ok"` for these entries; UI surfaces can
+ * use this counter to gate downstream trust on the legacy
+ * fraction.
+ *
+ * `filesChecked` lists only the `.jsonl` files that were
+ * actually opened and inspected (not every file in the
+ * directory). On an early break this contains files up to and
+ * including the one in which the break occurred; files
+ * discovered during directory traversal but never opened are NOT
+ * included.
+ */
+export interface AuditChainVerification {
+  status: "ok" | "broken_at";
+  entriesChecked: number;
+  entriesLegacyLinkageOnly: number;
+  filesChecked: string[];
+  headHash: string;
+  breakFile: string | null;
+  breakLine: number | null;
+  breakReason:
+    | "prev_hash_mismatch"
+    | "hash_recompute_mismatch"
+    | "unsupported_hash_version"
+    | "legacy_hash_version_rejected"
+    | "malformed_entry"
+    | "io"
+    | null;
+  breakDetail: string | null;
+}
+
 let backend: BridgeBackend | null = null;
 
 export function getBridge(): BridgeBackend {
@@ -1189,6 +1273,7 @@ interface NativeApi {
   runtime_status(): unknown;
   project_engine_status(project_path: string): unknown;
   project_audit_sync(project_path: string): unknown;
+  project_audit_verify(project_path: string): unknown;
   // ASYNC: returns Promise<unknown> because the underlying napi
   // function is `#[napi] async fn` (parses the IFC on a tokio
   // blocking-pool worker so it doesn't freeze the JS event loop).
@@ -1371,6 +1456,7 @@ export const NATIVE_WIRED_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   "runtimeStatus",
   "projectEngineStatus",
   "projectAuditSync",
+  "projectAuditVerify",
   // BIM domain wired in PR-P. `bimImportIfc` / `bimAttachIfc` /
   // `bimCheckFileSize` all delegate to real `#[napi]` exports in
   // `crates/aec_bridge/src/napi_api.rs`.
@@ -1562,6 +1648,8 @@ function adaptNative(n: NativeApi): BridgeBackend {
     runtimeStatus: async () => n.runtime_status() as RuntimeStatus,
     projectEngineStatus: async (p) => n.project_engine_status(p) as EngineStatus,
     projectAuditSync: async (p) => n.project_audit_sync(p) as number,
+    projectAuditVerify: async (p) =>
+      n.project_audit_verify(p) as AuditChainVerification,
     // `n.bim_import_ifc` is a native ASYNC napi function (returns
     // a Promise) so that the multi-second IFC parse runs on the
     // tokio blocking pool and does NOT freeze the Electron main
@@ -2808,6 +2896,25 @@ export function inProcessBackend(): BridgeBackend {
       // documentation in `BridgeBackend` instructs callers to interpret
       // a 0 here as "fallback didn't insert anything".
       return 0;
+    },
+
+    async projectAuditVerify(_projectPath) {
+      // No on-disk audit log exists in the in-process fallback (the
+      // in-process backend keeps the project graph in memory only),
+      // so verification is trivially "ok" with zero entries
+      // inspected. Callers needing a real integrity report must run
+      // through the native bridge.
+      return {
+        status: "ok" as const,
+        entriesChecked: 0,
+        entriesLegacyLinkageOnly: 0,
+        filesChecked: [],
+        headHash: "blake3:genesis",
+        breakFile: null,
+        breakLine: null,
+        breakReason: null,
+        breakDetail: null,
+      };
     },
 
     async commandApply(projectPath, command) {

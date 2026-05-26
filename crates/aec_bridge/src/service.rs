@@ -1787,6 +1787,31 @@ impl BridgeService {
         Ok(n as u64)
     }
 
+    /// Verify the BLAKE3 chain integrity of every audit log under
+    /// `<project>/audit/` (all `.jsonl` files). Walks the files in
+    /// lexicographic order, recomputes each entry's `hash` from its
+    /// immutable fields, and reports the first broken link.
+    ///
+    /// Read-only — does not modify the project package or the SQL
+    /// mirror, and does not touch the engine-status cache. Safe to
+    /// run concurrently with reads.
+    pub fn project_audit_verify(
+        &self,
+        path: &str,
+    ) -> Result<aec_audit::ChainVerification, BridgeServiceError> {
+        // Read-only — `ProjectPackage::open` only reads `manifest.json`
+        // and validates the package layout (including the presence of
+        // the `audit/` subdirectory). It does NOT touch the SQLCipher
+        // DB, so no master-key unwrap is required for chain
+        // verification (the audit log itself is plaintext JSONL by
+        // design — its integrity is protected by the BLAKE3 chain,
+        // not by encryption).
+        let pkg = ProjectPackage::open(path)?;
+        let dir = pkg.root().join("audit");
+        let verification = aec_audit::verify_chain(&dir)?;
+        Ok(verification)
+    }
+
     /// Read-only engine status for the renderer's status pane.
     /// Combines `meta.schema_version` (from the SQLCipher DB) with the
     /// audit chain head (from JSONL) and per-scope row counts (from the
