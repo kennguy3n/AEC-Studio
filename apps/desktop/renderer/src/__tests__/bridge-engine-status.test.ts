@@ -38,6 +38,7 @@ describe("bridge in-process engine status", () => {
     const v = await bridge.projectAuditVerify("/projects/anything.aecstudio");
     expect(v.status).toBe("ok");
     expect(v.entriesChecked).toBe(0);
+    expect(v.entriesLegacyLinkageOnly).toBe(0);
     expect(v.filesChecked).toEqual([]);
     expect(v.headHash).toBe("blake3:genesis");
     expect(v.breakFile).toBeNull();
