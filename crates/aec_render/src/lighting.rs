@@ -751,9 +751,15 @@ impl IesLookupTexture {
     /// (since `candela_at` is periodic in horizontal). Vertical clamps
     /// to `[0°, 180°]`.
     pub fn sample(&self, vertical_deg: f32, horizontal_deg: f32) -> f32 {
+        // `.max(1)` guarantees both axes are at least 1; degenerate
+        // textures collapse onto column / row 0 rather than panicking.
         let w = self.width.max(1) as usize;
         let h = self.height.max(1) as usize;
-        if w == 0 || h == 0 {
+        // If a caller constructed `IesLookupTexture` directly with an
+        // empty `candela` buffer (the fields are `pub`), bail out
+        // rather than indexing past the end. The bake itself always
+        // allocates `w × h` floats so this only catches user error.
+        if self.candela.len() < w * h {
             return 0.0;
         }
         let vy = (vertical_deg.clamp(0.0, 180.0) / 180.0) * (h as f32 - 1.0);
