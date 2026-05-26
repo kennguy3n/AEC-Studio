@@ -266,7 +266,15 @@ fn compare_revision_snapshots_errors_when_snapshot_file_missing() {
 #[test]
 fn compare_revision_snapshots_errors_when_revision_has_no_snapshot() {
     let td = TempDir::new().unwrap();
-    let (conn, db_path, _key) = open_project(td.path());
+    // Use the same project key for the whole test. `project_key()` calls
+    // `generate_project_nonce()` which is random, so generating a fresh
+    // key here (the previous shape) would silently pass today (the
+    // function short-circuits on `head.snapshot == None` before the key
+    // is used) but would surface as a confusing SQLCipher decryption
+    // error if the check order in `compare_revision_snapshots` ever
+    // changes. Threading the original key through keeps the test
+    // honest about the failure it's asserting on.
+    let (conn, db_path, key) = open_project(td.path());
     insert_entity(&conn, "wall.A", "wall", r#"{}"#);
     let store = RevisionStore::open(td.path().join("revisions")).unwrap();
     // v1 has a snapshot.
@@ -277,7 +285,7 @@ fn compare_revision_snapshots_errors_when_revision_has_no_snapshot() {
     let v2 = store.create(draft("v2")).unwrap();
     assert!(v2.snapshot.is_none());
 
-    let err = compare_revision_snapshots(&store, &v1, &v2, &project_key()).unwrap_err();
+    let err = compare_revision_snapshots(&store, &v1, &v2, &key).unwrap_err();
     let msg = format!("{err}");
     assert!(
         msg.contains("no snapshot"),
