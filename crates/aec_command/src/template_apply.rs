@@ -432,26 +432,55 @@ fn actor_command(actor: &Actor, kind: CommandKind) -> Command {
             Command::ai(tool, kind)
         }
         aec_core::types::ActorKind::KChat => {
-            // Templates are always user-initiated today, so a KChat
-            // actor would only arrive via a forced override. `Command`
-            // has no dedicated KChat constructor; fall back to a user
-            // command so audit-trail integrity is preserved. The
-            // KChat actor handle is still available on the parent
-            // operation's audit envelope.
-            Command::user(kind)
+            // Devin Review `ANALYSIS_0007` (PR #51): the previous
+            // shape silently downgraded a KChat actor to a User
+            // command because `Command` had no dedicated KChat
+            // constructor. That collapsed the KChat-vs-User
+            // distinction on the audit trail, which matters for
+            // template instantiations driven from a chat thread
+            // (e.g. a reviewer applying a "use the apartment
+            // template" suggestion). `Command::kchat` (added
+            // alongside `Command::user` / `Command::ai` in
+            // `crates/aec_command/src/commands/mod.rs`) preserves
+            // the actor faithfully; we fall back to "kchat" as
+            // the handle if the actor record was missing one.
+            let commenter = actor.tool.clone().unwrap_or_else(|| "kchat".to_string());
+            Command::kchat(commenter, kind)
         }
     }
 }
 
 fn validate_room(room: &TemplateRoom) -> Option<String> {
-    if room.width_mm <= 0.0 {
-        return Some(format!("width_mm must be > 0 (got {})", room.width_mm));
+    // See `crates/aec_command/src/commands/wall.rs` for the
+    // `is_finite()` rationale (Devin Review `ANALYSIS_0008` on
+    // PR #51). JSON itself can't represent NaN/+-inf, so the
+    // template loader cannot produce a non-finite value here
+    // today, but the guard is cheap and surfaces a clear error
+    // for any future code path that bypasses the JSON loader
+    // (e.g. a programmatic template builder).
+    if !room.width_mm.is_finite() || room.width_mm <= 0.0 {
+        return Some(format!(
+            "width_mm must be a finite positive number (got {})",
+            room.width_mm
+        ));
     }
-    if room.depth_mm <= 0.0 {
-        return Some(format!("depth_mm must be > 0 (got {})", room.depth_mm));
+    if !room.depth_mm.is_finite() || room.depth_mm <= 0.0 {
+        return Some(format!(
+            "depth_mm must be a finite positive number (got {})",
+            room.depth_mm
+        ));
     }
-    if room.height_mm <= 0.0 {
-        return Some(format!("height_mm must be > 0 (got {})", room.height_mm));
+    if !room.height_mm.is_finite() || room.height_mm <= 0.0 {
+        return Some(format!(
+            "height_mm must be a finite positive number (got {})",
+            room.height_mm
+        ));
+    }
+    if !room.origin_mm.iter().all(|c| c.is_finite()) {
+        return Some(format!(
+            "origin_mm coordinates must all be finite (got {:?})",
+            room.origin_mm
+        ));
     }
     None
 }

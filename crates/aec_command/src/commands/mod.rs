@@ -203,6 +203,30 @@ impl Command {
             kind,
         }
     }
+
+    /// Build a command sourced from a KChat (kennguy3n chat / review)
+    /// participant. The `commenter` argument is the chat handle of
+    /// whoever drove this command — typically a reviewer applying a
+    /// fix suggested in a review thread.
+    ///
+    /// Devin Review `ANALYSIS_0007` (PR #51): the previous shape had
+    /// no `Command::kchat` constructor, so [`crate::template_apply`]
+    /// silently downgraded `ActorKind::KChat` to `Actor::user()`
+    /// when synthesising commands. That collapsed the
+    /// KChat-vs-User distinction on the audit trail. Adding the
+    /// constructor (paralleling [`Self::user`] and [`Self::ai`])
+    /// preserves the source actor faithfully at the command layer
+    /// for any future flow that drives template instantiation
+    /// from a chat thread.
+    pub fn kchat(commenter: impl Into<String>, kind: CommandKind) -> Self {
+        Self {
+            command_id: CommandId::new(),
+            ts: chrono::Utc::now(),
+            scope: kind.scope(),
+            actor: Actor::kchat(commenter),
+            kind,
+        }
+    }
 }
 
 /// Identifier shared between commands and entity deltas.

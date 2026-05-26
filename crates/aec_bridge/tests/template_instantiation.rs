@@ -16,8 +16,10 @@
 //! * The audit sidecar at
 //!   `<project>/audit/template_instantiation.json` is written and
 //!   matches the materialised state.
-//! * Undo over a template-instantiated project reverses the most
-//!   recent command (e.g. the last `SaveCamera`).
+//! * Undo over a template-instantiated project reverses the **whole**
+//!   instantiation batch (template land = one undo step, so a single
+//!   Cmd-Z clears every wall / floor / ceiling / room / camera the
+//!   template emitted).
 //!
 //! The tests use the project root reported by
 //! `BridgeService::project_create_from_template`, then call
@@ -229,23 +231,56 @@ fn every_shipped_template_instantiates_cleanly() {
 }
 
 #[test]
-fn undo_over_a_template_instantiated_project_reverses_last_command() {
+fn undo_over_a_template_instantiated_project_reverses_whole_batch() {
     use aec_core::types::Scope;
     let (mut s, _g) = boot_service();
     let summary = s
         .project_create_from_template("interior.apartment", "Undo After Template")
         .expect("create");
 
-    // The apartment template ends with 3 SaveCamera commands; undo
-    // once and the last camera should be gone.
+    // The apartment template lands a multi-command batch (walls,
+    // floors, ceilings, rooms, cameras, plus the lighting preset)
+    // as a single SQL transaction via
+    // `CommandEngine::execute_persistent_batch`, which records the
+    // whole batch as **one** journal entry. So a single
+    // `command_undo` reverses every entity the template created in
+    // one step.
+    let walls_before = count_kind(&mut s, &summary.path, "wall");
+    let floors_before = count_kind(&mut s, &summary.path, "floor");
+    let ceilings_before = count_kind(&mut s, &summary.path, "ceiling");
+    let rooms_before = count_kind(&mut s, &summary.path, "room");
     let cameras_before = count_kind(&mut s, &summary.path, "camera");
-    assert_eq!(cameras_before, 3);
+    assert!(
+        walls_before > 0 && cameras_before == 3 && rooms_before > 0,
+        "apartment template should have populated walls + rooms + 3 cameras"
+    );
+
     let undo = s.command_undo(&summary.path, Scope::Design).expect("undo");
-    assert_eq!(undo.applied.len(), 1, "undo reverses one command");
-    let cameras_after = count_kind(&mut s, &summary.path, "camera");
-    assert_eq!(
-        cameras_after,
-        cameras_before - 1,
-        "undo should drop one camera entity",
+    // The merged batch journal entry's inverse covers every delta
+    // produced by every command in the instantiation (one
+    // `Delete` per `Create*` command).
+    assert!(
+        undo.applied.len()
+            >= walls_before + floors_before + ceilings_before + rooms_before + cameras_before,
+        "undo's inverse should cover every delta emitted by the template batch (got {})",
+        undo.applied.len()
+    );
+
+    // After one undo, every entity the template created should be
+    // gone — that's the user-visible "single Cmd-Z reverts the
+    // whole template instantiation" contract.
+    assert_eq!(count_kind(&mut s, &summary.path, "wall"), 0);
+    assert_eq!(count_kind(&mut s, &summary.path, "floor"), 0);
+    assert_eq!(count_kind(&mut s, &summary.path, "ceiling"), 0);
+    assert_eq!(count_kind(&mut s, &summary.path, "room"), 0);
+    assert_eq!(count_kind(&mut s, &summary.path, "camera"), 0);
+
+    // A second undo should fail (nothing left on the stack — the
+    // whole template batch occupied a single slot).
+    let err = s.command_undo(&summary.path, Scope::Design).unwrap_err();
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("NothingToUndo") || msg.contains("nothing to undo"),
+        "second undo should fail with NothingToUndo, got {msg}"
     );
 }

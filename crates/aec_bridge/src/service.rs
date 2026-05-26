@@ -1497,7 +1497,7 @@ impl BridgeService {
         // is a positive signal: "this project went through the real
         // template path, not a no-op fast path".
         let outcome = aec_command::template_apply::template_to_commands(&template);
-        if let Err(e) = apply_template_outcome(&pkg, &self.master_key, template_key, &outcome) {
+        if let Err(e) = apply_template_outcome(&pkg, &self.master_key, template_key, outcome) {
             // Roll back the half-created project so the next call to
             // `project_create_from_template` with the same name isn't
             // blocked by an `AlreadyExists` error against a useless
@@ -4440,16 +4440,54 @@ fn slugify(name: &str) -> String {
 /// fails validation the transaction is rolled back and the function
 /// returns an error; the caller deletes the now-incomplete project
 /// directory in that branch.
+///
+/// Takes `outcome` **by value** (Devin Review `ANALYSIS_0005` on
+/// PR #51): the previous shape took `&InstantiationOutcome` and
+/// then deep-cloned `outcome.commands` into
+/// `execute_persistent_batch`. The villa template emits ~77
+/// commands (11 rooms × 7 commands each + lighting + cameras),
+/// each carrying a serialised JSON body, so the clone was a real
+/// allocation hot-spot dominated only by the SQL transaction that
+/// follows. Consuming the outcome lets us move
+/// `outcome.commands` straight into the engine and clone nothing.
+///
+/// Engine scope is derived from `outcome.commands[0].scope`
+/// (Devin Review `ANALYSIS_0004` on PR #51): the old shape
+/// hardcoded `Scope::Design`, which works today because every
+/// `CommandKind` emitted by the template path returns
+/// `Scope::Design` from its `scope()` method, but a future
+/// template feature emitting a non-Design command (e.g. a Draft
+/// `DrawPrimitive` for a 2D plan template, or a Render
+/// `SaveCamera` variant) would silently trip a `ScopeMismatch`
+/// inside the batch guard. Reading the scope off the commands
+/// themselves matches the AI accept path's pattern
+/// (`engine_scope = conversion.commands[0].scope`) and removes
+/// the brittle-against-extension assumption.
 fn apply_template_outcome(
     pkg: &ProjectPackage,
     master_key: &[u8; 32],
     template_key: &str,
-    outcome: &aec_command::template_apply::InstantiationOutcome,
+    outcome: aec_command::template_apply::InstantiationOutcome,
 ) -> Result<(), BridgeServiceError> {
-    if !outcome.commands.is_empty() {
+    // Destructure once so we can move `commands` into the engine
+    // and still borrow the other fields for the sidecar JSON. The
+    // batch-internal-consistency guard inside
+    // `execute_persistent_batch` will reject any command whose
+    // scope differs from `commands[0].scope`, so picking the first
+    // command's scope is both correct and uniquely defined.
+    let aec_command::template_apply::InstantiationOutcome {
+        commands,
+        rooms,
+        camera_ids,
+        lighting_preset,
+        skipped,
+    } = outcome;
+    let applied_command_count = commands.len();
+    if !commands.is_empty() {
+        let engine_scope = commands[0].scope;
         let mut conn = pkg.open_database(master_key)?;
-        let mut engine = CommandEngine::open(&conn, Scope::Design)?;
-        engine.execute_persistent_batch(outcome.commands.clone(), &mut conn)?;
+        let mut engine = CommandEngine::open(&conn, engine_scope)?;
+        engine.execute_persistent_batch(commands, &mut conn)?;
         // Drop the connection eagerly so the project package's SQLite
         // file is closed before we touch the audit sidecar.
         drop(engine);
@@ -4461,16 +4499,16 @@ fn apply_template_outcome(
     let sidecar = sidecar_dir.join("template_instantiation.json");
     let body = serde_json::json!({
         "template_key": template_key,
-        "applied_command_count": outcome.commands.len(),
-        "room_count": outcome.rooms.len(),
-        "camera_count": outcome.camera_ids.len(),
-        "lighting_preset": outcome.lighting_preset,
-        "skipped": outcome.skipped.iter().map(|s| serde_json::json!({
+        "applied_command_count": applied_command_count,
+        "room_count": rooms.len(),
+        "camera_count": camera_ids.len(),
+        "lighting_preset": lighting_preset,
+        "skipped": skipped.iter().map(|s| serde_json::json!({
             "storey": s.storey_name,
             "room": s.room_name,
             "reason": s.reason,
         })).collect::<Vec<_>>(),
-        "rooms": outcome.rooms.iter().map(|r| serde_json::json!({
+        "rooms": rooms.iter().map(|r| serde_json::json!({
             "room_id": r.room_id.as_str(),
             "wall_ids": r.wall_ids.iter().map(aec_core::types::EntityId::as_str).collect::<Vec<_>>(),
             "floor_id": r.floor_id.as_str(),
@@ -4480,7 +4518,7 @@ fn apply_template_outcome(
             "footprint_size_mm": r.footprint_size_mm,
             "height_mm": r.height_mm,
         })).collect::<Vec<_>>(),
-        "camera_ids": outcome.camera_ids.iter().map(aec_core::types::EntityId::as_str).collect::<Vec<_>>(),
+        "camera_ids": camera_ids.iter().map(aec_core::types::EntityId::as_str).collect::<Vec<_>>(),
     });
     let bytes = serde_json::to_vec_pretty(&body)
         .map_err(|e| BridgeServiceError::Core(format!("serialise template sidecar: {e}")))?;
