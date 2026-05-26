@@ -260,9 +260,27 @@ export function registerIpcHandlers(): void {
 
   // ----- AI -----
   ipcMain.handle("ai:listTools", async () => getBridge().aiListTools());
+  // `ai:plan` is routed through `withResolvedProjectPath` for the same
+  // reason `draft:*` / `deliver:*` are: the renderer's public preload
+  // shape (`aec.ai.plan({ tool, scope, prompt, context,
+  // maxEntitiesModified })`) does NOT carry `projectPath`, but the
+  // native adaptor (`adaptNative.aiPlan` in `bridge.ts`) treats it
+  // as a required string and throws when it's missing. Routing
+  // through the helper injects the active project path from the
+  // tracker at *plan-time* (the moment the user pressed "Suggest
+  // layout"), which is also the binding semantics the Rust side
+  // wants: `BridgeService::ai_plan` captures `(project_path, scope)`
+  // into the `PendingDiff` registry, and `ai_accept_diff` later
+  // re-opens that exact project even if the renderer has since
+  // switched the active project. Without this injection, the
+  // renderer call at `LayoutSuggestionsPanel.tsx::suggestLayout`
+  // would surface "aiPlan: missing required string field
+  // 'projectPath'" in production while still passing the in-process
+  // backend test at `bridge-ai.test.ts:81-97` (the in-process
+  // fallback intentionally accepts missing `projectPath`).
   ipcMain.handle("ai:plan", async (_e, p) => {
     assertObject(p, "params");
-    return getBridge().aiPlan(p);
+    return getBridge().aiPlan(withResolvedProjectPath(p, "aiPlan"));
   });
   ipcMain.handle("ai:acceptDiff", async (_e, { diffId }) => {
     assertString(diffId, "diffId");

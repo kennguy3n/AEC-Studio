@@ -173,6 +173,7 @@ dependencies = [
  "gltf",
  "hex",
  "printpdf",
+ "rusqlite",
  "rust_xlsxwriter",
  "serde",
  "serde_json",

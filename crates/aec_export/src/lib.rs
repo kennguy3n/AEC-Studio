@@ -19,7 +19,10 @@ pub mod schedule;
 pub mod svg_export;
 pub mod xlsx;
 
-pub use before_after::{BeforeAfterPdfError, BeforeAfterPdfOptions, BeforeAfterRenderPair};
+pub use before_after::{
+    BeforeAfterPdfError, BeforeAfterPdfOptions, BeforeAfterRenderPair, BeforeAfterReport,
+    BeforeAfterReportError, PlanOverlay, PlanOverlayCounts, PlanOverlayLevel, PlanOverlaySegment,
+};
 pub use bim_pack::{BimPack, BimPackError, ValidationReport, ValidationReportKind};
 pub use boq::{BoqExport, BoqExportError, BoqLine, BoqSection, RegionalConfig};
 pub use contractor_pack::{

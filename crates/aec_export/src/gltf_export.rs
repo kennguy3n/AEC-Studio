@@ -205,6 +205,14 @@ pub struct WriteGltfOptions {
     pub pretty_print: bool,
     /// Generator string written to the asset table.
     pub generator: String,
+    /// Copyright string written to the asset table. Caller-supplied
+    /// (rather than baked from `chrono::Utc::now()` like a build
+    /// timestamp) so the module-level byte-determinism guarantee
+    /// holds end-to-end: identical `(scene, options)` inputs produce
+    /// identical bytes regardless of wall-clock time. Callers that
+    /// want a build timestamp embedded in the output can format one
+    /// into this string themselves.
+    pub copyright: String,
 }
 
 impl Default for WriteGltfOptions {
@@ -213,6 +221,7 @@ impl Default for WriteGltfOptions {
             mm_to_metres: true,
             pretty_print: true,
             generator: "AEC Studio aec_export gltf_export".into(),
+            copyright: "AEC Studio export".into(),
         }
     }
 }
@@ -548,7 +557,14 @@ pub fn write_gltf(
     }
 
     // -- Top-level document ------------------------------------------
-    let copyright = format!("AEC Studio export — {}", chrono::Utc::now().to_rfc3339());
+    // `options.copyright` is the only path that can land in the
+    // asset table; we deliberately do NOT mix in `chrono::Utc::now()`
+    // (or any other non-deterministic source) because the
+    // module-level doc promises byte-identical output for identical
+    // inputs. A previous revision embedded the wall-clock timestamp
+    // here and the test had to strip the field before comparison —
+    // see `glb_writes_are_byte_deterministic_across_invocations`.
+    let copyright = options.copyright.clone();
     let scene_obj = json!({
         "name": scene.name,
         "nodes": node_indices,
@@ -1036,8 +1052,11 @@ mod tests {
         scene.meshes[0].material_id = Some("mat:oak".into());
         let out_a = dir.path().join("a.glb");
         let out_b = dir.path().join("b.glb");
-        // Suppress timestamp non-determinism by overriding the
-        // generator string to a fixed value.
+        // All fields of `WriteGltfOptions` are deterministic by
+        // default (no `chrono::Utc::now()` baked in), so we don't
+        // need to override anything to make this test reproducible.
+        // We still pin the generator to a fixed string so the test
+        // doesn't drift if `Default` changes in the future.
         let opts = WriteGltfOptions {
             generator: "AEC Studio test".into(),
             ..Default::default()
@@ -1046,16 +1065,13 @@ mod tests {
         write_gltf(&out_b, &scene, &opts).unwrap();
         let bytes_a = std::fs::read(&out_a).unwrap();
         let bytes_b = std::fs::read(&out_b).unwrap();
-        // Strip the asset.copyright timestamp by parsing JSON,
-        // removing the field, and re-comparing.
-        let (json_a, bin_a) = split_glb(&bytes_a);
-        let (json_b, bin_b) = split_glb(&bytes_b);
-        let mut va: Value = serde_json::from_slice(&json_a).unwrap();
-        let mut vb: Value = serde_json::from_slice(&json_b).unwrap();
-        va["asset"].as_object_mut().unwrap().remove("copyright");
-        vb["asset"].as_object_mut().unwrap().remove("copyright");
-        assert_eq!(va, vb);
-        assert_eq!(bin_a, bin_b);
+        // Full byte-level equality: `options.copyright` defaults to a
+        // deterministic constant (no `chrono::Utc::now()` baked in),
+        // so the entire `.glb` is identical across invocations —
+        // header, JSON chunk, BIN chunk. The old test had to strip
+        // `asset.copyright` first; the new contract no longer needs
+        // that workaround.
+        assert_eq!(bytes_a, bytes_b);
     }
 
     #[test]
