@@ -120,6 +120,15 @@ fn phase2_apartment_designer_journey_through_bridge_service() {
         assets.len()
     );
 
+    // Snapshot the template baseline so we can assert the *delta*
+    // contributed by this journey (place / save calls), independent
+    // of any entities the apartment template itself pre-populates
+    // (Phase 11 Group B / Task 12 template instantiation, PR #51).
+    let furniture_baseline = svc
+        .project_graph_list(&summary.path, Some("furniture"))
+        .expect("graph: furniture baseline")
+        .len();
+
     // Place each demo asset once in distinct quadrants of the room.
     let furniture_positions: Vec<[f64; 3]> = vec![
         [1_000.0, 1_000.0, 0.0],
@@ -127,10 +136,11 @@ fn phase2_apartment_designer_journey_through_bridge_service() {
         [1_000.0, 3_000.0, 0.0],
         [3_500.0, 3_000.0, 0.0],
     ];
-    let mut placed_count = 0usize;
+    let mut furniture_entity_ids: Vec<EntityId> = Vec::new();
     for (asset, position) in assets.iter().zip(furniture_positions.iter()) {
+        let eid = EntityId::new();
         let cmd = Command::user(CommandKind::PlaceFurniture(PlaceFurniture {
-            entity_id: EntityId::new(),
+            entity_id: eid.clone(),
             asset_ref: asset.asset_id.clone(),
             position_mm: *position,
             rotation_yaw_deg: 0.0,
@@ -140,18 +150,29 @@ fn phase2_apartment_designer_journey_through_bridge_service() {
         }));
         svc.command_apply(&summary.path, cmd)
             .unwrap_or_else(|e| panic!("place furniture {}: {e}", asset.asset_id));
-        placed_count += 1;
+        furniture_entity_ids.push(eid);
     }
-    assert_eq!(placed_count, 4, "should have placed 4 furniture instances");
+    assert_eq!(
+        furniture_entity_ids.len(),
+        4,
+        "should have placed 4 furniture instances"
+    );
 
     let furniture = svc
         .project_graph_list(&summary.path, Some("furniture"))
         .expect("graph: furniture");
     assert_eq!(
         furniture.len(),
-        4,
-        "exactly 4 furniture entities should be in the graph after placement"
+        furniture_baseline + 4,
+        "exactly 4 new furniture entities should be in the graph after placement \
+         (baseline {furniture_baseline} + 4 placed)"
     );
+    for eid in &furniture_entity_ids {
+        assert!(
+            furniture.iter().any(|e| &e.id == eid),
+            "placed furniture entity {eid:?} must be queryable in the graph"
+        );
+    }
 
     // ── Step 3: set the lighting preset ──
     let cmd = Command::user(CommandKind::SetLighting(SetLighting {
@@ -159,6 +180,13 @@ fn phase2_apartment_designer_journey_through_bridge_service() {
     }));
     svc.command_apply(&summary.path, cmd)
         .expect("set lighting preset");
+
+    // Snapshot the camera baseline post-template-instantiation so
+    // the assert below counts only the cameras *this test* saved.
+    let camera_baseline = svc
+        .project_graph_list(&summary.path, Some("camera"))
+        .expect("graph: camera baseline")
+        .len();
 
     // ── Step 4: save 4 cameras (Living, Bedroom, Bathroom, Hero) ──
     let camera_specs: [(&str, [f64; 3], [f64; 3]); 4] = [
@@ -207,7 +235,18 @@ fn phase2_apartment_designer_journey_through_bridge_service() {
     let cameras = svc
         .project_graph_list(&summary.path, Some("camera"))
         .expect("graph: cameras");
-    assert_eq!(cameras.len(), 4, "exactly 4 cameras saved");
+    assert_eq!(
+        cameras.len(),
+        camera_baseline + 4,
+        "exactly 4 new cameras saved on top of the template baseline \
+         (baseline {camera_baseline} + 4 saved)"
+    );
+    for eid in &camera_entity_ids {
+        assert!(
+            cameras.iter().any(|c| &c.id == eid),
+            "saved camera entity {eid:?} must be queryable in the graph"
+        );
+    }
 
     // ── Step 5: enqueue 4 renders (one per camera at `standard`) ──
     let camera_id_strings: Vec<String> = camera_entity_ids
@@ -291,13 +330,32 @@ fn phase2_journey_persists_across_service_restart() {
         .project_create_from_template("interior.apartment", "Phase 2 Restart")
         .expect("create");
 
-    // Place 2 furniture + 2 cameras through command_apply.
+    // Snapshot the template-instantiation baseline so the post-restart
+    // assertion can verify the *delta* this test added survives the
+    // service reboot, independent of whatever the apartment template
+    // pre-populates.
+    let furniture_baseline = svc
+        .project_graph_list(&summary.path, Some("furniture"))
+        .expect("furniture baseline")
+        .len();
+    let camera_baseline = svc
+        .project_graph_list(&summary.path, Some("camera"))
+        .expect("camera baseline")
+        .len();
+
+    // Place 2 furniture + 2 cameras through command_apply. We track
+    // each entity_id so the post-restart check can prove the *exact*
+    // entities this test created round-tripped, not just that the
+    // count is right (a count-only check could be satisfied by the
+    // template baseline alone if mutations were silently dropped).
     let assets = svc
         .design_list_assets(&AssetListQuery::default())
         .expect("list");
+    let mut placed_furniture_ids: Vec<EntityId> = Vec::new();
     for (i, a) in assets.iter().take(2).enumerate() {
+        let eid = EntityId::new();
         let cmd = Command::user(CommandKind::PlaceFurniture(PlaceFurniture {
-            entity_id: EntityId::new(),
+            entity_id: eid.clone(),
             asset_ref: a.asset_id.clone(),
             position_mm: [1_000.0 + 1_000.0 * i as f64, 1_000.0, 0.0],
             rotation_yaw_deg: 0.0,
@@ -306,10 +364,13 @@ fn phase2_journey_persists_across_service_restart() {
             parent: None,
         }));
         svc.command_apply(&summary.path, cmd).unwrap();
+        placed_furniture_ids.push(eid);
     }
+    let mut saved_camera_ids: Vec<EntityId> = Vec::new();
     for i in 0..2 {
+        let eid = EntityId::new();
         let cmd = Command::user(CommandKind::SaveCamera(SaveCamera {
-            entity_id: EntityId::new(),
+            entity_id: eid.clone(),
             name: format!("Cam{i}"),
             params: CameraParams {
                 position_mm: [0.0, 0.0, 1_650.0],
@@ -322,6 +383,7 @@ fn phase2_journey_persists_across_service_restart() {
             },
         }));
         svc.command_apply(&summary.path, cmd).unwrap();
+        saved_camera_ids.push(eid);
     }
     svc.project_save(&summary.path).expect("save");
     drop(svc); // close the service; tempdir survives because we hold `tmp`.
@@ -341,15 +403,29 @@ fn phase2_journey_persists_across_service_restart() {
         .expect("furniture after reboot");
     assert_eq!(
         furniture.len(),
-        2,
-        "furniture entities must persist across service restart"
+        furniture_baseline + 2,
+        "furniture entities must persist across service restart \
+         (baseline {furniture_baseline} + 2 placed)"
     );
+    for eid in &placed_furniture_ids {
+        assert!(
+            furniture.iter().any(|e| &e.id == eid),
+            "placed furniture {eid:?} must survive service restart"
+        );
+    }
     let cameras = svc2
         .project_graph_list(&summary.path, Some("camera"))
         .expect("cameras after reboot");
     assert_eq!(
         cameras.len(),
-        2,
-        "camera entities must persist across service restart"
+        camera_baseline + 2,
+        "camera entities must persist across service restart \
+         (baseline {camera_baseline} + 2 saved)"
     );
+    for eid in &saved_camera_ids {
+        assert!(
+            cameras.iter().any(|c| &c.id == eid),
+            "saved camera {eid:?} must survive service restart"
+        );
+    }
 }
