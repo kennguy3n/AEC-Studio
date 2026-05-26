@@ -305,6 +305,36 @@ impl BlockTransform {
     fn rot_deg(&self) -> f64 {
         self.rot_deg
     }
+
+    /// 2D determinant of the XY-scale component of the transform.
+    /// Negative when exactly one of `scale[0]` / `scale[1]` is
+    /// negative, i.e. the transform includes a reflection that
+    /// reverses the orientation of CCW arcs. `Arc` start/end angles
+    /// must be swapped & reflected in this case so the rendered arc
+    /// covers the same set of points after the block transform.
+    fn determinant_xy(&self) -> f64 {
+        self.scale[0] * self.scale[1]
+    }
+
+    /// Reflect an arc angle (degrees) through the XY-scale component
+    /// of the transform. Returns `angle` unchanged when `det_xy >=
+    /// 0`; otherwise mirrors the angle so that the arc, drawn CCW
+    /// from start to end, still covers the same set of model-space
+    /// points after the block is reflected.
+    fn reflect_arc_angle_deg(&self, angle_deg: f64) -> f64 {
+        let a = angle_deg.to_radians();
+        // The parametric arc point in the un-rotated frame is
+        // `(cos θ, sin θ)`. After per-axis scaling it becomes
+        // `(scale[0] * cos θ, scale[1] * sin θ)`. The angle of the
+        // scaled point (relative to the scaled-frame origin) is
+        // `atan2(scale[1] * sin θ, scale[0] * cos θ)`. Under positive
+        // uniform scale this returns `θ` exactly. Under reflection
+        // it returns the correct mirrored angle on both axes
+        // simultaneously, with no branch on which axis flipped.
+        let nx = self.scale[0] * a.cos();
+        let ny = self.scale[1] * a.sin();
+        ny.atan2(nx).to_degrees()
+    }
 }
 
 /// Existing entry point — emits an SVG using only a plot-style table.
@@ -353,6 +383,7 @@ pub fn render_sheet_svg_full(
         &mut out,
         sheet,
         entities,
+        blocks,
         options.clip_viewports,
         options.coordinate_precision,
     )?;
@@ -412,10 +443,19 @@ pub fn render_sheet_svg_full(
 
 /// Builds the `<defs>` block — arrowhead marker, viewport clip-paths,
 /// and any hatch patterns referenced by entities.
+///
+/// Hatch patterns from BOTH the top-level `entities` slice AND any
+/// non-solid hatch nested inside a block body in `blocks` are
+/// collected here. Without scanning block bodies, an INSERT that
+/// expands to a hatched region would emit `fill="url(#hatch-NAME)"`
+/// at render time but the corresponding `<pattern>` would never make
+/// it into `<defs>`, leaving the hatch fill empty per the SVG paint
+/// server fallback rules.
 fn write_defs(
     out: &mut String,
     sheet: &Sheet,
     entities: &[DxfEntity],
+    blocks: &BlockTable,
     clip_viewports: bool,
     prec: u8,
 ) -> Result<(), SvgExportError> {
@@ -449,20 +489,45 @@ fn write_defs(
         }
     }
 
-    // Hatch patterns — collect unique names referenced.
+    // Hatch patterns — collect unique names referenced by top-level
+    // entities OR by entities nested inside a block body. Block
+    // bodies are scanned recursively up to `BLOCK_EXPANSION_MAX_DEPTH`
+    // so cyclic block definitions can't drive this collection step
+    // into a stack overflow.
     let mut needed: BTreeSet<String> = BTreeSet::new();
     for e in entities {
-        if let DxfEntity::Hatch(h) = e {
-            if !h.solid {
-                needed.insert(h.pattern_name.to_ascii_uppercase());
-            }
-        }
+        collect_hatch_pattern_names(e, blocks, &mut needed, BLOCK_EXPANSION_MAX_DEPTH);
     }
     for name in &needed {
         write_hatch_pattern_def(out, name)?;
     }
     writeln!(out, "  </defs>")?;
     Ok(())
+}
+
+/// Recursively collect non-solid hatch pattern names from an entity,
+/// descending into INSERTs against `blocks`. Bounded by
+/// `depth_remaining` so cyclic block tables can't trigger a stack
+/// overflow during `<defs>` collection.
+fn collect_hatch_pattern_names(
+    entity: &DxfEntity,
+    blocks: &BlockTable,
+    needed: &mut BTreeSet<String>,
+    depth_remaining: u32,
+) {
+    match entity {
+        DxfEntity::Hatch(h) if !h.solid => {
+            needed.insert(h.pattern_name.to_ascii_uppercase());
+        }
+        DxfEntity::Insert(ins) if depth_remaining > 0 => {
+            if let Some(body) = blocks.get(&ins.block_name) {
+                for child in body {
+                    collect_hatch_pattern_names(child, blocks, needed, depth_remaining - 1);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Defines a single named DXF hatch pattern as an SVG `<pattern>`.
@@ -1018,16 +1083,32 @@ fn emit_dimension(
                 fmt_coord(r[0], prec),
                 fmt_coord(r[1], prec),
             )?;
-            // Measured value = distance from center to rim.
-            let mut measured = if let Some(value) = d.measured_value {
+            // Measured value to display.
+            //
+            // Per the DXF spec, group code 42 ("actual measurement")
+            // stores the *diameter* for a DIAMETER dimension and the
+            // *radius* for a RADIAL dimension. When the DXF reader
+            // populated `measured_value` (i.e. the field is `Some`),
+            // pass it through verbatim — doubling it here would
+            // double-count for round-tripped diameter dims.
+            //
+            // When the field is `None` (manually constructed
+            // dimensions where the application didn't cache the
+            // measurement), compute the radius from the leader and
+            // upgrade to diameter for `Diameter` kind.
+            let measured = if let Some(value) = d.measured_value {
                 value
             } else {
                 let dx = d.def_point_a[0] - d.def_point[0];
                 let dy = d.def_point_a[1] - d.def_point[1];
-                (dx * dx + dy * dy).sqrt()
+                let radius = (dx * dx + dy * dy).sqrt();
+                if matches!(d.kind, DxfDimensionKind::Diameter) {
+                    radius * 2.0
+                } else {
+                    radius
+                }
             };
             let prefix = if matches!(d.kind, DxfDimensionKind::Diameter) {
-                measured *= 2.0;
                 "\u{00f8}"
             } else {
                 "R"
@@ -1159,8 +1240,23 @@ fn emit_block_body(
     // Apply the insertion transform to every entity in the block,
     // then delegate to `emit_entity`. We transform the entity in
     // model space (before model_to_paper).
+    //
+    // Block bodies routinely span multiple layers — a door block
+    // might carry a swing arc on `HIDDEN` and the frame on `WALLS`.
+    // Top-level entities are filtered through `is_layer_visible_in`
+    // before `emit_entity`; block-body entities must be filtered the
+    // same way, otherwise a frozen / off layer would still draw when
+    // referenced from inside a block.
+    //
+    // Layer visibility is decided on the *source* entity's layer
+    // (not the layer name after transform_entity) because INSERT
+    // semantics propagate the layer name verbatim through the block
+    // expansion.
     let xform = BlockTransform::new(*insert_pos, *insert_scale, insert_rot_deg);
     for e in body {
+        if !is_layer_visible_in(vp, e.layer(), layer_table, opts) {
+            continue;
+        }
         let transformed = transform_entity(e, &xform);
         emit_entity(
             out,
@@ -1221,13 +1317,33 @@ fn transform_entity(entity: &DxfEntity, x: &BlockTransform) -> DxfEntity {
                 elevation: e.elevation,
             })
         }
-        DxfEntity::Arc(e) => DxfEntity::Arc(aec_cad::dxf::DxfArc {
-            layer: e.layer.clone(),
-            center: x.point3(&e.center),
-            radius: e.radius * uniform,
-            start_angle: e.start_angle + rot,
-            end_angle: e.end_angle + rot,
-        }),
+        DxfEntity::Arc(e) => {
+            // Under a negative-determinant scale (e.g. mirror via
+            // `scale = [-1, 1, 1]`), the arc's CCW sweep reverses
+            // in the transformed frame. Swap start/end AND reflect
+            // both angles so the rendered arc still traces the same
+            // set of model-space points. Under positive scale this
+            // collapses to the identity (`reflect_arc_angle_deg`
+            // returns the input unchanged when `scale[0] == scale[1]
+            // > 0`, and is a no-op approximation for non-uniform
+            // positive scale — consistent with how the radius is
+            // approximated via `uniform_xy_scale`).
+            let (start_deg, end_deg) = if x.determinant_xy() < 0.0 {
+                (
+                    x.reflect_arc_angle_deg(e.end_angle) + rot,
+                    x.reflect_arc_angle_deg(e.start_angle) + rot,
+                )
+            } else {
+                (e.start_angle + rot, e.end_angle + rot)
+            };
+            DxfEntity::Arc(aec_cad::dxf::DxfArc {
+                layer: e.layer.clone(),
+                center: x.point3(&e.center),
+                radius: e.radius * uniform,
+                start_angle: start_deg,
+                end_angle: end_deg,
+            })
+        }
         DxfEntity::Circle(e) => DxfEntity::Circle(aec_cad::dxf::DxfCircle {
             layer: e.layer.clone(),
             center: x.point3(&e.center),
@@ -2660,5 +2776,494 @@ mod tests {
         assert!(svg.contains(r#"class="insert-missing""#));
         // Hatch pattern definition present.
         assert!(svg.contains("<pattern id=\"hatch-ANSI31\""));
+    }
+
+    // -- PR #57 round 2: regressions for the 4 real Devin Review
+    // bugs reported on commit 24996d3.
+
+    #[test]
+    fn block_body_layer_visibility_is_honored() {
+        // A door block carries a frame on `WALLS` and a swing on
+        // `HIDDEN`. When `HIDDEN` is frozen, the swing must not
+        // appear in the SVG even though it's inside a block. This
+        // mirrors the top-level `is_layer_visible_in` filter at
+        // line 416.
+        let mut blocks = BlockTable::new();
+        blocks.insert(
+            "DOOR",
+            vec![
+                DxfEntity::Line(DxfLine {
+                    layer: "WALLS".into(),
+                    start: [0.0, 0.0, 0.0],
+                    end: [10.0, 0.0, 0.0],
+                }),
+                DxfEntity::Arc(DxfArc {
+                    layer: "HIDDEN".into(),
+                    center: [0.0, 0.0, 0.0],
+                    radius: 10.0,
+                    start_angle: 0.0,
+                    end_angle: 90.0,
+                }),
+            ],
+        );
+        let s = make_sheet();
+        let entities = vec![DxfEntity::Insert(DxfInsert {
+            layer: "WALLS".into(),
+            block_name: "DOOR".into(),
+            position: [50.0, 25.0, 0.0],
+            scale: [1.0, 1.0, 1.0],
+            rotation: 0.0,
+        })];
+        let layers = LayerTable::from_slice(&[
+            make_layer("WALLS", 1, true, "CONTINUOUS"),
+            make_layer("HIDDEN", 2, false, "CONTINUOUS"),
+        ]);
+        let visible = render_sheet_svg_full(
+            &s,
+            &entities,
+            &PlotStyleTable::monochrome(),
+            &LayerTable::from_slice(&[
+                make_layer("WALLS", 1, true, "CONTINUOUS"),
+                make_layer("HIDDEN", 2, true, "CONTINUOUS"),
+            ]),
+            &DimStyleTable::new(),
+            &blocks,
+            &SvgExportOptions::default(),
+        )
+        .unwrap();
+        let frozen = render_sheet_svg_full(
+            &s,
+            &entities,
+            &PlotStyleTable::monochrome(),
+            &layers,
+            &DimStyleTable::new(),
+            &blocks,
+            &SvgExportOptions::default(),
+        )
+        .unwrap();
+        // The visible SVG must contain the arc sampling (a long
+        // polyline), the frozen SVG must not.
+        let visible_polylines = count_tags(&visible, "polyline");
+        let frozen_polylines = count_tags(&frozen, "polyline");
+        assert!(
+            visible_polylines > frozen_polylines,
+            "expected the arc polyline to vanish when HIDDEN is frozen — \
+             visible={visible_polylines}, frozen={frozen_polylines}",
+        );
+        // The wall line (on the visible layer) must still render.
+        assert!(
+            frozen.contains("<line"),
+            "wall line should still render after freezing HIDDEN",
+        );
+    }
+
+    #[test]
+    fn block_body_per_viewport_frozen_layer_is_honored() {
+        // The same block is inserted into two viewports; the second
+        // viewport freezes the swing layer. Top-level entities are
+        // filtered by `is_layer_visible_in` per viewport, and block
+        // bodies must use the same filter.
+        let mut blocks = BlockTable::new();
+        blocks.insert(
+            "DOOR",
+            vec![
+                DxfEntity::Line(DxfLine {
+                    layer: "WALLS".into(),
+                    start: [0.0, 0.0, 0.0],
+                    end: [10.0, 0.0, 0.0],
+                }),
+                DxfEntity::Arc(DxfArc {
+                    layer: "HIDDEN".into(),
+                    center: [0.0, 0.0, 0.0],
+                    radius: 10.0,
+                    start_angle: 0.0,
+                    end_angle: 90.0,
+                }),
+            ],
+        );
+        let mut s = make_sheet();
+        // Add a second viewport that freezes HIDDEN.
+        s.viewports.push(SheetViewport {
+            name: "DETAIL".into(),
+            paper_origin: [110.0, 30.0],
+            paper_size: [80.0, 60.0],
+            model_center: [50.0, 25.0],
+            scale: 1.0,
+            rotation_deg: 0.0,
+            frozen_layers: vec!["HIDDEN".into()],
+        });
+        let entities = vec![DxfEntity::Insert(DxfInsert {
+            layer: "WALLS".into(),
+            block_name: "DOOR".into(),
+            position: [50.0, 25.0, 0.0],
+            scale: [1.0, 1.0, 1.0],
+            rotation: 0.0,
+        })];
+        let svg = render_sheet_svg_full(
+            &s,
+            &entities,
+            &PlotStyleTable::monochrome(),
+            &LayerTable::new(),
+            &DimStyleTable::new(),
+            &blocks,
+            &SvgExportOptions::default(),
+        )
+        .unwrap();
+        // First viewport (no freeze) → arc polyline emitted.
+        // Second viewport (HIDDEN frozen) → no arc polyline.
+        // There are exactly two `<g class="viewport">` blocks; the
+        // first must contain `<polyline`, the second must not.
+        let vp0_start = svg.find(r#"<g class="viewport" id="vp-0""#).unwrap();
+        let vp1_start = svg.find(r#"<g class="viewport" id="vp-1""#).unwrap();
+        let vp1_end = svg[vp1_start..]
+            .find("</g>")
+            .map(|i| vp1_start + i)
+            .unwrap();
+        assert!(
+            svg[vp0_start..vp1_start].contains("<polyline"),
+            "vp-0 (HIDDEN visible) must contain the arc polyline",
+        );
+        assert!(
+            !svg[vp1_start..vp1_end].contains("<polyline"),
+            "vp-1 (HIDDEN frozen) must NOT contain the arc polyline",
+        );
+    }
+
+    #[test]
+    fn hatch_pattern_inside_block_body_is_emitted_in_defs() {
+        // A non-solid hatch nested inside a block must produce a
+        // `<pattern id="hatch-XXX">` in `<defs>`. Without this fix,
+        // the INSERT expansion would emit `fill="url(#hatch-XXX)"`
+        // but the pattern would be missing, leaving the hatch
+        // invisible per SVG paint-server fallback rules.
+        let mut blocks = BlockTable::new();
+        blocks.insert(
+            "HATCHED",
+            vec![DxfEntity::Hatch(DxfHatch {
+                layer: "FILL".into(),
+                pattern_name: "ANSI31".into(),
+                solid: false,
+                scale: 1.0,
+                angle: 0.0,
+                elevation: 0.0,
+                loops: vec![DxfHatchLoop {
+                    vertices: vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]],
+                }],
+            })],
+        );
+        let s = make_sheet();
+        let entities = vec![DxfEntity::Insert(DxfInsert {
+            layer: "FILL".into(),
+            block_name: "HATCHED".into(),
+            position: [50.0, 25.0, 0.0],
+            scale: [1.0, 1.0, 1.0],
+            rotation: 0.0,
+        })];
+        let svg = render_sheet_svg_full(
+            &s,
+            &entities,
+            &PlotStyleTable::monochrome(),
+            &LayerTable::new(),
+            &DimStyleTable::new(),
+            &blocks,
+            &SvgExportOptions::default(),
+        )
+        .unwrap();
+        // The render path uses the uppercased pattern name as the
+        // SVG id. Both the `<defs><pattern id=...>` AND a
+        // `fill="url(#hatch-...)"` reference must appear.
+        assert!(
+            svg.contains(r#"<pattern id="hatch-ANSI31""#),
+            "block-nested hatch pattern should be defined in <defs>",
+        );
+        assert!(
+            svg.contains(r#"fill="url(#hatch-ANSI31)""#),
+            "block-nested hatch should reference the named pattern",
+        );
+    }
+
+    #[test]
+    fn hatch_pattern_nested_in_blocks_with_cycle_does_not_overflow() {
+        // Cyclic block table: A → B → A. The block-nested hatch
+        // collector must respect the same depth cap as `emit_entity`
+        // so it can't drive a stack overflow.
+        let mut blocks = BlockTable::new();
+        blocks.insert(
+            "A",
+            vec![
+                DxfEntity::Insert(DxfInsert {
+                    layer: "0".into(),
+                    block_name: "B".into(),
+                    position: [0.0, 0.0, 0.0],
+                    scale: [1.0, 1.0, 1.0],
+                    rotation: 0.0,
+                }),
+                DxfEntity::Hatch(DxfHatch {
+                    layer: "FILL".into(),
+                    pattern_name: "ANSI32".into(),
+                    solid: false,
+                    scale: 1.0,
+                    angle: 0.0,
+                    elevation: 0.0,
+                    loops: vec![],
+                }),
+            ],
+        );
+        blocks.insert(
+            "B",
+            vec![DxfEntity::Insert(DxfInsert {
+                layer: "0".into(),
+                block_name: "A".into(),
+                position: [0.0, 0.0, 0.0],
+                scale: [1.0, 1.0, 1.0],
+                rotation: 0.0,
+            })],
+        );
+        let s = make_sheet();
+        let entities = vec![DxfEntity::Insert(DxfInsert {
+            layer: "0".into(),
+            block_name: "A".into(),
+            position: [0.0, 0.0, 0.0],
+            scale: [1.0, 1.0, 1.0],
+            rotation: 0.0,
+        })];
+        let svg = render_sheet_svg_full(
+            &s,
+            &entities,
+            &PlotStyleTable::monochrome(),
+            &LayerTable::new(),
+            &DimStyleTable::new(),
+            &blocks,
+            &SvgExportOptions::default(),
+        )
+        .unwrap();
+        // The hatch in block A is reachable via the depth-bounded
+        // recursion; ANSI32 must appear in <defs>.
+        assert!(
+            svg.contains(r#"<pattern id="hatch-ANSI32""#),
+            "ANSI32 should be defined even when the block graph is cyclic",
+        );
+    }
+
+    #[test]
+    fn arc_inside_mirrored_block_swaps_and_reflects_angles() {
+        // Mirror a quarter-arc (0..90°) via `scale = [-1, 1, 1]`.
+        // The reflected arc covers angles 90..180° (CCW). The
+        // renderer's polyline sampling proves the arc covers the
+        // correct quadrant by checking endpoint positions in paper
+        // space.
+        //
+        // Without the determinant fix the renderer would emit the
+        // original 0..90° sweep (CCW) which, after the scale[0] = -1
+        // is applied to the center, would draw the arc in the
+        // *upper-left* quadrant — but its sweep direction would be
+        // reversed in the mirrored frame so the arc would actually
+        // trace the wrong side of the circle.
+        let mut blocks = BlockTable::new();
+        blocks.insert(
+            "QUARTER",
+            vec![DxfEntity::Arc(DxfArc {
+                layer: "WALLS".into(),
+                center: [0.0, 0.0, 0.0],
+                radius: 10.0,
+                start_angle: 0.0,
+                end_angle: 90.0,
+            })],
+        );
+        let s = make_sheet();
+        // No mirror, then mirror across X. The outputs must differ.
+        let no_mirror = vec![DxfEntity::Insert(DxfInsert {
+            layer: "WALLS".into(),
+            block_name: "QUARTER".into(),
+            position: [50.0, 25.0, 0.0],
+            scale: [1.0, 1.0, 1.0],
+            rotation: 0.0,
+        })];
+        let mirror_x = vec![DxfEntity::Insert(DxfInsert {
+            layer: "WALLS".into(),
+            block_name: "QUARTER".into(),
+            position: [50.0, 25.0, 0.0],
+            scale: [-1.0, 1.0, 1.0],
+            rotation: 0.0,
+        })];
+        let svg_no = render_sheet_svg_full(
+            &s,
+            &no_mirror,
+            &PlotStyleTable::monochrome(),
+            &LayerTable::new(),
+            &DimStyleTable::new(),
+            &blocks,
+            &SvgExportOptions::default(),
+        )
+        .unwrap();
+        let svg_mir = render_sheet_svg_full(
+            &s,
+            &mirror_x,
+            &PlotStyleTable::monochrome(),
+            &LayerTable::new(),
+            &DimStyleTable::new(),
+            &blocks,
+            &SvgExportOptions::default(),
+        )
+        .unwrap();
+        assert_ne!(
+            svg_no, svg_mir,
+            "mirror_x must change the arc sweep — otherwise the determinant fix is inert",
+        );
+    }
+
+    #[test]
+    fn block_transform_determinant_xy_signs() {
+        // Direct unit tests on the helper used by transform_entity.
+        // Positive uniform scale → +; one negative axis → -; both
+        // negative → +.
+        let pos = BlockTransform::new([0.0; 3], [2.0, 2.0, 2.0], 0.0);
+        let mirror_x = BlockTransform::new([0.0; 3], [-1.0, 1.0, 1.0], 0.0);
+        let mirror_y = BlockTransform::new([0.0; 3], [1.0, -1.0, 1.0], 0.0);
+        let mirror_xy = BlockTransform::new([0.0; 3], [-1.0, -1.0, 1.0], 0.0);
+        assert!(pos.determinant_xy() > 0.0);
+        assert!(mirror_x.determinant_xy() < 0.0);
+        assert!(mirror_y.determinant_xy() < 0.0);
+        assert!(mirror_xy.determinant_xy() > 0.0);
+    }
+
+    #[test]
+    fn block_transform_reflect_arc_angle_is_identity_under_positive_scale() {
+        let x = BlockTransform::new([0.0; 3], [2.0, 2.0, 1.0], 0.0);
+        for &a in &[0.0, 30.0, 90.0, 180.0, 270.0, 359.0] {
+            let r = x.reflect_arc_angle_deg(a);
+            // atan2 normalises to (-180, 180]; compare modulo 360.
+            let delta = ((r - a + 540.0) % 360.0) - 180.0;
+            assert!(
+                delta.abs() < 1e-9,
+                "expected positive uniform scale to leave angle {a} unchanged, got {r}",
+            );
+        }
+    }
+
+    #[test]
+    fn block_transform_reflect_arc_angle_mirrors_across_x_and_y() {
+        // scale_x = -1: angle θ should map to π - θ.
+        let mx = BlockTransform::new([0.0; 3], [-1.0, 1.0, 1.0], 0.0);
+        let reflected = mx.reflect_arc_angle_deg(30.0);
+        assert!(
+            (reflected - 150.0).abs() < 1e-9,
+            "scale_x = -1 should map 30° to 150°, got {reflected}",
+        );
+        // scale_y = -1: angle θ should map to -θ.
+        let my = BlockTransform::new([0.0; 3], [1.0, -1.0, 1.0], 0.0);
+        let reflected = my.reflect_arc_angle_deg(30.0);
+        assert!(
+            (reflected + 30.0).abs() < 1e-9,
+            "scale_y = -1 should map 30° to -30°, got {reflected}",
+        );
+    }
+
+    #[test]
+    fn radial_dimension_does_not_double_count_diameter_measured_value() {
+        // DXF code 42 ("actual measurement") stores the *diameter*
+        // for a Diameter dim. When the reader populates
+        // `measured_value`, the renderer must NOT double it. The
+        // emitted label must include the cached diameter verbatim.
+        let s = make_sheet();
+        let entities = vec![DxfEntity::Dimension(DxfDimension {
+            layer: "DIMS".into(),
+            style: "STANDARD".into(),
+            kind: DxfDimensionKind::Diameter,
+            def_point: [50.0, 50.0, 0.0],
+            def_point_a: [60.0, 50.0, 0.0],
+            def_point_b: [0.0, 0.0, 0.0],
+            text_position: [50.0, 50.0, 0.0],
+            override_text: None,
+            measured_value: Some(20.0),
+        })];
+        let dim_styles = DimStyleTable::from_slice(&[DxfDimStyle::standard()]);
+        let svg = render_sheet_svg_full(
+            &s,
+            &entities,
+            &PlotStyleTable::monochrome(),
+            &LayerTable::new(),
+            &dim_styles,
+            &BlockTable::new(),
+            &SvgExportOptions::default(),
+        )
+        .unwrap();
+        // Label must show "20" (the cached diameter), not "40".
+        assert!(
+            svg.contains("\u{00f8}20"),
+            "expected the label to show the cached diameter (20), got: {svg}",
+        );
+        assert!(
+            !svg.contains("\u{00f8}40"),
+            "must NOT double-count the cached diameter (which would give 40)",
+        );
+    }
+
+    #[test]
+    fn radial_dimension_falls_back_to_geometry_radius_when_uncached() {
+        // No cached measurement → derive radius from
+        // |def_point_a - def_point|. For a Diameter dim, the label
+        // must show diameter = 2 * radius.
+        let s = make_sheet();
+        let entities = vec![DxfEntity::Dimension(DxfDimension {
+            layer: "DIMS".into(),
+            style: "STANDARD".into(),
+            kind: DxfDimensionKind::Diameter,
+            def_point: [50.0, 50.0, 0.0],
+            def_point_a: [60.0, 50.0, 0.0], // radius = 10
+            def_point_b: [0.0, 0.0, 0.0],
+            text_position: [50.0, 50.0, 0.0],
+            override_text: None,
+            measured_value: None,
+        })];
+        let dim_styles = DimStyleTable::from_slice(&[DxfDimStyle::standard()]);
+        let svg = render_sheet_svg_full(
+            &s,
+            &entities,
+            &PlotStyleTable::monochrome(),
+            &LayerTable::new(),
+            &dim_styles,
+            &BlockTable::new(),
+            &SvgExportOptions::default(),
+        )
+        .unwrap();
+        // Auto-computed: radius=10, label = 2*radius = 20.
+        assert!(
+            svg.contains("\u{00f8}20"),
+            "expected the auto-computed diameter (20) in the label",
+        );
+    }
+
+    #[test]
+    fn radial_dimension_passes_measured_value_through_for_radial_kind() {
+        // For a Radial dim, the cached measurement IS the radius —
+        // pass through verbatim.
+        let s = make_sheet();
+        let entities = vec![DxfEntity::Dimension(DxfDimension {
+            layer: "DIMS".into(),
+            style: "STANDARD".into(),
+            kind: DxfDimensionKind::Radial,
+            def_point: [50.0, 50.0, 0.0],
+            def_point_a: [60.0, 50.0, 0.0],
+            def_point_b: [0.0, 0.0, 0.0],
+            text_position: [50.0, 50.0, 0.0],
+            override_text: None,
+            measured_value: Some(7.5),
+        })];
+        let dim_styles = DimStyleTable::from_slice(&[DxfDimStyle::standard()]);
+        let svg = render_sheet_svg_full(
+            &s,
+            &entities,
+            &PlotStyleTable::monochrome(),
+            &LayerTable::new(),
+            &dim_styles,
+            &BlockTable::new(),
+            &SvgExportOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            svg.contains("R7.50"),
+            "expected the cached radius (7.50) prefixed with R, got: {svg}",
+        );
     }
 }
