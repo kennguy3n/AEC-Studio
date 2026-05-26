@@ -332,11 +332,19 @@ fn parse_blocks(groups: &[Group], mut i: usize, doc: &mut DxfDocument) -> usize 
             let mut name = String::new();
             let mut flags = 0i32;
             let mut base = [0.0; 3];
+            // BLOCK entities carry a code-8 layer per DXF spec.
+            // Default to "0" — the AutoCAD convention for block
+            // definitions, picked so contained `BYLAYER` colors
+            // resolve through the INSERT's layer rather than being
+            // baked in at definition time. Empty / absent code-8
+            // round-trips back to "0".
+            let mut layer = String::from("0");
             i += 1;
             // Header fields up to the first nested code-0.
             while i < groups.len() && groups[i].code != 0 {
                 match groups[i].code {
                     2 => name.clone_from(&groups[i].value),
+                    8 => layer.clone_from(&groups[i].value),
                     10 => base[0] = groups[i].value.parse().unwrap_or(0.0),
                     20 => base[1] = groups[i].value.parse().unwrap_or(0.0),
                     30 => base[2] = groups[i].value.parse().unwrap_or(0.0),
@@ -376,16 +384,29 @@ fn parse_blocks(groups: &[Group], mut i: usize, doc: &mut DxfDocument) -> usize 
                 // Merge with an existing BLOCK_RECORD-table entry that
                 // declared the metadata (description, etc.) so we
                 // don't end up with two records for the same name.
+                //
+                // Flags are *OR-merged*, not "BLOCK_RECORD wins if
+                // non-zero". The DXF code-70 field on both
+                // BLOCK_RECORD and BLOCK is a bitfield (anonymous /
+                // has-attributes / xref / etc.), so OR-ing preserves
+                // information from non-conforming files where the
+                // table entry and the BLOCK definition disagree on a
+                // bit. Conforming files set the same bits on both
+                // sides, so this is a no-op for them.
+                //
+                // The BLOCK entity's code-8 layer always wins over
+                // the (non-existent) BLOCK_RECORD layer — only the
+                // BLOCK side of the pair carries a layer per spec.
                 if let Some(existing) = doc.block_records.iter_mut().find(|b| b.name == name) {
                     existing.base_point = base;
                     existing.entities = entities;
-                    if existing.flags == 0 {
-                        existing.flags = flags;
-                    }
+                    existing.layer = layer;
+                    existing.flags |= flags;
                 } else {
                     let mut br = DxfBlockRecord::new(name);
                     br.flags = flags;
                     br.base_point = base;
+                    br.layer = layer;
                     br.entities = entities;
                     doc.block_records.push(br);
                 }

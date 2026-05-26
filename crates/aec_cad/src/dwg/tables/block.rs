@@ -35,6 +35,17 @@ impl BlockRecord {
             // start them at the canonical defaults so the downstream
             // DXF writer emits a syntactically-valid BLOCK … ENDBLK.
             base_point: [0.0, 0.0, 0.0],
+            // BLOCK entities live on layer "0" by AutoCAD convention
+            // so contained `BYLAYER` colors resolve through the
+            // INSERT's layer at draw time. DWG BLOCK_HEADER records
+            // don't carry this directly — it's a property of the
+            // emitted BLOCK entity, not the table record — so we
+            // emit the canonical default here. Recovering a
+            // non-default value from a DWG file would require the
+            // block-body codec to forward the BLOCK entity's code-8
+            // through this struct (future work, tracked alongside
+            // `entity_handles` resolution).
+            layer: "0".to_string(),
             entities: Vec::new(),
         }
     }

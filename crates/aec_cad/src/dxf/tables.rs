@@ -28,10 +28,24 @@ pub struct DxfBlockRecord {
     /// to the origin.
     #[serde(default)]
     pub base_point: [f64; 3],
+    /// Layer the BLOCK entity itself sits on (DXF group code 8 on
+    /// the BLOCK record inside the BLOCKS section). Per the DXF
+    /// spec this is a required field on a BLOCK entity; strict
+    /// third-party consumers (AutoCAD, BricsCAD, LibreDWG) reject
+    /// or warn on a missing code-8. AutoCAD's convention is that
+    /// block definitions live on layer "0" so a contained entity's
+    /// `BYLAYER` color resolves through the insert's layer instead
+    /// of being baked in at block-definition time.
+    #[serde(default = "default_block_layer")]
+    pub layer: String,
     /// Entities that make up the body of this block. Empty for
     /// blocks that only contribute metadata.
     #[serde(default)]
     pub entities: Vec<DxfEntity>,
+}
+
+fn default_block_layer() -> String {
+    "0".to_string()
 }
 
 impl DxfBlockRecord {
@@ -41,6 +55,7 @@ impl DxfBlockRecord {
             description: None,
             flags: 0,
             base_point: [0.0, 0.0, 0.0],
+            layer: default_block_layer(),
             entities: Vec::new(),
         }
     }

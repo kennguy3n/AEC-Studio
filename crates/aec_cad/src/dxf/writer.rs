@@ -199,6 +199,14 @@ fn write_blocks<W: Write>(doc: &DxfDocument, w: &mut W) -> CadResult<()> {
     write_pair(w, 2, "BLOCKS")?;
     for br in &doc.block_records {
         write_pair(w, 0, "BLOCK")?;
+        // Group code 8: layer the BLOCK entity sits on. Required by
+        // the DXF spec on the BLOCK entity inside the BLOCKS section.
+        // Strict third-party consumers (AutoCAD, BricsCAD, LibreDWG,
+        // QCAD) reject or warn on a missing code-8. Defaults to "0"
+        // so that any `BYLAYER` colors on entities inside the block
+        // resolve through the insert's layer at draw time rather
+        // than being baked into the block definition.
+        write_pair(w, 8, &br.layer)?;
         write_pair(w, 2, &br.name)?;
         write_pair(w, 70, &br.flags.to_string())?;
         write_pair(w, 10, &fmt_f(br.base_point[0]))?;

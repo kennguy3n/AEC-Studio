@@ -759,3 +759,183 @@ fn dxf_writer_emits_dimstyle_340_as_hard_pointer_handle() {
         "DIMSTYLE 340 hex handle resolves back to the style name on read"
     );
 }
+
+#[test]
+fn dxf_writer_emits_code_8_layer_on_block_entities() {
+    // Regression for the missing-code-8 finding: the DXF spec
+    // requires a layer (group code 8) on every BLOCK entity inside
+    // the BLOCKS section. Strict third-party consumers (AutoCAD,
+    // BricsCAD, LibreDWG, QCAD) reject or warn on a missing code-8.
+    // Our reader defaulted to "0" on missing input, so the bug was
+    // invisible on internal round-trips, but external interop is
+    // broken without it. New regression locks in:
+    //   1. The writer emits code-8 immediately after the BLOCK
+    //      keyword.
+    //   2. Default layer is "0" (AutoCAD's block-definition
+    //      convention so BYLAYER colors on contained entities
+    //      resolve through the INSERT's layer).
+    //   3. A non-default layer round-trips verbatim.
+    //   4. OR-merge on the parse_blocks flags path preserves bits
+    //      from a BLOCK_RECORD-table entry's flags field when the
+    //      BLOCK entity's flags differ (defense-in-depth on
+    //      non-conforming files).
+    let mut doc = DxfDocument::new();
+    let mut block_default = DxfBlockRecord::new("DEFAULT_LAYER_BLOCK");
+    block_default.entities.push(DxfEntity::Line(DxfLine {
+        layer: "0".into(),
+        start: [0.0, 0.0, 0.0],
+        end: [10.0, 0.0, 0.0],
+    }));
+    doc.block_records.push(block_default);
+
+    let mut block_custom = DxfBlockRecord::new("CUSTOM_LAYER_BLOCK");
+    block_custom.layer = "A-BLOCK-DEFS".into();
+    block_custom.entities.push(DxfEntity::Line(DxfLine {
+        layer: "A-WALL".into(),
+        start: [0.0, 0.0, 0.0],
+        end: [5.0, 5.0, 0.0],
+    }));
+    doc.block_records.push(block_custom);
+
+    let written = DxfWriter::write_to_string(&doc).expect("DXF writes");
+
+    // Locate the first BLOCK record and assert code 8 appears in
+    // its header before any contained entity (i.e. before the next
+    // code-0 that isn't ENDBLK).
+    let lines: Vec<&str> = written.lines().collect();
+    let mut block_starts = Vec::new();
+    let mut idx = 0;
+    while idx + 1 < lines.len() {
+        if lines[idx].trim() == "0" && lines[idx + 1].trim() == "BLOCK" {
+            block_starts.push(idx);
+            idx += 2;
+        } else {
+            idx += 1;
+        }
+    }
+    assert_eq!(
+        block_starts.len(),
+        2,
+        "expected exactly 2 BLOCK records, got {}",
+        block_starts.len()
+    );
+
+    fn extract_layer(lines: &[&str], block_start: usize) -> String {
+        let mut j = block_start + 2;
+        while j + 1 < lines.len() && lines[j].trim() != "0" {
+            if lines[j].trim() == "8" {
+                return lines[j + 1].trim().to_string();
+            }
+            j += 2;
+        }
+        panic!("no code-8 layer found in BLOCK header starting at line {block_start}");
+    }
+
+    assert_eq!(
+        extract_layer(&lines, block_starts[0]),
+        "0",
+        "first BLOCK uses default layer \"0\""
+    );
+    assert_eq!(
+        extract_layer(&lines, block_starts[1]),
+        "A-BLOCK-DEFS",
+        "second BLOCK uses custom layer"
+    );
+
+    // Re-read and verify the layer round-trips on the in-memory
+    // struct.
+    let reparsed = DxfReader::read_str(&written).expect("re-read");
+    let default_block = reparsed
+        .block_records
+        .iter()
+        .find(|b| b.name == "DEFAULT_LAYER_BLOCK")
+        .expect("default-layer block re-reads");
+    assert_eq!(default_block.layer, "0");
+    let custom_block = reparsed
+        .block_records
+        .iter()
+        .find(|b| b.name == "CUSTOM_LAYER_BLOCK")
+        .expect("custom-layer block re-reads");
+    assert_eq!(custom_block.layer, "A-BLOCK-DEFS");
+}
+
+#[test]
+fn dxf_parse_blocks_or_merges_flags_from_block_record_and_block() {
+    // Regression for the conditional-flags-merge finding: the prior
+    // "if existing.flags == 0 { existing.flags = flags; }" branch
+    // silently dropped flag bits when a BLOCK_RECORD-table entry
+    // and the matching BLOCK definition disagreed (the BLOCK_RECORD
+    // bits would win even though both fields are bitfields).
+    // OR-merging preserves information from non-conforming files
+    // and is a no-op for conforming files where the two sides set
+    // the same bits.
+    //
+    // Synthesise a DXF with a BLOCK_RECORD-table flags=1
+    // (anonymous) and a BLOCK entity flags=4 (xref overlay); the
+    // merged record must end up with flags=5.
+    let dxf = r"  0
+SECTION
+  2
+HEADER
+  9
+$ACADVER
+  1
+AC1009
+  0
+ENDSEC
+  0
+SECTION
+  2
+TABLES
+  0
+TABLE
+  2
+BLOCK_RECORD
+ 70
+1
+  0
+BLOCK_RECORD
+  2
+MERGED_FLAGS
+ 70
+1
+  0
+ENDTAB
+  0
+ENDSEC
+  0
+SECTION
+  2
+BLOCKS
+  0
+BLOCK
+  8
+0
+  2
+MERGED_FLAGS
+ 70
+4
+ 10
+0.0
+ 20
+0.0
+ 30
+0.0
+  0
+ENDBLK
+  0
+ENDSEC
+  0
+EOF
+";
+    let doc = DxfReader::read_str(dxf).expect("parse merged-flags fixture");
+    let block = doc
+        .block_records
+        .iter()
+        .find(|b| b.name == "MERGED_FLAGS")
+        .expect("MERGED_FLAGS block present");
+    assert_eq!(
+        block.flags, 5,
+        "BLOCK_RECORD (1) | BLOCK (4) must OR-merge to 5"
+    );
+}
