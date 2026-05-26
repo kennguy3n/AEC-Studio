@@ -234,12 +234,23 @@ pub fn compare_revision_snapshots(
     ))
 }
 
-/// Open a `.snap` SQLCipher file read-only for diffing purposes. Uses
-/// [`db::open_existing`] which validates the encryption key against
-/// the file (so a wrong key surfaces immediately rather than as a
-/// confusing "no such table" error later).
+/// Open a `.snap` SQLCipher file **strictly read-only** for diffing
+/// purposes. Uses [`db::open_readonly`] which opens the file with
+/// `SQLITE_OPEN_READ_ONLY` so the SQLite library itself refuses any
+/// write — not just by convention. This:
+///
+/// 1. Validates the encryption key against the file (a wrong key
+///    surfaces here rather than as a confusing "no such table" error
+///    later).
+/// 2. Prevents any future bug in a caller from accidentally mutating a
+///    snapshot — the kernel-level read-only flag would surface the
+///    write attempt as a runtime error.
+/// 3. Suppresses the `-wal` / `-shm` sidecar files SQLite would
+///    otherwise create next to the `.snap` file, so a process crash
+///    during a diff can't leave orphan WAL state in the revisions
+///    directory.
 fn open_snapshot_db(path: &Path, key: &Key32) -> AecResult<Connection> {
-    db::open_existing(path, key)
+    db::open_readonly(path, key)
 }
 
 /// Pure-data variant of [`compare_revisions`] that takes the
