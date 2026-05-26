@@ -235,9 +235,14 @@ impl<'a> AssetImportPipeline<'a> {
                 });
                 continue;
             }
+            // Use caller-supplied decimation options if provided so
+            // boundary-heavy meshes have a real recovery path (set
+            // `preserve_boundary: false`); fall back to the strict
+            // default otherwise. `target_triangle_count` is always
+            // overridden per LOD level from the chain.
             let opts = DecimateOptions {
                 target_triangle_count: level.triangle_count,
-                ..Default::default()
+                ..req.decimate_options.unwrap_or_default()
             };
             let decimated =
                 decimate(mesh_in_mm.as_ref(), &opts).map_err(|source| AssetError::Decimation {
@@ -347,6 +352,7 @@ impl<'a> AssetImportPipeline<'a> {
             source_units: meta.source_units,
             mesh: ingested.mesh,
             extra_ratios: meta.extra_ratios,
+            decimate_options: meta.decimate_options,
             thumbnail_opts: meta.thumbnail_opts,
         };
         self.import_mesh(req)
@@ -376,6 +382,22 @@ pub struct PathImportMetadata {
     pub materials: Vec<String>,
     pub source_units: Units,
     pub extra_ratios: Vec<f32>,
+    /// Optional override for QEM decimation behaviour applied to every
+    /// non-base LOD level. `None` uses [`DecimateOptions::default`]
+    /// (`preserve_boundary: true`, `max_cost: f64::INFINITY`), which
+    /// is the right policy for typical closed-manifold glTF / OBJ
+    /// assets. On boundary-heavy meshes (open shells, strips,
+    /// non-manifold) the default may produce
+    /// [`crate::AssetError::LodNotStrictlyDecreasing`] at the
+    /// aggressive 5% target; set this to
+    /// `Some(DecimateOptions { preserve_boundary: false, .. })` to
+    /// permit boundary collapses.
+    ///
+    /// The `target_triangle_count` field is **ignored** — the
+    /// pipeline overrides it per LOD level from
+    /// [`crate::LodChain::aggressive_for_real_mesh`]. Only the other
+    /// fields (`preserve_boundary`, `max_cost`) propagate.
+    pub decimate_options: Option<DecimateOptions>,
     pub thumbnail_opts: Option<ThumbnailOptions>,
 }
 
@@ -399,6 +421,12 @@ pub struct RealMeshImportRequest {
     /// Extra LOD ratios beyond the default chain (`[1.0, 0.25, 0.05]`).
     /// Empty means "use the default chain".
     pub extra_ratios: Vec<f32>,
+    /// Optional override for QEM decimation behaviour applied to every
+    /// non-base LOD level. See
+    /// [`PathImportMetadata::decimate_options`] for the full doc —
+    /// the two fields share semantics and the path-import surface
+    /// just forwards this through verbatim.
+    pub decimate_options: Option<DecimateOptions>,
     /// Override thumbnail rendering options. `None` -> defaults.
     pub thumbnail_opts: Option<ThumbnailOptions>,
 }
@@ -543,6 +571,7 @@ mod tests {
             source_units: Units::Mm,
             mesh,
             extra_ratios: vec![],
+            decimate_options: None,
             thumbnail_opts: Some(ThumbnailOptions {
                 width: 32,
                 height: 32,

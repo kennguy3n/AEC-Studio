@@ -24,7 +24,8 @@ use std::path::PathBuf;
 
 use aec_assets::metadata::{License, Vendor};
 use aec_assets::{
-    AssetDatabase, AssetImportPipeline, IngestFormat, PathImportMetadata, ThumbnailOptions,
+    AssetDatabase, AssetError, AssetImportPipeline, DecimateOptions, IngestFormat,
+    PathImportMetadata, ThumbnailOptions,
 };
 
 /// 80-triangle UV sphere (icosphere subdivided once: 20 base faces
@@ -86,6 +87,10 @@ fn meta_for_format(asset_id: &str, format: IngestFormat) -> PathImportMetadata {
         materials: vec![],
         source_units: format.default_units(),
         extra_ratios: vec![],
+        // Closed-manifold icosphere: the strict default
+        // (`preserve_boundary: true`) reaches the 5% LOD2 target
+        // without needing the boundary-mesh recovery knob.
+        decimate_options: None,
         thumbnail_opts: Some(cheap_thumb_opts()),
     }
 }
@@ -194,6 +199,55 @@ fn re_importing_same_file_dedupes_on_blake3_hash() {
     let first = db.get("first").unwrap().unwrap();
     let second = db.get("second").unwrap().unwrap();
     assert_eq!(first.lods[0].mesh_hash, second.lods[0].mesh_hash);
+}
+
+#[test]
+fn decimate_options_override_propagates_to_the_solver() {
+    // Proves the recovery knob added for the boundary-heavy-mesh case
+    // (Devin Review finding 3305659126) actually reaches the QEM
+    // solver. We do this symmetrically: rather than authoring a
+    // custom boundary-heavy fixture, we hand the existing closed
+    // icosphere a *deny-every-collapse* override (`max_cost = 0.0`).
+    // If the override is wired correctly the decimator can't reduce
+    // a single triangle and the pipeline must surface
+    // `LodNotStrictlyDecreasing`. If it weren't wired the strict
+    // default (`max_cost = INFINITY`) would still decimate the mesh
+    // cleanly and this test would silently pass.
+    //
+    // The same plumbing is what callers of the recovery path go
+    // through, just with `preserve_boundary: false` instead.
+    let dir = tempfile::tempdir().unwrap();
+    let p = write_fixture(dir.path(), "icosphere.obj", OBJ_ICOSPHERE.as_bytes());
+    let mut db = AssetDatabase::open_in_memory().unwrap();
+    let mut pipe = AssetImportPipeline::new(&mut db);
+
+    let mut meta = obj_meta("override_propagates");
+    meta.decimate_options = Some(DecimateOptions {
+        // Per-level `target_triangle_count` is overridden by the
+        // pipeline from the chain — this seed value is irrelevant.
+        target_triangle_count: 0,
+        max_cost: 0.0,
+        preserve_boundary: true,
+    });
+    let err = pipe
+        .import_path(&p, meta)
+        .expect_err("zero-cost-cap override must block every collapse");
+    match err {
+        AssetError::LodNotStrictlyDecreasing { actual, base, .. } => {
+            assert_eq!(
+                actual, base,
+                "no collapse was allowed, so decimated count must equal base"
+            );
+        }
+        other => panic!("expected LodNotStrictlyDecreasing, got {other:?}"),
+    }
+
+    // Sanity: identical metadata *without* the override succeeds.
+    let mut db2 = AssetDatabase::open_in_memory().unwrap();
+    let mut pipe2 = AssetImportPipeline::new(&mut db2);
+    pipe2
+        .import_path(&p, obj_meta("default_succeeds"))
+        .expect("strict default reaches 5% target on closed icosphere");
 }
 
 #[test]

@@ -38,6 +38,28 @@ impl LodChain {
     /// LOD 0 is the original mesh, LOD 1 retains ~25% of the triangles
     /// (mid-distance view), LOD 2 retains ~5% (far view / icon).
     /// This matches the spec for [`crate::pipeline::AssetImportPipeline::import_mesh`].
+    ///
+    /// # Boundary-heavy meshes
+    ///
+    /// The 5% target is aggressive and assumes the input is a closed
+    /// (or near-closed) manifold, which is the typical case for glTF /
+    /// OBJ assets the asset DB ingests. On meshes with heavy boundary
+    /// topology (open shells, single-sided surfaces, strips,
+    /// non-manifold edges) the default decimation option
+    /// `preserve_boundary: true` will refuse every collapse that
+    /// touches a boundary vertex, leaving the decimated mesh too close
+    /// to the base count to satisfy the pipeline's
+    /// strictly-decreasing guarantee. When that happens the import
+    /// surfaces [`crate::AssetError::LodNotStrictlyDecreasing`]
+    /// (or [`crate::AssetError::Decimation`] if the solver returns
+    /// no result at all); see those variants' doc comments for the
+    /// supported recovery paths.
+    ///
+    /// `extra_ratios` *extend* this seed (the resulting chain is
+    /// sorted-deduplicated-descending), so callers cannot use them to
+    /// soften the 5% floor — the recovery path runs through
+    /// [`crate::PathImportMetadata::decimate_options`] /
+    /// [`crate::pipeline::RealMeshImportRequest::decimate_options`].
     pub fn aggressive_for_real_mesh(base_triangle_count: u32, extra_ratios: &[f32]) -> Self {
         Self::from_seed_ratios(base_triangle_count, &[1.0_f32, 0.25, 0.05], extra_ratios)
     }

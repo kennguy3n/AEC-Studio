@@ -32,6 +32,32 @@ pub enum AssetError {
     /// `DecimateError` for diagnostics. This is the structured
     /// replacement for the previous silent fallback that stored the
     /// base mesh under a degraded LOD hash.
+    ///
+    /// ### Recovery
+    ///
+    /// The default LOD chain for real-mesh imports is the aggressive
+    /// `[1.0, 0.25, 0.05]` per
+    /// [`crate::LodChain::aggressive_for_real_mesh`]. On meshes with
+    /// heavy boundary topology (open shells, non-manifold edges) the
+    /// 5% target may be unreachable while the default decimation
+    /// option `preserve_boundary: true` blocks every collapse that
+    /// touches a boundary vertex. Two callers' knobs exist:
+    ///
+    /// * Set
+    ///   [`crate::PathImportMetadata::decimate_options`] /
+    ///   [`crate::pipeline::RealMeshImportRequest::decimate_options`]
+    ///   to `Some(DecimateOptions { preserve_boundary: false, .. })`
+    ///   to allow boundary collapses (silhouette will shrink at far
+    ///   LODs, which is generally acceptable for icon-distance views).
+    /// * Lower `DecimateOptions::max_cost` to cap how aggressively a
+    ///   collapse is allowed to move geometry — useful in the
+    ///   opposite direction, when the failure is from a high-cost
+    ///   collapse hitting the cap rather than from boundary lock-in.
+    ///
+    /// The `target_triangle_count` field on the supplied
+    /// [`crate::DecimateOptions`] is **ignored**: the pipeline
+    /// overrides it per-LOD-level from the chain. Only
+    /// `preserve_boundary` and `max_cost` propagate.
     #[error("decimation failed at LOD level {level} (target = {target} triangles): {source}")]
     Decimation {
         level: u8,
@@ -44,6 +70,19 @@ pub enum AssetError {
     /// under a separate LOD hash would either duplicate the base blob
     /// or claim a triangle budget the chain cannot honour, so the
     /// pipeline rejects the import early.
+    ///
+    /// ### Recovery
+    ///
+    /// This typically fires on meshes with heavy boundary topology
+    /// where every collapse the QEM solver tried was blocked by the
+    /// default `preserve_boundary: true` option, leaving the
+    /// decimated mesh tied with — or exceeding — the base triangle
+    /// count. The recovery path is the same as for
+    /// [`AssetError::Decimation`]: pass
+    /// `Some(DecimateOptions { preserve_boundary: false, .. })` via
+    /// [`crate::PathImportMetadata::decimate_options`] /
+    /// [`crate::pipeline::RealMeshImportRequest::decimate_options`].
+    /// See [`AssetError::Decimation`] for the full discussion.
     #[error(
         "decimation at LOD level {level} produced {actual} triangles, not strictly less than base {base}"
     )]
