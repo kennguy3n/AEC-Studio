@@ -34,6 +34,8 @@
 //! The PDF builder is unchanged: it caption-lists each render pair
 //! plus, if present, embeds the SVG plan overlay summary text.
 
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -510,7 +512,6 @@ fn parse_xy(
 }
 
 fn build_plan_overlay(base: &[WallBody], head: &[WallBody]) -> PlanOverlay {
-    use std::collections::BTreeMap;
     let base_map: BTreeMap<&str, &WallBody> = base.iter().map(|w| (w.id.as_str(), w)).collect();
     let head_map: BTreeMap<&str, &WallBody> = head.iter().map(|w| (w.id.as_str(), w)).collect();
 
@@ -633,8 +634,6 @@ fn render_plan_overlay_svg_impl(
     overlay: &PlanOverlay,
     margin_mm: f64,
 ) -> Result<String, BeforeAfterReportError> {
-    use std::fmt::Write;
-
     let mut out = String::new();
     let margin = margin_mm.max(0.0);
 
@@ -786,7 +785,6 @@ fn discover_render_pairs_impl(
     base_revision_id: &str,
     head_revision_id: &str,
 ) -> Vec<BeforeAfterRenderPair> {
-    use std::collections::BTreeMap;
     let Ok(entries) = fs::read_dir(renders_dir) else {
         return Vec::new();
     };
