@@ -63,7 +63,20 @@ pub fn diff_payload_hash(diff: &Diff) -> String {
     // proposal's content. Two diffs with the same operations should
     // hash to the same value regardless of `DiffId` (which is
     // generated per `DiffEngine::build` call).
-    let payload = serde_json::to_vec(&diff.operations).unwrap_or_default();
+    //
+    // Devin Review `ANALYSIS_0006` (round 6): the previous
+    // implementation used `unwrap_or_default()`, which would
+    // silently substitute an empty byte vector if serialisation
+    // ever failed. That collapses every "broken" diff to the same
+    // hash, which is a denial-of-tampering-detection in the audit
+    // chain (two distinct unserialisable diffs would carry the
+    // same `payload_hash`, masking corruption). `DiffOperation`
+    // derives `Serialize` and its fields are all JSON-safe types
+    // (strings, numbers, vectors of same), so the failure path
+    // is genuinely impossible — but we make the impossible failure
+    // loud via `.expect` rather than silent via `unwrap_or_default`.
+    let payload = serde_json::to_vec(&diff.operations)
+        .expect("DiffOperation is always JSON-serialisable; this is an audit-chain invariant");
     blake3::hash(&payload).to_hex().to_string()
 }
 

@@ -455,13 +455,25 @@ fn build_move_furniture(
         .unwrap_or(current_rotation);
     // `scale_override` follows the same "absent = keep current"
     // semantics so a yaw-only patch doesn't strip an existing
-    // scale override.
-    let scale_override = if patch.get("scale_override").is_some() {
-        patch
-            .get("scale_override")
-            .and_then(serde_json::Value::as_f64)
-    } else {
-        current_scale_override(record)
+    // scale override. Devin Review `ANALYSIS_0002` (round 6)
+    // flagged that the previous implementation silently fell
+    // through to `None` (clearing the existing scale) whenever
+    // the patch supplied a non-numeric value like `true` or
+    // `"big"`. That was asymmetric with `rotation_deg` above,
+    // which errors on non-numeric inputs. The fix mirrors the
+    // rotation handling but preserves the `Option` semantics of
+    // the underlying command field: JSON `null` means "explicitly
+    // clear the override", a number means "set", anything else
+    // (string, bool, object, array) is rejected as a parse error.
+    let scale_override = match patch.get("scale_override") {
+        None => current_scale_override(record),
+        Some(Value::Null) => None,
+        Some(value) => match value.as_f64() {
+            Some(n) => Some(n),
+            None => {
+                return Err("scale_override is not a number or null".to_string());
+            }
+        },
     };
     Ok(MoveFurniture {
         entity_id: target,
@@ -962,6 +974,135 @@ mod tests {
         assert!(out.commands.is_empty());
         assert_eq!(out.skipped.len(), 1);
         assert!(out.skipped[0].reason.contains("length 2"));
+    }
+
+    #[test]
+    fn update_furniture_non_numeric_scale_override_is_rejected() {
+        // Devin Review ANALYSIS_0002 (round 6): a present but
+        // non-numeric `scale_override` (e.g. a string or boolean)
+        // previously fell through `Value::as_f64()` to `None` and
+        // silently cleared the existing override. That was
+        // asymmetric with `rotation_deg`, which errors on the
+        // same shape of bad input. The fix makes scale_override
+        // reject anything that isn't a number or JSON null.
+        use crate::commands::{EntityDelta, EntityRecord, ProjectGraph};
+        let mut g = ProjectGraph::new();
+        let furn_id = EntityId::new();
+        g.apply(&EntityDelta::Create {
+            record: EntityRecord {
+                id: furn_id.clone(),
+                kind: "furniture".into(),
+                body: json!({
+                    "asset_ref": "asset_chair",
+                    "position_mm": [0.0, 0.0, 0.0],
+                    "rotation_yaw_deg": 0.0,
+                    "scale_override": 1.5,
+                }),
+                parent: None,
+            },
+        })
+        .unwrap();
+        for bad in [json!("big"), json!(true), json!([1.0]), json!({"v": 2})] {
+            let diff = diff_of(
+                ToolName::LayoutSuggestion,
+                vec![DiffOperation::Update {
+                    target: furn_id.clone(),
+                    patch: json!({"scale_override": bad}),
+                }],
+            );
+            let out = diff_to_commands(&diff, &g, ApplyDefaults::default());
+            assert!(
+                out.commands.is_empty(),
+                "non-numeric scale_override `{bad}` must not produce a command",
+            );
+            assert_eq!(out.skipped.len(), 1);
+            assert!(
+                out.skipped[0].reason.contains("scale_override"),
+                "skip reason should mention scale_override; got `{}`",
+                out.skipped[0].reason,
+            );
+        }
+    }
+
+    #[test]
+    fn update_furniture_explicit_null_scale_override_clears() {
+        // Companion to ANALYSIS_0002: JSON `null` is the explicit
+        // "clear the override" signal (matches the `Option<f64>`
+        // shape of the underlying command field). A patch with
+        // `scale_override: null` must produce a `MoveFurniture`
+        // with `scale_override: None`.
+        use crate::commands::{EntityDelta, EntityRecord, ProjectGraph};
+        let mut g = ProjectGraph::new();
+        let furn_id = EntityId::new();
+        g.apply(&EntityDelta::Create {
+            record: EntityRecord {
+                id: furn_id.clone(),
+                kind: "furniture".into(),
+                body: json!({
+                    "asset_ref": "asset_chair",
+                    "position_mm": [0.0, 0.0, 0.0],
+                    "rotation_yaw_deg": 0.0,
+                    "scale_override": 1.5,
+                }),
+                parent: None,
+            },
+        })
+        .unwrap();
+        let diff = diff_of(
+            ToolName::LayoutSuggestion,
+            vec![DiffOperation::Update {
+                target: furn_id.clone(),
+                patch: json!({"scale_override": serde_json::Value::Null}),
+            }],
+        );
+        let out = diff_to_commands(&diff, &g, ApplyDefaults::default());
+        assert_eq!(out.commands.len(), 1);
+        match &out.commands[0].kind {
+            CommandKind::MoveFurniture(c) => {
+                assert_eq!(c.scale_override, None);
+            }
+            other => panic!("expected MoveFurniture, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_furniture_numeric_scale_override_sets() {
+        // Companion to ANALYSIS_0002: a numeric value should set
+        // the override exactly as supplied (the happy path that
+        // pre-existed but was previously coupled to the
+        // silent-clear bug above).
+        use crate::commands::{EntityDelta, EntityRecord, ProjectGraph};
+        let mut g = ProjectGraph::new();
+        let furn_id = EntityId::new();
+        g.apply(&EntityDelta::Create {
+            record: EntityRecord {
+                id: furn_id.clone(),
+                kind: "furniture".into(),
+                body: json!({
+                    "asset_ref": "asset_chair",
+                    "position_mm": [0.0, 0.0, 0.0],
+                    "rotation_yaw_deg": 0.0,
+                    "scale_override": 1.0,
+                }),
+                parent: None,
+            },
+        })
+        .unwrap();
+        let diff = diff_of(
+            ToolName::LayoutSuggestion,
+            vec![DiffOperation::Update {
+                target: furn_id.clone(),
+                patch: json!({"scale_override": 2.25}),
+            }],
+        );
+        let out = diff_to_commands(&diff, &g, ApplyDefaults::default());
+        assert_eq!(out.commands.len(), 1);
+        match &out.commands[0].kind {
+            CommandKind::MoveFurniture(c) => {
+                assert_eq!(c.scale_override, Some(2.25));
+            }
+            other => panic!("expected MoveFurniture, got {other:?}"),
+        }
     }
 
     #[test]
