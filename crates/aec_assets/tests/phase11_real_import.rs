@@ -24,9 +24,10 @@ use std::path::PathBuf;
 
 use aec_assets::metadata::{License, Vendor};
 use aec_assets::{
-    AssetDatabase, AssetError, AssetImportPipeline, DecimateOptions, IngestFormat,
-    PathImportMetadata, ThumbnailOptions,
+    ingest_path, AssetDatabase, AssetError, AssetImportPipeline, DecimateOptions, IngestFormat,
+    PathImportMetadata, RealMeshImportRequest, ThumbnailOptions,
 };
+use aec_core::types::Units;
 
 /// 80-triangle UV sphere (icosphere subdivided once: 20 base faces
 /// × 4 subdivisions = 80 triangles, 42 vertices). Pinned to the
@@ -269,4 +270,126 @@ fn re_importing_different_file_under_same_asset_id_is_rejected() {
         msg.contains("hash") || msg.contains("conflict"),
         "expected hash conflict on differing payload for same asset_id, got: {msg}",
     );
+}
+
+/// Build a [`RealMeshImportRequest`] with the boilerplate metadata
+/// fields populated; callers patch `mesh`, `source_units`, and
+/// `decimate_options` for the test under exercise.
+fn real_req(asset_id: &str, mesh: aec_geometry::Mesh) -> RealMeshImportRequest {
+    RealMeshImportRequest {
+        asset_id: asset_id.to_string(),
+        name: format!("Test asset {asset_id}"),
+        vendor: Vendor {
+            id: "phase11".into(),
+            name: "Phase 11 Acceptance".into(),
+            url: None,
+        },
+        version: "1.0.0".into(),
+        license: License::CcBy,
+        attribution: None,
+        tags: vec!["test".into()],
+        style_tags: vec![],
+        materials: vec![],
+        source_units: Units::Mm,
+        mesh,
+        extra_ratios: vec![],
+        decimate_options: None,
+        thumbnail_opts: Some(cheap_thumb_opts()),
+    }
+}
+
+#[test]
+fn max_cost_interpretation_does_not_vary_with_source_units() {
+    // Regression guard for the documented contract on
+    // `PathImportMetadata::decimate_options` and the
+    // `AssetError::Decimation` recovery section: `max_cost` is
+    // evaluated in canonical mm² space, **independent of
+    // `source_units`**. (Devin Review finding 3305788569.)
+    //
+    // We pick the icosphere fixture because every interior collapse
+    // pushes the new vertex off the local tangent plane, producing a
+    // strictly positive QEM cost — so `max_cost = 0.0` blocks every
+    // collapse on the closed manifold (planar geometry would have
+    // cost-0 collapses that slip past the strict `cost > max_cost`
+    // predicate). The same canonical geometry tagged `Units::M`
+    // (positions scaled to metres) and `Units::Mm` (positions in mm)
+    // must produce identical decimation outcomes under the same
+    // `max_cost`. If a future change started interpreting `max_cost`
+    // in source-unit² space (e.g. scaling it by
+    // `source_units.to_mm(1.0).powi(2)` somewhere in the pipeline),
+    // the metres-tagged path would see a 10⁶× different effective
+    // cap and this test would fail at the equality checks below.
+    let dir = tempfile::tempdir().unwrap();
+    let p = write_fixture(dir.path(), "icosphere.obj", OBJ_ICOSPHERE.as_bytes());
+
+    // Ingest once to get the canonical (mm-space) icosphere mesh.
+    let ingested = ingest_path(&p).expect("OBJ fixture parses");
+    let mm_mesh = ingested.mesh.clone();
+    let mut metres_mesh = mm_mesh.clone();
+    for pos in &mut metres_mesh.positions {
+        pos[0] /= 1000.0;
+        pos[1] /= 1000.0;
+        pos[2] /= 1000.0;
+    }
+
+    let blocking_opts = Some(DecimateOptions {
+        // The pipeline always overrides target_triangle_count per LOD
+        // level from the chain — this seed value is irrelevant.
+        target_triangle_count: 0,
+        // Cap every collapse: any cost > 0 (i.e. every non-coplanar
+        // collapse on a closed sphere-shaped manifold) is rejected.
+        max_cost: 0.0,
+        preserve_boundary: false,
+    });
+
+    let mut mm_db = AssetDatabase::open_in_memory().unwrap();
+    let mut mm_pipe = AssetImportPipeline::new(&mut mm_db);
+    let mut mm_req = real_req("mm_icosphere", mm_mesh);
+    mm_req.source_units = Units::Mm;
+    mm_req.decimate_options = blocking_opts;
+    let mm_err = mm_pipe
+        .import_mesh(mm_req)
+        .expect_err("mm-tagged icosphere + max_cost=0 must block every collapse");
+
+    let mut m_db = AssetDatabase::open_in_memory().unwrap();
+    let mut m_pipe = AssetImportPipeline::new(&mut m_db);
+    let mut m_req = real_req("m_icosphere", metres_mesh);
+    m_req.source_units = Units::M;
+    m_req.decimate_options = blocking_opts;
+    let m_err = m_pipe
+        .import_mesh(m_req)
+        .expect_err("metres-tagged icosphere must hit the same cap symmetrically");
+
+    match (mm_err, m_err) {
+        (
+            AssetError::LodNotStrictlyDecreasing {
+                actual: mm_actual,
+                base: mm_base,
+                level: mm_level,
+            },
+            AssetError::LodNotStrictlyDecreasing {
+                actual: m_actual,
+                base: m_base,
+                level: m_level,
+            },
+        ) => {
+            assert_eq!(
+                mm_actual, m_actual,
+                "max_cost must produce the same decimated triangle count regardless of \
+                 source_units (mm² space invariant)"
+            );
+            assert_eq!(
+                mm_base, m_base,
+                "canonical base triangle count must match (same geometry, different tag)"
+            );
+            assert_eq!(
+                mm_level, m_level,
+                "max_cost must trigger at the same LOD level regardless of source_units"
+            );
+        }
+        (mm_other, m_other) => panic!(
+            "expected symmetric LodNotStrictlyDecreasing on both unit tags, \
+             got mm={mm_other:?} m={m_other:?}"
+        ),
+    }
 }

@@ -397,6 +397,26 @@ pub struct PathImportMetadata {
     /// pipeline overrides it per LOD level from
     /// [`crate::LodChain::aggressive_for_real_mesh`]. Only the other
     /// fields (`preserve_boundary`, `max_cost`) propagate.
+    ///
+    /// ### Unit space for `max_cost`
+    ///
+    /// `DecimateOptions::max_cost` caps the per-collapse QEM error
+    /// (a squared-distance term in **position²**). The pipeline
+    /// always runs decimation on the **canonicalised mesh** — the
+    /// caller's mesh after [`canonicalise_to_mm`] scales positions
+    /// from `source_units` to millimetres for storage. Therefore
+    /// `max_cost` is evaluated in **mm² space**, *independent of
+    /// `source_units`*. A caller importing the same canonical
+    /// geometry tagged `Units::M` vs `Units::Mm` sees identical
+    /// decimation under the same `max_cost` (locked in by
+    /// `max_cost_interpretation_does_not_vary_with_source_units`).
+    ///
+    /// Practical implication: if you have a calibration value `c`
+    /// expressed in **source-unit² space** (e.g. metres²),
+    /// multiply by `source_units.to_mm(1.0).powi(2)` before
+    /// assigning to `max_cost` — for metres that's `1_000_000`.
+    /// The strict default (`f64::INFINITY`) is unit-agnostic and
+    /// needs no adjustment.
     pub decimate_options: Option<DecimateOptions>,
     pub thumbnail_opts: Option<ThumbnailOptions>,
 }

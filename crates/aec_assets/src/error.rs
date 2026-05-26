@@ -53,6 +53,12 @@ pub enum AssetError {
     ///   collapse is allowed to move geometry — useful in the
     ///   opposite direction, when the failure is from a high-cost
     ///   collapse hitting the cap rather than from boundary lock-in.
+    ///   `max_cost` is evaluated in the canonical **mm² space**
+    ///   (positions after the unit-canonicalisation step), not in
+    ///   `source_units²`; see
+    ///   [`crate::PathImportMetadata::decimate_options`] for the
+    ///   conversion factor if you have a value calibrated for a
+    ///   non-millimetre source unit.
     ///
     /// The `target_triangle_count` field on the supplied
     /// [`crate::DecimateOptions`] is **ignored**: the pipeline
