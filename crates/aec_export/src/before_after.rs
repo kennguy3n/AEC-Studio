@@ -13,7 +13,7 @@
 //!    project's `renders/` directory.
 //!
 //! 2. **A plan overlay** — an SVG drawing of the project's walls
-//!    rendered with three semantic colours:
+//!    rendered with four semantic colours:
 //!    * **red** for *demolition* (walls present in `base` but not in
 //!      `head`),
 //!    * **green** for *new* construction (present only in `head`),
@@ -425,7 +425,13 @@ fn build_plan_overlay(base: &[WallBody], head: &[WallBody]) -> PlanOverlay {
                     b[3] = y;
                 }
             }
-            None => bbox = Some([w.start_mm[0], w.start_mm[1], w.start_mm[0], w.start_mm[1]]),
+            // Seed the bbox from this very `grow(x, y)` invocation
+            // rather than the captured wall's `start_mm`. The two are
+            // equal today because the first `grow` call below always
+            // passes `w.start_mm`, but using the local `(x, y)` makes
+            // the closure robust to future refactors that might call
+            // `grow(w.end_mm[0], w.end_mm[1])` first.
+            None => bbox = Some([x, y, x, y]),
         };
         grow(w.start_mm[0], w.start_mm[1]);
         grow(w.end_mm[0], w.end_mm[1]);
