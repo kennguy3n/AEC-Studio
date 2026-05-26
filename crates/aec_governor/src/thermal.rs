@@ -425,7 +425,10 @@ impl WindowsWmiSensor {
             let kelvin = tenths_kelvin as f32 / 10.0;
             let celsius = kelvin - 273.15;
             // Sanity gate — WMI sometimes returns absurd values
-            // (e.g. 2732 = 0 K) on virtual machines.
+            // on virtual machines (e.g. `0` tenths-K = -273.15 °C,
+            // or unreasonably large tenths-K values). Anything
+            // outside the physical-CPU range is silently dropped
+            // so we don't trip a thermal state from sensor garbage.
             if !(-50.0..=200.0).contains(&celsius) {
                 continue;
             }
@@ -739,7 +742,24 @@ mod tests {
 
     #[test]
     fn windows_wmi_discards_absurd_values() {
-        // 2732 = 0 K (sensor misreport); 3502 = 77.05 °C.
+        // `0` tenths-K = -273.15 °C → below the -50 °C floor,
+        // discarded by the sanity gate. `9999` tenths-K = 726.7 °C
+        // → above the 200 °C ceiling, also discarded. `3502`
+        // tenths-K = 77.05 °C → the only valid zone, becomes the
+        // reported max.
+        let r = WindowsWmiSensor::parse("0,9999,3502").unwrap();
+        assert!((r.max_cpu_celsius.unwrap() - 77.05).abs() < 0.01);
+
+        // All zones absurd → no reading produced.
+        assert!(WindowsWmiSensor::parse("0,9999").is_none());
+    }
+
+    #[test]
+    fn windows_wmi_keeps_borderline_low_kelvin_values() {
+        // `2732` tenths-K = 0.05 °C — physically improbable for a
+        // running CPU but inside the sanity range, so the parser
+        // keeps it. Document the boundary explicitly so a future
+        // tightening of the gate doesn't silently break this case.
         let r = WindowsWmiSensor::parse("2732,3502").unwrap();
         assert!((r.max_cpu_celsius.unwrap() - 77.05).abs() < 0.01);
     }
