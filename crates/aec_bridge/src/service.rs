@@ -3552,22 +3552,39 @@ impl BridgeService {
         pending: PendingDiff,
     ) -> Result<AiAcceptCommitted, BridgeServiceError> {
         let project_path = pending.project_path.clone();
-        // `pending.scope` is the engine scope the user invoked the
-        // plan under (e.g. `Design` for a furniture-placement
-        // session). It is the single source of truth used by every
-        // downstream step:
-        //   - `command_apply_batch` opens the engine with it.
-        //   - `BUG_0001`'s batch scope guard validates each emitted
-        //     command against it.
-        //   - `ai_audit_append` records the scope on the AI audit
-        //     envelope so the provenance log can be filtered by
-        //     mode.
-        // Capturing it here (instead of re-deriving from
-        // `conversion.commands[0].scope`) prevents the variable
-        // shadow Devin Review flagged as `ANALYSIS_0004` and keeps
-        // the audit-log scope honest even if `diff_to_commands`
-        // ever produces an empty command list (e.g. every operation
-        // was skipped).
+        // There are **two** scopes in play during an AI accept, and
+        // they intentionally do not have to agree:
+        //
+        //   * `plan_scope` — the engine scope the user *invoked*
+        //     the plan from. For `plan_detection` / `plan_to_wall`
+        //     this can be `Draft` (a 2D drafter detecting walls in
+        //     an imported plan) even though the resulting commands
+        //     are `Design` walls. The AI tool registry
+        //     (`crates/aec_ai/data/ai_tools.json`) declares
+        //     `allowed_scopes: ["design", "draft"]` for exactly
+        //     this workflow. We retain it as a provenance label on
+        //     the AI audit envelope so the audit log answers "what
+        //     UI mode produced this accept?" honestly.
+        //
+        //   * `engine_scope` — the scope the `CommandEngine` must
+        //     be opened at to apply the emitted commands. This is
+        //     derived from `conversion.commands[0].scope`, which
+        //     is the intrinsic scope of the `CommandKind` itself
+        //     (`Design` for `CreateWall`, `Draft` for
+        //     `DrawPrimitive`, `Deliver` for `CreateRevision`). The
+        //     journal entries the engine writes get tagged with
+        //     this scope so undo/redo validation works: a later
+        //     `Cmd-Z` issued from a Design session can undo a
+        //     wall-create even if the original accept happened in
+        //     a Draft session.
+        //
+        // `BUG_0001 (round 4)` fix: opening the engine at
+        // `plan_scope` rather than `engine_scope` broke the
+        // Draft-launched plan_detection / plan_to_wall path
+        // because the batch-scope guard (added in round 3) rejects
+        // when `commands[0].scope (Design) != engine.active_scope
+        // (Draft)`. Splitting the two scopes here restores the
+        // intended behaviour and keeps the audit log faithful.
         let plan_scope = pending.scope;
         let diff = pending.diff;
         let op_count = u32::try_from(diff.operations.len()).unwrap_or(u32::MAX);
@@ -3606,14 +3623,22 @@ impl BridgeService {
             // converter ran) — this is the
             // `ANALYSIS_0003 (round 2)` double-load fix.
             //
-            // The engine is opened with the plan's authoritative
-            // scope (`plan_scope`); the batch path now enforces
-            // every command match that scope (see `BUG_0001`), so
-            // a model that emits an off-scope command surfaces a
-            // `ScopeMismatch` before any SQL is touched rather
-            // than silently mislabelling the journal entry.
-            let mut engine = aec_command::CommandEngine::open_with_graph(&conn, plan_scope, graph)
-                .map_err(|e| BridgeServiceError::Command(e.to_string()))?;
+            // Engine scope = `commands[0].scope` (the intrinsic
+            // scope of the emitted commands), NOT `plan_scope`
+            // (the UI launch context). The batch's internal
+            // consistency guard already requires every command in
+            // a batch to share the same scope, so any command
+            // satisfies the role of "canonical batch scope".
+            //
+            // This is the `BUG_0001 (round 4)` fix — opening at
+            // `plan_scope` tripped the batch scope guard whenever
+            // the renderer dispatched a Draft-launched
+            // `plan_detection` (which legitimately emits Design
+            // walls).
+            let engine_scope = conversion.commands[0].scope;
+            let mut engine =
+                aec_command::CommandEngine::open_with_graph(&conn, engine_scope, graph)
+                    .map_err(|e| BridgeServiceError::Command(e.to_string()))?;
             let results = engine
                 .execute_persistent_batch(conversion.commands, &mut conn)
                 .map_err(|e| BridgeServiceError::Command(e.to_string()))?;
@@ -3675,6 +3700,35 @@ impl BridgeService {
         // project, etc.), the pending entry survives so the
         // renderer can retry the reject (or escalate via the
         // pending-diff inspector).
+        //
+        // **Ordering note (`ANALYSIS_0001`):** the reject path
+        // intentionally runs *audit append before finalize*, the
+        // mirror of the accept path's *finalize before audit*. The
+        // asymmetry is by design and reflects the different
+        // worst-case failure modes:
+        //   * Accept has a SQL commit that mutates the project
+        //     graph; finalizing AFTER commit prevents a transient
+        //     audit-append failure from re-entering the converter
+        //     on retry (which generates fresh `EntityId::new()`
+        //     UUIDs and would double-insert every wall/furniture
+        //     row). Worst case the accept path defends against is
+        //     *data-integrity violation* — duplicated graph
+        //     entities.
+        //   * Reject does not mutate the graph, so the only state
+        //     at risk is the AI audit log itself. Auditing BEFORE
+        //     finalize means a transient finalize failure (rare:
+        //     would require a concurrent finalize racing this
+        //     thread) leaves the diff pending and the audit
+        //     containing a reject entry. The renderer's retry
+        //     would then write a duplicate audit entry — visible,
+        //     deduplicable by `diff_id`, but harmless. The
+        //     alternative ordering (finalize → audit) would expose
+        //     a strictly worse failure mode: an audit-append
+        //     failure after the diff is already finalized would
+        //     SILENTLY drop the rejection from the security log
+        //     with no retry path. For an audit / forensic surface,
+        //     "loud duplicate" beats "silent gap" — so this is the
+        //     correct asymmetry.
         let pending = self.ai_state.peek_diff(diff_id)?;
         let outcome = Self::ai_reject_diff_inner(diff_id, pending, reason)?;
         self.ai_state.finalize_diff(diff_id)?;

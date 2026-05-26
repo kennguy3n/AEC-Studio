@@ -131,6 +131,27 @@ fn valid_style_assistant_response_bytes() -> Vec<u8> {
     bytes
 }
 
+/// Wire-format HTTP response for a successful `plan_detection`
+/// completion. The payload is one polyline (two points) — the diff
+/// engine emits one wall `Insert` per polyline, which
+/// `ai_apply::diff_to_commands` converts into one `CreateWall`
+/// command (intrinsic scope = `Design`). Used by the
+/// `BUG_0001 (round 4)` regression test to drive a Draft-launched
+/// plan through the accept path.
+fn valid_plan_detection_response_bytes() -> Vec<u8> {
+    // Two-point polyline (≥ min_segment_length) — yields exactly
+    // one `CreateWall`. The `confidence` is above the default
+    // `min_confidence` so the converter does not drop it.
+    let body = br#"{"content":"{\"polylines\":[{\"points\":[[0.0,0.0],[4000.0,0.0]],\"confidence\":0.92}]}","stop":true,"tokens_predicted":42}"#;
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    let mut bytes = head.into_bytes();
+    bytes.extend_from_slice(body);
+    bytes
+}
+
 fn canned_response(bytes: Vec<u8>) -> &'static [u8] {
     Box::leak(bytes.into_boxed_slice())
 }
@@ -444,6 +465,117 @@ fn ai_accept_diff_rejects_unknown_id() {
     let (mut s, _g) = make_service();
     let err = s.ai_accept_diff("diff_does_not_exist").unwrap_err();
     assert!(err.to_string().contains("not found"));
+}
+
+/// `BUG_0001 (round 4)` regression: a Draft-launched
+/// `plan_detection` accept must succeed even though the emitted
+/// `CreateWall` commands carry intrinsic scope = `Design`. The
+/// AI tool registry (`crates/aec_ai/data/ai_tools.json`) declares
+/// `allowed_scopes: ["design", "draft"]` for `plan_detection` —
+/// a 2D drafter is allowed to detect walls in their imported plan
+/// even though the resulting walls are Design-scope objects.
+///
+/// Prior to round 4 the bridge opened the `CommandEngine` at the
+/// renderer-supplied `plan_scope` (here: `Draft`) and the batch's
+/// scope guard rejected with `ScopeMismatch` because
+/// `commands[0].scope (Design) != engine.active_scope (Draft)`.
+/// The fix derives the engine scope from
+/// `conversion.commands[0].scope` and keeps `plan_scope` only as
+/// the provenance label on the AI audit envelope.
+///
+/// The assertions cover both halves of the fix:
+///   * the accept does not raise `ScopeMismatch`,
+///   * the resulting wall lands in the graph (Design-scope query),
+///   * the AI audit chain advances past genesis (audit append
+///     ran with `plan_scope = Draft` as the launch-context label),
+///   * the forensic record retains the launch scope so the audit
+///     trail captures *which* UI mode produced the accept.
+#[test]
+fn ai_accept_diff_draft_launched_plan_detection_succeeds() {
+    let (mut s, _g, project_path) = make_service_with_project();
+    let listener = bind_loopback();
+    let port = listener.local_addr().unwrap().port();
+    let resp = canned_response(valid_plan_detection_response_bytes());
+    let _join = spawn_mock_sidecar(listener, resp, 1);
+    wire_ai_state_to_mock(&mut s, port);
+
+    let pre_walls = s
+        .project_graph_list(&project_path, Some("wall"))
+        .expect("graph list pre-accept");
+    assert!(
+        pre_walls.is_empty(),
+        "fresh project must have no walls yet, got {pre_walls:?}"
+    );
+
+    let result = s
+        .ai_plan(
+            &project_path,
+            "plan_detection",
+            // Launch from Draft — this is the leg the round-4
+            // regression covers; round-3 testing only exercised
+            // Design-launched plans.
+            Scope::Draft,
+            "",
+            "{}",
+            5,
+        )
+        .expect("plan_detection must register a pending diff under Draft scope");
+
+    let outcome = s
+        .ai_accept_diff(&result.diff_id)
+        .expect("Draft-launched plan_detection accept must NOT raise ScopeMismatch");
+
+    assert!(outcome.ok, "accept must succeed");
+    assert_eq!(
+        outcome.op_count, 1,
+        "one polyline → one wall Insert in the diff"
+    );
+    assert_eq!(
+        outcome.applied_count, 1,
+        "the wall Insert must apply (not be skipped) — got skipped={:?}",
+        outcome.skipped
+    );
+    assert_eq!(
+        outcome.command_ids.len(),
+        1,
+        "the batch must journal exactly one CreateWall command"
+    );
+    assert_ne!(
+        outcome.audit_chain_head, "blake3:genesis",
+        "audit chain must advance past genesis after a Draft-launched accept"
+    );
+
+    let post_walls = s
+        .project_graph_list(&project_path, Some("wall"))
+        .expect("graph list post-accept");
+    assert_eq!(
+        post_walls.len(),
+        1,
+        "the polyline must land as a single wall in the graph, got {post_walls:?}"
+    );
+
+    // The forensic record retains the *launch* scope (Draft) so a
+    // security reviewer can reconstruct which UI session produced
+    // the accept — even though the journal entry itself is tagged
+    // Design (the intrinsic command scope). This is the dual-scope
+    // contract documented on `ai_accept_diff_commit`.
+    let records_path = std::path::Path::new(&project_path)
+        .join("audit")
+        .join("ai_audit_records.jsonl");
+    let records = std::fs::read_to_string(&records_path)
+        .expect("ai_audit_records.jsonl must exist after accept");
+    assert!(
+        records.contains("plan_detection"),
+        "forensic record must name the tool, got: {records}"
+    );
+    assert!(
+        records.contains("\"scope\":\"draft\""),
+        "forensic record must capture the Draft launch scope, got: {records}"
+    );
+    assert!(
+        records.contains("\"status\":\"accepted\""),
+        "forensic record must capture the Accepted status, got: {records}"
+    );
 }
 
 /// `BUG_0001 (round 2)` regression: if `ai_accept_diff` fails after
