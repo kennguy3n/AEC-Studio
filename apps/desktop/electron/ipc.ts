@@ -5,6 +5,7 @@ import {
   peekActiveProjectPath,
   peekActiveProjectSummary,
   setActiveProject,
+  setActiveProjectIfMatchesActive,
 } from "./active-project";
 
 /**
@@ -52,22 +53,18 @@ export function registerIpcHandlers(): void {
   ipcMain.handle("project:save", async (_e, { projectPath }) => {
     assertString(projectPath, "projectPath");
     const summary = await getBridge().projectSave(projectPath);
-    // Refresh the cached summary so subsequent `project:current`
-    // polls see the new `modifiedAt`. Path is unchanged so the
+    // Only refresh the cached active-project summary when the saved
+    // project IS the currently-open one. The contract — "the active
+    // slot only changes via project-lifecycle handlers, never as a
+    // side-effect of a save of a non-active project" — is enforced
+    // by `setActiveProjectIfMatchesActive`, shared with any future
+    // handler that needs the same behaviour (e.g.
+    // `project:exportPackage` if it grows a save side-effect). For
+    // the active-project case the path is unchanged, so the
     // renderer-side hook treats this as the same project (no route
-    // guard trip), it just re-renders the header timestamp.
-    //
-    // TODO(Devin Review thread 56, comment 3311164822): This
-    // unconditionally promotes the saved project to the active slot.
-    // Today that's safe because the only renderer caller —
-    // `useActiveProject.saveProject()` — always passes the active
-    // project's path. If a future code path (e.g. a background
-    // export pipeline) saves a non-active project, the right guard
-    // is to mirror the `deliver:buildPack` pattern and only refresh
-    // when `peekActiveProjectPath() === summary.path`. Deferred
-    // until a concrete consumer exists so the guard can be added
-    // alongside a test that exercises the hazard.
-    setActiveProject(summary);
+    // guard trip), it just re-renders the header timestamp from the
+    // new `modifiedAt`.
+    setActiveProjectIfMatchesActive(summary);
     return summary;
   });
   // `project:current` is a synchronous-style channel that the

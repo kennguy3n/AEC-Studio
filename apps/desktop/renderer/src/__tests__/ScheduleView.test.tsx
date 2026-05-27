@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { ScheduleView, ScheduleRow } from "../components/bim/ScheduleView";
+import { aec } from "../api/aec";
 
 const baseProps = {
   sourcePath: "/test/project.ifc",
@@ -90,5 +91,42 @@ describe("ScheduleView", () => {
     // path and fail on the native side.
     fireEvent.click(btn);
     expect(onGenerate).not.toHaveBeenCalled();
+  });
+
+  // Defense-in-depth regression: Devin Review flagged that the
+  // `regenerate` callback itself lacks an internal empty-`sourcePath`
+  // guard. Today the button-disabled check (`disabled={busy ||
+  // sourcePath === ""}`) makes the bug unreachable from the UI, but
+  // a future non-button caller (parent-driven re-generation on mount,
+  // a keyboard shortcut, a "regenerate all" toolbar action) could
+  // invoke the function programmatically with an empty path. The
+  // internal `if (busy || sourcePath === "") return;` guard at the
+  // top of `regenerate` makes that programmatic path safe too.
+  // We simulate the future caller by force-removing the button's
+  // disabled attribute and firing a click — without the internal
+  // guard the IPC spy would record a call with `sourcePath: ""`.
+  it("regenerate() internal guard skips the IPC when sourcePath is empty", async () => {
+    const onGenerate = vi.fn();
+    const generateSpy = vi.spyOn(aec.bim, "generateSchedule");
+    render(
+      <ScheduleView
+        sourcePath=""
+        outPathForKind={baseProps.outPathForKind}
+        rowsByKind={{}}
+        onGenerate={onGenerate}
+      />,
+    );
+    const btn = screen.getByTestId("schedule-regenerate") as HTMLButtonElement;
+    // Simulate a future caller that bypasses the disabled-button UX
+    // (e.g. wires the click handler to a keyboard shortcut and forgets
+    // to mirror the disabled check). The internal guard must hold.
+    btn.removeAttribute("disabled");
+    fireEvent.click(btn);
+    // Give any unguarded promise a tick to settle so a missed guard
+    // would surface as a spy invocation before this assertion runs.
+    await Promise.resolve();
+    expect(generateSpy).not.toHaveBeenCalled();
+    expect(onGenerate).not.toHaveBeenCalled();
+    generateSpy.mockRestore();
   });
 });

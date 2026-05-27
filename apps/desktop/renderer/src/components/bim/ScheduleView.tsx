@@ -52,6 +52,22 @@ export function ScheduleView({
   const columns = rows.length === 0 ? [] : Object.keys(rows[0]);
 
   const regenerate = async () => {
+    // Defense-in-depth: the button is already disabled when
+    // `sourcePath === ""` (no IFC imported yet) or `busy === true`,
+    // but mirror the guard here so any future non-button caller
+    // (parent-driven re-generation on mount, a keyboard shortcut,
+    // a "regenerate all" toolbar action) cannot send an empty path
+    // into `aec.bim.generateSchedule`. The main-process IPC handler
+    // would reject it via `assertString(sourcePath, "sourcePath")`,
+    // but the rejection surfaces as an unhandled promise rejection
+    // with no user feedback — and the in-process fallback accepts
+    // empty strings silently, hiding the regression from unit tests.
+    // Returning early here keeps the failure mode aligned with the
+    // disabled-button UX. Mirrors the ValidatorPanel revalidate
+    // guard so the two BIM panels share one contract.
+    if (busy || sourcePath === "") {
+      return;
+    }
     setBusy(true);
     try {
       const outPath = outPathForKind(active);

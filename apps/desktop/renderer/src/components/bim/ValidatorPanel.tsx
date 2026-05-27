@@ -29,6 +29,22 @@ export function ValidatorPanel({
   const [busy, setBusy] = useState(false);
 
   const revalidate = async () => {
+    // Defense-in-depth: the button is already disabled when
+    // `sourcePath === ""` or `busy === true`, but mirror the guard
+    // here so any future non-button caller (parent-driven
+    // re-validation on mount, a keyboard shortcut, a "validate all"
+    // toolbar action) cannot send an empty path into
+    // `aec.bim.validate`. The main-process IPC handler rejects it
+    // via `assertString(sourcePath, "sourcePath")`, but the
+    // rejection surfaces as an unhandled promise rejection with no
+    // user feedback — and the in-process fallback accepts empty
+    // strings silently, hiding the regression from unit tests.
+    // Returning early here keeps the failure mode aligned with the
+    // disabled-button UX. Mirrors the ScheduleView regenerate guard
+    // so the two BIM panels share one contract.
+    if (busy || sourcePath === "") {
+      return;
+    }
     setBusy(true);
     try {
       const result = await aec.bim.validate({ sourcePath });

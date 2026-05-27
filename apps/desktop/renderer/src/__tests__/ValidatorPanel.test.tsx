@@ -4,6 +4,7 @@ import {
   ValidatorPanel,
   ValidationFinding,
 } from "../components/bim/ValidatorPanel";
+import { aec } from "../api/aec";
 
 const FINDINGS: ValidationFinding[] = [
   {
@@ -125,5 +126,39 @@ describe("ValidatorPanel", () => {
     ) as HTMLButtonElement;
     expect(button.disabled).toBe(false);
     expect(button.title).toBe("");
+  });
+
+  // Defense-in-depth regression: the `revalidate` callback itself
+  // now has an internal empty-`sourcePath` guard, mirroring the
+  // ScheduleView `regenerate` guard. Today the button-disabled
+  // check makes the bug unreachable from the UI, but a future
+  // non-button caller (parent-driven re-validation on mount, a
+  // keyboard shortcut, a "validate all" toolbar action) could
+  // invoke the function programmatically with an empty path. The
+  // internal guard makes that programmatic path safe too.
+  it("revalidate() internal guard skips the IPC when sourcePath is empty", async () => {
+    const onFindings = vi.fn();
+    const validateSpy = vi.spyOn(aec.bim, "validate");
+    render(
+      <ValidatorPanel
+        sourcePath=""
+        findings={[]}
+        onFindings={onFindings}
+        onZoomTo={() => undefined}
+      />,
+    );
+    const btn = screen.getByTestId(
+      "validator-revalidate",
+    ) as HTMLButtonElement;
+    // Simulate a future caller that bypasses the disabled-button UX
+    // (e.g. wires the click handler to a keyboard shortcut and
+    // forgets to mirror the disabled check). The internal guard
+    // must hold.
+    btn.removeAttribute("disabled");
+    fireEvent.click(btn);
+    await Promise.resolve();
+    expect(validateSpy).not.toHaveBeenCalled();
+    expect(onFindings).not.toHaveBeenCalled();
+    validateSpy.mockRestore();
   });
 });

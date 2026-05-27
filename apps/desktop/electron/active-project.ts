@@ -124,6 +124,37 @@ export function peekActiveProjectPath(): string | null {
 }
 
 /**
+ * Refresh the cached summary *only* when the given summary belongs
+ * to the currently-open project. Returns `true` when the cache was
+ * updated, `false` otherwise.
+ *
+ * Used by the `project:save` IPC handler so that saving the active
+ * project picks up the new `modifiedAt` for the header, while a
+ * non-active caller (a future background export pipeline that saves
+ * an archived project, a multi-project bulk-save batch job) cannot
+ * silently promote a different project into the active slot — which
+ * would race with the renderer's `useActiveProject` hook and trip
+ * the `RequireProject` route guard mid-edit. The active slot only
+ * ever changes via `project:open` / `project:createFromTemplate` /
+ * `project:close`, or a save of the project that is already active.
+ *
+ * The cross-handler invariant ("only project-lifecycle IPC handlers
+ * move the active slot") is enforced *here* rather than inlined at
+ * each call site so future handlers that need the same behaviour
+ * (e.g. `project:exportPackage` if it grows a save-side-effect)
+ * pick up the same contract by importing this helper.
+ */
+export function setActiveProjectIfMatchesActive(
+  summary: ActiveProjectSummary,
+): boolean {
+  if (activeProjectPath !== summary.path) {
+    return false;
+  }
+  setActiveProject(summary);
+  return true;
+}
+
+/**
  * Look up the cached summary of the currently open project. Returns
  * `null` if no project is open or no summary has been cached (only
  * `setActiveProjectPath` was called — in that case the renderer
