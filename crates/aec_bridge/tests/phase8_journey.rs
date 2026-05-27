@@ -232,4 +232,52 @@ fn phase8_extension_lifecycle_journey() {
         perm_msg.to_lowercase().contains("permission"),
         "permission-denied error message must mention the missing permission; got: {perm_msg}"
     );
+
+    // ── Step 7: failed installs must NOT corrupt the asset DB ──
+    //
+    // Steps 5 and 6 both `expect_err`, but the test would still
+    // be passing if the loader had partially landed the failed
+    // extensions' entries into the asset DB before erroring out
+    // (e.g. half a transaction committed, or the first asset
+    // hashed-OK but a later one failed checksum). The Phase 8
+    // contract is "install is all-or-nothing per registry call"
+    // — verify the happy-path entries from step 2 are still the
+    // ONLY journey-tagged entries visible to the renderer.
+    //
+    // Without this guard, a regression where a failing install
+    // leaves zombie rows in the asset DB would slip through —
+    // and the failure mode (renderer sees half-installed
+    // extensions with broken payload paths) is exactly the user-
+    // facing nightmare the Phase 8 "atomic install" promise
+    // exists to prevent.
+    let listed_after_failures = svc
+        .design_list_assets(&AssetListQuery {
+            search: None,
+            tags: vec!["journey".into()],
+            style_tags: Vec::new(),
+            limit: Some(100),
+        })
+        .expect("design_list_assets after rejected installs");
+    let post_failure_ids: Vec<&str> = listed_after_failures
+        .iter()
+        .map(|a| a.asset_id.as_str())
+        .collect();
+    assert_eq!(
+        listed_after_failures.len(),
+        2,
+        "rejected installs must NOT leave zombie rows in the asset DB; expected exactly the 2 happy-path entries from step 2 but got {} entries: {:?}",
+        listed_after_failures.len(),
+        post_failure_ids,
+    );
+    assert!(
+        post_failure_ids.contains(&"journey.living_room.sofa_l1")
+            && post_failure_ids.contains(&"journey.living_room.chair_l1"),
+        "happy-path entries from step 2 must survive the failed installs intact; got {post_failure_ids:?}"
+    );
+    assert!(
+        post_failure_ids
+            .iter()
+            .all(|id| !id.starts_with("journey.tampered.") && !id.starts_with("journey.no_perm.")),
+        "no entry from the rejected `journey.tampered` / `journey.no_perm` extensions may be visible; got {post_failure_ids:?}"
+    );
 }

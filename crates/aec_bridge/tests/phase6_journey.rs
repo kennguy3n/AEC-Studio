@@ -284,12 +284,34 @@ fn phase6_deliver_workflow_journey() {
         diff.by_category
     );
     // Roll up the per-category counts to sanity-check totals.
+    // The journey added exactly one wall between v1 and v2, so:
+    //   * across all categories: `added == 1`, `removed == 0`,
+    //     `modified == 0`
+    //   * inside the `wall` category specifically: `added == 1`
+    // A `>= 1` total assertion is too loose — it would silently
+    // accept the failure mode where `compare_revisions` over-counts
+    // (e.g. reports the new wall as both added AND modified, or
+    // double-counts via the parent room's wall_ids list change).
+    // Phase 13 Task 29's "compare v1 vs v2 (geometry diff non-empty)"
+    // criterion is met by exactly one wall add; nothing more.
     let added: u32 = diff.by_category.values().map(|c| c.added).sum();
     let modified: u32 = diff.by_category.values().map(|c| c.modified).sum();
     let removed: u32 = diff.by_category.values().map(|c| c.removed).sum();
-    assert!(
-        added + modified + removed >= 1,
-        "v1→v2 diff by_category roll-up must report >=1 change; got added={added}, modified={modified}, removed={removed}"
+    assert_eq!(
+        (added, modified, removed),
+        (1, 0, 0),
+        "v1→v2 diff must report exactly the one wall we added — no spurious modifications or removals; got added={added}, modified={modified}, removed={removed}, full diff: {:?}",
+        diff.by_category
+    );
+    let wall_counts = diff.by_category.get("wall").unwrap_or_else(|| {
+        panic!(
+            "v1→v2 diff must include a 'wall' category entry for the added wall; got categories: {:?}",
+            diff.by_category.keys().collect::<Vec<_>>()
+        )
+    });
+    assert_eq!(
+        wall_counts.added, 1,
+        "v1→v2 wall.added must be exactly 1 (the journey wall); got {wall_counts:?}"
     );
 
     // ── Step 9: export all 4 deliver pack kinds ──
@@ -317,9 +339,19 @@ fn phase6_deliver_workflow_journey() {
             out.display()
         );
         let meta = std::fs::metadata(&out).unwrap();
+        // 1 KiB is a real "this pack contains the cover PDF +
+        // manifest + at least one entry" threshold. A `> 0`
+        // assertion would accept a 22-byte empty-central-directory
+        // ZIP, which is exactly the failure mode an early-return
+        // bug in `aec_export::write_deliver_pack_with_context`
+        // would produce — and which the Phase 13 Task 7-12 work
+        // exists to prevent. The cover PDF alone (printpdf
+        // generated, with the project name + revision label) is
+        // already 8-10 KiB at minimum, so 1 KiB has plenty of
+        // headroom for archive overhead.
         assert!(
-            meta.len() > 0,
-            "pack '{kind}' must be non-empty; got {} bytes",
+            meta.len() > 1024,
+            "pack '{kind}' must be a real deliver archive (>1 KiB); got {} bytes — likely empty central directory from a failed write_deliver_pack_with_context call",
             meta.len()
         );
         assert!(
@@ -352,16 +384,26 @@ fn phase6_deliver_workflow_journey() {
                 let mut entry = zr.by_name(xlsx_name).unwrap();
                 let mut buf = Vec::new();
                 std::io::Read::read_to_end(&mut entry, &mut buf).unwrap();
+                // Phase 13 plan §"Group B Task 9" calls out the
+                // criterion "real XLSX (> 500 bytes)" — distinguishes
+                // a `rust_xlsxwriter`-generated workbook (~2-4 KiB
+                // even for an empty schedule, due to the
+                // sharedStrings.xml / styles.xml / sheet1.xml
+                // skeleton) from the legacy `placeholder_xlsx`
+                // 22-byte empty-zip output we removed earlier this
+                // PR. A `>= 4` check would only catch the
+                // local-file-header magic; a `> 500` check verifies
+                // the workbook has real OpenXML scaffolding.
                 assert!(
-                    buf.len() >= 4,
-                    "pack '{kind}' XLSX entry '{xlsx_name}' must be a non-trivial workbook; got {} bytes",
+                    buf.len() > 500,
+                    "pack '{kind}' XLSX entry '{xlsx_name}' must be a real OpenXML workbook (>500 B); got {} bytes — a sub-500-byte XLSX is the placeholder_xlsx signature the Phase 13 work removed",
                     buf.len()
                 );
                 assert_eq!(
                     &buf[..4],
                     b"PK\x03\x04",
-                    "pack '{kind}' XLSX entry '{xlsx_name}' must be a real OpenXML zip; got {:?}",
-                    &buf[..4.min(buf.len())]
+                    "pack '{kind}' XLSX entry '{xlsx_name}' must be a real OpenXML zip (PK\\x03\\x04 header); got {:?}",
+                    &buf[..4]
                 );
             }
         }
