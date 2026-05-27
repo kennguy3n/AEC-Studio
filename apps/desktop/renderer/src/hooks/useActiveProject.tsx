@@ -93,6 +93,30 @@ export function ActiveProjectProvider({
   // callbacks that fire well after the current commit.
   const saveProjectRef = useRef<() => Promise<void>>(async () => {});
 
+  // Coalesce concurrent `saveProject` invocations. Without this slot,
+  // two architectural hazards exist when a save takes longer than the
+  // 5s auto-save debounce window (slow disks, large projects,
+  // encrypted volumes, or any future bridge-side flush-and-checkpoint
+  // path that grows past 5s):
+  //
+  //   1. The 5s timer armed by `markDirty()` fires DURING an
+  //      in-flight manual save and dispatches a second
+  //      `aec.project.save(project.path)` call. The bridge layer is
+  //      idempotent (SQLCipher WAL + atomic file write), so the data
+  //      is safe — but the StatusBar flickers Saving→Saved→Saving→
+  //      Saved for one logical save and the redundant call burns
+  //      real disk I/O and battery on laptops.
+  //   2. The user spams Ctrl+S during a slow save ("is it stuck?")
+  //      and triggers N parallel bridge calls. Same I/O burn plus
+  //      log spam and any future telemetry counter inflation.
+  //
+  // Returning the in-flight promise from subsequent invocations means
+  // every caller awaits the same resolution, the StatusBar shows one
+  // logical save, and the bridge sees exactly one `project.save` call
+  // per logical save event. The ref is cleared in the inflight's
+  // `finally` so the next save event starts fresh.
+  const savingPromiseRef = useRef<Promise<void> | null>(null);
+
   // Cancel any pending auto-save before transitioning the active
   // project (open / create / close). Without this, a debounced timer
   // armed by `markDirty()` for project A can fire *after* the user has
@@ -226,45 +250,92 @@ export function ActiveProjectProvider({
   );
 
   const closeProject = useCallback(async () => {
+    // Same cancel-before-await + catch-rearm pattern as
+    // `openProject` / `createProject`. Today the main-process
+    // `project:close` handler synchronously calls
+    // `clearActiveProjectPath()` and cannot throw — so the catch is
+    // unreachable in the current build. But the handler signature is
+    // `async`, and any future enhancement (flush-pending-changes
+    // before close, user-confirmation prompt with await-roundtrip,
+    // telemetry submit before clearing the slot, integrity-check on
+    // the project file before release) introduces a real failure
+    // surface. Without the catch, the bridge would reject, the
+    // `setProject(null)` / dirty-clear below would never run, and the
+    // *current* project would remain active with `dirty === true`
+    // while its auto-save timer is permanently cancelled — identical
+    // data-loss window to the one documented on `openProject`. The
+    // re-throw lets callers (App `close` handler) surface the failure
+    // as an error toast while still keeping the user on a stable
+    // route. `armAutoSave` is stable (empty deps via
+    // `saveProjectRef`), so adding it here does not unstabilize
+    // `closeProject`'s identity across project transitions.
     cancelPendingAutoSave();
-    await aec.project.close();
-    setProject(null);
-    setDirty(false);
-    dirtyRef.current = false;
-    setUndoLen(0);
-    setRedoLen(0);
-  }, [cancelPendingAutoSave]);
+    try {
+      await aec.project.close();
+      setProject(null);
+      setDirty(false);
+      dirtyRef.current = false;
+      setUndoLen(0);
+      setRedoLen(0);
+    } catch (err) {
+      if (dirtyRef.current) {
+        armAutoSave();
+      }
+      throw err;
+    }
+  }, [cancelPendingAutoSave, armAutoSave]);
 
   const saveProject = useCallback(async () => {
     if (project === null) return;
-    setSaving(true);
-    try {
-      const summary = (await aec.project.save(project.path)) as ProjectSummary;
-      setProject(summary);
-      setDirty(false);
-      dirtyRef.current = false;
-      // Cancel any pending auto-save timer on the success path. A
-      // manual `Ctrl+S` (or any other caller invoking `saveProject`
-      // directly) immediately after a mutation would otherwise leave
-      // the 5s timer armed from `markDirty()` — that timer would then
-      // fire, call `saveProject` again, and flash the StatusBar
-      // "Saved" → "Saving…" → "Saved" for no work. The cancel must
-      // live here (next to the `setDirty(false)`) and not at the
-      // App-level save handler, because *every* successful save —
-      // including the auto-save timer's own invocation — must clear
-      // the slot so a subsequent re-arming cannot pile up against a
-      // stale pending timer. Calling `cancelPendingAutoSave()` is a
-      // no-op when the slot is already empty (the auto-save path
-      // nulls the ref before invoking `saveProject`), so there's no
-      // double-clear hazard.
-      cancelPendingAutoSave();
-    } finally {
-      // `dirty` stays true on failure so the auto-save timer (or the
-      // user's next mutation) re-arms a retry without explicit reset
-      // logic here; the catch in the caller decides whether to surface
-      // the failure as a toast (manual save) or swallow it (auto-save).
-      setSaving(false);
+    // Coalesce: if a save is already in flight, return its promise so
+    // every caller awaits the same resolution. See `savingPromiseRef`
+    // for the full rationale (handles both the auto-save-fires-during-
+    // manual-save race when saves take >5s, and the Ctrl+S spam case).
+    if (savingPromiseRef.current !== null) {
+      return savingPromiseRef.current;
     }
+    // Cancel any pending auto-save BEFORE the bridge call. A manual
+    // save satisfies the auto-save's contract — the user's changes
+    // will reach disk well before the 5s debounce would have fired,
+    // so leaving the timer armed only creates a flicker hazard. The
+    // counterpart cancel in the success path below covers a different
+    // race (a `markDirty` arriving *during* the save's await window);
+    // together they ensure no timer slot ever survives a save's
+    // lifetime. This cancel cannot be moved into the inflight IIFE
+    // because the IIFE is async — by the time it runs, the queued
+    // timer may have already fired and dispatched a second save.
+    cancelPendingAutoSave();
+    setSaving(true);
+    const inflight = (async () => {
+      try {
+        const summary = (await aec.project.save(
+          project.path,
+        )) as ProjectSummary;
+        setProject(summary);
+        setDirty(false);
+        dirtyRef.current = false;
+        // Cancel again: a `markDirty` that arrived DURING the save's
+        // await would have re-armed the timer. The fresh save already
+        // includes whatever was in the bridge at write-time (the
+        // bridge holds its own write lock, so the post-mutation state
+        // is what landed on disk); we clear the slot here so the
+        // next mutation arms a single fresh 5s debounce instead of
+        // racing a stale armed timer against the just-completed save.
+        cancelPendingAutoSave();
+      } finally {
+        // `dirty` stays true on failure so the next mutation (or a
+        // caller's manual retry) re-arms a save. The catch in the
+        // caller decides whether to surface the failure as a toast
+        // (manual save) or swallow it (auto-save). The `inflight`
+        // promise is cleared here so the next save event starts from
+        // a clean coalescing slot — without this, a failed save
+        // would permanently lock out future `saveProject` calls.
+        setSaving(false);
+        savingPromiseRef.current = null;
+      }
+    })();
+    savingPromiseRef.current = inflight;
+    return inflight;
   }, [project, cancelPendingAutoSave]);
 
   // Keep the `saveProject` ref pointed at the latest closure so the

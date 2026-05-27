@@ -711,3 +711,318 @@ describe("useActiveProject — failed transition re-arms auto-save timer", () =>
     saveSpy.mockRestore();
   });
 });
+
+/**
+ * `closeProject` symmetry with `openProject` / `createProject`.
+ *
+ * Devin Review's fifth pass flagged that `closeProject` did not share
+ * the catch-rearm-rethrow pattern that the other two project-lifecycle
+ * transitions adopted after the earlier fixes. Today the main-process
+ * `project:close` handler is a synchronous `clearActiveProjectPath()`
+ * that cannot throw, so the catch is unreachable in the current build
+ * — but the handler signature is `async` and future enhancements
+ * (flush-pending-changes before close, user-confirmation prompt with
+ * await round-trip, telemetry submit before clearing the slot,
+ * integrity-check on the project file before release) create a real
+ * failure surface. Without the catch the original project would
+ * remain active with `dirty === true` while its auto-save timer is
+ * permanently cancelled — equivalent data-loss window to the one the
+ * earlier fix closed for open/create. These tests force the bridge
+ * `project:close` to reject and pin both the rearm-on-failure and the
+ * negative-case (no spurious arm from a clean state) contracts.
+ */
+function DirtyThenFailingClose({
+  initialPath,
+  onError,
+}: {
+  initialPath: string;
+  onError: (err: unknown) => void;
+}) {
+  const { project, openProject, closeProject, markDirty } = useActiveProject();
+  useEffect(() => {
+    void openProject(initialPath);
+  }, [openProject, initialPath]);
+  return (
+    <div>
+      <span data-testid="proj-path">{project?.path ?? ""}</span>
+      <button
+        type="button"
+        data-testid="dirty"
+        onClick={() => markDirty()}
+      >
+        dirty
+      </button>
+      <button
+        type="button"
+        data-testid="close-failing"
+        onClick={async () => {
+          try {
+            await closeProject();
+          } catch (err) {
+            onError(err);
+          }
+        }}
+      >
+        close failing
+      </button>
+    </div>
+  );
+}
+
+describe("useActiveProject — failed close re-arms auto-save timer", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("re-arms the auto-save timer when closeProject's bridge call rejects mid-flight", async () => {
+    const saveSpy = vi.spyOn(aec.project, "save");
+    const onError = vi.fn();
+
+    render(
+      <ActiveProjectProvider>
+        <DirtyThenFailingClose
+          initialPath="/tmp/projectA.aecstudio"
+          onError={onError}
+        />
+      </ActiveProjectProvider>,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByTestId("proj-path").textContent).toBe(
+        "/tmp/projectA.aecstudio",
+      ),
+    );
+
+    // Force the bridge close to reject — simulates a future
+    // flush-pending-changes / confirmation handler that fails.
+    const closeSpy = vi
+      .spyOn(aec.project, "close")
+      .mockRejectedValue(new Error("flush failed"));
+
+    await act(async () => {
+      screen.getByTestId("dirty").click();
+    });
+
+    await act(async () => {
+      screen.getByTestId("close-failing").click();
+    });
+
+    await waitFor(() => expect(onError).toHaveBeenCalledTimes(1));
+    const err = onError.mock.calls[0]![0];
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toBe("flush failed");
+
+    // The active project should still be A — the close never landed.
+    expect(screen.getByTestId("proj-path").textContent).toBe(
+      "/tmp/projectA.aecstudio",
+    );
+
+    // Advance past the re-armed 5s debounce. WITHOUT the fix, the
+    // timer was cancelled before the await and never re-armed, so
+    // `aec.project.save` would NOT be called here — pending changes
+    // would only persist on the user's next mutation. WITH the fix,
+    // the catch block re-arms via `armAutoSave` and the auto-save
+    // fires on schedule against project A.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+
+    expect(saveSpy).toHaveBeenCalledTimes(1);
+    expect(saveSpy).toHaveBeenCalledWith("/tmp/projectA.aecstudio");
+
+    closeSpy.mockRestore();
+    saveSpy.mockRestore();
+  });
+
+  it("does NOT arm a spurious auto-save timer when a failing closeProject runs from a clean state", async () => {
+    // Negative case: matches the open/create clean-state guard. If
+    // dirty was never set, a failed close must not spontaneously
+    // schedule a save against an unchanged project.
+    const saveSpy = vi.spyOn(aec.project, "save");
+    const onError = vi.fn();
+
+    render(
+      <ActiveProjectProvider>
+        <DirtyThenFailingClose
+          initialPath="/tmp/projectA.aecstudio"
+          onError={onError}
+        />
+      </ActiveProjectProvider>,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByTestId("proj-path").textContent).toBe(
+        "/tmp/projectA.aecstudio",
+      ),
+    );
+
+    const closeSpy = vi
+      .spyOn(aec.project, "close")
+      .mockRejectedValue(new Error("flush failed"));
+
+    // Deliberately skip the dirty click — project A is clean.
+    await act(async () => {
+      screen.getByTestId("close-failing").click();
+    });
+
+    await waitFor(() => expect(onError).toHaveBeenCalledTimes(1));
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+
+    expect(saveSpy).not.toHaveBeenCalled();
+
+    closeSpy.mockRestore();
+    saveSpy.mockRestore();
+  });
+});
+
+/**
+ * `saveProject` must coalesce concurrent invocations.
+ *
+ * Devin Review's sixth pass flagged that the previous `saveProject`
+ * implementation issued a parallel bridge call when the 5-second
+ * auto-save timer fired DURING an in-flight manual save (or vice
+ * versa). The bridge is idempotent (SQLCipher WAL + atomic file
+ * write), so no data corruption — but the StatusBar would flicker
+ * Saving→Saved→Saving→Saved for one logical save event, redundant
+ * disk I/O would burn battery on laptops, and the user spamming
+ * `Ctrl+S` during a slow save ("is it stuck?") would multiply the
+ * problem. The fix introduces a `savingPromiseRef` slot that returns
+ * the in-flight promise from subsequent invocations so every caller
+ * awaits the same resolution. These tests pin both the spam-coalesce
+ * contract and the auto-save-during-manual-save coalesce contract,
+ * plus the recovery case: a failed save must clear the slot so the
+ * next save event isn't permanently locked out.
+ */
+function ManualSaveSpammer({
+  initialPath,
+  spamCount,
+}: {
+  initialPath: string;
+  spamCount: number;
+}) {
+  const { project, openProject, saveProject } = useActiveProject();
+  useEffect(() => {
+    void openProject(initialPath);
+  }, [openProject, initialPath]);
+  return (
+    <div>
+      <span data-testid="proj-path">{project?.path ?? ""}</span>
+      <button
+        type="button"
+        data-testid="spam-save"
+        onClick={() => {
+          for (let i = 0; i < spamCount; i++) {
+            // Swallow rejections in the fixture so the test asserts
+            // bridge-call-count via the spy rather than via toast
+            // surfacing. Real callers (the App save handler) attach a
+            // proper `.catch(addToast)` — they don't `void` the promise.
+            saveProject().catch(() => {});
+          }
+        }}
+      >
+        spam save
+      </button>
+    </div>
+  );
+}
+
+describe("useActiveProject — saveProject coalesces concurrent invocations", () => {
+  it("dispatches exactly one bridge call when the same tick fires N parallel saveProject calls", async () => {
+    // Hold the save resolution so the spam can stack against an
+    // in-flight promise. Without coalescing, all N invocations would
+    // each call `aec.project.save(...)` and the spy count would be N.
+    let resolveSave: ((summary: unknown) => void) | null = null;
+    const savePromise = new Promise<unknown>((resolve) => {
+      resolveSave = resolve;
+    });
+    const saveSpy = vi
+      .spyOn(aec.project, "save")
+      .mockImplementation(() => savePromise);
+
+    render(
+      <ActiveProjectProvider>
+        <ManualSaveSpammer
+          initialPath="/tmp/spamSave.aecstudio"
+          spamCount={5}
+        />
+      </ActiveProjectProvider>,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByTestId("proj-path").textContent).toBe(
+        "/tmp/spamSave.aecstudio",
+      ),
+    );
+
+    // Fire 5 parallel saveProject calls in a single click handler.
+    await act(async () => {
+      screen.getByTestId("spam-save").click();
+    });
+
+    // Exactly one bridge call should be in flight, regardless of N.
+    expect(saveSpy).toHaveBeenCalledTimes(1);
+
+    // Resolve the in-flight save with a summary shape the hook
+    // recognizes.
+    await act(async () => {
+      resolveSave!({
+        path: "/tmp/spamSave.aecstudio",
+        name: "spamSave",
+        template_key: "blank",
+        room_count: 0,
+        material_count: 0,
+      });
+    });
+
+    // Still exactly one bridge call after resolution.
+    expect(saveSpy).toHaveBeenCalledTimes(1);
+
+    saveSpy.mockRestore();
+  });
+
+  it("clears the coalescing slot on save failure so the next save event is not locked out", async () => {
+    // Without the `savingPromiseRef.current = null` in the `finally`,
+    // a single failed save would permanently reject every subsequent
+    // `saveProject` call with the stale promise — turning a transient
+    // disk error into a session-long save outage.
+    const saveSpy = vi
+      .spyOn(aec.project, "save")
+      .mockRejectedValueOnce(new Error("transient disk error"));
+
+    render(
+      <ActiveProjectProvider>
+        <ManualSaveSpammer
+          initialPath="/tmp/recovery.aecstudio"
+          spamCount={1}
+        />
+      </ActiveProjectProvider>,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByTestId("proj-path").textContent).toBe(
+        "/tmp/recovery.aecstudio",
+      ),
+    );
+
+    // First save: rejects. The hook clears the slot in its `finally`.
+    await act(async () => {
+      screen.getByTestId("spam-save").click();
+    });
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+
+    // Second save: must dispatch a fresh bridge call (the in-process
+    // mock now resolves because we only queued one rejection above).
+    await act(async () => {
+      screen.getByTestId("spam-save").click();
+    });
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(2));
+
+    saveSpy.mockRestore();
+  });
+});
