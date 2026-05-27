@@ -126,16 +126,36 @@ impl KChatState {
         }
     }
 
-    /// Snapshot the current connection status. Re-runs discovery on
-    /// every call so the renderer's poll picks up newly started
-    /// KChat Desktop instances *and* notices when an existing
-    /// instance disappears — neither requires restarting AEC Studio.
+    /// Snapshot the current connection status.
     ///
-    /// The per-call probe is cheap (a 200 ms socket connect + ping
-    /// round-trip) and the renderer polls this every 5 s, so the
-    /// extra IO is well under the visible-latency budget.
+    /// When the state is already "connected" (a live
+    /// [`LocalIpcPublisher`] is installed and the last discovery
+    /// returned `Some(_)`), this takes only a read-lock — it does
+    /// NOT re-probe the IPC socket. Crash detection for an
+    /// already-connected instance flows through the publisher
+    /// itself: [`Self::publish`] downgrades to the in-memory
+    /// fallback on a [`KChatError::Transport`] result, which flips
+    /// the cached state to "disconnected" and re-enables probing.
+    ///
+    /// When the state is "disconnected" (or the cached publisher is
+    /// in-memory because boot-time discovery returned `None`), this
+    /// re-runs [`KChatDiscovery::probe_with_timeout`] so the
+    /// renderer's poll picks up newly started KChat Desktop
+    /// instances without restarting AEC Studio. The probe is cheap
+    /// (200 ms socket connect + ping) and gated on the
+    /// not-yet-connected path so the steady-state renderer poll
+    /// (every 5 s while connected) costs only a read-lock acquire.
     pub fn status(&self) -> KChatStatusReport {
-        self.refresh_status();
+        // Fast path: read-lock only. We re-probe iff we're currently
+        // disconnected — see the doc comment for why connected
+        // sessions don't need a periodic probe.
+        let needs_refresh = {
+            let inner = self.inner.read().expect("kchat state not poisoned");
+            inner.last_status.state == "disconnected"
+        };
+        if needs_refresh {
+            self.refresh_status();
+        }
         self.inner
             .read()
             .expect("kchat state not poisoned")
