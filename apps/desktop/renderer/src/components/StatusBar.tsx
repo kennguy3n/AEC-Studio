@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { aec, RuntimeStatus } from "../api/aec";
+import { KChatStatusIndicator } from "./kchat/KChatStatusIndicator";
 
 export function StatusBar() {
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
@@ -35,6 +36,7 @@ export function StatusBar() {
         <span>Loading hardware profile…</span>
       )}
       <span style={{ marginLeft: "auto" }}>AI · {aiState}</span>
+      <KChatStatusIndicator />
     </footer>
   );
 }

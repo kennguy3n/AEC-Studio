@@ -1,0 +1,170 @@
+import { useCallback, useEffect, useState } from "react";
+import { aec } from "../../api/aec";
+
+/**
+ * Deliver-mode panel that shows review comments ingested from the
+ * KChat thread tied to the active project.
+ *
+ * The panel polls `kchat:ingestReviews` on a 30 s interval, applying
+ * the `since_iso` cursor advance so only newly-posted comments are
+ * fetched per tick. Each comment renders with:
+ *
+ * - author (KChat handle)
+ * - posted_at timestamp (renderer-local time zone)
+ * - the comment body
+ * - the artifact card it threads under (when present)
+ *
+ * Empty thread → friendly empty state; offline → callout pointing
+ * the user at the StatusBar chip's "click to reload" affordance.
+ */
+export type KChatReviewPanelProps = {
+  threadId: string;
+  /**
+   * When `true`, the panel renders even if the bridge reports the
+   * in-memory fallback. Useful for screenshots / Storybook so the
+   * empty state doesn't dominate the layout. Defaults to `false`,
+   * which hides the panel entirely outside of an active local-ipc
+   * connection.
+   */
+  showWhenOffline?: boolean;
+};
+
+export type ReviewCommentRow = {
+  comment_id: string;
+  author: string;
+  text: string;
+  posted_at: string;
+  artifact_id: string | null;
+};
+
+const POLL_INTERVAL_MS = 30_000;
+
+export function KChatReviewPanel(props: KChatReviewPanelProps) {
+  const [comments, setComments] = useState<ReviewCommentRow[]>([]);
+  const [sinceIso, setSinceIso] = useState<string | null>(null);
+  const [offline, setOffline] = useState(false);
+  const [loading, setLoading] = useState(false);
+
+  const fetchOnce = useCallback(async () => {
+    setLoading(true);
+    try {
+      const statusReport = await aec.kchat.status();
+      const isOffline =
+        statusReport.state !== "connected" &&
+        statusReport.publisherKind !== "local_ipc";
+      setOffline(isOffline);
+      if (isOffline) return;
+      const res = await aec.kchat.ingestReviews({
+        threadId: props.threadId,
+        sinceIso,
+      });
+      const parsed = parseComments(res.commentsJson);
+      if (parsed.length > 0) {
+        setComments((prev) => mergeAndSort(prev, parsed));
+        const newest = newestTimestamp(parsed);
+        if (newest) setSinceIso(newest);
+      }
+    } finally {
+      setLoading(false);
+    }
+  }, [props.threadId, sinceIso]);
+
+  useEffect(() => {
+    void fetchOnce();
+    const id = window.setInterval(() => void fetchOnce(), POLL_INTERVAL_MS);
+    return () => window.clearInterval(id);
+  }, [fetchOnce]);
+
+  if (offline && !props.showWhenOffline) {
+    return (
+      <aside
+        data-testid="kchat-review-panel"
+        data-offline="true"
+        className="kchat-review-panel kchat-review-panel--offline"
+        aria-label="KChat review (offline)"
+      >
+        <p>KChat is offline. Reviews appear here when KChat Desktop is running.</p>
+      </aside>
+    );
+  }
+
+  return (
+    <aside
+      data-testid="kchat-review-panel"
+      data-offline={offline ? "true" : "false"}
+      className="kchat-review-panel"
+      aria-label="KChat review comments"
+    >
+      <header className="kchat-review-panel__header">
+        <h3>Reviews · {props.threadId}</h3>
+        <button
+          type="button"
+          data-testid="kchat-review-refresh"
+          disabled={loading}
+          onClick={() => void fetchOnce()}
+        >
+          {loading ? "Polling…" : "Refresh"}
+        </button>
+      </header>
+      {comments.length === 0 ? (
+        <p
+          data-testid="kchat-review-empty"
+          className="kchat-review-panel__empty"
+        >
+          No reviews on this thread yet.
+        </p>
+      ) : (
+        <ul
+          data-testid="kchat-review-list"
+          className="kchat-review-panel__list"
+        >
+          {comments.map((c) => (
+            <li key={c.comment_id} className="kchat-review-panel__item">
+              <header>
+                <strong>{c.author}</strong>
+                <time dateTime={c.posted_at}>
+                  {new Date(c.posted_at).toLocaleString()}
+                </time>
+              </header>
+              <p>{c.text}</p>
+              {c.artifact_id && (
+                <p className="kchat-review-panel__artifact">
+                  Artifact: <code>{c.artifact_id}</code>
+                </p>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+    </aside>
+  );
+}
+
+function parseComments(json: string): ReviewCommentRow[] {
+  try {
+    const parsed = JSON.parse(json) as ReviewCommentRow[];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function mergeAndSort(
+  prev: ReviewCommentRow[],
+  next: ReviewCommentRow[],
+): ReviewCommentRow[] {
+  const byId = new Map<string, ReviewCommentRow>();
+  for (const c of prev) byId.set(c.comment_id, c);
+  for (const c of next) byId.set(c.comment_id, c);
+  return Array.from(byId.values()).sort((a, b) =>
+    a.posted_at.localeCompare(b.posted_at),
+  );
+}
+
+function newestTimestamp(rows: ReviewCommentRow[]): string | null {
+  let max: string | null = null;
+  for (const r of rows) {
+    if (max === null || r.posted_at > max) max = r.posted_at;
+  }
+  return max;
+}

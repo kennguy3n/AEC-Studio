@@ -14,6 +14,7 @@ import type {
   RevisionSummary,
   VersionDiffSummary,
 } from "../../../electron/bridge";
+import { KChatReviewPanel } from "../components/kchat/KChatReviewPanel";
 import {
   PackComposer,
   defaultDeliverablesFor,
@@ -186,6 +187,7 @@ export function Deliver(): JSX.Element {
           comparing={comparing}
         />
       </div>
+      <KChatReviewPanel threadId="kchat-default" />
       {exportResult ? (
         <section data-testid="deliver-export-result">
           <h3>Pack built</h3>

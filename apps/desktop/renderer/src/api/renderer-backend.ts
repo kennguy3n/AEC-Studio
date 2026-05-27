@@ -398,7 +398,46 @@ export function rendererInProcessBackend(): AecApi {
         os: "test",
       }),
     },
+    kchat: kchatMock(newId),
   };
+}
+
+/**
+ * Renderer-fallback KChat backend. There's no KChat Desktop instance
+ * in vitest, so `status()` always reports the in-memory publisher,
+ * `publish()` returns a deterministic `messageId` (the `newId()`
+ * counter is shared with every other renderer-mock id source so
+ * snapshot tests get stable output), and `ingestReviews()` returns
+ * an empty result set.
+ */
+function kchatMock(newId: (prefix: string) => string) {
+  return {
+    status: async () =>
+      ({
+        state: "disconnected",
+        publisherKind: "in_memory",
+        instanceJson: null,
+      }) as Awaited<ReturnType<AecApi["kchat"]["status"]>>,
+    reload: async () =>
+      ({
+        state: "disconnected",
+        publisherKind: "in_memory",
+        instanceJson: null,
+      }) as Awaited<ReturnType<AecApi["kchat"]["reload"]>>,
+    publish: async (_params: { cardJson: string }) => ({
+      messageId: newId("kchat_msg"),
+      threadId: "kchat-default",
+      publishedAt: new Date("2026-01-01T00:00:00Z").toISOString(),
+    }),
+    ingestReviews: async (params: {
+      threadId: string;
+      sinceIso?: string | null;
+    }) => ({
+      threadId: params.threadId,
+      commentsJson: "[]",
+      cardsJson: "[]",
+    }),
+  } satisfies AecApi["kchat"];
 }
 
 /**

@@ -1272,6 +1272,12 @@ pub struct BridgeService {
     /// touch only the diff registry. See `crate::ai_state` module
     /// doc for the full concurrency rationale.
     ai_state: AiState,
+    /// Process-wide KChat publisher state. Holds either a
+    /// [`aec_core::LocalIpcPublisher`] (when a KChat Desktop
+    /// instance is discovered on the box) or an
+    /// [`aec_core::InMemoryPublisher`] fallback. See
+    /// [`crate::kchat_state`] for the publisher-selection rationale.
+    kchat_state: crate::kchat_state::KChatState,
 }
 
 /// Process-wide render state held by [`BridgeService::render_state`].
@@ -1356,7 +1362,16 @@ impl BridgeService {
             render_state: Mutex::new(RenderState::new()),
             asset_state,
             ai_state: AiState::new(default_ai_runtime_config()),
+            kchat_state: crate::kchat_state::KChatState::new(),
         })
+    }
+
+    /// Borrow the process-wide [`KChatState`]. Used by tests that
+    /// need to install a mock publisher / socket fixture before
+    /// driving the bridge through the public KChat endpoints.
+    #[doc(hidden)]
+    pub fn __kchat_state(&self) -> &crate::kchat_state::KChatState {
+        &self.kchat_state
     }
 
     /// Canonicalise a caller-supplied project path so the same project
@@ -4237,6 +4252,61 @@ impl BridgeService {
             changes,
         })
     }
+
+    // ===== KChat (Phase 12) =====
+
+    /// Snapshot the current KChat connection state. Cheap; the
+    /// renderer polls this from the status indicator every ~5 s.
+    pub fn kchat_status(&self) -> crate::kchat_state::KChatStatusReport {
+        self.kchat_state.status()
+    }
+
+    /// Re-run KChat discovery and replace the active publisher.
+    /// Triggered by the Settings page's "Reload KChat connection"
+    /// button.
+    pub fn kchat_reload(&self) -> crate::kchat_state::KChatStatusReport {
+        self.kchat_state.reload()
+    }
+
+    /// Publish an artifact card through the active publisher.
+    pub fn kchat_publish(
+        &self,
+        card: aec_core::kchat::ArtifactCard,
+    ) -> Result<aec_core::kchat::PublishResult, BridgeServiceError> {
+        self.kchat_state
+            .publish(card)
+            .map_err(|e| BridgeServiceError::Core(format!("kchat publish: {e}")))
+    }
+
+    /// Pull review comments newer than `since_iso` from the active
+    /// publisher's thread. Returns `(comments, cards)`. The in-memory
+    /// fallback always returns `(vec![], vec![])`.
+    pub fn kchat_ingest_reviews(
+        &self,
+        thread_id: &str,
+        since_iso: Option<String>,
+    ) -> Result<KChatIngestReport, BridgeServiceError> {
+        let (comments, cards) = self
+            .kchat_state
+            .ingest_reviews(thread_id, since_iso)
+            .map_err(|e| BridgeServiceError::Core(format!("kchat ingest: {e}")))?;
+        Ok(KChatIngestReport {
+            thread_id: thread_id.to_string(),
+            comments,
+            cards,
+        })
+    }
+}
+
+/// Bridge-shaped review-ingest report. Renderer-facing alias for the
+/// `(comments, cards)` tuple — `serde`-friendly so it crosses the
+/// N-API boundary cleanly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KChatIngestReport {
+    pub thread_id: String,
+    pub comments: Vec<aec_core::kchat::ReviewComment>,
+    pub cards: Vec<aec_core::kchat::ReviewCard>,
 }
 
 fn revision_to_summary(r: aec_core::revision::Revision) -> RevisionSummary {

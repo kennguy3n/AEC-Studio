@@ -2612,6 +2612,107 @@ pub async fn deliver_compare_revisions(
     .await
 }
 
+// ===== KChat (Phase 12) =====
+
+/// Renderer-shaped KChat connection status. Mirrors
+/// [`crate::kchat_state::KChatStatusReport`].
+#[napi(object)]
+pub struct KChatStatusJs {
+    pub state: String,
+    pub publisher_kind: String,
+    pub instance_json: Option<String>,
+}
+
+#[napi(object)]
+pub struct KChatPublishParamsJs {
+    /// Serialised [`aec_core::kchat::ArtifactCard`] (JSON). The
+    /// renderer assembles this from form values and sends the
+    /// stringified JSON across the bridge.
+    pub card_json: String,
+}
+
+#[napi(object)]
+pub struct KChatPublishResultJs {
+    pub message_id: String,
+    pub thread_id: String,
+    pub published_at: String,
+}
+
+#[napi(object)]
+pub struct KChatIngestParamsJs {
+    pub thread_id: String,
+    pub since_iso: Option<String>,
+}
+
+#[napi(object)]
+pub struct KChatIngestResultJs {
+    pub thread_id: String,
+    /// JSON-encoded `Vec<ReviewComment>`.
+    pub comments_json: String,
+    /// JSON-encoded `Vec<ReviewCard>`.
+    pub cards_json: String,
+}
+
+fn kchat_status_to_js(rep: crate::kchat_state::KChatStatusReport) -> KChatStatusJs {
+    let instance_json = rep
+        .instance
+        .as_ref()
+        .map(|info| serde_json::to_string(info).unwrap_or_default());
+    KChatStatusJs {
+        state: rep.state,
+        publisher_kind: rep.publisher_kind,
+        instance_json,
+    }
+}
+
+#[napi]
+pub fn kchat_status() -> Result<KChatStatusJs> {
+    let rep = with_service_ref(|svc| svc.kchat_status())?;
+    Ok(kchat_status_to_js(rep))
+}
+
+#[napi]
+pub fn kchat_reload() -> Result<KChatStatusJs> {
+    let rep = with_service_ref(|svc| svc.kchat_reload())?;
+    Ok(kchat_status_to_js(rep))
+}
+
+#[napi]
+pub fn kchat_publish(params: KChatPublishParamsJs) -> Result<KChatPublishResultJs> {
+    let card: aec_core::kchat::ArtifactCard = serde_json::from_str(&params.card_json)
+        .map_err(|e| Error::new(Status::GenericFailure, format!("kchat_publish parse: {e}")))?;
+    let result = with_service_ref_fallible(|svc| svc.kchat_publish(card))?;
+    Ok(KChatPublishResultJs {
+        message_id: result.message_id,
+        thread_id: result.thread_id,
+        published_at: result.published_at.to_rfc3339(),
+    })
+}
+
+#[napi]
+pub fn kchat_ingest_reviews(params: KChatIngestParamsJs) -> Result<KChatIngestResultJs> {
+    let report = with_service_ref_fallible(|svc| {
+        svc.kchat_ingest_reviews(&params.thread_id, params.since_iso.clone())
+    })?;
+    let comments_json = serde_json::to_string(&report.comments).map_err(|e| {
+        Error::new(
+            Status::GenericFailure,
+            format!("kchat_ingest_reviews serialize: {e}"),
+        )
+    })?;
+    let cards_json = serde_json::to_string(&report.cards).map_err(|e| {
+        Error::new(
+            Status::GenericFailure,
+            format!("kchat_ingest_reviews serialize cards: {e}"),
+        )
+    })?;
+    Ok(KChatIngestResultJs {
+        thread_id: report.thread_id,
+        comments_json,
+        cards_json,
+    })
+}
+
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
     if s.len() % 2 != 0 {
         return None;

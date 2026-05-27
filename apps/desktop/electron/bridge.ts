@@ -554,6 +554,49 @@ export interface BridgeBackend {
    * renderer sorts client-side if it needs deterministic display.
    */
   projectGraphList(projectPath: string, kindFilter?: string): Promise<EntityRecord[]>;
+
+  // ----- KChat (Phase 12) -----
+
+  /**
+   * Current KChat connection status. Returns the publisher kind
+   * (`local_ipc` for a discovered KChat Desktop instance,
+   * `in_memory` for the fallback) and the connection state
+   * (`connected` / `reconnecting` / `disconnected`).
+   */
+  kchatStatus(): Promise<KChatStatusReport>;
+  /** Re-run discovery and rebuild the publisher. */
+  kchatReload(): Promise<KChatStatusReport>;
+  /** Publish an artifact card. The card is the `ArtifactCard` JSON shape. */
+  kchatPublish(params: { cardJson: string }): Promise<KChatPublishResult>;
+  /** Poll review comments newer than `sinceIso`. */
+  kchatIngestReviews(params: {
+    threadId: string;
+    sinceIso?: string | null;
+  }): Promise<KChatIngestReport>;
+}
+
+/** Renderer-facing KChat connection status. */
+export interface KChatStatusReport {
+  state: "connected" | "reconnecting" | "disconnected";
+  publisherKind: "local_ipc" | "in_memory";
+  /** Discovered instance JSON, when `publisherKind` is `local_ipc`. */
+  instanceJson?: string | null;
+}
+
+/** Result of `kchatPublish`. */
+export interface KChatPublishResult {
+  messageId: string;
+  threadId: string;
+  publishedAt: string;
+}
+
+/** Result of `kchatIngestReviews`. */
+export interface KChatIngestReport {
+  threadId: string;
+  /** JSON-encoded `ReviewComment[]`. */
+  commentsJson: string;
+  /** JSON-encoded `ReviewCard[]`. */
+  cardsJson: string;
 }
 
 /**
@@ -1436,6 +1479,18 @@ interface NativeApi {
     base_id: string,
     head_id: string,
   ): Promise<unknown>;
+  // KChat (Phase 12) — published as N-API exports in
+  // `crates/aec_bridge/src/napi_api.rs`. All four are synchronous
+  // from JS's POV — the underlying transport runs on the main
+  // process's tokio runtime but each individual round trip is
+  // sub-millisecond when KChat Desktop is local.
+  kchat_status(): unknown;
+  kchat_reload(): unknown;
+  kchat_publish(params: { cardJson: string }): unknown;
+  kchat_ingest_reviews(params: {
+    threadId: string;
+    sinceIso?: string | null;
+  }): unknown;
 }
 
 /**
@@ -1567,6 +1622,17 @@ export const NATIVE_WIRED_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   "deliverCreateRevision",
   "deliverListRevisions",
   "deliverCompareRevisions",
+  // KChat domain wired in Phase 12. `kchatStatus` / `kchatReload` /
+  // `kchatPublish` / `kchatIngestReviews` all route through real
+  // `#[napi]` exports in `crates/aec_bridge/src/napi_api.rs` which
+  // dispatch to `BridgeService::kchat_state` (`KChatState`). The
+  // state holds a `LocalIpcPublisher` when a KChat Desktop instance
+  // is discovered on the box, falling back to `InMemoryPublisher`
+  // for CI / dev runs without a real KChat install.
+  "kchatStatus",
+  "kchatReload",
+  "kchatPublish",
+  "kchatIngestReviews",
 ];
 
 /**
@@ -2174,6 +2240,50 @@ function adaptNative(n: NativeApi): BridgeBackend {
         diffJson: string;
       };
       return JSON.parse(raw.diffJson) as VersionDiffSummary;
+    },
+    // ----- KChat (Phase 12) -----
+    kchatStatus: async () => {
+      const raw = n.kchat_status() as {
+        state: string;
+        publisherKind: string;
+        instanceJson: string | null | undefined;
+      };
+      return {
+        state: raw.state as KChatStatusReport["state"],
+        publisherKind: raw.publisherKind as KChatStatusReport["publisherKind"],
+        instanceJson: raw.instanceJson ?? null,
+      };
+    },
+    kchatReload: async () => {
+      const raw = n.kchat_reload() as {
+        state: string;
+        publisherKind: string;
+        instanceJson: string | null | undefined;
+      };
+      return {
+        state: raw.state as KChatStatusReport["state"],
+        publisherKind: raw.publisherKind as KChatStatusReport["publisherKind"],
+        instanceJson: raw.instanceJson ?? null,
+      };
+    },
+    kchatPublish: async (params) => {
+      const raw = n.kchat_publish({ cardJson: params.cardJson }) as {
+        messageId: string;
+        threadId: string;
+        publishedAt: string;
+      };
+      return raw;
+    },
+    kchatIngestReviews: async (params) => {
+      const raw = n.kchat_ingest_reviews({
+        threadId: params.threadId,
+        sinceIso: params.sinceIso ?? null,
+      }) as {
+        threadId: string;
+        commentsJson: string;
+        cardsJson: string;
+      };
+      return raw;
     },
   };
   // Self-check 0: the two catalogues must be *disjoint*. A method
@@ -3006,6 +3116,33 @@ export function inProcessBackend(): BridgeBackend {
       }
       return rows;
     },
+    // ----- KChat (Phase 12) -----
+    //
+    // The in-process backend always reports the in-memory publisher
+    // as disconnected: there's no real KChat Desktop instance to
+    // probe in renderer-only / vitest contexts. Publish round-trips
+    // produce a deterministic message id so component tests can
+    // pin the rendered output.
+    kchatStatus: async () => ({
+      state: "disconnected",
+      publisherKind: "in_memory",
+      instanceJson: null,
+    }),
+    kchatReload: async () => ({
+      state: "disconnected",
+      publisherKind: "in_memory",
+      instanceJson: null,
+    }),
+    kchatPublish: async (_params) => ({
+      messageId: id("kchat_msg"),
+      threadId: "kchat-default",
+      publishedAt: new Date().toISOString(),
+    }),
+    kchatIngestReviews: async (params) => ({
+      threadId: params.threadId,
+      commentsJson: "[]",
+      cardsJson: "[]",
+    }),
   };
 }
 

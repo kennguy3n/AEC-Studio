@@ -354,6 +354,37 @@ const api = {
   runtime: {
     status: () => ipcRenderer.invoke("runtime:status"),
   },
+
+  // ----- KChat (Phase 12) -----
+  kchat: {
+    status: () =>
+      ipcRenderer.invoke("kchat:status") as Promise<{
+        state: "connected" | "reconnecting" | "disconnected";
+        publisherKind: "local_ipc" | "in_memory";
+        instanceJson: string | null;
+      }>,
+    reload: () =>
+      ipcRenderer.invoke("kchat:reload") as Promise<{
+        state: "connected" | "reconnecting" | "disconnected";
+        publisherKind: "local_ipc" | "in_memory";
+        instanceJson: string | null;
+      }>,
+    publish: (params: { cardJson: string }) =>
+      ipcRenderer.invoke("kchat:publish", params) as Promise<{
+        messageId: string;
+        threadId: string;
+        publishedAt: string;
+      }>,
+    ingestReviews: (params: {
+      threadId: string;
+      sinceIso?: string | null;
+    }) =>
+      ipcRenderer.invoke("kchat:ingestReviews", params) as Promise<{
+        threadId: string;
+        commentsJson: string;
+        cardsJson: string;
+      }>,
+  },
 };
 
 contextBridge.exposeInMainWorld("aec", api);

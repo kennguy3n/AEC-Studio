@@ -475,6 +475,26 @@ export function registerIpcHandlers(): void {
 
   // ----- Runtime -----
   ipcMain.handle("runtime:status", async () => getBridge().runtimeStatus());
+
+  // ----- KChat (Phase 12) -----
+  ipcMain.handle("kchat:status", async () => getBridge().kchatStatus());
+  ipcMain.handle("kchat:reload", async () => getBridge().kchatReload());
+  ipcMain.handle("kchat:publish", async (_e, params) => {
+    assertObject(params, "params");
+    return getBridge().kchatPublish(
+      params as unknown as Parameters<
+        ReturnType<typeof getBridge>["kchatPublish"]
+      >[0],
+    );
+  });
+  ipcMain.handle("kchat:ingestReviews", async (_e, params) => {
+    assertObject(params, "params");
+    return getBridge().kchatIngestReviews(
+      params as unknown as Parameters<
+        ReturnType<typeof getBridge>["kchatIngestReviews"]
+      >[0],
+    );
+  });
 }
 
 // ----- validation helpers (small, real, not stubs) -----
