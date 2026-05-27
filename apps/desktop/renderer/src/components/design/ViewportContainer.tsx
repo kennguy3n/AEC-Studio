@@ -194,6 +194,14 @@ export function ViewportContainer({ activeTool }: Props) {
       if (!running) return;
       try {
         const f = await aec.viewport.requestFrame();
+        // The await above can race with unmount: by the time the
+        // promise resolves the cleanup may have flipped `running` to
+        // false and cancelled the in-flight rAF id. Re-check before
+        // both the `setStatus` and the next `requestAnimationFrame`
+        // so we don't (a) update React state on an unmounted host or
+        // (b) schedule one more tick that would only return harmlessly
+        // anyway.
+        if (!running) return;
         setStatus((prev) =>
           prev.state === "loading"
             ? prev
@@ -202,6 +210,7 @@ export function ViewportContainer({ activeTool }: Props) {
       } catch {
         // swallow
       }
+      if (!running) return;
       raf = requestAnimationFrame(() => {
         void tick();
       });
