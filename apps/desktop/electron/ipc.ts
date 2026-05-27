@@ -498,19 +498,42 @@ export function registerIpcHandlers(): void {
   ipcMain.handle("kchat:reload", async () => getBridge().kchatReload());
   ipcMain.handle("kchat:publish", async (_e, params) => {
     assertObject(params, "params");
-    return getBridge().kchatPublish(
-      params as unknown as Parameters<
-        ReturnType<typeof getBridge>["kchatPublish"]
-      >[0],
-    );
+    const cardJson = (params as { cardJson?: unknown }).cardJson;
+    assertString(cardJson, "cardJson");
+    // Surface obviously-broken payloads at the IPC boundary so the
+    // caller gets a descriptive error rather than a generic
+    // GenericFailure from `serde_json::from_str` on the Rust side.
+    try {
+      const parsed = JSON.parse(cardJson) as unknown;
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error(
+          "kchatPublish: cardJson must encode an object (ArtifactCard)",
+        );
+      }
+    } catch (err) {
+      if (err instanceof SyntaxError) {
+        throw new Error(
+          `kchatPublish: cardJson is not valid JSON (${err.message})`,
+        );
+      }
+      throw err;
+    }
+    return getBridge().kchatPublish({ cardJson });
   });
   ipcMain.handle("kchat:ingestReviews", async (_e, params) => {
     assertObject(params, "params");
-    return getBridge().kchatIngestReviews(
-      params as unknown as Parameters<
-        ReturnType<typeof getBridge>["kchatIngestReviews"]
-      >[0],
-    );
+    const threadId = (params as { threadId?: unknown }).threadId;
+    assertString(threadId, "threadId");
+    const rawSince = (params as { sinceIso?: unknown }).sinceIso;
+    let sinceIso: string | null | undefined;
+    if (rawSince === undefined || rawSince === null) {
+      sinceIso = rawSince ?? undefined;
+    } else if (typeof rawSince === "string") {
+      sinceIso = rawSince;
+    } else {
+      throw new Error("kchatIngestReviews: sinceIso must be a string or null");
+    }
+    return getBridge().kchatIngestReviews({ threadId, sinceIso });
   });
 
   // ----- Viewport (Phase 12) -----
