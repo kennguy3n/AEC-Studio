@@ -141,7 +141,18 @@ pub struct GpuSceneBuffers {
     lights: Vec<LightGpu>,
     sky_color: [f32; 3],
     sky_strength: f32,
+    /// IES candela atlas (Phase 12 Task 23). Each IES light contributes
+    /// `IES_ATLAS_W * IES_ATLAS_H` candela samples. The `LightGpu.params`
+    /// field for an IES light stores the starting offset into this
+    /// table. Empty for scenes without IES lights.
+    ies_atlas: Vec<f32>,
 }
+
+/// Width of the per-light IES atlas slice (horizontal-angle samples).
+pub const IES_ATLAS_W: u32 = 64;
+/// Height of the per-light IES atlas slice (vertical-angle samples).
+pub const IES_ATLAS_H: u32 = 32;
+const IES_ATLAS_SLICE: u32 = IES_ATLAS_W * IES_ATLAS_H;
 
 impl GpuSceneBuffers {
     /// Flatten a [`PathTraceScene`] for GPU consumption. The BVH leaf
@@ -213,7 +224,15 @@ impl GpuSceneBuffers {
             })
             .collect();
 
-        let lights: Vec<LightGpu> = scene.lights.iter().map(LightGpu::from_native).collect();
+        // Phase 12 Task 23: bake per-light IES candela tables into the
+        // atlas, and route IES-kind lights through kind=3 with the
+        // atlas-offset packed into `params.x`.
+        let mut ies_atlas: Vec<f32> = Vec::new();
+        let lights: Vec<LightGpu> = scene
+            .lights
+            .iter()
+            .map(|l| LightGpu::from_native_with_atlas(l, &mut ies_atlas))
+            .collect();
 
         Self {
             bvh_nodes,
@@ -222,6 +241,7 @@ impl GpuSceneBuffers {
             lights,
             sky_color: scene.sky.color,
             sky_strength: scene.sky.strength,
+            ies_atlas,
         }
     }
 
@@ -237,9 +257,57 @@ impl GpuSceneBuffers {
     pub fn light_count(&self) -> usize {
         self.lights.len()
     }
+    pub fn ies_atlas_len(&self) -> usize {
+        self.ies_atlas.len()
+    }
 }
 
 impl LightGpu {
+    /// Variant of [`from_native`] that bakes IES candela tables into a
+    /// shared atlas so the GPU shader can sample per-direction candela
+    /// values instead of using the `representative_cd` scalar fallback.
+    /// Phase 12 Task 23.
+    fn from_native_with_atlas(
+        l: &crate::light_sampling::NativeLight,
+        atlas: &mut Vec<f32>,
+    ) -> Self {
+        use crate::light_sampling::NativeLight;
+        if let NativeLight::Ies {
+            position,
+            forward,
+            up,
+            profile,
+            intensity_scale,
+            color,
+        } = l
+        {
+            // Bake the IES profile into a fixed-resolution slice of the
+            // shared atlas. The GPU shader samples this via bilinear
+            // interpolation at hit time.
+            let slice_offset = atlas.len() as u32 / IES_ATLAS_SLICE;
+            let baked = profile.to_lookup_texture(IES_ATLAS_W, IES_ATLAS_H);
+            atlas.extend_from_slice(&baked.candela);
+            let fwd = forward.normalize_or_zero();
+            let up_n = up.normalize_or_zero();
+            return LightGpu {
+                kind: 3,
+                _pad_kind: [0; 3],
+                position: position.to_array(),
+                _pad_position: 0.0,
+                // params.x = atlas slice offset (in slices of IES_ATLAS_SLICE)
+                // params.yzw = forward axis
+                params: [slice_offset as f32, fwd.x, fwd.y, fwd.z],
+                // extra.xyz = up axis, extra.w = intensity scale
+                extra: [up_n.x, up_n.y, up_n.z, *intensity_scale],
+                size: [0.0; 2],
+                _pad_size: [0.0; 2],
+                emission: color.to_array(),
+                pad: 0.0,
+            };
+        }
+        Self::from_native(l)
+    }
+
     fn from_native(l: &crate::light_sampling::NativeLight) -> Self {
         use crate::light_sampling::NativeLight;
         match l {
@@ -351,15 +419,15 @@ impl GpuPathTracer {
             force_fallback_adapter: false,
         }))
         .ok_or(GpuTraceError::NoAdapter)?;
-        // We need 5 storage buffers per stage (bvh / triangles /
-        // materials / lights / accumulator). Downlevel defaults only
-        // guarantee 4, so request a slightly higher floor — but cap to
-        // what the adapter actually supports so we don't error on
-        // request_device. This is sufficient for software adapters
-        // (lavapipe advertises 16) and native GPUs alike.
+        // We need 6 storage buffers per stage (bvh / triangles /
+        // materials / lights / accumulator / IES atlas). Downlevel
+        // defaults only guarantee 4, so request a slightly higher
+        // floor — but cap to what the adapter actually supports so we
+        // don't error on request_device. This is sufficient for software
+        // adapters (lavapipe advertises 16) and native GPUs alike.
         let adapter_limits = adapter.limits();
         // If the adapter can't hit 8 storage buffers per stage (we use
-        // 5), fall back to NoAdapter so callers route to CPU.
+        // 6), fall back to NoAdapter so callers route to CPU.
         if adapter_limits.max_storage_buffers_per_shader_stage < 8 {
             return Err(GpuTraceError::NoAdapter);
         }
@@ -395,6 +463,8 @@ impl GpuPathTracer {
                 storage_entry(3, true),
                 uniform_entry(4),
                 storage_entry(5, false),
+                // Phase 12 Task 23: IES candela atlas (read-only storage).
+                storage_entry(6, true),
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -515,6 +585,15 @@ impl GpuPathTracer {
         } else {
             self.create_storage("lights", bytemuck::cast_slice(&buffers.lights))
         };
+        // Phase 12 Task 23: IES candela atlas. When the scene has no IES
+        // lights, bind a single-zero stub so the validator sees a
+        // non-empty f32 storage buffer. The shader guards on
+        // `light.kind == 3u` so the stub is never read.
+        let ies_atlas_buf = if buffers.ies_atlas.is_empty() {
+            self.create_storage("ies_atlas", bytemuck::cast_slice(&[0.0_f32]))
+        } else {
+            self.create_storage("ies_atlas", bytemuck::cast_slice(&buffers.ies_atlas))
+        };
 
         let camera_frame = build_camera_frame(camera);
         let projection = match config.projection {
@@ -585,6 +664,10 @@ impl GpuPathTracer {
                 wgpu::BindGroupEntry {
                     binding: 5,
                     resource: accum_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: ies_atlas_buf.as_entire_binding(),
                 },
             ],
         });
@@ -862,6 +945,47 @@ mod tests {
         // has two leaves with one prim each, or a single leaf).
         for tri in &buffers.triangles {
             assert!(tri.v0[1].abs() < 1.0e-3, "floor y=0");
+        }
+        // Quad scene has no IES light → empty atlas.
+        assert_eq!(buffers.ies_atlas_len(), 0);
+    }
+
+    #[test]
+    fn ies_light_bakes_atlas_slice_and_marks_kind_three() {
+        // Phase 12 Task 23: an IES light in the scene must produce a
+        // baked atlas slice and a LightGpu with kind=3 carrying the
+        // atlas offset in params.x and forward/up axes in the
+        // remaining slots.
+        use crate::light_sampling::NativeLight;
+        use crate::lighting::IesProfile;
+        use glam::Vec3;
+        let mut atlas: Vec<f32> = Vec::new();
+        let light = NativeLight::Ies {
+            position: Vec3::new(0.0, 3000.0, 0.0),
+            forward: Vec3::new(0.0, -1.0, 0.0),
+            up: Vec3::new(1.0, 0.0, 0.0),
+            profile: IesProfile::test_isotropic(1500.0),
+            intensity_scale: 2.0,
+            color: Vec3::new(1.0, 1.0, 1.0),
+        };
+        let gpu = LightGpu::from_native_with_atlas(&light, &mut atlas);
+        assert_eq!(gpu.kind, 3, "IES light must map to kind=3");
+        assert_eq!(
+            atlas.len() as u32,
+            IES_ATLAS_SLICE,
+            "atlas must hold exactly one slice of IES_ATLAS_W*IES_ATLAS_H floats"
+        );
+        // Slice offset 0 for the first IES light.
+        assert_eq!(gpu.params[0], 0.0);
+        // Forward stored normalized in params.yzw.
+        assert!((gpu.params[1] - 0.0).abs() < 1.0e-5);
+        assert!((gpu.params[2] - -1.0).abs() < 1.0e-5);
+        assert!((gpu.params[3] - 0.0).abs() < 1.0e-5);
+        // Intensity scale stored in extra.w.
+        assert!((gpu.extra[3] - 2.0).abs() < 1.0e-5);
+        // All baked candela values should equal the isotropic peak.
+        for c in &atlas {
+            assert!((c - 1500.0).abs() < 1.0e-3, "isotropic profile bakes flat");
         }
     }
 

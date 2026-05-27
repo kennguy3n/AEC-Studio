@@ -89,6 +89,60 @@ struct Params {
 @group(0) @binding(3) var<storage, read> lights: array<LightGpu>;
 @group(0) @binding(4) var<uniform> params: Params;
 @group(0) @binding(5) var<storage, read_write> accum: array<vec4<f32>>;
+// Phase 12 Task 23: IES candela atlas. Per-light slice is
+// IES_ATLAS_W * IES_ATLAS_H floats; the slice offset is packed in
+// `light.params.x` for kind=3u (IES) lights. The shader samples
+// candela via bilinear interpolation on the (vertical, horizontal)
+// direction angles.
+@group(0) @binding(6) var<storage, read> ies_atlas: array<f32>;
+
+const IES_ATLAS_W: u32 = 64u;
+const IES_ATLAS_H: u32 = 32u;
+const IES_ATLAS_SLICE: u32 = 2048u; // IES_ATLAS_W * IES_ATLAS_H
+
+// Sample the IES candela atlas at direction `dir` (world-space, from
+// light to receiver). `forward` and `up` define the luminaire frame.
+// Returns interpolated candela value (cd) for the given direction.
+fn sample_ies_atlas(slice_offset: u32, dir: vec3<f32>, forward: vec3<f32>, up: vec3<f32>) -> f32 {
+    // Transform direction into luminaire local frame. The IES vertical
+    // angle is measured from the downward axis (the "nadir"), which is
+    // -forward in our convention. Horizontal angle is measured around
+    // forward, with 0 at +up.
+    let fwd = normalize(forward);
+    let upn = normalize(up - fwd * dot(up, fwd));
+    let right = normalize(cross(fwd, upn));
+    let local_x = dot(dir, right);
+    let local_y = dot(dir, upn);
+    let local_z = dot(dir, fwd);
+    // Vertical: angle from downward (-fwd) axis. cos(theta_v) = -local_z.
+    let cos_v = clamp(-local_z, -1.0, 1.0);
+    let theta_v = acos(cos_v); // [0, pi]
+    let v_frac = theta_v / 3.14159265359; // [0, 1]
+    // Horizontal: atan2(x, y) gives angle around the forward axis, with
+    // 0 at +y (up). Wrap to [0, 1].
+    var phi_h = atan2(local_x, local_y); // [-pi, pi]
+    if (phi_h < 0.0) {
+        phi_h = phi_h + 6.2831853;
+    }
+    let h_frac = phi_h / 6.2831853; // [0, 1)
+    // Bilinear sample
+    let fx = h_frac * f32(IES_ATLAS_W - 1u);
+    let fy = v_frac * f32(IES_ATLAS_H - 1u);
+    let x0 = u32(floor(fx));
+    let y0 = u32(floor(fy));
+    let x1 = min(x0 + 1u, IES_ATLAS_W - 1u);
+    let y1 = min(y0 + 1u, IES_ATLAS_H - 1u);
+    let tx = fx - f32(x0);
+    let ty = fy - f32(y0);
+    let base = slice_offset * IES_ATLAS_SLICE;
+    let c00 = ies_atlas[base + y0 * IES_ATLAS_W + x0];
+    let c10 = ies_atlas[base + y0 * IES_ATLAS_W + x1];
+    let c01 = ies_atlas[base + y1 * IES_ATLAS_W + x0];
+    let c11 = ies_atlas[base + y1 * IES_ATLAS_W + x1];
+    let c0 = c00 + (c10 - c00) * tx;
+    let c1 = c01 + (c11 - c01) * tx;
+    return c0 + (c1 - c0) * ty;
+}
 
 // Tiny PCG-style RNG so every workgroup invocation has a uncorrelated
 // sequence even for the small SPP we dispatch from compute.
@@ -268,6 +322,24 @@ fn sample_light_gpu(light: LightGpu, hit_pos: vec3<f32>, r0: f32, r1: f32, out_d
         *out_dist = dist;
         *out_emitted = light.emission;
         *out_pdf = dist2 / (area * cos_at_light);
+        return true;
+    } else if (light.kind == 3u) {
+        // Phase 12 Task 23: IES light. Sample the candela atlas at the
+        // direction from light to hit point, scale emission by candela
+        // * intensity_scale / r².
+        let slice_offset = u32(light.params.x);
+        let forward = light.params.yzw;
+        let up = light.extra.xyz;
+        let intensity_scale = light.extra.w;
+        let d = hit_pos - light.position;
+        let dist2 = max(dot(d, d), 1.0e-6);
+        let dist = sqrt(dist2);
+        let dir_l_to_r = d / dist;
+        let candela = sample_ies_atlas(slice_offset, dir_l_to_r, forward, up);
+        *out_dir = -dir_l_to_r;
+        *out_dist = dist;
+        *out_emitted = light.emission * (candela * intensity_scale / dist2);
+        *out_pdf = 1.0;
         return true;
     }
     return false;

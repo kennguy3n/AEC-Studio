@@ -225,6 +225,7 @@ version = "0.1.0"
 dependencies = [
  "aec_audit",
  "aec_core",
+ "aec_geometry",
  "aec_governor",
  "aec_materials",
  "aec_viewport",
