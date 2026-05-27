@@ -13,6 +13,7 @@ pub mod kchat_state;
 pub mod recents;
 pub mod service;
 mod snapshot_cache;
+pub mod viewport_service;
 
 #[cfg(feature = "napi")]
 pub mod napi_api;

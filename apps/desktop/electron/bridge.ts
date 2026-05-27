@@ -171,7 +171,10 @@ export interface LayoutSuggestionParsed {
 }
 
 export interface BridgeBackend {
-  projectCreateFromTemplate(templateKey: string, projectName: string): Promise<ProjectSummary>;
+  projectCreateFromTemplate(
+    templateKey: string,
+    projectName: string,
+  ): Promise<ProjectSummary>;
   projectOpen(projectPath: string): Promise<ProjectSummary>;
   /**
    * Persist the open project's manifest and return its summary. The native
@@ -194,15 +197,23 @@ export interface BridgeBackend {
     outPath: string,
   ): Promise<ProjectExportPackageResult>;
 
-  designPlaceFurniture(params: Record<string, unknown>): Promise<{ entityId: string }>;
+  designPlaceFurniture(
+    params: Record<string, unknown>,
+  ): Promise<{ entityId: string }>;
   designPaintMaterial(params: Record<string, unknown>): Promise<{ ok: true }>;
   designSetLighting(params: Record<string, unknown>): Promise<{ ok: true }>;
-  designSaveCamera(params: Record<string, unknown>): Promise<{ cameraId: string }>;
+  designSaveCamera(
+    params: Record<string, unknown>,
+  ): Promise<{ cameraId: string }>;
   designListAssets(query: Record<string, unknown>): Promise<AssetSummary[]>;
 
-  draftDrawPrimitive(params: Record<string, unknown>): Promise<{ entityId: string }>;
+  draftDrawPrimitive(
+    params: Record<string, unknown>,
+  ): Promise<{ entityId: string }>;
   draftEditTool(params: Record<string, unknown>): Promise<{ ok: true }>;
-  draftCreateSheet(params: Record<string, unknown>): Promise<{ sheetId: string }>;
+  draftCreateSheet(
+    params: Record<string, unknown>,
+  ): Promise<{ sheetId: string }>;
   draftSetLayerState(params: Record<string, unknown>): Promise<{ ok: true }>;
   /**
    * Import a DXF file into the project graph. `params.projectPath`
@@ -304,7 +315,9 @@ export interface BridgeBackend {
    * the renderer can wire undo without a round-trip; the in-
    * process fallback mirrors the same shape.
    */
-  bimSetProperty(params: Record<string, unknown>): Promise<BimSetPropertyResult>;
+  bimSetProperty(
+    params: Record<string, unknown>,
+  ): Promise<BimSetPropertyResult>;
   /**
    * Parse an IFC file and generate one of the four supported
    * schedules (`"door"` / `"window"` / `"room"` / `"material"`),
@@ -368,7 +381,9 @@ export interface BridgeBackend {
   renderListJobs(): Promise<RenderJob[]>;
   renderCancelJob(jobId: string): Promise<{ cancelled: true }>;
   renderApplyPreset(params: Record<string, unknown>): Promise<{ ok: true }>;
-  renderDiagnose(jobId: string): Promise<{ jobId: string; suggestions: string[] }>;
+  renderDiagnose(
+    jobId: string,
+  ): Promise<{ jobId: string; suggestions: string[] }>;
   renderCheckMaterials(): Promise<{
     findings: Array<{
       code: string;
@@ -407,11 +422,15 @@ export interface BridgeBackend {
   aiCancelJob(jobId: string): Promise<{ cancelled: true }>;
   aiRuntimeStatus(): Promise<{ state: string; lastError: string | null }>;
 
-  exportPdf(params: Record<string, unknown>): Promise<{ outPath: string; pages: number }>;
+  exportPdf(
+    params: Record<string, unknown>,
+  ): Promise<{ outPath: string; pages: number }>;
   exportDxf(params: Record<string, unknown>): Promise<{ outPath: string }>;
   exportIfc(params: Record<string, unknown>): Promise<{ outPath: string }>;
   exportGltf(params: Record<string, unknown>): Promise<{ outPath: string }>;
-  exportBuildProposalPack(params: Record<string, unknown>): Promise<{ outPath: string }>;
+  exportBuildProposalPack(
+    params: Record<string, unknown>,
+  ): Promise<{ outPath: string }>;
 
   // ----- Deliver mode -----
 
@@ -435,7 +454,9 @@ export interface BridgeBackend {
     }>;
   }): Promise<RevisionSummary>;
   /** List every revision in the project at `params.projectPath`. */
-  deliverListRevisions(params: { projectPath: string }): Promise<RevisionSummary[]>;
+  deliverListRevisions(params: {
+    projectPath: string;
+  }): Promise<RevisionSummary[]>;
   /**
    * Diff two revisions. Both must already exist in
    * `params.projectPath`'s `revisions/` directory.
@@ -526,7 +547,10 @@ export interface BridgeBackend {
    * `kind` (tagged `design.create_wall`, `design.paint_material`,
    * etc., per `aec_command::commands::CommandKind`'s serde tags).
    */
-  commandApply(projectPath: string, command: Command): Promise<CommandApplyResult>;
+  commandApply(
+    projectPath: string,
+    command: Command,
+  ): Promise<CommandApplyResult>;
 
   /**
    * Undo the most recently applied command. The renderer renders
@@ -542,10 +566,16 @@ export interface BridgeBackend {
    * an undo issued under the wrong active scope would silently
    * apply inverse deltas tagged for a different rail.
    */
-  commandUndo(projectPath: string, activeScope: CommandScope): Promise<CommandApplyResult>;
+  commandUndo(
+    projectPath: string,
+    activeScope: CommandScope,
+  ): Promise<CommandApplyResult>;
 
   /** Symmetric counterpart to {@link commandUndo}. */
-  commandRedo(projectPath: string, activeScope: CommandScope): Promise<CommandApplyResult>;
+  commandRedo(
+    projectPath: string,
+    activeScope: CommandScope,
+  ): Promise<CommandApplyResult>;
 
   /**
    * Read-only listing of the project graph. Pass `kindFilter`
@@ -553,7 +583,10 @@ export interface BridgeBackend {
    * `undefined` for the full graph. Order is unspecified — the
    * renderer sorts client-side if it needs deterministic display.
    */
-  projectGraphList(projectPath: string, kindFilter?: string): Promise<EntityRecord[]>;
+  projectGraphList(
+    projectPath: string,
+    kindFilter?: string,
+  ): Promise<EntityRecord[]>;
 
   // ----- KChat (Phase 12) -----
 
@@ -573,6 +606,23 @@ export interface BridgeBackend {
     threadId: string;
     sinceIso?: string | null;
   }): Promise<KChatIngestReport>;
+
+  // ----- Viewport (Phase 12) -----
+  /** Current viewport status (GPU readiness, dimensions, frame count). */
+  viewportStatus(): Promise<ViewportStatusReport>;
+  /** Resize the off-screen viewport surface. Both dimensions must
+   *  be > 0. */
+  viewportResize(params: {
+    width: number;
+    height: number;
+  }): Promise<ViewportStatusReport>;
+  /** Apply an orbit / pan / zoom / reset to the camera. Returns
+   *  the updated camera state as JSON. */
+  viewportInput(params: ViewportInputParams): Promise<{ cameraJson: string }>;
+  /** Request the next frame. Returns a frame report — the actual
+   *  pixel bytes live in the bridge's surface manager and are
+   *  picked up by the desktop shell out-of-band. */
+  viewportRequestFrame(): Promise<ViewportFrameReport>;
 }
 
 /** Renderer-facing KChat connection status. */
@@ -597,6 +647,47 @@ export interface KChatIngestReport {
   commentsJson: string;
   /** JSON-encoded `ReviewCard[]`. */
   cardsJson: string;
+}
+
+/** Renderer-facing viewport status (Phase 12). */
+export interface ViewportStatusReport {
+  /** `"ready"` when the GPU device + pipeline are constructed,
+   *  `"unavailable"` otherwise (no adapter on this machine). */
+  state: "ready" | "unavailable";
+  width: number;
+  height: number;
+  frameIndex: number;
+  /** JSON-encoded `GpuDescriptor`, or `null` when no adapter. */
+  gpuDescriptorJson?: string | null;
+}
+
+/** Renderer-facing camera report. */
+export interface ViewportCameraReport {
+  position: [number, number, number];
+  target: [number, number, number];
+  up: [number, number, number];
+  fov_y_radians: number;
+}
+
+/** Result of `viewportRequestFrame`. */
+export interface ViewportFrameReport {
+  frameIndex: number;
+  width: number;
+  height: number;
+  /** `"presented"`, `"coalesced"` (no-change shortcut), or
+   *  `"unavailable"` (no GPU device). */
+  state: "presented" | "coalesced" | "unavailable";
+  /** JSON-encoded `ViewportCameraReport`. */
+  cameraJson: string;
+}
+
+/** Input parameters for `viewportInput`. */
+export interface ViewportInputParams {
+  /** `"orbit"`, `"pan"`, `"zoom"`, or `"reset"`. */
+  kind: "orbit" | "pan" | "zoom" | "reset";
+  dx?: number;
+  dy?: number;
+  delta?: number;
 }
 
 /**
@@ -693,9 +784,7 @@ export interface EntityRecord {
  * commands; `ai` for AI-issued commands (the `tool` field carries
  * the AI tool name). Serde shape mirrors `aec_command::Actor`.
  */
-export type CommandActor =
-  | { kind: "user" }
-  | { kind: "ai"; tool: string };
+export type CommandActor = { kind: "user" } | { kind: "ai"; tool: string };
 
 /**
  * A typed command envelope. Mirrors `aec_command::commands::Command`
@@ -1196,7 +1285,14 @@ export function setBridge(replacement: BridgeBackend): void {
  * still gets the native backend wired up.
  */
 function loadNativeBackend(): BridgeBackend | null {
-  const targetDir = path.resolve(__dirname, "..", "..", "..", "target", "release");
+  const targetDir = path.resolve(
+    __dirname,
+    "..",
+    "..",
+    "..",
+    "target",
+    "release",
+  );
   const candidates = nativeLibraryCandidates(process.platform).map((name) =>
     path.join(targetDir, name),
   );
@@ -1274,7 +1370,9 @@ interface EntityRecordJs {
  * floors). We coalesce missing/undefined to `null` so the native
  * path matches the in-process path's invariant exactly.
  */
-function normaliseEntityRecord<T extends { parent?: string | null }>(record: T): T {
+function normaliseEntityRecord<T extends { parent?: string | null }>(
+  record: T,
+): T {
   return { ...record, parent: record.parent ?? null };
 }
 
@@ -1293,7 +1391,9 @@ function decodeCommandApplyJs(r: CommandApplyResultJs): CommandApplyResult {
     // infallible in practice. We still guard with a clear error so
     // a future serde shape change surfaces here rather than at the
     // first downstream consumer.
-    applied: (JSON.parse(r.appliedJson) as EntityDelta[]).map(normaliseEntityDelta),
+    applied: (JSON.parse(r.appliedJson) as EntityDelta[]).map(
+      normaliseEntityDelta,
+    ),
     undoLen: r.undoLen,
     redoLen: r.redoLen,
   };
@@ -1309,7 +1409,10 @@ function decodeEntityRecordJs(r: EntityRecordJs): EntityRecord {
 }
 
 interface NativeApi {
-  project_create_from_template(template_key: string, project_name: string): unknown;
+  project_create_from_template(
+    template_key: string,
+    project_name: string,
+  ): unknown;
   project_open(project_path: string): unknown;
   project_save(project_path: string): unknown;
   project_list_recents(): unknown;
@@ -1329,7 +1432,10 @@ interface NativeApi {
   command_apply(project_path: string, command_json: string): unknown;
   command_undo(project_path: string, active_scope: string): unknown;
   command_redo(project_path: string, active_scope: string): unknown;
-  project_graph_list(project_path: string, kind_filter: string | null | undefined): unknown;
+  project_graph_list(
+    project_path: string,
+    kind_filter: string | null | undefined,
+  ): unknown;
   // Render endpoints wired in PR-R. The `priority` and `scene_json`
   // parameters on `render_enqueue` (and `scene_json` on
   // `render_enqueue_batch`) are optional from napi-rs's POV;
@@ -1371,7 +1477,11 @@ interface NativeApi {
   bim_export_ifc(ifc_path: string, out_path: string): unknown;
   bim_validate(ifc_path: string): unknown;
   bim_diff(before_path: string, after_path: string): unknown;
-  bim_generate_schedule(ifc_path: string, kind: string, out_path: string): unknown;
+  bim_generate_schedule(
+    ifc_path: string,
+    kind: string,
+    out_path: string,
+  ): unknown;
   // Asset library wired in PR-U. The napi side narrows the loosely-
   // typed `Record<string, unknown>` query to the four documented
   // fields; unknown extra keys are silently dropped by napi-rs.
@@ -1491,6 +1601,17 @@ interface NativeApi {
     threadId: string;
     sinceIso?: string | null;
   }): unknown;
+  // Viewport (Phase 12) — see KChat note above; same threading
+  // discipline, same JSON-encoded payload pattern.
+  viewport_status(): unknown;
+  viewport_resize(params: { width: number; height: number }): unknown;
+  viewport_input(params: {
+    kind: string;
+    dx?: number;
+    dy?: number;
+    delta?: number;
+  }): unknown;
+  viewport_request_frame(): unknown;
 }
 
 /**
@@ -1633,6 +1754,16 @@ export const NATIVE_WIRED_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   "kchatReload",
   "kchatPublish",
   "kchatIngestReviews",
+  // Viewport domain wired in Phase 12. `viewportStatus` /
+  // `viewportResize` / `viewportInput` / `viewportRequestFrame`
+  // all route through `ViewportService` which owns its own wgpu
+  // device. The service reports `state: "unavailable"` on machines
+  // without a GPU adapter rather than failing — the bridge surface
+  // is unconditional.
+  "viewportStatus",
+  "viewportResize",
+  "viewportInput",
+  "viewportRequestFrame",
 ];
 
 /**
@@ -1664,10 +1795,15 @@ export const NATIVE_FALLBACK_METHODS: ReadonlyArray<keyof BridgeBackend> = [];
  * params bag, or throw with a clear error message. All design.*
  * and bim.* adapters use this to locate the encrypted project DB.
  */
-function requireProjectPath(params: Record<string, unknown>, method: string): string {
+function requireProjectPath(
+  params: Record<string, unknown>,
+  method: string,
+): string {
   const v = params.projectPath;
   if (typeof v !== "string" || v.length === 0) {
-    throw new Error(`${method}: params.projectPath must be a non-empty string (got ${typeof v})`);
+    throw new Error(
+      `${method}: params.projectPath must be a non-empty string (got ${typeof v})`,
+    );
   }
   return v;
 }
@@ -1678,7 +1814,9 @@ function requireProjectPath(params: Record<string, unknown>, method: string): st
  * `projectPath` is a renderer convention, not part of any Rust
  * command struct.
  */
-function withoutProjectPath(params: Record<string, unknown>): Record<string, unknown> {
+function withoutProjectPath(
+  params: Record<string, unknown>,
+): Record<string, unknown> {
   const { projectPath: _, ...rest } = params;
   return rest;
 }
@@ -1710,9 +1848,11 @@ function adaptNative(n: NativeApi): BridgeBackend {
       n.project_create_from_template(k, p) as ProjectSummary,
     projectOpen: async (p) => n.project_open(p) as ProjectSummary,
     projectSave: async (p) => n.project_save(p) as ProjectSummary,
-    projectListRecents: async () => n.project_list_recents() as ProjectSummary[],
+    projectListRecents: async () =>
+      n.project_list_recents() as ProjectSummary[],
     runtimeStatus: async () => n.runtime_status() as RuntimeStatus,
-    projectEngineStatus: async (p) => n.project_engine_status(p) as EngineStatus,
+    projectEngineStatus: async (p) =>
+      n.project_engine_status(p) as EngineStatus,
     projectAuditSync: async (p) => n.project_audit_sync(p) as number,
     projectAuditVerify: async (p) =>
       n.project_audit_verify(p) as AuditChainVerification,
@@ -1720,14 +1860,16 @@ function adaptNative(n: NativeApi): BridgeBackend {
     // a Promise) so that the multi-second IFC parse runs on the
     // tokio blocking pool and does NOT freeze the Electron main
     // process's JS event loop. Must be awaited.
-    bimImportIfc: async (p) =>
-      (await n.bim_import_ifc(p)) as BimImportSummary,
+    bimImportIfc: async (p) => (await n.bim_import_ifc(p)) as BimImportSummary,
     bimCheckFileSize: async (p) => n.bim_check_file_size(p) as BimFileSizeCheck,
     bimAttachIfc: async (projectPath, ifcPath) =>
       n.bim_attach_ifc(projectPath, ifcPath) as BimAttachSummary,
     commandApply: async (projectPath, command) =>
       decodeCommandApplyJs(
-        n.command_apply(projectPath, JSON.stringify(command)) as CommandApplyResultJs,
+        n.command_apply(
+          projectPath,
+          JSON.stringify(command),
+        ) as CommandApplyResultJs,
       ),
     commandUndo: async (projectPath, activeScope) =>
       decodeCommandApplyJs(
@@ -1738,9 +1880,12 @@ function adaptNative(n: NativeApi): BridgeBackend {
         n.command_redo(projectPath, activeScope) as CommandApplyResultJs,
       ),
     projectGraphList: async (projectPath, kindFilter) =>
-      (n.project_graph_list(projectPath, kindFilter ?? null) as EntityRecordJs[]).map(
-        decodeEntityRecordJs,
-      ),
+      (
+        n.project_graph_list(
+          projectPath,
+          kindFilter ?? null,
+        ) as EntityRecordJs[]
+      ).map(decodeEntityRecordJs),
     // ----- Render endpoints (PR-R) -----
     //
     // `renderEnqueue` accepts a loose `Record<string, unknown>` for
@@ -1752,7 +1897,8 @@ function adaptNative(n: NativeApi): BridgeBackend {
     // error on the Rust side — the resulting napi `Error` is
     // re-thrown as a JS error and surfaces in the renderer's catch.
     renderEnqueue: async (params) => {
-      const cameraId = typeof params.cameraId === "string" ? params.cameraId : "";
+      const cameraId =
+        typeof params.cameraId === "string" ? params.cameraId : "";
       const preset = typeof params.preset === "string" ? params.preset : "";
       const priority =
         typeof params.priority === "number" && Number.isFinite(params.priority)
@@ -1772,20 +1918,19 @@ function adaptNative(n: NativeApi): BridgeBackend {
       // today), but the native side accepts it for forward
       // compatibility with the in-process queue. We pull it
       // defensively via a typeof-narrowed cast through `unknown`.
-      const candidate = (params as unknown as { sceneJson?: unknown }).sceneJson;
+      const candidate = (params as unknown as { sceneJson?: unknown })
+        .sceneJson;
       const sceneJson =
-        typeof candidate === "string" && candidate.length > 0 ? candidate : null;
+        typeof candidate === "string" && candidate.length > 0
+          ? candidate
+          : null;
       const presetIds =
         params.presetIds && params.presetIds.length > 0
           ? params.presetIds
           : params.presetId
             ? [params.presetId]
             : [];
-      return n.render_enqueue_batch(
-        params.cameraIds,
-        presetIds,
-        sceneJson,
-      ) as {
+      return n.render_enqueue_batch(params.cameraIds, presetIds, sceneJson) as {
         batchId: string;
         jobIds: string[];
       };
@@ -1843,19 +1988,19 @@ function adaptNative(n: NativeApi): BridgeBackend {
     // surface as `napi::Error` with `Status::InvalidArg`).
     exportPdf: async (params) =>
       n.export_pdf(params) as { outPath: string; pages: number },
-    exportDxf: async (params) =>
-      n.export_dxf(params) as { outPath: string },
-    exportIfc: async (params) =>
-      n.export_ifc(params) as { outPath: string },
-    exportGltf: async (params) =>
-      n.export_gltf(params) as { outPath: string },
+    exportDxf: async (params) => n.export_dxf(params) as { outPath: string },
+    exportIfc: async (params) => n.export_ifc(params) as { outPath: string },
+    exportGltf: async (params) => n.export_gltf(params) as { outPath: string },
     exportBuildProposalPack: async (params) =>
       n.export_build_proposal_pack(params) as { outPath: string },
     deliverBuildPack: async (params) =>
       n.deliver_build_pack(params) as DeliverPackResult,
     // ----- BIM read-only endpoints (PR-T) -----
     bimExportIfc: async (params) =>
-      n.bim_export_ifc(params.sourcePath, params.outPath) as BimExportIfcSummary,
+      n.bim_export_ifc(
+        params.sourcePath,
+        params.outPath,
+      ) as BimExportIfcSummary,
     bimValidate: async (params) =>
       n.bim_validate(params.sourcePath) as BimValidateReport,
     bimDiff: async (params) =>
@@ -1876,16 +2021,23 @@ function adaptNative(n: NativeApi): BridgeBackend {
     // filter path for forward-compat.
     designListAssets: async (query) =>
       n.design_list_assets({
-        search: typeof query.search === "string" ? (query.search as string) : undefined,
+        search:
+          typeof query.search === "string"
+            ? (query.search as string)
+            : undefined,
         tags: Array.isArray(query.tags) ? (query.tags as string[]) : undefined,
         styleTags: Array.isArray(query.styleTags)
           ? (query.styleTags as string[])
           : undefined,
-        limit: typeof query.limit === "number" ? (query.limit as number) : undefined,
+        limit:
+          typeof query.limit === "number" ? (query.limit as number) : undefined,
       }) as AssetSummary[],
     // ----- PR-W (Phase 1): project package archive -----
     projectExportPackage: async (projectPath, outPath) =>
-      n.project_export_package(projectPath, outPath) as ProjectExportPackageResult,
+      n.project_export_package(
+        projectPath,
+        outPath,
+      ) as ProjectExportPackageResult,
     // ----- PR-W (Phase 1+2): design.* command façades -----
     //
     // The renderer's `BridgeBackend.design{PaintMaterial,
@@ -1905,12 +2057,16 @@ function adaptNative(n: NativeApi): BridgeBackend {
     designPaintMaterial: async (params) => {
       const projectPath = requireProjectPath(params, "designPaintMaterial");
       const inner = withoutProjectPath(params);
-      return n.design_paint_material(projectPath, JSON.stringify(inner)) as { ok: true };
+      return n.design_paint_material(projectPath, JSON.stringify(inner)) as {
+        ok: true;
+      };
     },
     designSetLighting: async (params) => {
       const projectPath = requireProjectPath(params, "designSetLighting");
       const inner = withoutProjectPath(params);
-      return n.design_set_lighting(projectPath, JSON.stringify(inner)) as { ok: true };
+      return n.design_set_lighting(projectPath, JSON.stringify(inner)) as {
+        ok: true;
+      };
     },
     designSaveCamera: async (params) => {
       const projectPath = requireProjectPath(params, "designSaveCamera");
@@ -1918,7 +2074,9 @@ function adaptNative(n: NativeApi): BridgeBackend {
       // napi returns `{ cameraId }` via the snake_case adapter —
       // the typed `DesignCameraIdJs` struct is serialised
       // camelCase-friendly by napi-rs.
-      return n.design_save_camera(projectPath, JSON.stringify(inner)) as { cameraId: string };
+      return n.design_save_camera(projectPath, JSON.stringify(inner)) as {
+        cameraId: string;
+      };
     },
     designPlaceFurniture: async (params) => {
       const projectPath = requireProjectPath(params, "designPlaceFurniture");
@@ -1939,7 +2097,13 @@ function adaptNative(n: NativeApi): BridgeBackend {
       const pset = requireStringField(params, "bimSetProperty", "pset");
       const key = requireStringField(params, "bimSetProperty", "key");
       const value = requireStringField(params, "bimSetProperty", "value");
-      return n.bim_set_property(projectPath, entityId, pset, key, value) as BimSetPropertyResult;
+      return n.bim_set_property(
+        projectPath,
+        entityId,
+        pset,
+        key,
+        value,
+      ) as BimSetPropertyResult;
     },
     // ----- AI endpoints (PR-V) -----
     //
@@ -1948,8 +2112,7 @@ function adaptNative(n: NativeApi): BridgeBackend {
     // `AI_TOOLS` constant. This keeps the wire shape pinned to the
     // Rust enum: a renderer build that ships an out-of-date `AI_TOOLS`
     // constant will still see the native truth in production.
-    aiListTools: async () =>
-      (await n.ai_list_tools()) as AiTool[],
+    aiListTools: async () => (await n.ai_list_tools()) as AiTool[],
     // `aiPlan` accepts a loose `Record<string, unknown>` for
     // back-compat with the in-process fallback. We extract `tool`,
     // `scope`, `prompt`, `context`, and `max_entities_modified`
@@ -1971,9 +2134,7 @@ function adaptNative(n: NativeApi): BridgeBackend {
             ? (params.project_path as string)
             : "";
       if (projectPath.length === 0) {
-        throw new Error(
-          "aiPlan: missing required string field 'projectPath'",
-        );
+        throw new Error("aiPlan: missing required string field 'projectPath'");
       }
       const tool = typeof params.tool === "string" ? params.tool : "";
       if (tool.length === 0) {
@@ -2158,7 +2319,9 @@ function adaptNative(n: NativeApi): BridgeBackend {
     draftEditTool: async (params) => {
       const projectPath = requireProjectPath(params, "draftEditTool");
       const inner = withoutProjectPath(params);
-      return n.draft_edit_tool(projectPath, JSON.stringify(inner)) as { ok: true };
+      return n.draft_edit_tool(projectPath, JSON.stringify(inner)) as {
+        ok: true;
+      };
     },
     draftCreateSheet: async (params) => {
       const projectPath = requireProjectPath(params, "draftCreateSheet");
@@ -2170,16 +2333,24 @@ function adaptNative(n: NativeApi): BridgeBackend {
     draftSetLayerState: async (params) => {
       const projectPath = requireProjectPath(params, "draftSetLayerState");
       const inner = withoutProjectPath(params);
-      return n.draft_set_layer_state(projectPath, JSON.stringify(inner)) as { ok: true };
+      return n.draft_set_layer_state(projectPath, JSON.stringify(inner)) as {
+        ok: true;
+      };
     },
     draftImportDxf: async (params) => {
-      const r = (await n.draft_import_dxf(params.projectPath, params.dxfPath)) as {
+      const r = (await n.draft_import_dxf(
+        params.projectPath,
+        params.dxfPath,
+      )) as {
         entityCount: number;
       };
       return { imported: r.entityCount };
     },
     draftExportDxf: async (params) => {
-      const r = (await n.draft_export_dxf(params.projectPath, params.dxfPath)) as {
+      const r = (await n.draft_export_dxf(
+        params.projectPath,
+        params.dxfPath,
+      )) as {
         path: string;
       };
       return { exported: true, path: r.path };
@@ -2195,7 +2366,9 @@ function adaptNative(n: NativeApi): BridgeBackend {
       // `RevisionSummary`.
       const tag = params.tag;
       if (typeof tag !== "string" || tag.length === 0) {
-        throw new Error("deliverCreateRevision: missing required string field 'tag'");
+        throw new Error(
+          "deliverCreateRevision: missing required string field 'tag'",
+        );
       }
       // `#[napi(object)]` on `RevisionTrackedEntityJs` auto-converts
       // the Rust struct's snake_case fields to camelCase on the JS
@@ -2230,13 +2403,19 @@ function adaptNative(n: NativeApi): BridgeBackend {
       return JSON.parse(raw.summaryJson) as RevisionSummary;
     },
     deliverListRevisions: async (params) => {
-      const raw = (await n.deliver_list_revisions(params.projectPath)) as Array<{
+      const raw = (await n.deliver_list_revisions(
+        params.projectPath,
+      )) as Array<{
         summaryJson: string;
       }>;
       return raw.map((r) => JSON.parse(r.summaryJson) as RevisionSummary);
     },
     deliverCompareRevisions: async ({ projectPath, baseId, headId }) => {
-      const raw = (await n.deliver_compare_revisions(projectPath, baseId, headId)) as {
+      const raw = (await n.deliver_compare_revisions(
+        projectPath,
+        baseId,
+        headId,
+      )) as {
         diffJson: string;
       };
       return JSON.parse(raw.diffJson) as VersionDiffSummary;
@@ -2284,6 +2463,67 @@ function adaptNative(n: NativeApi): BridgeBackend {
         cardsJson: string;
       };
       return raw;
+    },
+    // ----- Viewport (Phase 12) -----
+    viewportStatus: async () => {
+      const raw = n.viewport_status() as {
+        state: string;
+        width: number;
+        height: number;
+        frameIndex: number;
+        gpuDescriptorJson?: string | null;
+      };
+      return {
+        state: raw.state as ViewportStatusReport["state"],
+        width: raw.width,
+        height: raw.height,
+        frameIndex: raw.frameIndex,
+        gpuDescriptorJson: raw.gpuDescriptorJson ?? null,
+      };
+    },
+    viewportResize: async (params) => {
+      const raw = n.viewport_resize({
+        width: params.width,
+        height: params.height,
+      }) as {
+        state: string;
+        width: number;
+        height: number;
+        frameIndex: number;
+        gpuDescriptorJson?: string | null;
+      };
+      return {
+        state: raw.state as ViewportStatusReport["state"],
+        width: raw.width,
+        height: raw.height,
+        frameIndex: raw.frameIndex,
+        gpuDescriptorJson: raw.gpuDescriptorJson ?? null,
+      };
+    },
+    viewportInput: async (params) => {
+      const raw = n.viewport_input({
+        kind: params.kind,
+        dx: params.dx,
+        dy: params.dy,
+        delta: params.delta,
+      }) as { cameraJson: string };
+      return raw;
+    },
+    viewportRequestFrame: async () => {
+      const raw = n.viewport_request_frame() as {
+        frameIndex: number;
+        width: number;
+        height: number;
+        state: string;
+        cameraJson: string;
+      };
+      return {
+        frameIndex: raw.frameIndex,
+        width: raw.width,
+        height: raw.height,
+        state: raw.state as ViewportFrameReport["state"],
+        cameraJson: raw.cameraJson,
+      };
     },
   };
   // Self-check 0: the two catalogues must be *disjoint*. A method
@@ -2377,7 +2617,8 @@ export function inProcessBackend(): BridgeBackend {
   const recents: ProjectSummary[] = [];
   let nextId = 1;
 
-  const id = (prefix: string) => `${prefix}_${(nextId++).toString(36).padStart(4, "0")}`;
+  const id = (prefix: string) =>
+    `${prefix}_${(nextId++).toString(36).padStart(4, "0")}`;
 
   const upsertRecent = (p: ProjectSummary) => {
     const idx = recents.findIndex((r) => r.projectId === p.projectId);
@@ -2673,7 +2914,8 @@ export function inProcessBackend(): BridgeBackend {
       // exactly the dev/prod-parity hazard the rest of this backend
       // is structured to avoid. The matching field also appears on
       // every job created by `renderEnqueueBatch` below.
-      const cameraId = typeof params.cameraId === "string" ? params.cameraId : undefined;
+      const cameraId =
+        typeof params.cameraId === "string" ? params.cameraId : undefined;
       const job: RenderJob = {
         jobId: id("job"),
         status: "queued",
@@ -2922,7 +3164,10 @@ export function inProcessBackend(): BridgeBackend {
       // still validate the field exists so renderer wiring bugs
       // (missing projectPath) fail loudly here the same way they
       // do against the native backend.
-      if (typeof params.projectPath !== "string" || params.projectPath.length === 0) {
+      if (
+        typeof params.projectPath !== "string" ||
+        params.projectPath.length === 0
+      ) {
         throw new Error(
           "deliverCreateRevision: params.projectPath must be a non-empty string",
         );
@@ -2953,7 +3198,10 @@ export function inProcessBackend(): BridgeBackend {
       return rev;
     },
     async deliverListRevisions(params) {
-      if (typeof params?.projectPath !== "string" || params.projectPath.length === 0) {
+      if (
+        typeof params?.projectPath !== "string" ||
+        params.projectPath.length === 0
+      ) {
         throw new Error(
           "deliverListRevisions: params.projectPath must be a non-empty string",
         );
@@ -3110,7 +3358,10 @@ export function inProcessBackend(): BridgeBackend {
             parent: r.parent,
             // Defensive deep-clone so renderer mutation doesn't leak
             // back into the engine state.
-            body: r.body === null || r.body === undefined ? r.body : JSON.parse(JSON.stringify(r.body)),
+            body:
+              r.body === null || r.body === undefined
+                ? r.body
+                : JSON.parse(JSON.stringify(r.body)),
           });
         }
       }
@@ -3142,6 +3393,44 @@ export function inProcessBackend(): BridgeBackend {
       threadId: params.threadId,
       commentsJson: "[]",
       cardsJson: "[]",
+    }),
+    // Viewport in-process fallback. Returns plausible but inert
+    // values — the real `ViewportService` is only available via the
+    // native bridge (it needs wgpu). The UI shows
+    // `state: "unavailable"` and disables interactive 3D bits.
+    viewportStatus: async () => ({
+      state: "unavailable",
+      width: 0,
+      height: 0,
+      frameIndex: 0,
+      gpuDescriptorJson: null,
+    }),
+    viewportResize: async ({ width, height }) => ({
+      state: "unavailable",
+      width,
+      height,
+      frameIndex: 0,
+      gpuDescriptorJson: null,
+    }),
+    viewportInput: async () => ({
+      cameraJson: JSON.stringify({
+        position: [5000, 3000, 5000],
+        target: [0, 0, 0],
+        up: [0, 1, 0],
+        fov_y_radians: Math.PI / 3,
+      }),
+    }),
+    viewportRequestFrame: async () => ({
+      frameIndex: 0,
+      width: 0,
+      height: 0,
+      state: "unavailable",
+      cameraJson: JSON.stringify({
+        position: [5000, 3000, 5000],
+        target: [0, 0, 0],
+        up: [0, 1, 0],
+        fov_y_radians: Math.PI / 3,
+      }),
     }),
   };
 }
@@ -3272,7 +3561,10 @@ function assertObjectBody(
  * and renderer-backend.ts that an earlier draft of this engine
  * had (Devin Review round 3, ANALYSIS_0003).
  */
-export function computeForwardDeltas(graph: InProcessGraph, command: Command): EntityDelta[] {
+export function computeForwardDeltas(
+  graph: InProcessGraph,
+  command: Command,
+): EntityDelta[] {
   const args = (command.arguments as Record<string, unknown> | undefined) ?? {};
   const tool = command.tool;
   switch (tool) {
@@ -3289,7 +3581,9 @@ export function computeForwardDeltas(graph: InProcessGraph, command: Command): E
       const entityId = (args.entity_id as string | undefined) ?? randomId();
       const kind = CREATE_TOOL_KIND_MAP[tool];
       if (!kind) {
-        throw new Error(`commandApply (in-process): kind map missing entry for ${tool}`);
+        throw new Error(
+          `commandApply (in-process): kind map missing entry for ${tool}`,
+        );
       }
       // Openings (doors/windows) hang off the host wall in the Rust
       // engine (`PlaceDoor::to_delta` sets `parent: Some(host_wall_id)`).
@@ -3369,9 +3663,12 @@ export function computeForwardDeltas(graph: InProcessGraph, command: Command): E
       if (!existing) throw new Error(`${tool}: entity not found: ${id}`);
       const body = assertObjectBody(existing.body, tool);
       const after: Record<string, unknown> = { ...body };
-      if (args.new_boundary_mm !== undefined) after.boundary_mm = args.new_boundary_mm;
-      if (args.new_thickness_mm !== undefined) after.thickness_mm = args.new_thickness_mm;
-      if (args.new_material_id !== undefined) after.material_id = args.new_material_id;
+      if (args.new_boundary_mm !== undefined)
+        after.boundary_mm = args.new_boundary_mm;
+      if (args.new_thickness_mm !== undefined)
+        after.thickness_mm = args.new_thickness_mm;
+      if (args.new_material_id !== undefined)
+        after.material_id = args.new_material_id;
       return [{ kind: "update", id, before: existing.body, after }];
     }
 
@@ -3408,7 +3705,10 @@ export function computeForwardDeltas(graph: InProcessGraph, command: Command): E
       if (surface === undefined || surface === null) {
         after.material_id = materialId;
       } else {
-        const surfaces = { ...((body.surface_materials as Record<string, unknown> | undefined) ?? {}) };
+        const surfaces = {
+          ...((body.surface_materials as Record<string, unknown> | undefined) ??
+            {}),
+        };
         surfaces[surface] = materialId;
         after.surface_materials = surfaces;
       }
@@ -3424,7 +3724,10 @@ export function computeForwardDeltas(graph: InProcessGraph, command: Command): E
       const existing = graph.entities.get(id);
       if (!existing) throw new Error(`${tool}: entity not found: ${id}`);
       const body = assertObjectBody(existing.body, tool);
-      const after: Record<string, unknown> = { ...body, material_id: args.to_material_id };
+      const after: Record<string, unknown> = {
+        ...body,
+        material_id: args.to_material_id,
+      };
       return [{ kind: "update", id, before: existing.body, after }];
     }
 
@@ -3469,7 +3772,10 @@ export function computeForwardDeltas(graph: InProcessGraph, command: Command): E
  *   • Update   ↔ Update with `before` / `after` swapped
  *   • Delete   ↔ Create
  */
-export function applyDeltas(graph: InProcessGraph, deltas: EntityDelta[]): EntityDelta[] {
+export function applyDeltas(
+  graph: InProcessGraph,
+  deltas: EntityDelta[],
+): EntityDelta[] {
   const inverse: EntityDelta[] = [];
   for (const d of deltas) {
     switch (d.kind) {
@@ -3482,7 +3788,12 @@ export function applyDeltas(graph: InProcessGraph, deltas: EntityDelta[]): Entit
         if (!existing) throw new Error(`update: entity not found: ${d.id}`);
         const updated: EntityRecord = { ...existing, body: d.after };
         graph.entities.set(d.id, updated);
-        inverse.unshift({ kind: "update", id: d.id, before: d.after, after: d.before });
+        inverse.unshift({
+          kind: "update",
+          id: d.id,
+          before: d.after,
+          after: d.before,
+        });
         break;
       }
       case "delete":
@@ -3554,7 +3865,13 @@ function requireNonBlankStringField(
 
 function inProcessEngineStatus(): EngineStatus {
   const byScope: Record<string, number> = {};
-  for (const scope of ["design", "draft", "bim", "render", "deliver"] as const) {
+  for (const scope of [
+    "design",
+    "draft",
+    "bim",
+    "render",
+    "deliver",
+  ] as const) {
     byScope[scope] = 0;
   }
   return {
@@ -3941,10 +4258,18 @@ function seedAssets(): AssetSummary[] {
   ];
 }
 
-function filterAssets(assets: AssetSummary[], query: Record<string, unknown>): AssetSummary[] {
+function filterAssets(
+  assets: AssetSummary[],
+  query: Record<string, unknown>,
+): AssetSummary[] {
   const tags = Array.isArray(query.tags) ? (query.tags as string[]) : [];
-  const styleTags = Array.isArray(query.styleTags) ? (query.styleTags as string[]) : [];
-  const search = typeof query.search === "string" ? (query.search as string).toLowerCase() : "";
+  const styleTags = Array.isArray(query.styleTags)
+    ? (query.styleTags as string[])
+    : [];
+  const search =
+    typeof query.search === "string"
+      ? (query.search as string).toLowerCase()
+      : "";
   const limit = typeof query.limit === "number" ? (query.limit as number) : 24;
   return assets
     .filter((a) => tags.every((t) => a.tags.includes(t)))

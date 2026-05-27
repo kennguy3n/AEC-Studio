@@ -31,6 +31,7 @@ rusqlite = { workspace = true }
 aec_geometry = { path = "../aec_geometry" }
 aec_assets = { path = "../aec_assets" }
 aec_render = { path = "../aec_render" }
+aec_viewport = { path = "../aec_viewport" }
 aec_materials = { path = "../aec_materials" }
 uuid = { workspace = true }
 aec_governor = { path = "../aec_governor" }
@@ -41,6 +42,7 @@ chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+glam = { workspace = true }
 
 # `tokio_rt` is required so async `#[napi]` functions (e.g. `ai_plan`,
 # `bim_import_ifc`) execute on napi-rs's bundled tokio runtime rather

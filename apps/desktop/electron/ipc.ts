@@ -1,9 +1,6 @@
 import { ipcMain } from "electron";
 import { getBridge } from "./bridge";
-import {
-  peekActiveProjectPath,
-  setActiveProjectPath,
-} from "./active-project";
+import { peekActiveProjectPath, setActiveProjectPath } from "./active-project";
 
 /**
  * Register every IPC handler the preload bridge expects. Handlers are
@@ -20,18 +17,24 @@ import {
  */
 export function registerIpcHandlers(): void {
   // ----- Project -----
-  ipcMain.handle("project:createFromTemplate", async (_e, { templateKey, projectName }) => {
-    assertString(templateKey, "templateKey");
-    assertString(projectName, "projectName");
-    // Promote the freshly created project to "active" so subsequent
-    // draft / deliver / command handlers that don't carry an explicit
-    // `projectPath` (because the renderer's public `aec.*` API doesn't
-    // expose one) can resolve the active project path. See
-    // `active-project.ts` for the design rationale.
-    const summary = await getBridge().projectCreateFromTemplate(templateKey, projectName);
-    setActiveProjectPath(summary.path);
-    return summary;
-  });
+  ipcMain.handle(
+    "project:createFromTemplate",
+    async (_e, { templateKey, projectName }) => {
+      assertString(templateKey, "templateKey");
+      assertString(projectName, "projectName");
+      // Promote the freshly created project to "active" so subsequent
+      // draft / deliver / command handlers that don't carry an explicit
+      // `projectPath` (because the renderer's public `aec.*` API doesn't
+      // expose one) can resolve the active project path. See
+      // `active-project.ts` for the design rationale.
+      const summary = await getBridge().projectCreateFromTemplate(
+        templateKey,
+        projectName,
+      );
+      setActiveProjectPath(summary.path);
+      return summary;
+    },
+  );
   ipcMain.handle("project:open", async (_e, { projectPath }) => {
     assertString(projectPath, "projectPath");
     const summary = await getBridge().projectOpen(projectPath);
@@ -48,11 +51,14 @@ export function registerIpcHandlers(): void {
   ipcMain.handle("project:listRecents", async () => {
     return getBridge().projectListRecents();
   });
-  ipcMain.handle("project:exportPackage", async (_e, { projectPath, outPath }) => {
-    assertString(projectPath, "projectPath");
-    assertString(outPath, "outPath");
-    return getBridge().projectExportPackage(projectPath, outPath);
-  });
+  ipcMain.handle(
+    "project:exportPackage",
+    async (_e, { projectPath, outPath }) => {
+      assertString(projectPath, "projectPath");
+      assertString(outPath, "outPath");
+      return getBridge().projectExportPackage(projectPath, outPath);
+    },
+  );
 
   // ----- Design -----
   ipcMain.handle("design:placeFurniture", async (_e, params) => {
@@ -227,7 +233,9 @@ export function registerIpcHandlers(): void {
     assertObject(p, "params");
     const cameraIds = (p as { cameraIds?: unknown }).cameraIds;
     if (!Array.isArray(cameraIds) || cameraIds.length === 0) {
-      throw new Error("renderEnqueueBatch: cameraIds must be a non-empty array");
+      throw new Error(
+        "renderEnqueueBatch: cameraIds must be a non-empty array",
+      );
     }
     if (!cameraIds.every((c) => typeof c === "string")) {
       throw new Error("renderEnqueueBatch: cameraIds must contain strings");
@@ -300,7 +308,9 @@ export function registerIpcHandlers(): void {
     let reasonStr: string | null = null;
     if (reason !== undefined && reason !== null) {
       if (typeof reason !== "string") {
-        throw new Error("ai:rejectDiff: 'reason' must be a string when present");
+        throw new Error(
+          "ai:rejectDiff: 'reason' must be a string when present",
+        );
       }
       reasonStr = reason;
     }
@@ -418,12 +428,16 @@ export function registerIpcHandlers(): void {
       // Forwarded so the native backend's PDF-summary label matches
       // the renderer-supplied project name (otherwise napi defaults
       // to the generic "Project" string).
-      projectName: typeof p.projectName === "string" ? p.projectName : undefined,
-      includeRenders: typeof p.includeRenders === "boolean" ? p.includeRenders : undefined,
-      includeSheets: typeof p.includeSheets === "boolean" ? p.includeSheets : undefined,
+      projectName:
+        typeof p.projectName === "string" ? p.projectName : undefined,
+      includeRenders:
+        typeof p.includeRenders === "boolean" ? p.includeRenders : undefined,
+      includeSheets:
+        typeof p.includeSheets === "boolean" ? p.includeSheets : undefined,
       includeIfc: typeof p.includeIfc === "boolean" ? p.includeIfc : undefined,
       includeBoq: typeof p.includeBoq === "boolean" ? p.includeBoq : undefined,
-      includeProposal: typeof p.includeProposal === "boolean" ? p.includeProposal : undefined,
+      includeProposal:
+        typeof p.includeProposal === "boolean" ? p.includeProposal : undefined,
       region,
     });
   });
@@ -462,16 +476,19 @@ export function registerIpcHandlers(): void {
     assertScope(activeScope);
     return getBridge().commandRedo(projectPath, activeScope);
   });
-  ipcMain.handle("project:graphList", async (_e, { projectPath, kindFilter }) => {
-    assertString(projectPath, "projectPath");
-    if (kindFilter !== undefined && kindFilter !== null) {
-      assertString(kindFilter, "kindFilter");
-    }
-    return getBridge().projectGraphList(
-      projectPath,
-      typeof kindFilter === "string" ? kindFilter : undefined,
-    );
-  });
+  ipcMain.handle(
+    "project:graphList",
+    async (_e, { projectPath, kindFilter }) => {
+      assertString(projectPath, "projectPath");
+      if (kindFilter !== undefined && kindFilter !== null) {
+        assertString(kindFilter, "kindFilter");
+      }
+      return getBridge().projectGraphList(
+        projectPath,
+        typeof kindFilter === "string" ? kindFilter : undefined,
+      );
+    },
+  );
 
   // ----- Runtime -----
   ipcMain.handle("runtime:status", async () => getBridge().runtimeStatus());
@@ -495,6 +512,61 @@ export function registerIpcHandlers(): void {
       >[0],
     );
   });
+
+  // ----- Viewport (Phase 12) -----
+  //
+  // The viewport handlers are thin: they validate the IPC payload
+  // shape and forward to the bridge. The bridge's
+  // `viewport_service` owns the wgpu device + render pipeline; it
+  // degrades gracefully to a "no GPU" stub when no adapter is
+  // available (CI / headless), so the renderer can call these
+  // handlers unconditionally without checking for hardware support
+  // first.
+  ipcMain.handle("viewport:status", async () => getBridge().viewportStatus());
+  ipcMain.handle("viewport:resize", async (_e, params) => {
+    assertObject(params, "params");
+    const p = params as { width?: unknown; height?: unknown };
+    const width = Number(p.width);
+    const height = Number(p.height);
+    if (!Number.isFinite(width) || width <= 0) {
+      throw new Error("viewport:resize requires a positive numeric width");
+    }
+    if (!Number.isFinite(height) || height <= 0) {
+      throw new Error("viewport:resize requires a positive numeric height");
+    }
+    return getBridge().viewportResize({
+      width: Math.round(width),
+      height: Math.round(height),
+    });
+  });
+  ipcMain.handle("viewport:input", async (_e, params) => {
+    assertObject(params, "params");
+    const p = params as {
+      kind?: unknown;
+      dx?: unknown;
+      dy?: unknown;
+      delta?: unknown;
+    };
+    if (
+      p.kind !== "orbit" &&
+      p.kind !== "pan" &&
+      p.kind !== "zoom" &&
+      p.kind !== "reset"
+    ) {
+      throw new Error(
+        "viewport:input `kind` must be 'orbit' | 'pan' | 'zoom' | 'reset'",
+      );
+    }
+    return getBridge().viewportInput({
+      kind: p.kind,
+      dx: typeof p.dx === "number" ? p.dx : undefined,
+      dy: typeof p.dy === "number" ? p.dy : undefined,
+      delta: typeof p.delta === "number" ? p.delta : undefined,
+    });
+  });
+  ipcMain.handle("viewport:requestFrame", async () =>
+    getBridge().viewportRequestFrame(),
+  );
 }
 
 // ----- validation helpers (small, real, not stubs) -----
@@ -556,7 +628,10 @@ export function assertScope(
   field: string = "activeScope",
 ): asserts value is import("./bridge").CommandScope {
   const allowed = ["design", "draft", "bim", "render", "deliver"] as const;
-  if (typeof value !== "string" || !allowed.includes(value as typeof allowed[number])) {
+  if (
+    typeof value !== "string" ||
+    !allowed.includes(value as (typeof allowed)[number])
+  ) {
     throw new IpcValidationError(
       `${field} must be one of ${allowed.join(" / ")} (got: ${String(value)})`,
     );

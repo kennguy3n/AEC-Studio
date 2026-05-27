@@ -9,9 +9,14 @@ const api = {
   // ----- Project -----
   project: {
     createFromTemplate: (templateKey: string, projectName: string) =>
-      ipcRenderer.invoke("project:createFromTemplate", { templateKey, projectName }),
-    open: (projectPath: string) => ipcRenderer.invoke("project:open", { projectPath }),
-    save: (projectPath: string) => ipcRenderer.invoke("project:save", { projectPath }),
+      ipcRenderer.invoke("project:createFromTemplate", {
+        templateKey,
+        projectName,
+      }),
+    open: (projectPath: string) =>
+      ipcRenderer.invoke("project:open", { projectPath }),
+    save: (projectPath: string) =>
+      ipcRenderer.invoke("project:save", { projectPath }),
     listRecents: () => ipcRenderer.invoke("project:listRecents"),
     exportPackage: (projectPath: string, outPath: string) =>
       ipcRenderer.invoke("project:exportPackage", { projectPath, outPath }),
@@ -216,10 +221,12 @@ const api = {
     enqueueRender: (params: Record<string, unknown>) =>
       ipcRenderer.invoke("render:enqueueRender", params),
     listJobs: () => ipcRenderer.invoke("render:listJobs"),
-    cancelJob: (jobId: string) => ipcRenderer.invoke("render:cancelJob", { jobId }),
+    cancelJob: (jobId: string) =>
+      ipcRenderer.invoke("render:cancelJob", { jobId }),
     applyPreset: (params: Record<string, unknown>) =>
       ipcRenderer.invoke("render:applyPreset", params),
-    diagnose: (jobId: string) => ipcRenderer.invoke("render:diagnose", { jobId }),
+    diagnose: (jobId: string) =>
+      ipcRenderer.invoke("render:diagnose", { jobId }),
     enqueueBatch: (params: {
       cameraIds: string[];
       presetIds?: string[];
@@ -233,8 +240,10 @@ const api = {
   // ----- AI -----
   ai: {
     listTools: () => ipcRenderer.invoke("ai:listTools"),
-    plan: (params: Record<string, unknown>) => ipcRenderer.invoke("ai:plan", params),
-    acceptDiff: (diffId: string) => ipcRenderer.invoke("ai:acceptDiff", { diffId }),
+    plan: (params: Record<string, unknown>) =>
+      ipcRenderer.invoke("ai:plan", params),
+    acceptDiff: (diffId: string) =>
+      ipcRenderer.invoke("ai:acceptDiff", { diffId }),
     rejectDiff: (diffId: string, reason?: string | null) =>
       ipcRenderer.invoke("ai:rejectDiff", { diffId, reason: reason ?? null }),
     cancelJob: (jobId: string) => ipcRenderer.invoke("ai:cancelJob", { jobId }),
@@ -308,33 +317,87 @@ const api = {
       ipcRenderer.invoke("command:apply", { projectPath, command }) as Promise<{
         commandId: string;
         applied: Array<
-          | { kind: "create"; record: { id: string; kind: string; parent: string | null; body: unknown } }
+          | {
+              kind: "create";
+              record: {
+                id: string;
+                kind: string;
+                parent: string | null;
+                body: unknown;
+              };
+            }
           | { kind: "update"; id: string; before: unknown; after: unknown }
-          | { kind: "delete"; record: { id: string; kind: string; parent: string | null; body: unknown } }
+          | {
+              kind: "delete";
+              record: {
+                id: string;
+                kind: string;
+                parent: string | null;
+                body: unknown;
+              };
+            }
         >;
         undoLen: number;
         redoLen: number;
       }>,
     /** Undo the most recently applied command. */
     undo: (projectPath: string, activeScope: string) =>
-      ipcRenderer.invoke("command:undo", { projectPath, activeScope }) as Promise<{
+      ipcRenderer.invoke("command:undo", {
+        projectPath,
+        activeScope,
+      }) as Promise<{
         commandId: string;
         applied: Array<
-          | { kind: "create"; record: { id: string; kind: string; parent: string | null; body: unknown } }
+          | {
+              kind: "create";
+              record: {
+                id: string;
+                kind: string;
+                parent: string | null;
+                body: unknown;
+              };
+            }
           | { kind: "update"; id: string; before: unknown; after: unknown }
-          | { kind: "delete"; record: { id: string; kind: string; parent: string | null; body: unknown } }
+          | {
+              kind: "delete";
+              record: {
+                id: string;
+                kind: string;
+                parent: string | null;
+                body: unknown;
+              };
+            }
         >;
         undoLen: number;
         redoLen: number;
       }>,
     /** Redo the most recently undone command. */
     redo: (projectPath: string, activeScope: string) =>
-      ipcRenderer.invoke("command:redo", { projectPath, activeScope }) as Promise<{
+      ipcRenderer.invoke("command:redo", {
+        projectPath,
+        activeScope,
+      }) as Promise<{
         commandId: string;
         applied: Array<
-          | { kind: "create"; record: { id: string; kind: string; parent: string | null; body: unknown } }
+          | {
+              kind: "create";
+              record: {
+                id: string;
+                kind: string;
+                parent: string | null;
+                body: unknown;
+              };
+            }
           | { kind: "update"; id: string; before: unknown; after: unknown }
-          | { kind: "delete"; record: { id: string; kind: string; parent: string | null; body: unknown } }
+          | {
+              kind: "delete";
+              record: {
+                id: string;
+                kind: string;
+                parent: string | null;
+                body: unknown;
+              };
+            }
         >;
         undoLen: number;
         redoLen: number;
@@ -345,8 +408,16 @@ const api = {
      * `undefined` for the full graph.
      */
     listGraph: (projectPath: string, kindFilter?: string) =>
-      ipcRenderer.invoke("project:graphList", { projectPath, kindFilter }) as Promise<
-        Array<{ id: string; kind: string; parent: string | null; body: unknown }>
+      ipcRenderer.invoke("project:graphList", {
+        projectPath,
+        kindFilter,
+      }) as Promise<
+        Array<{
+          id: string;
+          kind: string;
+          parent: string | null;
+          body: unknown;
+        }>
       >,
   },
 
@@ -375,14 +446,57 @@ const api = {
         threadId: string;
         publishedAt: string;
       }>,
-    ingestReviews: (params: {
-      threadId: string;
-      sinceIso?: string | null;
-    }) =>
+    ingestReviews: (params: { threadId: string; sinceIso?: string | null }) =>
       ipcRenderer.invoke("kchat:ingestReviews", params) as Promise<{
         threadId: string;
         commentsJson: string;
         cardsJson: string;
+      }>,
+  },
+
+  // ----- Viewport (Phase 12) -----
+  //
+  // The viewport API is intentionally orthogonal to the other
+  // bridge methods: it doesn't go through the `bridge.*` namespace
+  // (which is in-process-fallback-or-native) because the viewport
+  // service has its own state (no `BridgeService` cache needed)
+  // and we don't want the in-process fallback to be reachable
+  // through `aec.viewport.*` — when there's no native bridge,
+  // the Design viewport should explicitly render a "GPU
+  // unavailable" placeholder rather than animate against a stub.
+  viewport: {
+    status: () =>
+      ipcRenderer.invoke("viewport:status") as Promise<{
+        state: "ready" | "unavailable";
+        width: number;
+        height: number;
+        frameIndex: number;
+        gpuDescriptorJson?: string | null;
+      }>,
+    resize: (params: { width: number; height: number }) =>
+      ipcRenderer.invoke("viewport:resize", params) as Promise<{
+        state: "ready" | "unavailable";
+        width: number;
+        height: number;
+        frameIndex: number;
+        gpuDescriptorJson?: string | null;
+      }>,
+    input: (params: {
+      kind: "orbit" | "pan" | "zoom" | "reset";
+      dx?: number;
+      dy?: number;
+      delta?: number;
+    }) =>
+      ipcRenderer.invoke("viewport:input", params) as Promise<{
+        cameraJson: string;
+      }>,
+    requestFrame: () =>
+      ipcRenderer.invoke("viewport:requestFrame") as Promise<{
+        frameIndex: number;
+        width: number;
+        height: number;
+        state: "presented" | "coalesced" | "unavailable";
+        cameraJson: string;
       }>,
   },
 };

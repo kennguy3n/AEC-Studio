@@ -2713,6 +2713,129 @@ pub fn kchat_ingest_reviews(params: KChatIngestParamsJs) -> Result<KChatIngestRe
     })
 }
 
+// ----- Viewport (Phase 12) ---------------------------------
+//
+// The viewport methods on `BridgeService` route through
+// [`crate::viewport_service::ViewportService`], which owns its own
+// wgpu device and pipelines. The N-API surface is intentionally
+// flat: each call serializes the result through JSON (rather than
+// returning a heavily-typed struct) because the renderer's
+// `bridge.ts` ultimately re-parses these into TypeScript domain
+// types, and a `string` payload is easier to evolve than a
+// generated `#[napi(object)]` struct.
+
+#[napi(object)]
+pub struct ViewportStatusJs {
+    pub state: String,
+    pub width: u32,
+    pub height: u32,
+    pub frame_index: f64,
+    /// JSON-encoded `Option<GpuDescriptor>`. `null` when no adapter.
+    pub gpu_descriptor_json: Option<String>,
+}
+
+fn viewport_status_to_js(rep: crate::viewport_service::ViewportStatusReport) -> ViewportStatusJs {
+    let gpu_descriptor_json = rep
+        .gpu_descriptor
+        .as_ref()
+        .map(|d| serde_json::to_string(d).unwrap_or_default());
+    ViewportStatusJs {
+        state: rep.state,
+        width: rep.width,
+        height: rep.height,
+        frame_index: rep.frame_index as f64,
+        gpu_descriptor_json,
+    }
+}
+
+#[napi(object)]
+pub struct ViewportResizeParamsJs {
+    pub width: u32,
+    pub height: u32,
+}
+
+#[napi]
+pub fn viewport_resize(params: ViewportResizeParamsJs) -> Result<ViewportStatusJs> {
+    let report = with_service_ref_fallible(|svc| svc.viewport_resize(params.width, params.height))?;
+    Ok(viewport_status_to_js(report))
+}
+
+#[napi(object)]
+pub struct ViewportInputParamsJs {
+    /// One of `"orbit"`, `"pan"`, `"zoom"`, `"reset"`.
+    pub kind: String,
+    pub dx: Option<f64>,
+    pub dy: Option<f64>,
+    pub delta: Option<f64>,
+}
+
+#[napi(object)]
+pub struct ViewportCameraJs {
+    /// JSON-encoded
+    /// [`crate::viewport_service::ViewportCameraReport`].
+    pub camera_json: String,
+}
+
+#[napi]
+pub fn viewport_input(params: ViewportInputParamsJs) -> Result<ViewportCameraJs> {
+    let input = parse_viewport_input(&params)
+        .map_err(|e| Error::new(Status::GenericFailure, format!("viewport_input parse: {e}")))?;
+    let cam = with_service_ref_fallible(|svc| svc.viewport_input(input))?;
+    let camera_json = serde_json::to_string(&cam)
+        .map_err(|e| Error::new(Status::GenericFailure, format!("camera serialize: {e}")))?;
+    Ok(ViewportCameraJs { camera_json })
+}
+
+fn parse_viewport_input(
+    p: &ViewportInputParamsJs,
+) -> std::result::Result<crate::viewport_service::ViewportInput, String> {
+    use crate::viewport_service::ViewportInput;
+    match p.kind.as_str() {
+        "orbit" => Ok(ViewportInput::Orbit {
+            dx: p.dx.unwrap_or(0.0) as f32,
+            dy: p.dy.unwrap_or(0.0) as f32,
+        }),
+        "pan" => Ok(ViewportInput::Pan {
+            dx: p.dx.unwrap_or(0.0) as f32,
+            dy: p.dy.unwrap_or(0.0) as f32,
+        }),
+        "zoom" => Ok(ViewportInput::Zoom {
+            delta: p.delta.unwrap_or(0.0) as f32,
+        }),
+        "reset" => Ok(ViewportInput::Reset),
+        other => Err(format!("unknown input kind '{other}'")),
+    }
+}
+
+#[napi(object)]
+pub struct ViewportFrameJs {
+    pub frame_index: f64,
+    pub width: u32,
+    pub height: u32,
+    pub state: String,
+    pub camera_json: String,
+}
+
+#[napi]
+pub fn viewport_request_frame() -> Result<ViewportFrameJs> {
+    let report = with_service_ref_fallible(|svc| svc.viewport_request_frame())?;
+    let camera_json = serde_json::to_string(&report.camera)
+        .map_err(|e| Error::new(Status::GenericFailure, format!("camera serialize: {e}")))?;
+    Ok(ViewportFrameJs {
+        frame_index: report.frame_index as f64,
+        width: report.width,
+        height: report.height,
+        state: report.state,
+        camera_json,
+    })
+}
+
+#[napi]
+pub fn viewport_status() -> Result<ViewportStatusJs> {
+    let rep = with_service_ref(|svc| svc.viewport_status())?;
+    Ok(viewport_status_to_js(rep))
+}
+
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
     if s.len() % 2 != 0 {
         return None;

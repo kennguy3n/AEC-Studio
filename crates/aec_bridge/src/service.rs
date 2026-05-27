@@ -1278,6 +1278,11 @@ pub struct BridgeService {
     /// [`aec_core::InMemoryPublisher`] fallback. See
     /// [`crate::kchat_state`] for the publisher-selection rationale.
     kchat_state: crate::kchat_state::KChatState,
+    /// Real-time viewport service. Owns the wgpu device, the four
+    /// core render pipelines, and the off-screen surface. See
+    /// [`crate::viewport_service`] for the rationale around the
+    /// "real device when available, fallback otherwise" pattern.
+    viewport_service: crate::viewport_service::ViewportService,
 }
 
 /// Process-wide render state held by [`BridgeService::render_state`].
@@ -1363,6 +1368,7 @@ impl BridgeService {
             asset_state,
             ai_state: AiState::new(default_ai_runtime_config()),
             kchat_state: crate::kchat_state::KChatState::new(),
+            viewport_service: crate::viewport_service::ViewportService::new(),
         })
     }
 
@@ -4295,6 +4301,59 @@ impl BridgeService {
             comments,
             cards,
         })
+    }
+
+    // ----- Viewport (Phase 12) ---------------------------------
+    //
+    // The viewport service owns its own GPU device and pipelines and
+    // is safe to call even when no adapter is available — it will
+    // simply report `"unavailable"` instead of crashing. See
+    // [`crate::viewport_service`] for the design rationale.
+
+    /// Borrow the process-wide viewport service. Exposed for tests
+    /// and the N-API layer; downstream code should prefer the
+    /// typed methods below.
+    pub fn __viewport_service(&self) -> &crate::viewport_service::ViewportService {
+        &self.viewport_service
+    }
+
+    /// Resize the viewport's off-screen surface.
+    pub fn viewport_resize(
+        &self,
+        width: u32,
+        height: u32,
+    ) -> Result<crate::viewport_service::ViewportStatusReport, BridgeServiceError> {
+        self.viewport_service
+            .resize(width, height)
+            .map_err(|e| BridgeServiceError::Invalid(format!("viewport resize: {e}")))?;
+        Ok(self.viewport_service.status())
+    }
+
+    /// Apply a mouse / camera input to the viewport.
+    pub fn viewport_input(
+        &self,
+        input: crate::viewport_service::ViewportInput,
+    ) -> Result<crate::viewport_service::ViewportCameraReport, BridgeServiceError> {
+        self.viewport_service.apply_input(input);
+        Ok(self.viewport_service.camera_report())
+    }
+
+    /// Request the next viewport frame. The actual pixel bytes are
+    /// available via the underlying [`SurfaceManager`]; this method
+    /// returns a deterministic summary (frame index, camera state,
+    /// `presented` / `coalesced` / `unavailable`) that the renderer
+    /// can use to drive its diagnostic UI.
+    pub fn viewport_request_frame(
+        &self,
+    ) -> Result<crate::viewport_service::ViewportFrameReport, BridgeServiceError> {
+        self.viewport_service
+            .request_frame()
+            .map_err(|e| BridgeServiceError::Core(format!("viewport frame: {e}")))
+    }
+
+    /// Status report for the viewport diagnostics panel.
+    pub fn viewport_status(&self) -> crate::viewport_service::ViewportStatusReport {
+        self.viewport_service.status()
     }
 }
 
