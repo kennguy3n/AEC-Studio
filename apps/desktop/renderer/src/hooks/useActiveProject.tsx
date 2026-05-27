@@ -35,6 +35,7 @@ export interface ActiveProjectState {
   project: ProjectSummary | null;
   loading: boolean;
   dirty: boolean;
+  saving: boolean;
   undoLen: number;
   redoLen: number;
   openProject: (path: string) => Promise<void>;
@@ -67,6 +68,7 @@ export function ActiveProjectProvider({
   const [project, setProject] = useState<ProjectSummary | null>(null);
   const [loading, setLoading] = useState(true);
   const [dirty, setDirty] = useState(false);
+  const [saving, setSaving] = useState(false);
   const [undoLen, setUndoLen] = useState(0);
   const [redoLen, setRedoLen] = useState(0);
   const autoSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -135,12 +137,15 @@ export function ActiveProjectProvider({
 
   const saveProject = useCallback(async () => {
     if (project === null) return;
+    setSaving(true);
     try {
       const summary = (await aec.project.save(project.path)) as ProjectSummary;
       setProject(summary);
       setDirty(false);
     } catch {
       // Save failed — keep dirty flag so auto-save retries.
+    } finally {
+      setSaving(false);
     }
   }, [project]);
 
@@ -185,6 +190,7 @@ export function ActiveProjectProvider({
     project,
     loading,
     dirty,
+    saving,
     undoLen,
     redoLen,
     openProject,

@@ -1,8 +1,10 @@
 import { useCallback, useState } from "react";
-import { Routes, Route, Navigate, useNavigate } from "react-router-dom";
+import { Routes, Route, Navigate, useLocation, useNavigate } from "react-router-dom";
 import { ModeRail } from "./components/ModeRail";
 import { StatusBar } from "./components/StatusBar";
 import { CommandPalette } from "./components/CommandPalette";
+import { ShortcutHelp } from "./components/ShortcutHelp";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import {
   useKeyboardShortcuts,
   useShortcut,
@@ -14,7 +16,10 @@ import {
 import {
   ToastProvider,
   ToastContainer,
+  useToast,
 } from "./hooks/useToast";
+import { aec } from "./api/aec";
+import type { CommandScope } from "./api/commands";
 import { Home } from "./pages/Home";
 import { Design } from "./pages/Design";
 import { Draft } from "./pages/Draft";
@@ -46,6 +51,23 @@ function AppCommands({
   onClosePalette: () => void;
 }): null {
   const navigate = useNavigate();
+  const location = useLocation();
+  const { project, saveProject, closeProject, setUndoRedo, markDirty } =
+    useActiveProject();
+  const { addToast } = useToast();
+
+  // The command engine partitions undo/redo by mode scope; map the
+  // current route to the matching scope so Ctrl/Cmd+Z undoes within
+  // the active mode. Unknown routes (Home, Settings, etc.) fall back
+  // to "design" — undo on Home is a no-op because we guard on `project`.
+  const activeScope: CommandScope = (() => {
+    const path = location.pathname.split("/")[1] ?? "";
+    if (path === "design" || path === "draft" || path === "bim" ||
+        path === "render" || path === "deliver") {
+      return path;
+    }
+    return "design";
+  })();
   // Navigation shortcuts dismiss any open palette so the user lands on
   // the new route with the overlay cleared.
   const goto = useCallback(
@@ -55,6 +77,86 @@ function AppCommands({
     },
     [navigate, onClosePalette],
   );
+
+  // Undo / Redo route through the main process which delegates to the
+  // bridge's command engine. The renderer keeps the undo/redo stack
+  // depths in sync via `setUndoRedo` so the StatusBar reflects the
+  // current state.
+  const undo = useCallback(async () => {
+    if (project === null) return;
+    try {
+      const result = await aec.command.undo(project.path, activeScope);
+      setUndoRedo(result.undoLen, result.redoLen);
+      markDirty();
+    } catch (err) {
+      addToast(
+        "error",
+        `Undo failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }, [project, activeScope, setUndoRedo, markDirty, addToast]);
+
+  const redo = useCallback(async () => {
+    if (project === null) return;
+    try {
+      const result = await aec.command.redo(project.path, activeScope);
+      setUndoRedo(result.undoLen, result.redoLen);
+      markDirty();
+    } catch (err) {
+      addToast(
+        "error",
+        `Redo failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }, [project, activeScope, setUndoRedo, markDirty, addToast]);
+
+  const save = useCallback(async () => {
+    if (project === null) return;
+    try {
+      await saveProject();
+      addToast("success", `Saved ${project.name}`);
+    } catch (err) {
+      addToast(
+        "error",
+        `Save failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }, [project, saveProject, addToast]);
+
+  const close = useCallback(async () => {
+    if (project === null) return;
+    await closeProject();
+    navigate("/");
+  }, [project, closeProject, navigate]);
+
+  useShortcut({
+    id: "undo",
+    label: "Undo",
+    group: "global",
+    keys: "mod+z",
+    handler: () => void undo(),
+  });
+  useShortcut({
+    id: "redo",
+    label: "Redo",
+    group: "global",
+    keys: "mod+shift+z",
+    handler: () => void redo(),
+  });
+  useShortcut({
+    id: "save",
+    label: "Save project",
+    group: "global",
+    keys: "mod+s",
+    handler: () => void save(),
+  });
+  useShortcut({
+    id: "close-project",
+    label: "Close project",
+    group: "global",
+    keys: "mod+w",
+    handler: () => void close(),
+  });
   useShortcut({
     id: "open-command-palette",
     label: "Open command palette",
@@ -142,7 +244,9 @@ function AppShell() {
             path="/design"
             element={
               <RequireProject>
-                <Design />
+                <ErrorBoundary label="Design">
+                  <Design />
+                </ErrorBoundary>
               </RequireProject>
             }
           />
@@ -150,7 +254,9 @@ function AppShell() {
             path="/draft"
             element={
               <RequireProject>
-                <Draft />
+                <ErrorBoundary label="Draft">
+                  <Draft />
+                </ErrorBoundary>
               </RequireProject>
             }
           />
@@ -158,7 +264,9 @@ function AppShell() {
             path="/bim"
             element={
               <RequireProject>
-                <Bim />
+                <ErrorBoundary label="BIM">
+                  <Bim />
+                </ErrorBoundary>
               </RequireProject>
             }
           />
@@ -166,7 +274,9 @@ function AppShell() {
             path="/render"
             element={
               <RequireProject>
-                <Render />
+                <ErrorBoundary label="Render">
+                  <Render />
+                </ErrorBoundary>
               </RequireProject>
             }
           />
@@ -174,16 +284,26 @@ function AppShell() {
             path="/deliver"
             element={
               <RequireProject>
-                <Deliver />
+                <ErrorBoundary label="Deliver">
+                  <Deliver />
+                </ErrorBoundary>
               </RequireProject>
             }
           />
-          <Route path="/settings" element={<Settings />} />
+          <Route
+            path="/settings"
+            element={
+              <ErrorBoundary label="Settings">
+                <Settings />
+              </ErrorBoundary>
+            }
+          />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </main>
       <StatusBar />
       <CommandPalette open={paletteOpen} onClose={closePalette} />
+      <ShortcutHelp />
       <ToastContainer />
     </div>
   );
