@@ -60,6 +60,27 @@ pub fn open_encrypted(path: &Path, key: &Key32) -> AecResult<Connection> {
         // the WAL writer when we copy it. We re-open immediately after
         // the backup so the rest of this function works against a
         // fully-initialized connection.
+        //
+        // Load-bearing invariant: this is the *only* connection to the
+        // database at this point — `open_encrypted` opened it moments
+        // ago and no other code path has had a chance to attach.
+        // Dropping the last connection in WAL mode triggers SQLite's
+        // passive checkpoint, which flushes the `-wal` sidecar back
+        // into the main file *before* `backup_before_migration`'s
+        // `std::fs::copy` runs. That's how the file copy can omit the
+        // `-wal` / `-shm` sidecars (see the rationale on
+        // `backup_before_migration`) and still capture a consistent
+        // pre-migration snapshot.
+        //
+        // If a future change ever introduces a second concurrent
+        // connection to the SQLCipher file (e.g. a reader handle held
+        // by another subsystem for the lifetime of `BridgeService`),
+        // the `drop(conn)` here will no longer be the last-connection
+        // checkpoint trigger, and the file copy will silently capture
+        // a half-committed view of the database. In that case the
+        // backup path *must* either (a) explicitly run
+        // `PRAGMA wal_checkpoint(FULL);` before the `drop`, or (b)
+        // copy the `-wal` + `-shm` sidecars alongside the main file.
         drop(conn);
         backup_before_migration(path, from_version, to_version)?;
         conn = Connection::open_with_flags(

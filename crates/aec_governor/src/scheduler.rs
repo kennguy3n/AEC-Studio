@@ -104,6 +104,16 @@ impl GovernorScheduler {
             return ScheduleVerdict::deny(BackoffReason::UserOverride);
         }
         if self.thermal == ThermalState::Critical {
+            // Load-bearing early return: the cap computation below
+            // assumes `thermal != Critical` when it reaches the
+            // `Pressured => 1.max(thermal_cap / 2)` arm. If a future
+            // refactor moves this thermal check past the cap
+            // computation (or removes it in favor of relying on
+            // `ThermalState::Critical => 0` in the `thermal_cap`
+            // match), then the `Pressured` memory arm would silently
+            // upgrade a hard-zero thermal cap into `1.max(0 / 2) = 1`,
+            // re-admitting renders on a critically hot machine.
+            // Keep this guard before the cap math, not after.
             return ScheduleVerdict::deny(BackoffReason::Thermal);
         }
         // Phase 12 Task 27: critical memory pressure denies all new
@@ -115,6 +125,14 @@ impl GovernorScheduler {
         if self.available_ram_mb < self.policy.mesh_cache_budget_mb as u64 {
             return ScheduleVerdict::deny(BackoffReason::MemoryPressure);
         }
+        // INVARIANT: by the time control reaches here, `self.thermal`
+        // is not `Critical` (the early return above guarantees it) and
+        // `self.memory` is not `Critical` (the second early return
+        // guarantees it). The `thermal_cap` match below still lists
+        // `Critical => 0` as a defense-in-depth fallback, but the cap
+        // arithmetic in the `memory` match deliberately does NOT have
+        // to defend against `thermal_cap == 0` because that case is
+        // unreachable here.
         let thermal_cap = match self.thermal {
             ThermalState::Nominal => self.policy.render.max_concurrent_jobs,
             ThermalState::Warm => 1.max(self.policy.render.max_concurrent_jobs.saturating_sub(1)),
