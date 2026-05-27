@@ -9,6 +9,8 @@
 //! Phase 1 AI tool returns a single GBNF-constrained JSON envelope, so there
 //! is no benefit to consuming a token-by-token SSE stream.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -35,6 +37,8 @@ pub enum TransportError {
     DecodeResponse(#[source] serde_json::Error),
     #[error("sidecar returned an empty completion")]
     EmptyCompletion,
+    #[error("request cancelled by caller")]
+    Cancelled,
 }
 
 /// Subset of the llama.cpp `/completion` request envelope. Anything we don't
@@ -162,6 +166,93 @@ impl SidecarTransport {
         }
         Ok(parsed)
     }
+
+    /// Submit a completion with retry on 503 (model loading) and
+    /// cooperative cancellation (Phase 12 Task 17).
+    ///
+    /// Retries up to `max_retries` times when the sidecar returns HTTP 503
+    /// (indicating the model is still loading). Between retries, checks
+    /// `cancel` to allow the caller to abort early.
+    ///
+    /// Fails fast on 4xx errors (no retry — the request itself is bad).
+    pub fn complete_with_retry(
+        &self,
+        request: &CompletionRequest,
+        cancel: Option<&AiCancelToken>,
+        max_retries: u32,
+    ) -> Result<CompletionResponse, TransportError> {
+        let body = serde_json::to_string(request).map_err(TransportError::EncodeRequest)?;
+        let mut last_err = None;
+        for attempt in 0..=max_retries {
+            if cancel.is_some_and(AiCancelToken::is_cancelled) {
+                return Err(TransportError::Cancelled);
+            }
+            match http::request(
+                self.port,
+                "POST",
+                "/completion",
+                &body,
+                DEFAULT_CONNECT_TIMEOUT,
+                self.request_timeout,
+            ) {
+                Ok(resp) => {
+                    let parsed: CompletionResponse = serde_json::from_str(&resp.body)
+                        .map_err(TransportError::DecodeResponse)?;
+                    if parsed.content.is_empty() {
+                        return Err(TransportError::EmptyCompletion);
+                    }
+                    return Ok(parsed);
+                }
+                Err(HttpError::HttpStatus { status, .. }) if (400..500).contains(&status) => {
+                    return Err(HttpError::HttpStatus {
+                        status,
+                        body: format!("4xx fail-fast on attempt {attempt}"),
+                    }
+                    .into());
+                }
+                Err(HttpError::HttpStatus { status: 503, .. }) if attempt < max_retries => {
+                    last_err = Some(TransportError::Http(HttpError::HttpStatus {
+                        status: 503,
+                        body: "model loading".into(),
+                    }));
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+                Err(e) => {
+                    last_err = Some(e.into());
+                    if attempt < max_retries {
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
+                }
+            }
+        }
+        Err(last_err.unwrap_or(TransportError::EmptyCompletion))
+    }
+}
+
+/// Cooperative cancellation token for AI requests. Shared between
+/// the bridge (which owns the cancel trigger) and the transport
+/// (which checks `is_cancelled` between retries).
+#[derive(Clone, Default)]
+pub struct AiCancelToken(Arc<AtomicBool>);
+
+impl AiCancelToken {
+    pub fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+impl std::fmt::Debug for AiCancelToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "AiCancelToken({})", self.is_cancelled())
+    }
 }
 
 fn is_health_ok(body: &str) -> bool {
@@ -207,5 +298,30 @@ mod tests {
         assert!(!is_health_ok(r#"{"status":"loading model"}"#));
         assert!(!is_health_ok("not json"));
         assert!(!is_health_ok(""));
+    }
+
+    #[test]
+    fn cancel_token_starts_not_cancelled() {
+        let token = AiCancelToken::new();
+        assert!(!token.is_cancelled());
+    }
+
+    #[test]
+    fn cancel_token_becomes_cancelled_after_cancel() {
+        let token = AiCancelToken::new();
+        let cloned = token.clone();
+        token.cancel();
+        assert!(token.is_cancelled());
+        assert!(cloned.is_cancelled());
+    }
+
+    #[test]
+    fn complete_with_retry_returns_cancelled_when_token_set() {
+        let transport = SidecarTransport::new(1, Duration::from_millis(100));
+        let cancel = AiCancelToken::new();
+        cancel.cancel();
+        let req = CompletionRequest::new("test", "root ::= \"x\"");
+        let result = transport.complete_with_retry(&req, Some(&cancel), 3);
+        assert!(matches!(result, Err(TransportError::Cancelled)));
     }
 }

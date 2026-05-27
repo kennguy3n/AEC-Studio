@@ -288,6 +288,42 @@ impl<'a> ToolPlanner<'a> {
             completion.content,
         )
     }
+
+    /// Like [`dispatch`], but uses `transport.complete_with_retry` so the
+    /// sidecar's 503-loading window is handled transparently and the
+    /// caller can cancel mid-flight via [`AiCancelToken`].
+    ///
+    /// Phase 12 Task 17: this is the production entry point — the bridge
+    /// holds a cancel token per inflight job so the renderer's
+    /// `ai_cancel_job` IPC actually aborts the upstream HTTP call instead
+    /// of merely abandoning the JS Promise.
+    pub fn dispatch_with_retry(
+        &self,
+        request: &PlanRequest,
+        transport: &SidecarTransport,
+        cancel: Option<&crate::transport::AiCancelToken>,
+        max_retries: u32,
+    ) -> Result<PlanResponse, PlanError> {
+        self.precheck(request)?;
+        let schema = self
+            .schemas
+            .get(request.tool)
+            .ok_or_else(|| SafetyError::UnknownTool(request.tool.as_str().into()))?;
+        let grammar = self
+            .grammars
+            .get(&schema.grammar_key)
+            .ok_or_else(|| PlanError::UnknownGrammar(schema.grammar_key.clone()))?;
+        let prompt = build_prompt(schema, request);
+        let completion_request = CompletionRequest::new(prompt, grammar.gbnf.clone());
+        let completion =
+            transport.complete_with_retry(&completion_request, cancel, max_retries)?;
+        self.finalize(
+            request.tool,
+            request.scope,
+            request.max_entities_modified,
+            completion.content,
+        )
+    }
 }
 
 /// Assemble the model-facing prompt. The format is deliberately small —

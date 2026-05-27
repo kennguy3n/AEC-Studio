@@ -180,6 +180,95 @@ fn poll_until_healthy(
     }
 }
 
+/// Restart policy with exponential backoff. Tracks the number of consecutive
+/// failures and computes the next delay.
+///
+/// The initial delay is 500 ms and doubles on each failure, capped at 30 s.
+/// Calling [`RestartPolicy::reset`] after a successful health check resets the
+/// counter to zero.
+#[derive(Debug, Clone)]
+pub struct RestartPolicy {
+    consecutive_failures: u32,
+    max_delay: Duration,
+}
+
+impl Default for RestartPolicy {
+    fn default() -> Self {
+        Self {
+            consecutive_failures: 0,
+            max_delay: Duration::from_secs(30),
+        }
+    }
+}
+
+impl RestartPolicy {
+    pub fn new(max_delay: Duration) -> Self {
+        Self {
+            consecutive_failures: 0,
+            max_delay,
+        }
+    }
+
+    /// Record a spawn failure. Returns the delay the caller should wait before
+    /// the next attempt.
+    pub fn record_failure(&mut self) -> Duration {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.next_delay()
+    }
+
+    /// Compute the delay for the current failure count without recording a
+    /// new failure. Used by callers that want to inspect the policy before
+    /// deciding whether to retry.
+    pub fn next_delay(&self) -> Duration {
+        let base_ms = 500_u64;
+        let shift = self.consecutive_failures.min(20);
+        let multiplier = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
+        let delay_ms = base_ms.saturating_mul(multiplier);
+        Duration::from_millis(delay_ms).min(self.max_delay)
+    }
+
+    /// Reset after a successful spawn + health check.
+    pub fn reset(&mut self) {
+        self.consecutive_failures = 0;
+    }
+
+    pub fn consecutive_failures(&self) -> u32 {
+        self.consecutive_failures
+    }
+}
+
+/// Spawn the sidecar with automatic retry. On failure, waits the duration
+/// returned by `policy.record_failure()` before the next attempt, up to
+/// `max_attempts`.
+///
+/// Returns the live handle on the first successful attempt. If all attempts
+/// fail, returns the error from the last attempt.
+pub fn spawn_with_retry(
+    config: &RuntimeConfig,
+    health_poll_timeout: Duration,
+    policy: &mut RestartPolicy,
+    max_attempts: u32,
+) -> Result<SidecarHandle, SidecarSpawnError> {
+    let mut last_err = None;
+    for attempt in 0..max_attempts {
+        if attempt > 0 {
+            let delay = policy.next_delay();
+            std::thread::sleep(delay);
+        }
+        match spawn(config, health_poll_timeout) {
+            Ok(handle) => {
+                policy.reset();
+                return Ok(handle);
+            }
+            Err(e) => {
+                policy.record_failure();
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or(SidecarSpawnError::HealthTimeout(health_poll_timeout)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,5 +337,49 @@ mod tests {
         let cfg = RuntimeConfig::default();
         let result = spawn(&cfg, Duration::from_millis(10));
         assert!(matches!(result, Err(SidecarSpawnError::Spawn { .. })));
+    }
+
+    #[test]
+    fn restart_policy_doubles_delay_on_each_failure() {
+        let mut policy = RestartPolicy::new(Duration::from_secs(30));
+        assert_eq!(policy.consecutive_failures(), 0);
+        let d1 = policy.record_failure();
+        assert_eq!(d1, Duration::from_secs(1)); // 500 * 2^1
+        let d2 = policy.record_failure();
+        assert_eq!(d2, Duration::from_secs(2)); // 500 * 2^2
+        let d3 = policy.record_failure();
+        assert_eq!(d3, Duration::from_secs(4)); // 500 * 2^3
+        assert_eq!(policy.consecutive_failures(), 3);
+    }
+
+    #[test]
+    fn restart_policy_caps_at_max_delay() {
+        let mut policy = RestartPolicy::new(Duration::from_secs(5));
+        for _ in 0..20 {
+            policy.record_failure();
+        }
+        assert!(policy.next_delay() <= Duration::from_secs(5));
+    }
+
+    #[test]
+    fn restart_policy_resets_on_success() {
+        let mut policy = RestartPolicy::default();
+        policy.record_failure();
+        policy.record_failure();
+        assert_eq!(policy.consecutive_failures(), 2);
+        policy.reset();
+        assert_eq!(policy.consecutive_failures(), 0);
+        assert_eq!(policy.next_delay(), Duration::from_millis(500));
+    }
+
+    #[test]
+    fn spawn_with_retry_fails_after_max_attempts() {
+        let _g = EnvGuard::acquire();
+        std::env::set_var(SIDECAR_BIN_ENV, "/nonexistent/aec-test-xyz");
+        let cfg = RuntimeConfig::default();
+        let mut policy = RestartPolicy::new(Duration::from_millis(1)); // tiny for test speed
+        let result = spawn_with_retry(&cfg, Duration::from_millis(1), &mut policy, 2);
+        assert!(result.is_err());
+        assert_eq!(policy.consecutive_failures(), 2);
     }
 }

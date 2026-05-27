@@ -16,6 +16,7 @@ pub mod grammars;
 pub mod http;
 pub mod layout_suggestion;
 pub mod lighting_balance;
+pub mod model_manager;
 pub mod plan_detection;
 pub mod plan_to_wall;
 pub mod planner;
@@ -44,6 +45,9 @@ pub use cover_draft::{CoverDraftError, CoverDraftTone, CoverPageDraft};
 pub use diff_engine::{Diff, DiffEngine, DiffOperation, DiffStatus};
 pub use grammars::{Grammar, GrammarRegistry};
 pub use layout_suggestion::{LayoutProposal, LayoutSuggestionResult, LayoutValidationError};
+pub use model_manager::{
+    select_tier as select_model_tier, ModelDescriptor, ModelManager, ModelManagerError, ModelTier,
+};
 pub use lighting_balance::{
     AccentLight, AccentLightKind, LightingBalanceError, LightingBalanceResult, MAX_ACCENT_LIGHTS,
 };
@@ -67,7 +71,7 @@ pub use sidecar::{SidecarHandle, SidecarSpawnError};
 pub use style_assistant::{StyleAssistantResult, StyleSuggestion};
 pub use tool_schema::{ToolName, ToolSchema, ToolSchemaRegistry};
 pub use transport::{
-    CompletionRequest, CompletionResponse, SidecarTransport, TransportError,
+    AiCancelToken, CompletionRequest, CompletionResponse, SidecarTransport, TransportError,
     DEFAULT_HEALTH_TIMEOUT, DEFAULT_MAX_PREDICT, DEFAULT_TEMPERATURE,
 };
 pub use validation_help::{FixAction, ValidationFix, ValidationHelpError, ValidationHelpResult};
