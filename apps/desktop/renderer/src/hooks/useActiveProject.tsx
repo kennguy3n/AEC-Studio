@@ -161,6 +161,21 @@ export function ActiveProjectProvider({
       const summary = (await aec.project.save(project.path)) as ProjectSummary;
       setProject(summary);
       setDirty(false);
+      // Cancel any pending auto-save timer on the success path. A
+      // manual `Ctrl+S` (or any other caller invoking `saveProject`
+      // directly) immediately after a mutation would otherwise leave
+      // the 5s timer armed from `markDirty()` — that timer would then
+      // fire, call `saveProject` again, and flash the StatusBar
+      // "Saved" → "Saving…" → "Saved" for no work. The cancel must
+      // live here (next to the `setDirty(false)`) and not at the
+      // App-level save handler, because *every* successful save —
+      // including the auto-save timer's own invocation — must clear
+      // the slot so a subsequent re-arming cannot pile up against a
+      // stale pending timer. Calling `cancelPendingAutoSave()` is a
+      // no-op when the slot is already empty (the auto-save path
+      // nulls the ref before invoking `saveProject`), so there's no
+      // double-clear hazard.
+      cancelPendingAutoSave();
     } finally {
       // `dirty` stays true on failure so the auto-save timer (or the
       // user's next mutation) re-arms a retry without explicit reset
@@ -168,7 +183,7 @@ export function ActiveProjectProvider({
       // the failure as a toast (manual save) or swallow it (auto-save).
       setSaving(false);
     }
-  }, [project]);
+  }, [project, cancelPendingAutoSave]);
 
   const markDirty = useCallback(() => {
     setDirty(true);

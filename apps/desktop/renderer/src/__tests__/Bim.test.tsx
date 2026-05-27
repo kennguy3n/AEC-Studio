@@ -170,3 +170,84 @@ describe("Bim page — classify action", () => {
     });
   });
 });
+
+// Regression: Devin Review flagged that `onInvoke` in `Bim.tsx`
+// had a `try/finally` but no `catch`. Pre-Phase 13 every BIM
+// branch targeted `demo://...` paths handled by the in-process
+// fallback (which never throws), so the missing catch was
+// benign. Phase 13 wires every branch through real OS paths from
+// the file-picker, so bridge failures (disk full, permission
+// denied, malformed IFC, locked SQLCipher DB) are realistic and
+// must surface as a user-visible error toast — silent unhandled
+// promise rejections clear the busy spinner with no feedback.
+// The fix is a single `catch` after the switch that converts any
+// uncaught bridge error into an `error`-severity toast. These
+// tests pin that contract for the `classify` branch (the same
+// catch covers `exportIfc` / `validate` / `diff` /
+// `generateSchedule` / `boq` uniformly — one test is sufficient
+// because the catch is shared, and adding five duplicates would
+// only test the spy harness).
+describe("Bim page — bridge error handling", () => {
+  let classifySpy = vi.spyOn(aec.bim, "classify");
+  let currentSpy = vi.spyOn(aec.project, "current");
+  let openSpy = vi.spyOn(aec.project, "open");
+  classifySpy.mockRestore();
+  currentSpy.mockRestore();
+  openSpy.mockRestore();
+
+  beforeEach(() => {
+    classifySpy = vi.spyOn(aec.bim, "classify");
+    currentSpy = vi.spyOn(aec.project, "current");
+    openSpy = vi.spyOn(aec.project, "open");
+  });
+
+  afterEach(() => {
+    classifySpy.mockRestore();
+    currentSpy.mockRestore();
+    openSpy.mockRestore();
+  });
+
+  it("surfaces an error toast when the bridge rejects mid-operation", async () => {
+    const summary = {
+      projectId: "proj_sample",
+      name: "Sample",
+      path: "/tmp/sample.aecstudio",
+      templateKey: null,
+      modifiedAt: new Date().toISOString(),
+    };
+    currentSpy.mockResolvedValue({ summary });
+    openSpy.mockResolvedValue(summary);
+    classifySpy.mockRejectedValue(new Error("SQLCipher database is locked"));
+
+    render(
+      <ToastProvider>
+        <ActiveProjectProvider>
+          <BimWithProject path="/tmp/sample.aecstudio" />
+          <ToastContainer />
+        </ActiveProjectProvider>
+      </ToastProvider>,
+    );
+
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("active-project-path").textContent,
+      ).toBe("/tmp/sample.aecstudio");
+    });
+
+    fireEvent.click(screen.getByTestId("bim-action-classify"));
+
+    // The error toast must include the action name and the
+    // bridge's error message so the user can diagnose the cause
+    // (locked DB, disk full, etc.) without having to open
+    // devtools.
+    await waitFor(() => {
+      expect(
+        screen.getByText(/classify failed: SQLCipher database is locked/i),
+      ).toBeInTheDocument();
+    });
+
+    // The spy was called (the catch is post-failure, not
+    // pre-empting the call).
+    expect(classifySpy).toHaveBeenCalledTimes(1);
+  });
+});

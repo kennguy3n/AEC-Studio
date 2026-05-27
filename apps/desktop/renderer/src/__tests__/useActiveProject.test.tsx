@@ -304,3 +304,137 @@ describe("useActiveProject — auto-save timer cancellation on transition", () =
     saveSpy.mockRestore();
   });
 });
+
+/**
+ * Manual `saveProject()` must cancel the pending auto-save timer.
+ *
+ * Devin Review's third pass on the hook flagged that `saveProject`
+ * (called by `Ctrl+S`, the App save handler, or any future programmatic
+ * caller) cleared `dirty` but did not clear the 5-second auto-save
+ * timer armed by the prior `markDirty()`. Five seconds after the
+ * manual save the orphaned timer would fire, run a second
+ * `aec.project.save(...)` IPC round-trip, and flash the StatusBar
+ * "Saved" → "Saving…" → "Saved" for zero useful work. The fix
+ * colocates `cancelPendingAutoSave()` with the `setDirty(false)` on
+ * the success branch of `saveProject`. The auto-save path's own
+ * `setTimeout` callback nulls `autoSaveTimerRef.current` before
+ * invoking `saveProject`, so the inner `cancelPendingAutoSave()`
+ * call is a no-op on that path — but it remains the single source
+ * of truth for "a successful save invalidates a pending timer".
+ */
+function DirtyThenManualSave({
+  initialPath,
+}: {
+  initialPath: string;
+}) {
+  const { project, openProject, markDirty, saveProject } = useActiveProject();
+  useEffect(() => {
+    void openProject(initialPath);
+  }, [openProject, initialPath]);
+  return (
+    <div>
+      <span data-testid="proj-path">{project?.path ?? ""}</span>
+      <button
+        type="button"
+        data-testid="dirty"
+        onClick={() => markDirty()}
+      >
+        dirty
+      </button>
+      <button
+        type="button"
+        data-testid="manual-save"
+        onClick={() => {
+          void saveProject();
+        }}
+      >
+        manual save
+      </button>
+    </div>
+  );
+}
+
+describe("useActiveProject — manual save cancels pending auto-save", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("does not fire a second save 5s after a manual save", async () => {
+    const saveSpy = vi.spyOn(aec.project, "save");
+
+    render(
+      <ActiveProjectProvider>
+        <DirtyThenManualSave initialPath="/tmp/manualSave.aecstudio" />
+      </ActiveProjectProvider>,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByTestId("proj-path").textContent).toBe(
+        "/tmp/manualSave.aecstudio",
+      ),
+    );
+
+    // Arm the 5s auto-save timer.
+    await act(async () => {
+      screen.getByTestId("dirty").click();
+    });
+
+    // Trigger an immediate manual save (the Ctrl+S code path).
+    await act(async () => {
+      screen.getByTestId("manual-save").click();
+    });
+
+    // Exactly one bridge save round-trip for the manual save itself.
+    await waitFor(() => expect(saveSpy).toHaveBeenCalledTimes(1));
+
+    // Advance well past the 5-second debounce. Without the fix the
+    // stale auto-save timer fires here and triggers a second
+    // `aec.project.save` round-trip — flashing the StatusBar through
+    // "Saving…" → "Saved" with no underlying mutation. With the fix
+    // the timer was cancelled inside `saveProject` itself.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+
+    expect(saveSpy).toHaveBeenCalledTimes(1);
+
+    saveSpy.mockRestore();
+  });
+
+  it("only fires the auto-save once when the debounce elapses naturally", async () => {
+    // Defense-in-depth: the auto-save path nulls `autoSaveTimerRef`
+    // before calling `saveProject`, and `saveProject` then re-enters
+    // `cancelPendingAutoSave`. This test pins that the no-op
+    // double-clear path does NOT race with `markDirty` re-arming the
+    // timer mid-save (it shouldn't, because no dirty mutation happens
+    // between the timer firing and `saveProject` resolving).
+    const saveSpy = vi.spyOn(aec.project, "save");
+
+    render(
+      <ActiveProjectProvider>
+        <DirtyThenManualSave initialPath="/tmp/autoSave.aecstudio" />
+      </ActiveProjectProvider>,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByTestId("proj-path").textContent).toBe(
+        "/tmp/autoSave.aecstudio",
+      ),
+    );
+
+    await act(async () => {
+      screen.getByTestId("dirty").click();
+    });
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+
+    expect(saveSpy).toHaveBeenCalledTimes(1);
+
+    saveSpy.mockRestore();
+  });
+});

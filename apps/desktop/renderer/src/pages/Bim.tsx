@@ -299,6 +299,24 @@ export function Bim() {
           break;
         }
       }
+    } catch (err) {
+      // Centralized error surface for every BIM operation. Before
+      // Phase 13 these branches all targeted `demo://...` paths
+      // resolved by the in-process fallback (which never throws), so
+      // a missing catch was benign. Now that `exportIfc` / `validate`
+      // / `classify` / `diff` / `generateSchedule` / `boq` all run
+      // against real OS paths from the file picker, transient
+      // failures (disk full, permission denied, malformed IFC,
+      // locked SQLCipher DB) are realistic and must reach the user.
+      // The single `catch` covers all six branches uniformly and
+      // matches the toast convention used by Draft/Deliver/App save
+      // — putting per-case `try/catch` blocks inline would duplicate
+      // the same toast call six times and let one branch silently
+      // diverge from the others in a future patch.
+      addToast(
+        "error",
+        `${action} failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
     } finally {
       setBusyAction(null);
     }
