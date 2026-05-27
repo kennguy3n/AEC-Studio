@@ -30,6 +30,7 @@ use aec_core::kchat::{
     ArtifactCard, InMemoryPublisher, KChatError, KChatPublisher, PublishResult, ReviewCard,
     ReviewComment,
 };
+use aec_core::kchat_config::KChatConfig;
 use aec_core::kchat_discovery::{KChatDiscovery, KChatInstanceInfo};
 use aec_core::kchat_transport::DEFAULT_IO_TIMEOUT;
 use aec_core::local_ipc_publisher::LocalIpcPublisher;
@@ -51,6 +52,17 @@ pub struct KChatStatusReport {
     pub publisher_kind: String,
     /// Discovered instance info, if any.
     pub instance: Option<KChatInstanceInfo>,
+    /// Per-project KChat thread the active project routes publishes
+    /// and review-comment ingestion to. Mirrors
+    /// [`KChatConfig::default_thread_id`] from the open project's
+    /// manifest, surfaced through the status payload so the renderer
+    /// can wire its review panel without an extra IPC roundtrip.
+    ///
+    /// `None` either means no project is open yet or the open
+    /// project hasn't picked a thread — callers fall back to
+    /// [`aec_core::DEFAULT_THREAD_ID`] (the publisher-side default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_thread_id: Option<String>,
 }
 
 pub struct KChatState {
@@ -92,6 +104,14 @@ struct Inner {
     /// "disable KChat" in Settings is a hard refusal and not a silent
     /// noop.
     enabled: bool,
+    /// Cached per-project thread id mirroring
+    /// [`KChatConfig::default_thread_id`] from the currently open
+    /// project's manifest. Refreshed by [`KChatState::apply_project_config`]
+    /// on each `project_open` / `project_save` so the renderer's
+    /// status poll surfaces the right thread the moment a project is
+    /// active. `None` outside of an open project (or when the
+    /// project chose to leave `default_thread_id` unset).
+    default_thread_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,6 +250,7 @@ impl KChatState {
             state: state_str.into(),
             publisher_kind: inner.publisher_kind.as_str().into(),
             instance: probed,
+            default_thread_id: inner.default_thread_id.clone(),
         };
     }
 
@@ -245,6 +266,7 @@ impl KChatState {
             state: "disconnected".into(),
             publisher_kind: PublisherKind::InMemory.as_str().into(),
             instance: inner.discovered.clone(),
+            default_thread_id: inner.default_thread_id.clone(),
         };
     }
 
@@ -266,6 +288,61 @@ impl KChatState {
         self.inner.read().expect("kchat state not poisoned").enabled
     }
 
+    /// Adopt the per-project [`KChatConfig`] for the currently
+    /// active project. Called by [`crate::service::BridgeService`]
+    /// after every `project_open` / `project_save` so the bridge's
+    /// shared state mirrors the just-opened manifest.
+    ///
+    /// Applies two fields:
+    ///
+    /// - `enabled` — flipped onto [`Inner::enabled`] so subsequent
+    ///   publishes respect the per-project toggle. This is the same
+    ///   bit [`Self::set_enabled`] flips; we route through both so
+    ///   the Settings toggle and project-open both converge on the
+    ///   same observable state.
+    /// - `default_thread_id` — cached so [`Self::status`] surfaces it
+    ///   to the renderer. The Deliver page's review panel reads
+    ///   this field and falls back to the publisher-side default
+    ///   only when it's `None`.
+    ///
+    /// Idempotent — repeated calls with the same config produce
+    /// the same `last_status`.
+    pub fn apply_project_config(&self, config: &KChatConfig) {
+        let mut inner = self.inner.write().expect("kchat state not poisoned");
+        inner.enabled = config.enabled;
+        inner
+            .default_thread_id
+            .clone_from(&config.default_thread_id);
+        inner
+            .last_status
+            .default_thread_id
+            .clone_from(&config.default_thread_id);
+    }
+
+    /// Drop any per-project state cached from a prior
+    /// [`Self::apply_project_config`] call. Used when closing a
+    /// project (or opening one with no `KChatConfig` set in the
+    /// manifest) so the renderer's review panel falls back to the
+    /// publisher-side default thread instead of pointing at a
+    /// stale project's thread.
+    pub fn clear_project_config(&self) {
+        let mut inner = self.inner.write().expect("kchat state not poisoned");
+        inner.default_thread_id = None;
+        inner.last_status.default_thread_id = None;
+    }
+
+    /// Mirror of [`KChatConfig::default_thread_id`] for the
+    /// currently open project. Returned by [`Self::status`] as
+    /// `default_thread_id`; exposed separately so tests can assert
+    /// without re-running the discovery probe in `status()`.
+    pub fn default_thread_id(&self) -> Option<String> {
+        self.inner
+            .read()
+            .expect("kchat state not poisoned")
+            .default_thread_id
+            .clone()
+    }
+
     /// Test helper — force the state into an in-memory publisher
     /// pointed at the supplied origin tag.
     #[doc(hidden)]
@@ -278,6 +355,7 @@ impl KChatState {
             state: "disconnected".into(),
             publisher_kind: PublisherKind::InMemory.as_str().into(),
             instance: None,
+            default_thread_id: inner.default_thread_id.clone(),
         };
         inner.discovered = None;
     }
@@ -305,6 +383,7 @@ impl KChatState {
             state: "connected".into(),
             publisher_kind: PublisherKind::LocalIpc.as_str().into(),
             instance: Some(info),
+            default_thread_id: inner.default_thread_id.clone(),
         };
     }
 }
@@ -326,9 +405,11 @@ impl Inner {
                     state: "connected".into(),
                     publisher_kind: PublisherKind::LocalIpc.as_str().into(),
                     instance: Some(info.clone()),
+                    default_thread_id: None,
                 },
                 discovered: Some(info),
                 enabled: true,
+                default_thread_id: None,
             };
         }
         let publisher: Arc<dyn KChatPublisher + Send + Sync> =
@@ -341,9 +422,11 @@ impl Inner {
                 state: "disconnected".into(),
                 publisher_kind: PublisherKind::InMemory.as_str().into(),
                 instance: None,
+                default_thread_id: None,
             },
             discovered: None,
             enabled: true,
+            default_thread_id: None,
         }
     }
 }
@@ -390,5 +473,85 @@ mod tests {
         let (c, k) = st.ingest_reviews("any-thread", None).unwrap();
         assert!(c.is_empty());
         assert!(k.is_empty());
+    }
+
+    /// `apply_project_config` must propagate
+    /// [`KChatConfig::default_thread_id`] to both the cached
+    /// `default_thread_id` and the next `status()` snapshot so the
+    /// renderer's poll surfaces the per-project thread on the very
+    /// next tick.
+    #[test]
+    fn apply_project_config_threads_through_status_payload() {
+        std::env::remove_var(aec_core::kchat_discovery::KCHAT_SOCKET_PATH_ENV);
+        let st = KChatState::new();
+        assert!(
+            st.default_thread_id().is_none(),
+            "fresh state must have no per-project thread"
+        );
+        assert!(
+            st.status().default_thread_id.is_none(),
+            "status payload must mirror cached state"
+        );
+
+        st.apply_project_config(&KChatConfig::enabled_with_thread("project-thread-xyz"));
+        assert_eq!(
+            st.default_thread_id(),
+            Some("project-thread-xyz".to_string()),
+        );
+        let s = st.status();
+        assert_eq!(s.default_thread_id, Some("project-thread-xyz".to_string()));
+        assert!(
+            st.is_enabled(),
+            "applying an enabled config must enable publishes"
+        );
+    }
+
+    /// Reopening a project that omitted `default_thread_id` must
+    /// clear the previously cached value so the renderer falls
+    /// back to its `kchat-default` constant instead of continuing
+    /// to read from the prior project's thread.
+    #[test]
+    fn apply_project_config_clears_stale_thread_when_new_config_omits_it() {
+        std::env::remove_var(aec_core::kchat_discovery::KCHAT_SOCKET_PATH_ENV);
+        let st = KChatState::new();
+        st.apply_project_config(&KChatConfig::enabled_with_thread("first-thread"));
+        assert_eq!(st.default_thread_id(), Some("first-thread".to_string()));
+
+        st.apply_project_config(&KChatConfig::enabled());
+        assert_eq!(st.default_thread_id(), None);
+        assert!(st.status().default_thread_id.is_none());
+    }
+
+    /// `clear_project_config` is the explicit "close project" hook;
+    /// it must drop the cached thread regardless of whether a
+    /// project was previously opened.
+    #[test]
+    fn clear_project_config_drops_cached_thread() {
+        std::env::remove_var(aec_core::kchat_discovery::KCHAT_SOCKET_PATH_ENV);
+        let st = KChatState::new();
+        st.apply_project_config(&KChatConfig::enabled_with_thread("to-be-cleared"));
+        assert!(st.default_thread_id().is_some());
+        st.clear_project_config();
+        assert!(st.default_thread_id().is_none());
+        assert!(st.status().default_thread_id.is_none());
+    }
+
+    /// Even after the publisher transparently downgrades to the
+    /// in-memory fallback, the per-project thread id must survive
+    /// because it's a property of the open project, not the
+    /// transport.
+    #[test]
+    fn downgrade_to_fallback_preserves_default_thread_id() {
+        std::env::remove_var(aec_core::kchat_discovery::KCHAT_SOCKET_PATH_ENV);
+        let st = KChatState::new();
+        st.apply_project_config(&KChatConfig::enabled_with_thread("survive-downgrade"));
+        // The `__test_force_in_memory` helper rewrites
+        // `last_status` directly, mirroring the downgrade path;
+        // we still expect the cached `default_thread_id` to win.
+        st.__test_force_in_memory("forced-origin");
+        assert_eq!(
+            st.status().default_thread_id,
+            Some("survive-downgrade".to_string())
+        );
     }
 }

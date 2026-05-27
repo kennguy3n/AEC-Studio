@@ -30,11 +30,37 @@ import {
 import { RevisionManager } from "../components/deliver/RevisionManager";
 import { DeliverToolbar } from "../components/deliver/DeliverToolbar";
 
+/**
+ * Fallback thread id used when no per-project `KChatConfig` has been
+ * adopted by the bridge yet (no project open, or the manifest left
+ * `default_thread_id` unset). Matches `DEFAULT_THREAD_ID` from
+ * `crates/aec_core/src/local_ipc_publisher.rs` so the Deliver review
+ * panel and the bridge publisher converge on the same default.
+ */
+const FALLBACK_THREAD_ID = "kchat-default";
+
+/**
+ * Cadence at which the Deliver page re-reads
+ * `kchat:status.defaultThreadId` to pick up project switches /
+ * KChatConfig edits that happened after the page mounted. Matches
+ * the cadence used by `KChatStatusIndicator` so the two converge on
+ * the same view of the bridge state.
+ */
+const STATUS_POLL_INTERVAL_MS = 5_000;
+
 export function Deliver(): JSX.Element {
   const [kind, setKind] = useState<PackKind>("concept");
   const [deliverables, setDeliverables] = useState<PackDeliverables>(() =>
     defaultDeliverablesFor("concept"),
   );
+
+  // Per-project KChat thread id, polled from `kchat:status` so the
+  // Deliver review panel keys off the active project's
+  // `KChatConfig::default_thread_id` rather than a hard-coded value.
+  // Falls back to `FALLBACK_THREAD_ID` (matching the bridge
+  // publisher's `DEFAULT_THREAD_ID` constant) when no project is
+  // open / the project chose to leave the field unset.
+  const [defaultThreadId, setDefaultThreadId] = useState<string | null>(null);
 
   const [targets, setTargets] = useState<ExportTarget[]>(() =>
     defaultExportTargets(),
@@ -63,6 +89,32 @@ export function Deliver(): JSX.Element {
     });
     return () => {
       alive = false;
+    };
+  }, []);
+
+  // Poll the bridge for the per-project KChat thread id. Mirrors the
+  // cadence used by `KChatStatusIndicator` so the Deliver review
+  // panel converges on the same thread the status chip displays.
+  // Failures are swallowed: the panel keeps showing the last-known
+  // thread (or the fallback constant) rather than flickering on a
+  // single missed poll.
+  useEffect(() => {
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const s = await aec.kchat.status();
+        if (!cancelled) {
+          setDefaultThreadId(s.defaultThreadId ?? null);
+        }
+      } catch {
+        // Intentionally swallowed — see comment above.
+      }
+    };
+    void tick();
+    const id = window.setInterval(() => void tick(), STATUS_POLL_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
     };
   }, []);
 
@@ -187,7 +239,7 @@ export function Deliver(): JSX.Element {
           comparing={comparing}
         />
       </div>
-      <KChatReviewPanel threadId="kchat-default" />
+      <KChatReviewPanel threadId={defaultThreadId ?? FALLBACK_THREAD_ID} />
       {exportResult ? (
         <section data-testid="deliver-export-result">
           <h3>Pack built</h3>

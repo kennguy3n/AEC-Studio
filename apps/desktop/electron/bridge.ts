@@ -631,6 +631,14 @@ export interface KChatStatusReport {
   publisherKind: "local_ipc" | "in_memory";
   /** Discovered instance JSON, when `publisherKind` is `local_ipc`. */
   instanceJson?: string | null;
+  /**
+   * Per-project default thread id sourced from the active project's
+   * `KChatConfig::default_thread_id`. `null` when no project is open
+   * or the project chose to omit the field — callers (e.g. the
+   * Deliver page's review panel) fall back to `"kchat-default"` in
+   * that case.
+   */
+  defaultThreadId?: string | null;
 }
 
 /** Result of `kchatPublish`. */
@@ -2426,11 +2434,13 @@ function adaptNative(n: NativeApi): BridgeBackend {
         state: string;
         publisherKind: string;
         instanceJson: string | null | undefined;
+        defaultThreadId: string | null | undefined;
       };
       return {
         state: raw.state as KChatStatusReport["state"],
         publisherKind: raw.publisherKind as KChatStatusReport["publisherKind"],
         instanceJson: raw.instanceJson ?? null,
+        defaultThreadId: raw.defaultThreadId ?? null,
       };
     },
     kchatReload: async () => {
@@ -2438,11 +2448,13 @@ function adaptNative(n: NativeApi): BridgeBackend {
         state: string;
         publisherKind: string;
         instanceJson: string | null | undefined;
+        defaultThreadId: string | null | undefined;
       };
       return {
         state: raw.state as KChatStatusReport["state"],
         publisherKind: raw.publisherKind as KChatStatusReport["publisherKind"],
         instanceJson: raw.instanceJson ?? null,
+        defaultThreadId: raw.defaultThreadId ?? null,
       };
     },
     kchatPublish: async (params) => {
@@ -3378,11 +3390,17 @@ export function inProcessBackend(): BridgeBackend {
       state: "disconnected",
       publisherKind: "in_memory",
       instanceJson: null,
+      // The in-process fallback has no concept of an open project,
+      // so the per-project default thread is always absent. The
+      // renderer falls back to its `kchat-default` constant in
+      // this case.
+      defaultThreadId: null,
     }),
     kchatReload: async () => ({
       state: "disconnected",
       publisherKind: "in_memory",
       instanceJson: null,
+      defaultThreadId: null,
     }),
     kchatPublish: async (_params) => ({
       messageId: id("kchat_msg"),

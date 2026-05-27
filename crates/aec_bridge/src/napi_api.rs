@@ -2621,6 +2621,15 @@ pub struct KChatStatusJs {
     pub state: String,
     pub publisher_kind: String,
     pub instance_json: Option<String>,
+    /// Per-project [`KChatConfig::default_thread_id`][cfg] (or `None`
+    /// when no project is open / the project omitted the field).
+    /// Surfaces through the same status payload the renderer
+    /// already polls every 5 s; the Deliver page's review panel
+    /// reads it directly and falls back to the publisher-side
+    /// default constant only when this is `None`.
+    ///
+    /// [cfg]: aec_core::kchat_config::KChatConfig
+    pub default_thread_id: Option<String>,
 }
 
 #[napi(object)]
@@ -2662,6 +2671,7 @@ fn kchat_status_to_js(rep: crate::kchat_state::KChatStatusReport) -> KChatStatus
         state: rep.state,
         publisher_kind: rep.publisher_kind,
         instance_json,
+        default_thread_id: rep.default_thread_id,
     }
 }
 

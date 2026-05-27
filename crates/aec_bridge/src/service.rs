@@ -1535,6 +1535,14 @@ impl BridgeService {
         // failure handling as the other mutating endpoints.
         let root_str = root.to_string_lossy();
         self.invalidate_status_cache_for(&root_str);
+        // Adopt the fresh project's KChat config (typically `None`
+        // for a template-created project — templates don't carry a
+        // thread id) so a subsequent `kchat:status` poll reflects
+        // the just-created project rather than the previously-open
+        // one's stale thread. The renderer will issue its usual
+        // `project_open` follow-up, but applying here keeps the
+        // bridge consistent the moment creation succeeds.
+        self.apply_kchat_project_config(pkg.manifest().settings.kchat.as_ref());
         let summary: ProjectSummary = pkg.summary().into();
         let core_summary = pkg.summary();
         self.recents.record(&core_summary)?;
@@ -1563,10 +1571,29 @@ impl BridgeService {
         // state — see `EngineStatusCache::invalidate_all` for the
         // full rationale.
         self.invalidate_status_cache_for(path);
+        // Adopt the just-opened project's KChat config so the
+        // renderer's `kchat:status` poll surfaces this project's
+        // `default_thread_id` and `enabled` flag on the very next
+        // tick. When the manifest omits the field we clear the
+        // bridge-side cache so the Deliver page's review panel
+        // falls back to the publisher-side default thread instead
+        // of pointing at the previously-open project.
+        self.apply_kchat_project_config(pkg.manifest().settings.kchat.as_ref());
         let core_summary = pkg.summary();
         let summary: ProjectSummary = core_summary.clone().into();
         self.recents.record(&core_summary)?;
         Ok(summary)
+    }
+
+    /// Apply (or clear) the per-project KChat configuration on the
+    /// bridge-wide [`crate::kchat_state::KChatState`]. Called from
+    /// every endpoint that opens or re-opens a project so the
+    /// renderer's `kchat:status` poll mirrors the on-disk manifest.
+    fn apply_kchat_project_config(&self, config: Option<&aec_core::kchat_config::KChatConfig>) {
+        match config {
+            Some(c) => self.kchat_state.apply_project_config(c),
+            None => self.kchat_state.clear_project_config(),
+        }
     }
 
     /// Persist the manifest of an open project.
@@ -1585,6 +1612,11 @@ impl BridgeService {
         // state. Falls back to `invalidate_all` on canonicalise
         // failure (see `invalidate_status_cache_for`).
         self.invalidate_status_cache_for(path);
+        // Mirror the saved manifest's KChat config onto the
+        // bridge-wide state so a save that toggles `enabled` or
+        // changes `default_thread_id` is reflected on the next
+        // `kchat:status` poll without forcing a project re-open.
+        self.apply_kchat_project_config(pkg.manifest().settings.kchat.as_ref());
         Ok(pkg.summary().into())
     }
 
@@ -4820,6 +4852,90 @@ mod tests {
         assert_eq!(opened.project_id, summary.project_id);
         let saved = s.project_save(&summary.path).unwrap();
         assert_eq!(saved.project_id, summary.project_id);
+    }
+
+    /// `project_open` must adopt the just-opened project's
+    /// [`KChatConfig::default_thread_id`] so the renderer's
+    /// `kchat:status` poll surfaces it immediately. Verifies the end-
+    /// to-end path: write the per-project thread to `manifest.json`,
+    /// then call `project_open` and assert the bridge-wide
+    /// `KChatState::status` reports the new thread.
+    #[test]
+    fn project_open_adopts_kchat_default_thread_id_from_manifest() {
+        use aec_core::kchat_config::KChatConfig;
+        use aec_core::ProjectManifest;
+
+        let (mut s, _g) = service();
+        let summary = s
+            .project_create_from_template("interior.apartment", "ThreadProj")
+            .unwrap();
+
+        // Fresh project: no per-project thread until the manifest
+        // is amended.
+        assert!(
+            s.kchat_status().default_thread_id.is_none(),
+            "freshly-created project has no per-project thread"
+        );
+
+        // Inject the thread into manifest.json on disk, then re-open
+        // through the service so we exercise the real
+        // `project_open` → `apply_kchat_project_config` path.
+        let manifest_path = std::path::Path::new(&summary.path).join("manifest.json");
+        let mut manifest: ProjectManifest =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        manifest.settings.kchat = Some(KChatConfig::enabled_with_thread("manifest-thread-7"));
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        s.project_open(&summary.path).unwrap();
+        let status = s.kchat_status();
+        assert_eq!(
+            status.default_thread_id,
+            Some("manifest-thread-7".to_string()),
+            "project_open must push KChatConfig::default_thread_id into the status payload"
+        );
+    }
+
+    /// Opening a project that omits `kchat` in its manifest must
+    /// clear any stale per-project thread the bridge cached from
+    /// the previously-open project — otherwise the Deliver page
+    /// would point at the wrong thread after a project switch.
+    #[test]
+    fn project_open_clears_stale_thread_when_new_manifest_omits_kchat() {
+        use aec_core::kchat_config::KChatConfig;
+        use aec_core::ProjectManifest;
+
+        let (mut s, _g) = service();
+
+        // First project: persist a thread id into its manifest and
+        // open it so the bridge caches the thread.
+        let first = s
+            .project_create_from_template("interior.apartment", "FirstProj")
+            .unwrap();
+        let first_manifest = std::path::Path::new(&first.path).join("manifest.json");
+        let mut m: ProjectManifest =
+            serde_json::from_str(&std::fs::read_to_string(&first_manifest).unwrap()).unwrap();
+        m.settings.kchat = Some(KChatConfig::enabled_with_thread("first-thread"));
+        std::fs::write(&first_manifest, serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+        s.project_open(&first.path).unwrap();
+        assert_eq!(
+            s.kchat_status().default_thread_id,
+            Some("first-thread".to_string())
+        );
+
+        // Second project: no kchat config in its manifest. Opening
+        // it must clear the cached thread from FirstProj.
+        let second = s
+            .project_create_from_template("interior.apartment", "SecondProj")
+            .unwrap();
+        s.project_open(&second.path).unwrap();
+        assert!(
+            s.kchat_status().default_thread_id.is_none(),
+            "opening a project without a thread must clear the prior project's cache"
+        );
     }
 
     #[test]

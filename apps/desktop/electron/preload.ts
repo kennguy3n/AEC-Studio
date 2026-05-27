@@ -433,12 +433,14 @@ const api = {
         state: "connected" | "reconnecting" | "disconnected";
         publisherKind: "local_ipc" | "in_memory";
         instanceJson: string | null;
+        defaultThreadId: string | null;
       }>,
     reload: () =>
       ipcRenderer.invoke("kchat:reload") as Promise<{
         state: "connected" | "reconnecting" | "disconnected";
         publisherKind: "local_ipc" | "in_memory";
         instanceJson: string | null;
+        defaultThreadId: string | null;
       }>,
     publish: (params: { cardJson: string }) =>
       ipcRenderer.invoke("kchat:publish", params) as Promise<{

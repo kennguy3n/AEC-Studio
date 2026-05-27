@@ -427,12 +427,18 @@ function kchatMock(newId: (prefix: string) => string) {
         state: "disconnected",
         publisherKind: "in_memory",
         instanceJson: null,
+        // Vitest contexts never open a real project, so the
+        // per-project `KChatConfig::default_thread_id` is always
+        // absent. The Deliver page's review panel falls back to
+        // its `kchat-default` constant when this is null.
+        defaultThreadId: null,
       }) as Awaited<ReturnType<AecApi["kchat"]["status"]>>,
     reload: async () =>
       ({
         state: "disconnected",
         publisherKind: "in_memory",
         instanceJson: null,
+        defaultThreadId: null,
       }) as Awaited<ReturnType<AecApi["kchat"]["reload"]>>,
     publish: async (_params: { cardJson: string }) => ({
       messageId: newId("kchat_msg"),
