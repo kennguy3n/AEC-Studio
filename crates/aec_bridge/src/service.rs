@@ -2088,14 +2088,20 @@ impl BridgeService {
     /// extensions root and the bridge does the loader-side work.
     ///
     /// Trust policy:
-    /// * `require_signature == true` → only extensions signed by a
-    ///   known key are accepted. Unsigned manifests and signatures
-    ///   that don't match the bundled `TrustStore` produce a hard
-    ///   error.
-    /// * `require_signature == false` → unsigned manifests are
-    ///   permitted (development / sideload flow). Signed manifests
-    ///   are still verified opportunistically so a tampered payload
-    ///   is rejected even in dev mode.
+    /// * Unsigned manifests are permitted (development / sideload
+    ///   flow) — `LoadOptions::allow_unsigned()` is used.
+    /// * Signed manifests are still verified *opportunistically*
+    ///   inside the loader via `verify_signature_self_consistent`
+    ///   so a tampered payload is rejected even in this mode.
+    ///
+    /// Strict signed-only mode (require an `Ed25519` signature from
+    /// a publisher key in a configured `TrustStore`) is deferred
+    /// until a future PR wires a `TrustStore` configuration source
+    /// through the bridge boot path — exposing a `require_signature`
+    /// parameter today would be scaffolding because the bridge has
+    /// no `TrustStore` to enforce against. The strict mode hook
+    /// lives on `LoadOptions::strict(TrustStore)` and will be
+    /// reached from this endpoint once that wiring lands.
     ///
     /// Returns the per-extension summary
     /// ([`aec_assets::extension_host::InstallSummary`]) so the
@@ -2104,24 +2110,11 @@ impl BridgeService {
     pub fn extensions_install_asset_packs(
         &self,
         extensions_dir: &str,
-        require_signature: bool,
     ) -> Result<aec_assets::extension_host::InstallSummary, BridgeServiceError> {
         use aec_core::extensions::{ExtensionLoader, LoadOptions};
         use aec_core::PermissionEnforcer;
 
-        let opts = if require_signature {
-            // Production builds always supply a trust store; the
-            // renderer-facing JSON parameter just chooses whether
-            // to enforce it. Without a trust store there's
-            // nothing to enforce against, so flagging
-            // `require_signature` with no `TrustStore` ships is
-            // the correct hard error.
-            return Err(BridgeServiceError::Invalid(
-                "extensions_install_asset_packs(require_signature=true) requires a configured TrustStore; not yet wired through the bridge boot path".into(),
-            ));
-        } else {
-            LoadOptions::allow_unsigned()
-        };
+        let opts = LoadOptions::allow_unsigned();
 
         let loader = ExtensionLoader::new(extensions_dir);
         let registry = loader.load(&opts).map_err(|e| {

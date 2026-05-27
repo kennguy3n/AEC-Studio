@@ -130,7 +130,7 @@ fn phase8_extension_lifecycle_journey() {
 
     // ── Step 2: install via the bridge ──
     let summary = svc
-        .extensions_install_asset_packs(ext_root.path().to_str().unwrap(), false)
+        .extensions_install_asset_packs(ext_root.path().to_str().unwrap())
         .expect("install_asset_packs (happy path)");
     assert_eq!(
         summary.installed.len(),
@@ -169,7 +169,7 @@ fn phase8_extension_lifecycle_journey() {
 
     // ── Step 4: re-running the install is idempotent ──
     let summary2 = svc
-        .extensions_install_asset_packs(ext_root.path().to_str().unwrap(), false)
+        .extensions_install_asset_packs(ext_root.path().to_str().unwrap())
         .expect("install_asset_packs (idempotent re-run)");
     assert!(
         summary2.installed.is_empty(),
@@ -202,7 +202,7 @@ fn phase8_extension_lifecycle_journey() {
         .join("tampered_1.glb");
     std::fs::write(&tampered_blob, b"TAMPERED-AFTER-MANIFEST").unwrap();
     let tamper_err = svc
-        .extensions_install_asset_packs(tampered_root.path().to_str().unwrap(), false)
+        .extensions_install_asset_packs(tampered_root.path().to_str().unwrap())
         .expect_err("tampered payload must produce a checksum error");
     let msg = format!("{tamper_err:?}");
     assert!(
@@ -225,7 +225,7 @@ fn phase8_extension_lifecycle_journey() {
         vec![("blocked_1".into(), b"never-touched".to_vec())],
     );
     let perm_err = svc
-        .extensions_install_asset_packs(nogeom_root.path().to_str().unwrap(), false)
+        .extensions_install_asset_packs(nogeom_root.path().to_str().unwrap())
         .expect_err("missing filesystem_read must produce a permission error");
     let perm_msg = format!("{perm_err:?}");
     assert!(

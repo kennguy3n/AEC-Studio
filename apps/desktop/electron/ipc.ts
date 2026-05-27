@@ -401,23 +401,23 @@ export function registerIpcHandlers(): void {
   });
   ipcMain.handle("export:buildProposalPack", async (_e, p) => {
     assertObject(p, "params");
-    // Inject the active project path so the bridge's
-    // `export_proposal_pack` endpoint can build a real
-    // `DeliverPackContext` (room count, material count, template
-    // name) for the cover paragraph (Phase 13 Task 10). Caller-
-    // supplied `projectPath` wins (matches the same convention as
-    // `deliver:buildPack`); otherwise the active-project tracker
-    // is the source of truth.
-    const explicit =
-      typeof (p as Record<string, unknown>).projectPath === "string" &&
-      ((p as Record<string, unknown>).projectPath as string).length > 0
-        ? ((p as Record<string, unknown>).projectPath as string)
-        : null;
-    const projectPath = explicit ?? peekActiveProjectPath();
-    return getBridge().exportBuildProposalPack({
-      ...(p as Record<string, unknown>),
-      projectPath: projectPath ?? undefined,
-    });
+    // Inject the active project path through the shared
+    // `withResolvedProjectPath` helper so this handler obeys the
+    // same caller-supplied-wins / active-tracker-fallback /
+    // typed-error-on-missing contract every other project-scoped
+    // IPC handler (`draft:*`, `ai:plan`, `deliver:*`) uses. The
+    // bridge's `export_proposal_pack` endpoint still accepts
+    // `Option<&str>` so external `aec_export` embedders can call it
+    // without an open project, but every renderer-facing flow is
+    // route-guarded by `RequireProject` so the helper's throw path
+    // is unreachable in practice; aligning here removes the only
+    // bespoke project-path injection in the IPC layer.
+    return getBridge().exportBuildProposalPack(
+      withResolvedProjectPath(p, "exportBuildProposalPack") as Record<
+        string,
+        unknown
+      > & { projectPath: string },
+    );
   });
 
   // ----- Deliver -----

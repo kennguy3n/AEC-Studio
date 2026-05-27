@@ -293,7 +293,7 @@ project state, but the AEC Studio shell never calls them.
 
 ### Extension lifecycle (Phase 13 Group F)
 
-`BridgeService::extensions_install_asset_packs(extensions_dir, require_signature)`
+`BridgeService::extensions_install_asset_packs(extensions_dir)`
 is the renderer's hook for the Phase 8 extension lifecycle. The bridge
 loads extensions through `aec_core::extensions::ExtensionLoader`, builds a
 `PermissionEnforcer` from the registry, and installs `AssetPack`
@@ -303,8 +303,7 @@ asset becomes immediately visible to `BridgeService::design_list_assets`
 without any additional cache invalidation — the asset DB is the source of
 truth and the renderer's asset browser reads from it directly.
 
-Trust + integrity invariants the loader enforces (independent of whether
-`require_signature` is set):
+Trust + integrity invariants the loader enforces:
 
 * Manifest schema validation (`ExtensionManifest::validate()`)
 * BLAKE3 checksum of every payload file against

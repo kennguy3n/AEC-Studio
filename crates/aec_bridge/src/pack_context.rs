@@ -199,10 +199,23 @@ pub fn build_for_project(
         let Ok(bytes) = std::fs::read(&source_path) else {
             continue;
         };
-        let Ok(body_str) = std::str::from_utf8(&bytes) else {
-            continue;
-        };
-        if let Ok(snap) = aec_bim::ifc::IfcReader::from_string(body_str) {
+        // Real-world IFC exports — particularly CJK-locale and
+        // legacy-locale outputs from older ArchiCAD / Revit and
+        // IfcOpenShell-scripted pipelines — sometimes leak raw
+        // Windows-1252 or Shift-JIS bytes into `IfcLabel` / `IfcText`
+        // string literals. A strict `std::str::from_utf8` would reject
+        // those files outright, causing the deliver / proposal pack
+        // to silently drop the entire IFC (and degrade to empty
+        // schedules + skeletal IFC) with no diagnostic the user
+        // could act on. Use the same byte-read + lossy decode pattern
+        // as `BridgeService::bim_import_ifc` (service.rs:2212) and
+        // `BridgeService::load_ifc_snapshot` (service.rs:2907): invalid
+        // sequences are replaced with U+FFFD inside string literals
+        // while the structural STEP grammar (entity-type keywords,
+        // `#N` refs, `,` / `;` / `'` delimiters — all ASCII by spec)
+        // is preserved and the parser can proceed.
+        let body_str = String::from_utf8_lossy(&bytes);
+        if let Ok(snap) = aec_bim::ifc::IfcReader::from_string(&body_str) {
             snapshot = Some(snap);
             break;
         }
@@ -357,5 +370,111 @@ mod tests {
         // template_id was passed as `None` so this round-trips as
         // `None`, not as `Some(\"\")`.
         assert!(ctx.template_name.is_none());
+    }
+
+    /// Regression for the Phase 13 PR-71 Devin Review BUG:
+    /// `build_for_project` previously called `std::str::from_utf8` on
+    /// the IFC bytes and silently `continue`d on `Err(_)`, which
+    /// dropped the entire IFC from the deliver / proposal pack
+    /// whenever the source file carried any non-UTF-8 bytes (CJK
+    /// locales, legacy ArchiCAD / IfcOpenShell exports). Post-fix
+    /// the function uses `String::from_utf8_lossy` — the same
+    /// pattern as `BridgeService::bim_import_ifc` and
+    /// `BridgeService::load_ifc_snapshot` — so the IFC survives and
+    /// `ctx.ifc_string` is populated.
+    #[test]
+    fn build_for_project_recovers_ifc_with_non_utf8_bytes() {
+        use aec_command::commands::project_graph::{EntityDelta, EntityRecord};
+        use aec_core::types::EntityId;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let project_path = tmp.path().join("non_utf8.aecstudio");
+        let master_key = [0u8; 32];
+        let _pkg = ProjectPackage::create(
+            project_path.to_str().unwrap(),
+            "NonUtf8",
+            aec_core::ProjectSettings::default(),
+            None,
+            &master_key,
+        )
+        .unwrap();
+
+        // Same fixture as `bim_import_ifc_tolerates_non_utf8_bytes`
+        // in service.rs: a minimal valid IFC2x3 graph with a single
+        // 0x9F byte (Windows-1252 codepoint, invalid UTF-8) inside
+        // the IFCPROJECT name string.
+        let ifc_path = tmp.path().join("legacy.ifc");
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(
+            b"ISO-10303-21;\n\
+HEADER;\n\
+FILE_DESCRIPTION(('test'),'2;1');\n\
+FILE_NAME('t.ifc','2026-05-20T00:00:00',(''),(''),'','','');\n\
+FILE_SCHEMA(('IFC2X3'));\n\
+ENDSEC;\n\
+DATA;\n\
+#1 = IFCOWNERHISTORY($,$,$,.NOCHANGE.,$,$,$,1747699200);\n\
+#2 = IFCPROJECT('00000000000000000000a1',#1,'Latin1-",
+        );
+        body.push(0x9F);
+        body.extend_from_slice(
+            b"','P',$,$,$,$,$);\n\
+ENDSEC;\n\
+END-ISO-10303-21;\n",
+        );
+        std::fs::write(&ifc_path, &body).unwrap();
+
+        // Insert a `bim/spatial/IfcProject` row whose body JSON
+        // points at the non-UTF-8 file. We construct the entity
+        // through the public `ProjectGraph::persist_delta_in_tx`
+        // API so the row matches the exact schema
+        // `bim_attach::attach_snapshot` writes — keeping the test
+        // honest about the production data shape.
+        let (_pkg, mut conn) = ProjectPackage::open_with_master_key_and_database(
+            project_path.to_str().unwrap(),
+            &master_key,
+        )
+        .unwrap();
+        let spatial_body = serde_json::json!({
+            "ifc_guid": "00000000000000000000a1",
+            "ifc_class": "IfcProject",
+            "name": "Legacy",
+            "source_schema": "IFC2X3",
+            "source_path": ifc_path.to_str().unwrap(),
+        });
+        let record = EntityRecord {
+            id: EntityId::from_guid_seed("pack_context-non-utf8-ifc"),
+            kind: "bim/spatial/IfcProject".to_owned(),
+            body: spatial_body,
+            parent: None,
+        };
+        let tx = conn.transaction().unwrap();
+        aec_command::commands::ProjectGraph::persist_delta_in_tx(
+            &tx,
+            &EntityDelta::Create { record },
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        drop(conn);
+
+        let ctx = build_for_project(project_path.to_str().unwrap(), &master_key).unwrap();
+        assert!(
+            ctx.ifc_string.is_some(),
+            "lossy UTF-8 decode must let the IFC parse succeed — pre-fix this was None because \
+             std::str::from_utf8 rejected the 0x9F byte and the code silently `continue`d"
+        );
+        // The IFC was parseable, so the deliver / proposal pack now
+        // gets a real `model/project.ifc` body rather than the
+        // skeletal `build_summary_ifc` fallback. The reproduced
+        // schema header proves we round-tripped through IfcReader →
+        // IfcWriter (the writer always emits an `ISO-10303-21;`
+        // preamble).
+        assert!(
+            ctx.ifc_string
+                .as_ref()
+                .unwrap()
+                .starts_with("ISO-10303-21;"),
+            "recovered IFC must start with the STEP preamble"
+        );
     }
 }
