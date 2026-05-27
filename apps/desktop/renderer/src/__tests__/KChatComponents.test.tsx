@@ -23,6 +23,7 @@ describe("KChatStatusIndicator", () => {
       state: "disconnected",
       publisherKind: "in_memory",
       instanceJson: null,
+      defaultThreadId: null,
     });
     render(<KChatStatusIndicator />);
     await waitFor(() =>
@@ -44,6 +45,7 @@ describe("KChatStatusIndicator", () => {
         version: "1.4.2",
         health: "ok",
       }),
+      defaultThreadId: null,
     });
     render(<KChatStatusIndicator />);
     await waitFor(() =>
@@ -61,6 +63,7 @@ describe("KChatStatusIndicator", () => {
       state: "disconnected",
       publisherKind: "in_memory",
       instanceJson: null,
+      defaultThreadId: null,
     });
     const reload = vi.spyOn(aec.kchat, "reload").mockResolvedValue({
       state: "connected",
@@ -70,6 +73,7 @@ describe("KChatStatusIndicator", () => {
         version: "2.0.0",
         health: "ok",
       }),
+      defaultThreadId: null,
     });
     render(<KChatStatusIndicator />);
     await waitFor(() =>
@@ -178,6 +182,7 @@ describe("KChatReviewPanel", () => {
       state: "disconnected",
       publisherKind: "in_memory",
       instanceJson: null,
+      defaultThreadId: null,
     });
     render(<KChatReviewPanel threadId="kchat-default" />);
     const panel = await screen.findByTestId("kchat-review-panel");
@@ -195,6 +200,7 @@ describe("KChatReviewPanel", () => {
         version: "1.0.0",
         health: "ok",
       }),
+      defaultThreadId: null,
     });
     vi.spyOn(aec.kchat, "ingestReviews").mockResolvedValue({
       threadId: "kchat-default",
