@@ -46,13 +46,25 @@ export function useToast(): ToastContextValue {
   return ctx;
 }
 
-let nextToastId = 1;
-
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [toasts, setToasts] = useState<Toast[]>([]);
   const timersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(
     new Map(),
   );
+  // Provider-scoped monotonic counter for toast IDs. Holding the
+  // counter in a `useRef` instead of a module-level `let` matters
+  // for two reasons: (1) test determinism — vitest tears down and
+  // re-mounts the provider for each test, so the per-test sequence
+  // starts from 1 instead of leaking ordering across tests run in
+  // the same module / sharing the same module instance; (2) HMR
+  // safety — a renderer hot-reload in dev that swaps the module
+  // would otherwise reset the counter at unpredictable times and
+  // could in principle hand out an id collision against a still-
+  // mounted toast. Since `ToastContainer` keys on the returned
+  // string id directly, a collision would silently drop a toast
+  // from the DOM. The ref-scoped counter is bound to the provider's
+  // lifecycle, which matches the DOM's keying lifecycle.
+  const nextToastIdRef = useRef(1);
 
   const dismiss = useCallback((id: string) => {
     setToasts((prev) => prev.filter((t) => t.id !== id));
@@ -65,7 +77,8 @@ export function ToastProvider({ children }: { children: ReactNode }) {
 
   const addToast = useCallback(
     (kind: ToastKind, message: string): string => {
-      const id = `toast_${(nextToastId++).toString(36)}`;
+      const id = `toast_${nextToastIdRef.current.toString(36)}`;
+      nextToastIdRef.current += 1;
       const toast: Toast = { id, kind, message };
       setToasts((prev) => [...prev, toast]);
       if (kind !== "error") {

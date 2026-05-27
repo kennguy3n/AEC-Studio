@@ -58,15 +58,23 @@ function AppCommands({
 
   // The command engine partitions undo/redo by mode scope; map the
   // current route to the matching scope so Ctrl/Cmd+Z undoes within
-  // the active mode. Unknown routes (Home, Settings, etc.) fall back
-  // to "design" — undo on Home is a no-op because we guard on `project`.
-  const activeScope: CommandScope = (() => {
+  // the active mode. Unknown routes (Home, Settings, etc.) resolve
+  // to `null` so the shortcut becomes a silent no-op instead of
+  // mis-attributing the keystroke to the "design" scope. The previous
+  // "fall back to design" behaviour was a bug: a user who placed a
+  // chair in Design, navigated to Home (project still open), and
+  // reflexively hit Ctrl/Cmd+Z would silently undo that placement
+  // from a screen with no visual affordance for the action. The
+  // `project === null` guard below catches the no-project-open case;
+  // this `activeScope === null` guard catches the
+  // project-open-but-not-in-a-mode case.
+  const activeScope: CommandScope | null = (() => {
     const path = location.pathname.split("/")[1] ?? "";
     if (path === "design" || path === "draft" || path === "bim" ||
         path === "render" || path === "deliver") {
       return path;
     }
-    return "design";
+    return null;
   })();
   // Navigation shortcuts dismiss any open palette so the user lands on
   // the new route with the overlay cleared.
@@ -83,7 +91,7 @@ function AppCommands({
   // depths in sync via `setUndoRedo` so the StatusBar reflects the
   // current state.
   const undo = useCallback(async () => {
-    if (project === null) return;
+    if (project === null || activeScope === null) return;
     try {
       const result = await aec.command.undo(project.path, activeScope);
       setUndoRedo(result.undoLen, result.redoLen);
@@ -97,7 +105,7 @@ function AppCommands({
   }, [project, activeScope, setUndoRedo, markDirty, addToast]);
 
   const redo = useCallback(async () => {
-    if (project === null) return;
+    if (project === null || activeScope === null) return;
     try {
       const result = await aec.command.redo(project.path, activeScope);
       setUndoRedo(result.undoLen, result.redoLen);

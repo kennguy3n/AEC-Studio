@@ -72,4 +72,48 @@ describe("useToast", () => {
     fireEvent.click(dismissBtn);
     expect(screen.queryByText("hello")).not.toBeInTheDocument();
   });
+
+  // Regression: Devin Review flagged that `nextToastId` was a
+  // module-level `let`, leaking ordering across provider remounts
+  // (test order non-determinism, and an HMR collision hazard
+  // where a stale toast on the DOM could share an id with a
+  // freshly-issued one — `ToastContainer.map(t => <div key={t.id} />)`
+  // would silently drop one). The fix promotes the counter to a
+  // provider-scoped `useRef`. This test pins the contract:
+  // remounting the provider resets the sequence, so each
+  // independent provider produces deterministic, non-colliding ids.
+  it("issues deterministic ids that reset on provider remount", () => {
+    const seen: string[] = [];
+    function Capture() {
+      const { addToast } = useToast();
+      return (
+        <button
+          type="button"
+          onClick={() => seen.push(addToast("info", "x"))}
+        >
+          fire
+        </button>
+      );
+    }
+
+    const { unmount } = render(
+      <ToastProvider>
+        <Capture />
+      </ToastProvider>,
+    );
+    fireEvent.click(screen.getByText("fire"));
+    fireEvent.click(screen.getByText("fire"));
+    fireEvent.click(screen.getByText("fire"));
+    expect(seen).toEqual(["toast_1", "toast_2", "toast_3"]);
+    unmount();
+
+    // Independent provider instance → counter restarts from 1.
+    render(
+      <ToastProvider>
+        <Capture />
+      </ToastProvider>,
+    );
+    fireEvent.click(screen.getByText("fire"));
+    expect(seen[seen.length - 1]).toBe("toast_1");
+  });
 });

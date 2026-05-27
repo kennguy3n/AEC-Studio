@@ -25,6 +25,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -536,22 +537,58 @@ export function ActiveProjectProvider({
     };
   }, []);
 
-  const value: ActiveProjectState = {
-    project,
-    loading,
-    dirty,
-    saving,
-    undoLen,
-    redoLen,
-    openProject,
-    createProject,
-    closeProject,
-    saveProject,
-    refreshProject,
-    markDirty,
-    markClean,
-    setUndoRedo,
-  };
+  // Memoise the context value so consumers don't tear down their
+  // subtrees on every provider render. Without this, *every*
+  // re-render of `ActiveProjectProvider` — including ones driven
+  // by orthogonal state like `dirty`, `saving`, `undoLen` ticking —
+  // would create a fresh `value` object identity. Every component
+  // that calls `useActiveProject()` would then re-render even if it
+  // only reads, say, `project.name`. Today this is benign because
+  // there are no expensive consumers, but it becomes a real perf
+  // footgun the moment a consumer renders an expensive subtree
+  // (3D viewport overlay, large schedule table, etc.).
+  //
+  // The dep list enumerates every value (state + every callback)
+  // that the object exposes; each callback is itself `useCallback`-
+  // wrapped above so its identity is stable across renders where
+  // its own deps haven't changed. The end result: `value` keeps
+  // referential equality across renders that don't actually change
+  // any of the exposed state, satisfying React's `Object.is`-based
+  // context-propagation bail-out.
+  const value = useMemo<ActiveProjectState>(
+    () => ({
+      project,
+      loading,
+      dirty,
+      saving,
+      undoLen,
+      redoLen,
+      openProject,
+      createProject,
+      closeProject,
+      saveProject,
+      refreshProject,
+      markDirty,
+      markClean,
+      setUndoRedo,
+    }),
+    [
+      project,
+      loading,
+      dirty,
+      saving,
+      undoLen,
+      redoLen,
+      openProject,
+      createProject,
+      closeProject,
+      saveProject,
+      refreshProject,
+      markDirty,
+      markClean,
+      setUndoRedo,
+    ],
+  );
 
   return (
     <ActiveProjectContext.Provider value={value}>
