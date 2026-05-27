@@ -97,7 +97,13 @@ export function ScheduleView({
           className="bim-schedule__regen"
           data-testid="schedule-regenerate"
           onClick={regenerate}
-          disabled={busy}
+          // Disabled when busy *or* the parent hasn't imported an IFC
+          // yet (sourcePath === ""). Without the empty-string guard the
+          // bridge would receive an empty path and fail on the native
+          // side; the in-process fallback hides the regression in
+          // tests, so the disabled state is the user-facing fix.
+          disabled={busy || sourcePath === ""}
+          title={sourcePath === "" ? "Import an IFC first" : undefined}
         >
           {busy ? "Generating…" : "Regenerate"}
         </button>

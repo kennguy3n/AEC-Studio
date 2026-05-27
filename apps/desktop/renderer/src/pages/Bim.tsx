@@ -286,14 +286,14 @@ export function Bim() {
       ? `${projectPath}/schedules/${kind}.xlsx`
       : `${kind}.xlsx`;
 
-  const onScheduleGenerate = async (kind: ScheduleKind) => {
-    if (!ifcSourcePath) return;
-    const outPath = scheduleOutPathForKind(kind);
-    const summary = await aec.bim.generateSchedule({
-      sourcePath: ifcSourcePath,
-      outPath,
-      kind,
-    });
+  // Consume the summary that `ScheduleView.regenerate()` already
+  // produced — calling `generateSchedule` a second time would write
+  // the XLSX twice with identical content. We only need to read the
+  // rows back from the file the bridge just wrote.
+  const onScheduleGenerate = async (
+    kind: ScheduleKind,
+    summary: { outPath: string; rows: number },
+  ) => {
     let rows: ScheduleRow[] = [];
     if (summary.rows > 0) {
       try {
@@ -302,7 +302,8 @@ export function Bim() {
         });
         rows = readback.rows as ScheduleRow[];
       } catch {
-        // Readback failed.
+        // Readback failed — leave the inline preview empty; the
+        // XLSX on disk is still authoritative.
       }
     }
     setSchedules((prev) => ({ ...prev, [kind]: rows }));
@@ -340,8 +341,8 @@ export function Bim() {
           sourcePath={scheduleSourcePath}
           outPathForKind={scheduleOutPathForKind}
           rowsByKind={schedules}
-          onGenerate={(kind, _summary) => {
-            void onScheduleGenerate(kind);
+          onGenerate={(kind, summary) => {
+            void onScheduleGenerate(kind, summary);
           }}
         />
         <ValidatorPanel

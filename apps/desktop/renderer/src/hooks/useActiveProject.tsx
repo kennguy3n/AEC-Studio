@@ -142,9 +142,11 @@ export function ActiveProjectProvider({
       const summary = (await aec.project.save(project.path)) as ProjectSummary;
       setProject(summary);
       setDirty(false);
-    } catch {
-      // Save failed — keep dirty flag so auto-save retries.
     } finally {
+      // `dirty` stays true on failure so the auto-save timer (or the
+      // user's next mutation) re-arms a retry without explicit reset
+      // logic here; the catch in the caller decides whether to surface
+      // the failure as a toast (manual save) or swallow it (auto-save).
       setSaving(false);
     }
   }, [project]);
@@ -157,7 +159,13 @@ export function ActiveProjectProvider({
     }
     autoSaveTimerRef.current = setTimeout(() => {
       autoSaveTimerRef.current = null;
-      void saveProject();
+      // Auto-save is fire-and-forget: a transient failure (network
+      // blip, disk pressure) shouldn't crash the timer or trigger an
+      // error toast — the next mutation will re-arm and retry.
+      saveProject().catch(() => {
+        // Intentional swallow: dirty flag stays set so the next
+        // `markDirty` debounce will retry.
+      });
     }, 5_000);
   }, [saveProject]);
 

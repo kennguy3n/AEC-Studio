@@ -72,4 +72,23 @@ describe("ScheduleView", () => {
     expect(typeof summary.scheduleId).toBe("string");
     expect(summary.outPath).toBe("/test/project.room.xlsx");
   });
+
+  it("disables the Regenerate button when no IFC is imported (empty sourcePath)", () => {
+    const onGenerate = vi.fn();
+    render(
+      <ScheduleView
+        sourcePath=""
+        outPathForKind={baseProps.outPathForKind}
+        rowsByKind={{}}
+        onGenerate={onGenerate}
+      />,
+    );
+    const btn = screen.getByTestId("schedule-regenerate") as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
+    // Clicking a disabled button must not invoke the parent callback;
+    // without the empty-string guard the bridge would receive an empty
+    // path and fail on the native side.
+    fireEvent.click(btn);
+    expect(onGenerate).not.toHaveBeenCalled();
+  });
 });

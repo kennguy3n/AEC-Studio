@@ -337,6 +337,13 @@ const api = {
       // backend falls back to the generic "Project" label — see
       // `crates/aec_bridge/src/napi_api.rs::deliver_build_pack`.
       projectName?: string;
+      // Explicit project path for the "archived project" flow
+      // documented in `bridge.ts`. When omitted the main-process IPC
+      // handler falls back to `peekActiveProjectPath()` (the active
+      // project). Aligning the preload type with the handler keeps
+      // the renderer-side call type-safe end-to-end instead of
+      // relying on structural-typing leakage at the IPC boundary.
+      projectPath?: string;
       includeRenders?: boolean;
       includeSheets?: boolean;
       includeIfc?: boolean;

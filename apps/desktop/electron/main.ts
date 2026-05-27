@@ -1,6 +1,7 @@
-import { app, BrowserWindow, session } from "electron";
+import { app, BrowserWindow, dialog, session } from "electron";
 import * as path from "path";
 import { registerIpcHandlers } from "./ipc";
+import { registerDialogIpcHandlers } from "./dialog-ipc";
 
 let mainWindow: BrowserWindow | null = null;
 
@@ -68,6 +69,38 @@ function createWindow(): void {
 
 app.whenReady().then(() => {
   registerIpcHandlers();
+  // Dialog IPC handlers (`dialog:openFile`, `dialog:openDirectory`,
+  // `dialog:saveFile`) live in a separate module so the renderer-side
+  // file-picker calls don't get rejected because the channels aren't
+  // registered on the main process. Without this, every `aec.dialog.*`
+  // call (BIM Import IFC, Draft DXF import/export, Deliver Build Pack
+  // save dialog, Home Open Project directory picker) would silently
+  // fail in production — Vitest hides the bug because the in-process
+  // renderer backend short-circuits with `canceled: true`.
+  //
+  // `mainWindow` is `null` here (we register before `createWindow()`)
+  // but the handlers re-evaluate `getActiveWindow()` on every IPC
+  // call, so by the time the user clicks "Import" the BrowserWindow
+  // reference is live. Registering early keeps the channels available
+  // for any renderer that loads before the window is shown.
+  // Electron's `dialog.showOpenDialog` / `showSaveDialog` are overloaded
+  // — one form takes `(BrowserWindow, options)` (modal/parented), the
+  // other `(options)` (un-parented). Our `DialogModule` contract takes
+  // `BrowserWindow | null`; this adapter dispatches to the correct
+  // overload so a null parent doesn't crash the type checker.
+  registerDialogIpcHandlers({
+    dialog: {
+      showOpenDialog: (window, options) =>
+        window === null
+          ? dialog.showOpenDialog(options)
+          : dialog.showOpenDialog(window, options),
+      showSaveDialog: (window, options) =>
+        window === null
+          ? dialog.showSaveDialog(options)
+          : dialog.showSaveDialog(window, options),
+    },
+    getActiveWindow: () => mainWindow,
+  });
   createWindow();
 
   app.on("activate", () => {
