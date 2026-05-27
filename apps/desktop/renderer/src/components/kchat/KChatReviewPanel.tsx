@@ -63,6 +63,12 @@ export function KChatReviewPanel(props: KChatReviewPanelProps) {
   // and the polling cadence honest.
   const sinceIsoRef = useRef<string | null>(null);
 
+  // Tracks the threadId that is currently "active". fetchOnce captures
+  // `props.threadId` at call time and checks this ref after every await;
+  // if they diverge, a threadId switch happened mid-flight and the
+  // response belongs to the old thread — it is silently discarded.
+  const threadIdRef = useRef(props.threadId);
+
   // Reset all accumulated per-thread state when the parent passes a
   // different `threadId` (e.g. the user opened a project whose
   // `KChatConfig::default_thread_id` differs from the previous
@@ -86,46 +92,46 @@ export function KChatReviewPanel(props: KChatReviewPanelProps) {
   // banner from the previous thread doesn't bleed into the new one
   // before its first poll completes.
   useEffect(() => {
+    threadIdRef.current = props.threadId;
     sinceIsoRef.current = null;
     setComments([]);
     setError(null);
   }, [props.threadId]);
 
   const fetchOnce = useCallback(async () => {
+    // Capture the threadId at call time so we can detect a mid-flight
+    // switch after each await below.
+    const capturedThread = props.threadId;
     setLoading(true);
     try {
       const statusReport = await aec.kchat.status();
+      if (threadIdRef.current !== capturedThread) return;
       const isOffline =
         statusReport.state !== "connected" &&
         statusReport.publisherKind !== "local_ipc";
       setOffline(isOffline);
       if (isOffline) {
-        // Offline isn't an error condition — the StatusBar chip is
-        // the canonical reconnect affordance. Clear any stale error
-        // so re-connect cycles don't leave a phantom message.
         setError(null);
         return;
       }
       const res = await aec.kchat.ingestReviews({
-        threadId: props.threadId,
+        threadId: capturedThread,
         sinceIso: sinceIsoRef.current,
       });
+      // After the second await: if a threadId switch landed while
+      // we were waiting on the bridge, discard this stale response
+      // so old-thread comments don't leak into the new thread's
+      // comment list and the sinceIso cursor stays clean.
+      if (threadIdRef.current !== capturedThread) return;
       const parsed = parseComments(res.commentsJson);
       if (parsed.length > 0) {
         setComments((prev) => mergeAndSort(prev, parsed));
         const newest = newestTimestamp(parsed);
         if (newest) sinceIsoRef.current = newest;
       }
-      // Successful round-trip — clear any prior error so the
-      // banner disappears once the bridge recovers.
       setError(null);
     } catch (e) {
-      // Catch *every* IPC error here. The two `void fetchOnce()`
-      // call sites below are fire-and-forget, and the sibling
-      // `KChatStatusIndicator` / `Deliver.tsx` pollers also catch
-      // and swallow IPC errors on the same pattern. We surface
-      // the message inline so the user gets a why; the next
-      // successful poll clears it.
+      if (threadIdRef.current !== capturedThread) return;
       const msg = e instanceof Error ? e.message : String(e);
       setError(msg);
     } finally {

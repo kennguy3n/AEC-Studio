@@ -433,4 +433,90 @@ describe("KChatReviewPanel", () => {
       expect(list.textContent).not.toContain("alice");
     });
   });
+
+  // Regression test for Devin Review finding: an in-flight fetchOnce
+  // from the previous thread resolving *after* a threadId prop change
+  // must not corrupt the new thread's comment list or sinceIso cursor.
+  // The fix uses a `threadIdRef` guard that discards stale responses.
+  it("discards in-flight fetch results from a stale thread after threadId changes", async () => {
+    // The status call always reports connected.
+    vi.spyOn(aec.kchat, "status").mockResolvedValue({
+      state: "connected",
+      publisherKind: "local_ipc",
+      instanceJson: JSON.stringify({
+        socket_path: "/tmp/kchat.sock",
+        version: "1.0.0",
+        health: "ok",
+      }),
+      defaultThreadId: null,
+    });
+
+    // ingestReviews: thread-a resolves after a 100 ms delay (simulating
+    // a slow network); thread-b resolves instantly.
+    let resolveSlowA: (() => void) | null = null;
+    const ingest = vi
+      .spyOn(aec.kchat, "ingestReviews")
+      .mockImplementation(async ({ threadId }) => {
+        if (threadId === "thread-a") {
+          await new Promise<void>((r) => {
+            resolveSlowA = r;
+          });
+          return {
+            threadId,
+            commentsJson: JSON.stringify([
+              {
+                comment_id: "stale-a1",
+                author: "alice",
+                text: "stale from old thread",
+                posted_at: "2026-05-27T00:00:00Z",
+                artifact_id: null,
+              },
+            ]),
+            cardsJson: "[]",
+          };
+        }
+        return {
+          threadId,
+          commentsJson: JSON.stringify([
+            {
+              comment_id: "b1",
+              author: "bob",
+              text: "comment on thread B",
+              posted_at: "2026-05-27T00:01:00Z",
+              artifact_id: null,
+            },
+          ]),
+          cardsJson: "[]",
+        };
+      });
+
+    // Mount with thread-a — its fetch is now waiting on the deferred promise.
+    const { rerender } = render(<KChatReviewPanel threadId="thread-a" />);
+    // Wait for the status call at least.
+    await waitFor(() => expect(ingest).toHaveBeenCalled());
+
+    // Switch to thread-b *before* thread-a's ingest resolves.
+    rerender(<KChatReviewPanel threadId="thread-b" />);
+
+    // thread-b should resolve and render bob's comment.
+    await waitFor(() => {
+      const list = screen.getByTestId("kchat-review-list");
+      expect(list.textContent).toContain("bob");
+    });
+
+    // Now let the stale thread-a response land.
+    expect(resolveSlowA).not.toBeNull();
+    resolveSlowA!();
+
+    // Give the event loop a chance to process the resolved promise.
+    await new Promise((r) => setTimeout(r, 50));
+
+    // The stale "alice" comment must NOT appear — the threadIdRef
+    // guard discarded the response.
+    const list = screen.getByTestId("kchat-review-list");
+    expect(list.textContent).not.toContain("alice");
+    expect(list.textContent).toContain("bob");
+    const items = list.querySelectorAll("li");
+    expect(items.length).toBe(1);
+  });
 });
