@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 
 use aec_bridge::{BridgeConfig, BridgeService};
 use aec_cad::dxf::{DxfDocument, DxfEntity, DxfLine, DxfWriter};
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use tempfile::TempDir;
 
 fn workspace_templates_dir() -> PathBuf {
@@ -117,19 +117,30 @@ fn bench_project_open(c: &mut Criterion) {
 }
 
 /// Bench 3: DXF import — 10 000 LINE entities written to a real
-/// on-disk DXF, then re-imported into a fresh project. The DXF
-/// fixture is regenerated per iteration so the disk read isn't
-/// served exclusively from the page cache after a warm-up.
+/// on-disk DXF, then re-imported into a *fresh* project on every
+/// iteration. The acceptance criterion targets "open a fresh
+/// project and import a 10 k-entity DXF" — not "import a 10 k-
+/// entity DXF on top of N previous 10 k-entity imports". Using
+/// `iter_batched` with `BatchSize::PerIteration` runs the setup
+/// (fresh project, fresh DXF on disk) outside the timed block and
+/// reports timings only for the `draft_import_dxf` call, which is
+/// the operation the acceptance criterion measures.
+///
+/// `BatchSize::PerIteration` is required (rather than the default
+/// `SmallInput`) because the setup is too heavy to run inside the
+/// inner timing loop and the resulting `(summary, _scratch_tempdir,
+/// dxf_path)` triple owns filesystem resources that must be freed
+/// (drop the tempdir, drop the project state) between iterations
+/// so the bench stays reproducible across runs of varying length.
 fn bench_dxf_import_10k(c: &mut Criterion) {
     let mut group = c.benchmark_group("phase13_acceptance_dxf_import_10k");
     group.sample_size(10);
     group.bench_function("draft_import_dxf_10k_lines", |b| {
-        let (cfg, _g) = make_config();
-        let mut svc = BridgeService::new(cfg, [0x4Cu8; 32]).expect("boot bridge");
-        let summary = svc
-            .project_create_from_template("interior.apartment", "DXF Bench")
-            .expect("create project");
-        // Generate a real DXF document with 10 000 LINE entities.
+        // Pre-serialise the DXF text once — the parse cost is
+        // already captured by the timed `draft_import_dxf` call,
+        // and re-running the 10k-entity serialization on every
+        // iteration would dwarf the timed import on slower
+        // machines, masking the metric we're trying to track.
         let mut doc = DxfDocument::new();
         for i in 0..10_000_u32 {
             let f = i as f64;
@@ -140,18 +151,47 @@ fn bench_dxf_import_10k(c: &mut Criterion) {
             }));
         }
         let dxf_text = DxfWriter::write_to_string(&doc).expect("serialize DXF");
-        let scratch = tempfile::tempdir().unwrap();
-        let dxf_path = scratch.path().join("ten_k.dxf");
-        let mut f = std::fs::File::create(&dxf_path).unwrap();
-        f.write_all(dxf_text.as_bytes()).unwrap();
-        drop(f);
-        let dxf_path_str = dxf_path.to_string_lossy().into_owned();
-        b.iter(|| {
-            let res = svc
-                .draft_import_dxf(&summary.path, &dxf_path_str)
-                .expect("draft_import_dxf");
-            black_box(res);
-        });
+        let mut counter: u64 = 0;
+        b.iter_batched(
+            || {
+                // Fresh project + fresh DXF file per iteration so
+                // each timed `draft_import_dxf` call sees an
+                // empty-graph project, matching the acceptance
+                // criterion ("open a fresh project + import a 10k-
+                // entity DXF"). Without this, iteration N would
+                // measure import-on-top-of-(N-1)×10k entities, and
+                // Criterion's statistics would be biased toward
+                // the cumulatively-larger graphs.
+                let (cfg, state_guard) = make_config();
+                let mut svc =
+                    BridgeService::new(cfg, [0x4Cu8; 32]).expect("boot bridge for DXF bench");
+                counter += 1;
+                let summary = svc
+                    .project_create_from_template(
+                        "interior.apartment",
+                        &format!("DXF Bench {counter}"),
+                    )
+                    .expect("create fresh project for DXF bench");
+                let scratch = tempfile::tempdir().expect("scratch tempdir for DXF fixture");
+                let dxf_path = scratch.path().join("ten_k.dxf");
+                let mut f = std::fs::File::create(&dxf_path).expect("create DXF fixture file");
+                f.write_all(dxf_text.as_bytes())
+                    .expect("write DXF fixture bytes");
+                drop(f);
+                let dxf_path_str = dxf_path.to_string_lossy().into_owned();
+                // Hand the iteration body owned handles so the
+                // tempdir + state-dir survive past the timed block
+                // and only drop in the post-iteration phase.
+                (svc, state_guard, scratch, summary, dxf_path_str)
+            },
+            |(mut svc, _state_guard, _scratch, summary, dxf_path_str)| {
+                let res = svc
+                    .draft_import_dxf(&summary.path, &dxf_path_str)
+                    .expect("draft_import_dxf");
+                black_box(res);
+            },
+            BatchSize::PerIteration,
+        );
     });
     group.finish();
 }
