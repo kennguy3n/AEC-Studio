@@ -2623,3 +2623,136 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
     }
     Some(out)
 }
+
+#[cfg(test)]
+mod chain_verification_js_tests {
+    //! Locks the conversion from `aec_audit::ChainVerification` to
+    //! `ChainVerificationJs` so that every `BreakReason` variant maps to
+    //! a stable, documented `break_reason` string. The Rust enum and the
+    //! TypeScript `AuditChainVerification.breakReason` union must stay
+    //! in lock-step — if a new variant is added in `aec_audit`, this
+    //! test (plus the non-exhaustive-match compile error) is the gate
+    //! that forces the bridge layer and `apps/desktop/electron/bridge.ts`
+    //! to be updated together.
+    use super::*;
+    use aec_audit::{BreakReason, ChainStatus, ChainVerification};
+    use std::path::PathBuf;
+
+    fn convert(status: ChainStatus) -> ChainVerificationJs {
+        let v = ChainVerification {
+            status,
+            entries_checked: 0,
+            entries_legacy_linkage_only: 0,
+            files_checked: vec![PathBuf::from("audit/test.jsonl")],
+            head_hash: "blake3:genesis".to_string(),
+        };
+        v.into()
+    }
+
+    #[test]
+    fn ok_status_clears_break_fields() {
+        let js = convert(ChainStatus::Ok);
+        assert_eq!(js.status, "ok");
+        assert!(js.break_reason.is_none());
+        assert!(js.break_detail.is_none());
+        assert!(js.break_file.is_none());
+        assert!(js.break_line.is_none());
+    }
+
+    #[test]
+    fn prev_hash_mismatch_maps_to_stable_string() {
+        let js = convert(ChainStatus::BrokenAt {
+            file: PathBuf::from("audit/test.jsonl"),
+            line: 7,
+            reason: BreakReason::PrevHashMismatch {
+                expected: "blake3:e".to_string(),
+                found: "blake3:f".to_string(),
+            },
+        });
+        assert_eq!(js.status, "broken_at");
+        assert_eq!(js.break_reason.as_deref(), Some("prev_hash_mismatch"));
+        assert!(js.break_detail.unwrap().contains("blake3:e"));
+        assert_eq!(js.break_line, Some(7));
+    }
+
+    #[test]
+    fn hash_recompute_mismatch_maps_to_stable_string() {
+        let js = convert(ChainStatus::BrokenAt {
+            file: PathBuf::from("audit/test.jsonl"),
+            line: 1,
+            reason: BreakReason::HashRecomputeMismatch {
+                stored: "blake3:a".to_string(),
+                recomputed: "blake3:b".to_string(),
+            },
+        });
+        assert_eq!(js.break_reason.as_deref(), Some("hash_recompute_mismatch"));
+    }
+
+    #[test]
+    fn unsupported_hash_version_maps_to_stable_string() {
+        let js = convert(ChainStatus::BrokenAt {
+            file: PathBuf::from("audit/test.jsonl"),
+            line: 1,
+            reason: BreakReason::UnsupportedHashVersion {
+                version: 99,
+                supported: vec![1, 2],
+            },
+        });
+        assert_eq!(js.break_reason.as_deref(), Some("unsupported_hash_version"));
+        let detail = js.break_detail.unwrap();
+        assert!(detail.contains("99"));
+        assert!(detail.contains("[1, 2]"));
+    }
+
+    #[test]
+    fn legacy_hash_version_rejected_maps_to_stable_string() {
+        // The strict_v2_only verify mode emits this variant when a v1
+        // entry is found. The bridge must translate it to the
+        // documented `"legacy_hash_version_rejected"` string so the
+        // renderer can pattern-match without runtime surprise.
+        let js = convert(ChainStatus::BrokenAt {
+            file: PathBuf::from("audit/legacy.jsonl"),
+            line: 3,
+            reason: BreakReason::LegacyHashVersionRejected {
+                version: 1,
+                required_min: 2,
+            },
+        });
+        assert_eq!(js.status, "broken_at");
+        assert_eq!(
+            js.break_reason.as_deref(),
+            Some("legacy_hash_version_rejected")
+        );
+        let detail = js.break_detail.unwrap();
+        assert!(detail.contains("hash_version = 1"));
+        assert!(detail.contains("required minimum = 2"));
+        assert_eq!(js.break_line, Some(3));
+        assert_eq!(js.break_file.as_deref(), Some("audit/legacy.jsonl"));
+    }
+
+    #[test]
+    fn malformed_entry_maps_to_stable_string() {
+        let js = convert(ChainStatus::BrokenAt {
+            file: PathBuf::from("audit/test.jsonl"),
+            line: 1,
+            reason: BreakReason::MalformedEntry {
+                message: "expected `}`".to_string(),
+            },
+        });
+        assert_eq!(js.break_reason.as_deref(), Some("malformed_entry"));
+        assert_eq!(js.break_detail.as_deref(), Some("expected `}`"));
+    }
+
+    #[test]
+    fn io_error_maps_to_stable_string() {
+        let js = convert(ChainStatus::BrokenAt {
+            file: PathBuf::from("audit/test.jsonl"),
+            line: 1,
+            reason: BreakReason::Io {
+                message: "permission denied".to_string(),
+            },
+        });
+        assert_eq!(js.break_reason.as_deref(), Some("io"));
+        assert_eq!(js.break_detail.as_deref(), Some("permission denied"));
+    }
+}
