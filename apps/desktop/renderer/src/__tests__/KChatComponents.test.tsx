@@ -230,4 +230,42 @@ describe("KChatReviewPanel", () => {
     expect(list.textContent).toContain("alice");
     expect(list.textContent).toContain("Move the window");
   });
+
+  // Regression test for Devin Review finding "fetchOnce lacks catch
+  // block, producing unhandled promise rejections on every poll
+  // failure". `fetchOnce` must catch every IPC error so the two
+  // `void fetchOnce()` fire-and-forget call sites don't leak
+  // unhandled rejections, and must surface the failure inline so
+  // the user can see *why* the panel is stale rather than the
+  // panel silently presenting stale data.
+  it("renders an inline error banner when the bridge throws and keeps prior comments visible", async () => {
+    let unhandled: unknown = null;
+    const handler = (e: PromiseRejectionEvent) => {
+      unhandled = e.reason;
+    };
+    window.addEventListener("unhandledrejection", handler);
+
+    vi.spyOn(aec.kchat, "status").mockResolvedValue({
+      state: "connected",
+      publisherKind: "local_ipc",
+      instanceJson: JSON.stringify({
+        socket_path: "/tmp/kchat.sock",
+        version: "1.0.0",
+        health: "ok",
+      }),
+      defaultThreadId: null,
+    });
+    vi.spyOn(aec.kchat, "ingestReviews").mockRejectedValue(
+      new Error("bridge timed out"),
+    );
+
+    render(<KChatReviewPanel threadId="kchat-default" />);
+    const banner = await screen.findByTestId("kchat-review-error");
+    expect(banner.textContent).toContain("bridge timed out");
+    // No unhandled promise rejection from the fire-and-forget
+    // call sites.
+    expect(unhandled).toBeNull();
+
+    window.removeEventListener("unhandledrejection", handler);
+  });
 });

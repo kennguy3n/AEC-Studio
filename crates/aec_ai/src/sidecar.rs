@@ -183,9 +183,14 @@ fn poll_until_healthy(
 /// Restart policy with exponential backoff. Tracks the number of consecutive
 /// failures and computes the next delay.
 ///
-/// The initial delay is 500 ms and doubles on each failure, capped at 30 s.
-/// Calling [`RestartPolicy::reset`] after a successful health check resets the
-/// counter to zero.
+/// Delay schedule: each call to [`Self::record_failure`] first bumps the
+/// consecutive-failure counter and then returns `500 ms * 2^counter`, capped
+/// at the configured `max_delay` (default 30 s). So the first failure
+/// returns 1 s (= 500 ms × 2), the second returns 2 s, the third 4 s, etc.
+/// The base of 500 ms only shows up in the *pre*-increment state and is
+/// never actually returned. Calling [`RestartPolicy::reset`] after a
+/// successful health check resets the counter to zero, restarting the
+/// schedule on the next failure.
 #[derive(Debug, Clone)]
 pub struct RestartPolicy {
     consecutive_failures: u32,

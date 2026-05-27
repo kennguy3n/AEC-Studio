@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import type { AecApi } from "../../../../electron/preload";
 import { aec } from "../../api/aec";
 
 /**
@@ -20,11 +21,14 @@ import { aec } from "../../api/aec";
  * Studio and the user wants to wire up the connection without
  * waiting for the next 5-s poll tick.
  */
-export type KChatStatus = {
-  state: "connected" | "reconnecting" | "disconnected";
-  publisherKind: "local_ipc" | "in_memory";
-  instanceJson: string | null;
-};
+// Derived from the IPC contract in preload.ts so adding a field to
+// `kchat:status` (e.g. `defaultThreadId`) doesn't silently get
+// stripped here. The chip only renders `state`, `publisherKind`,
+// and `instanceJson` — `defaultThreadId` is consumed by `Deliver`
+// — but typing the full payload keeps the contract honest and the
+// `as KChatStatus` casts on lines 39 / 58 stop being implicit
+// subset coercions.
+export type KChatStatus = Awaited<ReturnType<AecApi["kchat"]["status"]>>;
 
 const POLL_INTERVAL_MS = 5_000;
 

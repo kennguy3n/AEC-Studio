@@ -43,6 +43,16 @@ export function KChatReviewPanel(props: KChatReviewPanelProps) {
   const [comments, setComments] = useState<ReviewCommentRow[]>([]);
   const [offline, setOffline] = useState(false);
   const [loading, setLoading] = useState(false);
+  // Last poll error message, if any. Surfaced inline below the
+  // refresh button so the user knows *why* the panel is stale,
+  // rather than silently presenting old comments. Cleared on the
+  // next successful poll. Holding this in state (rather than
+  // re-throwing) is deliberate: we need the component to keep its
+  // last-known-good comment list visible, and we need
+  // `void fetchOnce()` at the call sites not to produce
+  // unhandled promise rejections every 30 s when the bridge is
+  // misbehaving.
+  const [error, setError] = useState<string | null>(null);
   // The `since_iso` cursor lives in a ref (not state) on purpose: it
   // advances on every successful ingest, and storing it in state would
   // churn the `fetchOnce` callback identity on every batch of new
@@ -61,7 +71,13 @@ export function KChatReviewPanel(props: KChatReviewPanelProps) {
         statusReport.state !== "connected" &&
         statusReport.publisherKind !== "local_ipc";
       setOffline(isOffline);
-      if (isOffline) return;
+      if (isOffline) {
+        // Offline isn't an error condition — the StatusBar chip is
+        // the canonical reconnect affordance. Clear any stale error
+        // so re-connect cycles don't leave a phantom message.
+        setError(null);
+        return;
+      }
       const res = await aec.kchat.ingestReviews({
         threadId: props.threadId,
         sinceIso: sinceIsoRef.current,
@@ -72,6 +88,18 @@ export function KChatReviewPanel(props: KChatReviewPanelProps) {
         const newest = newestTimestamp(parsed);
         if (newest) sinceIsoRef.current = newest;
       }
+      // Successful round-trip — clear any prior error so the
+      // banner disappears once the bridge recovers.
+      setError(null);
+    } catch (e) {
+      // Catch *every* IPC error here. The two `void fetchOnce()`
+      // call sites below are fire-and-forget, and the sibling
+      // `KChatStatusIndicator` / `Deliver.tsx` pollers also catch
+      // and swallow IPC errors on the same pattern. We surface
+      // the message inline so the user gets a why; the next
+      // successful poll clears it.
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(msg);
     } finally {
       setLoading(false);
     }
@@ -114,6 +142,16 @@ export function KChatReviewPanel(props: KChatReviewPanelProps) {
           {loading ? "Polling…" : "Refresh"}
         </button>
       </header>
+      {error ? (
+        <p
+          data-testid="kchat-review-error"
+          role="status"
+          className="kchat-review-panel__error"
+        >
+          Couldn't reach KChat: {error}. Showing last-known reviews; will retry
+          on the next poll.
+        </p>
+      ) : null}
       {comments.length === 0 ? (
         <p
           data-testid="kchat-review-empty"
