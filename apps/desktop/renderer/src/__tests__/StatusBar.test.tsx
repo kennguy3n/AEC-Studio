@@ -273,4 +273,114 @@ describe("StatusBar — render job polling gates on active project", () => {
 
     listJobsSpy.mockRestore();
   });
+
+  it("returns a cleanup function on every branch of the render-job effect (close→open→close→open does not leak intervals)", async () => {
+    // Devin Review (commit be262cd) flagged that the no-project
+    // early-return branch fell through `return;` (implicit undefined)
+    // rather than returning a cleanup closure. React tolerates a
+    // bare return — `undefined` is interpreted as "no cleanup needed"
+    // — but the asymmetric contract is a footgun: a future
+    // contributor adding any async work above the `return;` would
+    // silently leave it running after unmount because the no-project
+    // branch never runs the cleanup-emission path. The fix returns
+    // `() => {}` from the early branch.
+    //
+    // This test pins the symmetric-cleanup contract by cycling the
+    // active project null → A → null → B and asserting that the
+    // total interval count is bounded — if cleanup ever leaked an
+    // interval (because the no-project branch's return value tripped
+    // up React's deps-changed teardown sequence), the spy would
+    // accumulate calls from BOTH the closed-project's stale interval
+    // AND the newly-mounted project's interval.
+    const listJobsSpy = vi
+      .spyOn(aec.render, "listJobs")
+      .mockResolvedValue([]);
+
+    function CycleHarness() {
+      const { openProject, closeProject } = useActiveProject();
+      return (
+        <div>
+          <StatusBar />
+          <button
+            type="button"
+            data-testid="open-A"
+            onClick={() => {
+              void openProject("/tmp/StatusBarCycleA.aecstudio");
+            }}
+          >
+            open A
+          </button>
+          <button
+            type="button"
+            data-testid="open-B"
+            onClick={() => {
+              void openProject("/tmp/StatusBarCycleB.aecstudio");
+            }}
+          >
+            open B
+          </button>
+          <button
+            type="button"
+            data-testid="close"
+            onClick={() => {
+              void closeProject();
+            }}
+          >
+            close
+          </button>
+        </div>
+      );
+    }
+
+    render(
+      <ActiveProjectProvider>
+        <CycleHarness />
+      </ActiveProjectProvider>,
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // null → A: one initial tick.
+    await act(async () => {
+      screen.getByTestId("open-A").click();
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    const afterOpenA = listJobsSpy.mock.calls.length;
+    expect(afterOpenA).toBeGreaterThan(0);
+
+    // A → null: cleanup runs, count resets, no new ticks for 15s.
+    await act(async () => {
+      screen.getByTestId("close").click();
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(15_000);
+    });
+    expect(listJobsSpy.mock.calls.length).toBe(afterOpenA);
+
+    // null → B: the no-project branch's `return () => {}` cleanup
+    // ran cleanly on the previous transition, so this open mounts a
+    // fresh interval with exactly one initial tick — no leaked
+    // interval from the prior closed state.
+    await act(async () => {
+      screen.getByTestId("open-B").click();
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    const afterOpenB = listJobsSpy.mock.calls.length;
+    expect(afterOpenB).toBe(afterOpenA + 1);
+
+    // One more 5s window → exactly one more tick (no leaked interval
+    // doubling up the cadence).
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_000);
+    });
+    expect(listJobsSpy.mock.calls.length).toBe(afterOpenB + 1);
+
+    listJobsSpy.mockRestore();
+  });
 });

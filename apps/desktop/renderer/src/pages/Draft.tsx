@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { aec } from "../api/aec";
 import { DraftToolbar, DraftTool } from "../components/draft/DraftToolbar";
 import {
@@ -40,6 +40,28 @@ export function Draft() {
     primaryType: null,
     layer: null,
   });
+
+  // Reset per-project state on project transitions. Today this fires
+  // only on initial mount because `RequireProject` unmounts the Draft
+  // page on every project switch (so `useState` resets naturally) —
+  // but the unmount-on-switch invariant is a route-guard convention,
+  // not a contract the page itself owns. Any future in-page project
+  // picker, a `Recent project` jump from a side panel, or any flow
+  // that calls `openProject` without navigating away from `/draft`
+  // would silently leak project A's layers / sheets / command log /
+  // selection into project B. Mirroring the explicit reset that
+  // `Bim.tsx:94-110` and `Render.tsx:90-149` already use makes the
+  // contract structural — the page owns its own per-project reset
+  // regardless of how the parent route handles transitions. The
+  // reset is synchronous (no IPC), so there is no microtask window
+  // for stale state to render in.
+  useEffect(() => {
+    setActiveTool("select");
+    setLayers(DEFAULT_LAYERS);
+    setSheets([{ id: "sheet-default", name: "Sheet 1" }]);
+    setActiveSheet("sheet-default");
+    setLog([]);
+  }, [project?.path]);
 
   const onImportDxf = async () => {
     const dialog = await aec.dialog.openFile({

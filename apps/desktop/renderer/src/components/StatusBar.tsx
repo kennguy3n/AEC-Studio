@@ -58,7 +58,20 @@ export function StatusBar() {
   useEffect(() => {
     if (projectPath === null) {
       setRenderJobCount(0);
-      return;
+      // Return a no-op cleanup so every branch of this effect has a
+      // symmetric contract. React tolerates a bare `return` (the
+      // implicit `undefined` is interpreted as "no cleanup needed"),
+      // but a contributor adding any future async work above this
+      // line — a `requestIdleCallback`, a subscription, a pre-flight
+      // bridge probe — would silently leave that work running after
+      // unmount because the no-project branch never ran the
+      // cleanup-emission path. Returning a no-op makes the contract
+      // explicit: every branch of every effect in this file emits a
+      // cleanup, and any future work added inside the branch must
+      // wire its own teardown into the returned closure (rather than
+      // appending an unguarded async call). Defense-in-depth that
+      // costs one expression and zero runtime branches.
+      return () => {};
     }
     let alive = true;
     const tick = () => {

@@ -5,7 +5,7 @@ import {
   ActiveProjectProvider,
   useActiveProject,
 } from "../hooks/useActiveProject";
-import { ToastProvider } from "../hooks/useToast";
+import { ToastProvider, ToastContainer } from "../hooks/useToast";
 import { aec } from "../api/aec";
 import { useEffect } from "react";
 
@@ -249,5 +249,170 @@ describe("Render page — project switch resets camera selection", () => {
     });
 
     listJobsSpy.mockRestore();
+  });
+});
+
+/**
+ * Devin Review (commit be262cd) flagged that the Render page's main
+ * `useEffect` listed `project?.path` in its deps AND issued the
+ * `aec.runtime.status()` IPC inside the same effect. That call
+ * fetches static hardware/AI tier info (CPU cores, GPU, RAM) — the
+ * value cannot change while the renderer process is running (hot-
+ * plugging a GPU mid-session requires a full app restart). Listing
+ * it under `[project?.path]` re-issued the IPC on every project
+ * transition for zero observable benefit. The fix splits the call
+ * into its own mount-only `useEffect([], [])`, matching the pattern
+ * `StatusBar.tsx:16-27` already uses. This test pins the contract:
+ * one `runtime.status()` call across N project transitions.
+ */
+describe("Render page — runtime.status is mount-only", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("does NOT re-issue aec.runtime.status() on project transitions", async () => {
+    const PATH_A = "/tmp/render-rs-A.aecstudio";
+    const PATH_B = "/tmp/render-rs-B.aecstudio";
+
+    const runtimeStatusSpy = vi
+      .spyOn(aec.runtime, "status")
+      .mockResolvedValue({
+        tier: "Workstation",
+        cpuName: "Test CPU",
+        gpuName: "Test GPU",
+        ramGb: 32,
+      });
+
+    render(
+      <ToastProvider>
+        <ActiveProjectProvider>
+          <OpenSwitch pathA={PATH_A} pathB={PATH_B} />
+          <Render />
+        </ActiveProjectProvider>
+      </ToastProvider>,
+    );
+
+    // Wait for the initial runtime.status() call to land.
+    await waitFor(() => {
+      expect(runtimeStatusSpy).toHaveBeenCalledTimes(1);
+    });
+
+    // Switch to project B. Project transition fires the per-project
+    // effect (cameras / jobs reset + listGraph), but the mount-only
+    // effect must NOT re-run.
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("switch-to-B"));
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // After the project transition: still exactly one
+    // runtime.status() call. The hardware tier is session-scoped, so
+    // re-fetching on every project switch is pure IPC waste.
+    expect(runtimeStatusSpy).toHaveBeenCalledTimes(1);
+
+    runtimeStatusSpy.mockRestore();
+  });
+});
+
+/**
+ * Devin Review (commit be262cd) flagged that `enqueueAll` wrapped
+ * the per-camera loop in `try/finally` with no `catch`. Each call
+ * to `aec.render.enqueueRender` is its own IPC round-trip — a single
+ * bridge-side rejection (stale camera ID, tier-downgrade rejecting
+ * the preset, OOM enqueueing a 4K preset on a Tablet tier) would
+ * propagate as an unhandled promise rejection from the `onClick`
+ * handler. The user saw the cameras that succeeded land in the
+ * queue and the rest silently disappear with no toast, log entry,
+ * or any other affordance. The fix wraps each per-camera enqueue
+ * in its own `try/catch`, accumulates `{cameraId, message}` failure
+ * records, commits whatever succeeded to the queue, and surfaces:
+ *   - a success toast for the cameras that landed (if any)
+ *   - an error toast for the cameras that failed (if any), with the
+ *     camera IDs + bridge error message in the body so the user has
+ *     actionable info.
+ * This test pins the error-path contract.
+ */
+describe("Render page — enqueueAll surfaces partial failure", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("commits the cameras that succeeded and surfaces an error toast for the cameras that failed", async () => {
+    const PATH_A = "/tmp/render-enqueue-A.aecstudio";
+
+    vi.spyOn(aec.command, "listGraph").mockImplementation(
+      async (path: string, kind?: string) => {
+        if (kind !== "camera" || path !== PATH_A) return [];
+        return [
+          { id: "cam_ok", kind: "camera", parent: null, body: { name: "OK" } },
+          {
+            id: "cam_bad",
+            kind: "camera",
+            parent: null,
+            body: { name: "BAD" },
+          },
+        ];
+      },
+    );
+
+    let call = 0;
+    const enqueueSpy = vi
+      .spyOn(aec.render, "enqueueRender")
+      .mockImplementation(async () => {
+        call += 1;
+        if (call === 1) return { jobId: "job_ok" };
+        throw new Error("queue depth exceeded");
+      });
+
+    render(
+      <ToastProvider>
+        <ActiveProjectProvider>
+          <OpenSwitch pathA={PATH_A} pathB={PATH_A} />
+          <Render />
+          <ToastContainer />
+        </ActiveProjectProvider>
+      </ToastProvider>,
+    );
+
+    // Wait for project A's cameras to load.
+    await waitFor(() => {
+      expect(screen.getByTestId("camera-tile-cam_ok")).toBeInTheDocument();
+      expect(screen.getByTestId("camera-tile-cam_bad")).toBeInTheDocument();
+    });
+
+    // Select both cameras then trigger the queue.
+    fireEvent.click(screen.getByTestId("camera-toggle-cam_ok"));
+    fireEvent.click(screen.getByTestId("camera-toggle-cam_bad"));
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("render-enqueue-all"));
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // The good camera's job ID must appear in the queue — partial
+    // success is committed, not rolled back.
+    await waitFor(() => {
+      expect(screen.getByTestId("render-job-job_ok")).toBeInTheDocument();
+    });
+
+    // Both a success toast (for the camera that landed) AND an error
+    // toast (for the camera that failed) must render. The error
+    // toast body must include the failing camera ID and the bridge
+    // error message so the user has actionable info.
+    const toasts = screen.getAllByRole("alert").map((n) => n.textContent ?? "");
+    const okToast = toasts.find((t) => t.includes("Queued 1 render"));
+    const errToast = toasts.find((t) => t.includes("Failed to queue"));
+    expect(okToast).toBeDefined();
+    expect(errToast).toBeDefined();
+    expect(errToast!).toContain("cam_bad");
+    expect(errToast!).toContain("queue depth exceeded");
+
+    enqueueSpy.mockRestore();
   });
 });

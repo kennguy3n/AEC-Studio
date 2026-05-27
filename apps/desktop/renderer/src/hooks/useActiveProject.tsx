@@ -416,7 +416,26 @@ export function ActiveProjectProvider({
   }, [cancelPendingAutoSave, armAutoSave, updateDirty, updateProject]);
 
   const saveProject = useCallback(async () => {
-    if (project === null) return;
+    // Read the active project's path through `projectPathRef` rather
+    // than the captured `project` state. The ref is updated
+    // synchronously alongside every `setProject` site via
+    // `updateProject`, so this read always sees the latest value.
+    // Threading the path through the ref — instead of taking
+    // `project` as a `useCallback` dep — keeps `saveProject`'s
+    // identity stable across saves: `updateProject(summary)` runs on
+    // every successful save (to surface the refreshed `modifiedAt`
+    // timestamp), which creates a fresh `project` object reference
+    // and would otherwise re-derive a new `saveProject` closure on
+    // every save. That cascade churned the `useMemo` context `value`
+    // identity in `ActiveProjectProvider` on every save tick,
+    // re-rendering every consumer that depends on the context even
+    // when their used fields hadn't changed. The same logic applies
+    // to `setActiveProject` push notifications from the main process
+    // — they replace the summary object even when the path is
+    // unchanged, so threading the path through the ref decouples
+    // identity from notification cadence too.
+    const savePath = projectPathRef.current;
+    if (savePath === null) return;
     // Coalesce: if a save is already in flight, return its promise so
     // every caller awaits the same resolution. See `savingPromiseRef`
     // for the full rationale (handles both the auto-save-fires-during-
@@ -436,14 +455,6 @@ export function ActiveProjectProvider({
     // timer may have already fired and dispatched a second save.
     cancelPendingAutoSave();
     setSaving(true);
-    // Capture the project path at save-start. The IIFE uses this to
-    // (a) call the bridge with the project that originated the save
-    // (so a mid-flight project switch doesn't redirect the save to
-    // the wrong file), and (b) gate `setProject` against the current
-    // `projectPathRef` so a stale summary cannot revert the renderer
-    // to a project the user has already left. See `projectPathRef`
-    // for the full race description.
-    const savePath = project.path;
     // `inflight` is referenced from inside its own IIFE so the
     // finally can compare against `savingPromiseRef.current` without
     // racing a fresh inflight that a project-transition callback has
@@ -501,7 +512,7 @@ export function ActiveProjectProvider({
     })();
     savingPromiseRef.current = inflight;
     return inflight;
-  }, [project, cancelPendingAutoSave, updateDirty, updateProject]);
+  }, [cancelPendingAutoSave, updateDirty, updateProject]);
 
   // Keep the `saveProject` ref pointed at the latest closure so the
   // stable `armAutoSave` helper dispatches through the current

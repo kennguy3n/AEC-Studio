@@ -60,6 +60,33 @@ export function Render() {
   >([]);
   const [busy, setBusy] = useState(false);
 
+  // Mount-only: detect the hardware tier and pick the recommended
+  // preset on the user's first visit to the page. The runtime tier
+  // (CPU cores, GPU model, RAM) is static for the renderer process —
+  // hot-plugging a GPU mid-session would require a full app restart
+  // anyway — so re-fetching on every project transition would be
+  // pure IPC waste (matches the `StatusBar.tsx:16-27` pattern for
+  // the same `runtime.status()` call). The recommended-preset
+  // application is also intentionally one-shot via
+  // `userChosePresetRef`: once the user picks a preset, the tier
+  // badge inside `PresetSelector` still advertises the recommended
+  // value so they can switch back manually, but we never overwrite
+  // their explicit choice on a re-render.
+  useEffect(() => {
+    let alive = true;
+    void aec.runtime.status().then((status) => {
+      if (!alive) return;
+      const rs = status as RuntimeStatus;
+      setTier(rs.tier);
+      if (userChosePresetRef.current) return;
+      const recommended = recommendedFor(rs.tier);
+      if (recommended) setPreset(recommended);
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
   useEffect(() => {
     let alive = true;
     // Reset per-project state *synchronously* before any async load.
@@ -88,14 +115,6 @@ export function Render() {
     setJobs([]);
     void aec.render.listJobs().then((rows) => {
       if (alive) setJobs(rows as RenderJob[]);
-    });
-    void aec.runtime.status().then((status) => {
-      if (!alive) return;
-      const rs = status as RuntimeStatus;
-      setTier(rs.tier);
-      if (userChosePresetRef.current) return;
-      const recommended = recommendedFor(rs.tier);
-      if (recommended) setPreset(recommended);
     });
     // Load cameras from the project graph when a project is open.
     if (project?.path) {
@@ -147,25 +166,63 @@ export function Render() {
   const enqueueAll = async () => {
     if (selectedCameras.size === 0) return;
     setBusy(true);
+    // Per-camera enqueue. Each `aec.render.enqueueRender` call is
+    // its own bridge round-trip — a single bad camera (stale ID, an
+    // orphan left over from a project the user navigated away from
+    // before the camera-reset effect committed, or any bridge-side
+    // validation failure such as a tier downgrade rejecting the
+    // requested preset) must NOT silently abort the whole batch with
+    // no user-visible feedback. Pre-Phase 13 the symmetric success
+    // toast was added but the error path was left to bubble up as an
+    // unhandled promise from the `onClick` handler — the user saw
+    // the cameras that succeeded committed to the queue and the
+    // rest disappear without explanation. Wrap each call so we
+    // accumulate the partial result, then surface a success toast
+    // for what landed AND an error toast for what failed (with the
+    // failed camera IDs + bridge error in the message body so the
+    // user can act on it). Any cameras that succeeded before the
+    // first failure DO commit to the queue — they have valid job
+    // IDs and the bridge already accepted them, so it would be
+    // misleading to drop them from the UI. The user-actionable info
+    // is which cameras didn't make it.
+    const newJobs: RenderJob[] = [];
+    const failures: { cameraId: string; message: string }[] = [];
     try {
-      const newJobs: RenderJob[] = [];
       for (const cameraId of selectedCameras) {
-        const result = (await aec.render.enqueueRender({
-          cameraId,
-          preset,
-        })) as { jobId: string };
-        newJobs.push({
-          jobId: result.jobId,
-          status: "queued",
-          preset,
-          progress: 0,
-        });
+        try {
+          const result = (await aec.render.enqueueRender({
+            cameraId,
+            preset,
+          })) as { jobId: string };
+          newJobs.push({
+            jobId: result.jobId,
+            status: "queued",
+            preset,
+            progress: 0,
+          });
+        } catch (err) {
+          failures.push({
+            cameraId,
+            message: err instanceof Error ? err.message : String(err),
+          });
+        }
       }
-      setJobs((prev) => [...newJobs, ...prev]);
-      addToast(
-        "success",
-        `Queued ${newJobs.length} render${newJobs.length === 1 ? "" : "s"}`,
-      );
+      if (newJobs.length > 0) {
+        setJobs((prev) => [...newJobs, ...prev]);
+        addToast(
+          "success",
+          `Queued ${newJobs.length} render${newJobs.length === 1 ? "" : "s"}`,
+        );
+      }
+      if (failures.length > 0) {
+        const detail = failures
+          .map((f) => `${f.cameraId}: ${f.message}`)
+          .join(", ");
+        addToast(
+          "error",
+          `Failed to queue ${failures.length} render${failures.length === 1 ? "" : "s"} (${detail})`,
+        );
+      }
     } finally {
       setBusy(false);
     }

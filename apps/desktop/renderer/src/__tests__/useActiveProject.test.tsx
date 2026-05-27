@@ -1340,6 +1340,69 @@ describe("useActiveProject — context value identity is memoised", () => {
     expect(b).toBe(c);
   });
 
+  it("preserves saveProject callback identity across successful saves", async () => {
+    // Devin Review (commit be262cd) flagged that `saveProject` listed
+    // `project` in its `useCallback` deps. Every successful save runs
+    // `updateProject(refreshedSummary)` which creates a brand-new
+    // `project` object reference (the bridge stamps a new
+    // `modifiedAt`), causing `saveProject` to be re-derived and the
+    // context `value` to be re-memoised with a fresh identity. The
+    // fix threads the active path through `projectPathRef` and drops
+    // `project` from the deps — `saveProject` identity is now stable
+    // across saves. This test seeds a project, captures `saveProject`
+    // before and after a save, and asserts referential equality.
+    const seen: Array<() => Promise<void>> = [];
+    function Spy() {
+      const { saveProject } = useActiveProject();
+      seen.push(saveProject);
+      return null;
+    }
+    function Harness() {
+      const { openProject, saveProject } = useActiveProject();
+      useEffect(() => {
+        void openProject("/tmp/identity-save.aecstudio");
+      }, [openProject]);
+      return (
+        <button
+          type="button"
+          data-testid="trigger-save"
+          onClick={async () => {
+            await saveProject();
+          }}
+        >
+          save
+        </button>
+      );
+    }
+
+    render(
+      <ActiveProjectProvider>
+        <Harness />
+        <Spy />
+      </ActiveProjectProvider>,
+    );
+
+    // Wait for openProject to land its summary on the provider.
+    await waitFor(() => expect(seen.length).toBeGreaterThanOrEqual(2));
+    // Capture identity right before triggering the save.
+    const before = seen[seen.length - 1];
+
+    await act(async () => {
+      screen.getByTestId("trigger-save").click();
+    });
+    // Flush the save IIFE and any post-save state commits.
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // Post-save identity must match pre-save identity. Before the
+    // fix, the new `project` reference would have re-derived
+    // `saveProject` and these would differ.
+    const after = seen[seen.length - 1];
+    expect(after).toBe(before);
+  });
+
   it("preserves value identity across renders that don't mutate provider state", async () => {
     let setExternal: ((n: number) => void) | null = null;
     const seen: object[] = [];
