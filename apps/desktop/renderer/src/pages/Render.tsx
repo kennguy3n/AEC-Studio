@@ -62,6 +62,18 @@ export function Render() {
 
   useEffect(() => {
     let alive = true;
+    // Reset per-project state *synchronously* before any async load.
+    // Without this, the `cameras` list and `selectedCameras` set carry
+    // over from the previous project — the user would see project A's
+    // cameras (or worse, project A's IDs in the selection set) after
+    // opening project B. If the new project has zero cameras, the
+    // async branch below won't run `setCameras`, so the fallback list
+    // takes over and the user is never left looking at a stale list.
+    // The selection set is always cleared because camera IDs are not
+    // valid across projects: enqueueing a render with a stale ID
+    // creates an orphaned job that the native backend will reject.
+    setCameras(FALLBACK_CAMERAS);
+    setSelectedCameras(new Set());
     void aec.render.listJobs().then((rows) => {
       if (alive) setJobs(rows as RenderJob[]);
     });

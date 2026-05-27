@@ -635,6 +635,15 @@ function deliverMock(newId: (prefix: string) => string) {
     async buildPack(params: {
       kind: "concept" | "interior" | "contractor" | "bim";
       outPath: string;
+      // Optional `projectPath` and `projectName` mirror the preload
+      // signature so vitest-side callers and electron-side callers
+      // share the same typed contract. The vitest fixture doesn't
+      // need either value to compute its synthetic inventory, but
+      // accepting them keeps the renderer's `aec.deliver.buildPack`
+      // call site polymorphic across both backends and prevents
+      // structural-typing leakage at the IPC boundary.
+      projectPath?: string;
+      projectName?: string;
       includeRenders?: boolean;
       includeSheets?: boolean;
       includeIfc?: boolean;

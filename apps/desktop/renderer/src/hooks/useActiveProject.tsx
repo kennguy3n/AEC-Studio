@@ -73,6 +73,26 @@ export function ActiveProjectProvider({
   const [redoLen, setRedoLen] = useState(0);
   const autoSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Cancel any pending auto-save before transitioning the active
+  // project (open / create / close). Without this, a debounced timer
+  // armed by `markDirty()` for project A can fire *after* the user has
+  // already opened project B; the timer's captured `saveProject`
+  // closure references project A, so `aec.project.save(A.path)` would
+  // run, its returned summary would `setProject(summaryA)`, and the
+  // main-process `project:save` handler would call
+  // `setActiveProject(summaryA)` — silently re-binding the active
+  // project to A while the renderer header still says "B". Every
+  // subsequent `draft:*` / `deliver:*` / `command:*` call would then
+  // address the wrong project. Centralizing the cancel in one helper
+  // ensures future project-transition branches (e.g., "switch to
+  // recent") inherit the guarantee without re-deriving it.
+  const cancelPendingAutoSave = useCallback(() => {
+    if (autoSaveTimerRef.current !== null) {
+      clearTimeout(autoSaveTimerRef.current);
+      autoSaveTimerRef.current = null;
+    }
+  }, []);
+
   const refreshProject = useCallback(async () => {
     try {
       const result = await aec.project.current();
@@ -90,6 +110,7 @@ export function ActiveProjectProvider({
 
   const openProject = useCallback(
     async (path: string) => {
+      cancelPendingAutoSave();
       setLoading(true);
       try {
         const summary = (await aec.project.open(path)) as ProjectSummary;
@@ -101,11 +122,12 @@ export function ActiveProjectProvider({
         setLoading(false);
       }
     },
-    [],
+    [cancelPendingAutoSave],
   );
 
   const createProject = useCallback(
     async (templateKey: string, name: string) => {
+      cancelPendingAutoSave();
       setLoading(true);
       try {
         const summary = (await aec.project.createFromTemplate(
@@ -120,20 +142,17 @@ export function ActiveProjectProvider({
         setLoading(false);
       }
     },
-    [],
+    [cancelPendingAutoSave],
   );
 
   const closeProject = useCallback(async () => {
-    if (autoSaveTimerRef.current !== null) {
-      clearTimeout(autoSaveTimerRef.current);
-      autoSaveTimerRef.current = null;
-    }
+    cancelPendingAutoSave();
     await aec.project.close();
     setProject(null);
     setDirty(false);
     setUndoLen(0);
     setRedoLen(0);
-  }, []);
+  }, [cancelPendingAutoSave]);
 
   const saveProject = useCallback(async () => {
     if (project === null) return;
@@ -171,11 +190,8 @@ export function ActiveProjectProvider({
 
   const markClean = useCallback(() => {
     setDirty(false);
-    if (autoSaveTimerRef.current !== null) {
-      clearTimeout(autoSaveTimerRef.current);
-      autoSaveTimerRef.current = null;
-    }
-  }, []);
+    cancelPendingAutoSave();
+  }, [cancelPendingAutoSave]);
 
   const setUndoRedo = useCallback(
     (undo: number, redo: number) => {

@@ -189,6 +189,16 @@ export function Deliver(): JSX.Element {
       const result = await aec.deliver.buildPack({
         kind,
         outPath: dialog.path,
+        // Pass `projectPath` explicitly even though the main-process
+        // IPC handler falls back to `peekActiveProjectPath()` when it
+        // is omitted. Threading it through here matches the pattern
+        // every other page (BIM, Draft, Render) follows: the page
+        // *owns* the active-project reference via `useActiveProject`,
+        // and the IPC handler's fallback is defense-in-depth, not the
+        // primary path. Without this, a future refactor that drops
+        // the IPC fallback (e.g. to support multi-project workspaces)
+        // would silently break Deliver export but no other page.
+        projectPath: project?.path,
         projectName: project?.name,
         includeRenders: deliverables.renders,
         includeSheets: deliverables.sheets,
