@@ -206,6 +206,31 @@ impl MemorySampler for FakeSampler {
 /// Pressured, Pressured → Critical, or Normal → Critical directly).
 /// This avoids hammering the mesh cache with eviction calls every 5 s
 /// while the process sits at 78 % RSS.
+///
+/// # Thread model
+///
+/// `MemoryMonitor` is a **single-writer** type. Both
+/// [`Self::add_listener`] and [`Self::sample`] take `&mut self`, so
+/// callers must serialise access — in practice this is the governor's
+/// 5-second tick thread, which is the only writer in the process.
+/// Listeners are dispatched without holding any lock because:
+///
+/// 1. The writer side already has exclusive access via the `&mut self`
+///    borrow, so iterating over `&self.listeners` after pushing a new
+///    state cannot race with another `add_listener` or `sample` call.
+/// 2. Listener implementations are pure functions of the
+///    `MemoryState` argument — none of them re-enter the monitor or
+///    mutate shared state outside their own caches.
+/// 3. Other subsystems that want the latest band without driving
+///    the tick read [`Self::state`] / [`Self::last_sample`]
+///    (both `&self`) — these never race with `sample` because the
+///    single-writer constraint already serialises everything.
+///
+/// If we ever expose multi-threaded *registration* (e.g. plugin
+/// listeners spawned from worker threads), the right fix is to switch
+/// `listeners` to `RwLock<Vec<…>>` with a read-guard scope around the
+/// dispatch loop — not to retrofit a `Mutex` on the existing
+/// single-threaded path.
 pub struct MemoryMonitor {
     sampler: Box<dyn MemorySampler>,
     thresholds: MemoryThresholds,
