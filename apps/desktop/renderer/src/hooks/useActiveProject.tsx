@@ -112,6 +112,35 @@ export function ActiveProjectProvider({
     dirtyRef.current = next;
   }, []);
 
+  // Mirror `project?.path` into a ref so the save IIFE can detect
+  // whether the user transitioned to a different project (or closed
+  // the project entirely) while the save's bridge call was in flight.
+  //
+  // Without this guard, the following race silently corrupts renderer
+  // state: user has project A open and dirty → 5s auto-save fires →
+  // `aec.project.save(A)` dispatched and awaiting disk → user clicks
+  // "Open Project B" → `openProject(B)` sets the active slot to B's
+  // summary and clears dirty → A's save resolves → IIFE unconditionally
+  // calls `setProject(summaryA)`, reverting the renderer to A while
+  // the StatusBar header and every mode page that already re-rendered
+  // against B is now addressing the wrong project on its next bridge
+  // call. The window is small (one disk fsync) but not zero, and grows
+  // with bigger projects, encrypted volumes, and any future bridge
+  // checkpoint path. Every site that mutates the active project MUST
+  // go through `updateProject` below (which assigns both the state
+  // and the ref atomically) to keep the two in lockstep.
+  const projectPathRef = useRef<string | null>(null);
+
+  // Atomic project mutator. Single entry point for changing the
+  // active project — assigns React state and the synchronous ref
+  // mirror in one place so the two cannot drift. Same rationale and
+  // pattern as `updateDirty`. Stable identity so callers can list it
+  // in their dep arrays without triggering refresh loops.
+  const updateProject = useCallback((next: ProjectSummary | null) => {
+    setProject(next);
+    projectPathRef.current = next?.path ?? null;
+  }, []);
+
   // Mirror `saveProject` into a ref so the stable `armAutoSave`
   // helper can dispatch through the latest closure without taking
   // `saveProject` as a dep (which itself depends on `project` and so
@@ -142,6 +171,15 @@ export function ActiveProjectProvider({
   // logical save, and the bridge sees exactly one `project.save` call
   // per logical save event. The ref is cleared in the inflight's
   // `finally` so the next save event starts fresh.
+  //
+  // The finally also performs an *equality* check on the ref before
+  // clearing it: project-transition callbacks (open/create/close)
+  // clear the slot explicitly so the new project's saves never
+  // coalesce against a stale promise that belongs to the previous
+  // project. Without the equality guard, this finally would race
+  // and clobber a freshly-armed inflight for the new project,
+  // leaving the next saveProject invocation to dispatch a duplicate
+  // bridge call (defeating coalescing for the new project).
   const savingPromiseRef = useRef<Promise<void> | null>(null);
 
   // Cancel any pending auto-save before transitioning the active
@@ -192,13 +230,13 @@ export function ActiveProjectProvider({
   const refreshProject = useCallback(async () => {
     try {
       const result = await aec.project.current();
-      setProject(result.summary as ProjectSummary | null);
+      updateProject(result.summary as ProjectSummary | null);
     } catch {
-      setProject(null);
+      updateProject(null);
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [updateProject]);
 
   useEffect(() => {
     void refreshProject();
@@ -220,9 +258,23 @@ export function ActiveProjectProvider({
       // the open failure surfaced.
       cancelPendingAutoSave();
       setLoading(true);
+      // Clear any in-flight save's coalescing slot. A save for the
+      // previous project that is still on the wire belongs to a
+      // project the user is abandoning; the IIFE's setProject is
+      // guarded by `projectPathRef` so its state commit is dropped,
+      // but the slot itself must be cleared here so the freshly
+      // opened project can dispatch its own first save without
+      // coalescing against the old project's promise (which would
+      // return resolved as soon as the old save finishes, falsely
+      // telling B's caller "your save is done" when B was never
+      // actually saved). The finally inside the old IIFE uses an
+      // equality check before re-clearing the slot, so a new
+      // inflight armed by B is not accidentally clobbered when A's
+      // promise eventually settles.
+      savingPromiseRef.current = null;
       try {
         const summary = (await aec.project.open(path)) as ProjectSummary;
-        setProject(summary);
+        updateProject(summary);
         updateDirty(false);
         setUndoLen(0);
         setRedoLen(0);
@@ -244,21 +296,23 @@ export function ActiveProjectProvider({
         setLoading(false);
       }
     },
-    [cancelPendingAutoSave, armAutoSave, updateDirty],
+    [cancelPendingAutoSave, armAutoSave, updateDirty, updateProject],
   );
 
   const createProject = useCallback(
     async (templateKey: string, name: string) => {
-      // Same cancel-before-await + catch-rearm pattern as
-      // `openProject` — see that callback for the full rationale.
+      // Same cancel-before-await + catch-rearm + clear-saving-slot
+      // pattern as `openProject` — see that callback for the full
+      // rationale on each step.
       cancelPendingAutoSave();
+      savingPromiseRef.current = null;
       setLoading(true);
       try {
         const summary = (await aec.project.createFromTemplate(
           templateKey,
           name,
         )) as ProjectSummary;
-        setProject(summary);
+        updateProject(summary);
         updateDirty(false);
         setUndoLen(0);
         setRedoLen(0);
@@ -271,7 +325,7 @@ export function ActiveProjectProvider({
         setLoading(false);
       }
     },
-    [cancelPendingAutoSave, armAutoSave, updateDirty],
+    [cancelPendingAutoSave, armAutoSave, updateDirty, updateProject],
   );
 
   const closeProject = useCallback(async () => {
@@ -295,9 +349,15 @@ export function ActiveProjectProvider({
     // `saveProjectRef`), so adding it here does not unstabilize
     // `closeProject`'s identity across project transitions.
     cancelPendingAutoSave();
+    // Clear the inflight save slot for the same reason as
+    // `openProject` / `createProject` — see those callbacks. The
+    // user is leaving the active project; any in-flight save belongs
+    // to a project they no longer have open, and a subsequent
+    // openProject must not coalesce against it.
+    savingPromiseRef.current = null;
     try {
       await aec.project.close();
-      setProject(null);
+      updateProject(null);
       updateDirty(false);
       setUndoLen(0);
       setRedoLen(0);
@@ -307,7 +367,7 @@ export function ActiveProjectProvider({
       }
       throw err;
     }
-  }, [cancelPendingAutoSave, armAutoSave, updateDirty]);
+  }, [cancelPendingAutoSave, armAutoSave, updateDirty, updateProject]);
 
   const saveProject = useCallback(async () => {
     if (project === null) return;
@@ -330,21 +390,48 @@ export function ActiveProjectProvider({
     // timer may have already fired and dispatched a second save.
     cancelPendingAutoSave();
     setSaving(true);
-    const inflight = (async () => {
+    // Capture the project path at save-start. The IIFE uses this to
+    // (a) call the bridge with the project that originated the save
+    // (so a mid-flight project switch doesn't redirect the save to
+    // the wrong file), and (b) gate `setProject` against the current
+    // `projectPathRef` so a stale summary cannot revert the renderer
+    // to a project the user has already left. See `projectPathRef`
+    // for the full race description.
+    const savePath = project.path;
+    // `inflight` is referenced from inside its own IIFE so the
+    // finally can compare against `savingPromiseRef.current` without
+    // racing a fresh inflight that a project-transition callback has
+    // since installed in the slot. `let` + null-init keeps TypeScript
+    // happy with the self-reference; the IIFE body cannot read
+    // `inflight` until after the await resolves, by which time the
+    // assignment below has completed.
+    let inflight: Promise<void> | null = null;
+    inflight = (async () => {
       try {
-        const summary = (await aec.project.save(
-          project.path,
-        )) as ProjectSummary;
-        setProject(summary);
-        updateDirty(false);
-        // Cancel again: a `markDirty` that arrived DURING the save's
-        // await would have re-armed the timer. The fresh save already
-        // includes whatever was in the bridge at write-time (the
-        // bridge holds its own write lock, so the post-mutation state
-        // is what landed on disk); we clear the slot here so the
-        // next mutation arms a single fresh 5s debounce instead of
-        // racing a stale armed timer against the just-completed save.
-        cancelPendingAutoSave();
+        const summary = (await aec.project.save(savePath)) as ProjectSummary;
+        // Guard: only commit the save's result to React state if the
+        // user is still on the same project. If a project transition
+        // (open/create/close) ran while this save was in flight,
+        // `projectPathRef.current` no longer matches `savePath`;
+        // applying `setProject(summary)` here would silently revert
+        // the renderer to the old project while every mode page is
+        // already rendering against the new one. The bridge call
+        // itself is not wasted — the old project's bytes have safely
+        // landed on disk, which is the only durable contract a save
+        // promises.
+        if (projectPathRef.current === savePath) {
+          updateProject(summary);
+          updateDirty(false);
+          // Cancel again: a `markDirty` that arrived DURING the save's
+          // await would have re-armed the timer. The fresh save
+          // already includes whatever was in the bridge at write-time
+          // (the bridge holds its own write lock, so the
+          // post-mutation state is what landed on disk); we clear the
+          // slot here so the next mutation arms a single fresh 5s
+          // debounce instead of racing a stale armed timer against
+          // the just-completed save.
+          cancelPendingAutoSave();
+        }
       } finally {
         // `dirty` stays true on failure so the next mutation (or a
         // caller's manual retry) re-arms a save. The catch in the
@@ -353,13 +440,22 @@ export function ActiveProjectProvider({
         // promise is cleared here so the next save event starts from
         // a clean coalescing slot — without this, a failed save
         // would permanently lock out future `saveProject` calls.
+        //
+        // Equality-guard the clear: if a project transition cleared
+        // the slot and a fresh save was dispatched for the new
+        // project, that fresh inflight is now in the slot. Clearing
+        // unconditionally would lose the new inflight and break
+        // coalescing for the new project. Only clear when the slot
+        // still holds *this* IIFE's promise.
         setSaving(false);
-        savingPromiseRef.current = null;
+        if (savingPromiseRef.current === inflight) {
+          savingPromiseRef.current = null;
+        }
       }
     })();
     savingPromiseRef.current = inflight;
     return inflight;
-  }, [project, cancelPendingAutoSave, updateDirty]);
+  }, [project, cancelPendingAutoSave, updateDirty, updateProject]);
 
   // Keep the `saveProject` ref pointed at the latest closure so the
   // stable `armAutoSave` helper dispatches through the current

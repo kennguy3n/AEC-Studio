@@ -1026,3 +1026,268 @@ describe("useActiveProject — saveProject coalesces concurrent invocations", ()
     saveSpy.mockRestore();
   });
 });
+
+/**
+ * `saveProject` must not clobber renderer state when a project
+ * transition happens while a save is in flight.
+ *
+ * Devin Review's seventh pass flagged a real architectural race: a
+ * save for project A dispatched by the 5-second auto-save (or a
+ * manual Ctrl+S) holds the bridge for one disk fsync. If the user
+ * clicks "Open Project B" during that window, `openProject` cancels
+ * the auto-save timer, calls `aec.project.open(B)`, and commits the
+ * new active slot. Then A's save resolves and the IIFE unconditionally
+ * calls `setProject(summaryA)` — silently reverting the renderer to
+ * project A while every mode page is already rendering against B,
+ * and any subsequent `commandApply` / `bimImportIfc` / `draftSet*`
+ * call dispatches against the wrong project's path.
+ *
+ * The fix introduces `projectPathRef` (mirrors `project?.path`) and
+ * guards `setProject` in the save IIFE: if the path captured at
+ * save-start no longer matches the ref, the save's summary commit is
+ * dropped. The bridge call itself is not wasted — the bytes safely
+ * landed on disk, which is the only durable contract a save promises.
+ *
+ * A second related hazard: B's first save would coalesce with A's
+ * still-in-flight promise (returning resolved as soon as A's save
+ * finishes — falsely telling B's caller "your save is done"). The
+ * fix clears `savingPromiseRef.current = null` in every transition
+ * callback (open/create/close) so B's first save dispatches its own
+ * bridge call. These tests pin both contracts.
+ */
+function OpenAThenSwitchToB({
+  pathA,
+  pathB,
+  onSaveError,
+}: {
+  pathA: string;
+  pathB: string;
+  onSaveError: (err: unknown) => void;
+}) {
+  const { project, openProject, saveProject } = useActiveProject();
+  useEffect(() => {
+    void openProject(pathA);
+  }, [openProject, pathA]);
+  return (
+    <div>
+      <span data-testid="proj-path">{project?.path ?? ""}</span>
+      <button
+        type="button"
+        data-testid="save-A"
+        onClick={() => {
+          saveProject().catch(onSaveError);
+        }}
+      >
+        save A
+      </button>
+      <button
+        type="button"
+        data-testid="open-B"
+        onClick={async () => {
+          try {
+            await openProject(pathB);
+          } catch (err) {
+            onSaveError(err);
+          }
+        }}
+      >
+        open B
+      </button>
+      <button
+        type="button"
+        data-testid="save-B"
+        onClick={() => {
+          saveProject().catch(onSaveError);
+        }}
+      >
+        save B
+      </button>
+    </div>
+  );
+}
+
+describe("useActiveProject — saveProject guards against mid-flight project switch", () => {
+  it("does not revert the active project when an old save resolves after openProject(B)", async () => {
+    // Hold project A's save resolution so we can transition to B
+    // before it settles. Without the `projectPathRef` guard inside
+    // the save IIFE, A's resolution would call setProject(summaryA)
+    // and revert the renderer to A while the header still shows B.
+    let resolveSaveA: ((summary: unknown) => void) | null = null;
+    const saveAPromise = new Promise<unknown>((resolve) => {
+      resolveSaveA = resolve;
+    });
+    const saveSpy = vi
+      .spyOn(aec.project, "save")
+      .mockImplementation(() => saveAPromise);
+    const onSaveError = vi.fn();
+
+    render(
+      <ActiveProjectProvider>
+        <OpenAThenSwitchToB
+          pathA="/tmp/projectA.aecstudio"
+          pathB="/tmp/projectB.aecstudio"
+          onSaveError={onSaveError}
+        />
+      </ActiveProjectProvider>,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByTestId("proj-path").textContent).toBe(
+        "/tmp/projectA.aecstudio",
+      ),
+    );
+
+    // Start the save for A. The bridge spy holds the promise so the
+    // IIFE is parked on the await.
+    await act(async () => {
+      screen.getByTestId("save-A").click();
+    });
+    expect(saveSpy).toHaveBeenCalledTimes(1);
+    expect(saveSpy).toHaveBeenCalledWith("/tmp/projectA.aecstudio");
+
+    // Switch to B BEFORE A's save resolves. `openProject` uses the
+    // in-process backend (no mock for `open`) so it returns project
+    // B's summary and commits the slot synchronously after the
+    // await.
+    await act(async () => {
+      screen.getByTestId("open-B").click();
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("proj-path").textContent).toBe(
+        "/tmp/projectB.aecstudio",
+      ),
+    );
+
+    // Now resolve A's save with a stale summary that would, WITHOUT
+    // the guard, blast through `setProject(summaryA)` and revert the
+    // renderer to A.
+    await act(async () => {
+      resolveSaveA!({
+        path: "/tmp/projectA.aecstudio",
+        name: "projectA",
+        template_key: "blank",
+        room_count: 0,
+        material_count: 0,
+      });
+    });
+
+    // The renderer must stay on B. WITHOUT the `projectPathRef`
+    // guard, this assertion fails — the textContent would be
+    // "/tmp/projectA.aecstudio".
+    expect(screen.getByTestId("proj-path").textContent).toBe(
+      "/tmp/projectB.aecstudio",
+    );
+    expect(onSaveError).not.toHaveBeenCalled();
+
+    saveSpy.mockRestore();
+  });
+
+  it("does not coalesce a new save for B against an in-flight save for A", async () => {
+    // After openProject(B), the savingPromiseRef must be cleared so
+    // that saveProject(B) dispatches its own bridge call. Without
+    // the clear, B's first save would return A's still-in-flight
+    // promise, falsely telling B's caller "your save is done" the
+    // moment A's save finishes — and B's bytes would never reach
+    // disk until the user's next mutation triggers another save.
+    let resolveSaveA: ((summary: unknown) => void) | null = null;
+    let resolveSaveB: ((summary: unknown) => void) | null = null;
+    const saveSpy = vi
+      .spyOn(aec.project, "save")
+      .mockImplementation((path: string) => {
+        if (path === "/tmp/projectA.aecstudio") {
+          return new Promise<unknown>((resolve) => {
+            resolveSaveA = resolve;
+          });
+        }
+        if (path === "/tmp/projectB.aecstudio") {
+          return new Promise<unknown>((resolve) => {
+            resolveSaveB = resolve;
+          });
+        }
+        throw new Error(`unexpected save path: ${path}`);
+      });
+    const onSaveError = vi.fn();
+
+    render(
+      <ActiveProjectProvider>
+        <OpenAThenSwitchToB
+          pathA="/tmp/projectA.aecstudio"
+          pathB="/tmp/projectB.aecstudio"
+          onSaveError={onSaveError}
+        />
+      </ActiveProjectProvider>,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByTestId("proj-path").textContent).toBe(
+        "/tmp/projectA.aecstudio",
+      ),
+    );
+
+    // Dispatch a save for A; it parks awaiting our resolveSaveA.
+    await act(async () => {
+      screen.getByTestId("save-A").click();
+    });
+    expect(saveSpy).toHaveBeenCalledTimes(1);
+
+    // Switch to B; openProject clears the coalescing slot so the
+    // next saveProject is not bound to A's promise.
+    await act(async () => {
+      screen.getByTestId("open-B").click();
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("proj-path").textContent).toBe(
+        "/tmp/projectB.aecstudio",
+      ),
+    );
+
+    // Save B. WITHOUT the slot-clear, this would return A's promise
+    // and the spy would still show only 1 call. WITH the fix, B
+    // dispatches its own bridge call against `pathB`.
+    await act(async () => {
+      screen.getByTestId("save-B").click();
+    });
+    expect(saveSpy).toHaveBeenCalledTimes(2);
+    expect(saveSpy).toHaveBeenNthCalledWith(2, "/tmp/projectB.aecstudio");
+
+    // Resolve A's stale save first. The equality-guarded `finally`
+    // must skip clearing the slot (B's inflight is in it now), so a
+    // subsequent saveProject for B still coalesces correctly.
+    await act(async () => {
+      resolveSaveA!({
+        path: "/tmp/projectA.aecstudio",
+        name: "projectA",
+        template_key: "blank",
+        room_count: 0,
+        material_count: 0,
+      });
+    });
+
+    // Now spam another save for B — must coalesce against the
+    // existing B inflight (not dispatch a third bridge call).
+    await act(async () => {
+      screen.getByTestId("save-B").click();
+    });
+    expect(saveSpy).toHaveBeenCalledTimes(2);
+
+    // Resolve B's save. The slot clears on its own finally, and
+    // subsequent saves can dispatch fresh.
+    await act(async () => {
+      resolveSaveB!({
+        path: "/tmp/projectB.aecstudio",
+        name: "projectB",
+        template_key: "blank",
+        room_count: 0,
+        material_count: 0,
+      });
+    });
+
+    await act(async () => {
+      screen.getByTestId("save-B").click();
+    });
+    expect(saveSpy).toHaveBeenCalledTimes(3);
+
+    expect(onSaveError).not.toHaveBeenCalled();
+    saveSpy.mockRestore();
+  });
+});

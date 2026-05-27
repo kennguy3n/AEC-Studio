@@ -9,6 +9,10 @@ export function StatusBar() {
   const [aiState, setAiState] = useState<string>("idle");
   const [renderJobCount, setRenderJobCount] = useState<number>(0);
 
+  // Static hardware/AI status: one-shot fetch on mount. These don't
+  // change while the renderer is running (hot-plugging a GPU mid-
+  // session would require a full restart anyway), so polling here
+  // would only burn IPC round-trips.
   useEffect(() => {
     let alive = true;
     void aec.runtime.status().then((s) => {
@@ -17,8 +21,32 @@ export function StatusBar() {
     void aec.ai.runtimeStatus().then((s) => {
       if (alive) setAiState((s as { state: string }).state);
     });
-    // Poll render queue count every 5s so the StatusBar reflects
-    // active jobs without subscribing to per-job events.
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  // Render-queue polling: gated on `project !== null` so the Home
+  // screen and any route hit before a project is opened pays zero IPC
+  // cost. Render jobs are *always* scoped to a project (every enqueue
+  // captures the active project path), so the count is structurally
+  // zero whenever no project is active — polling that state would
+  // either reach a no-op bridge handler or return per-project counts
+  // for projects the user is not currently viewing (both wasteful).
+  //
+  // Resetting `renderJobCount` to 0 on project transitions (or when
+  // the project becomes null) prevents a stale count from the
+  // previous project bleeding into the new project's status line for
+  // up to one poll interval. The interval and the initial tick are
+  // both no-ops when `project === null`, so the cleanup return
+  // handles the close-project case correctly via the `useEffect`
+  // unmount-on-deps-change contract.
+  useEffect(() => {
+    if (project === null) {
+      setRenderJobCount(0);
+      return;
+    }
+    let alive = true;
     const tick = () => {
       void aec.render.listJobs().then((jobs) => {
         if (!alive) return;
@@ -34,7 +62,7 @@ export function StatusBar() {
       alive = false;
       window.clearInterval(id);
     };
-  }, []);
+  }, [project]);
 
   return (
     <footer className="status-bar" role="status" aria-live="polite">
