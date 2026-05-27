@@ -2434,6 +2434,7 @@ impl BridgeService {
             Some(path) => Some(crate::pack_context::build_for_project(
                 path,
                 &self.master_key,
+                &self.snapshot_cache,
             )?),
             None => None,
         };
@@ -2497,6 +2498,7 @@ impl BridgeService {
             Some(path) => Some(crate::pack_context::build_for_project(
                 path,
                 &self.master_key,
+                &self.snapshot_cache,
             )?),
             None => None,
         };
