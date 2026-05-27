@@ -56,6 +56,17 @@ export function registerIpcHandlers(): void {
     // polls see the new `modifiedAt`. Path is unchanged so the
     // renderer-side hook treats this as the same project (no route
     // guard trip), it just re-renders the header timestamp.
+    //
+    // TODO(Devin Review thread 56, comment 3311164822): This
+    // unconditionally promotes the saved project to the active slot.
+    // Today that's safe because the only renderer caller —
+    // `useActiveProject.saveProject()` — always passes the active
+    // project's path. If a future code path (e.g. a background
+    // export pipeline) saves a non-active project, the right guard
+    // is to mirror the `deliver:buildPack` pattern and only refresh
+    // when `peekActiveProjectPath() === summary.path`. Deferred
+    // until a concrete consumer exists so the guard can be added
+    // alongside a test that exercises the hazard.
     setActiveProject(summary);
     return summary;
   });
