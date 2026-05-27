@@ -101,9 +101,10 @@ fn backup_before_migration(path: &Path, from: u32, to: u32) -> AecResult<()> {
         from,
         to
     );
-    let backup_path = path
-        .parent()
-        .map_or_else(|| std::path::PathBuf::from(&backup_name), |p| p.join(&backup_name));
+    let backup_path = path.parent().map_or_else(
+        || std::path::PathBuf::from(&backup_name),
+        |p| p.join(&backup_name),
+    );
     // Use std::fs::copy for the raw SQLCipher file copy — this is
     // intentionally NOT a `VACUUM INTO` because the source DB is
     // encrypted and we want the backup encrypted the same way (i.e.
