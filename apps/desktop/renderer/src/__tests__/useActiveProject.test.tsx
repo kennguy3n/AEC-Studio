@@ -438,3 +438,276 @@ describe("useActiveProject — manual save cancels pending auto-save", () => {
     saveSpy.mockRestore();
   });
 });
+
+/**
+ * Failed `openProject` / `createProject` must re-arm the auto-save timer.
+ *
+ * Devin Review's fourth pass on the hook flagged a data-loss window:
+ * `openProject`/`createProject` both call `cancelPendingAutoSave()`
+ * BEFORE the async bridge call (correctly — otherwise a stale timer
+ * captured against project A could fire AFTER the swap to project B
+ * and re-bind the active project). If the bridge call then *throws*
+ * (corrupt file, permission denied, disk full, etc.), the original
+ * project remains active with `dirty === true` but its auto-save
+ * timer is permanently lost: the user's pending changes would only
+ * persist on their next mutation, which may never come if they walk
+ * away. The fix wraps each transition in a try/catch that re-arms the
+ * timer (via the stable `armAutoSave` helper) iff the dirty flag is
+ * still set. These tests pin both the rearm-on-failure behavior and
+ * its negative case (no spurious arm when the original state was
+ * clean).
+ */
+function DirtyThenFailingOpen({
+  initialPath,
+  failingPath,
+  onError,
+}: {
+  initialPath: string;
+  failingPath: string;
+  onError: (err: unknown) => void;
+}) {
+  const { project, openProject, markDirty } = useActiveProject();
+  useEffect(() => {
+    void openProject(initialPath);
+  }, [openProject, initialPath]);
+  return (
+    <div>
+      <span data-testid="proj-path">{project?.path ?? ""}</span>
+      <button
+        type="button"
+        data-testid="dirty"
+        onClick={() => markDirty()}
+      >
+        dirty
+      </button>
+      <button
+        type="button"
+        data-testid="open-failing"
+        onClick={async () => {
+          try {
+            await openProject(failingPath);
+          } catch (err) {
+            onError(err);
+          }
+        }}
+      >
+        open failing
+      </button>
+    </div>
+  );
+}
+
+function DirtyThenFailingCreate({
+  initialPath,
+  templateKey,
+  newName,
+  onError,
+}: {
+  initialPath: string;
+  templateKey: string;
+  newName: string;
+  onError: (err: unknown) => void;
+}) {
+  const { project, openProject, createProject, markDirty } = useActiveProject();
+  useEffect(() => {
+    void openProject(initialPath);
+  }, [openProject, initialPath]);
+  return (
+    <div>
+      <span data-testid="proj-path">{project?.path ?? ""}</span>
+      <button
+        type="button"
+        data-testid="dirty"
+        onClick={() => markDirty()}
+      >
+        dirty
+      </button>
+      <button
+        type="button"
+        data-testid="create-failing"
+        onClick={async () => {
+          try {
+            await createProject(templateKey, newName);
+          } catch (err) {
+            onError(err);
+          }
+        }}
+      >
+        create failing
+      </button>
+    </div>
+  );
+}
+
+describe("useActiveProject — failed transition re-arms auto-save timer", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("re-arms the auto-save timer when openProject's bridge call rejects mid-flight", async () => {
+    // The initial mount call must succeed (the test needs an active
+    // project A to mark dirty against). We let the in-process backend
+    // handle that, then install the rejection mock only after the
+    // first open settles so the second open — the button-triggered
+    // failing transition — rejects with "permission denied".
+    const saveSpy = vi.spyOn(aec.project, "save");
+    const onError = vi.fn();
+
+    render(
+      <ActiveProjectProvider>
+        <DirtyThenFailingOpen
+          initialPath="/tmp/projectA.aecstudio"
+          failingPath="/tmp/broken.aecstudio"
+          onError={onError}
+        />
+      </ActiveProjectProvider>,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByTestId("proj-path").textContent).toBe(
+        "/tmp/projectA.aecstudio",
+      ),
+    );
+
+    // Now that project A is loaded, swap the bridge implementation
+    // so the next `aec.project.open(...)` call rejects.
+    const openSpy = vi
+      .spyOn(aec.project, "open")
+      .mockRejectedValue(new Error("permission denied"));
+
+    // Arm the 5s auto-save timer against project A.
+    await act(async () => {
+      screen.getByTestId("dirty").click();
+    });
+
+    // Trigger the failing open. The hook cancels the timer before
+    // the await, the bridge rejects, and the catch block must re-arm.
+    await act(async () => {
+      screen.getByTestId("open-failing").click();
+    });
+
+    await waitFor(() => expect(onError).toHaveBeenCalledTimes(1));
+    const err = onError.mock.calls[0]![0];
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toBe("permission denied");
+
+    // The active project should still be A — the swap never happened.
+    expect(screen.getByTestId("proj-path").textContent).toBe(
+      "/tmp/projectA.aecstudio",
+    );
+
+    // Advance past the re-armed 5s debounce. WITHOUT the fix, the
+    // timer was cancelled before the await and never re-armed, so
+    // `aec.project.save` would NOT be called here — the bug. WITH
+    // the fix, the catch block re-arms via `armAutoSave` and the
+    // auto-save fires on schedule against project A.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+
+    expect(saveSpy).toHaveBeenCalledTimes(1);
+    expect(saveSpy).toHaveBeenCalledWith("/tmp/projectA.aecstudio");
+
+    openSpy.mockRestore();
+    saveSpy.mockRestore();
+  });
+
+  it("re-arms the auto-save timer when createProject's bridge call rejects mid-flight", async () => {
+    const createSpy = vi
+      .spyOn(aec.project, "createFromTemplate")
+      .mockRejectedValue(new Error("template not found"));
+    const saveSpy = vi.spyOn(aec.project, "save");
+    const onError = vi.fn();
+
+    render(
+      <ActiveProjectProvider>
+        <DirtyThenFailingCreate
+          initialPath="/tmp/projectA.aecstudio"
+          templateKey="missing"
+          newName="Should Fail"
+          onError={onError}
+        />
+      </ActiveProjectProvider>,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByTestId("proj-path").textContent).toBe(
+        "/tmp/projectA.aecstudio",
+      ),
+    );
+
+    await act(async () => {
+      screen.getByTestId("dirty").click();
+    });
+
+    await act(async () => {
+      screen.getByTestId("create-failing").click();
+    });
+
+    await waitFor(() => expect(onError).toHaveBeenCalledTimes(1));
+    expect(screen.getByTestId("proj-path").textContent).toBe(
+      "/tmp/projectA.aecstudio",
+    );
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+
+    // Auto-save should have fired against the still-active project A.
+    expect(saveSpy).toHaveBeenCalledTimes(1);
+    expect(saveSpy).toHaveBeenCalledWith("/tmp/projectA.aecstudio");
+
+    createSpy.mockRestore();
+    saveSpy.mockRestore();
+  });
+
+  it("does NOT arm a spurious auto-save timer when a failing openProject runs from a clean state", async () => {
+    // Negative case: if there was never a pending timer (dirty stayed
+    // false), a failed open must not spontaneously schedule one. This
+    // pins the `if (dirtyRef.current) armAutoSave()` guard so future
+    // refactors don't accidentally arm timers from clean states and
+    // burn cycles auto-saving an unchanged project.
+    const saveSpy = vi.spyOn(aec.project, "save");
+    const onError = vi.fn();
+
+    render(
+      <ActiveProjectProvider>
+        <DirtyThenFailingOpen
+          initialPath="/tmp/projectA.aecstudio"
+          failingPath="/tmp/broken.aecstudio"
+          onError={onError}
+        />
+      </ActiveProjectProvider>,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByTestId("proj-path").textContent).toBe(
+        "/tmp/projectA.aecstudio",
+      ),
+    );
+
+    const openSpy = vi
+      .spyOn(aec.project, "open")
+      .mockRejectedValue(new Error("permission denied"));
+
+    // Deliberately skip the dirty click — project A is clean.
+    await act(async () => {
+      screen.getByTestId("open-failing").click();
+    });
+
+    await waitFor(() => expect(onError).toHaveBeenCalledTimes(1));
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+
+    // No save should have fired — there was nothing to save.
+    expect(saveSpy).not.toHaveBeenCalled();
+
+    openSpy.mockRestore();
+    saveSpy.mockRestore();
+  });
+});

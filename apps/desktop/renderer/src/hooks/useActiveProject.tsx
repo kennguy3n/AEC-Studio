@@ -73,6 +73,26 @@ export function ActiveProjectProvider({
   const [redoLen, setRedoLen] = useState(0);
   const autoSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Mirror `dirty` into a ref so stable callbacks (`armAutoSave`,
+  // open/create catch blocks) can read the latest value without
+  // listing `dirty` in their dep arrays — which would otherwise
+  // unstabilize their identity on every keystroke and break consumer
+  // `useEffect` deps (e.g., tests that read `openProject` as a dep).
+  // State commits and useEffect ref-syncs run *after* the current
+  // event handler completes, so updating the ref via `useEffect`
+  // alone would leave it one tick stale during the same event tick;
+  // every site that calls `setDirty(...)` therefore also assigns
+  // `dirtyRef.current` synchronously to keep the two in lockstep.
+  const dirtyRef = useRef(false);
+
+  // Mirror `saveProject` into a ref so the stable `armAutoSave`
+  // helper can dispatch through the latest closure without taking
+  // `saveProject` as a dep (which itself depends on `project` and so
+  // changes on every project transition). The effect-based sync is
+  // safe here because the ref is only read from `setTimeout`
+  // callbacks that fire well after the current commit.
+  const saveProjectRef = useRef<() => Promise<void>>(async () => {});
+
   // Cancel any pending auto-save before transitioning the active
   // project (open / create / close). Without this, a debounced timer
   // armed by `markDirty()` for project A can fire *after* the user has
@@ -93,6 +113,31 @@ export function ActiveProjectProvider({
     }
   }, []);
 
+  // Arm (or re-arm) the 5s debounced auto-save timer. Used by
+  // `markDirty` on every mutation and by the open/create catch
+  // blocks to restore auto-save protection when a project transition
+  // fails mid-flight. Kept stable (empty dep array) by dispatching
+  // through `saveProjectRef` rather than capturing `saveProject`
+  // directly — this preserves the identity of every callback that
+  // depends on `armAutoSave` (including `openProject`/`createProject`),
+  // so consumer `useEffect`s that list them don't refire on every
+  // dirty-flag flip.
+  const armAutoSave = useCallback(() => {
+    if (autoSaveTimerRef.current !== null) {
+      clearTimeout(autoSaveTimerRef.current);
+    }
+    autoSaveTimerRef.current = setTimeout(() => {
+      autoSaveTimerRef.current = null;
+      // Auto-save is fire-and-forget: a transient failure (network
+      // blip, disk pressure) shouldn't crash the timer or trigger an
+      // error toast — the next mutation will re-arm and retry.
+      saveProjectRef.current().catch(() => {
+        // Intentional swallow: dirty flag stays set so the next
+        // `markDirty` debounce will retry.
+      });
+    }, 5_000);
+  }, []);
+
   const refreshProject = useCallback(async () => {
     try {
       const result = await aec.project.current();
@@ -110,23 +155,52 @@ export function ActiveProjectProvider({
 
   const openProject = useCallback(
     async (path: string) => {
+      // Cancel BEFORE the bridge call to prevent the stale-timer race
+      // documented on `cancelPendingAutoSave`. If the bridge call
+      // succeeds, `setDirty(false)` below clears the dirty flag and
+      // the cancel was correct (no auto-save needed for the freshly
+      // opened project, which starts clean). If the bridge call
+      // throws (corrupt file, permission denied, disk full, etc.),
+      // the *current* project remains active with `dirty === true`
+      // but its auto-save timer is already cancelled — without the
+      // catch below, pending changes would only persist on the next
+      // user mutation (which may never come if they walk away),
+      // creating a data-loss window equal to the dwell time before
+      // the open failure surfaced.
       cancelPendingAutoSave();
       setLoading(true);
       try {
         const summary = (await aec.project.open(path)) as ProjectSummary;
         setProject(summary);
         setDirty(false);
+        dirtyRef.current = false;
         setUndoLen(0);
         setRedoLen(0);
+      } catch (err) {
+        // Re-arm the timer so the still-active project retains its
+        // auto-save protection. Guarded by `dirtyRef` so a failed
+        // open from a clean state doesn't spuriously schedule a
+        // save-while-clean call (which would no-op via the `project
+        // === null` / clean-flag check inside `saveProject`, but the
+        // extra timer churn is wasteful). Re-throw so callers can
+        // surface the failure (toast, route stay-put, etc.) — the
+        // hook deliberately doesn't toast itself to keep the
+        // ToastProvider an optional consumer-side concern.
+        if (dirtyRef.current) {
+          armAutoSave();
+        }
+        throw err;
       } finally {
         setLoading(false);
       }
     },
-    [cancelPendingAutoSave],
+    [cancelPendingAutoSave, armAutoSave],
   );
 
   const createProject = useCallback(
     async (templateKey: string, name: string) => {
+      // Same cancel-before-await + catch-rearm pattern as
+      // `openProject` — see that callback for the full rationale.
       cancelPendingAutoSave();
       setLoading(true);
       try {
@@ -136,13 +210,19 @@ export function ActiveProjectProvider({
         )) as ProjectSummary;
         setProject(summary);
         setDirty(false);
+        dirtyRef.current = false;
         setUndoLen(0);
         setRedoLen(0);
+      } catch (err) {
+        if (dirtyRef.current) {
+          armAutoSave();
+        }
+        throw err;
       } finally {
         setLoading(false);
       }
     },
-    [cancelPendingAutoSave],
+    [cancelPendingAutoSave, armAutoSave],
   );
 
   const closeProject = useCallback(async () => {
@@ -150,6 +230,7 @@ export function ActiveProjectProvider({
     await aec.project.close();
     setProject(null);
     setDirty(false);
+    dirtyRef.current = false;
     setUndoLen(0);
     setRedoLen(0);
   }, [cancelPendingAutoSave]);
@@ -161,6 +242,7 @@ export function ActiveProjectProvider({
       const summary = (await aec.project.save(project.path)) as ProjectSummary;
       setProject(summary);
       setDirty(false);
+      dirtyRef.current = false;
       // Cancel any pending auto-save timer on the success path. A
       // manual `Ctrl+S` (or any other caller invoking `saveProject`
       // directly) immediately after a mutation would otherwise leave
@@ -185,26 +267,22 @@ export function ActiveProjectProvider({
     }
   }, [project, cancelPendingAutoSave]);
 
+  // Keep the `saveProject` ref pointed at the latest closure so the
+  // stable `armAutoSave` helper dispatches through the current
+  // project's save logic without taking `saveProject` as a dep.
+  useEffect(() => {
+    saveProjectRef.current = saveProject;
+  }, [saveProject]);
+
   const markDirty = useCallback(() => {
     setDirty(true);
-    // Debounced auto-save: 5 seconds after the last mutation.
-    if (autoSaveTimerRef.current !== null) {
-      clearTimeout(autoSaveTimerRef.current);
-    }
-    autoSaveTimerRef.current = setTimeout(() => {
-      autoSaveTimerRef.current = null;
-      // Auto-save is fire-and-forget: a transient failure (network
-      // blip, disk pressure) shouldn't crash the timer or trigger an
-      // error toast — the next mutation will re-arm and retry.
-      saveProject().catch(() => {
-        // Intentional swallow: dirty flag stays set so the next
-        // `markDirty` debounce will retry.
-      });
-    }, 5_000);
-  }, [saveProject]);
+    dirtyRef.current = true;
+    armAutoSave();
+  }, [armAutoSave]);
 
   const markClean = useCallback(() => {
     setDirty(false);
+    dirtyRef.current = false;
     cancelPendingAutoSave();
   }, [cancelPendingAutoSave]);
 
