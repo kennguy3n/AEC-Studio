@@ -24,7 +24,7 @@
 //! Settings page (which calls [`KChatState::reload`]).
 
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aec_core::kchat::{
     ArtifactCard, InMemoryPublisher, KChatError, KChatPublisher, PublishResult, ReviewCard,
@@ -112,6 +112,15 @@ struct Inner {
     /// active. `None` outside of an open project (or when the
     /// project chose to leave `default_thread_id` unset).
     default_thread_id: Option<String>,
+    /// Monotonic timestamp of the most recent
+    /// [`KChatDiscovery::probe_with_timeout`] attempt from the
+    /// `status()` path. Used to throttle re-probes to at most once
+    /// every [`PROBE_COOLDOWN`] so the renderer's 5 s poll doesn't
+    /// block the N-API thread for 200 ms on every tick when KChat
+    /// Desktop isn't installed — particularly on Windows where
+    /// `socket_exists` cannot short-circuit via `path.exists()` and
+    /// every probe goes to a full connect timeout.
+    last_probe_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +137,16 @@ impl PublisherKind {
         }
     }
 }
+
+/// Minimum interval between consecutive re-probes on the
+/// disconnected path. On macOS/Linux `path.exists()` returns
+/// `false` instantly when the socket file doesn't exist, but on
+/// Windows `KChatDiscovery::socket_exists` always returns `true`
+/// (no filesystem entry for named pipes) so every probe blocks
+/// for the full 200 ms connect timeout. Throttling to once per
+/// 30 s keeps the worst-case Windows-with-no-KChat cost at
+/// ~0.67 % of the N-API thread instead of 4 %.
+const PROBE_COOLDOWN: Duration = Duration::from_secs(30);
 
 impl Default for KChatState {
     fn default() -> Self {
@@ -161,17 +180,25 @@ impl KChatState {
     /// in-memory because boot-time discovery returned `None`), this
     /// re-runs [`KChatDiscovery::probe_with_timeout`] so the
     /// renderer's poll picks up newly started KChat Desktop
-    /// instances without restarting AEC Studio. The probe is cheap
-    /// (200 ms socket connect + ping) and gated on the
-    /// not-yet-connected path so the steady-state renderer poll
-    /// (every 5 s while connected) costs only a read-lock acquire.
+    /// instances without restarting AEC Studio. The probe is capped
+    /// at 200 ms (socket connect + ping) and further throttled by
+    /// [`PROBE_COOLDOWN`] (30 s) so the worst-case cost on Windows
+    /// (where `socket_exists` cannot short-circuit) is one 200 ms
+    /// block per 30 s rather than per 5 s poll. The steady-state
+    /// renderer poll (every 5 s while connected) costs only a
+    /// read-lock acquire.
     pub fn status(&self) -> KChatStatusReport {
         // Fast path: read-lock only. We re-probe iff we're currently
-        // disconnected — see the doc comment for why connected
-        // sessions don't need a periodic probe.
+        // disconnected AND the probe cooldown has elapsed — see the
+        // doc comment for why connected sessions don't need a
+        // periodic probe, and `PROBE_COOLDOWN` for why we throttle
+        // disconnected ones.
         let needs_refresh = {
             let inner = self.inner.read().expect("kchat state not poisoned");
             inner.last_status.state == "disconnected"
+                && inner
+                    .last_probe_at
+                    .map_or(true, |t| t.elapsed() >= PROBE_COOLDOWN)
         };
         if needs_refresh {
             self.refresh_status();
@@ -269,6 +296,7 @@ impl KChatState {
 
     fn refresh_status(&self) {
         let mut inner = self.inner.write().expect("kchat state not poisoned");
+        inner.last_probe_at = Some(Instant::now());
         // Re-run discovery cheaply (200 ms timeout).
         let probed = KChatDiscovery::probe_with_timeout(Duration::from_millis(200));
         inner.discovered.clone_from(&probed);
@@ -442,6 +470,7 @@ impl Inner {
                 discovered: Some(info),
                 enabled: true,
                 default_thread_id: None,
+                last_probe_at: None,
             };
         }
         let publisher: Arc<dyn KChatPublisher + Send + Sync> =
@@ -459,6 +488,7 @@ impl Inner {
             discovered: None,
             enabled: true,
             default_thread_id: None,
+            last_probe_at: None,
         }
     }
 }
@@ -622,6 +652,41 @@ mod tests {
         assert_eq!(
             st.status().default_thread_id,
             Some("survive-downgrade".to_string())
+        );
+    }
+
+    /// The probe cooldown prevents `status()` from blocking the
+    /// N-API thread with a 200 ms connect attempt on every 5 s
+    /// renderer poll when KChat Desktop isn't installed. After
+    /// the first probe, subsequent calls within [`PROBE_COOLDOWN`]
+    /// must return the cached snapshot without re-running discovery.
+    #[test]
+    fn status_cooldown_prevents_rapid_reprobes() {
+        std::env::remove_var(aec_core::kchat_discovery::KCHAT_SOCKET_PATH_ENV);
+        let st = KChatState::new();
+        // First call triggers a probe (last_probe_at is None).
+        let s1 = st.status();
+        assert_eq!(s1.state, "disconnected");
+        // Record the probe timestamp.
+        let probe_ts = st
+            .inner
+            .read()
+            .expect("not poisoned")
+            .last_probe_at
+            .expect("first status() must set last_probe_at");
+        // Second call within the cooldown must NOT update the
+        // timestamp — i.e. no re-probe happened.
+        let s2 = st.status();
+        assert_eq!(s2.state, "disconnected");
+        let probe_ts2 = st
+            .inner
+            .read()
+            .expect("not poisoned")
+            .last_probe_at
+            .expect("still set");
+        assert_eq!(
+            probe_ts, probe_ts2,
+            "second status() within cooldown must reuse cached probe"
         );
     }
 }

@@ -135,7 +135,9 @@ export function KChatReviewPanel(props: KChatReviewPanelProps) {
       const msg = e instanceof Error ? e.message : String(e);
       setError(msg);
     } finally {
-      setLoading(false);
+      if (threadIdRef.current === capturedThread) {
+        setLoading(false);
+      }
     }
   }, [props.threadId]);
 

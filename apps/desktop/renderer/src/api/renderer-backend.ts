@@ -504,6 +504,11 @@ function viewportMock() {
       if (params.kind === "orbit") {
         camera.position[0] += params.dx ?? 0;
         camera.position[1] += params.dy ?? 0;
+      } else if (params.kind === "pan") {
+        camera.position[0] -= params.dx ?? 0;
+        camera.position[1] += params.dy ?? 0;
+        camera.target[0] -= params.dx ?? 0;
+        camera.target[1] += params.dy ?? 0;
       } else if (params.kind === "zoom") {
         const f = 1 - (params.delta ?? 0) * 0.001;
         camera.position[0] *= f;
