@@ -83,6 +83,69 @@ impl RenderScene {
     }
 }
 
+impl SerializedMesh {
+    /// Phase 12 Task 21: convert an `aec_geometry::Mesh` (the tessellated
+    /// output of walls / floors / ceilings / furniture in the project
+    /// graph) into a `SerializedMesh` suitable for the render scene.
+    ///
+    /// `id` and `material_id` are caller-supplied because the project
+    /// graph entity carries this metadata separately from the raw mesh
+    /// geometry; `transform` is the entity's world-space transform as a
+    /// 4×4 row-major matrix.
+    pub fn from_geometry_mesh(
+        id: impl Into<String>,
+        mesh: &aec_geometry::Mesh,
+        material_id: Option<String>,
+        transform: [[f32; 4]; 4],
+    ) -> Self {
+        // The geometry tessellator can emit meshes with empty UV arrays
+        // (most procedural shapes don't need texture coordinates). The
+        // path tracer assumes `uvs.len() == positions.len()`, so pad
+        // with zeros when the source mesh has no UVs.
+        let uvs = if mesh.uvs.len() == mesh.positions.len() {
+            mesh.uvs.clone()
+        } else {
+            vec![[0.0_f32, 0.0]; mesh.positions.len()]
+        };
+        // Similarly, normals can be empty when only positions are
+        // populated. Default to up so the renderer still gets a valid
+        // basis instead of NaN-tangents.
+        let normals = if mesh.normals.len() == mesh.positions.len() {
+            mesh.normals.clone()
+        } else {
+            vec![[0.0_f32, 1.0, 0.0]; mesh.positions.len()]
+        };
+        SerializedMesh {
+            id: id.into(),
+            indices: mesh.indices.clone(),
+            positions: mesh.positions.clone(),
+            normals,
+            uvs,
+            material_id,
+            transform,
+        }
+    }
+}
+
+impl RenderScene {
+    /// Phase 12 Task 21: append a tessellated geometry mesh to the
+    /// render scene with optional material binding and a 4×4 transform.
+    pub fn push_geometry_mesh(
+        &mut self,
+        id: impl Into<String>,
+        mesh: &aec_geometry::Mesh,
+        material_id: Option<String>,
+        transform: [[f32; 4]; 4],
+    ) {
+        self.meshes.push(SerializedMesh::from_geometry_mesh(
+            id,
+            mesh,
+            material_id,
+            transform,
+        ));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,5 +163,52 @@ mod tests {
             transform: [[0.0; 4]; 4],
         });
         assert_eq!(s.triangle_count(), 2);
+    }
+
+    #[test]
+    fn push_geometry_mesh_pads_missing_uvs_and_normals() {
+        // Phase 12 Task 21: geometry meshes coming out of the wall /
+        // floor tessellator can omit UVs or normals. The push helper
+        // must pad them rather than producing a malformed scene.
+        let mesh = aec_geometry::Mesh {
+            positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            normals: vec![], // empty
+            uvs: vec![],     // empty
+            indices: vec![0, 1, 2],
+            attributes: vec![],
+        };
+        let mut s = RenderScene::new();
+        let identity = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        s.push_geometry_mesh("wall_1", &mesh, Some("oak".into()), identity);
+        assert_eq!(s.meshes.len(), 1);
+        let m = &s.meshes[0];
+        assert_eq!(m.positions.len(), 3);
+        assert_eq!(m.normals.len(), 3, "normals padded to position count");
+        assert_eq!(m.uvs.len(), 3, "uvs padded to position count");
+        assert_eq!(m.indices, vec![0, 1, 2]);
+        assert_eq!(m.material_id, Some("oak".into()));
+        assert_eq!(s.triangle_count(), 1);
+    }
+
+    #[test]
+    fn push_geometry_mesh_preserves_provided_normals_and_uvs() {
+        // When the geometry mesh DOES supply normals/uvs they must be
+        // carried through verbatim — the path tracer relies on the
+        // normals being unit-length and oriented per the source.
+        let mesh = aec_geometry::Mesh {
+            positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            normals: vec![[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            uvs: vec![[0.0, 0.0], [1.0, 0.0]],
+            indices: vec![],
+            attributes: vec![],
+        };
+        let s = SerializedMesh::from_geometry_mesh("m", &mesh, None, [[0.0; 4]; 4]);
+        assert_eq!(s.normals, vec![[0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
+        assert_eq!(s.uvs, vec![[0.0, 0.0], [1.0, 0.0]]);
     }
 }

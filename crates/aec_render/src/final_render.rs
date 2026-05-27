@@ -136,6 +136,22 @@ impl FinalRenderPipeline {
         output_path: impl AsRef<Path>,
         cancel: Option<CancelToken>,
     ) -> Result<FinalRenderOutput, FinalRenderError> {
+        self.render_with_progress(scene, preset, camera, output_path, cancel, None)
+    }
+
+    /// Render with progress streaming (Phase 12 Task 25). The
+    /// `progress` callback receives `(tiles_done, total_tiles)` for each
+    /// completed tile of the CPU path tracer; cancellation is checked at
+    /// tile boundaries via `cancel`.
+    pub fn render_with_progress(
+        &self,
+        scene: &RenderScene,
+        preset: &RenderPreset,
+        camera: &RenderCamera,
+        output_path: impl AsRef<Path>,
+        cancel: Option<CancelToken>,
+        progress: Option<crate::path_trace::ProgressFn>,
+    ) -> Result<FinalRenderOutput, FinalRenderError> {
         let output_path = output_path.as_ref().to_path_buf();
         if let Some(parent) = output_path.parent() {
             if !parent.as_os_str().is_empty() && !parent.exists() {
@@ -159,7 +175,7 @@ impl FinalRenderPipeline {
             &pt_scene,
             camera,
             &config,
-            None,
+            progress,
             cancel.clone(),
             preset.config.denoise,
         );
@@ -172,7 +188,17 @@ impl FinalRenderPipeline {
         }
 
         let denoised = preset.config.denoise;
-        let srgb = encode_srgb8(&buffer, denoised);
+        // Phase 12 Task 24: NLM for low-sample (Quick) renders, bilateral
+        // for higher-sample (Standard+) renders. Driven by the preset's
+        // configured sample count so it scales with quality automatically.
+        let denoiser_choice = if denoised {
+            Some(crate::denoise::Denoiser::auto_for_samples(
+                preset.config.samples,
+            ))
+        } else {
+            None
+        };
+        let srgb = encode_srgb8_with_denoiser(&buffer, denoiser_choice);
         let img = ImageBuffer::<Rgb<u8>, _>::from_raw(buffer.width, buffer.height, srgb)
             .expect("buffer size matches width * height * 3");
         img.save(&output_path)?;
@@ -252,10 +278,30 @@ pub(crate) fn path_trace_config_from_preset(
 /// single tone-map implementation also ensures still / panorama /
 /// walkthrough output matches pixel-for-pixel given the same buffer.
 pub(crate) fn encode_srgb8(buffer: &AccumulationBuffer, denoise: bool) -> Vec<u8> {
-    if !denoise {
+    encode_srgb8_with_denoiser(
+        buffer,
+        if denoise {
+            Some(crate::denoise::Denoiser::Bilateral)
+        } else {
+            None
+        },
+    )
+}
+
+/// Tone-map with an explicit denoiser choice. Phase 12 Task 24 wires this
+/// so the main render path can use [`crate::denoise::Denoiser::auto_for_samples`]
+/// to pick NLM for low-sample renders (Quick presets) and bilateral for
+/// high-sample renders, without changing the call sites in `panorama`
+/// or `walkthrough` (which still call [`encode_srgb8`] with their preset's
+/// `denoise` flag).
+pub(crate) fn encode_srgb8_with_denoiser(
+    buffer: &AccumulationBuffer,
+    denoiser: Option<crate::denoise::Denoiser>,
+) -> Vec<u8> {
+    let Some(denoiser) = denoiser else {
         // Borrowing path — no full-buffer clone for the common case.
         return buffer.as_srgb8();
-    }
+    };
     let avg = buffer.average_rgb();
     // When the buffer carries first-hit aux guidance (because the
     // renderer was driven via `render_with_aux`), feed it to the
@@ -278,24 +324,12 @@ pub(crate) fn encode_srgb8(buffer: &AccumulationBuffer, denoise: bool) -> Vec<u8
             height: buffer.height,
             pixels,
         });
-    // Argument order must match `bilateral_denoise(color, normal, albedo, params)`.
-    // Mismatching the two aux images is silently incorrect because the
-    // kernel computes a normal-edge term `(1 - dot(nc, ns))²` (which
-    // assumes unit-length vectors with range [-1, 1]) on the second
-    // argument and an L2 RGB-distance term on the third — fed the wrong
-    // way around, geometric silhouettes get over-smoothed and material
-    // boundaries get over-sharpened because the sigmas are tuned for
-    // mismatched value ranges.
-    let denoised = crate::denoise::bilateral_denoise(
-        &crate::denoise::ImageRgb {
-            width: buffer.width,
-            height: buffer.height,
-            pixels: avg,
-        },
-        normal_img.as_ref(),
-        albedo_img.as_ref(),
-        crate::denoise::BilateralParams::default(),
-    );
+    let color = crate::denoise::ImageRgb {
+        width: buffer.width,
+        height: buffer.height,
+        pixels: avg,
+    };
+    let denoised = denoiser.apply(&color, normal_img.as_ref(), albedo_img.as_ref());
 
     let mut out = Vec::with_capacity(denoised.pixels.len() * 3);
     for p in &denoised.pixels {

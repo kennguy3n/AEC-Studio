@@ -290,6 +290,26 @@ impl ViewportPipeline {
             (self.desc.height / scale).max(1),
         )
     }
+
+    /// Phase 12 Task 22: drive a [`crate::pbr_preview::PbrPreviewPipeline`]
+    /// to render a Design-mode frame. Runs the CPU-side state machine
+    /// ([`prepare_frame`]) first so culling and outline state are in
+    /// sync with the GPU draw, then submits the PBR render.
+    ///
+    /// Returns the per-frame stats from [`prepare_frame`] so the caller
+    /// can update HUDs / telemetry. The PBR pipeline produces its
+    /// internal colour + depth views; the caller blits them to the
+    /// final swapchain target.
+    pub fn render_pbr(
+        &mut self,
+        frame: &ViewportFrame,
+        preview: &mut crate::pbr_preview::PbrPreviewPipeline,
+        preview_frame: &crate::pbr_preview::PreviewFrame<'_>,
+    ) -> Result<ViewportStats, crate::pbr_preview::PreviewError> {
+        let stats = self.prepare_frame(frame);
+        preview.render(preview_frame)?;
+        Ok(stats)
+    }
 }
 
 #[cfg(test)]

@@ -1,4 +1,8 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
+import {
+  PublishCardModal,
+  type PublishOutcome,
+} from "../kchat/PublishCardModal";
 
 export interface RenderHistoryEntry {
   jobId: string;
@@ -17,6 +21,15 @@ interface Props {
   selectedB: string | null;
   onSelectA: (jobId: string | null) => void;
   onSelectB: (jobId: string | null) => void;
+  /**
+   * Optional project deep link prefix used when publishing renders
+   * to KChat. Defaults to a synthetic `aecstudio://project/local/...`
+   * scheme so the modal can be exercised in dev/test mode without
+   * an open project. Real callers should pass
+   * `aecstudio://project/<projectId>` so the artifact card's
+   * `project_link` resolves to a real artifact.
+   */
+  projectLinkPrefix?: string;
 }
 
 /**
@@ -29,6 +42,7 @@ export function RenderHistory({
   selectedB,
   onSelectA,
   onSelectB,
+  projectLinkPrefix = "aecstudio://project/local",
 }: Props) {
   const sorted = useMemo(
     () =>
@@ -37,6 +51,11 @@ export function RenderHistory({
       ),
     [entries],
   );
+
+  const [publishTarget, setPublishTarget] =
+    useState<RenderHistoryEntry | null>(null);
+  const [publishOutcome, setPublishOutcome] =
+    useState<PublishOutcome | null>(null);
 
   if (sorted.length === 0) {
     return (
@@ -102,11 +121,51 @@ export function RenderHistory({
                 >
                   {isB ? "B ✓" : "B"}
                 </button>
+                <button
+                  type="button"
+                  data-testid={`render-history-publish-${e.jobId}`}
+                  onClick={() => setPublishTarget(e)}
+                  aria-label={`Publish render ${e.jobId} to KChat`}
+                >
+                  Publish
+                </button>
               </div>
             </li>
           );
         })}
       </ol>
+      {publishTarget && (
+        <PublishCardModal
+          artifactKind="concept_render"
+          projectLink={`${projectLinkPrefix}/render/${publishTarget.jobId}`}
+          defaultCaption={`${publishTarget.presetId} render of ${
+            publishTarget.cameraName ?? "scene"
+          }`}
+          thumbnailBlake3={publishTarget.thumbnailHash ?? null}
+          onClose={(outcome) => {
+            setPublishTarget(null);
+            setPublishOutcome(outcome);
+          }}
+        />
+      )}
+      {publishOutcome && publishOutcome.kind === "published" && (
+        <p
+          data-testid="render-history-publish-ack"
+          className="render-history__publish-ack"
+          role="status"
+        >
+          Published to thread <code>{publishOutcome.threadId}</code>
+        </p>
+      )}
+      {publishOutcome && publishOutcome.kind === "failed" && (
+        <p
+          data-testid="render-history-publish-err"
+          className="render-history__publish-err"
+          role="alert"
+        >
+          Publish failed: {publishOutcome.message}
+        </p>
+      )}
     </section>
   );
 }

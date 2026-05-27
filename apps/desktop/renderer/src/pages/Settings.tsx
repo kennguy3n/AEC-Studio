@@ -43,6 +43,21 @@ export function Settings() {
   const [settings, setSettings] = useState<SettingsState>(DEFAULT_SETTINGS);
   const [savedAt, setSavedAt] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [kchatStatus, setKchatStatus] = useState<{
+    state: "connected" | "reconnecting" | "disconnected";
+    publisherKind: "local_ipc" | "in_memory";
+    instance: { socket_path: string; version: string; health: string } | null;
+  } | null>(null);
+  const [kchatReloading, setKchatReloading] = useState(false);
+  // Surfaces the last `kchat:reload` failure inline next to the
+  // reload button. The `onClick={() => void onReloadKChat()}` call
+  // site cannot observe a rejected promise (React ignores returned
+  // Promises from `onClick`), so without this state any reload
+  // failure would silently disappear and the user would think
+  // their click did nothing. Cleared on the next successful reload.
+  const [kchatReloadError, setKchatReloadError] = useState<string | null>(
+    null,
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -58,9 +73,51 @@ export function Settings() {
         }
       }
     })();
+    (async () => {
+      try {
+        const s = await aec.kchat.status();
+        if (!cancelled) {
+          setKchatStatus({
+            state: s.state,
+            publisherKind: s.publisherKind,
+            instance: parseKChatInstance(s.instanceJson),
+          });
+        }
+      } catch {
+        // KChat status is best-effort; surfacing a hard error here
+        // would prevent the user from changing other preferences.
+      }
+    })();
     return () => {
       cancelled = true;
     };
+  }, []);
+
+  const onReloadKChat = useCallback(async () => {
+    setKchatReloading(true);
+    try {
+      const s = await aec.kchat.reload();
+      setKchatStatus({
+        state: s.state,
+        publisherKind: s.publisherKind,
+        instance: parseKChatInstance(s.instanceJson),
+      });
+      // Clear any prior failure once we've successfully refreshed.
+      setKchatReloadError(null);
+    } catch (e: unknown) {
+      // `kchat:reload` can reject when the bridge is mid-restart,
+      // the discovered socket is unreachable, or napi serialization
+      // fails. The `onClick={() => void onReloadKChat()}` call site
+      // throws away the returned promise, so we must capture the
+      // error here or it propagates as an unhandled rejection and
+      // the user sees no feedback. We deliberately surface the
+      // message inline rather than reusing the page-level `error`
+      // state — a transient KChat reconnect failure shouldn't make
+      // the whole Settings page look broken.
+      setKchatReloadError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setKchatReloading(false);
+    }
   }, []);
 
   const updateSetting = useCallback(
@@ -227,6 +284,54 @@ export function Settings() {
           />
           Enable KChat integration
         </label>
+        <div
+          className="settings-kchat-instance"
+          data-testid="settings-kchat-instance"
+        >
+          {kchatStatus === null ? (
+            <p>Checking for KChat Desktop…</p>
+          ) : kchatStatus.instance ? (
+            <ul>
+              <li>
+                Publisher: <code>{kchatStatus.publisherKind}</code>
+              </li>
+              <li>
+                Connection: <code>{kchatStatus.state}</code>
+              </li>
+              <li>
+                Socket: <code>{kchatStatus.instance.socket_path}</code>
+              </li>
+              <li>
+                Version: <code>{kchatStatus.instance.version}</code>
+              </li>
+              <li>
+                Health: <code>{kchatStatus.instance.health}</code>
+              </li>
+            </ul>
+          ) : (
+            <p>
+              No KChat Desktop instance detected on this machine. AEC
+              Studio will use the in-memory fallback publisher.
+            </p>
+          )}
+          <button
+            type="button"
+            data-testid="settings-kchat-reload"
+            disabled={kchatReloading}
+            onClick={() => void onReloadKChat()}
+          >
+            {kchatReloading ? "Reloading…" : "Reload KChat connection"}
+          </button>
+          {kchatReloadError && (
+            <p
+              data-testid="settings-kchat-reload-error"
+              className="settings-page__inline-error"
+              role="alert"
+            >
+              Reload failed: {kchatReloadError}
+            </p>
+          )}
+        </div>
       </section>
 
       <footer className="settings-page__footer">
@@ -256,3 +361,26 @@ export function Settings() {
 }
 
 export default Settings;
+
+function parseKChatInstance(json: string | null | undefined): {
+  socket_path: string;
+  version: string;
+  health: string;
+} | null {
+  if (!json) return null;
+  try {
+    const parsed = JSON.parse(json) as {
+      socket_path?: string;
+      version?: string;
+      health?: string;
+    };
+    if (!parsed.socket_path || !parsed.version) return null;
+    return {
+      socket_path: parsed.socket_path,
+      version: parsed.version,
+      health: parsed.health ?? "unknown",
+    };
+  } catch {
+    return null;
+  }
+}

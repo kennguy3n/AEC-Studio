@@ -318,6 +318,22 @@ impl Denoiser {
             Denoiser::Nlm => nlm_denoise(color, NlmParams::default()),
         }
     }
+
+    /// Heuristic: pick the appropriate denoiser for a given sample count
+    /// (Phase 12 Task 24).
+    ///
+    /// At very low sample counts (Quick presets, ≤ 64 spp), NLM produces
+    /// noticeably better edge preservation because it matches whole patches
+    /// rather than per-pixel weights. At higher sample counts the gain
+    /// over bilateral shrinks while bilateral's cost stays constant, so we
+    /// flip back to bilateral for Standard+ quality.
+    pub fn auto_for_samples(samples: u32) -> Self {
+        if samples <= 64 {
+            Self::Nlm
+        } else {
+            Self::Bilateral
+        }
+    }
 }
 
 #[cfg(test)]
@@ -591,6 +607,54 @@ mod tests {
             max_abs_diff > 1.0e-3,
             "bilateral_denoise must distinguish (normal, albedo) from \
              (albedo, normal); got max_abs_diff = {max_abs_diff}"
+        );
+    }
+
+    #[test]
+    fn auto_for_samples_picks_nlm_below_threshold_and_bilateral_above() {
+        // Phase 12 Task 24 — Quick presets use 32-64 spp, Standard
+        // 128+, High 256+. The heuristic should pick NLM for the low
+        // end and bilateral for the high end.
+        assert_eq!(Denoiser::auto_for_samples(16), Denoiser::Nlm);
+        assert_eq!(Denoiser::auto_for_samples(64), Denoiser::Nlm);
+        assert_eq!(Denoiser::auto_for_samples(65), Denoiser::Bilateral);
+        assert_eq!(Denoiser::auto_for_samples(128), Denoiser::Bilateral);
+        assert_eq!(Denoiser::auto_for_samples(256), Denoiser::Bilateral);
+    }
+
+    #[test]
+    fn nlm_reduces_variance_on_uniform_noisy_patch() {
+        // NLM should reduce variance just like bilateral. Use a
+        // uniform-grey patch with added gaussian noise so the patch
+        // average converges to the true signal.
+        let mut color = ImageRgb::new(32, 32);
+        let mut rng = fastrand::Rng::with_seed(0xBEEF);
+        for px in &mut color.pixels {
+            let n = (rng.f32() - 0.5) * 0.4;
+            *px = [(0.5 + n).clamp(0.0, 1.0); 3];
+        }
+        let before_var: f32 = {
+            let mean: f32 =
+                color.pixels.iter().map(|p| p[0]).sum::<f32>() / color.pixels.len() as f32;
+            color
+                .pixels
+                .iter()
+                .map(|p| (p[0] - mean).powi(2))
+                .sum::<f32>()
+                / color.pixels.len() as f32
+        };
+        let out = nlm_denoise(&color, NlmParams::default());
+        let after_var: f32 = {
+            let mean: f32 = out.pixels.iter().map(|p| p[0]).sum::<f32>() / out.pixels.len() as f32;
+            out.pixels
+                .iter()
+                .map(|p| (p[0] - mean).powi(2))
+                .sum::<f32>()
+                / out.pixels.len() as f32
+        };
+        assert!(
+            after_var < before_var,
+            "NLM must reduce variance: before={before_var}, after={after_var}"
         );
     }
 }

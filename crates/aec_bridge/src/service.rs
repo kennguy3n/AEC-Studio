@@ -1272,6 +1272,17 @@ pub struct BridgeService {
     /// touch only the diff registry. See `crate::ai_state` module
     /// doc for the full concurrency rationale.
     ai_state: AiState,
+    /// Process-wide KChat publisher state. Holds either a
+    /// [`aec_core::LocalIpcPublisher`] (when a KChat Desktop
+    /// instance is discovered on the box) or an
+    /// [`aec_core::InMemoryPublisher`] fallback. See
+    /// [`crate::kchat_state`] for the publisher-selection rationale.
+    kchat_state: crate::kchat_state::KChatState,
+    /// Real-time viewport service. Owns the wgpu device, the four
+    /// core render pipelines, and the off-screen surface. See
+    /// [`crate::viewport_service`] for the rationale around the
+    /// "real device when available, fallback otherwise" pattern.
+    viewport_service: crate::viewport_service::ViewportService,
 }
 
 /// Process-wide render state held by [`BridgeService::render_state`].
@@ -1356,7 +1367,17 @@ impl BridgeService {
             render_state: Mutex::new(RenderState::new()),
             asset_state,
             ai_state: AiState::new(default_ai_runtime_config()),
+            kchat_state: crate::kchat_state::KChatState::new(),
+            viewport_service: crate::viewport_service::ViewportService::new(),
         })
+    }
+
+    /// Borrow the process-wide [`KChatState`]. Used by tests that
+    /// need to install a mock publisher / socket fixture before
+    /// driving the bridge through the public KChat endpoints.
+    #[doc(hidden)]
+    pub fn __kchat_state(&self) -> &crate::kchat_state::KChatState {
+        &self.kchat_state
     }
 
     /// Canonicalise a caller-supplied project path so the same project
@@ -1514,6 +1535,14 @@ impl BridgeService {
         // failure handling as the other mutating endpoints.
         let root_str = root.to_string_lossy();
         self.invalidate_status_cache_for(&root_str);
+        // Adopt the fresh project's KChat config (typically `None`
+        // for a template-created project — templates don't carry a
+        // thread id) so a subsequent `kchat:status` poll reflects
+        // the just-created project rather than the previously-open
+        // one's stale thread. The renderer will issue its usual
+        // `project_open` follow-up, but applying here keeps the
+        // bridge consistent the moment creation succeeds.
+        self.apply_kchat_project_config(pkg.manifest().settings.kchat.as_ref());
         let summary: ProjectSummary = pkg.summary().into();
         let core_summary = pkg.summary();
         self.recents.record(&core_summary)?;
@@ -1542,10 +1571,29 @@ impl BridgeService {
         // state — see `EngineStatusCache::invalidate_all` for the
         // full rationale.
         self.invalidate_status_cache_for(path);
+        // Adopt the just-opened project's KChat config so the
+        // renderer's `kchat:status` poll surfaces this project's
+        // `default_thread_id` and `enabled` flag on the very next
+        // tick. When the manifest omits the field we clear the
+        // bridge-side cache so the Deliver page's review panel
+        // falls back to the publisher-side default thread instead
+        // of pointing at the previously-open project.
+        self.apply_kchat_project_config(pkg.manifest().settings.kchat.as_ref());
         let core_summary = pkg.summary();
         let summary: ProjectSummary = core_summary.clone().into();
         self.recents.record(&core_summary)?;
         Ok(summary)
+    }
+
+    /// Apply (or clear) the per-project KChat configuration on the
+    /// bridge-wide [`crate::kchat_state::KChatState`]. Called from
+    /// every endpoint that opens or re-opens a project so the
+    /// renderer's `kchat:status` poll mirrors the on-disk manifest.
+    fn apply_kchat_project_config(&self, config: Option<&aec_core::kchat_config::KChatConfig>) {
+        match config {
+            Some(c) => self.kchat_state.apply_project_config(c),
+            None => self.kchat_state.clear_project_config(),
+        }
     }
 
     /// Persist the manifest of an open project.
@@ -1564,6 +1612,11 @@ impl BridgeService {
         // state. Falls back to `invalidate_all` on canonicalise
         // failure (see `invalidate_status_cache_for`).
         self.invalidate_status_cache_for(path);
+        // Mirror the saved manifest's KChat config onto the
+        // bridge-wide state so a save that toggles `enabled` or
+        // changes `default_thread_id` is reflected on the next
+        // `kchat:status` poll without forcing a project re-open.
+        self.apply_kchat_project_config(pkg.manifest().settings.kchat.as_ref());
         Ok(pkg.summary().into())
     }
 
@@ -3199,6 +3252,31 @@ impl BridgeService {
         }
     }
 
+    /// Phase 12 Task 29 — persist the in-memory render queue to a JSON
+    /// file on disk. Used at session shutdown / quit so a subsequent
+    /// service boot can resume an in-flight render batch via
+    /// [`Self::render_queue_restore`]. Atomic write-then-rename in the
+    /// underlying `RenderQueue::persist`.
+    pub fn render_queue_persist(&self, path: &str) -> Result<(), BridgeServiceError> {
+        let state = self.lock_render_state()?;
+        state
+            .queue
+            .persist(std::path::Path::new(path))
+            .map_err(|e| BridgeServiceError::Core(format!("render_queue_persist: {e}")))
+    }
+
+    /// Phase 12 Task 29 — restore a previously-persisted render queue
+    /// from disk into the in-memory state. Missing-file is *not* an
+    /// error: a fresh boot before the first persist() call legitimately
+    /// has no queue file yet, and the symmetric `load` returns an
+    /// empty queue in that case.
+    pub fn render_queue_restore(&self, path: &str) -> Result<(), BridgeServiceError> {
+        let mut state = self.lock_render_state()?;
+        state.queue = aec_render::queue::RenderQueue::load(std::path::Path::new(path))
+            .map_err(|e| BridgeServiceError::Core(format!("render_queue_restore: {e}")))?;
+        Ok(())
+    }
+
     /// Select the given preset id as the active preset in the in-memory
     /// preset store. The return carries the now-active preset id so
     /// the renderer can keep its dropdown in lock-step with the engine
@@ -4237,6 +4315,128 @@ impl BridgeService {
             changes,
         })
     }
+
+    // ===== KChat (Phase 12) =====
+
+    /// Snapshot the current KChat connection state. Cheap; the
+    /// renderer polls this from the status indicator every ~5 s.
+    pub fn kchat_status(&self) -> crate::kchat_state::KChatStatusReport {
+        self.kchat_state.status()
+    }
+
+    /// Re-run KChat discovery and replace the active publisher.
+    /// Triggered by the Settings page's "Reload KChat connection"
+    /// button.
+    pub fn kchat_reload(&self) -> crate::kchat_state::KChatStatusReport {
+        self.kchat_state.reload()
+    }
+
+    /// Phase 12 Task 30 — flip the master KChat enable switch. When
+    /// `enabled` is `false`, subsequent [`Self::kchat_publish`] and
+    /// [`Self::kchat_ingest_reviews`] calls return
+    /// [`aec_core::kchat::KChatError::Disabled`] without touching the
+    /// transport. Used by the Settings page's "Disable KChat" toggle.
+    pub fn kchat_set_enabled(&self, enabled: bool) {
+        self.kchat_state.set_enabled(enabled);
+    }
+
+    /// Phase 12 Task 30 — mirror of [`Self::kchat_set_enabled`].
+    pub fn kchat_is_enabled(&self) -> bool {
+        self.kchat_state.is_enabled()
+    }
+
+    /// Publish an artifact card through the active publisher.
+    pub fn kchat_publish(
+        &self,
+        card: aec_core::kchat::ArtifactCard,
+    ) -> Result<aec_core::kchat::PublishResult, BridgeServiceError> {
+        self.kchat_state
+            .publish(card)
+            .map_err(|e| BridgeServiceError::Core(format!("kchat publish: {e}")))
+    }
+
+    /// Pull review comments newer than `since_iso` from the active
+    /// publisher's thread. Returns `(comments, cards)`. The in-memory
+    /// fallback always returns `(vec![], vec![])`.
+    pub fn kchat_ingest_reviews(
+        &self,
+        thread_id: &str,
+        since_iso: Option<String>,
+    ) -> Result<KChatIngestReport, BridgeServiceError> {
+        let (comments, cards) = self
+            .kchat_state
+            .ingest_reviews(thread_id, since_iso)
+            .map_err(|e| BridgeServiceError::Core(format!("kchat ingest: {e}")))?;
+        Ok(KChatIngestReport {
+            thread_id: thread_id.to_string(),
+            comments,
+            cards,
+        })
+    }
+
+    // ----- Viewport (Phase 12) ---------------------------------
+    //
+    // The viewport service owns its own GPU device and pipelines and
+    // is safe to call even when no adapter is available — it will
+    // simply report `"unavailable"` instead of crashing. See
+    // [`crate::viewport_service`] for the design rationale.
+
+    /// Borrow the process-wide viewport service. Exposed for tests
+    /// and the N-API layer; downstream code should prefer the
+    /// typed methods below.
+    pub fn __viewport_service(&self) -> &crate::viewport_service::ViewportService {
+        &self.viewport_service
+    }
+
+    /// Resize the viewport's off-screen surface.
+    pub fn viewport_resize(
+        &self,
+        width: u32,
+        height: u32,
+    ) -> Result<crate::viewport_service::ViewportStatusReport, BridgeServiceError> {
+        self.viewport_service
+            .resize(width, height)
+            .map_err(|e| BridgeServiceError::Invalid(format!("viewport resize: {e}")))?;
+        Ok(self.viewport_service.status())
+    }
+
+    /// Apply a mouse / camera input to the viewport.
+    pub fn viewport_input(
+        &self,
+        input: crate::viewport_service::ViewportInput,
+    ) -> Result<crate::viewport_service::ViewportCameraReport, BridgeServiceError> {
+        self.viewport_service.apply_input(input);
+        Ok(self.viewport_service.camera_report())
+    }
+
+    /// Request the next viewport frame. The actual pixel bytes are
+    /// available via the underlying [`SurfaceManager`]; this method
+    /// returns a deterministic summary (frame index, camera state,
+    /// `presented` / `coalesced` / `unavailable`) that the renderer
+    /// can use to drive its diagnostic UI.
+    pub fn viewport_request_frame(
+        &self,
+    ) -> Result<crate::viewport_service::ViewportFrameReport, BridgeServiceError> {
+        self.viewport_service
+            .request_frame()
+            .map_err(|e| BridgeServiceError::Core(format!("viewport frame: {e}")))
+    }
+
+    /// Status report for the viewport diagnostics panel.
+    pub fn viewport_status(&self) -> crate::viewport_service::ViewportStatusReport {
+        self.viewport_service.status()
+    }
+}
+
+/// Bridge-shaped review-ingest report. Renderer-facing alias for the
+/// `(comments, cards)` tuple — `serde`-friendly so it crosses the
+/// N-API boundary cleanly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KChatIngestReport {
+    pub thread_id: String,
+    pub comments: Vec<aec_core::kchat::ReviewComment>,
+    pub cards: Vec<aec_core::kchat::ReviewCard>,
 }
 
 fn revision_to_summary(r: aec_core::revision::Revision) -> RevisionSummary {
@@ -4652,6 +4852,90 @@ mod tests {
         assert_eq!(opened.project_id, summary.project_id);
         let saved = s.project_save(&summary.path).unwrap();
         assert_eq!(saved.project_id, summary.project_id);
+    }
+
+    /// `project_open` must adopt the just-opened project's
+    /// [`KChatConfig::default_thread_id`] so the renderer's
+    /// `kchat:status` poll surfaces it immediately. Verifies the end-
+    /// to-end path: write the per-project thread to `manifest.json`,
+    /// then call `project_open` and assert the bridge-wide
+    /// `KChatState::status` reports the new thread.
+    #[test]
+    fn project_open_adopts_kchat_default_thread_id_from_manifest() {
+        use aec_core::kchat_config::KChatConfig;
+        use aec_core::ProjectManifest;
+
+        let (mut s, _g) = service();
+        let summary = s
+            .project_create_from_template("interior.apartment", "ThreadProj")
+            .unwrap();
+
+        // Fresh project: no per-project thread until the manifest
+        // is amended.
+        assert!(
+            s.kchat_status().default_thread_id.is_none(),
+            "freshly-created project has no per-project thread"
+        );
+
+        // Inject the thread into manifest.json on disk, then re-open
+        // through the service so we exercise the real
+        // `project_open` → `apply_kchat_project_config` path.
+        let manifest_path = std::path::Path::new(&summary.path).join("manifest.json");
+        let mut manifest: ProjectManifest =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+        manifest.settings.kchat = Some(KChatConfig::enabled_with_thread("manifest-thread-7"));
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        s.project_open(&summary.path).unwrap();
+        let status = s.kchat_status();
+        assert_eq!(
+            status.default_thread_id,
+            Some("manifest-thread-7".to_string()),
+            "project_open must push KChatConfig::default_thread_id into the status payload"
+        );
+    }
+
+    /// Opening a project that omits `kchat` in its manifest must
+    /// clear any stale per-project thread the bridge cached from
+    /// the previously-open project — otherwise the Deliver page
+    /// would point at the wrong thread after a project switch.
+    #[test]
+    fn project_open_clears_stale_thread_when_new_manifest_omits_kchat() {
+        use aec_core::kchat_config::KChatConfig;
+        use aec_core::ProjectManifest;
+
+        let (mut s, _g) = service();
+
+        // First project: persist a thread id into its manifest and
+        // open it so the bridge caches the thread.
+        let first = s
+            .project_create_from_template("interior.apartment", "FirstProj")
+            .unwrap();
+        let first_manifest = std::path::Path::new(&first.path).join("manifest.json");
+        let mut m: ProjectManifest =
+            serde_json::from_str(&std::fs::read_to_string(&first_manifest).unwrap()).unwrap();
+        m.settings.kchat = Some(KChatConfig::enabled_with_thread("first-thread"));
+        std::fs::write(&first_manifest, serde_json::to_vec_pretty(&m).unwrap()).unwrap();
+        s.project_open(&first.path).unwrap();
+        assert_eq!(
+            s.kchat_status().default_thread_id,
+            Some("first-thread".to_string())
+        );
+
+        // Second project: no kchat config in its manifest. Opening
+        // it must clear the cached thread from FirstProj.
+        let second = s
+            .project_create_from_template("interior.apartment", "SecondProj")
+            .unwrap();
+        s.project_open(&second.path).unwrap();
+        assert!(
+            s.kchat_status().default_thread_id.is_none(),
+            "opening a project without a thread must clear the prior project's cache"
+        );
     }
 
     #[test]

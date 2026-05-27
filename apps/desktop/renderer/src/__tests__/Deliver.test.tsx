@@ -7,9 +7,10 @@
  * and the pack-build flow.
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 
+import { aec } from "../api/aec";
 import { Deliver } from "../pages/Deliver";
 
 describe("<Deliver />", () => {
@@ -110,5 +111,92 @@ describe("<Deliver />", () => {
     });
     // Concept pack ships a manifest in our fixture.
     expect(screen.getByTestId("pack-file-manifest.json")).toBeInTheDocument();
+  });
+});
+
+/**
+ * The Deliver page reads the active project's
+ * `KChatConfig::default_thread_id` from `kchat:status.defaultThreadId`
+ * (surfaced through the IPC layer) and forwards it to
+ * `<KChatReviewPanel threadId={…} />`. These tests pin the wiring:
+ *
+ * - when the bridge reports a per-project thread, the panel must
+ *   key its ingest poll off *that* thread, and
+ * - when the bridge reports `null` (no project open / project
+ *   manifest omitted `default_thread_id`), the panel must fall back
+ *   to the `"kchat-default"` constant which matches
+ *   `aec_core::DEFAULT_THREAD_ID` on the publisher side.
+ *
+ * Both tests force the status mock into the *connected* path so the
+ * panel's offline branch doesn't hide the thread-id heading.
+ */
+describe("<Deliver /> KChat thread wiring", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("forwards the active project's defaultThreadId to the review panel", async () => {
+    // Spy on `aec.kchat.status` to simulate a project-open that has
+    // already pushed `KChatConfig::default_thread_id = "thread-from-project"`
+    // through to the bridge state.
+    vi.spyOn(aec.kchat, "status").mockResolvedValue({
+      state: "connected",
+      publisherKind: "local_ipc",
+      instanceJson: null,
+      defaultThreadId: "thread-from-project",
+    });
+    // Spy on `ingestReviews` so the panel's first poll resolves
+    // synchronously and we can assert the threadId it was called
+    // with.
+    const ingestSpy = vi
+      .spyOn(aec.kchat, "ingestReviews")
+      .mockResolvedValue({
+        threadId: "thread-from-project",
+        commentsJson: "[]",
+        cardsJson: "[]",
+      });
+
+    render(<Deliver />);
+    await waitFor(() => {
+      // The panel renders `Reviews · {threadId}` only on the
+      // connected path; existence of this heading confirms the
+      // project's thread made it all the way to the panel.
+      expect(
+        screen.getByText("Reviews · thread-from-project"),
+      ).toBeInTheDocument();
+    });
+    await waitFor(() => {
+      expect(ingestSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ threadId: "thread-from-project" }),
+      );
+    });
+  });
+
+  it("falls back to 'kchat-default' when no project thread is set", async () => {
+    vi.spyOn(aec.kchat, "status").mockResolvedValue({
+      state: "connected",
+      publisherKind: "local_ipc",
+      instanceJson: null,
+      defaultThreadId: null,
+    });
+    const ingestSpy = vi
+      .spyOn(aec.kchat, "ingestReviews")
+      .mockResolvedValue({
+        threadId: "kchat-default",
+        commentsJson: "[]",
+        cardsJson: "[]",
+      });
+
+    render(<Deliver />);
+    await waitFor(() => {
+      expect(
+        screen.getByText("Reviews · kchat-default"),
+      ).toBeInTheDocument();
+    });
+    await waitFor(() => {
+      expect(ingestSpy).toHaveBeenCalledWith(
+        expect.objectContaining({ threadId: "kchat-default" }),
+      );
+    });
   });
 });

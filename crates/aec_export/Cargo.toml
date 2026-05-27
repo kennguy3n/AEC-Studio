@@ -12,6 +12,7 @@ aec_bim = { path = "../aec_bim" }
 aec_cad = { path = "../aec_cad" }
 aec_core = { path = "../aec_core" }
 aec_materials = { path = "../aec_materials" }
+image = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

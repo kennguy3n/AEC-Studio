@@ -95,7 +95,9 @@ export function rendererInProcessBackend(): AecApi {
       open: async (projectPath) => {
         const summary: Recent = {
           projectId: newId("proj"),
-          name: projectPath.split("/").pop()?.replace(".aecstudio", "") ?? "Project",
+          name:
+            projectPath.split("/").pop()?.replace(".aecstudio", "") ??
+            "Project",
           path: projectPath,
           templateKey: null,
           modifiedAt: new Date().toISOString(),
@@ -112,7 +114,9 @@ export function rendererInProcessBackend(): AecApi {
         }
         return {
           projectId: newId("proj"),
-          name: projectPath.split("/").pop()?.replace(".aecstudio", "") ?? "Project",
+          name:
+            projectPath.split("/").pop()?.replace(".aecstudio", "") ??
+            "Project",
           path: projectPath,
           templateKey: null,
           modifiedAt: now,
@@ -127,12 +131,21 @@ export function rendererInProcessBackend(): AecApi {
       setLighting: async () => ({ ok: true }),
       saveCamera: async () => ({ cameraId: newId("cam") }),
       listAssets: async (query) => {
-        const q = query as { tags?: string[]; styleTags?: string[]; search?: string; limit?: number };
+        const q = query as {
+          tags?: string[];
+          styleTags?: string[];
+          search?: string;
+          limit?: number;
+        };
         return assets
           .filter((a) => (q.tags ?? []).every((t) => a.tags.includes(t)))
-          .filter((a) => (q.styleTags ?? []).every((t) => a.styleTags.includes(t)))
           .filter((a) =>
-            q.search ? a.name.toLowerCase().includes(q.search.toLowerCase()) : true,
+            (q.styleTags ?? []).every((t) => a.styleTags.includes(t)),
+          )
+          .filter((a) =>
+            q.search
+              ? a.name.toLowerCase().includes(q.search.toLowerCase())
+              : true,
           )
           .slice(0, q.limit ?? 24);
       },
@@ -267,14 +280,10 @@ export function rendererInProcessBackend(): AecApi {
               ? [params.presetId]
               : [];
         if (params.cameraIds.length === 0) {
-          throw new Error(
-            "renderEnqueueBatch requires at least one camera id",
-          );
+          throw new Error("renderEnqueueBatch requires at least one camera id");
         }
         if (presets.length === 0) {
-          throw new Error(
-            "renderEnqueueBatch requires at least one preset id",
-          );
+          throw new Error("renderEnqueueBatch requires at least one preset id");
         }
         for (const preset of presets) {
           if (!isBuiltInPresetId(preset)) {
@@ -398,7 +407,129 @@ export function rendererInProcessBackend(): AecApi {
         os: "test",
       }),
     },
+    kchat: kchatMock(newId),
+    viewport: viewportMock(),
   };
+}
+
+/**
+ * Renderer-fallback KChat backend. There's no KChat Desktop instance
+ * in vitest, so `status()` always reports the in-memory publisher,
+ * `publish()` returns a deterministic `messageId` (the `newId()`
+ * counter is shared with every other renderer-mock id source so
+ * snapshot tests get stable output), and `ingestReviews()` returns
+ * an empty result set.
+ */
+function kchatMock(newId: (prefix: string) => string) {
+  return {
+    status: async () =>
+      ({
+        state: "disconnected",
+        publisherKind: "in_memory",
+        instanceJson: null,
+        // Vitest contexts never open a real project, so the
+        // per-project `KChatConfig::default_thread_id` is always
+        // absent. The Deliver page's review panel falls back to
+        // its `kchat-default` constant when this is null.
+        defaultThreadId: null,
+      }) as Awaited<ReturnType<AecApi["kchat"]["status"]>>,
+    reload: async () =>
+      ({
+        state: "disconnected",
+        publisherKind: "in_memory",
+        instanceJson: null,
+        defaultThreadId: null,
+      }) as Awaited<ReturnType<AecApi["kchat"]["reload"]>>,
+    publish: async (_params: { cardJson: string }) => ({
+      messageId: newId("kchat_msg"),
+      threadId: "kchat-default",
+      publishedAt: new Date("2026-01-01T00:00:00Z").toISOString(),
+    }),
+    ingestReviews: async (params: {
+      threadId: string;
+      sinceIso?: string | null;
+    }) => ({
+      threadId: params.threadId,
+      commentsJson: "[]",
+      cardsJson: "[]",
+    }),
+  } satisfies AecApi["kchat"];
+}
+
+/**
+ * Renderer-fallback viewport backend (Phase 12). Vitest doesn't
+ * have a GPU adapter, so we return `state: "unavailable"` from
+ * `status()`, store the requested width/height in a closure
+ * variable so subsequent `resize()` reports the latest values, and
+ * keep a tiny in-memory camera so `input({kind:"orbit"})` followed
+ * by `requestFrame()` reflects the new pose.
+ */
+function viewportMock() {
+  const camera = {
+    position: [5000, 3000, 5000] as [number, number, number],
+    target: [0, 0, 0] as [number, number, number],
+    up: [0, 1, 0] as [number, number, number],
+    fov_y_radians: Math.PI / 3,
+  };
+  let width = 0;
+  let height = 0;
+  let frameIndex = 0;
+  const cameraJson = () => JSON.stringify(camera);
+  return {
+    status: async () => ({
+      state: "unavailable" as const,
+      width,
+      height,
+      frameIndex,
+      gpuDescriptorJson: null,
+    }),
+    resize: async (params: { width: number; height: number }) => {
+      width = params.width;
+      height = params.height;
+      return {
+        state: "unavailable" as const,
+        width,
+        height,
+        frameIndex,
+        gpuDescriptorJson: null,
+      };
+    },
+    input: async (params: {
+      kind: "orbit" | "pan" | "zoom" | "reset";
+      dx?: number;
+      dy?: number;
+      delta?: number;
+    }) => {
+      // Trivial position update so tests can observe an effect.
+      if (params.kind === "orbit") {
+        camera.position[0] += params.dx ?? 0;
+        camera.position[1] += params.dy ?? 0;
+      } else if (params.kind === "pan") {
+        camera.position[0] -= params.dx ?? 0;
+        camera.position[1] += params.dy ?? 0;
+        camera.target[0] -= params.dx ?? 0;
+        camera.target[1] += params.dy ?? 0;
+      } else if (params.kind === "zoom") {
+        const f = 1 - (params.delta ?? 0) * 0.001;
+        camera.position[0] *= f;
+        camera.position[1] *= f;
+        camera.position[2] *= f;
+      } else if (params.kind === "reset") {
+        camera.position = [5000, 3000, 5000];
+      }
+      return { cameraJson: cameraJson() };
+    },
+    requestFrame: async () => {
+      frameIndex += 1;
+      return {
+        frameIndex,
+        width,
+        height,
+        state: "unavailable" as const,
+        cameraJson: cameraJson(),
+      };
+    },
+  } satisfies AecApi["viewport"];
 }
 
 /**
@@ -612,7 +743,10 @@ function commandMock() {
         redoLen: graph.redo.length,
       };
     },
-    async listGraph(projectPath: string, kindFilter?: string): Promise<EntityRecord[]> {
+    async listGraph(
+      projectPath: string,
+      kindFilter?: string,
+    ): Promise<EntityRecord[]> {
       const graph = ensureInProcessGraph(graphs, projectPath);
       const rows: EntityRecord[] = [];
       for (const r of graph.entities.values()) {

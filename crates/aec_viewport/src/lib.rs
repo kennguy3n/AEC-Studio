@@ -11,6 +11,7 @@ pub mod cad_canvas;
 pub mod camera;
 pub mod csm;
 pub mod culling;
+pub mod draft_2d;
 pub mod gizmo;
 pub mod grid;
 pub mod instancing;
@@ -19,11 +20,13 @@ pub mod outline;
 pub mod pbr_preview;
 pub mod picking;
 pub mod reference_image;
+pub mod render_pipeline;
 pub mod renderer;
 pub mod scene;
 pub mod selection;
 pub mod sky;
 pub mod snap_overlay;
+pub mod surface;
 pub mod viewport_pipeline;
 
 pub use bim_batch::{BatchKey, BimBatch, BimBatchCache, BimEntity, BimKind, MeshHash};
@@ -45,10 +48,14 @@ pub use reference_image::{
     ReferenceImage, ReferenceImageBitmap, ReferenceImageError, ReferenceImageKind,
     ReferenceImageOverlay, ReferenceImagePage, MAX_IMAGE_DIMENSION_PX,
 };
-pub use renderer::{RendererBackend, ViewportRenderer};
+pub use render_pipeline::{
+    CameraUniform, PipelineConfig, PipelineError, RenderPipeline, DEFAULT_MSAA,
+};
+pub use renderer::{GpuDescriptor, RendererBackend, RendererError, ViewportRenderer};
 pub use scene::{SceneGraph, SceneMesh, SceneNode, SceneNodeKind};
 pub use selection::{Selection, SelectionMode};
 pub use snap_overlay::{SnapHit, SnapKind, SnapOverlay};
+pub use surface::{aligned_row_bytes, FrameKey, SurfaceError, SurfaceManager};
 pub use viewport_pipeline::{
     validate_shaders as validate_viewport_shaders, ViewportDescriptor, ViewportError,
     ViewportFrame, ViewportPipeline, ViewportStats, HIZ_SHADER_SOURCE, OUTLINE_SHADER_SOURCE,

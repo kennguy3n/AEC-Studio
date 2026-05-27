@@ -2612,6 +2612,240 @@ pub async fn deliver_compare_revisions(
     .await
 }
 
+// ===== KChat (Phase 12) =====
+
+/// Renderer-shaped KChat connection status. Mirrors
+/// [`crate::kchat_state::KChatStatusReport`].
+#[napi(object)]
+pub struct KChatStatusJs {
+    pub state: String,
+    pub publisher_kind: String,
+    pub instance_json: Option<String>,
+    /// Per-project [`KChatConfig::default_thread_id`][cfg] (or `None`
+    /// when no project is open / the project omitted the field).
+    /// Surfaces through the same status payload the renderer
+    /// already polls every 5 s; the Deliver page's review panel
+    /// reads it directly and falls back to the publisher-side
+    /// default constant only when this is `None`.
+    ///
+    /// [cfg]: aec_core::kchat_config::KChatConfig
+    pub default_thread_id: Option<String>,
+}
+
+#[napi(object)]
+pub struct KChatPublishParamsJs {
+    /// Serialised [`aec_core::kchat::ArtifactCard`] (JSON). The
+    /// renderer assembles this from form values and sends the
+    /// stringified JSON across the bridge.
+    pub card_json: String,
+}
+
+#[napi(object)]
+pub struct KChatPublishResultJs {
+    pub message_id: String,
+    pub thread_id: String,
+    pub published_at: String,
+}
+
+#[napi(object)]
+pub struct KChatIngestParamsJs {
+    pub thread_id: String,
+    pub since_iso: Option<String>,
+}
+
+#[napi(object)]
+pub struct KChatIngestResultJs {
+    pub thread_id: String,
+    /// JSON-encoded `Vec<ReviewComment>`.
+    pub comments_json: String,
+    /// JSON-encoded `Vec<ReviewCard>`.
+    pub cards_json: String,
+}
+
+fn kchat_status_to_js(rep: crate::kchat_state::KChatStatusReport) -> KChatStatusJs {
+    let instance_json = rep
+        .instance
+        .as_ref()
+        .map(|info| serde_json::to_string(info).unwrap_or_default());
+    KChatStatusJs {
+        state: rep.state,
+        publisher_kind: rep.publisher_kind,
+        instance_json,
+        default_thread_id: rep.default_thread_id,
+    }
+}
+
+#[napi]
+pub fn kchat_status() -> Result<KChatStatusJs> {
+    let rep = with_service_ref(super::service::BridgeService::kchat_status)?;
+    Ok(kchat_status_to_js(rep))
+}
+
+#[napi]
+pub fn kchat_reload() -> Result<KChatStatusJs> {
+    let rep = with_service_ref(super::service::BridgeService::kchat_reload)?;
+    Ok(kchat_status_to_js(rep))
+}
+
+#[napi]
+pub fn kchat_publish(params: KChatPublishParamsJs) -> Result<KChatPublishResultJs> {
+    let card: aec_core::kchat::ArtifactCard = serde_json::from_str(&params.card_json)
+        .map_err(|e| Error::new(Status::GenericFailure, format!("kchat_publish parse: {e}")))?;
+    let result = with_service_ref_fallible(|svc| svc.kchat_publish(card))?;
+    Ok(KChatPublishResultJs {
+        message_id: result.message_id,
+        thread_id: result.thread_id,
+        published_at: result.published_at.to_rfc3339(),
+    })
+}
+
+#[napi]
+pub fn kchat_ingest_reviews(params: KChatIngestParamsJs) -> Result<KChatIngestResultJs> {
+    let report = with_service_ref_fallible(|svc| {
+        svc.kchat_ingest_reviews(&params.thread_id, params.since_iso.clone())
+    })?;
+    let comments_json = serde_json::to_string(&report.comments).map_err(|e| {
+        Error::new(
+            Status::GenericFailure,
+            format!("kchat_ingest_reviews serialize: {e}"),
+        )
+    })?;
+    let cards_json = serde_json::to_string(&report.cards).map_err(|e| {
+        Error::new(
+            Status::GenericFailure,
+            format!("kchat_ingest_reviews serialize cards: {e}"),
+        )
+    })?;
+    Ok(KChatIngestResultJs {
+        thread_id: report.thread_id,
+        comments_json,
+        cards_json,
+    })
+}
+
+// ----- Viewport (Phase 12) ---------------------------------
+//
+// The viewport methods on `BridgeService` route through
+// [`crate::viewport_service::ViewportService`], which owns its own
+// wgpu device and pipelines. The N-API surface is intentionally
+// flat: each call serializes the result through JSON (rather than
+// returning a heavily-typed struct) because the renderer's
+// `bridge.ts` ultimately re-parses these into TypeScript domain
+// types, and a `string` payload is easier to evolve than a
+// generated `#[napi(object)]` struct.
+
+#[napi(object)]
+pub struct ViewportStatusJs {
+    pub state: String,
+    pub width: u32,
+    pub height: u32,
+    pub frame_index: f64,
+    /// JSON-encoded `Option<GpuDescriptor>`. `null` when no adapter.
+    pub gpu_descriptor_json: Option<String>,
+}
+
+fn viewport_status_to_js(rep: crate::viewport_service::ViewportStatusReport) -> ViewportStatusJs {
+    let gpu_descriptor_json = rep
+        .gpu_descriptor
+        .as_ref()
+        .map(|d| serde_json::to_string(d).unwrap_or_default());
+    ViewportStatusJs {
+        state: rep.state,
+        width: rep.width,
+        height: rep.height,
+        frame_index: rep.frame_index as f64,
+        gpu_descriptor_json,
+    }
+}
+
+#[napi(object)]
+pub struct ViewportResizeParamsJs {
+    pub width: u32,
+    pub height: u32,
+}
+
+#[napi]
+pub fn viewport_resize(params: ViewportResizeParamsJs) -> Result<ViewportStatusJs> {
+    let report = with_service_ref_fallible(|svc| svc.viewport_resize(params.width, params.height))?;
+    Ok(viewport_status_to_js(report))
+}
+
+#[napi(object)]
+pub struct ViewportInputParamsJs {
+    /// One of `"orbit"`, `"pan"`, `"zoom"`, `"reset"`.
+    pub kind: String,
+    pub dx: Option<f64>,
+    pub dy: Option<f64>,
+    pub delta: Option<f64>,
+}
+
+#[napi(object)]
+pub struct ViewportCameraJs {
+    /// JSON-encoded
+    /// [`crate::viewport_service::ViewportCameraReport`].
+    pub camera_json: String,
+}
+
+#[napi]
+pub fn viewport_input(params: ViewportInputParamsJs) -> Result<ViewportCameraJs> {
+    let input = parse_viewport_input(&params)
+        .map_err(|e| Error::new(Status::GenericFailure, format!("viewport_input parse: {e}")))?;
+    let cam = with_service_ref_fallible(|svc| svc.viewport_input(input))?;
+    let camera_json = serde_json::to_string(&cam)
+        .map_err(|e| Error::new(Status::GenericFailure, format!("camera serialize: {e}")))?;
+    Ok(ViewportCameraJs { camera_json })
+}
+
+fn parse_viewport_input(
+    p: &ViewportInputParamsJs,
+) -> std::result::Result<crate::viewport_service::ViewportInput, String> {
+    use crate::viewport_service::ViewportInput;
+    match p.kind.as_str() {
+        "orbit" => Ok(ViewportInput::Orbit {
+            dx: p.dx.unwrap_or(0.0) as f32,
+            dy: p.dy.unwrap_or(0.0) as f32,
+        }),
+        "pan" => Ok(ViewportInput::Pan {
+            dx: p.dx.unwrap_or(0.0) as f32,
+            dy: p.dy.unwrap_or(0.0) as f32,
+        }),
+        "zoom" => Ok(ViewportInput::Zoom {
+            delta: p.delta.unwrap_or(0.0) as f32,
+        }),
+        "reset" => Ok(ViewportInput::Reset),
+        other => Err(format!("unknown input kind '{other}'")),
+    }
+}
+
+#[napi(object)]
+pub struct ViewportFrameJs {
+    pub frame_index: f64,
+    pub width: u32,
+    pub height: u32,
+    pub state: String,
+    pub camera_json: String,
+}
+
+#[napi]
+pub fn viewport_request_frame() -> Result<ViewportFrameJs> {
+    let report = with_service_ref_fallible(super::service::BridgeService::viewport_request_frame)?;
+    let camera_json = serde_json::to_string(&report.camera)
+        .map_err(|e| Error::new(Status::GenericFailure, format!("camera serialize: {e}")))?;
+    Ok(ViewportFrameJs {
+        frame_index: report.frame_index as f64,
+        width: report.width,
+        height: report.height,
+        state: report.state,
+        camera_json,
+    })
+}
+
+#[napi]
+pub fn viewport_status() -> Result<ViewportStatusJs> {
+    let rep = with_service_ref(super::service::BridgeService::viewport_status)?;
+    Ok(viewport_status_to_js(rep))
+}
+
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
     if s.len() % 2 != 0 {
         return None;

@@ -13,6 +13,7 @@ aec_audit = { path = "../aec_audit" }
 aec_bim = { path = "../aec_bim" }
 blake3 = { workspace = true }
 chrono = { workspace = true }
+hex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

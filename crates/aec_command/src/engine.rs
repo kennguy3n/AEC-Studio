@@ -1470,4 +1470,62 @@ mod tests {
         assert_eq!(e2.undo_len(), 1);
         assert_eq!(e2.redo_len(), 0);
     }
+
+    #[test]
+    fn phase12_task28_undo_redo_stacks_survive_simulated_crash() {
+        // Phase 12 Task 28 — apply 3 commands, undo 2, redo 1, then
+        // drop the engine (simulating a process crash) and reopen.
+        // The undo and redo stack sizes (and their entity IDs) must
+        // exactly match the pre-crash state.
+        let mut conn = open_in_memory_persistent_db();
+        let mut wall_ids: Vec<EntityId> = Vec::new();
+
+        // Apply three create-wall commands. Each shifts the wall to a
+        // distinct location so the graph state has three independent
+        // entities and the journal three distinct entries.
+        {
+            let mut e = CommandEngine::open(&conn, Scope::Design).unwrap();
+            for offset_mm in [0.0_f64, 5000.0, 10_000.0] {
+                let w = wall::CreateWall {
+                    entity_id: EntityId::new(),
+                    start_mm: [offset_mm, 0.0],
+                    end_mm: [offset_mm + 4500.0, 0.0],
+                    height_mm: 2700.0,
+                    thickness_mm: 100.0,
+                    material_id: None,
+                };
+                wall_ids.push(w.entity_id.clone());
+                e.execute_persistent(Command::user(CommandKind::CreateWall(w)), &mut conn)
+                    .unwrap();
+            }
+            assert_eq!(e.graph().len(), 3);
+            assert_eq!(e.undo_len(), 3);
+            assert_eq!(e.redo_len(), 0);
+
+            // Undo twice — graph drops to 1 wall, undo→1, redo→2.
+            e.undo_persistent(&mut conn).unwrap();
+            e.undo_persistent(&mut conn).unwrap();
+            assert_eq!(e.graph().len(), 1);
+            assert_eq!(e.undo_len(), 1);
+            assert_eq!(e.redo_len(), 2);
+
+            // Redo once — graph back to 2 walls, undo→2, redo→1.
+            e.redo_persistent(&mut conn).unwrap();
+            assert_eq!(e.graph().len(), 2);
+            assert_eq!(e.undo_len(), 2);
+            assert_eq!(e.redo_len(), 1);
+        } // <-- engine drops here, simulating a crash.
+
+        // Reopen from the connection. Stack depths AND entity IDs must
+        // match the pre-crash snapshot.
+        let restarted = CommandEngine::open(&conn, Scope::Design).unwrap();
+        assert_eq!(restarted.graph().len(), 2);
+        assert_eq!(restarted.undo_len(), 2);
+        assert_eq!(restarted.redo_len(), 1);
+        // The first two walls must be present; the third (still on the
+        // redo stack) must not.
+        assert!(restarted.graph().contains(&wall_ids[0]));
+        assert!(restarted.graph().contains(&wall_ids[1]));
+        assert!(!restarted.graph().contains(&wall_ids[2]));
+    }
 }
