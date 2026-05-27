@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import {
+  act,
   render,
   screen,
   fireEvent,
@@ -191,5 +192,145 @@ describe("ViewportContainer", () => {
     await waitFor(() =>
       expect(input).toHaveBeenCalledWith({ kind: "zoom", delta: -100 }),
     );
+  });
+
+  // Regression: Devin Review flagged that the resize-debounce
+  // effect armed a 120 ms trailing-edge timer that, when it fired,
+  // awaited an `aec.viewport.resize` IPC and then called
+  // `setStatus` with the bridge's response. The effect cleanup
+  // disconnected the observer and called `clearTimeout` on the
+  // pending timer, but if the timer had ALREADY fired and the IPC
+  // was in flight when the component unmounted, the awaited promise
+  // resolved on a torn-down component and `setStatus` dispatched
+  // into dead state. The fix mirrors the `alive` flag pattern
+  // already used by the initial status probe (lines 58-84): the
+  // cleanup sets `alive = false` and `flush` re-checks `alive`
+  // after the awaited IPC resolves before writing state.
+  //
+  // This test pins the in-flight contract: a resize IPC that's
+  // still pending when the component unmounts must NOT trigger a
+  // post-unmount React state update when it eventually resolves.
+  it("guards the in-flight resize IPC against post-unmount state updates", async () => {
+    // Polyfill ResizeObserver so the debounce path executes (jsdom
+    // lacks it; the component otherwise short-circuits to a single
+    // synchronous resize on mount).
+    let observerCallback:
+      | ((entries: ResizeObserverEntry[]) => void)
+      | null = null;
+    class FakeResizeObserver {
+      constructor(cb: (entries: ResizeObserverEntry[]) => void) {
+        observerCallback = cb;
+      }
+      observe() {}
+      disconnect() {
+        observerCallback = null;
+      }
+      unobserve() {}
+    }
+    const prev = (
+      globalThis as unknown as { ResizeObserver?: typeof ResizeObserver }
+    ).ResizeObserver;
+    (
+      globalThis as unknown as { ResizeObserver: typeof ResizeObserver }
+    ).ResizeObserver = FakeResizeObserver as unknown as typeof ResizeObserver;
+    vi.useFakeTimers();
+    const consoleErr = vi.spyOn(console, "error");
+    try {
+      // Use `unavailable` so the rAF loop (which fires only when
+      // status.state === "ready") does not start — otherwise
+      // `vi.runAllTimersAsync` would loop forever on the
+      // requestAnimationFrame chain that the component's frame
+      // poll effect drives.
+      vi.spyOn(aec.viewport, "status").mockResolvedValue({
+        state: "unavailable",
+        width: 800,
+        height: 600,
+        frameIndex: 0,
+        gpuDescriptorJson: null,
+      });
+      // Controllable resize promise: we resolve it manually AFTER
+      // unmount to simulate an in-flight IPC at teardown time.
+      let resolveResize: () => void = () => {};
+      const resizePending = new Promise<{
+        state: "ready" | "unavailable";
+        width: number;
+        height: number;
+        frameIndex: number;
+        gpuDescriptorJson: string | null;
+      }>((res) => {
+        resolveResize = () =>
+          res({
+            state: "ready",
+            width: 1024,
+            height: 768,
+            frameIndex: 5,
+            gpuDescriptorJson: null,
+          });
+      });
+      vi.spyOn(aec.viewport, "resize").mockReturnValue(resizePending);
+
+      const { unmount } = render(<ViewportContainer activeTool="select" />);
+      await act(async () => {
+        await vi.runAllTimersAsync();
+      });
+
+      // Arm the trailing-edge timer.
+      expect(observerCallback).not.toBeNull();
+      act(() => {
+        observerCallback!([
+          {
+            contentRect: { width: 1024, height: 768 } as DOMRectReadOnly,
+          } as ResizeObserverEntry,
+        ]);
+      });
+
+      // Fire the trailing-edge timer so `flush` is called and the
+      // resize IPC is in flight (awaited, not yet resolved).
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(150);
+      });
+      expect(aec.viewport.resize).toHaveBeenCalledWith({
+        width: 1024,
+        height: 768,
+      });
+
+      // Unmount while the IPC is still pending.
+      unmount();
+
+      // Resolve the IPC AFTER unmount. The `alive` flag inside
+      // `flush` must short-circuit before `setStatus` is reached.
+      await act(async () => {
+        resolveResize();
+        await vi.runAllTimersAsync();
+      });
+
+      // React would emit a "state update on unmounted component"
+      // warning to console.error if `setStatus` ran after unmount
+      // (React 18 quieted this for unmounted, but the alive guard
+      // also prevents any future side-effect added inside `flush`
+      // from leaking past the unmount boundary). Either way, no
+      // errors of any kind should have surfaced.
+      const unmountWarnings = consoleErr.mock.calls.filter((args) => {
+        const msg = typeof args[0] === "string" ? args[0] : "";
+        return (
+          msg.includes("unmounted component") ||
+          msg.includes("memory leak") ||
+          msg.includes("Can't perform a React state update")
+        );
+      });
+      expect(unmountWarnings).toEqual([]);
+    } finally {
+      consoleErr.mockRestore();
+      vi.useRealTimers();
+      if (prev) {
+        (
+          globalThis as unknown as { ResizeObserver: typeof ResizeObserver }
+        ).ResizeObserver = prev;
+      } else {
+        delete (
+          globalThis as unknown as { ResizeObserver?: typeof ResizeObserver }
+        ).ResizeObserver;
+      }
+    }
   });
 });

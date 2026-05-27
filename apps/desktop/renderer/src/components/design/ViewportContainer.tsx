@@ -109,14 +109,31 @@ export function ViewportContainer({ activeTool }: Props) {
     let pendingTimer: ReturnType<typeof setTimeout> | null = null;
     let pendingW = 0;
     let pendingH = 0;
+    // `alive` mirrors the same closure-captured flag used by the
+    // initial status probe (lines 58-84). The trailing-edge timer
+    // can fire AFTER the effect's cleanup ran (the timer queue and
+    // the effect cleanup are independent), and the awaited
+    // `aec.viewport.resize` IPC may still be in flight when React
+    // unmounts the component. Without the guard, the `setStatus`
+    // call inside `flush` is a silent no-op on a torn-down
+    // component but it still produces a console warning under the
+    // legacy renderer profile and, more importantly, the bridge
+    // would receive a `resize` request for a viewport whose host
+    // surface has already been torn down — wasting GPU memory the
+    // surface manager has to reclaim on the next mount. Setting
+    // `alive = false` in the cleanup short-circuits both the
+    // bridge dispatch and the state write atomically.
+    let alive = true;
 
     const flush = async () => {
       pendingTimer = null;
+      if (!alive) return;
       const w = pendingW;
       const h = pendingH;
       if (w <= 0 || h <= 0) return;
       try {
         const s = await aec.viewport.resize({ width: w, height: h });
+        if (!alive) return;
         setStatus((prev) =>
           prev.state === "loading"
             ? prev
@@ -161,6 +178,7 @@ export function ViewportContainer({ activeTool }: Props) {
     });
     ro.observe(el);
     return () => {
+      alive = false;
       ro.disconnect();
       if (pendingTimer !== null) {
         clearTimeout(pendingTimer);

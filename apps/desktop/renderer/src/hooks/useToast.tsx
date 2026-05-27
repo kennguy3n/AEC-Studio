@@ -15,6 +15,8 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -92,10 +94,49 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     [dismiss],
   );
 
+  // Flush every pending auto-dismiss timer on provider unmount. The
+  // dismiss callback that fires asynchronously after a setTimeout
+  // would otherwise call `setToasts` on a torn-down component — a
+  // silent no-op in React 18+ but still a latent leak (the timer
+  // handle pins its captured closure and the dispatched id keeps
+  // the dismiss path alive). This mirrors the `autoSaveTimerRef`
+  // cleanup pattern in `useActiveProject` so every timer reference
+  // in the renderer has a single, documented disposal site bound
+  // to the owning component's lifecycle.
+  //
+  // The effect deps are empty: the cleanup reads the *current*
+  // ref map at unmount time (snapshotted via a local alias so
+  // React's `react-hooks/exhaustive-deps` lint rule is satisfied),
+  // not whatever value the map had at mount time.
+  useEffect(() => {
+    const timers = timersRef.current;
+    return () => {
+      for (const timer of timers.values()) {
+        clearTimeout(timer);
+      }
+      timers.clear();
+    };
+  }, []);
+
+  // Memoise the context value so sibling consumers don't re-render
+  // unless `toasts`, `addToast`, or `dismiss` actually change
+  // identity. `addToast` and `dismiss` are wrapped in `useCallback`
+  // already, so the only dependency that flips on a real state
+  // change is `toasts`. Without this `useMemo` the inline object
+  // literal at the JSX site is a fresh reference on every render —
+  // benign today because `ToastProvider` wraps the whole app and
+  // re-renders are driven entirely by `toasts`, but inconsistent
+  // with the `ActiveProjectProvider` memoisation pattern. Keeping
+  // both providers on the same contract means a future move of
+  // `ToastProvider` deeper into the tree (e.g. per-route toast
+  // scopes) doesn't silently regress consumer perf.
+  const value = useMemo<ToastContextValue>(
+    () => ({ toasts, addToast, dismiss }),
+    [toasts, addToast, dismiss],
+  );
+
   return (
-    <ToastContext.Provider value={{ toasts, addToast, dismiss }}>
-      {children}
-    </ToastContext.Provider>
+    <ToastContext.Provider value={value}>{children}</ToastContext.Provider>
   );
 }
 
