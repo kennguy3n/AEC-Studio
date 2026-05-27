@@ -49,6 +49,15 @@ export function Settings() {
     instance: { socket_path: string; version: string; health: string } | null;
   } | null>(null);
   const [kchatReloading, setKchatReloading] = useState(false);
+  // Surfaces the last `kchat:reload` failure inline next to the
+  // reload button. The `onClick={() => void onReloadKChat()}` call
+  // site cannot observe a rejected promise (React ignores returned
+  // Promises from `onClick`), so without this state any reload
+  // failure would silently disappear and the user would think
+  // their click did nothing. Cleared on the next successful reload.
+  const [kchatReloadError, setKchatReloadError] = useState<string | null>(
+    null,
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -93,6 +102,19 @@ export function Settings() {
         publisherKind: s.publisherKind,
         instance: parseKChatInstance(s.instanceJson),
       });
+      // Clear any prior failure once we've successfully refreshed.
+      setKchatReloadError(null);
+    } catch (e: unknown) {
+      // `kchat:reload` can reject when the bridge is mid-restart,
+      // the discovered socket is unreachable, or napi serialization
+      // fails. The `onClick={() => void onReloadKChat()}` call site
+      // throws away the returned promise, so we must capture the
+      // error here or it propagates as an unhandled rejection and
+      // the user sees no feedback. We deliberately surface the
+      // message inline rather than reusing the page-level `error`
+      // state — a transient KChat reconnect failure shouldn't make
+      // the whole Settings page look broken.
+      setKchatReloadError(e instanceof Error ? e.message : String(e));
     } finally {
       setKchatReloading(false);
     }
@@ -300,6 +322,15 @@ export function Settings() {
           >
             {kchatReloading ? "Reloading…" : "Reload KChat connection"}
           </button>
+          {kchatReloadError && (
+            <p
+              data-testid="settings-kchat-reload-error"
+              className="settings-page__inline-error"
+              role="alert"
+            >
+              Reload failed: {kchatReloadError}
+            </p>
+          )}
         </div>
       </section>
 

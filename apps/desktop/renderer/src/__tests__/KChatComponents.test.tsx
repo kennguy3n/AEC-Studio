@@ -84,6 +84,52 @@ describe("KChatStatusIndicator", () => {
     fireEvent.click(screen.getByTestId("kchat-status-chip"));
     await waitFor(() => expect(reload).toHaveBeenCalledTimes(1));
   });
+
+  // Regression test for Devin Review finding "onReload lacks catch
+  // block, propagating unhandled promise rejection". `onReload`
+  // must catch every IPC error so the React onClick handler doesn't
+  // leak unhandled rejections (React ignores returned promises),
+  // and must surface the failure to the user via the chip's title
+  // / data-reload-error attributes rather than failing silently.
+  it("captures reload failures into the chip tooltip and avoids unhandled rejections", async () => {
+    let unhandled: unknown = null;
+    const handler = (e: PromiseRejectionEvent) => {
+      unhandled = e.reason;
+    };
+    window.addEventListener("unhandledrejection", handler);
+
+    vi.spyOn(aec.kchat, "status").mockResolvedValue({
+      state: "disconnected",
+      publisherKind: "in_memory",
+      instanceJson: null,
+      defaultThreadId: null,
+    });
+    vi.spyOn(aec.kchat, "reload").mockRejectedValue(
+      new Error("socket unreachable"),
+    );
+
+    render(<KChatStatusIndicator />);
+    await waitFor(() =>
+      expect(screen.getByTestId("kchat-status-chip").textContent).toContain(
+        "offline",
+      ),
+    );
+    fireEvent.click(screen.getByTestId("kchat-status-chip"));
+    await waitFor(() => {
+      const chip = screen.getByTestId("kchat-status-chip");
+      expect(chip.getAttribute("data-reload-error")).toBe("socket unreachable");
+      expect(chip.getAttribute("title")).toContain("socket unreachable");
+      expect(chip.getAttribute("aria-label")).toContain("reload failed");
+      // The `finally` must still re-enable the chip even on the
+      // error branch — otherwise the user can never retry.
+      expect((chip as HTMLButtonElement).disabled).toBe(false);
+    });
+
+    // No unhandled promise rejection escapes the React onClick.
+    expect(unhandled).toBeNull();
+
+    window.removeEventListener("unhandledrejection", handler);
+  });
 });
 
 describe("PublishCardModal", () => {
@@ -267,5 +313,124 @@ describe("KChatReviewPanel", () => {
     expect(unhandled).toBeNull();
 
     window.removeEventListener("unhandledrejection", handler);
+  });
+
+  // Regression test for Devin Review finding "panel retains stale
+  // comments and sinceIso cursor when threadId prop changes". When
+  // the parent re-renders the panel with a different `threadId`
+  // (e.g. the active project's `KChatConfig::default_thread_id`
+  // changes), the panel must:
+  //   1. clear the previous thread's comments from the list, and
+  //   2. reset the `sinceIso` cursor so the new thread starts at
+  //      the bridge's natural head, not at the previous thread's
+  //      newest-comment timestamp.
+  //
+  // We assert (1) by checking the rendered list, and (2) by
+  // checking the `sinceIso` argument passed to the *second*
+  // `ingestReviews` invocation after the prop flips — it must be
+  // null again, not the timestamp the previous thread advanced it
+  // to.
+  it("resets comments and sinceIso cursor when threadId prop changes", async () => {
+    vi.spyOn(aec.kchat, "status").mockResolvedValue({
+      state: "connected",
+      publisherKind: "local_ipc",
+      instanceJson: JSON.stringify({
+        socket_path: "/tmp/kchat.sock",
+        version: "1.0.0",
+        health: "ok",
+      }),
+      defaultThreadId: null,
+    });
+    const ingest = vi
+      .spyOn(aec.kchat, "ingestReviews")
+      .mockImplementation(async ({ threadId }) => {
+        if (threadId === "thread-a") {
+          return {
+            threadId,
+            commentsJson: JSON.stringify([
+              {
+                comment_id: "a1",
+                author: "alice",
+                text: "comment on thread A",
+                posted_at: "2026-05-27T00:00:00Z",
+                artifact_id: null,
+              },
+            ]),
+            cardsJson: "[]",
+          };
+        }
+        return {
+          threadId,
+          commentsJson: JSON.stringify([
+            {
+              comment_id: "b1",
+              author: "bob",
+              text: "comment on thread B",
+              posted_at: "2026-05-27T00:01:00Z",
+              artifact_id: null,
+            },
+          ]),
+          cardsJson: "[]",
+        };
+      });
+
+    const { rerender } = render(<KChatReviewPanel threadId="thread-a" />);
+    await waitFor(() => {
+      const list = screen.getByTestId("kchat-review-list");
+      const items = list.querySelectorAll("li");
+      expect(items.length).toBe(1);
+      expect(list.textContent).toContain("alice");
+    });
+
+    // First ingest call: sinceIso must be null (initial cursor).
+    expect(ingest.mock.calls[0][0]).toMatchObject({
+      threadId: "thread-a",
+      sinceIso: null,
+    });
+
+    // Capture the number of ingest calls observed for thread-a so
+    // we can locate the first thread-b call cleanly without
+    // depending on race timing.
+    const callsAfterA = ingest.mock.calls.length;
+
+    rerender(<KChatReviewPanel threadId="thread-b" />);
+
+    // The first ingest call observed after the threadId flip must
+    // address thread-b *and* must pass sinceIso=null — confirming
+    // that the per-thread cursor was reset rather than leaking the
+    // timestamp the previous thread had advanced it to. We check
+    // this *first* (against the mock call log) before the DOM
+    // assertion below, because the cursor-reset is the structural
+    // invariant; the rendered list is a downstream consequence.
+    await waitFor(() => {
+      const firstBCall = ingest.mock.calls
+        .slice(callsAfterA)
+        .find(
+          (args) =>
+            (args[0] as { threadId: string }).threadId === "thread-b",
+        );
+      expect(firstBCall).toBeDefined();
+      expect(firstBCall![0]).toMatchObject({
+        threadId: "thread-b",
+        sinceIso: null,
+      });
+    });
+
+    // And the rendered list must show *only* thread B's comment —
+    // the previous thread's "alice" row must not bleed across the
+    // switch. We re-query the list each tick because the panel
+    // briefly swaps the `<ul data-testid="kchat-review-list">` for
+    // the empty-state `<p>` while `comments` is `[]` between the
+    // reset effect and the next ingest resolving — a stale node
+    // reference captured before the rerender would point at the
+    // detached `<ul>` still holding "alice" and never observe the
+    // recovered "bob" state.
+    await waitFor(() => {
+      const list = screen.getByTestId("kchat-review-list");
+      const items = list.querySelectorAll("li");
+      expect(items.length).toBe(1);
+      expect(list.textContent).toContain("bob");
+      expect(list.textContent).not.toContain("alice");
+    });
   });
 });

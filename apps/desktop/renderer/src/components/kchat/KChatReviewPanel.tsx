@@ -63,6 +63,34 @@ export function KChatReviewPanel(props: KChatReviewPanelProps) {
   // and the polling cadence honest.
   const sinceIsoRef = useRef<string | null>(null);
 
+  // Reset all accumulated per-thread state when the parent passes a
+  // different `threadId` (e.g. the user opened a project whose
+  // `KChatConfig::default_thread_id` differs from the previous
+  // project's). Two things would otherwise leak across the switch:
+  //
+  // 1. `sinceIsoRef` would still point at the newest comment from the
+  //    *previous* thread, so the very next `kchat:ingestReviews` poll
+  //    would ask the bridge for comments newer than a timestamp that
+  //    belongs to a completely different thread — silently skipping
+  //    every comment on the new thread older than that cursor until a
+  //    full app reload.
+  // 2. `comments` would still hold the previous thread's rows. The
+  //    next `mergeAndSort` deduplicates by `comment_id` (UUIDs from
+  //    different threads never collide), so old comments would simply
+  //    persist alongside the new thread's, mixing two conversations
+  //    in one UI.
+  //
+  // Clearing here — *before* the polling effect re-runs `fetchOnce`
+  // (whose identity also flips on `props.threadId`) — guarantees the
+  // next poll starts from a clean slate. We also clear `error` so a
+  // banner from the previous thread doesn't bleed into the new one
+  // before its first poll completes.
+  useEffect(() => {
+    sinceIsoRef.current = null;
+    setComments([]);
+    setError(null);
+  }, [props.threadId]);
+
   const fetchOnce = useCallback(async () => {
     setLoading(true);
     try {
