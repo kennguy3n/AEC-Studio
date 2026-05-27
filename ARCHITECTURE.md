@@ -426,7 +426,10 @@ crates/aec_render/
 ├── cameras.rs                  # CameraSnapshot, CameraStore, CameraJournal, preset thumbnails
 ├── denoise.rs                  # Edge-aware bilateral denoiser (Phase 9 PR2) + Non-Local Means
 │                               # denoiser (Phase 12) using albedo / normal / depth aux buffers;
-│                               # auto-select by preset (bilateral for Quick, NLM for Standard+)
+│                               # auto-select by sample count (NLM for ≤ 64 spp / Quick presets
+│                               # where its patch-matching wins on edge preservation, bilateral
+│                               # for Standard+ where the NLM gain shrinks vs. its higher cost) —
+│                               # see `Denoiser::auto_for_samples` in `crates/aec_render/src/denoise.rs`
 ├── doctor.rs                   # Material check / diagnostics (missing texture, non-PBR, swapped channels)
 ├── final_render.rs             # Native final-render pipeline — CPU/GPU path tracer → tone-map → PNG
 ├── gpu_trace.rs                # wgpu compute path tracer + fallback to CPU rayon path tracer

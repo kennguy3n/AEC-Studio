@@ -185,9 +185,41 @@ impl KChatState {
 
     /// Re-run discovery and rebuild the publisher accordingly. Used
     /// by Settings "Reload KChat connection".
+    ///
+    /// **Preserves per-project state across the reload.** "Reload"
+    /// is a *transport* operation — the user is telling us to
+    /// re-discover the KChat Desktop socket — so it must not
+    /// silently drop properties that belong to the *open project*:
+    ///
+    /// - [`Inner::default_thread_id`] — the per-project review
+    ///   thread, populated by [`Self::apply_project_config`] when a
+    ///   project is opened. If we dropped this, the Deliver page
+    ///   would silently fall back to the publisher-side
+    ///   `kchat-default` constant until the next `project_open`
+    ///   fired (which never happens — projects only open when the
+    ///   user explicitly picks one).
+    /// - [`Inner::enabled`] — the master toggle, also mirrored from
+    ///   the open project's [`KChatConfig`]. Resetting this to
+    ///   `true` on reload would re-enable publishes that the
+    ///   project explicitly disabled.
+    ///
+    /// We snapshot both fields before swapping the publisher, then
+    /// reapply them onto the freshly built `Inner`. The renderer's
+    /// next `status()` poll will therefore see the new publisher
+    /// kind but the same `default_thread_id` and `enabled` it had
+    /// before reload.
     pub fn reload(&self) -> KChatStatusReport {
         let mut inner = self.inner.write().expect("kchat state not poisoned");
-        *inner = Inner::detect_and_build();
+        let preserved_thread = inner.default_thread_id.clone();
+        let preserved_enabled = inner.enabled;
+        let mut rebuilt = Inner::detect_and_build();
+        rebuilt
+            .last_status
+            .default_thread_id
+            .clone_from(&preserved_thread);
+        rebuilt.default_thread_id = preserved_thread;
+        rebuilt.enabled = preserved_enabled;
+        *inner = rebuilt;
         inner.last_status.clone()
     }
 
@@ -534,6 +566,44 @@ mod tests {
         st.clear_project_config();
         assert!(st.default_thread_id().is_none());
         assert!(st.status().default_thread_id.is_none());
+    }
+
+    /// "Reload KChat connection" is a transport operation — it must
+    /// re-run discovery + rebuild the publisher, but it must NOT
+    /// silently drop the per-project `default_thread_id` or reset
+    /// the project's `enabled` toggle. Both of those properties
+    /// belong to the open project, not the transport, and would
+    /// otherwise vanish until the next `project_open` (which only
+    /// fires when the user explicitly picks a project).
+    #[test]
+    fn reload_preserves_project_default_thread_and_enabled_toggle() {
+        std::env::remove_var(aec_core::kchat_discovery::KCHAT_SOCKET_PATH_ENV);
+        let st = KChatState::new();
+        // Apply a project that picked a custom thread and disabled
+        // KChat publishes (e.g. an offline-only project).
+        let mut cfg = KChatConfig::enabled_with_thread("preserved-thread");
+        cfg.enabled = false;
+        st.apply_project_config(&cfg);
+        assert_eq!(st.default_thread_id(), Some("preserved-thread".to_string()));
+        assert!(!st.is_enabled());
+
+        // User clicks "Reload" in Settings. The transport rebuilds,
+        // but the project-scoped state must survive.
+        let s = st.reload();
+        assert_eq!(
+            s.default_thread_id,
+            Some("preserved-thread".to_string()),
+            "reload must not drop the per-project thread"
+        );
+        assert_eq!(
+            st.default_thread_id(),
+            Some("preserved-thread".to_string()),
+            "cached default_thread_id must also survive reload"
+        );
+        assert!(
+            !st.is_enabled(),
+            "reload must not re-enable a project that disabled publishes"
+        );
     }
 
     /// Even after the publisher transparently downgrades to the
