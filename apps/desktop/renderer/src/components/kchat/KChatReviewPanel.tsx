@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { aec } from "../../api/aec";
 
 /**
@@ -41,9 +41,17 @@ const POLL_INTERVAL_MS = 30_000;
 
 export function KChatReviewPanel(props: KChatReviewPanelProps) {
   const [comments, setComments] = useState<ReviewCommentRow[]>([]);
-  const [sinceIso, setSinceIso] = useState<string | null>(null);
   const [offline, setOffline] = useState(false);
   const [loading, setLoading] = useState(false);
+  // The `since_iso` cursor lives in a ref (not state) on purpose: it
+  // advances on every successful ingest, and storing it in state would
+  // churn the `fetchOnce` callback identity on every batch of new
+  // comments. That in turn would tear down and re-create the 30 s
+  // polling interval inside the effect below, producing a duplicate
+  // round-trip and resetting the timer every time fresh reviews land.
+  // Reading via a ref keeps the callback stable, the interval steady,
+  // and the polling cadence honest.
+  const sinceIsoRef = useRef<string | null>(null);
 
   const fetchOnce = useCallback(async () => {
     setLoading(true);
@@ -56,18 +64,18 @@ export function KChatReviewPanel(props: KChatReviewPanelProps) {
       if (isOffline) return;
       const res = await aec.kchat.ingestReviews({
         threadId: props.threadId,
-        sinceIso,
+        sinceIso: sinceIsoRef.current,
       });
       const parsed = parseComments(res.commentsJson);
       if (parsed.length > 0) {
         setComments((prev) => mergeAndSort(prev, parsed));
         const newest = newestTimestamp(parsed);
-        if (newest) setSinceIso(newest);
+        if (newest) sinceIsoRef.current = newest;
       }
     } finally {
       setLoading(false);
     }
-  }, [props.threadId, sinceIso]);
+  }, [props.threadId]);
 
   useEffect(() => {
     void fetchOnce();
