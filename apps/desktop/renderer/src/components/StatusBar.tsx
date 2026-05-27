@@ -26,13 +26,26 @@ export function StatusBar() {
     };
   }, []);
 
-  // Render-queue polling: gated on `project !== null` so the Home
-  // screen and any route hit before a project is opened pays zero IPC
-  // cost. Render jobs are *always* scoped to a project (every enqueue
-  // captures the active project path), so the count is structurally
-  // zero whenever no project is active — polling that state would
-  // either reach a no-op bridge handler or return per-project counts
-  // for projects the user is not currently viewing (both wasteful).
+  // Render-queue polling: gated on the active project's *path* (not
+  // the project summary object) so the Home screen and any route hit
+  // before a project is opened pays zero IPC cost. Render jobs are
+  // *always* scoped to a project (every enqueue captures the active
+  // project path), so the count is structurally zero whenever no
+  // project is active — polling that state would either reach a no-op
+  // bridge handler or return per-project counts for projects the user
+  // is not currently viewing (both wasteful).
+  //
+  // Why `project?.path` rather than the whole `project` object:
+  // `useActiveProject` re-creates the summary reference on every save
+  // (`updateProject(newSummary)` is called from the save IIFE so
+  // consumers see refreshed `modifiedAt`). Listing `project` as the
+  // dep would tear down and re-create this interval on every 5s
+  // auto-save — perpetually restarting the poller for one logical
+  // save event. The `path` string is the stable identity of the
+  // active project across saves (the file location does not change
+  // mid-session), so keying on it scopes effect re-runs to genuine
+  // project transitions (open / create / close / switch) — matching
+  // `Render.tsx:118` which uses the same `[project?.path]` pattern.
   //
   // Resetting `renderJobCount` to 0 on project transitions (or when
   // the project becomes null) prevents a stale count from the
@@ -41,8 +54,9 @@ export function StatusBar() {
   // both no-ops when `project === null`, so the cleanup return
   // handles the close-project case correctly via the `useEffect`
   // unmount-on-deps-change contract.
+  const projectPath = project?.path ?? null;
   useEffect(() => {
-    if (project === null) {
+    if (projectPath === null) {
       setRenderJobCount(0);
       return;
     }
@@ -62,7 +76,7 @@ export function StatusBar() {
       alive = false;
       window.clearInterval(id);
     };
-  }, [project]);
+  }, [projectPath]);
 
   return (
     <footer className="status-bar" role="status" aria-live="polite">

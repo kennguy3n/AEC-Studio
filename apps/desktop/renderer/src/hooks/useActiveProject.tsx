@@ -242,6 +242,51 @@ export function ActiveProjectProvider({
     void refreshProject();
   }, [refreshProject]);
 
+  // Subscribe to the main-process push channel for active-project
+  // changes (`aec.project.onActiveProjectChange`). The main-process
+  // `active-project.ts` tracker fires `notify()` synchronously from
+  // every `setActive*` / `clear*` call site (open / create / save /
+  // close); main.ts forwards each notification to every renderer
+  // window via `webContents.send("project:active-changed", summary)`.
+  //
+  // Today there is a single renderer window so this listener is a
+  // defensive no-op for any push that originated from this window's
+  // own `openProject` / `createProject` / `saveProject` /
+  // `closeProject` (those callbacks update local state before the
+  // push round-trips back; `updateProject` with the same payload is
+  // idempotent because the path-ref equality check below skips
+  // redundant state writes — and even if it didn't, React's
+  // `setState` would bail on reference equality of the spread
+  // summary, which it doesn't, so the path-ref guard is the only
+  // thing preventing a wasted render per save).
+  //
+  // The push channel becomes load-bearing the moment a second
+  // window is added (e.g. "Open project in new window", Print
+  // Preview, pop-out viewport) or a test harness mutates the tracker
+  // directly — every window stays in lockstep on the active project
+  // without polling or relying on the originator's manual sync.
+  //
+  // We only update the `project` summary on push, NOT the renderer-
+  // only fields (`dirty`, `saving`, `undoLen`, `redoLen`). Those are
+  // window-local — a different window with its own undo stack and
+  // its own dirty flag is allowed to have those diverge even if the
+  // underlying project file is the same.
+  useEffect(() => {
+    const unsubscribe = aec.project.onActiveProjectChange((summary) => {
+      // Skip the redundant write when the push reflects state we
+      // already have. `projectPathRef` is the synchronous mirror of
+      // `project?.path`, so this comparison sees the latest value
+      // even within the same event tick — no risk of a stale state
+      // read making us drop a real update.
+      const incomingPath = summary?.path ?? null;
+      if (incomingPath === projectPathRef.current) {
+        return;
+      }
+      updateProject(summary as ProjectSummary | null);
+    });
+    return unsubscribe;
+  }, [updateProject]);
+
   const openProject = useCallback(
     async (path: string) => {
       // Cancel BEFORE the bridge call to prevent the stale-timer race

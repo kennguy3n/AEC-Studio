@@ -32,6 +32,62 @@ const api = {
       }>,
     close: () =>
       ipcRenderer.invoke("project:close") as Promise<{ ok: true }>,
+    // Push subscription to active-project changes. The main process
+    // (`active-project.ts → onActiveProjectChange`) calls every
+    // listener synchronously on every `setActive*` / `clear*` site;
+    // the IPC bridge fans those notifications out to every renderer
+    // window via `webContents.send("project:active-changed", summary)`.
+    //
+    // The renderer's `useActiveProject` hook subscribes once on mount
+    // so that future multi-window scenarios — a second BrowserWindow
+    // is added (e.g. "Open project in new window", Print Preview,
+    // pop-out viewport), a future test harness mutates the tracker
+    // directly, or the bridge auto-recovers by routing to a fallback
+    // project after a corrupt-DB read — all keep the renderer-side
+    // active-project state coherent without a full reload.
+    //
+    // Today there is a single renderer window so the listener is a
+    // defensive no-op for any push that originated from the same
+    // window's own `openProject` / `createProject` / `saveProject` /
+    // `closeProject` (the renderer already updated its state before
+    // the push round-tripped back). The push channel does NOT
+    // duplicate the renderer-only fields (`dirty`, `saving`,
+    // `undoLen`, `redoLen`) — those are window-local and stay in the
+    // renderer's `useActiveProject` state.
+    //
+    // Returns an unsubscribe function. The hook calls it in its
+    // `useEffect` cleanup to prevent leaked listeners across HMR
+    // reloads in dev. We use `ipcRenderer.on` (NOT `addListener` /
+    // `once`) because the channel emits indefinitely.
+    onActiveProjectChange: (
+      listener: (
+        summary: {
+          projectId: string;
+          name: string;
+          path: string;
+          templateKey: string | null;
+          modifiedAt: string;
+        } | null,
+      ) => void,
+    ): (() => void) => {
+      const channel = "project:active-changed";
+      const handler = (
+        _event: Electron.IpcRendererEvent,
+        summary: {
+          projectId: string;
+          name: string;
+          path: string;
+          templateKey: string | null;
+          modifiedAt: string;
+        } | null,
+      ) => {
+        listener(summary);
+      };
+      ipcRenderer.on(channel, handler);
+      return () => {
+        ipcRenderer.removeListener(channel, handler);
+      };
+    },
   },
 
   // ----- Dialog (Phase 13) -----

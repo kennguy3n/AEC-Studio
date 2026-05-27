@@ -157,4 +157,97 @@ describe("Render page — project switch resets camera selection", () => {
       screen.getByTestId("camera-toggle-cam_B_1").getAttribute("aria-pressed"),
     ).toBe("false");
   });
+
+  it("clears the visible jobs queue synchronously on project switch — no flash of project A's jobs in project B", async () => {
+    // Devin Review flagged a visual flash on project switch: the
+    // `cameras` and `selectedCameras` reset was synchronous, but the
+    // `jobs` reset waited for the new project's `listJobs()` promise
+    // to resolve. The microtask gap was brief but real — long enough
+    // to render project A's jobs (with project-A jobIds) in project
+    // B's queue, which would also break any `cancelJob` / `diagnose`
+    // call that subsequently keyed off those stale IDs (the native
+    // queue would reject the cancel for a job that isn't in project
+    // B's scope).
+    //
+    // The fix adds `setJobs([])` alongside the camera reset. This
+    // test pins the contract: between firing the project switch and
+    // the next listJobs promise resolving, project A's job rows must
+    // NOT be in the DOM (proving the synchronous reset ran before
+    // any await yielded). We block the second `listJobs` call with
+    // a promise that never resolves during the assertion window —
+    // if the reset depended on the async path, project A's jobs
+    // would still be visible.
+    const PATH_A = "/tmp/render-jobs-A.aecstudio";
+    const PATH_B = "/tmp/render-jobs-B.aecstudio";
+
+    let resolveB: (jobs: unknown[]) => void = () => {};
+    const bGate = new Promise<unknown[]>((resolve) => {
+      resolveB = resolve;
+    });
+
+    // Sequence of `listJobs` calls:
+    //   1. Initial mount with no project — returns empty.
+    //   2. After `openProject(PATH_A)` runs — returns project A's job.
+    //   3. After `openProject(PATH_B)` runs — blocks indefinitely so
+    //      the synchronous `setJobs([])` reset is observable between
+    //      the project-switch commit and the bridge response landing.
+    const listJobsSpy = vi
+      .spyOn(aec.render, "listJobs")
+      .mockImplementation(async () => {
+        const callIndex = listJobsSpy.mock.calls.length;
+        if (callIndex === 1) return [];
+        if (callIndex === 2) {
+          return [
+            {
+              jobId: "jobA1",
+              cameraId: "cam_A_1",
+              progress: 0.5,
+              status: "running",
+              tier: "Workstation",
+              preset: "interior_balanced",
+              tiles: { completed: 1, total: 2 },
+            },
+          ];
+        }
+        return bGate;
+      });
+
+    render(
+      <ToastProvider>
+        <ActiveProjectProvider>
+          <OpenSwitch pathA={PATH_A} pathB={PATH_B} />
+          <Render />
+        </ActiveProjectProvider>
+      </ToastProvider>,
+    );
+
+    // Project A's job row appears once listJobs resolves.
+    await waitFor(() => {
+      expect(screen.getByTestId("render-job-jobA1")).toBeInTheDocument();
+    });
+
+    // Switch to project B. The component-level useEffect runs
+    // synchronously; `setJobs([])` should fire BEFORE the next
+    // listJobs() resolves (which is gated indefinitely here).
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("switch-to-B"));
+    });
+
+    // Project A's job must be gone — the synchronous reset cleared
+    // it before the async fetch had a chance to repopulate.
+    expect(screen.queryByTestId("render-job-jobA1")).toBeNull();
+
+    // The queue must show its empty state, not project A's stale row.
+    expect(screen.getByTestId("render-queue").textContent).toContain(
+      "No jobs queued.",
+    );
+
+    // Resolve the gate so the test doesn't leak the pending promise.
+    resolveB([]);
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    listJobsSpy.mockRestore();
+  });
 });

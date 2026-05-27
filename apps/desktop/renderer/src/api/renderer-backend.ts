@@ -33,7 +33,41 @@ interface Recent {
 }
 
 export function rendererInProcessBackend(): AecApi {
+  // The renderer in-process backend models two distinct pieces of
+  // state: the *recents history* (which persists across close+reopen,
+  // mirroring the user's most-recently-opened project list) and the
+  // *currently-open project* (which becomes `null` after `close()`,
+  // mirroring the main-process `clearActiveProjectPath()` contract).
+  //
+  // An earlier version conflated these by returning `recents[0]` from
+  // `current()` — which caused `close()` to be a no-op (since clearing
+  // the head would also destroy the user's recents list). Splitting
+  // them lets `close()` clear the active slot without wiping recents,
+  // matching production's main-process semantics exactly.
   const recents: Recent[] = [];
+  let current: Recent | null = null;
+  // Listeners subscribed via `project.onActiveProjectChange`. The
+  // in-process backend mirrors the main-process `active-project.ts`
+  // notification contract: every transition (open / create / save of
+  // the active project / close) fires `notifyActiveChange()`
+  // synchronously with the latest summary (or `null` for close).
+  // This lets the renderer hook's push-subscription useEffect exercise
+  // the same code path under vitest that production exercises against
+  // the real Electron IPC channel.
+  const activeListeners = new Set<(s: Recent | null) => void>();
+  const notifyActiveChange = () => {
+    const snapshot = current === null ? null : { ...current };
+    for (const l of Array.from(activeListeners)) {
+      try {
+        l(snapshot);
+      } catch {
+        // Match the main-process tracker's defensive try/catch — a
+        // listener throwing must not corrupt other listeners or the
+        // backend state. Production has no global handler that would
+        // catch a sync throw out of `ipcRenderer.on(...)`.
+      }
+    }
+  };
   let nextId = 1;
   const newId = (prefix: string) =>
     `${prefix}_${(nextId++).toString(36).padStart(4, "0")}`;
@@ -42,6 +76,8 @@ export function rendererInProcessBackend(): AecApi {
     if (i >= 0) recents.splice(i, 1);
     recents.unshift(r);
     while (recents.length > 16) recents.pop();
+    current = { ...r };
+    notifyActiveChange();
   };
 
   const assets = [
@@ -110,6 +146,19 @@ export function rendererInProcessBackend(): AecApi {
         const now = new Date().toISOString();
         if (idx >= 0 && recents[idx]) {
           recents[idx].modifiedAt = now;
+          // Keep the active-project mirror in lockstep with the
+          // recents entry so the next `current()` call reflects the
+          // refreshed `modifiedAt` — matching production where the
+          // main-process active-project tracker is updated on save.
+          // Only fire `notifyActiveChange()` when the saved project
+          // IS the active one; saving a non-active project from a
+          // future background-export pipeline must not promote that
+          // project into the active slot (same contract as
+          // `setActiveProjectIfMatchesActive` on the main side).
+          if (current?.path === projectPath) {
+            current = { ...recents[idx] };
+            notifyActiveChange();
+          }
           return { ...recents[idx] };
         }
         return {
@@ -125,11 +174,38 @@ export function rendererInProcessBackend(): AecApi {
       listRecents: async () => [...recents],
       exportPackage: async (_p, outPath) => ({ outPath }),
       current: async () => ({
-        summary: recents.length > 0 ? { ...recents[0] } : null,
+        summary: current === null ? null : { ...current },
       }),
       close: async () => {
-        // In-process: nothing to clear, just acknowledge.
+        // Clear the active-project mirror so `current()` returns `null`
+        // after close — matching the main-process `clearActiveProjectPath()`
+        // contract. The `recents` history is preserved so a subsequent
+        // open from the Home screen's recently-opened list still works.
+        current = null;
+        notifyActiveChange();
         return { ok: true as const };
+      },
+      // Push-subscription channel mirroring
+      // `aec.project.onActiveProjectChange` from the preload bridge.
+      // The renderer's `useActiveProject` hook subscribes once on
+      // mount and unsubscribes on unmount; the returned unsubscribe
+      // function removes the listener from the internal Set so
+      // long-running tests that mount/unmount the provider don't leak.
+      onActiveProjectChange: (
+        listener: (
+          summary: {
+            projectId: string;
+            name: string;
+            path: string;
+            templateKey: string | null;
+            modifiedAt: string;
+          } | null,
+        ) => void,
+      ): (() => void) => {
+        activeListeners.add(listener);
+        return () => {
+          activeListeners.delete(listener);
+        };
       },
     },
     dialog: {

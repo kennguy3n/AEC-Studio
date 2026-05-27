@@ -72,8 +72,20 @@ export function Render() {
     // The selection set is always cleared because camera IDs are not
     // valid across projects: enqueueing a render with a stale ID
     // creates an orphaned job that the native backend will reject.
+    //
+    // `jobs` is also reset synchronously even though the immediately-
+    // following `listJobs()` will repopulate it. Without the
+    // synchronous reset there is a one-microtask window after the
+    // project transition (between this effect committing and the
+    // `listJobs()` promise resolving) where the previous project's
+    // jobs would render in the queue. The flash is brief but visible,
+    // and a stale entry whose job ID belongs to the previous project
+    // would also fail any subsequent `cancelJob` / `diagnose` calls
+    // that key off it. Mirrors the `setCameras` / `setSelectedCameras`
+    // pattern so all per-project queue state transitions together.
     setCameras(FALLBACK_CAMERAS);
     setSelectedCameras(new Set());
+    setJobs([]);
     void aec.render.listJobs().then((rows) => {
       if (alive) setJobs(rows as RenderJob[]);
     });

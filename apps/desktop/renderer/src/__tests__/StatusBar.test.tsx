@@ -182,4 +182,95 @@ describe("StatusBar — render job polling gates on active project", () => {
 
     listJobsSpy.mockRestore();
   });
+
+  it("does NOT restart the render-job poller when the active project's modifiedAt changes (e.g. on save)", async () => {
+    // Devin Review flagged that listing `project` (the whole summary
+    // object) in the polling effect's deps causes the interval to
+    // tear down and re-create on every save, because
+    // `useActiveProject` re-creates the summary reference on each
+    // save to surface the refreshed `modifiedAt` to consumers. The
+    // fix is to key the effect on `project?.path` — the stable
+    // identity across saves. This test pins that behaviour by
+    // asserting the interval tick count is unchanged across N saves
+    // of the *same* path: the existing interval must keep firing,
+    // not be replaced by a fresh interval per save (which would
+    // additionally fire its own initial tick every time).
+    const listJobsSpy = vi
+      .spyOn(aec.render, "listJobs")
+      .mockResolvedValue([]);
+
+    function SaveHarness() {
+      const { openProject, saveProject } = useActiveProject();
+      return (
+        <div>
+          <StatusBar />
+          <button
+            type="button"
+            data-testid="open"
+            onClick={() => {
+              void openProject("/tmp/StatusBarSave.aecstudio");
+            }}
+          >
+            open
+          </button>
+          <button
+            type="button"
+            data-testid="save"
+            onClick={() => {
+              void saveProject();
+            }}
+          >
+            save
+          </button>
+        </div>
+      );
+    }
+
+    render(
+      <ActiveProjectProvider>
+        <SaveHarness />
+      </ActiveProjectProvider>,
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      screen.getByTestId("open").click();
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
+    // Initial tick on project open.
+    const callsAfterOpen = listJobsSpy.mock.calls.length;
+    expect(callsAfterOpen).toBeGreaterThanOrEqual(1);
+
+    // Issue several saves in rapid succession. If the effect were
+    // keyed on `project` (the object), each save would tear down +
+    // recreate the interval and fire a fresh initial tick, so the
+    // call count would jump by ~5 immediately. With the `project?.
+    // path` keying, the saves are no-ops for the polling effect: no
+    // extra ticks happen until the next 5s window.
+    for (let i = 0; i < 5; i++) {
+      await act(async () => {
+        screen.getByTestId("save").click();
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+    }
+
+    expect(listJobsSpy.mock.calls.length).toBe(callsAfterOpen);
+
+    // The existing interval must still fire on the next 5s boundary
+    // — proving it was not torn down and replaced.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_000);
+    });
+    expect(listJobsSpy.mock.calls.length).toBe(callsAfterOpen + 1);
+
+    listJobsSpy.mockRestore();
+  });
 });
