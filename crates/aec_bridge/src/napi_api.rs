@@ -2667,13 +2667,13 @@ fn kchat_status_to_js(rep: crate::kchat_state::KChatStatusReport) -> KChatStatus
 
 #[napi]
 pub fn kchat_status() -> Result<KChatStatusJs> {
-    let rep = with_service_ref(|svc| svc.kchat_status())?;
+    let rep = with_service_ref(super::service::BridgeService::kchat_status)?;
     Ok(kchat_status_to_js(rep))
 }
 
 #[napi]
 pub fn kchat_reload() -> Result<KChatStatusJs> {
-    let rep = with_service_ref(|svc| svc.kchat_reload())?;
+    let rep = with_service_ref(super::service::BridgeService::kchat_reload)?;
     Ok(kchat_status_to_js(rep))
 }
 
@@ -2818,7 +2818,7 @@ pub struct ViewportFrameJs {
 
 #[napi]
 pub fn viewport_request_frame() -> Result<ViewportFrameJs> {
-    let report = with_service_ref_fallible(|svc| svc.viewport_request_frame())?;
+    let report = with_service_ref_fallible(super::service::BridgeService::viewport_request_frame)?;
     let camera_json = serde_json::to_string(&report.camera)
         .map_err(|e| Error::new(Status::GenericFailure, format!("camera serialize: {e}")))?;
     Ok(ViewportFrameJs {
@@ -2832,7 +2832,7 @@ pub fn viewport_request_frame() -> Result<ViewportFrameJs> {
 
 #[napi]
 pub fn viewport_status() -> Result<ViewportStatusJs> {
-    let rep = with_service_ref(|svc| svc.viewport_status())?;
+    let rep = with_service_ref(super::service::BridgeService::viewport_status)?;
     Ok(viewport_status_to_js(rep))
 }
 
