@@ -2122,41 +2122,37 @@ impl BridgeService {
         })?;
         let enforcer = PermissionEnforcer::from_registry(&registry);
         // `with_db_mut` requires the closure to return
-        // `Result<_, AssetError>`, but `install_asset_packs`
-        // returns its own `AssetExtensionError` enum (permission
-        // denied, missing asset file, checksum mismatch — none of
-        // which are pure DB errors). Bubble the structured host
-        // error out through an `Option` so the bridge can keep
-        // the typed permission-denied / checksum-mismatch
-        // distinction in its `BridgeServiceError::Invalid` message
-        // instead of collapsing it through `AssetError::Other`
-        // (which doesn't exist).
-        let mut host_err: Option<aec_assets::extension_host::AssetExtensionError> = None;
-        let summary = self
+        // `Result<_, AssetError>`, but `install_asset_packs` returns
+        // its own `AssetExtensionError` enum (permission denied,
+        // missing asset file, checksum mismatch — none of which are
+        // pure DB errors). Nest the host result *inside* the closure's
+        // `Ok` payload: the outer `Result<_, AssetError>` still
+        // surfaces real DB / locking failures verbatim, while the
+        // inner `Result<InstallSummary, AssetExtensionError>` carries
+        // the host outcome without inventing a sentinel value or
+        // smuggling state through an `Option` captured by the
+        // closure. This keeps the typed permission-denied / checksum-
+        // mismatch distinction reachable at the call site (each
+        // produces a structurally distinct `BridgeServiceError::Invalid`
+        // message) and lets the borrow checker statically guarantee
+        // every error path has been considered — the previous
+        // `host_err: Option<…>` side channel could not.
+        let host_outcome: Result<
+            aec_assets::extension_host::InstallSummary,
+            aec_assets::extension_host::AssetExtensionError,
+        > = self
             .asset_state
             .with_db_mut(|db| {
-                match aec_assets::extension_host::install_asset_packs(db, &registry, &enforcer) {
-                    Ok(summary) => Ok(summary),
-                    Err(e) => {
-                        host_err = Some(e);
-                        // Surface a sentinel `AssetError` so the
-                        // outer caller knows to look at
-                        // `host_err`. The sentinel never reaches
-                        // the renderer — we replace it below
-                        // before returning the bridge error.
-                        Ok(aec_assets::extension_host::InstallSummary::default())
-                    }
-                }
+                Ok(aec_assets::extension_host::install_asset_packs(
+                    db, &registry, &enforcer,
+                ))
             })
             .map_err(|e| {
                 BridgeServiceError::Invalid(format!("extensions_install_asset_packs: db: {e}"))
             })?;
-        if let Some(e) = host_err {
-            return Err(BridgeServiceError::Invalid(format!(
-                "extensions_install_asset_packs: install: {e}"
-            )));
-        }
-        Ok(summary)
+        host_outcome.map_err(|e| {
+            BridgeServiceError::Invalid(format!("extensions_install_asset_packs: install: {e}"))
+        })
     }
 
     /// Read an `.ifc` file from disk and return a structured import
