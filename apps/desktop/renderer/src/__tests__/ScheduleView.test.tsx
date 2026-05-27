@@ -129,4 +129,77 @@ describe("ScheduleView", () => {
     expect(onGenerate).not.toHaveBeenCalled();
     generateSpy.mockRestore();
   });
+
+  // Regression test: Devin Review flagged that the `regenerate`
+  // callback had `try { ... } finally { ... }` with no `catch`.
+  // Pre-Phase 13 every branch hit `demo://` paths (in-process
+  // fallback never throws), so missing catch was benign; Phase 13
+  // wires real OS paths from the file picker so disk-full /
+  // permission-denied / locked-DB errors became silent unhandled
+  // promise rejections. The fix routes bridge failures through the
+  // optional `onError` callback so the parent (Bim.tsx) can surface
+  // them via `addToast("error", ...)`.
+  it("regenerate() surfaces bridge failures via onError", async () => {
+    const onGenerate = vi.fn();
+    const onError = vi.fn();
+    const generateSpy = vi
+      .spyOn(aec.bim, "generateSchedule")
+      .mockRejectedValueOnce(new Error("disk full"));
+    render(
+      <ScheduleView
+        {...baseProps}
+        rowsByKind={{}}
+        onGenerate={onGenerate}
+        onError={onError}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("schedule-regenerate"));
+    await waitFor(() => expect(onError).toHaveBeenCalledTimes(1));
+    // The display message must include the bridge error so the user
+    // can act on it (retry / free disk / pick a different out-path).
+    expect(onError.mock.calls[0][0]).toMatch(
+      /Regenerate room schedule failed: disk full/,
+    );
+    // onGenerate must NOT fire on failure — the XLSX wasn't written.
+    expect(onGenerate).not.toHaveBeenCalled();
+    // The button must re-enable for retry (finally block clears busy).
+    const btn = screen.getByTestId(
+      "schedule-regenerate",
+    ) as HTMLButtonElement;
+    await waitFor(() => expect(btn.disabled).toBe(false));
+    generateSpy.mockRestore();
+  });
+
+  // Companion regression: when `onError` is omitted (isolated unit
+  // tests, hypothetical future callers that forget to wire it), the
+  // panel falls back to `console.error` so the failure is still
+  // observable in dev rather than silently swallowed. The button
+  // must still re-enable for retry.
+  it("regenerate() logs to console when onError is omitted", async () => {
+    const consoleSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const generateSpy = vi
+      .spyOn(aec.bim, "generateSchedule")
+      .mockRejectedValueOnce(new Error("permission denied"));
+    render(
+      <ScheduleView
+        {...baseProps}
+        rowsByKind={{}}
+        onGenerate={() => undefined}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("schedule-regenerate"));
+    await waitFor(() => expect(consoleSpy).toHaveBeenCalled());
+    const message = consoleSpy.mock.calls[0][0] as string;
+    expect(message).toMatch(
+      /Regenerate room schedule failed: permission denied/,
+    );
+    const btn = screen.getByTestId(
+      "schedule-regenerate",
+    ) as HTMLButtonElement;
+    await waitFor(() => expect(btn.disabled).toBe(false));
+    generateSpy.mockRestore();
+    consoleSpy.mockRestore();
+  });
 });

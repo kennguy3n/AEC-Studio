@@ -161,4 +161,74 @@ describe("ValidatorPanel", () => {
     expect(onFindings).not.toHaveBeenCalled();
     validateSpy.mockRestore();
   });
+
+  // Regression test: Devin Review flagged that the `revalidate`
+  // callback had `try { ... } finally { ... }` with no `catch`.
+  // Pre-Phase 13 every branch hit `demo://` paths (in-process
+  // fallback never throws), so missing catch was benign; Phase 13
+  // wires real OS paths from the file picker so file-moved /
+  // permission-denied / malformed-IFC errors became silent
+  // unhandled promise rejections. The fix routes bridge failures
+  // through the optional `onError` callback so the parent (Bim.tsx)
+  // can surface them via `addToast("error", ...)`.
+  it("revalidate() surfaces bridge failures via onError", async () => {
+    const onFindings = vi.fn();
+    const onError = vi.fn();
+    const validateSpy = vi
+      .spyOn(aec.bim, "validate")
+      .mockRejectedValueOnce(new Error("file not found"));
+    render(
+      <ValidatorPanel
+        sourcePath="/test/project.ifc"
+        findings={[]}
+        onFindings={onFindings}
+        onZoomTo={() => undefined}
+        onError={onError}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("validator-revalidate"));
+    await waitFor(() => expect(onError).toHaveBeenCalledTimes(1));
+    expect(onError.mock.calls[0][0]).toMatch(
+      /Re-validate failed: file not found/,
+    );
+    // onFindings must NOT fire on failure — no report was produced.
+    expect(onFindings).not.toHaveBeenCalled();
+    // The button must re-enable for retry (finally block clears busy).
+    const btn = screen.getByTestId(
+      "validator-revalidate",
+    ) as HTMLButtonElement;
+    await waitFor(() => expect(btn.disabled).toBe(false));
+    validateSpy.mockRestore();
+  });
+
+  // Companion regression: when `onError` is omitted, the panel
+  // falls back to `console.error` so the failure is still observable
+  // in dev rather than silently swallowed. The button must still
+  // re-enable for retry.
+  it("revalidate() logs to console when onError is omitted", async () => {
+    const consoleSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const validateSpy = vi
+      .spyOn(aec.bim, "validate")
+      .mockRejectedValueOnce(new Error("locked DB"));
+    render(
+      <ValidatorPanel
+        sourcePath="/test/project.ifc"
+        findings={[]}
+        onFindings={() => undefined}
+        onZoomTo={() => undefined}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("validator-revalidate"));
+    await waitFor(() => expect(consoleSpy).toHaveBeenCalled());
+    const message = consoleSpy.mock.calls[0][0] as string;
+    expect(message).toMatch(/Re-validate failed: locked DB/);
+    const btn = screen.getByTestId(
+      "validator-revalidate",
+    ) as HTMLButtonElement;
+    await waitFor(() => expect(btn.disabled).toBe(false));
+    validateSpy.mockRestore();
+    consoleSpy.mockRestore();
+  });
 });

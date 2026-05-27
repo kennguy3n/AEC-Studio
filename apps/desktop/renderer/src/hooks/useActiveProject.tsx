@@ -81,9 +81,36 @@ export function ActiveProjectProvider({
   // State commits and useEffect ref-syncs run *after* the current
   // event handler completes, so updating the ref via `useEffect`
   // alone would leave it one tick stale during the same event tick;
-  // every site that calls `setDirty(...)` therefore also assigns
-  // `dirtyRef.current` synchronously to keep the two in lockstep.
+  // every site that mutates dirtiness MUST go through `updateDirty`
+  // below (which assigns both the state and the ref atomically) to
+  // keep the two in lockstep. Direct `setDirty(...)` calls are
+  // forbidden — Devin Review flagged the prior "pair of writes"
+  // pattern as a discipline-only invariant where any future
+  // contributor that adds a `setDirty(true)` without the matching
+  // `dirtyRef.current = true` would silently break the re-arm guard
+  // in the open/create/close catch blocks (failed transitions would
+  // no longer rearm the timer because the ref read would lag).
+  // Wrapping the pair in one helper makes the invariant
+  // structurally unfakeable instead of a comment-enforced contract.
   const dirtyRef = useRef(false);
+
+  // Atomic dirty mutator. The single entry point for changing
+  // `dirty` state — assigns the React state and the synchronous ref
+  // mirror in one place so the two cannot drift. Stable identity
+  // (empty dep array) so callers can list it in their own dep
+  // arrays without triggering refresh loops.
+  //
+  // Why a setter rather than functional-update style: every current
+  // caller already knows the absolute value it wants (`true` from
+  // `markDirty`, `false` from successful open/create/save/close /
+  // `markClean`). A functional API would invite stale-state bugs
+  // where callers compute the next value from a possibly-stale
+  // `dirty` closure. Forcing the absolute value keeps each site's
+  // intent explicit and grep-able.
+  const updateDirty = useCallback((next: boolean) => {
+    setDirty(next);
+    dirtyRef.current = next;
+  }, []);
 
   // Mirror `saveProject` into a ref so the stable `armAutoSave`
   // helper can dispatch through the latest closure without taking
@@ -181,7 +208,7 @@ export function ActiveProjectProvider({
     async (path: string) => {
       // Cancel BEFORE the bridge call to prevent the stale-timer race
       // documented on `cancelPendingAutoSave`. If the bridge call
-      // succeeds, `setDirty(false)` below clears the dirty flag and
+      // succeeds, `updateDirty(false)` below clears the dirty flag and
       // the cancel was correct (no auto-save needed for the freshly
       // opened project, which starts clean). If the bridge call
       // throws (corrupt file, permission denied, disk full, etc.),
@@ -196,8 +223,7 @@ export function ActiveProjectProvider({
       try {
         const summary = (await aec.project.open(path)) as ProjectSummary;
         setProject(summary);
-        setDirty(false);
-        dirtyRef.current = false;
+        updateDirty(false);
         setUndoLen(0);
         setRedoLen(0);
       } catch (err) {
@@ -218,7 +244,7 @@ export function ActiveProjectProvider({
         setLoading(false);
       }
     },
-    [cancelPendingAutoSave, armAutoSave],
+    [cancelPendingAutoSave, armAutoSave, updateDirty],
   );
 
   const createProject = useCallback(
@@ -233,8 +259,7 @@ export function ActiveProjectProvider({
           name,
         )) as ProjectSummary;
         setProject(summary);
-        setDirty(false);
-        dirtyRef.current = false;
+        updateDirty(false);
         setUndoLen(0);
         setRedoLen(0);
       } catch (err) {
@@ -246,7 +271,7 @@ export function ActiveProjectProvider({
         setLoading(false);
       }
     },
-    [cancelPendingAutoSave, armAutoSave],
+    [cancelPendingAutoSave, armAutoSave, updateDirty],
   );
 
   const closeProject = useCallback(async () => {
@@ -273,8 +298,7 @@ export function ActiveProjectProvider({
     try {
       await aec.project.close();
       setProject(null);
-      setDirty(false);
-      dirtyRef.current = false;
+      updateDirty(false);
       setUndoLen(0);
       setRedoLen(0);
     } catch (err) {
@@ -283,7 +307,7 @@ export function ActiveProjectProvider({
       }
       throw err;
     }
-  }, [cancelPendingAutoSave, armAutoSave]);
+  }, [cancelPendingAutoSave, armAutoSave, updateDirty]);
 
   const saveProject = useCallback(async () => {
     if (project === null) return;
@@ -312,8 +336,7 @@ export function ActiveProjectProvider({
           project.path,
         )) as ProjectSummary;
         setProject(summary);
-        setDirty(false);
-        dirtyRef.current = false;
+        updateDirty(false);
         // Cancel again: a `markDirty` that arrived DURING the save's
         // await would have re-armed the timer. The fresh save already
         // includes whatever was in the bridge at write-time (the
@@ -336,7 +359,7 @@ export function ActiveProjectProvider({
     })();
     savingPromiseRef.current = inflight;
     return inflight;
-  }, [project, cancelPendingAutoSave]);
+  }, [project, cancelPendingAutoSave, updateDirty]);
 
   // Keep the `saveProject` ref pointed at the latest closure so the
   // stable `armAutoSave` helper dispatches through the current
@@ -346,16 +369,14 @@ export function ActiveProjectProvider({
   }, [saveProject]);
 
   const markDirty = useCallback(() => {
-    setDirty(true);
-    dirtyRef.current = true;
+    updateDirty(true);
     armAutoSave();
-  }, [armAutoSave]);
+  }, [armAutoSave, updateDirty]);
 
   const markClean = useCallback(() => {
-    setDirty(false);
-    dirtyRef.current = false;
+    updateDirty(false);
     cancelPendingAutoSave();
-  }, [cancelPendingAutoSave]);
+  }, [cancelPendingAutoSave, updateDirty]);
 
   const setUndoRedo = useCallback(
     (undo: number, redo: number) => {

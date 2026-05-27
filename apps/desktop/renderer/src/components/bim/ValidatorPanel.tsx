@@ -18,6 +18,32 @@ interface Props {
   findings: ValidationFinding[];
   onFindings: (next: ValidationFinding[]) => void;
   onZoomTo?: (entityId: string) => void;
+  /**
+   * Error reporter for bridge failures. Phase 13 wires the bridge
+   * to real OS paths from the file picker, so `aec.bim.validate`
+   * can reject with real errors (file moved/deleted between import
+   * and revalidate, permission denied, malformed IFC on re-read,
+   * locked DB). Without this callback the rejection would surface
+   * as an unhandled promise rejection from `onClick` with zero
+   * user feedback — no toast, no error-boundary trigger (async
+   * rejections don't bubble to React error boundaries).
+   *
+   * Receives a human-readable error message. The parent (`Bim.tsx`)
+   * wires this to its `addToast("error", message)` so the failure
+   * is reported through the same toast system as the toolbar's
+   * centralized `onInvoke` catch. Optional so isolated unit tests
+   * that don't exercise the failure path don't need to wire a
+   * dependency — when omitted the panel falls back to
+   * `console.error` so the failure is still observable in dev
+   * builds rather than silently swallowed.
+   *
+   * Dependency-injection rather than direct `useToast` usage so
+   * the panel stays a pure presentation component (no implicit
+   * coupling to the toast provider tree, no provider wrapping
+   * required in every test). Mirrors the `onError` contract on
+   * `ScheduleView` so the two BIM panels share one failure shape.
+   */
+  onError?: (message: string) => void;
 }
 
 export function ValidatorPanel({
@@ -25,6 +51,7 @@ export function ValidatorPanel({
   findings,
   onFindings,
   onZoomTo,
+  onError,
 }: Props) {
   const [busy, setBusy] = useState(false);
 
@@ -49,6 +76,31 @@ export function ValidatorPanel({
     try {
       const result = await aec.bim.validate({ sourcePath });
       onFindings(bimReportToFindings(result));
+    } catch (err) {
+      // Surface the bridge failure through the parent's error
+      // reporter. Pre-Phase 13 the in-process fallback never
+      // threw (every branch routed through `demo://`), so the
+      // missing catch was benign — but Phase 13 wires real OS
+      // paths from the file picker, so file-moved, permission-
+      // denied, malformed-IFC, and locked-DB errors are real
+      // failure surfaces. Without this catch the rejection would
+      // become an unhandled promise rejection from `onClick` with
+      // no user feedback (async rejections don't trigger React
+      // error boundaries). The `finally` below still clears the
+      // `busy` flag so the button re-enables for retry — the
+      // failure is recoverable from the user's perspective.
+      // Mirrors the catch in `ScheduleView.regenerate` so the
+      // two BIM panels share one failure contract.
+      const msg = err instanceof Error ? err.message : String(err);
+      const display = `Re-validate failed: ${msg}`;
+      if (onError) {
+        onError(display);
+      } else {
+        // Dev fallback: parents that don't supply `onError` get a
+        // console.error so the failure is still observable in
+        // tests / future call sites instead of silently swallowed.
+        console.error(display, err);
+      }
     } finally {
       setBusy(false);
     }

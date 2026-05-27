@@ -415,12 +415,29 @@ export function Bim() {
           onGenerate={(kind, summary) => {
             void onScheduleGenerate(kind, summary);
           }}
+          // Route bridge failures from `ScheduleView.regenerate` into
+          // the same toast system used by the toolbar's centralized
+          // `onInvoke` catch (line ~328). Pre-Phase 13 every branch
+          // hit `demo://...` paths (in-process fallback never threw)
+          // so the missing catch was benign; Phase 13 wires real OS
+          // paths from the file picker, so disk-full / permission
+          // denied / locked-DB errors are now real failure surfaces.
+          // The panel handles the catch internally and forwards a
+          // pre-formatted message here so this page doesn't need to
+          // know about the bridge's specific error shapes.
+          onError={(msg) => addToast("error", msg)}
         />
         <ValidatorPanel
           sourcePath={ifcSourcePath ?? ""}
           findings={findings}
           onFindings={setFindings}
           onZoomTo={(id) => setSelectedId(id)}
+          // Same rationale as `ScheduleView.onError` above: route
+          // bridge failures from `ValidatorPanel.revalidate` into
+          // the toast system so file-moved / permission-denied /
+          // malformed-IFC errors surface visibly instead of becoming
+          // unhandled promise rejections from `onClick`.
+          onError={(msg) => addToast("error", msg)}
         />
       </div>
     </div>
