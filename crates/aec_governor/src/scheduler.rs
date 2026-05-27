@@ -42,6 +42,11 @@ pub struct GovernorScheduler {
     available_ram_mb: u64,
     thermal: ThermalState,
     user_paused: bool,
+    /// Phase 12 Task 27 — current memory pressure state, fed from
+    /// [`crate::MemoryMonitor`] sampling. `Pressured` halves the
+    /// render concurrency cap; `Critical` denies all render
+    /// admissions.
+    memory: crate::memory::MemoryState,
 }
 
 impl GovernorScheduler {
@@ -53,6 +58,7 @@ impl GovernorScheduler {
             available_ram_mb: u64::MAX,
             thermal: ThermalState::Nominal,
             user_paused: false,
+            memory: crate::memory::MemoryState::Normal,
         }
     }
 
@@ -66,6 +72,17 @@ impl GovernorScheduler {
 
     pub fn set_thermal_state(&mut self, t: ThermalState) {
         self.thermal = t;
+    }
+
+    /// Phase 12 Task 27 — record the latest memory pressure state.
+    /// The caller (typically the bridge tick) wires this from
+    /// [`crate::MemoryMonitor::sample`].
+    pub fn set_memory_state(&mut self, m: crate::memory::MemoryState) {
+        self.memory = m;
+    }
+
+    pub fn memory_state(&self) -> crate::memory::MemoryState {
+        self.memory
     }
 
     pub fn set_user_paused(&mut self, paused: bool) {
@@ -89,13 +106,27 @@ impl GovernorScheduler {
         if self.thermal == ThermalState::Critical {
             return ScheduleVerdict::deny(BackoffReason::Thermal);
         }
+        // Phase 12 Task 27: critical memory pressure denies all new
+        // render admissions, even ones that fit in the mesh cache
+        // budget. Pressured is handled below by halving concurrency.
+        if matches!(self.memory, crate::memory::MemoryState::Critical) {
+            return ScheduleVerdict::deny(BackoffReason::MemoryPressure);
+        }
         if self.available_ram_mb < self.policy.mesh_cache_budget_mb as u64 {
             return ScheduleVerdict::deny(BackoffReason::MemoryPressure);
         }
-        let cap = match self.thermal {
+        let thermal_cap = match self.thermal {
             ThermalState::Nominal => self.policy.render.max_concurrent_jobs,
             ThermalState::Warm => 1.max(self.policy.render.max_concurrent_jobs.saturating_sub(1)),
             ThermalState::Critical => 0,
+        };
+        // Memory-aware concurrency cap. Pressured halves the cap (but
+        // never below 1 so a user-initiated render still makes
+        // progress); Normal applies the thermal cap as-is.
+        let cap = match self.memory {
+            crate::memory::MemoryState::Pressured => 1.max(thermal_cap / 2),
+            crate::memory::MemoryState::Critical => 0,
+            crate::memory::MemoryState::Normal => thermal_cap,
         };
         if self.running_render_jobs >= cap {
             return ScheduleVerdict::deny(BackoffReason::ConcurrencyLimit);
@@ -207,5 +238,48 @@ mod tests {
         sched.commit_render_start();
         let v = sched.admit_ai();
         assert!(!v.admitted);
+    }
+
+    #[test]
+    fn critical_memory_pressure_denies_render() {
+        // Phase 12 Task 27: scheduler must respect the memory monitor's
+        // verdict even when there's plenty of RAM available in the
+        // raw counter — the monitor saw the *process* RSS hit critical.
+        let policy = GovernorPolicy::for_tier(HardwareTier::Pro);
+        let mut sched = GovernorScheduler::new(policy);
+        sched.set_memory_state(crate::memory::MemoryState::Critical);
+        let v = sched.admit_render();
+        assert!(!v.admitted);
+        assert_eq!(v.backoff_reason, Some(BackoffReason::MemoryPressure));
+    }
+
+    #[test]
+    fn pressured_memory_halves_render_concurrency_cap() {
+        // Phase 12 Task 27: at MemoryState::Pressured the scheduler
+        // halves the thermal cap. Pro tier has max_concurrent_jobs = 3
+        // → pressured cap = max(1, 3/2) = 1 → one committed render
+        // fills the cap.
+        let policy = GovernorPolicy::for_tier(HardwareTier::Pro);
+        assert!(
+            policy.render.max_concurrent_jobs >= 2,
+            "test depends on Pro tier having room to halve its cap"
+        );
+        let mut sched = GovernorScheduler::new(policy);
+        // Baseline (no pressure) — full cap available.
+        assert!(sched.admit_render().admitted);
+        sched.commit_render_start();
+        assert!(
+            sched.admit_render().admitted,
+            "without pressure a second render must fit in the Pro cap"
+        );
+        sched.commit_render_end();
+        // Now apply pressure. With cap halved to 1, the running job
+        // (just committed once) saturates the cap and the next
+        // admission must be denied.
+        sched.set_memory_state(crate::memory::MemoryState::Pressured);
+        sched.commit_render_start();
+        let v = sched.admit_render();
+        assert!(!v.admitted);
+        assert_eq!(v.backoff_reason, Some(BackoffReason::ConcurrencyLimit));
     }
 }

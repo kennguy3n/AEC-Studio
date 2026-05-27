@@ -636,13 +636,21 @@ mod tests {
         let before_var: f32 = {
             let mean: f32 =
                 color.pixels.iter().map(|p| p[0]).sum::<f32>() / color.pixels.len() as f32;
-            color.pixels.iter().map(|p| (p[0] - mean).powi(2)).sum::<f32>()
+            color
+                .pixels
+                .iter()
+                .map(|p| (p[0] - mean).powi(2))
+                .sum::<f32>()
                 / color.pixels.len() as f32
         };
         let out = nlm_denoise(&color, NlmParams::default());
         let after_var: f32 = {
             let mean: f32 = out.pixels.iter().map(|p| p[0]).sum::<f32>() / out.pixels.len() as f32;
-            out.pixels.iter().map(|p| (p[0] - mean).powi(2)).sum::<f32>() / out.pixels.len() as f32
+            out.pixels
+                .iter()
+                .map(|p| (p[0] - mean).powi(2))
+                .sum::<f32>()
+                / out.pixels.len() as f32
         };
         assert!(
             after_var < before_var,

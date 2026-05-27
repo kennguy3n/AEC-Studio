@@ -1,6 +1,6 @@
 # Phases
 
-High-level summary of the AEC Studio delivery phases (currently 0–11). The
+High-level summary of the AEC Studio delivery phases (currently 0–12). The
 canonical, up-to-date status — including per-item check marks, exit
 criteria, and changelog — lives in
 [PROGRESS.md](PROGRESS.md). This file is intentionally short so it
@@ -20,6 +20,7 @@ stays readable as the project grows.
 | **9 — Native render & BIM engine** | Replace the Blender and IfcOpenShell worker processes with in-process Rust implementations (SAH BVH, wgpu compute path tracer, PBR rasterizer preview, STEP parser/writer, geometry tessellator). No external runtime dependency for rendering or IFC. | `DONE` |
 | **10 — N-API bridge completion** | Wire every `BridgeBackend` method through the N-API boundary — no more in-process fallbacks. Promote the 9 `draft.*` / `deliver.*` methods listed in `NATIVE_FALLBACK_METHODS` into the wired set so every gesture journals through `command_apply` (Immediate transaction, audit chain, undo-able). | `DONE` |
 | **11 — Real domain depth** | Replace stubs and scaffolding with real implementations across the workspace: AI accept-diff → `command_apply`, template instantiation produces real walls/floors/ceilings/rooms, filesystem revision snapshots + BLAKE3 version diff, DXF round-trip fidelity, DWG bridge wiring, real PDF / SVG / glTF exports, asset import pipeline with LOD chain + thumbnails, real IFC schedules from project data, SQLite-backed render job persistence, incremental constraint solver, IES profile parsing, BLAKE3 audit-chain verification, per-OS thermal monitor + governor backoff, and end-to-end user-journey integration tests for the interior, drafter, and PM workflows. | `DONE` |
+| **12 — Production depth, KChat local IPC, viewport pipeline** | Take every Phase 0–11 surface from "works in tests" to "ships to users". `LocalIpcTransport` + `LocalIpcPublisher` + `KChatDiscovery` connect to a real KChat Desktop instance over a UNIX socket / named pipe; the wgpu viewport ships a real adapter + `RenderPipeline` + `SurfaceManager` with frame coalescing; deliver packs carry real PNGs / XLSX / PDFs / IFC / SVG content from the project graph (no placeholder bytes); the AI sidecar adapter spawns a real `llama-server` with `/health` checks, GBNF-constrained `/completion`, idle unload, and crash restart; the final render pipeline + PBR preview + IES GPU texture + NLM denoiser + tile progress streaming light up the production render path; and a cross-cutting hardening pass adds `ProjectPackage::open` forward-only migrations with pre-migration backup, memory-pressure eviction in the governor, SQL-backed undo/redo journal, plus Phase 5 and Phase 7 end-to-end journey tests. | `DONE` |
 
 ## Cross-cutting
 

@@ -141,17 +141,12 @@ impl ModelManager {
     /// Verify the BLAKE3 checksum of the active model file.
     pub fn verify_active_checksum(&self) -> Result<bool, ModelManagerError> {
         let path = self.active_model_path();
-        let descriptor = self
-            .descriptors
-            .iter()
-            .find(|d| d.tier == self.active_tier);
+        let descriptor = self.descriptors.iter().find(|d| d.tier == self.active_tier);
         let Some(desc) = descriptor else {
             return Ok(true); // No descriptor → skip verification.
         };
         if !path.is_file() {
-            return Err(ModelManagerError::ModelNotFound(
-                path.display().to_string(),
-            ));
+            return Err(ModelManagerError::ModelNotFound(path.display().to_string()));
         }
         let actual = blake3_file(&path)?;
         if actual != desc.blake3_hex {
@@ -283,9 +278,7 @@ mod tests {
         let mgr = ModelManager::new(dir.path().to_path_buf(), vec![], 16384, 8192).unwrap();
         let data = b"fake model data for testing";
         let hash = hex::encode(blake3::hash(data).as_bytes());
-        let path = mgr
-            .install_model(ModelTier::Small, data, &hash)
-            .unwrap();
+        let path = mgr.install_model(ModelTier::Small, data, &hash).unwrap();
         assert!(path.exists());
         assert_eq!(std::fs::read(&path).unwrap(), data);
     }
@@ -295,7 +288,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mgr = ModelManager::new(dir.path().to_path_buf(), vec![], 16384, 8192).unwrap();
         let result = mgr.install_model(ModelTier::Small, b"data", "bad_hash");
-        assert!(matches!(result, Err(ModelManagerError::ChecksumMismatch { .. })));
+        assert!(matches!(
+            result,
+            Err(ModelManagerError::ChecksumMismatch { .. })
+        ));
     }
 
     #[test]

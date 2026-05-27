@@ -3220,6 +3220,31 @@ impl BridgeService {
         }
     }
 
+    /// Phase 12 Task 29 — persist the in-memory render queue to a JSON
+    /// file on disk. Used at session shutdown / quit so a subsequent
+    /// service boot can resume an in-flight render batch via
+    /// [`Self::render_queue_restore`]. Atomic write-then-rename in the
+    /// underlying `RenderQueue::persist`.
+    pub fn render_queue_persist(&self, path: &str) -> Result<(), BridgeServiceError> {
+        let state = self.lock_render_state()?;
+        state
+            .queue
+            .persist(std::path::Path::new(path))
+            .map_err(|e| BridgeServiceError::Core(format!("render_queue_persist: {e}")))
+    }
+
+    /// Phase 12 Task 29 — restore a previously-persisted render queue
+    /// from disk into the in-memory state. Missing-file is *not* an
+    /// error: a fresh boot before the first persist() call legitimately
+    /// has no queue file yet, and the symmetric `load` returns an
+    /// empty queue in that case.
+    pub fn render_queue_restore(&self, path: &str) -> Result<(), BridgeServiceError> {
+        let mut state = self.lock_render_state()?;
+        state.queue = aec_render::queue::RenderQueue::load(std::path::Path::new(path))
+            .map_err(|e| BridgeServiceError::Core(format!("render_queue_restore: {e}")))?;
+        Ok(())
+    }
+
     /// Select the given preset id as the active preset in the in-memory
     /// preset store. The return carries the now-active preset id so
     /// the renderer can keep its dropdown in lock-step with the engine
@@ -4272,6 +4297,20 @@ impl BridgeService {
     /// button.
     pub fn kchat_reload(&self) -> crate::kchat_state::KChatStatusReport {
         self.kchat_state.reload()
+    }
+
+    /// Phase 12 Task 30 — flip the master KChat enable switch. When
+    /// `enabled` is `false`, subsequent [`Self::kchat_publish`] and
+    /// [`Self::kchat_ingest_reviews`] calls return
+    /// [`aec_core::kchat::KChatError::Disabled`] without touching the
+    /// transport. Used by the Settings page's "Disable KChat" toggle.
+    pub fn kchat_set_enabled(&self, enabled: bool) {
+        self.kchat_state.set_enabled(enabled);
+    }
+
+    /// Phase 12 Task 30 — mirror of [`Self::kchat_set_enabled`].
+    pub fn kchat_is_enabled(&self) -> bool {
+        self.kchat_state.is_enabled()
     }
 
     /// Publish an artifact card through the active publisher.

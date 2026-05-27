@@ -315,8 +315,7 @@ impl<'a> ToolPlanner<'a> {
             .ok_or_else(|| PlanError::UnknownGrammar(schema.grammar_key.clone()))?;
         let prompt = build_prompt(schema, request);
         let completion_request = CompletionRequest::new(prompt, grammar.gbnf.clone());
-        let completion =
-            transport.complete_with_retry(&completion_request, cancel, max_retries)?;
+        let completion = transport.complete_with_retry(&completion_request, cancel, max_retries)?;
         self.finalize(
             request.tool,
             request.scope,

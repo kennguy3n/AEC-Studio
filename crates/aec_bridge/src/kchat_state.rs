@@ -85,6 +85,13 @@ struct Inner {
     /// Cached discovery info — refreshed by `status()` calls so the
     /// UI can poll cheaply without re-probing every tick.
     discovered: Option<KChatInstanceInfo>,
+    /// Phase 12 Task 30 — master enable switch mirroring
+    /// [`aec_core::kchat_config::KChatConfig::enabled`]. When `false`
+    /// every publish / ingest call returns
+    /// [`KChatError::Disabled`] *before* touching the transport, so
+    /// "disable KChat" in Settings is a hard refusal and not a silent
+    /// noop.
+    enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,10 +156,15 @@ impl KChatState {
     }
 
     /// Publish an artifact card through whichever publisher is
-    /// currently active.
+    /// currently active. Returns [`KChatError::Disabled`] *before*
+    /// touching the transport when the integration has been disabled
+    /// via [`Self::set_enabled`] (Phase 12 Task 30).
     pub fn publish(&self, card: ArtifactCard) -> Result<PublishResult, KChatError> {
         let publisher = {
             let inner = self.inner.read().expect("kchat state not poisoned");
+            if !inner.enabled {
+                return Err(KChatError::Disabled);
+            }
             Arc::clone(&inner.publisher)
         };
         let result = publisher.publish(card);
@@ -176,6 +188,9 @@ impl KChatState {
     ) -> Result<(Vec<ReviewComment>, Vec<ReviewCard>), KChatError> {
         let local = {
             let inner = self.inner.read().expect("kchat state not poisoned");
+            if !inner.enabled {
+                return Err(KChatError::Disabled);
+            }
             inner.local_ipc.as_ref().map(Arc::clone)
         };
         match local {
@@ -215,6 +230,24 @@ impl KChatState {
             publisher_kind: PublisherKind::InMemory.as_str().into(),
             instance: inner.discovered.clone(),
         };
+    }
+
+    /// Phase 12 Task 30 — master enable / disable switch. Setting
+    /// this to `false` causes every subsequent [`Self::publish`] and
+    /// [`Self::ingest_reviews`] call to return
+    /// [`KChatError::Disabled`] without touching the transport.
+    /// Idempotent — flipping back to `true` resumes through the
+    /// already-installed publisher.
+    pub fn set_enabled(&self, enabled: bool) {
+        let mut inner = self.inner.write().expect("kchat state not poisoned");
+        inner.enabled = enabled;
+    }
+
+    /// Mirror of [`Self::set_enabled`] — useful for the Settings page
+    /// to reflect the current toggle state without re-reading from
+    /// the underlying project config.
+    pub fn is_enabled(&self) -> bool {
+        self.inner.read().expect("kchat state not poisoned").enabled
     }
 
     /// Test helper — force the state into an in-memory publisher
@@ -279,6 +312,7 @@ impl Inner {
                     instance: Some(info.clone()),
                 },
                 discovered: Some(info),
+                enabled: true,
             };
         }
         let publisher: Arc<dyn KChatPublisher + Send + Sync> =
@@ -293,6 +327,7 @@ impl Inner {
                 instance: None,
             },
             discovered: None,
+            enabled: true,
         }
     }
 }

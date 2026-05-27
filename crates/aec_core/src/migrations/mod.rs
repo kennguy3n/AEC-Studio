@@ -138,7 +138,11 @@ impl Migration {
 /// Read the database's recorded `meta.schema_version`, defaulting to 1
 /// for databases that initialised under the pre-migration code path
 /// (those still have the base schema, equivalent to a fresh v1).
-fn read_schema_version(conn: &Connection) -> AecResult<u32> {
+/// Read the recorded `meta.schema_version` from the supplied open
+/// database connection. Pub-crate so `open_encrypted` can read the
+/// version before running the migration walk in order to take a
+/// pre-migration backup (Phase 12 Task 26).
+pub(crate) fn read_schema_version(conn: &Connection) -> AecResult<u32> {
     let mut stmt = conn.prepare("SELECT value FROM meta WHERE key = 'schema_version'")?;
     let v: Option<String> = stmt
         .query_row([], |r| r.get::<_, String>(0))

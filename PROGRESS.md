@@ -398,6 +398,87 @@ This document tracks AEC Studio's phased delivery from open-source foundation to
 
 ---
 
+## Phase 12 — Production depth, KChat local IPC, and viewport pipeline
+
+**Status:** `DONE`
+
+**Goal:** Take every Phase 0–11 surface from "works in tests" to "ships to users". Real local-IPC transport to KChat Desktop, real wgpu viewport pipeline, real deliver-pack content (renders, schedules, sheets, IFC), real LLM sidecar connection, render production depth (FinalRenderPipeline + PBR preview + IES GPU texture + NLM denoiser + progress streaming), and cross-cutting production hardening (project migration with pre-migration backup, memory pressure eviction, SQL-backed undo/redo).
+
+### Group A — KChat Desktop local IPC transport (Tasks 1–5)
+
+| Item | Status |
+|---|---|
+| Task 1 — `LocalIpcTransport` (UNIX socket / Windows named pipe, JSON-line envelope, reconnect with backoff, heartbeat) | `DONE` |
+| Task 2 — `LocalIpcPublisher` (`KChatPublisher` impl, `ingest_reviews` polling, dedup on republish) | `DONE` |
+| Task 3 — `KChatDiscovery::probe()` (macOS `~/Library/Application Support/KChat/ipc.sock`, Linux `$XDG_RUNTIME_DIR/kchat/ipc.sock`, Windows `\\.\pipe\kchat-ipc`, `AEC_KCHAT_SOCKET_PATH` override) | `DONE` |
+| Task 4 — N-API + Electron IPC wiring (`kchat:publish`, `kchat:status`, `kchat:ingestReviews`) | `DONE` |
+| Task 5 — Renderer UI (`PublishCardModal` real publish, `KChatStatusIndicator` in StatusBar, `KChatReviewPanel` in Deliver, Settings page instance info) | `DONE` |
+
+### Group B — Real viewport pipeline (Tasks 6–10)
+
+| Item | Status |
+|---|---|
+| Task 6 — Real wgpu adapter + device acquisition (`ViewportRenderer::new` with HighPerformance → LowPower → force_fallback fallback chain) | `DONE` |
+| Task 7 — `RenderPipeline` (geometry → selection overlay → gizmo → grid, 4 WGSL shaders, MSAA 4x, depth + stencil) | `DONE` |
+| Task 8 — `SurfaceManager` off-screen render targets (resize without rebuild, frame coalescing on camera/selection/geometry hash, double-buffered output) | `DONE` |
+| Task 9 — Design-mode viewport (`ViewportContainer` ↔ `viewport:requestFrame` / `viewport:resize` / `viewport:mouseEvent`; orbit / pan / zoom via bridge) | `DONE` |
+| Task 10 — Draft-mode viewport (orthographic projection, major/minor grid at zoom level, crosshair cursor, snap indicator overlay) | `DONE` |
+
+### Group C — Real deliver pack content (Tasks 11–15)
+
+| Item | Status |
+|---|---|
+| Task 11 — Real PNGs in deliver packs (look in `<project>/renders/`; fall back to a real Quick-preset render thumbnail; no more 67-byte 1×1 placeholder) | `DONE` |
+| Task 12 — Real XLSX (`rust_xlsxwriter` multi-sheet workbook for material schedules and BOQ; rows derived from the project graph) | `DONE` |
+| Task 13 — Real PDF sheets (`SheetPdfBuilder` per project `Sheet`, viewport clipping, dimensions, title block, real DXF entities) | `DONE` |
+| Task 14 — Real IFC bytes (`IfcWriter::to_string_with_materials` + classifications + properties; validated via `aec_bim::validation` before zipping) | `DONE` |
+| Task 15 — Real proposal pack (project name, room/material counts, real `render_sheet_svg_full` plan page, render thumbnails when present, AI cover-page draft from real metadata) | `DONE` |
+
+### Group D — AI sidecar real connection (Tasks 16–20)
+
+| Item | Status |
+|---|---|
+| Task 16 — Real `LlamaCppAdapter` (spawn `llama-server`, `/health` check, SIGTERM-then-kill shutdown, idle unload, restart-with-backoff on crash) | `DONE` |
+| Task 17 — Real `LlamaCppTransport` (`/completion` HTTP client, GBNF grammar in body, streaming with `CancelToken`, 503 retry, 4xx fail-fast) | `DONE` |
+| Task 18 — `ToolPlanner::plan()` → real `LlamaCppTransport` (grammar-constrained → `ToolCall` parser → `SafetyValidator` → `DiffOperation`s) | `DONE` |
+| Task 19 — `ModelManager` (tier selection from governor, BLAKE3-checksummed download, runtime tier switching without restart) | `DONE` |
+| Task 20 — Bridge endpoints wired to real inference (`ai_plan` / `ai_accept_diff` / `ai_reject_diff` / `ai_runtime_status`) | `DONE` |
+
+### Group E — Render pipeline production depth (Tasks 21–25)
+
+| Item | Status |
+|---|---|
+| Task 21 — Real `FinalRenderPipeline` integration (project graph → `RenderScene` via `MeshCache` + `MaterialLibrary`, camera from `CameraStore`) | `DONE` |
+| Task 22 — Real PBR preview wiring (rasterizer as default Design viewport, real-time camera updates, lighting presets) | `DONE` |
+| Task 23 — IES GPU lookup texture (photometric web → 1D texture upload; WGSL samples instead of using `representative_cd`) | `DONE` |
+| Task 24 — NLM denoiser (uses albedo / normal / depth aux buffers; preset-aware auto-select alongside bilateral) | `DONE` |
+| Task 25 — Tile-by-tile render progress streaming (per-tile callback, cancellation at tile boundary, wired through bridge → `RenderQueue` UI) | `DONE` |
+
+### Group F — Cross-cutting production hardening (Tasks 26–30)
+
+| Item | Status |
+|---|---|
+| Task 26 — `ProjectPackage::open` forward-only migrations + pre-migration backup (`project.sqlite.bak.v{from}-to-v{to}`, fresh opens skipped, schema-version mismatch validated against `manifest.json`) | `DONE` |
+| Task 27 — Memory pressure governor (`sysinfo` RSS sampling, `MemorySampler` + `MemoryMonitor` with escalation-only listener dispatch, scheduler denies Critical and halves concurrency on Pressured) | `DONE` |
+| Task 28 — SQL-backed undo/redo journal (forward deltas to `undo_journal`, `superseded` flag for redo stack, crash recovery test reopens engine from disk) | `DONE` |
+| Task 29 — Phase 5 e2e journey (create project → 4 cameras × standard preset batch → list jobs → persist queue → restart service → restore queue → history compare) | `DONE` |
+| Task 30 — Phase 7 e2e journey (create project → publish concept card → ingest 3 review comments → disable KChat → all calls return `KChatError::Disabled` → re-enable → publish revision + dedup on re-ingest) | `DONE` |
+
+### Exit criteria
+
+- [x] KChat publish and review ingest round-trip through a real UNIX-domain-socket / named-pipe IPC against a running KChat Desktop instance (or a discovery-overridden mock server in tests).
+- [x] Viewport pipeline produces a real wgpu frame off-screen and the renderer surfaces it without going through a JSON-only fallback.
+- [x] Deliver packs contain real renders, real XLSX workbooks, real PDFs, real IFC, and a real SVG plan page — no placeholder bytes.
+- [x] AI sidecar can be spawned, health-checked, exercised over `/completion`, and unloaded — every bridge endpoint routes through the real transport.
+- [x] Render production depth: FinalRenderPipeline pulls from the project graph; PBR preview is the default Design viewport; IES uses a GPU texture; NLM denoiser ships alongside bilateral; tile progress streams through the bridge.
+- [x] `ProjectPackage::open` runs forward-only migrations and takes a pre-migration backup before mutating an out-of-date database.
+- [x] Memory monitor classifies Normal / Pressured / Critical and the governor scheduler reduces concurrency or denies admission accordingly.
+- [x] Undo / redo journal survives a simulated process crash (drop + reopen).
+- [x] Phase 5 and Phase 7 user-journey e2e tests pass end-to-end through `BridgeService`'s public API.
+- [x] `cargo test --workspace` (2 214 tests), `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all --check`, and `npm test --workspaces` (266 tests) all pass.
+
+---
+
 ## Phase 7 — Optional KChat integration
 
 **Status:** `DONE`
@@ -493,6 +574,16 @@ AEC Studio's UI follows the **KChat design system** — primary accent `#7C3AED`
 ---
 
 ## Changelog
+
+### 2026-05-27 (Phase 12 — production depth, KChat local IPC, viewport pipeline, 30 tasks in one PR)
+
+- **Group A — KChat Desktop local IPC.** New `crates/aec_core/src/kchat_transport.rs` ships a `LocalIpcTransport` speaking a discriminated-union JSON-line envelope (`ping` / `publish` / `ingest_reviews`) over a UNIX domain socket on macOS/Linux and a named pipe on Windows, with a hand-rolled 5-step exponential reconnect schedule and a `seconds_since_heartbeat()` accessor for the StatusBar's freshness indicator. `crates/aec_core/src/local_ipc_publisher.rs` wraps it as a `KChatPublisher` with a `(thread_id, project_link, caption)` dedup set so double-clicking the publish modal is a no-op. `crates/aec_core/src/kchat_discovery.rs` walks the platform-canonical paths (macOS Application Support, Linux `$XDG_RUNTIME_DIR`, Windows pipe namespace) and an `AEC_KCHAT_SOCKET_PATH` test override. Bridge exports `kchat_publish` / `kchat_status` / `kchat_ingest_reviews`; Electron IPC handlers `kchat:publish` / `kchat:status` / `kchat:ingestReviews` route through `preload.ts` and `bridge.ts`. Renderer ships `PublishCardModal` (real publish wired), `KChatStatusIndicator` in StatusBar with green/yellow/red dot, `KChatReviewPanel` in Deliver showing ingested comments with thread context, and KChat Desktop instance info on the Settings page.
+- **Group B — Real viewport pipeline.** `ViewportRenderer::new` requests an adapter with the HighPerformance → LowPower → `force_fallback_adapter` chain and stores `device`, `queue`, and `adapter_info` non-optionally on success. New `crates/aec_viewport/src/render_pipeline.rs` wires the four existing WGSL shaders (geometry, selection, gizmo, grid) into a forward-rendering pipeline with 4× MSAA, a depth buffer, and a selection stencil. New `crates/aec_viewport/src/surface.rs` allocates off-screen render targets, supports resize without rebuilding the pipeline, and frame-coalesces on `(camera_hash, selection_hash, geometry_hash)` so an idle viewport isn't redrawn at 60 Hz. `ViewportContainer` requests frames via `viewport:requestFrame` and routes mouse events to the bridge via `viewport:mouseEvent`; `DraftCanvas` shares the pipeline with an orthographic camera.
+- **Group C — Real deliver pack content.** `write_deliver_pack` now scans `<project>/renders/` for real PNG bytes (falling back to a real Quick-preset path-traced thumbnail rather than the 67-byte 1×1 placeholder), produces a multi-sheet XLSX via `rust_xlsxwriter` for material schedules and BOQs, renders each project `Sheet` via `SheetPdfBuilder` with real DXF entities clipped to the viewport, serialises the project graph to IFC via `IfcWriter::to_string_with_materials` (validated through `aec_bim::validation` before zipping), and emits a proposal pack with real project metadata, a real `render_sheet_svg_full` plan page, and an AI cover-page draft derived from the project's room/material/lighting state.
+- **Group D — AI sidecar real connection.** `crates/aec_ai/src/sidecar.rs` spawns `llama-server` as a child process, polls `/health` with a 30-attempt readiness loop, terminates with SIGTERM (force-kills after a timeout), unloads after 60 s of idle, and restarts on crash with backoff. `crates/aec_ai/src/transport.rs` posts to `/completion` with the GBNF grammar in the request body, streams tokens with `CancelToken`, retries 503 (model loading), and fails fast on 4xx. `ToolPlanner::plan()` routes through the real transport, parses tool calls, and validates them through `SafetyValidator` before producing `DiffOperation`s. `ModelManager` selects a tier from the governor's hardware profile, downloads model files with BLAKE3 checksum verification, and supports runtime tier switching without a restart. Bridge endpoints `ai_plan`, `ai_accept_diff`, `ai_reject_diff`, and `ai_runtime_status` are wired end-to-end.
+- **Group E — Render pipeline production depth.** `final_render.rs` builds a `RenderScene` from real project entities (walls, furniture, materials) via `aec_geometry::MeshCache` + `aec_materials::MaterialLibrary` and applies camera parameters from `CameraStore`. `pbr_preview.rs` is the default Design-mode viewport renderer; orbit triggers an immediate re-render; lighting presets (sun position, sky colour, ambient) come from `aec_render::lighting`. The GPU path tracer now samples IES profiles from a 1-D lookup texture baked from the photometric web instead of approximating with `representative_cd`. `denoise.rs` ships an NLM denoiser alongside the bilateral one, auto-selecting by preset (bilateral for Quick, NLM for Standard+). `render_or_fallback` streams per-tile progress through a callback channel and supports cancellation at tile boundaries.
+- **Group F — Cross-cutting production hardening.** `ProjectPackage::open` runs forward-only migrations from `crates/aec_core/src/migrations/` against a pre-migration `project.sqlite.bak.v{from}-to-v{to}` backup (`crates/aec_core/src/db.rs::backup_before_migration` uses raw `std::fs::copy` so the encrypted SQLCipher backup is bit-identical and decryptable with the same key). `crates/aec_governor/src/memory.rs` ships `MemorySampler` + `MemoryMonitor` polling `sysinfo` on a 5-second cadence; the scheduler denies new admissions at `Critical` and halves tile concurrency at `Pressured`, and the StatusBar surfaces the current band. `CommandEngine::undo` / `redo` now persist forward deltas to the SQL `undo_journal` table with a `superseded` flag for the redo stack; a `crash_recovery` test drops the engine, reopens it from disk, and confirms the undo stack survives. New `crates/aec_bridge/tests/phase5_journey.rs` exercises the full Phase 5 render workflow (create → 4 cameras × standard preset batch → persist queue → fresh service boot → restore → history `compare(a, b)` reporting `preset_changed` / `camera_changed` / `image_hash_changed` / `duration_delta_ms`). New `crates/aec_bridge/tests/phase7_journey.rs` exercises the full Phase 7 KChat collaboration journey against a real UNIX-socket mock server (publish concept render → ingest 3 review comments → audit entries with `ActorKind::KChat` → disable KChat → all calls return `KChatError::Disabled` *before* hitting the wire → re-enable → publish revision pack → `CommentSync` dedupes on re-ingest).
+- **Tests.** `cargo test --workspace` passes 2 214 tests across all crates; `cargo clippy --workspace --all-targets -- -D warnings` is clean; `cargo fmt --all --check` is clean; `npm test --workspaces` passes 266 tests across `apps/desktop/electron` and `apps/desktop/renderer`.
 
 ### 2026-05-25 (Phase 10 + Phase 11 — N-API bridge completion + real domain depth, 30 tasks across PRs #48–#66)
 

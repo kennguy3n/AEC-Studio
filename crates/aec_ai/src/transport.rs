@@ -196,8 +196,8 @@ impl SidecarTransport {
                 self.request_timeout,
             ) {
                 Ok(resp) => {
-                    let parsed: CompletionResponse = serde_json::from_str(&resp.body)
-                        .map_err(TransportError::DecodeResponse)?;
+                    let parsed: CompletionResponse =
+                        serde_json::from_str(&resp.body).map_err(TransportError::DecodeResponse)?;
                     if parsed.content.is_empty() {
                         return Err(TransportError::EmptyCompletion);
                     }

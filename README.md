@@ -80,7 +80,7 @@ Desktop only. Supports **CPU-only** and **CPU+GPU** configurations.
 
 ## Architecture overview
 
-AEC Studio is structured as an Electron desktop application with a React/TypeScript renderer, a Rust core engine accessed via N-API, a cross-platform wgpu viewport for 2D CAD and 3D design, and four supervised worker processes for 3D rendering, BIM/IFC, CAD heavy-lift, and local AI inference. The Electron main process enforces a strict security boundary between the renderer and native capabilities.
+AEC Studio is structured as an Electron desktop application with a React/TypeScript renderer, a Rust core engine accessed via N-API, and a cross-platform **real wgpu viewport pipeline** for 2D CAD and 3D design (real adapter acquisition with HighPerformance → LowPower → force-fallback chain, off-screen `SurfaceManager` with double-buffered output and frame coalescing on camera / selection / geometry hashes, forward-rendering `RenderPipeline` wiring the geometry / selection / gizmo / grid WGSL shaders, MSAA 4× and depth + stencil), an in-process Rust path tracer and PBR preview (no Blender, no IfcOpenShell), and a single supervised AI sidecar (`llama-server`) for local LLM inference. The Electron main process enforces a strict security boundary between the renderer and native capabilities.
 
 For the full technical architecture, see [ARCHITECTURE.md](ARCHITECTURE.md).
 
@@ -102,15 +102,16 @@ A Ctrl/Cmd+K **command palette** opens from any mode, fuzzy-searching every regi
 
 ---
 
-## KChat integration (optional, Phase 7)
+## KChat integration (optional, Phase 7 + Phase 12)
 
 AEC Studio ships with optional **KChat** integration that's strictly local-first:
 
-- **Outbound** — artefacts (renders, sheets, revision packs, BOQ snapshots) can be published as inline cards to a KChat thread with one click. The user supplies the transport; nothing routes through a centralised AEC Studio service.
-- **Inbound** — review and approval comments on those cards are ingested back into the project's audit trail with `ActorKind::KChat` so every decision is traceable.
-- **Off by default** — when the KChat toggle in Settings is off, every publish/sync method returns `KChatDisabled` and the corresponding UI hides itself. AEC Studio remains fully functional without ever touching KChat.
+- **Outbound** — artefacts (renders, sheets, revision packs, BOQ snapshots) can be published as inline cards to a KChat thread with one click. The transport is a **local IPC link to a running KChat Desktop instance** (`LocalIpcTransport` over a UNIX domain socket on macOS/Linux or a named pipe on Windows, discovered by `KChatDiscovery::probe()` at the platform-canonical path), so nothing routes through a centralised AEC Studio service.
+- **Inbound** — review and approval comments on those cards are ingested back into the project's audit trail with `ActorKind::KChat` so every decision is traceable. `aec_core::kchat_sync::CommentSync` dedupes on `(thread_id, timestamp, commenter, blake3(text))` so re-imports don't double the audit log, and edits land as new rows.
+- **Status surface** — the StatusBar shows a `KChatStatusIndicator` (connected / reconnecting / disconnected with the server-reported version), the Deliver mode shows a `KChatReviewPanel` of ingested comments, and the Settings page shows the detected KChat Desktop instance info (version + socket path).
+- **Off by default** — when the KChat toggle in Settings is off, every publish/sync method returns `KChatError::Disabled` *before* touching the transport, and the corresponding UI hides itself. AEC Studio remains fully functional without ever touching KChat.
 
-The full Phase 7 component listing lives in [PHASES.md](PHASES.md) and the technical design is in [ARCHITECTURE.md](ARCHITECTURE.md#96-kchat-integration).
+The full Phase 7 component listing lives in [PHASES.md](PHASES.md); the production-depth local-IPC transport, publisher, and discovery code landed in Phase 12. The technical design is in [ARCHITECTURE.md](ARCHITECTURE.md#96-kchat-integration).
 
 ---
 

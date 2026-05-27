@@ -137,13 +137,12 @@ impl RenderScene {
         material_id: Option<String>,
         transform: [[f32; 4]; 4],
     ) {
-        self.meshes
-            .push(SerializedMesh::from_geometry_mesh(
-                id,
-                mesh,
-                material_id,
-                transform,
-            ));
+        self.meshes.push(SerializedMesh::from_geometry_mesh(
+            id,
+            mesh,
+            material_id,
+            transform,
+        ));
     }
 }
 

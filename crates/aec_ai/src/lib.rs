@@ -45,11 +45,11 @@ pub use cover_draft::{CoverDraftError, CoverDraftTone, CoverPageDraft};
 pub use diff_engine::{Diff, DiffEngine, DiffOperation, DiffStatus};
 pub use grammars::{Grammar, GrammarRegistry};
 pub use layout_suggestion::{LayoutProposal, LayoutSuggestionResult, LayoutValidationError};
-pub use model_manager::{
-    select_tier as select_model_tier, ModelDescriptor, ModelManager, ModelManagerError, ModelTier,
-};
 pub use lighting_balance::{
     AccentLight, AccentLightKind, LightingBalanceError, LightingBalanceResult, MAX_ACCENT_LIGHTS,
+};
+pub use model_manager::{
+    select_tier as select_model_tier, ModelDescriptor, ModelManager, ModelManagerError, ModelTier,
 };
 pub use plan_detection::{PlanDetectionResult, PolylineProposal};
 pub use plan_to_wall::{

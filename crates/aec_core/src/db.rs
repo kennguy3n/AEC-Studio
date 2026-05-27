@@ -33,6 +33,11 @@ pub fn open_encrypted(path: &Path, key: &Key32) -> AecResult<Connection> {
     // (`Connection::open` → `READ_WRITE | CREATE | NO_MUTEX | URI`); all
     // three `open_*` paths therefore run in the same threading mode so
     // there are no surprising performance differences between them.
+    // Phase 12 Task 26: capture existence BEFORE the `OPEN_CREATE`
+    // call below creates the file as a side effect, so the
+    // pre-migration backup step can skip fresh databases — they have
+    // no committed user state worth preserving.
+    let existed_before_open = path.exists();
     let mut conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -41,12 +46,70 @@ pub fn open_encrypted(path: &Path, key: &Key32) -> AecResult<Connection> {
     )?;
     apply_pragmas(&conn, key)?;
     initialize_schema(&conn)?;
-    crate::migrations::run_pending(
-        &mut conn,
-        crate::migrations::Migration::all(),
-        crate::manifest::SCHEMA_VERSION,
-    )?;
+    // Phase 12 Task 26: back up the SQLCipher database before running
+    // any pending forward migrations. We only take the backup when:
+    //  (a) the file existed before this `open_encrypted` call, AND
+    //  (b) the recorded schema version is *behind* the current binary
+    // For fresh databases (no pre-existing file) and steady-state opens
+    // (already at current) the file copy is skipped so we don't
+    // pollute the project directory on every open.
+    let from_version = crate::migrations::read_schema_version(&conn)?;
+    let to_version = crate::manifest::SCHEMA_VERSION;
+    if existed_before_open && from_version < to_version {
+        // Drop our handle first so the source file isn't held open by
+        // the WAL writer when we copy it. We re-open immediately after
+        // the backup so the rest of this function works against a
+        // fully-initialized connection.
+        drop(conn);
+        backup_before_migration(path, from_version, to_version)?;
+        conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        apply_pragmas(&conn, key)?;
+    }
+    crate::migrations::run_pending(&mut conn, crate::migrations::Migration::all(), to_version)?;
     Ok(conn)
+}
+
+/// Phase 12 Task 26: copy the SQLCipher database alongside the original
+/// before forward migrations run. The backup name encodes the schema
+/// version range so legacy backups don't collide with future migrations
+/// — e.g. `project.sqlite.bak.v2-to-v4` lets a crash-recovery script
+/// know exactly which pre-image to restore from.
+///
+/// Returns `Ok(())` when no backup is required (database doesn't exist
+/// yet — `open_encrypted` is also the creation path for fresh
+/// projects) or after the copy completes. SQLite's `-wal` / `-shm`
+/// sidecar files aren't copied: the migration runner walks each
+/// migration inside its own transaction, so a partially-flushed WAL
+/// would be re-applied on the *next* open anyway, and the backup
+/// captures the pre-migration committed state which is what we need
+/// for rollback.
+fn backup_before_migration(path: &Path, from: u32, to: u32) -> AecResult<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let backup_name = format!(
+        "{}.bak.v{}-to-v{}",
+        path.file_name().map_or_else(
+            || "project.sqlite".to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        ),
+        from,
+        to
+    );
+    let backup_path = path
+        .parent()
+        .map_or_else(|| std::path::PathBuf::from(&backup_name), |p| p.join(&backup_name));
+    // Use std::fs::copy for the raw SQLCipher file copy — this is
+    // intentionally NOT a `VACUUM INTO` because the source DB is
+    // encrypted and we want the backup encrypted the same way (i.e.
+    // bit-identical pages, decryptable with the same key derivation).
+    std::fs::copy(path, &backup_path)?;
+    Ok(())
 }
 
 /// Open an *already-initialized* encrypted database read/write. Does NOT
@@ -308,5 +371,67 @@ mod tests {
         let wrong = derive_project_key(&master, &[0u8; 32]);
         let err = open_existing(&p, &wrong);
         assert!(err.is_err(), "wrong key must not open the database");
+    }
+
+    #[test]
+    fn fresh_open_does_not_create_a_pre_migration_backup() {
+        // Phase 12 Task 26: opening a brand-new database must NOT
+        // sprinkle backup files next to it — there's no pre-existing
+        // state to preserve and the backup would just clutter the
+        // project directory.
+        let (td, p) = temp_db();
+        let master = [11u8; 32];
+        let nonce = generate_project_nonce().unwrap();
+        let key = derive_project_key(&master, &nonce);
+        let _conn = open_encrypted(&p, &key).unwrap();
+        // Walk the temp dir and assert no `.bak.v*-to-v*` files exist.
+        let entries: Vec<String> = std::fs::read_dir(td.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !entries.iter().any(|n| n.contains(".bak.v")),
+            "no backup file expected next to a freshly-created database; got entries: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_v1_open_writes_a_pre_migration_backup() {
+        // Phase 12 Task 26: open a fresh DB, force its recorded version
+        // back to v1 to mimic a legacy project, close, then re-open to
+        // trigger the backup-then-migrate path.
+        let (td, p) = temp_db();
+        let master = [11u8; 32];
+        let nonce = generate_project_nonce().unwrap();
+        let key = derive_project_key(&master, &nonce);
+        {
+            let conn = open_encrypted(&p, &key).unwrap();
+            // Reverse every post-v1 migration so the next open's
+            // migration walk has real work to do without colliding
+            // with already-applied DDL. Mirrors what the legacy v1
+            // simulation in `package.rs::legacy_v1_project_is_upgraded_end_to_end`
+            // does.
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS audit_chain; \
+                 DROP INDEX IF EXISTS idx_undo_journal_scope; \
+                 DROP INDEX IF EXISTS idx_components_entity_kind; \
+                 ALTER TABLE undo_journal DROP COLUMN scope; \
+                 INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', '1');",
+            )
+            .unwrap();
+        }
+        // Re-open. The recorded version is now 1 < SCHEMA_VERSION so
+        // the open path must (a) take a backup, (b) run migrations.
+        let _conn = open_encrypted(&p, &key).unwrap();
+        let entries: Vec<String> = std::fs::read_dir(td.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        let target = crate::manifest::SCHEMA_VERSION;
+        let expected_prefix = format!("project.sqlite.bak.v1-to-v{target}");
+        assert!(
+            entries.contains(&expected_prefix),
+            "expected `{expected_prefix}` in {entries:?}"
+        );
     }
 }

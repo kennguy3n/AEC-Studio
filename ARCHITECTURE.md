@@ -322,11 +322,33 @@ crates/aec_render/
 └── doctor.rs                   # Render diagnostics
 
 crates/aec_viewport/
-├── pbr_preview.rs              # PBR forward rasterizer (wgpu) used by preview.rs
+├── renderer.rs                 # ViewportRenderer (Phase 12) — real wgpu adapter + device acquisition
+│                               # via the HighPerformance → LowPower → force_fallback_adapter chain;
+│                               # exposes `adapter_info` for the governor's hardware profiler
+├── render_pipeline.rs          # RenderPipeline (Phase 12) — forward-rendering pipeline wiring the
+│                               # four WGSL shaders (geometry, selection, gizmo, grid) with MSAA 4×,
+│                               # a depth buffer, and a selection stencil; vertex layout matches
+│                               # aec_geometry's spatial-index mesh format
+├── surface.rs                  # SurfaceManager (Phase 12) — off-screen render targets with
+│                               # double-buffered output for tear-free readback; resize without
+│                               # rebuilding the pipeline; frame coalescing on
+│                               # (camera_hash, selection_hash, geometry_hash) so an idle viewport
+│                               # is not redrawn at 60 Hz
+├── pbr_preview.rs              # PBR forward rasterizer (wgpu) used by preview.rs and by the
+│                               # default Design-mode viewport (Phase 12 wiring); reacts to orbit
+│                               # in real time
+├── shaders/geometry.wgsl       # Geometry pass shader
+├── shaders/selection.wgsl      # Selection-stencil outline pass
+├── shaders/gizmo.wgsl          # Transform gizmo + crosshair (Draft mode)
+├── shaders/grid.wgsl           # Major/minor grid (zoom-aware)
 ├── shaders/pbr.wgsl            # PBR fragment shader (metallic/roughness + IBL)
 ├── shaders/sky.wgsl            # Hosek–Wilkie procedural sky
 └── sky.rs                      # Sky parameters → GPU uniform binding
 ```
+
+### Viewport pipeline (Phase 12)
+
+The wgpu viewport pipeline is the production code path for both Design (3D perspective) and Draft (2D orthographic) modes. Renderer-side, `ViewportContainer` issues `viewport:requestFrame`, `viewport:resize`, and `viewport:mouseEvent` IPC calls; the bridge service routes them to `viewport_render_frame`, `viewport_resize`, and `viewport_input`, which drive the same `RenderPipeline` + `SurfaceManager` with different camera projections. Frame coalescing means idle viewports cost zero GPU time; resize-without-rebuild keeps interactive resize smooth even on integrated graphics. The IPC envelope between renderer and main is a small typed JSON contract — the Electron main process never decodes pixel data, it just passes back a pre-encoded PNG (or a shared-memory handle on platforms where that's cheaper).
 
 ### Pipelines
 
@@ -402,14 +424,19 @@ crates/aec_render/
 ├── benches/native_render.rs    # Criterion benchmark for the native CPU/GPU path tracer end-to-end
 ├── bvh.rs                      # SAH BVH2 builder + node layout (Tasks 1-2, Phase 9 PR1)
 ├── cameras.rs                  # CameraSnapshot, CameraStore, CameraJournal, preset thumbnails
-├── denoise.rs                  # Edge-aware bilateral / NLM denoiser (Phase 9 PR2)
+├── denoise.rs                  # Edge-aware bilateral denoiser (Phase 9 PR2) + Non-Local Means
+│                               # denoiser (Phase 12) using albedo / normal / depth aux buffers;
+│                               # auto-select by preset (bilateral for Quick, NLM for Standard+)
 ├── doctor.rs                   # Material check / diagnostics (missing texture, non-PBR, swapped channels)
 ├── final_render.rs             # Native final-render pipeline — CPU/GPU path tracer → tone-map → PNG
 ├── gpu_trace.rs                # wgpu compute path tracer + fallback to CPU rayon path tracer
 ├── history.rs                  # RenderHistory + compare(a, b) → CompareResult
 ├── intersect.rs                # Möller-Trumbore + stack-based BVH traversal (Phase 9 PR1)
 ├── job.rs                      # RenderJob, RenderJobStatus, walkthrough frame tracking, resume state
-├── light_sampling.rs           # Sun / area / point / IES sampling with MIS (Phase 9 PR1)
+├── light_sampling.rs           # Sun / area / point / IES sampling with MIS (Phase 9 PR1); IES
+│                               # profiles bake into a 1-D GPU lookup texture (Phase 12) so the
+│                               # WGSL shader samples the real photometric web instead of using a
+│                               # representative-candela approximation
 ├── lighting.rs                 # Lighting presets (WarmEvening/Daylight/Studio/...), IES profiles
 ├── material.rs                 # Principled BSDF (diffuse + GGX, Schlick Fresnel, Smith shadowing)
 ├── panorama.rs                 # Native 360° equirectangular panorama pipeline
@@ -432,18 +459,32 @@ crates/aec_render/
 
 ## 9.6 KChat integration
 
-KChat integration is the **only** optional cross-organisation surface in AEC Studio. It is gated on two axes:
+KChat integration is the **only** optional cross-organisation surface in AEC Studio. It is gated on three axes:
 
 1. **Compile-time** by the `kchat` cargo feature on `aec_core` (default-enabled). Disabling default features strips the `kchat`, `kchat_config`, and `kchat_sync` modules and their re-exports from the compiled crate; the `ActorKind::KChat` enum variant stays unconditional so the audit-log type remains stable across feature configurations.
-2. **Runtime** by the `KChatConfig::enabled` toggle exposed in Settings. When the config is disabled, every publish/sync method returns `KChatError::KChatDisabled` and the corresponding UI elements hide themselves.
+2. **Runtime project toggle** by the `KChatConfig::enabled` flag persisted in the project manifest — the per-project knob, primarily for "don't publish from this client / project".
+3. **Process-wide master switch** by `KChatState::set_enabled(false)` (Phase 12). This flips a bit on the bridge-wide `KChatState::Inner` so every `publish` / `ingest_reviews` call returns `KChatError::Disabled` *before* touching the transport, regardless of which publisher is currently installed. The Settings page wires the toggle through `BridgeService::kchat_set_enabled`.
 
 ```
 crates/aec_core/
 ├── kchat.rs                    # KChatArtifact (incl. AssetPack variant), ArtifactCard, KChatPublisher
 │                               # trait, InMemoryPublisher (tests), ReviewComment / ApprovalStatus /
-│                               # ReviewCard, AssetPackReference + AssetPackManifest::artifact_card
+│                               # ReviewCard, AssetPackReference + AssetPackManifest::artifact_card,
+│                               # KChatError::Disabled
 ├── kchat_sync.rs               # One-way comment sync (KChat thread → audit trail) with dedup by
-│                               # (thread_id, timestamp, commenter) so re-imports are no-ops
+│                               # (thread_id, timestamp, commenter, blake3(text)) — edits become new
+│                               # rows, re-imports of unchanged comments are no-ops
+├── kchat_transport.rs          # LocalIpcTransport (Phase 12): UNIX socket (macOS/Linux) or named pipe
+│                               # (Windows); JSON-line envelope with `kind` discriminator (ping /
+│                               # publish / ingest_reviews); 5-step exponential reconnect backoff;
+│                               # heartbeat freshness timer for the StatusBar indicator
+├── local_ipc_publisher.rs      # LocalIpcPublisher (Phase 12): KChatPublisher impl that wraps
+│                               # LocalIpcTransport; per-publisher (thread_id, project_link, caption)
+│                               # dedup set; `ingest_reviews` polling hook for the bridge
+├── kchat_discovery.rs          # KChatDiscovery::probe() (Phase 12): walks the platform-canonical
+│                               # paths (macOS ~/Library/Application Support/KChat/ipc.sock, Linux
+│                               # $XDG_RUNTIME_DIR/kchat/ipc.sock, Windows \\.\pipe\kchat-ipc) plus
+│                               # the AEC_KCHAT_SOCKET_PATH env override used by tests
 └── kchat_config.rs             # Local-first config (enabled: bool, default_thread_id: Option<String>);
                                 # `KChatIntegration` gates every operation on `enabled`. Its
                                 # `publish_asset_pack` routes the manifest *through* the transport as
@@ -452,9 +493,25 @@ crates/aec_core/
 ```
 
 ```
+crates/aec_bridge/src/
+├── kchat_state.rs              # Process-wide KChatState — owns the currently-installed publisher,
+│                               # selects LocalIpcPublisher when KChatDiscovery::probe succeeds and
+│                               # falls back to InMemoryPublisher otherwise, exposes set_enabled /
+│                               # is_enabled (the master switch), surfaces a KChatStatusReport
+│                               # (publisher_kind, state, version, socket_path, seconds_since_heartbeat)
+└── service.rs                  # BridgeService::kchat_publish / kchat_ingest_reviews /
+                                # kchat_status / kchat_set_enabled / kchat_is_enabled — every method
+                                # consults the master switch before delegating to the publisher.
+```
+
+```
 apps/desktop/renderer/src/components/kchat/
-├── PublishCardModal.tsx        # Preview an ArtifactCard before publishing
-└── ArtifactCardPreview.tsx     # Image + caption + metadata preview tile
+├── PublishCardModal.tsx        # Preview an ArtifactCard before publishing; wired to the real
+│                               # kchat:publish IPC (Phase 12)
+├── ArtifactCardPreview.tsx     # Image + caption + metadata preview tile
+├── KChatStatusIndicator.tsx    # StatusBar dot — green (connected) / yellow (reconnecting) / red
+│                               # (disconnected) with the server-reported version on hover
+└── KChatReviewPanel.tsx        # Deliver-mode panel showing ingested comments with thread context
 ```
 
 ### Data flow
@@ -502,7 +559,12 @@ crates/aec_governor/
 ├── policy/                     # Tier policies (low / medium / high / pro)
 ├── scheduler/                  # Render queue, AI queue, worker rate-limiting
 ├── thermal/                    # Backs off under sustained CPU/GPU load
-├── memory/                     # Pressure-aware mesh / cache eviction
+├── memory/                     # Pressure-aware mesh / cache eviction (Phase 12): MemorySampler
+│                               # polls sysinfo on a 5 s cadence, MemoryMonitor classifies
+│                               # Normal / Pressured / Critical based on RSS vs total RAM,
+│                               # dispatches escalation-only listener events, and the scheduler
+│                               # halves tile concurrency at Pressured and denies admission at
+│                               # Critical; StatusBar surfaces the current band
 └── ui_report/                  # Surfaces governor state to the status bar
 ```
 
