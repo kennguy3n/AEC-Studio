@@ -251,3 +251,154 @@ describe("Bim page — bridge error handling", () => {
     expect(classifySpy).toHaveBeenCalledTimes(1);
   });
 });
+
+// Regression: Devin Review flagged that the Bim page's
+// `ifcSourcePath` is per-session local state, not keyed to the
+// active project — if the component stayed mounted across a
+// project switch, the user would silently validate / export /
+// classify against project A's IFC while viewing project B.
+// Today this is hidden by the `RequireProject` route guard +
+// every project-switch path navigating away from `/bim` (so the
+// component unmounts and `useState` resets for free), but the
+// invariant is fragile: an in-page project picker or any future
+// flow that calls `openProject` without navigating would silently
+// break the contract. The fix is a `useEffect` keyed on
+// `project?.path` that mirrors the pattern `Render.tsx` already
+// uses (resets `cameras`/`selectedCameras`) and resets every
+// per-project Bim state slot. These tests pin the contract by
+// driving a project switch on a still-mounted Bim instance and
+// verifying that the ScheduleView's regenerate button — whose
+// `disabled` state directly mirrors `ifcSourcePath === null` —
+// transitions enabled → disabled across the switch.
+describe("Bim page — per-project state reset on project switch", () => {
+  let openFileSpy = vi.spyOn(aec.dialog, "openFile");
+  let attachIfcSpy = vi.spyOn(aec.bim, "attachIfc");
+  let currentSpy = vi.spyOn(aec.project, "current");
+  let openSpy = vi.spyOn(aec.project, "open");
+  openFileSpy.mockRestore();
+  attachIfcSpy.mockRestore();
+  currentSpy.mockRestore();
+  openSpy.mockRestore();
+
+  beforeEach(() => {
+    openFileSpy = vi.spyOn(aec.dialog, "openFile");
+    attachIfcSpy = vi.spyOn(aec.bim, "attachIfc");
+    currentSpy = vi.spyOn(aec.project, "current");
+    openSpy = vi.spyOn(aec.project, "open");
+  });
+
+  afterEach(() => {
+    openFileSpy.mockRestore();
+    attachIfcSpy.mockRestore();
+    currentSpy.mockRestore();
+    openSpy.mockRestore();
+  });
+
+  it("clears ifcSourcePath when the active project changes (re-mounted Bim instance)", async () => {
+    const summaryA = {
+      projectId: "proj_a",
+      name: "Project A",
+      path: "/tmp/a.aecstudio",
+      templateKey: null,
+      modifiedAt: new Date().toISOString(),
+    };
+    const summaryB = {
+      projectId: "proj_b",
+      name: "Project B",
+      path: "/tmp/b.aecstudio",
+      templateKey: null,
+      modifiedAt: new Date().toISOString(),
+    };
+    // `current` is read once on provider mount. `open` is driven
+    // by `BimWithProject`'s `useEffect` on `path` change — the
+    // implementation maps each `path` to the matching summary so
+    // a re-render with a different `path` switches projects
+    // without unmounting the Bim component.
+    currentSpy.mockResolvedValue({ summary: summaryA });
+    openSpy.mockImplementation(async (path: string) =>
+      path === summaryA.path ? summaryA : summaryB,
+    );
+    // Drive the attach flow: dialog returns a deterministic IFC
+    // path, the bridge returns a successful attach summary, and
+    // the Bim component sets `ifcSourcePath` to the picked path
+    // (which is the precondition for the regenerate button to
+    // become enabled).
+    openFileSpy.mockResolvedValue({
+      canceled: false,
+      paths: ["/tmp/site.ifc"],
+    });
+    attachIfcSpy.mockResolvedValue({
+      path: "/tmp/site.ifc",
+      projectPath: summaryA.path,
+      parseCacheHit: false,
+      spatialNodesInserted: 1,
+      spatialNodesUpdated: 0,
+      spatialNodesUnchanged: 0,
+      elementsInserted: 5,
+      elementsUpdated: 0,
+      elementsUnchanged: 0,
+      componentsInserted: 0,
+      relationsInserted: 0,
+      cacheRows: 0,
+    });
+
+    const { rerender } = render(
+      <ToastProvider>
+        <ActiveProjectProvider>
+          <BimWithProject path={summaryA.path} />
+          <ToastContainer />
+        </ActiveProjectProvider>
+      </ToastProvider>,
+    );
+
+    // Wait for project A to be the active project.
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("active-project-path").textContent,
+      ).toBe(summaryA.path);
+    });
+
+    // Initially the regenerate button is disabled — no IFC has
+    // been imported / attached yet.
+    expect(screen.getByTestId("schedule-regenerate")).toBeDisabled();
+
+    // Trigger the attach action, which routes through the
+    // file-picker + bridge spies and sets `ifcSourcePath`.
+    fireEvent.click(screen.getByTestId("bim-action-attachIfc"));
+
+    // Regenerate becomes enabled once `ifcSourcePath` is set.
+    await waitFor(() => {
+      expect(screen.getByTestId("schedule-regenerate")).toBeEnabled();
+    });
+
+    // Switch to project B by re-rendering with the new path.
+    // The `BimWithProject` useEffect fires `openProject(summaryB.path)`
+    // which transitions the provider state; the Bim component's
+    // new `useEffect` keyed on `project?.path` then resets
+    // `ifcSourcePath` to null.
+    rerender(
+      <ToastProvider>
+        <ActiveProjectProvider>
+          <BimWithProject path={summaryB.path} />
+          <ToastContainer />
+        </ActiveProjectProvider>
+      </ToastProvider>,
+    );
+
+    // Wait for the active project to switch to B.
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("active-project-path").textContent,
+      ).toBe(summaryB.path);
+    });
+
+    // The regenerate button must be disabled again — confirming
+    // that `ifcSourcePath` was reset by the project-switch
+    // useEffect. If this assertion ever fails, project A's IFC
+    // path would silently leak into operations performed under
+    // project B (the exact bug Devin Review flagged).
+    await waitFor(() => {
+      expect(screen.getByTestId("schedule-regenerate")).toBeDisabled();
+    });
+  });
+});

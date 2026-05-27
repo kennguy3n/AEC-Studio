@@ -125,9 +125,33 @@ function AppCommands({
 
   const close = useCallback(async () => {
     if (project === null) return;
-    await closeProject();
+    // Wrap the bridge call in try/catch to match the convention
+    // used by the sibling `save` / `undo` / `redo` callbacks.
+    // Today the main process's `project:close` handler only calls
+    // `clearActiveProjectPath()` (synchronous, can't fail), so an
+    // unhandled rejection here is unreachable. But the handler
+    // signature is async — and any future enhancement (a
+    // `flushPendingChanges` await per the deferred design
+    // tracker, an "are you sure?" confirmation dialog, telemetry
+    // emission) will create a real failure surface. Without this
+    // catch the bridge error would bubble as an unhandled promise
+    // rejection, and `navigate("/")` would never run — leaving
+    // the user stuck on the now-broken project view with no
+    // visible error. The toast follows the same `${err.message}`
+    // shape as the other handlers so the message is grep-able
+    // across the codebase, and we still attempt the navigation
+    // on failure so a partial close (project state may already be
+    // cleared on the renderer) doesn't strand the user.
+    try {
+      await closeProject();
+    } catch (err) {
+      addToast(
+        "error",
+        `Close failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
     navigate("/");
-  }, [project, closeProject, navigate]);
+  }, [project, closeProject, navigate, addToast]);
 
   useShortcut({
     id: "undo",

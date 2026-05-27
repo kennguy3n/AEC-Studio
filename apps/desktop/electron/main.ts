@@ -2,6 +2,7 @@ import { app, BrowserWindow, dialog, session } from "electron";
 import * as path from "path";
 import { registerIpcHandlers } from "./ipc";
 import { registerDialogIpcHandlers } from "./dialog-ipc";
+import { installApplicationMenu } from "./menu";
 
 let mainWindow: BrowserWindow | null = null;
 
@@ -68,6 +69,18 @@ function createWindow(): void {
 }
 
 app.whenReady().then(() => {
+  // Install the application menu BEFORE creating the window. On
+  // macOS the default Electron menu binds `CmdOrCtrl+W` to "Close
+  // Window" via the standard `windowMenu` role; because Electron
+  // processes menu accelerators before keydown events reach the
+  // renderer, the renderer's `mod+w` "Close project" shortcut
+  // (App.tsx) would never fire — Cmd+W would destroy the
+  // BrowserWindow instead of closing just the project. On
+  // Windows/Linux there is no native menu-bar convention worth
+  // keeping; suppressing the default menu sends every shortcut
+  // through the renderer's command palette / `useShortcut`
+  // registry. See `menu.ts` for the full rationale.
+  installApplicationMenu();
   registerIpcHandlers();
   // Dialog IPC handlers (`dialog:openFile`, `dialog:openDirectory`,
   // `dialog:saveFile`) live in a separate module so the renderer-side

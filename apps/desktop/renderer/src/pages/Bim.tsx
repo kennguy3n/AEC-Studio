@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { aec } from "../api/aec";
 import { importIfcWithSizeGuard } from "../api/bim-import";
 import { attachIfcToProject } from "../api/bim-attach";
@@ -90,6 +90,32 @@ export function Bim() {
   const [ifcSourcePath, setIfcSourcePath] = useState<string | null>(null);
 
   const projectPath = project?.path ?? null;
+
+  // Reset every per-project piece of BIM state whenever the active
+  // project changes (or closes). Today this is defence in depth —
+  // every project-switch path navigates away from `/bim` and the
+  // `RequireProject` route guard unmounts the page, so `useState`
+  // is reset for free. But the moment a future feature reuses the
+  // mounted Bim instance across projects (in-page project picker,
+  // a `useEffect` that calls `openProject` without navigating,
+  // multi-pane layout, etc.) the page would silently leak
+  // project A's IFC into project B: validate/classify/schedule
+  // would all run against the stale `ifcSourcePath` while the
+  // user sees project B's metadata. The same risk applies to the
+  // spatial tree (`root`/`selectedId`), Pset edits (`psets`), and
+  // generated schedule rows / validation findings. Mirroring the
+  // pattern used by `Render.tsx` (which resets `cameras` /
+  // `selectedCameras` on `project?.path` change) — see that
+  // useEffect for the long-form rationale — keeps every mode
+  // page consistent in how it handles project transitions.
+  useEffect(() => {
+    setIfcSourcePath(null);
+    setRoot(DEMO_ROOT);
+    setSelectedId(null);
+    setPsets(DEMO_PSETS);
+    setSchedules({});
+    setFindings([]);
+  }, [projectPath]);
 
   const onInvoke = async (action: BimAction) => {
     setBusyAction(action);
