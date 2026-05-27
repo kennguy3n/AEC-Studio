@@ -2414,6 +2414,35 @@ impl BridgeService {
         })
     }
 
+    /// Helper used by [`Self::export_proposal_pack`] and
+    /// [`Self::deliver_build_pack`] (and any future
+    /// `*_with_context` deliver/proposal endpoint) to build an
+    /// [`OwnedPackContext`] for an optionally-supplied project path.
+    ///
+    /// Centralising this prevents the two callers from drifting on
+    /// how the bridge maps "no project supplied" to "fall back to
+    /// the export crate's empty default" and ensures every future
+    /// `_with_context` endpoint participates in the bridge's
+    /// `SnapshotCache` automatically — no caller-side
+    /// `&self.snapshot_cache` reach-around. The function returns
+    /// `Ok(None)` for the no-project case (which the callers then
+    /// pass through to `unwrap_or_default()` on the borrowed
+    /// context) and propagates `Err` for real failures opening the
+    /// project DB or loading its graph.
+    fn build_owned_pack_context_for_optional_project(
+        &self,
+        project_path: Option<&str>,
+    ) -> Result<Option<crate::pack_context::OwnedPackContext>, BridgeServiceError> {
+        match project_path {
+            Some(path) => Ok(Some(crate::pack_context::build_for_project(
+                path,
+                &self.master_key,
+                &self.snapshot_cache,
+            )?)),
+            None => Ok(None),
+        }
+    }
+
     /// Export a real client-facing proposal PDF via
     /// [`aec_export::write_proposal_pack_with_context`] (Phase 13
     /// Task 10). When `project_path` is supplied, the proposal
@@ -2430,14 +2459,7 @@ impl BridgeService {
         client_name: &str,
         project_path: Option<&str>,
     ) -> Result<ExportProposalPackResult, BridgeServiceError> {
-        let owned = match project_path {
-            Some(path) => Some(crate::pack_context::build_for_project(
-                path,
-                &self.master_key,
-                &self.snapshot_cache,
-            )?),
-            None => None,
-        };
+        let owned = self.build_owned_pack_context_for_optional_project(project_path)?;
         let ctx = owned
             .as_ref()
             .map(crate::pack_context::OwnedPackContext::as_context)
@@ -2494,14 +2516,7 @@ impl BridgeService {
             include_boq: options.include_boq,
             include_proposal: options.include_proposal,
         };
-        let owned = match project_path.as_deref() {
-            Some(path) => Some(crate::pack_context::build_for_project(
-                path,
-                &self.master_key,
-                &self.snapshot_cache,
-            )?),
-            None => None,
-        };
+        let owned = self.build_owned_pack_context_for_optional_project(project_path.as_deref())?;
         let ctx = owned
             .as_ref()
             .map(crate::pack_context::OwnedPackContext::as_context)

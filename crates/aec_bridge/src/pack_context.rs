@@ -636,22 +636,21 @@ END-ISO-10303-21;\n";
         std::thread::sleep(std::time::Duration::from_millis(1100));
         std::fs::write(&ifc_path, body).unwrap();
         let _ctx3 = build_for_project(project_path.to_str().unwrap(), &master_key, &cache).unwrap();
-        // After the rewrite the new `(mtime, size)` key replaces the
-        // stale one. Cache still holds exactly one entry for this
-        // canonical path — the previous entry was evicted via the
-        // `(canonical_path, NEW_mtime, size)` insert which left the
-        // `(canonical_path, OLD_mtime, size)` entry orphaned (it
-        // ages out via TTL but is no longer reachable).
-        //
-        // The exact post-eviction count depends on whether the OLD
-        // entry has had time to be TTL-evicted; we assert >=1 and
-        // <=2 to keep the test robust against scheduler jitter while
-        // still proving the cache observed the mtime change.
-        let len_after_rewrite = cache.len();
-        assert!(
-            (1..=2).contains(&len_after_rewrite),
-            "after mtime change the cache should have either replaced (1) or shadowed (2) the entry, got {}",
-            len_after_rewrite
+        // After the rewrite the new `(mtime, size)` insert must
+        // *replace* the stale entry under the same canonical path, not
+        // coexist with it. The `SnapshotCache::insert` per-path
+        // uniqueness invariant guarantees this deterministically —
+        // any cached entry sharing this file's `canonical_path` with a
+        // different filesystem identity is dropped before the new
+        // entry lands, so the cache size stays at exactly 1 regardless
+        // of TTL timing. See
+        // `snapshot_cache::tests::insert_evicts_obsolete_entries_for_same_canonical_path`
+        // for the cache-layer regression that locks this in.
+        assert_eq!(
+            cache.len(),
+            1,
+            "after a file rewrite the per-path uniqueness invariant must reduce the cache to one \
+             live entry for this canonical path, not two"
         );
     }
 }
