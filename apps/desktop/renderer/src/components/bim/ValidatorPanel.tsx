@@ -50,7 +50,18 @@ export function ValidatorPanel({
           type="button"
           data-testid="validator-revalidate"
           onClick={revalidate}
-          disabled={busy}
+          // Disabled when busy *or* the parent hasn't imported an IFC
+          // yet (sourcePath === ""). Without the empty-string guard
+          // the bridge would receive an empty path and fail in the
+          // main-process IPC handler at `assertString(sourcePath,
+          // "sourcePath")` (ipc.ts:262), producing an unhandled
+          // promise rejection with no user feedback. The in-process
+          // fallback (`renderer-backend.ts`) accepts empty strings
+          // silently, which is why the regression isn't visible in
+          // unit tests — the disabled state is the user-facing fix.
+          // Mirrors the ScheduleView regenerate-button guard.
+          disabled={busy || sourcePath === ""}
+          title={sourcePath === "" ? "Import an IFC first" : undefined}
         >
           {busy ? "Validating…" : "Re-validate"}
         </button>

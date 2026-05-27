@@ -184,9 +184,36 @@ export function Bim() {
           );
           break;
         }
-        case "classify":
-          await aec.bim.classify({ entityId: selectedId, source: "ai" });
+        case "classify": {
+          // `bim_classify` operates on the active project's entity
+          // graph (not a single entity) and the Rust bridge requires
+          // both `projectPath` and `scheme`. The previous call shape
+          // (`{ entityId, source: "ai" }`) would have failed at
+          // `requireProjectPath` / `requireStringField("scheme")` in
+          // `bridge.ts` (the in-process fallback hid the regression
+          // by ignoring unknown fields). We default to the IFC
+          // scheme — the most useful auto-classify that maps
+          // entity kinds to their canonical IFC classes
+          // (`IfcWall`, `IfcDoor`, …). Future iterations can let
+          // the user choose between `ifc` / `uniformat-ii` /
+          // `omniclass-21` via a small picker; surfacing the
+          // counts in a toast keeps the operation observable
+          // without that UI.
+          if (!projectPath) {
+            addToast("error", "No project open — open or create one first");
+            break;
+          }
+          const result = await aec.bim.classify({
+            projectPath,
+            scheme: "ifc",
+          });
+          addToast(
+            "success",
+            `Classified ${result.classified} entit${result.classified === 1 ? "y" : "ies"}` +
+              ` (${result.unchanged} unchanged, ${result.skipped} skipped)`,
+          );
           break;
+        }
         case "generateSchedule": {
           if (!ifcSourcePath) {
             addToast("error", "Import an IFC first before generating schedules");

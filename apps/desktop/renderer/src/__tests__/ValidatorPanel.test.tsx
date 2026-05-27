@@ -87,4 +87,43 @@ describe("ValidatorPanel", () => {
     // which `bimReportToFindings` flattens to an empty `ValidationFinding[]`.
     expect(onFindings).toHaveBeenCalledWith([]);
   });
+
+  // Regression test: Devin Review flagged that when no IFC has been
+  // imported, the `sourcePath` is `""` and clicking Re-validate
+  // would invoke `aec.bim.validate({ sourcePath: "" })` — the
+  // production main-process IPC handler asserts the string is
+  // non-empty (`assertString` rejects `""`) and the error becomes
+  // an unhandled promise rejection with no user feedback. The
+  // disabled-state guard makes the bug unreachable from the UI.
+  it("disables Re-validate when sourcePath is empty (no IFC imported)", () => {
+    render(
+      <ValidatorPanel
+        sourcePath=""
+        findings={[]}
+        onFindings={() => undefined}
+        onZoomTo={() => undefined}
+      />,
+    );
+    const button = screen.getByTestId(
+      "validator-revalidate",
+    ) as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+    expect(button.title).toBe("Import an IFC first");
+  });
+
+  it("enables Re-validate once a sourcePath is provided", () => {
+    render(
+      <ValidatorPanel
+        sourcePath="/test/project.ifc"
+        findings={[]}
+        onFindings={() => undefined}
+        onZoomTo={() => undefined}
+      />,
+    );
+    const button = screen.getByTestId(
+      "validator-revalidate",
+    ) as HTMLButtonElement;
+    expect(button.disabled).toBe(false);
+    expect(button.title).toBe("");
+  });
 });

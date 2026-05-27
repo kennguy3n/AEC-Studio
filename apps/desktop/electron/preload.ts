@@ -174,8 +174,27 @@ const api = {
         bytesWritten: number;
         parseCacheHit: boolean;
       }>,
-    classify: (params: Record<string, unknown>) =>
-      ipcRenderer.invoke("bim:classify", params),
+    /**
+     * Run `bim_classify` on the active project's entity graph for
+     * the requested `scheme` (`"ifc"` / `"uniformat-ii"` /
+     * `"omniclass-21"`). The inline result type mirrors
+     * `BimClassifyResult` in `electron/bridge.ts` 1:1 so the
+     * renderer can react to counts without an extra import; drift
+     * here would surface as `undefined` on the classify toast,
+     * which the bridge's `adaptNative` self-check guards against.
+     */
+    classify: (params: { projectPath: string; scheme: string }) =>
+      ipcRenderer.invoke("bim:classify", params) as Promise<{
+        scheme: string;
+        classified: number;
+        unchanged: number;
+        skipped: number;
+        details: Array<{
+          entityId: string;
+          code: string;
+          title: string;
+        }>;
+      }>,
     setProperty: (params: Record<string, unknown>) =>
       ipcRenderer.invoke("bim:setProperty", params),
     /**

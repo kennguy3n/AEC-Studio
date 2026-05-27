@@ -228,7 +228,22 @@ export function rendererInProcessBackend(): AecApi {
         bytesWritten: 0,
         parseCacheHit: false,
       }),
-      classify: async () => ({ classified: 0 }),
+      // Mirrors `BimClassifyResult` in `electron/bridge.ts` and the
+      // typed preload signature. The in-process fallback can't run
+      // the real `bim_classify` (no SQLCipher project on disk under
+      // vitest), so it returns the empty-success shape and lets the
+      // caller's "0 classified" toast render. Earlier this method
+      // returned only `{ classified: 0 }`, which silently hid a
+      // production bug where the Bim page sent the wrong params —
+      // matching the full shape here means future drift will trip
+      // the bridge's `adaptNative` self-check instead of the user.
+      classify: async () => ({
+        scheme: "ifc",
+        classified: 0,
+        unchanged: 0,
+        skipped: 0,
+        details: [],
+      }),
       setProperty: async () => ({ ok: true }),
       readScheduleRows: async () => ({ rows: [] }),
       generateSchedule: async (params) => ({
