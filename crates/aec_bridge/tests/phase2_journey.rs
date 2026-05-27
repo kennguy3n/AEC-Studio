@@ -294,6 +294,10 @@ fn phase2_apartment_designer_journey_through_bridge_service() {
                 include_boq: false,
                 include_proposal: true,
             },
+            // Phase 2 journey predates Phase 13 Task 7 — no
+            // project_path means the export crate falls back to
+            // its per-kind synthesised inventory.
+            project_path: None,
         })
         .expect("deliver concept pack");
 

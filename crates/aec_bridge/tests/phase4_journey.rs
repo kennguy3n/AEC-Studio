@@ -256,6 +256,11 @@ fn phase4_construction_pm_bim_lite_and_boq_journey() {
                 include_boq: true,
                 include_proposal: false,
             },
+            // Phase 4 journey predates Phase 13 Task 7 — no
+            // project_path means the export crate falls back to
+            // its per-kind synthesised inventory, which is what
+            // this test was asserting on before the param landed.
+            project_path: None,
         })
         .expect("deliver contractor boq pack");
     assert!(boq_path.exists());
@@ -287,6 +292,7 @@ fn phase4_construction_pm_bim_lite_and_boq_journey() {
                 include_boq: true,
                 include_proposal: false,
             },
+            project_path: None,
         })
         .expect("deliver bim pack");
     assert!(bim_pack_path.exists());

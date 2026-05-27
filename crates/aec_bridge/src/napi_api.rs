@@ -1038,6 +1038,13 @@ pub struct ExportProposalPackParamsJs {
     /// page. The export still succeeds when `None` is passed (the
     /// cover renders `"(client)"` as the placeholder).
     pub client_name: Option<String>,
+    /// Path to the open `.aecstudio` project package. When supplied,
+    /// the proposal pack's cover prints the project's real room
+    /// count, material count, and template name; without it, the
+    /// cover paragraph is left empty (legacy behaviour preserved
+    /// for tests / CLI fixtures that have no project to source
+    /// data from).
+    pub project_path: Option<String>,
 }
 
 /// JS-facing result of [`export_build_proposal_pack`].
@@ -1061,8 +1068,9 @@ pub fn export_build_proposal_pack(
     params: ExportProposalPackParamsJs,
 ) -> Result<ExportProposalPackResultJs> {
     let client = params.client_name.as_deref().unwrap_or("(client)");
+    let project_path = params.project_path.as_deref();
     with_service_ref_fallible(|svc| {
-        svc.export_proposal_pack(&params.out_path, &params.project_name, client)
+        svc.export_proposal_pack(&params.out_path, &params.project_name, client, project_path)
     })
     .map(Into::into)
 }
@@ -1088,6 +1096,15 @@ pub struct DeliverBuildPackParamsJs {
     /// here so the renderer can keep passing it without breaking
     /// the napi shape.
     pub region: Option<String>,
+    /// Path to the open `.aecstudio` project package whose state
+    /// should populate the deliver pack (renders dir, attached
+    /// IFC, CAD sheets, schedules). The renderer's
+    /// `BridgeBackend.deliverBuildPack` defaults this to
+    /// `useActiveProject().path` so every renderer-initiated pack
+    /// runs through the context-aware path (Phase 13 Tasks 7 +
+    /// 11 + 12). Tests / CLI fixtures may omit it to fall back
+    /// to the no-context per-kind synthesised inventory.
+    pub project_path: Option<String>,
 }
 
 /// JS-facing result of [`deliver_build_pack`]. Mirrors the
@@ -1138,6 +1155,7 @@ pub fn deliver_build_pack(params: DeliverBuildPackParamsJs) -> Result<DeliverBui
             include_boq: params.include_boq.unwrap_or(true),
             include_proposal: params.include_proposal.unwrap_or(true),
         },
+        project_path: params.project_path,
     };
     // `with_service_ref_fallible` takes `FnOnce` (see helper declaration
     // ~600 LoC above) so the closure can consume `svc_params` directly

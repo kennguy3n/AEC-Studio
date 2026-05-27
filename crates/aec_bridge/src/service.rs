@@ -634,6 +634,17 @@ pub struct DeliverBuildPackParams {
     pub kind: String,
     pub project_name: String,
     pub options: DeliverPackInventoryFlags,
+    /// Path to the open `.aecstudio` project package whose state
+    /// should populate the deliver pack (renders dir, attached IFC,
+    /// CAD sheets, schedules). Optional so the bridge can still
+    /// produce a fallback-only pack from a project-less CLI fixture
+    /// or test harness — when `None`, the export crate falls back to
+    /// the per-kind synthesised inventory (`build_thumbnail_png` for
+    /// renders, header-only XLSX for schedules, `build_summary_ifc`
+    /// for IFC). Production renderer callers always populate this
+    /// from `useActiveProject().path`.
+    #[serde(default)]
+    pub project_path: Option<String>,
 }
 
 /// Result of a successful [`BridgeService::deliver_build_pack`]
@@ -2065,6 +2076,96 @@ impl BridgeService {
         Ok(rows.into_iter().map(asset_metadata_to_summary).collect())
     }
 
+    /// Discover every extension under `extensions_dir`, load and
+    /// validate each `manifest.json`, and install all `AssetPack`
+    /// extensions into the global asset library DB.
+    ///
+    /// This is the renderer's hook for the Phase 8 extension
+    /// lifecycle: when the user toggles an extension in the
+    /// extension browser (or on app boot if the user has the
+    /// "auto-install asset packs" preference enabled), the
+    /// renderer calls this endpoint with the path to the
+    /// extensions root and the bridge does the loader-side work.
+    ///
+    /// Trust policy:
+    /// * `require_signature == true` → only extensions signed by a
+    ///   known key are accepted. Unsigned manifests and signatures
+    ///   that don't match the bundled `TrustStore` produce a hard
+    ///   error.
+    /// * `require_signature == false` → unsigned manifests are
+    ///   permitted (development / sideload flow). Signed manifests
+    ///   are still verified opportunistically so a tampered payload
+    ///   is rejected even in dev mode.
+    ///
+    /// Returns the per-extension summary
+    /// ([`aec_assets::extension_host::InstallSummary`]) so the
+    /// renderer can show "installed X, skipped Y already-present"
+    /// in the extension browser.
+    pub fn extensions_install_asset_packs(
+        &self,
+        extensions_dir: &str,
+        require_signature: bool,
+    ) -> Result<aec_assets::extension_host::InstallSummary, BridgeServiceError> {
+        use aec_core::extensions::{ExtensionLoader, LoadOptions};
+        use aec_core::PermissionEnforcer;
+
+        let opts = if require_signature {
+            // Production builds always supply a trust store; the
+            // renderer-facing JSON parameter just chooses whether
+            // to enforce it. Without a trust store there's
+            // nothing to enforce against, so flagging
+            // `require_signature` with no `TrustStore` ships is
+            // the correct hard error.
+            return Err(BridgeServiceError::Invalid(
+                "extensions_install_asset_packs(require_signature=true) requires a configured TrustStore; not yet wired through the bridge boot path".into(),
+            ));
+        } else {
+            LoadOptions::allow_unsigned()
+        };
+
+        let loader = ExtensionLoader::new(extensions_dir);
+        let registry = loader.load(&opts).map_err(|e| {
+            BridgeServiceError::Invalid(format!("extensions_install_asset_packs: load: {e}"))
+        })?;
+        let enforcer = PermissionEnforcer::from_registry(&registry);
+        // `with_db_mut` requires the closure to return
+        // `Result<_, AssetError>`, but `install_asset_packs`
+        // returns its own `AssetExtensionError` enum (permission
+        // denied, missing asset file, checksum mismatch — none of
+        // which are pure DB errors). Bubble the structured host
+        // error out through an `Option` so the bridge can keep
+        // the typed permission-denied / checksum-mismatch
+        // distinction in its `BridgeServiceError::Invalid` message
+        // instead of collapsing it through `AssetError::Other`
+        // (which doesn't exist).
+        let mut host_err: Option<aec_assets::extension_host::AssetExtensionError> = None;
+        let summary = self
+            .asset_state
+            .with_db_mut(|db| {
+                match aec_assets::extension_host::install_asset_packs(db, &registry, &enforcer) {
+                    Ok(summary) => Ok(summary),
+                    Err(e) => {
+                        host_err = Some(e);
+                        // Surface a sentinel `AssetError` so the
+                        // outer caller knows to look at
+                        // `host_err`. The sentinel never reaches
+                        // the renderer — we replace it below
+                        // before returning the bridge error.
+                        Ok(aec_assets::extension_host::InstallSummary::default())
+                    }
+                }
+            })
+            .map_err(|e| {
+                BridgeServiceError::Invalid(format!("extensions_install_asset_packs: db: {e}"))
+            })?;
+        if let Some(e) = host_err {
+            return Err(BridgeServiceError::Invalid(format!(
+                "extensions_install_asset_packs: install: {e}"
+            )));
+        }
+        Ok(summary)
+    }
+
     /// Read an `.ifc` file from disk and return a structured import
     /// summary the renderer can show on its "Import BIM" panel.
     ///
@@ -2325,27 +2426,65 @@ impl BridgeService {
     }
 
     /// Export a real client-facing proposal PDF via
-    /// [`aec_export::write_proposal_pack`]. The output is a
-    /// printpdf-serialised file with the `aec_export::proposal`
-    /// branding + asset scaffolding pre-applied.
+    /// [`aec_export::write_proposal_pack_with_context`] (Phase 13
+    /// Task 10). When `project_path` is supplied, the proposal
+    /// cover paragraph includes the project's real room count,
+    /// material count, and template name; without it, the export
+    /// crate falls back to the generic empty-cover variant. The
+    /// output is a printpdf-serialised file with the
+    /// `aec_export::proposal` branding + asset scaffolding
+    /// pre-applied.
     pub fn export_proposal_pack(
         &self,
         out_path: &str,
         project_name: &str,
         client_name: &str,
+        project_path: Option<&str>,
     ) -> Result<ExportProposalPackResult, BridgeServiceError> {
-        let res = aec_export::write_proposal_pack(Path::new(out_path), project_name, client_name)?;
+        let owned = match project_path {
+            Some(path) => Some(crate::pack_context::build_for_project(
+                path,
+                &self.master_key,
+            )?),
+            None => None,
+        };
+        let ctx = owned
+            .as_ref()
+            .map(crate::pack_context::OwnedPackContext::as_context)
+            .unwrap_or_default();
+        let res = aec_export::write_proposal_pack_with_context(
+            Path::new(out_path),
+            project_name,
+            client_name,
+            &ctx,
+        )?;
         Ok(ExportProposalPackResult {
             out_path: res.out_path.to_string_lossy().into_owned(),
         })
     }
 
-    /// Build a contractor deliverable ZIP archive at `out_path`.
-    /// Kind + options control the inventory; see
-    /// [`aec_export::write_deliver_pack`] for the per-kind asset
-    /// list. The returned `contents` matches the inventory the
-    /// renderer preview pane shows pre-archive, and `total_bytes` is
-    /// the sum of payload sizes (manifest excluded).
+    /// Build a contractor deliverable ZIP archive at `out_path`
+    /// (Phase 13 Tasks 7 + 11 + 12). When `params.project_path`
+    /// resolves to an open `.aecstudio` package, the pack is
+    /// populated with real project state via
+    /// [`crate::pack_context::build_for_project`]:
+    ///
+    /// * `<project>/renders/` PNG files are embedded directly;
+    ///   absent files still fall back to a real gradient thumbnail.
+    /// * Schedules are generated from the attached IFC snapshot
+    ///   (door / material / room) and exported via `rust_xlsxwriter`.
+    /// * CAD sheet definitions + their primitive geometry feed
+    ///   `SheetPdfBuilder` so the contractor pack's sheets contain
+    ///   real `LINE`/`POLYLINE` content streams rather than
+    ///   title-only fallbacks.
+    /// * The IFC entry round-trips through
+    ///   `IfcWriter::to_string_with_materials` against the project's
+    ///   canonical attached source (not the skeleton
+    ///   `build_summary_ifc`).
+    ///
+    /// Missing data sources degrade cleanly to the export crate's
+    /// per-kind fallback — never to the legacy `placeholder_xlsx`
+    /// or `placeholder_png` paths (both removed from the crate now).
     pub fn deliver_build_pack(
         &self,
         params: DeliverBuildPackParams,
@@ -2355,6 +2494,7 @@ impl BridgeService {
             kind,
             project_name,
             options,
+            project_path,
         } = params;
         let kind = aec_export::DeliverPackKind::parse(&kind)?;
         let opts = aec_export::DeliverPackOptions {
@@ -2364,7 +2504,24 @@ impl BridgeService {
             include_boq: options.include_boq,
             include_proposal: options.include_proposal,
         };
-        let res = aec_export::write_deliver_pack(Path::new(&out_path), kind, &opts, &project_name)?;
+        let owned = match project_path.as_deref() {
+            Some(path) => Some(crate::pack_context::build_for_project(
+                path,
+                &self.master_key,
+            )?),
+            None => None,
+        };
+        let ctx = owned
+            .as_ref()
+            .map(crate::pack_context::OwnedPackContext::as_context)
+            .unwrap_or_default();
+        let res = aec_export::write_deliver_pack_with_context(
+            Path::new(&out_path),
+            kind,
+            &opts,
+            &project_name,
+            &ctx,
+        )?;
         Ok(DeliverPackResult {
             out_path: res.out_path.to_string_lossy().into_owned(),
             contents: res.contents,

@@ -121,10 +121,11 @@ impl AssetState {
     }
 
     /// Like [`Self::with_db`] but exposes a `&mut AssetDatabase` so the
-    /// caller can `upsert_metadata` / `put_blob` etc. Used by tests
-    /// (and, in the future, the asset import pipeline once it's wired
-    /// to the napi surface).
-    #[allow(dead_code)] // wired in a follow-up PR (asset import pipeline)
+    /// caller can `upsert_metadata` / `put_blob` etc. Used by the
+    /// Phase 8 extension-install endpoint
+    /// [`BridgeService::extensions_install_asset_packs`] and the
+    /// follow-up asset-import pipeline once it's wired to the napi
+    /// surface.
     pub(crate) fn with_db_mut<R>(
         &self,
         f: impl FnOnce(&mut AssetDatabase) -> Result<R, AssetError>,

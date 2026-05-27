@@ -10,6 +10,7 @@ mod asset_state;
 mod bim_attach;
 mod engine_status_cache;
 pub mod kchat_state;
+pub mod pack_context;
 pub mod recents;
 pub mod service;
 mod snapshot_cache;

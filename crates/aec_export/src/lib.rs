@@ -40,6 +40,15 @@ pub use interior_pack::{InteriorPack, InteriorPackError, InteriorRender};
 pub use pdf::{PdfBuilder, PdfBuilderError};
 pub use pdf_sheet::SheetPdfBuilder;
 pub use plot_style::{PlotStyle, PlotStyleTable};
+// The legacy `write_deliver_pack` / `write_proposal_pack` entry
+// points are kept in the public API (some downstream tests and
+// examples still call the no-context variant) but are
+// `#[deprecated]` (Phase 13 Tasks 7 + 10) so any new production
+// caller is caught at build time. The re-export itself triggers
+// the `deprecated` lint because it names the deprecated items;
+// scope the allow to this `pub use` block so any other
+// accidental use elsewhere in the crate still fires the warning.
+#[allow(deprecated)]
 pub use project_export::{
     write_deliver_pack, write_deliver_pack_with_context, write_project_dxf, write_project_gltf,
     write_project_ifc, write_project_package_zip, write_project_pdf, write_proposal_pack,

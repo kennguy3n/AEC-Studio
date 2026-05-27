@@ -59,6 +59,33 @@ napi-build = { version = "2", optional = true }
 [dev-dependencies]
 aec_cad = { path = "../aec_cad" }
 tempfile = { workspace = true }
+# `zip` is used by the Phase 13 deliver-pack integration test
+# (`tests/phase13_real_context.rs`) to inspect the produced ZIP
+# and the embedded OpenXML workbook (which is itself a zip). The
+# bridge already depends on `zip` transitively via `aec_export`;
+# pulling it into dev-deps gives the integration test a direct
+# import without affecting the production dependency surface.
+zip = { workspace = true }
+# Phase 13 Task 30 — `tests/phase8_journey.rs` authors a real
+# on-disk AssetPack extension and computes BLAKE3 of its
+# payload bytes (the same digest the loader re-computes for
+# `BlobChecksumMismatch` detection) to bake into the manifest.
+# The bridge already depends on `blake3` + `hex` transitively
+# via `aec_core` and `aec_assets`; pulling them into dev-deps
+# gives the journey test direct imports without expanding the
+# production dependency surface.
+blake3 = { workspace = true }
+hex = { workspace = true }
+# Phase 13 Task 28 — Criterion bench against the four
+# `PROPOSAL.md` acceptance latency targets (cold start, project
+# open, DXF import, AI runtime status). Same workspace pin as
+# the existing `aec_render` bench so the toolchain stays
+# consistent.
+criterion = { workspace = true }
+
+[[bench]]
+name = "acceptance_criteria"
+harness = false
 
 [lints]
 workspace = true
