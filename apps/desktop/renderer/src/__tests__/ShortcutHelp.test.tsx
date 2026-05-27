@@ -79,4 +79,44 @@ describe("<ShortcutHelp>", () => {
     fireEvent.click(screen.getByTestId("shortcut-help-close"));
     expect(screen.queryByTestId("shortcut-help")).not.toBeInTheDocument();
   });
+
+  it("renders 'Ctrl' on non-mac platforms for the `mod` accelerator", () => {
+    // JSDOM's default navigator.platform is "Linux x86_64".
+    render(
+      <Harness
+        extras={[{ id: "undo", label: "Undo", group: "global", keys: "mod+z" }]}
+      />,
+    );
+    fireEvent.keyDown(window, { key: "?", shiftKey: true });
+    const text = screen.getByTestId("shortcut-group-global").textContent ?? "";
+    expect(text).toContain("Ctrl");
+    expect(text).not.toContain("⌘");
+  });
+
+  it("renders '⌘' on macOS for the `mod` accelerator", () => {
+    const originalPlatform = navigator.platform;
+    Object.defineProperty(navigator, "platform", {
+      value: "MacIntel",
+      configurable: true,
+    });
+    try {
+      render(
+        <Harness
+          extras={[
+            { id: "undo", label: "Undo", group: "global", keys: "mod+z" },
+          ]}
+        />,
+      );
+      fireEvent.keyDown(window, { key: "?", shiftKey: true });
+      const text =
+        screen.getByTestId("shortcut-group-global").textContent ?? "";
+      expect(text).toContain("⌘");
+      expect(text).not.toContain("Ctrl");
+    } finally {
+      Object.defineProperty(navigator, "platform", {
+        value: originalPlatform,
+        configurable: true,
+      });
+    }
+  });
 });

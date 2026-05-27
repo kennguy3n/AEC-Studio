@@ -124,15 +124,35 @@ function groupBy(
   return [...map.entries()].sort(([a], [b]) => a.localeCompare(b));
 }
 
+// The shortcut registry binds `mod` to the platform-correct accelerator
+// (Cmd on macOS, Ctrl elsewhere) via `useKeyboardShortcuts`. The help
+// overlay needs to render the *display* label that matches the user's
+// platform — Ctrl on Linux/Windows, ⌘ on macOS. We detect macOS via
+// `navigator.platform`/`userAgentData.platform` because the renderer
+// has no direct Node `process.platform` access without an IPC roundtrip.
+function isMacPlatform(): boolean {
+  if (typeof navigator === "undefined") return false;
+  // Modern (User-Agent Client Hints) — falls back to legacy `platform`
+  // for browsers that haven't shipped UA-CH (e.g. Safari, Firefox).
+  const uaPlatform = (
+    navigator as Navigator & { userAgentData?: { platform?: string } }
+  ).userAgentData?.platform;
+  if (typeof uaPlatform === "string" && uaPlatform.length > 0) {
+    return uaPlatform.toLowerCase().includes("mac");
+  }
+  return /Mac|iPhone|iPad|iPod/i.test(navigator.platform || "");
+}
+
 function formatKeys(keys: string): string {
+  const mac = isMacPlatform();
   return keys
     .split("+")
     .map((p) => {
-      if (p === "mod") return "Ctrl";
-      if (p === "shift") return "Shift";
-      if (p === "alt") return "Alt";
+      if (p === "mod") return mac ? "⌘" : "Ctrl";
+      if (p === "shift") return mac ? "⇧" : "Shift";
+      if (p === "alt") return mac ? "⌥" : "Alt";
       if (p.length === 1) return p.toUpperCase();
       return p.charAt(0).toUpperCase() + p.slice(1);
     })
-    .join(" + ");
+    .join(mac ? " " : " + ");
 }
