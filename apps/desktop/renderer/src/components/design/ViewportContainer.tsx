@@ -83,7 +83,15 @@ export function ViewportContainer({ activeTool }: Props) {
     };
   }, []);
 
-  // 2. ResizeObserver → viewport.resize.
+  // 2. ResizeObserver → viewport.resize (debounced).
+  //
+  // While a window or split-pane is being dragged the
+  // ResizeObserver can fire 30+ times per second. Without
+  // debouncing each fire issued a `viewport.resize` IPC + a
+  // round-trip back to the bridge, which on a tier-2 laptop is
+  // enough to drop the frame rate during a resize. We coalesce
+  // bursts of resize events with a 120 ms trailing edge so the
+  // bridge only re-allocates the surface once the user lets go.
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
@@ -97,11 +105,15 @@ export function ViewportContainer({ activeTool }: Props) {
       void aec.viewport.resize({ width: w, height: h }).catch(() => {});
       return;
     }
-    const ro = new ResizeObserver(async (entries) => {
-      const entry = entries[0];
-      if (!entry) return;
-      const w = Math.round(entry.contentRect.width);
-      const h = Math.round(entry.contentRect.height);
+
+    let pendingTimer: ReturnType<typeof setTimeout> | null = null;
+    let pendingW = 0;
+    let pendingH = 0;
+
+    const flush = async () => {
+      pendingTimer = null;
+      const w = pendingW;
+      const h = pendingH;
       if (w <= 0 || h <= 0) return;
       try {
         const s = await aec.viewport.resize({ width: w, height: h });
@@ -122,9 +134,38 @@ export function ViewportContainer({ activeTool }: Props) {
         // its prior value; the next `requestFrame` will surface the
         // "unavailable" state if the bridge has indeed dropped.
       }
+    };
+
+    const ro = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (!entry) return;
+      const w = Math.round(entry.contentRect.width);
+      const h = Math.round(entry.contentRect.height);
+      if (w <= 0 || h <= 0) return;
+      // Coalesce: store the latest dimensions and (re)arm the
+      // trailing-edge timer.
+      pendingW = w;
+      pendingH = h;
+      if (pendingTimer !== null) {
+        clearTimeout(pendingTimer);
+      }
+      pendingTimer = setTimeout(() => {
+        void flush();
+      }, 120);
+      // Optimistically update the resolution indicator so the
+      // overlay reflects the *target* size during the drag — the
+      // bridge will reconcile when `flush` resolves.
+      setStatus((prev) =>
+        prev.state === "loading" ? prev : { ...prev, width: w, height: h },
+      );
     });
     ro.observe(el);
-    return () => ro.disconnect();
+    return () => {
+      ro.disconnect();
+      if (pendingTimer !== null) {
+        clearTimeout(pendingTimer);
+      }
+    };
   }, []);
 
   // 3. Pointer handlers.
@@ -268,6 +309,24 @@ export function ViewportContainer({ activeTool }: Props) {
           </>
         )}
       </div>
+      {ready && (
+        <div
+          data-testid="viewport-resolution"
+          style={{
+            position: "absolute",
+            bottom: 8,
+            right: 8,
+            fontSize: 11,
+            color: "var(--aec-color-text-muted)",
+            background: "rgba(0,0,0,0.35)",
+            padding: "2px 6px",
+            borderRadius: 4,
+            pointerEvents: "none",
+          }}
+        >
+          {status.width} × {status.height}
+        </div>
+      )}
       {loading && (
         <div data-testid="viewport-loading-banner" style={loadingStyle}>
           Initializing viewport…

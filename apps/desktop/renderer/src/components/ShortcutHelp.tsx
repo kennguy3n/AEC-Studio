@@ -18,18 +18,21 @@ import {
 export function ShortcutHelp(): JSX.Element | null {
   const [open, setOpen] = useState(false);
 
+  // Browsers deliver Shift+/ as `key === "?"` with `shiftKey === true`,
+  // so the normalised chord is `shift+?` (the registry preserves the
+  // shift token even when the resulting key is already a shifted
+  // character). Register the canonical form here.
   useShortcut({
     id: "shortcut-help",
     label: "Show keyboard shortcuts",
     group: "global",
-    keys: "?",
+    keys: "shift+?",
     handler: () => setOpen((prev) => !prev),
     whenInputFocused: false,
   });
 
-  // Mod+/ alternative for keyboards where `?` requires Shift on top
-  // of a Mod chord — some IMEs / non-US layouts don't surface `?`
-  // through `event.key` cleanly.
+  // Ctrl/Cmd+/ alternative for keyboards / IMEs where `?` doesn't
+  // surface cleanly through `event.key`.
   useShortcut({
     id: "shortcut-help-alt",
     label: "Show keyboard shortcuts (alt)",
