@@ -237,12 +237,14 @@ impl RestartPolicy {
     }
 }
 
-/// Spawn the sidecar with automatic retry. On failure, waits the duration
-/// returned by `policy.record_failure()` before the next attempt, up to
-/// `max_attempts`.
+/// Spawn the sidecar with automatic retry. On failure, the
+/// [`RestartPolicy`] is advanced — `record_failure()` bumps the
+/// consecutive-failure counter and returns the back-off duration the
+/// caller should sleep before the next attempt. Up to `max_attempts`
+/// total spawns are attempted.
 ///
-/// Returns the live handle on the first successful attempt. If all attempts
-/// fail, returns the error from the last attempt.
+/// Returns the live handle on the first successful attempt. If all
+/// attempts fail, returns the error from the last attempt.
 pub fn spawn_with_retry(
     config: &RuntimeConfig,
     health_poll_timeout: Duration,
@@ -250,9 +252,9 @@ pub fn spawn_with_retry(
     max_attempts: u32,
 ) -> Result<SidecarHandle, SidecarSpawnError> {
     let mut last_err = None;
-    for attempt in 0..max_attempts {
-        if attempt > 0 {
-            let delay = policy.next_delay();
+    let mut next_delay: Option<Duration> = None;
+    for _ in 0..max_attempts {
+        if let Some(delay) = next_delay.take() {
             std::thread::sleep(delay);
         }
         match spawn(config, health_poll_timeout) {
@@ -261,7 +263,10 @@ pub fn spawn_with_retry(
                 return Ok(handle);
             }
             Err(e) => {
-                policy.record_failure();
+                // `record_failure` bumps the failure counter and returns
+                // the exact delay to wait before the next attempt, so the
+                // sleep above and the policy state are always in lock-step.
+                next_delay = Some(policy.record_failure());
                 last_err = Some(e);
             }
         }
