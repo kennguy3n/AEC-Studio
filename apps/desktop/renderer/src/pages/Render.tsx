@@ -20,12 +20,14 @@ import {
 } from "../components/render/RenderDoctor";
 import { RenderPreview } from "../components/render/RenderPreview";
 import { BeforeAfterCompare } from "../components/render/BeforeAfterCompare";
+import { useActiveProject } from "../hooks/useActiveProject";
+import { useToast } from "../hooks/useToast";
 
 function recommendedFor(tier: RuntimeStatus["tier"]): RenderPresetKey {
   return recommendedPresetFor(tier);
 }
 
-const DEMO_CAMERAS: CameraTile[] = [
+const FALLBACK_CAMERAS: CameraTile[] = [
   {
     id: "cam_living",
     name: "Living wide",
@@ -41,16 +43,14 @@ const DEMO_CAMERAS: CameraTile[] = [
 ];
 
 export function Render() {
+  const { project } = useActiveProject();
+  const { addToast } = useToast();
   const [jobs, setJobs] = useState<RenderJob[]>([]);
   const [preset, setPreset] = useState<RenderPresetKey>("standard");
   const [lighting, setLighting] = useState<LightingPresetId>("daylight");
   const [tier, setTier] = useState<RuntimeStatus["tier"] | null>(null);
-  // Has the user made an explicit preset choice yet? If so, we never
-  // override their selection from the tier default — even if the
-  // component remounts because the user navigated away and back. Using
-  // a ref instead of state keeps the value stable across renders
-  // without re-triggering the runtime-status effect.
   const userChosePresetRef = useRef(false);
+  const [cameras, setCameras] = useState<CameraTile[]>(FALLBACK_CAMERAS);
   const [selectedCameras, setSelectedCameras] = useState<Set<string>>(
     new Set(),
   );
@@ -69,27 +69,45 @@ export function Render() {
       if (!alive) return;
       const rs = status as RuntimeStatus;
       setTier(rs.tier);
-      // Pre-select the recommended preset for the detected tier on the
-      // first mount only. Once the user has picked a preset (tracked
-      // via `userChosePresetRef`), we never overwrite their choice
-      // when the runtime status reloads or the page remounts. The
-      // tier badge in `PresetSelector` continues to advertise the
-      // recommended preset so the user can switch back manually.
       if (userChosePresetRef.current) return;
       const recommended = recommendedFor(rs.tier);
       if (recommended) setPreset(recommended);
     });
+    // Load cameras from the project graph when a project is open.
+    if (project?.path) {
+      void aec.command
+        .listGraph(project.path, "camera")
+        .then((entities) => {
+          if (!alive) return;
+          if (Array.isArray(entities) && entities.length > 0) {
+            const mapped: CameraTile[] = entities.map((e) => {
+              const body = e.body as Record<string, unknown> | null;
+              const bodyName =
+                body !== null && typeof body === "object" && typeof body.name === "string"
+                  ? body.name
+                  : null;
+              return {
+                id: e.id,
+                name: bodyName ?? `Camera ${e.id}`,
+                preset: "standard",
+                thumbnailDataUri: null,
+              };
+            });
+            setCameras(mapped);
+          }
+        })
+        .catch(() => {
+          // Project has no cameras yet — keep the fallback set.
+        });
+    }
     return () => {
       alive = false;
     };
-  }, []);
+  }, [project?.path]);
 
   const changePreset = useCallback((next: RenderPresetKey) => {
     setPreset(next);
     userChosePresetRef.current = true;
-    // Persist the choice on the backend so other surfaces (queue UI,
-    // diagnostics) see the active preset. The bridge stub returns
-    // `{ ok: true }` in dev; the real backend persists.
     void aec.render.applyPreset({ preset: next });
   }, []);
 
@@ -120,6 +138,10 @@ export function Render() {
         });
       }
       setJobs((prev) => [...newJobs, ...prev]);
+      addToast(
+        "success",
+        `Queued ${newJobs.length} render${newJobs.length === 1 ? "" : "s"}`,
+      );
     } finally {
       setBusy(false);
     }
@@ -131,6 +153,9 @@ export function Render() {
         j.jobId === jobId ? { ...j, status: "cancelled" } : j,
       ),
     );
+    void aec.render.cancelJob(jobId).catch(() => {
+      // Best-effort cancel — the job may already be done.
+    });
   };
 
   return (
@@ -157,7 +182,7 @@ export function Render() {
           />
           <LightingPresetSelector active={lighting} onChange={setLighting} />
           <CameraSelector
-            cameras={DEMO_CAMERAS}
+            cameras={cameras}
             selected={selectedCameras}
             onToggle={toggleCamera}
           />

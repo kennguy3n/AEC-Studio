@@ -124,6 +124,18 @@ export function rendererInProcessBackend(): AecApi {
       },
       listRecents: async () => [...recents],
       exportPackage: async (_p, outPath) => ({ outPath }),
+      current: async () => ({
+        summary: recents.length > 0 ? { ...recents[0] } : null,
+      }),
+      close: async () => {
+        // In-process: nothing to clear, just acknowledge.
+        return { ok: true as const };
+      },
+    },
+    dialog: {
+      openFile: async () => ({ canceled: true, paths: [] }),
+      openDirectory: async () => ({ canceled: true, path: null }),
+      saveFile: async () => ({ canceled: true, path: null }),
     },
     design: {
       placeFurniture: async () => ({ entityId: newId("ent") }),
@@ -205,8 +217,8 @@ export function rendererInProcessBackend(): AecApi {
       // and these renderer-side mocks intentionally do NOT touch
       // the filesystem — they return zeroed-out, wire-format-
       // compliant payloads so the renderer can exercise its
-      // status panes against synthetic `demo://project.ifc`
-      // paths that don't exist on disk. The actual IFC pipeline
+      // status panes against synthetic paths that don't exist
+      // on disk. The actual IFC pipeline
       // is exercised end-to-end by
       // `crates/aec_bridge/tests/bim_readonly_ops.rs`.
       exportIfc: async (params) => ({
@@ -218,6 +230,7 @@ export function rendererInProcessBackend(): AecApi {
       }),
       classify: async () => ({ classified: 0 }),
       setProperty: async () => ({ ok: true }),
+      readScheduleRows: async () => ({ rows: [] }),
       generateSchedule: async (params) => ({
         scheduleId: newId("sched"),
         kind: params.kind,

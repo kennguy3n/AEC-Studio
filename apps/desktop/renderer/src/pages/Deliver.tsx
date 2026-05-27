@@ -10,6 +10,8 @@
 import { useEffect, useMemo, useState } from "react";
 
 import { aec } from "../api/aec";
+import { useActiveProject } from "../hooks/useActiveProject";
+import { useToast } from "../hooks/useToast";
 import type {
   RevisionSummary,
   VersionDiffSummary,
@@ -49,6 +51,8 @@ const FALLBACK_THREAD_ID = "kchat-default";
 const STATUS_POLL_INTERVAL_MS = 5_000;
 
 export function Deliver(): JSX.Element {
+  const { project } = useActiveProject();
+  const { addToast } = useToast();
   const [kind, setKind] = useState<PackKind>("concept");
   const [deliverables, setDeliverables] = useState<PackDeliverables>(() =>
     defaultDeliverablesFor("concept"),
@@ -172,12 +176,20 @@ export function Deliver(): JSX.Element {
 
   const onBuildPack = async () => {
     if (!selectedTarget) return;
+    // Open a save dialog so the user can choose the output path.
+    const dialog = await aec.dialog.saveFile({
+      title: `Export ${kind} pack`,
+      defaultPath: selectedTarget.path,
+      filters: [{ name: "ZIP Archives", extensions: ["zip"] }],
+    });
+    if (dialog.canceled || !dialog.path) return;
     setExporting(true);
     setExportResult(null);
     try {
       const result = await aec.deliver.buildPack({
         kind,
-        outPath: selectedTarget.path,
+        outPath: dialog.path,
+        projectName: project?.name,
         includeRenders: deliverables.renders,
         includeSheets: deliverables.sheets,
         includeIfc: deliverables.ifc,
@@ -185,6 +197,15 @@ export function Deliver(): JSX.Element {
         includeProposal: deliverables.proposal,
       });
       setExportResult(result);
+      addToast(
+        "success",
+        `${kind} pack exported: ${result.contents.length} files`,
+      );
+    } catch (err) {
+      addToast(
+        "error",
+        `Pack export failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
     } finally {
       setExporting(false);
     }

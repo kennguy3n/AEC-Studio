@@ -1,10 +1,16 @@
 import { useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { aec, ProjectSummary, RuntimeStatus } from "../api/aec";
 import { ProjectCard } from "../components/ProjectCard";
 import { TemplateCard, DEFAULT_TEMPLATES, TemplateChoice } from "../components/TemplateCard";
 import { HardwareProfileCard } from "../components/HardwareProfileCard";
+import { useActiveProject } from "../hooks/useActiveProject";
+import { useToast } from "../hooks/useToast";
 
 export function Home() {
+  const navigate = useNavigate();
+  const { openProject, createProject } = useActiveProject();
+  const { addToast } = useToast();
   const [recents, setRecents] = useState<ProjectSummary[]>([]);
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
 
@@ -22,11 +28,49 @@ export function Home() {
   }, []);
 
   async function createFromTemplate(t: TemplateChoice) {
-    const summary = (await aec.project.createFromTemplate(
-      t.key,
-      `${t.name} Project`,
-    )) as ProjectSummary;
-    setRecents((prev) => [summary, ...prev.filter((p) => p.projectId !== summary.projectId)]);
+    try {
+      await createProject(t.key, `${t.name} Project`);
+      navigate("/design");
+    } catch (err) {
+      addToast(
+        "error",
+        `Failed to create project: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  async function onOpenProject() {
+    const dialog = await aec.dialog.openDirectory({
+      title: "Open AEC Studio project",
+    });
+    if (dialog.canceled || !dialog.path) return;
+    try {
+      await openProject(dialog.path);
+      navigate("/design");
+    } catch (err) {
+      addToast(
+        "error",
+        `Failed to open project: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  async function onOpenRecent(p: ProjectSummary) {
+    try {
+      await openProject(p.path);
+      navigate("/design");
+    } catch (err) {
+      // The project may have been moved / deleted. Remove it from
+      // the recents list so the user doesn't keep clicking a dead
+      // card, and show an error toast.
+      setRecents((prev) =>
+        prev.filter((r) => r.projectId !== p.projectId),
+      );
+      addToast(
+        "error",
+        `Could not open "${p.name}": ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   return (
@@ -38,6 +82,14 @@ export function Home() {
             Local-first design, drafting, BIM, and rendering.
           </p>
         </div>
+        <button
+          type="button"
+          className="home__open-btn"
+          onClick={onOpenProject}
+          data-testid="home-open-project"
+        >
+          Open Project
+        </button>
       </header>
 
       <HardwareProfileCard status={status} />
@@ -53,7 +105,11 @@ export function Home() {
         ) : (
           <div className="recent-grid">
             {recents.map((p) => (
-              <ProjectCard key={p.projectId} project={p} />
+              <ProjectCard
+                key={p.projectId}
+                project={p}
+                onOpen={() => void onOpenRecent(p)}
+              />
             ))}
           </div>
         )}

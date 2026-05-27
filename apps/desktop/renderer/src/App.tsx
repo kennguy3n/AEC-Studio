@@ -7,6 +7,14 @@ import {
   useKeyboardShortcuts,
   useShortcut,
 } from "./hooks/useKeyboardShortcuts";
+import {
+  ActiveProjectProvider,
+  useActiveProject,
+} from "./hooks/useActiveProject";
+import {
+  ToastProvider,
+  ToastContainer,
+} from "./hooks/useToast";
 import { Home } from "./pages/Home";
 import { Design } from "./pages/Design";
 import { Draft } from "./pages/Draft";
@@ -14,6 +22,21 @@ import { Bim } from "./pages/Bim";
 import { Render } from "./pages/Render";
 import { Deliver } from "./pages/Deliver";
 import { Settings } from "./pages/Settings";
+
+function RequireProject({ children }: { children: JSX.Element }): JSX.Element {
+  const { project, loading } = useActiveProject();
+  if (loading) {
+    return (
+      <div className="loading-gate" data-testid="loading-gate">
+        Loading…
+      </div>
+    );
+  }
+  if (project === null) {
+    return <Navigate to="/" replace />;
+  }
+  return children;
+}
 
 function AppCommands({
   onOpenPalette,
@@ -92,10 +115,11 @@ function AppCommands({
   return null;
 }
 
-export default function App() {
+function AppShell() {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const openPalette = useCallback(() => setPaletteOpen(true), []);
   const closePalette = useCallback(() => setPaletteOpen(false), []);
+  const { project } = useActiveProject();
 
   useKeyboardShortcuts();
 
@@ -103,20 +127,74 @@ export default function App() {
     <div className="app-shell">
       <ModeRail />
       <main className="app-main">
+        {project && (
+          <div
+            className="app-project-header"
+            data-testid="project-header"
+          >
+            {project.name}
+          </div>
+        )}
         <AppCommands onOpenPalette={openPalette} onClosePalette={closePalette} />
         <Routes>
           <Route path="/" element={<Home />} />
-          <Route path="/design" element={<Design />} />
-          <Route path="/draft" element={<Draft />} />
-          <Route path="/bim" element={<Bim />} />
-          <Route path="/render" element={<Render />} />
-          <Route path="/deliver" element={<Deliver />} />
+          <Route
+            path="/design"
+            element={
+              <RequireProject>
+                <Design />
+              </RequireProject>
+            }
+          />
+          <Route
+            path="/draft"
+            element={
+              <RequireProject>
+                <Draft />
+              </RequireProject>
+            }
+          />
+          <Route
+            path="/bim"
+            element={
+              <RequireProject>
+                <Bim />
+              </RequireProject>
+            }
+          />
+          <Route
+            path="/render"
+            element={
+              <RequireProject>
+                <Render />
+              </RequireProject>
+            }
+          />
+          <Route
+            path="/deliver"
+            element={
+              <RequireProject>
+                <Deliver />
+              </RequireProject>
+            }
+          />
           <Route path="/settings" element={<Settings />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </main>
       <StatusBar />
       <CommandPalette open={paletteOpen} onClose={closePalette} />
+      <ToastContainer />
     </div>
+  );
+}
+
+export default function App() {
+  return (
+    <ToastProvider>
+      <ActiveProjectProvider>
+        <AppShell />
+      </ActiveProjectProvider>
+    </ToastProvider>
   );
 }

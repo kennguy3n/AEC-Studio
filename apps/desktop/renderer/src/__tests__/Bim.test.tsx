@@ -1,10 +1,22 @@
 import { describe, it, expect } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { Bim } from "../pages/Bim";
+import { ActiveProjectProvider } from "../hooks/useActiveProject";
+import { ToastProvider } from "../hooks/useToast";
+
+function renderBim() {
+  return render(
+    <ToastProvider>
+      <ActiveProjectProvider>
+        <Bim />
+      </ActiveProjectProvider>
+    </ToastProvider>,
+  );
+}
 
 describe("Bim page", () => {
   it("assembles toolbar, spatial tree, viewport, property editor, schedule, validator", () => {
-    render(<Bim />);
+    renderBim();
     expect(screen.getByTestId("bim-mode")).toBeInTheDocument();
     expect(screen.getByTestId("bim-toolbar")).toBeInTheDocument();
     expect(screen.getByTestId("spatial-tree")).toBeInTheDocument();
@@ -15,9 +27,8 @@ describe("Bim page", () => {
   });
 
   it("selecting a spatial node opens the property editor for it", () => {
-    render(<Bim />);
+    renderBim();
     fireEvent.click(screen.getByTestId("spatial-node-lvl_l1"));
-    // Property editor shows the entity id we just clicked.
     expect(
       screen.getByTestId("property-editor").textContent,
     ).toContain("lvl_l1");

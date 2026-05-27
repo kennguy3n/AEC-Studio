@@ -1,6 +1,11 @@
 import { ipcMain } from "electron";
 import { getBridge } from "./bridge";
-import { peekActiveProjectPath, setActiveProjectPath } from "./active-project";
+import {
+  clearActiveProjectPath,
+  peekActiveProjectPath,
+  peekActiveProjectSummary,
+  setActiveProject,
+} from "./active-project";
 
 /**
  * Register every IPC handler the preload bridge expects. Handlers are
@@ -31,7 +36,7 @@ export function registerIpcHandlers(): void {
         templateKey,
         projectName,
       );
-      setActiveProjectPath(summary.path);
+      setActiveProject(summary);
       return summary;
     },
   );
@@ -41,12 +46,55 @@ export function registerIpcHandlers(): void {
     // Same active-project promotion as `createFromTemplate`. Set
     // *after* `projectOpen` succeeds so a failed open (bad path,
     // wrong master key, etc.) doesn't leave a stale active project.
-    setActiveProjectPath(summary.path);
+    setActiveProject(summary);
     return summary;
   });
   ipcMain.handle("project:save", async (_e, { projectPath }) => {
     assertString(projectPath, "projectPath");
-    return getBridge().projectSave(projectPath);
+    const summary = await getBridge().projectSave(projectPath);
+    // Refresh the cached summary so subsequent `project:current`
+    // polls see the new `modifiedAt`. Path is unchanged so the
+    // renderer-side hook treats this as the same project (no route
+    // guard trip), it just re-renders the header timestamp.
+    setActiveProject(summary);
+    return summary;
+  });
+  // `project:current` is a synchronous-style channel that the
+  // renderer's `useActiveProject` hook polls (or subscribes via
+  // an IPC push channel) to surface the currently-open project to
+  // every page. Returns `null` when no project is open so the
+  // hook can route the user to the Home screen via a route guard.
+  ipcMain.handle("project:current", async () => {
+    const summary = peekActiveProjectSummary();
+    const path = peekActiveProjectPath();
+    if (summary !== null) {
+      return { summary };
+    }
+    if (path !== null) {
+      // We have a path but no cached summary (e.g. the renderer
+      // reloaded after a hot-reload). Look it up from the recents
+      // store so the hook can still show the project name.
+      const recents = await getBridge().projectListRecents();
+      const found = recents.find((p) => p.path === path);
+      if (found) {
+        setActiveProject(found);
+        return { summary: found };
+      }
+    }
+    return { summary: null };
+  });
+  // `project:close` returns the user to the Home screen and clears
+  // the active-project slot so subsequent `draft:*` / `deliver:*` /
+  // `command:*` calls fail with the clean "no project is open"
+  // validation error rather than addressing the previously-open
+  // project. The renderer's `useActiveProject.closeProject()`
+  // calls this and then navigates to `/`. No bridge call is
+  // required — the project package is already persisted on disk
+  // (Save flushes on every mutation, and `projectSave` is
+  // idempotent).
+  ipcMain.handle("project:close", async () => {
+    clearActiveProjectPath();
+    return { ok: true };
   });
   ipcMain.handle("project:listRecents", async () => {
     return getBridge().projectListRecents();
@@ -195,6 +243,18 @@ export function registerIpcHandlers(): void {
       );
     }
     return getBridge().bimGenerateSchedule({ sourcePath, outPath, kind });
+  });
+  // `bim:readScheduleRows` parses an XLSX schedule file the bridge
+  // wrote during `bim_generate_schedule` and returns the rows so
+  // the renderer's `ScheduleView` can display them without having
+  // to re-read the file from the renderer process. The bridge
+  // crate already exposes a `read_schedule_rows` helper; this
+  // handler is a thin wrapper that validates the path.
+  ipcMain.handle("bim:readScheduleRows", async (_e, p) => {
+    assertObject(p, "params");
+    const xlsxPath = (p as { xlsxPath?: unknown }).xlsxPath;
+    assertString(xlsxPath, "xlsxPath");
+    return getBridge().bimReadScheduleRows({ xlsxPath });
   });
   ipcMain.handle("bim:validate", async (_e, p) => {
     assertObject(p, "params");
@@ -422,6 +482,16 @@ export function registerIpcHandlers(): void {
       ["eu", "na", "apac"].includes(p.region as string)
         ? (p.region as "eu" | "na" | "apac")
         : undefined;
+    // Inject the active project path so the bridge can build a
+    // `DeliverPackContext` from the real project (renders dir,
+    // schedules from graph, sheets, IFC string). Caller-supplied
+    // `projectPath` wins (e.g. an explicit "export this archived
+    // project" flow); otherwise the active-project tracker is the
+    // source of truth.
+    const projectPath =
+      typeof p.projectPath === "string" && p.projectPath.length > 0
+        ? p.projectPath
+        : peekActiveProjectPath();
     return getBridge().deliverBuildPack({
       kind: p.kind as "concept" | "interior" | "contractor" | "bim",
       outPath: p.outPath,
@@ -430,6 +500,7 @@ export function registerIpcHandlers(): void {
       // to the generic "Project" string).
       projectName:
         typeof p.projectName === "string" ? p.projectName : undefined,
+      projectPath: projectPath ?? undefined,
       includeRenders:
         typeof p.includeRenders === "boolean" ? p.includeRenders : undefined,
       includeSheets:

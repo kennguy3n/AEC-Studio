@@ -47,9 +47,11 @@ export const EDIT_TOOLS: { id: DraftEditTool; label: string }[] = [
 interface Props {
   activeTool: DraftTool;
   onSelect: (tool: DraftTool) => void;
+  onImport?: () => void;
+  onExport?: () => void;
 }
 
-export function DraftToolbar({ activeTool, onSelect }: Props) {
+export function DraftToolbar({ activeTool, onSelect, onImport, onExport }: Props) {
   return (
     <aside className="draft-toolbar" role="toolbar" aria-label="Draft tools">
       <button
@@ -86,6 +88,30 @@ export function DraftToolbar({ activeTool, onSelect }: Props) {
           </button>
         ))}
       </div>
+      {(onImport || onExport) && (
+        <div className="draft-toolbar__group" data-testid="draft-toolbar-io">
+          {onImport && (
+            <button
+              type="button"
+              className="draft-toolbar__btn"
+              onClick={onImport}
+              data-testid="draft-import-dxf"
+            >
+              Import
+            </button>
+          )}
+          {onExport && (
+            <button
+              type="button"
+              className="draft-toolbar__btn"
+              onClick={onExport}
+              data-testid="draft-export-dxf"
+            >
+              Export
+            </button>
+          )}
+        </div>
+      )}
     </aside>
   );
 }

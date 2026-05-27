@@ -20,6 +20,52 @@ const api = {
     listRecents: () => ipcRenderer.invoke("project:listRecents"),
     exportPackage: (projectPath: string, outPath: string) =>
       ipcRenderer.invoke("project:exportPackage", { projectPath, outPath }),
+    current: () =>
+      ipcRenderer.invoke("project:current") as Promise<{
+        summary: {
+          projectId: string;
+          name: string;
+          path: string;
+          templateKey: string | null;
+          modifiedAt: string;
+        } | null;
+      }>,
+    close: () =>
+      ipcRenderer.invoke("project:close") as Promise<{ ok: true }>,
+  },
+
+  // ----- Dialog (Phase 13) -----
+  dialog: {
+    openFile: (params?: {
+      title?: string;
+      defaultPath?: string;
+      filters?: Array<{ name: string; extensions: string[] }>;
+      message?: string;
+      allowMultiple?: boolean;
+    }) =>
+      ipcRenderer.invoke("dialog:openFile", params ?? {}) as Promise<{
+        canceled: boolean;
+        paths: string[];
+      }>,
+    openDirectory: (params?: {
+      title?: string;
+      defaultPath?: string;
+      message?: string;
+    }) =>
+      ipcRenderer.invoke("dialog:openDirectory", params ?? {}) as Promise<{
+        canceled: boolean;
+        path: string | null;
+      }>,
+    saveFile: (params?: {
+      title?: string;
+      defaultPath?: string;
+      filters?: Array<{ name: string; extensions: string[] }>;
+      message?: string;
+    }) =>
+      ipcRenderer.invoke("dialog:saveFile", params ?? {}) as Promise<{
+        canceled: boolean;
+        path: string | null;
+      }>,
   },
 
   // ----- Design -----
@@ -137,6 +183,10 @@ const api = {
      * room / material). Inline type mirrors `BimScheduleSummary`
      * in `electron/bridge.ts` 1:1.
      */
+    readScheduleRows: (params: { xlsxPath: string }) =>
+      ipcRenderer.invoke("bim:readScheduleRows", params) as Promise<{
+        rows: Array<Record<string, string | number | boolean | null>>;
+      }>,
     generateSchedule: (params: {
       sourcePath: string;
       outPath: string;

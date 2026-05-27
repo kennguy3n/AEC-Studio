@@ -3,8 +3,8 @@ import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { ScheduleView, ScheduleRow } from "../components/bim/ScheduleView";
 
 const baseProps = {
-  sourcePath: "demo://project.ifc",
-  outPathForKind: (kind: string) => `demo://project.${kind}.xlsx`,
+  sourcePath: "/test/project.ifc",
+  outPathForKind: (kind: string) => `/test/project.${kind}.xlsx`,
 };
 
 describe("ScheduleView", () => {
@@ -70,6 +70,6 @@ describe("ScheduleView", () => {
     const [kind, summary] = onGenerate.mock.calls[0];
     expect(kind).toBe("room");
     expect(typeof summary.scheduleId).toBe("string");
-    expect(summary.outPath).toBe("demo://project.room.xlsx");
+    expect(summary.outPath).toBe("/test/project.room.xlsx");
   });
 });

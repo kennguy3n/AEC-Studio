@@ -12,10 +12,26 @@ import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 
 import { aec } from "../api/aec";
 import { Deliver } from "../pages/Deliver";
+import { ActiveProjectProvider } from "../hooks/useActiveProject";
+import { ToastProvider } from "../hooks/useToast";
+
+function renderDeliver() {
+  return render(
+    <ToastProvider>
+      <ActiveProjectProvider>
+        <Deliver />
+      </ActiveProjectProvider>
+    </ToastProvider>,
+  );
+}
 
 describe("<Deliver />", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it("renders pack composer, export targets, and revision manager", () => {
-    render(<Deliver />);
+    renderDeliver();
     expect(screen.getByTestId("deliver-mode")).toBeInTheDocument();
     expect(screen.getByTestId("pack-composer")).toBeInTheDocument();
     expect(screen.getByTestId("export-target-list")).toBeInTheDocument();
@@ -24,7 +40,7 @@ describe("<Deliver />", () => {
   });
 
   it("seeds default deliverables for concept pack on first mount", () => {
-    render(<Deliver />);
+    renderDeliver();
     const rendersBox = screen
       .getByTestId("pack-deliverable-renders")
       .querySelector("input") as HTMLInputElement;
@@ -37,7 +53,7 @@ describe("<Deliver />", () => {
   });
 
   it("switches deliverables when pack kind changes", () => {
-    render(<Deliver />);
+    renderDeliver();
     const contractorRadio = screen
       .getByTestId("pack-kind-contractor")
       .querySelector("input") as HTMLInputElement;
@@ -50,7 +66,7 @@ describe("<Deliver />", () => {
   });
 
   it("creates a revision, then lists it", async () => {
-    render(<Deliver />);
+    renderDeliver();
     fireEvent.change(screen.getByTestId("revision-tag-input"), {
       target: { value: "v1" },
     });
@@ -67,7 +83,7 @@ describe("<Deliver />", () => {
   });
 
   it("disables compare until two distinct revisions are picked", async () => {
-    render(<Deliver />);
+    renderDeliver();
     const compareBtn = screen.getByTestId(
       "revision-compare-button",
     ) as HTMLButtonElement;
@@ -104,7 +120,13 @@ describe("<Deliver />", () => {
   });
 
   it("builds a pack and renders the resulting file list", async () => {
-    render(<Deliver />);
+    // The Deliver page now opens a save dialog before building.
+    // Mock it to return a chosen path.
+    vi.spyOn(aec.dialog, "saveFile").mockResolvedValue({
+      canceled: false,
+      path: "/tmp/test-pack.zip",
+    });
+    renderDeliver();
     fireEvent.click(screen.getByTestId("pack-build"));
     await waitFor(() => {
       expect(screen.getByTestId("deliver-export-result")).toBeInTheDocument();
@@ -136,18 +158,12 @@ describe("<Deliver /> KChat thread wiring", () => {
   });
 
   it("forwards the active project's defaultThreadId to the review panel", async () => {
-    // Spy on `aec.kchat.status` to simulate a project-open that has
-    // already pushed `KChatConfig::default_thread_id = "thread-from-project"`
-    // through to the bridge state.
     vi.spyOn(aec.kchat, "status").mockResolvedValue({
       state: "connected",
       publisherKind: "local_ipc",
       instanceJson: null,
       defaultThreadId: "thread-from-project",
     });
-    // Spy on `ingestReviews` so the panel's first poll resolves
-    // synchronously and we can assert the threadId it was called
-    // with.
     const ingestSpy = vi
       .spyOn(aec.kchat, "ingestReviews")
       .mockResolvedValue({
@@ -156,11 +172,8 @@ describe("<Deliver /> KChat thread wiring", () => {
         cardsJson: "[]",
       });
 
-    render(<Deliver />);
+    renderDeliver();
     await waitFor(() => {
-      // The panel renders `Reviews · {threadId}` only on the
-      // connected path; existence of this heading confirms the
-      // project's thread made it all the way to the panel.
       expect(
         screen.getByText("Reviews · thread-from-project"),
       ).toBeInTheDocument();
@@ -187,7 +200,7 @@ describe("<Deliver /> KChat thread wiring", () => {
         cardsJson: "[]",
       });
 
-    render(<Deliver />);
+    renderDeliver();
     await waitFor(() => {
       expect(
         screen.getByText("Reviews · kchat-default"),

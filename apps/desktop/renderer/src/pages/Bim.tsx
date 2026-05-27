@@ -24,6 +24,8 @@ import {
   BimToolbar,
   BimAction,
 } from "../components/bim/BimToolbar";
+import { useActiveProject } from "../hooks/useActiveProject";
+import { useToast } from "../hooks/useToast";
 
 const DEMO_ROOT: SpatialNode = {
   id: "proj_demo",
@@ -67,7 +69,11 @@ const DEMO_PSETS: PsetData = {
   },
 };
 
+const IFC_FILTERS = [{ name: "IFC Files", extensions: ["ifc"] }];
+
 export function Bim() {
+  const { project } = useActiveProject();
+  const { addToast } = useToast();
   const [root, setRoot] = useState<SpatialNode | null>(DEMO_ROOT);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [psets, setPsets] = useState<PsetData>(DEMO_PSETS);
@@ -77,111 +83,194 @@ export function Bim() {
   const [findings, setFindings] = useState<ValidationFinding[]>([]);
   const [busyAction, setBusyAction] = useState<BimAction | null>(null);
 
+  // The IFC source path tracked for the current session. Set by
+  // "Import IFC" after the user selects a file via the picker. All
+  // subsequent BIM ops (export, validate, schedule, diff) operate
+  // on this path. Null when no IFC has been imported yet.
+  const [ifcSourcePath, setIfcSourcePath] = useState<string | null>(null);
+
+  const projectPath = project?.path ?? null;
+
   const onInvoke = async (action: BimAction) => {
     setBusyAction(action);
     try {
       switch (action) {
         case "importIfc": {
-          // Run through the size-guarded helper so a multi-hundred-MB
-          // IFC file surfaces a confirm dialog *before* the bridge
-          // commits to the (several-seconds) STEP-21 parse. See
-          // `bim-import.ts` for the contract.
-          const outcome = await importIfcWithSizeGuard(
-            "demo://project.ifc",
-          );
+          const dialog = await aec.dialog.openFile({
+            title: "Import IFC",
+            filters: IFC_FILTERS,
+          });
+          if (dialog.canceled || dialog.paths.length === 0) break;
+          const selectedPath = dialog.paths[0];
+          const outcome = await importIfcWithSizeGuard(selectedPath);
           if (outcome.kind === "imported") {
-            // PR-P wired `bim_import_ifc` to the native bridge, so
-            // `outcome.result` is now a full `BimImportSummary`
-            // with entity counts. If the bridge actually parsed
-            // anything (i.e. we're running against a real file via
-            // the native path, not the all-zeros in-process
-            // fallback), refresh the demo tree. A future PR will
-            // replace the demo tree with a real one folded from
-            // the snapshot.
+            setIfcSourcePath(selectedPath);
             if (outcome.result.spatialNodes > 0 || outcome.result.elements > 0) {
               setRoot(DEMO_ROOT);
             }
+            addToast(
+              "success",
+              `Imported ${outcome.result.elements} elements from IFC`,
+            );
+          } else if (outcome.kind === "cancelled-by-user") {
+            addToast("info", "IFC import cancelled");
+          } else {
+            addToast("error", `IFC import failed: ${outcome.error}`);
           }
-          // "cancelled-by-user" / "failed" outcomes are no-ops on
-          // the demo tree — a future PR will surface them as a
-          // toast or status-pane note.
           break;
         }
         case "attachIfc": {
-          // Fold a previously-parsed IFC snapshot into the active
-          // project's SQLCipher DB. The bridge's in-process
-          // snapshot cache means an import → attach handoff on
-          // the same path does NOT re-parse the file
-          // (`parseCacheHit: true` in the result).
-          //
-          // The demo uses placeholder paths because the page-level
-          // project-picker UX isn't wired in this PR; a future PR
-          // will replace these with the currently-open project's
-          // path and a file-picker-supplied IFC path. The fallback
-          // backend will return all-zero counts here, so the demo
-          // tree stays untouched.
-          await attachIfcToProject(
-            "demo://project.aecstudio",
-            "demo://project.ifc",
+          if (!projectPath) {
+            addToast("error", "No project open — open or create one first");
+            break;
+          }
+          let attachPath = ifcSourcePath;
+          if (!attachPath) {
+            const dialog = await aec.dialog.openFile({
+              title: "Select IFC to attach",
+              filters: IFC_FILTERS,
+            });
+            if (dialog.canceled || dialog.paths.length === 0) break;
+            attachPath = dialog.paths[0];
+          }
+          const attachResult = await attachIfcToProject(
+            projectPath,
+            attachPath,
           );
+          if (attachResult.kind === "attached") {
+            setIfcSourcePath(attachPath);
+            addToast(
+              "success",
+              `Attached IFC: ${attachResult.result.elementsInserted} new, ` +
+                `${attachResult.result.elementsUpdated} updated`,
+            );
+          } else {
+            addToast("error", `Attach failed: ${attachResult.error}`);
+          }
           break;
         }
-        case "exportIfc":
-          // PR-T wired `bim_export_ifc` to the native bridge. The
-          // bridge re-serialises the parsed snapshot back to
-          // STEP-21 and writes it to `outPath`. Demo paths until a
-          // file-picker UX lands.
-          await aec.bim.exportIfc({
-            sourcePath: "demo://project.ifc",
-            outPath: "demo://project.out.ifc",
+        case "exportIfc": {
+          if (!ifcSourcePath) {
+            addToast("error", "Import an IFC first before exporting");
+            break;
+          }
+          const saveResult = await aec.dialog.saveFile({
+            title: "Export IFC",
+            defaultPath: projectPath
+              ? `${projectPath}/export.ifc`
+              : "export.ifc",
+            filters: IFC_FILTERS,
           });
+          if (saveResult.canceled || !saveResult.path) break;
+          await aec.bim.exportIfc({
+            sourcePath: ifcSourcePath,
+            outPath: saveResult.path,
+          });
+          addToast("success", `IFC exported to ${saveResult.path}`);
           break;
+        }
         case "validate": {
-          // PR-T wired `bim_validate` to the native bridge. The
-          // bridge runs the rule-based BIM validator over the
-          // parsed snapshot and splits findings into three vectors
-          // (errors / warnings / infos). The wire→UI mapping lives
-          // in `api/bim-validation.ts` so this page and
-          // `ValidatorPanel` share one adapter (Devin Review
-          // ANALYSIS_pr-T_0002).
+          if (!ifcSourcePath) {
+            addToast("error", "Import an IFC first before validating");
+            break;
+          }
           const result = await aec.bim.validate({
-            sourcePath: "demo://project.ifc",
+            sourcePath: ifcSourcePath,
           });
           setFindings(bimReportToFindings(result));
+          addToast(
+            result.ok ? "success" : "info",
+            `Validation: ${result.errors.length} errors, ${result.warnings.length} warnings`,
+          );
           break;
         }
         case "classify":
           await aec.bim.classify({ entityId: selectedId, source: "ai" });
           break;
         case "generateSchedule": {
-          // PR-T wired `bim_generate_schedule` to the native
-          // bridge. The bridge writes the XLSX directly to disk,
-          // returning row/column counts but NOT the row data — so
-          // `setSchedules` clears any stale rows until a future PR
-          // adds an XLSX-to-row-list parse step.
-          await aec.bim.generateSchedule({
-            sourcePath: "demo://project.ifc",
-            outPath: "demo://project.rooms.xlsx",
+          if (!ifcSourcePath) {
+            addToast("error", "Import an IFC first before generating schedules");
+            break;
+          }
+          const outPath = projectPath
+            ? `${projectPath}/schedules/rooms.xlsx`
+            : "rooms.xlsx";
+          const summary = await aec.bim.generateSchedule({
+            sourcePath: ifcSourcePath,
+            outPath,
             kind: "room",
           });
-          setSchedules((prev) => ({ ...prev, room: [] }));
+          // Read rows back from the generated file.
+          let rows: ScheduleRow[] = [];
+          if (summary.rows > 0) {
+            try {
+              const readback = await aec.bim.readScheduleRows({
+                xlsxPath: summary.outPath,
+              });
+              rows = readback.rows as ScheduleRow[];
+            } catch {
+              // Readback failed; display empty rows.
+            }
+          }
+          setSchedules((prev) => ({ ...prev, room: rows }));
+          addToast(
+            "success",
+            `Generated room schedule: ${summary.rows} rows`,
+          );
           break;
         }
-        case "diff":
-          // PR-T wired `bim_diff` to the native bridge. Demo paths
-          // until a file-picker UX lands.
-          await aec.bim.diff({
-            beforePath: "demo://snapshot.a.ifc",
-            afterPath: "demo://snapshot.b.ifc",
+        case "diff": {
+          const beforeDialog = await aec.dialog.openFile({
+            title: "Select 'before' IFC snapshot",
+            filters: IFC_FILTERS,
           });
+          if (beforeDialog.canceled || beforeDialog.paths.length === 0) break;
+          const afterDialog = await aec.dialog.openFile({
+            title: "Select 'after' IFC snapshot",
+            filters: IFC_FILTERS,
+          });
+          if (afterDialog.canceled || afterDialog.paths.length === 0) break;
+          const diffResult = await aec.bim.diff({
+            beforePath: beforeDialog.paths[0],
+            afterPath: afterDialog.paths[0],
+          });
+          addToast(
+            "info",
+            `Diff: ${diffResult.added.length} added, ${diffResult.removed.length} removed, ${diffResult.modified.length} modified`,
+          );
           break;
-        case "boq":
-          await aec.bim.generateSchedule({
-            sourcePath: "demo://project.ifc",
-            outPath: "demo://project.materials.xlsx",
+        }
+        case "boq": {
+          if (!ifcSourcePath) {
+            addToast("error", "Import an IFC first");
+            break;
+          }
+          const boqOut = projectPath
+            ? `${projectPath}/schedules/materials.xlsx`
+            : "materials.xlsx";
+          const boqSummary = await aec.bim.generateSchedule({
+            sourcePath: ifcSourcePath,
+            outPath: boqOut,
             kind: "material",
           });
+          let boqRows: ScheduleRow[] = [];
+          if (boqSummary.rows > 0) {
+            try {
+              const readback = await aec.bim.readScheduleRows({
+                xlsxPath: boqSummary.outPath,
+              });
+              boqRows = readback.rows as ScheduleRow[];
+            } catch {
+              // Readback failed.
+            }
+          }
+          setSchedules((prev) => ({ ...prev, material: boqRows }));
+          addToast(
+            "success",
+            `Generated BOQ: ${boqSummary.rows} rows`,
+          );
           break;
+        }
       }
     } finally {
       setBusyAction(null);
@@ -190,6 +279,34 @@ export function Bim() {
 
   const classification =
     selectedId === "lvl_l1" ? "IfcBuildingStorey" : selectedId ? "IfcWall" : null;
+
+  const scheduleSourcePath = ifcSourcePath ?? "";
+  const scheduleOutPathForKind = (kind: ScheduleKind): string =>
+    projectPath
+      ? `${projectPath}/schedules/${kind}.xlsx`
+      : `${kind}.xlsx`;
+
+  const onScheduleGenerate = async (kind: ScheduleKind) => {
+    if (!ifcSourcePath) return;
+    const outPath = scheduleOutPathForKind(kind);
+    const summary = await aec.bim.generateSchedule({
+      sourcePath: ifcSourcePath,
+      outPath,
+      kind,
+    });
+    let rows: ScheduleRow[] = [];
+    if (summary.rows > 0) {
+      try {
+        const readback = await aec.bim.readScheduleRows({
+          xlsxPath: summary.outPath,
+        });
+        rows = readback.rows as ScheduleRow[];
+      } catch {
+        // Readback failed.
+      }
+    }
+    setSchedules((prev) => ({ ...prev, [kind]: rows }));
+  };
 
   return (
     <div className="bim-layout" data-testid="bim-mode">
@@ -220,17 +337,15 @@ export function Bim() {
       </div>
       <div className="bim-bottom">
         <ScheduleView
-          sourcePath="demo://project.ifc"
-          outPathForKind={(kind) => `demo://project.${kind}.xlsx`}
+          sourcePath={scheduleSourcePath}
+          outPathForKind={scheduleOutPathForKind}
           rowsByKind={schedules}
-          onGenerate={(kind) =>
-            // The native bridge writes the XLSX directly; we don't
-            // get rows back, so clear any stale row data.
-            setSchedules((prev) => ({ ...prev, [kind]: [] }))
-          }
+          onGenerate={(kind, _summary) => {
+            void onScheduleGenerate(kind);
+          }}
         />
         <ValidatorPanel
-          sourcePath="demo://project.ifc"
+          sourcePath={ifcSourcePath ?? ""}
           findings={findings}
           onFindings={setFindings}
           onZoomTo={(id) => setSelectedId(id)}
