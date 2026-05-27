@@ -126,20 +126,16 @@ impl KChatState {
         }
     }
 
-    /// Snapshot the current connection status. Re-runs discovery so
-    /// the renderer's poll picks up newly started KChat Desktop
-    /// instances without restarting AEC Studio.
+    /// Snapshot the current connection status. Re-runs discovery on
+    /// every call so the renderer's poll picks up newly started
+    /// KChat Desktop instances *and* notices when an existing
+    /// instance disappears — neither requires restarting AEC Studio.
+    ///
+    /// The per-call probe is cheap (a 200 ms socket connect + ping
+    /// round-trip) and the renderer polls this every 5 s, so the
+    /// extra IO is well under the visible-latency budget.
     pub fn status(&self) -> KChatStatusReport {
-        // First check under a read lock — if the cached state is
-        // still valid we return without ever touching the write
-        // lock. Most polls hit this path.
-        let needs_refresh = {
-            let inner = self.inner.read().expect("kchat state not poisoned");
-            inner.last_status.state == "disconnected" || inner.discovered.is_some()
-        };
-        if needs_refresh {
-            self.refresh_status();
-        }
+        self.refresh_status();
         self.inner
             .read()
             .expect("kchat state not poisoned")
