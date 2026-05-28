@@ -138,9 +138,24 @@ export function Deliver(): JSX.Element {
     setExportResult(null);
     setComparing(false);
     setExporting(false);
-    void aec.deliver.listRevisions().then((rs) => {
-      if (alive) setRevisions(rs);
-    });
+    void aec.deliver
+      .listRevisions()
+      .then((rs) => {
+        if (alive) setRevisions(rs);
+      })
+      .catch(() => {
+        // Bridge failure (corrupt DB, permission denied, project
+        // closed mid-poll) — keep the empty list (synchronously
+        // reset above) so the user sees the empty-state instead
+        // of stale entries from a previous project. Matches the
+        // Render.tsx:156 listGraph pattern. The bridge layer logs
+        // the underlying error; the renderer does not surface a
+        // toast because (a) `RequireProject` already gates this
+        // page, (b) routine project switches race the bridge's
+        // own teardown and would otherwise spam toasts, and (c)
+        // the empty-state UI in RevisionManager already
+        // communicates "no revisions available".
+      });
     return () => {
       alive = false;
     };

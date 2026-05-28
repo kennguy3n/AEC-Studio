@@ -347,4 +347,67 @@ describe("<Deliver /> per-project state reset on project switch", () => {
       expect(screen.getByText("rev-from-B")).toBeInTheDocument();
     });
   });
+
+  it("swallows listRevisions bridge rejection without surfacing an unhandled rejection", async () => {
+    // Defensive catch on the listRevisions promise: if the bridge
+    // rejects (corrupt DB, permission denied, project closed
+    // mid-poll between the synchronous reset and the bridge round-
+    // trip), the per-project reset effect must NOT leave the
+    // promise unhandled — Node/jsdom surfaces those as an
+    // `unhandledrejection` event and React Testing Library's act
+    // utilities log them as test failures. Matches the silent-
+    // catch pattern used by `Render.tsx:156` for `listGraph`. The
+    // empty-state UI in `RevisionManager` communicates "no
+    // revisions" so the user sees the same view whether the
+    // bridge returned `[]` or rejected.
+    //
+    // The test mocks every `listRevisions` call to reject so the
+    // assertion does not depend on counting effect fires
+    // (`ActiveProjectProvider.refreshProject` on mount, the
+    // per-project reset effect on `project?.path` transitions,
+    // and `RequireProject` polling can all trigger calls). Any
+    // unhandled rejection from any of those calls would fail the
+    // test.
+    const unhandled: unknown[] = [];
+    const onUnhandled = (event: PromiseRejectionEvent) => {
+      unhandled.push(event.reason);
+      // Prevent jsdom from logging the rejection to console — we
+      // are intentionally exercising the catch path and recording
+      // observations in `unhandled` ourselves.
+      event.preventDefault();
+    };
+    window.addEventListener("unhandledrejection", onUnhandled);
+
+    try {
+      vi.spyOn(aec.deliver, "listRevisions").mockRejectedValue(
+        new Error("simulated bridge failure"),
+      );
+
+      render(
+        <ToastProvider>
+          <ActiveProjectProvider>
+            <Deliver />
+          </ActiveProjectProvider>
+        </ToastProvider>,
+      );
+
+      // The empty-state UI must render (RequireProject is not
+      // wrapping in this test, so the page mounts with project
+      // null and listRevisions rejects).
+      await waitFor(() => {
+        expect(screen.getByTestId("revision-empty")).toBeInTheDocument();
+      });
+
+      // Yield a few microtasks/macrotasks so any queued
+      // unhandled-rejection events fire before assertion. Without
+      // the catch in Deliver.tsx, the rejected promise from
+      // `aec.deliver.listRevisions()` would surface here.
+      await new Promise((r) => setTimeout(r, 50));
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(unhandled).toEqual([]);
+    } finally {
+      window.removeEventListener("unhandledrejection", onUnhandled);
+    }
+  });
 });
