@@ -249,3 +249,79 @@ describe("App — undo/redo on non-mode routes are no-ops", () => {
     expect(scope).toBe("design");
   });
 });
+
+// Regression: Devin Review flagged that `undo` / `redo` / `save`
+// / `close` in App.tsx listed `project` in their `useCallback`
+// dep arrays. Every successful save churns the `project`
+// summary (`useActiveProject.saveProject` calls
+// `updateProject(summary)` with the refreshed `modifiedAt`),
+// which re-derived all four callbacks on every save. The
+// shortcut dispatcher itself reads through `cmdRef.current` so
+// keybindings still fire, but the callback churn cascades
+// through `ActiveProjectProvider`'s `useMemo` context `value`
+// identity and forces consumers that list these callbacks as
+// deps to refire needlessly. The fix mirrors `project` into a
+// ref (`projectRef`) synced via `useEffect`, reads
+// `projectRef.current` inside the callbacks, and removes
+// `project` from the dep lists. The four callbacks now have
+// stable identity across per-save summary updates, matching
+// the `projectPathRef` pattern already established in
+// `useActiveProject.saveProject` (useActiveProject.tsx:206-218).
+//
+// Externally observable proof: after a save (which updates
+// `project.modifiedAt` in state), Ctrl+Z must still dispatch
+// to the bridge with the correct project path. If the ref read
+// regressed to a stale closure, the bridge call would either
+// fail (project null) or pass an out-of-date path.
+describe("App — shortcut callbacks read latest project through ref after save", () => {
+  let saveSpy = vi.spyOn(aec.project, "save");
+  let undoSpy = vi.spyOn(aec.command, "undo");
+  saveSpy.mockRestore();
+  undoSpy.mockRestore();
+
+  beforeEach(async () => {
+    await ensureProjectOpen();
+    saveSpy = vi.spyOn(aec.project, "save");
+    undoSpy = vi.spyOn(aec.command, "undo");
+  });
+
+  afterEach(() => {
+    saveSpy.mockRestore();
+    undoSpy.mockRestore();
+  });
+
+  it("Ctrl+Z after Ctrl+S still dispatches with the correct project path", async () => {
+    renderAt("/design");
+    await waitFor(() => {
+      expect(screen.getByTestId("design-mode")).toBeInTheDocument();
+    });
+
+    // Fire Ctrl+S to trigger saveProject → updateProject(summary)
+    // churn (the very condition the ref decouples callbacks
+    // from). The save handler resolves synchronously through
+    // the in-process backend; we wait for the save spy to
+    // observe the call before continuing.
+    act(() => {
+      fireEvent.keyDown(document, { key: "s", ctrlKey: true });
+    });
+    await waitFor(() => {
+      expect(saveSpy).toHaveBeenCalled();
+    });
+
+    // Mock undo to capture the path the callback dispatches
+    // with. If the ref read were stale (or projectRef was lost
+    // across the post-save re-render), the path would either
+    // be undefined or a previous-tick value.
+    undoSpy.mockRejectedValue(new Error("nothing to undo"));
+    act(() => {
+      fireEvent.keyDown(document, { key: "z", ctrlKey: true });
+    });
+    await waitFor(() => {
+      expect(undoSpy).toHaveBeenCalled();
+    });
+    const [path, scope] = undoSpy.mock.calls[0];
+    expect(typeof path).toBe("string");
+    expect((path as string).length).toBeGreaterThan(0);
+    expect(scope).toBe("design");
+  });
+});

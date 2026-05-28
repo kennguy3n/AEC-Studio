@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Routes, Route, Navigate, useLocation, useNavigate } from "react-router-dom";
 import { ModeRail } from "./components/ModeRail";
 import { StatusBar } from "./components/StatusBar";
@@ -56,6 +56,45 @@ function AppCommands({
     useActiveProject();
   const { addToast } = useToast();
 
+  // Mirror `project` into a ref so the four shortcut callbacks below
+  // (undo / redo / save / close) can read the active project without
+  // listing `project` in their `useCallback` dep arrays.
+  //
+  // Without this ref, every successful save churns the callback
+  // identities — `useActiveProject.saveProject` calls
+  // `updateProject(summary)` after each save to surface the
+  // refreshed `modifiedAt`, which creates a fresh `ProjectSummary`
+  // reference and forces React to re-derive `undo` / `redo` / `save`
+  // / `close`. The same churn happens on every `project:active-
+  // changed` push from the main process (e.g. multi-window or test
+  // harnesses mutating the tracker directly). Those new closures
+  // then cascade through the `useMemo` context `value` identity in
+  // `ActiveProjectProvider` (`useActiveProject.tsx:700-733`), which
+  // would re-render every consumer that depends on the context on
+  // every 5s auto-save even when the fields they consume have not
+  // changed.
+  //
+  // The shortcut dispatcher (`useShortcut` → `cmdRef.current` in
+  // `useKeyboardShortcuts.ts:153`) already reads the latest handler
+  // through a ref on every keypress, so the keybindings always fire
+  // the current callback regardless of identity churn — but child
+  // components or effects that list these callbacks as deps would
+  // refire needlessly. Mirroring `project` into a ref here decouples
+  // callback identity from per-save summary updates, matching the
+  // exact pattern `useActiveProject.saveProject` already uses with
+  // its internal `projectPathRef` (`useActiveProject.tsx:206-218`).
+  //
+  // Synced via `useEffect` rather than written directly during
+  // render to keep the render path side-effect-free; the timing is
+  // sufficient because the callbacks only read this ref from inside
+  // event handlers (key dispatch, navigation), which always run
+  // after the commit phase of the render that produced the new
+  // `project` reference.
+  const projectRef = useRef<typeof project>(project);
+  useEffect(() => {
+    projectRef.current = project;
+  }, [project]);
+
   // The command engine partitions undo/redo by mode scope; map the
   // current route to the matching scope so Ctrl/Cmd+Z undoes within
   // the active mode. Unknown routes (Home, Settings, etc.) resolve
@@ -90,10 +129,17 @@ function AppCommands({
   // bridge's command engine. The renderer keeps the undo/redo stack
   // depths in sync via `setUndoRedo` so the StatusBar reflects the
   // current state.
+  //
+  // Reads project state through `projectRef.current` (see ref
+  // declaration above) so the callback identity stays stable across
+  // per-save summary updates. `activeScope` is derived from
+  // `useLocation()` and only changes on navigation, so it stays in
+  // the dep array.
   const undo = useCallback(async () => {
-    if (project === null || activeScope === null) return;
+    const proj = projectRef.current;
+    if (proj === null || activeScope === null) return;
     try {
-      const result = await aec.command.undo(project.path, activeScope);
+      const result = await aec.command.undo(proj.path, activeScope);
       setUndoRedo(result.undoLen, result.redoLen);
       markDirty();
     } catch (err) {
@@ -102,12 +148,13 @@ function AppCommands({
         `Undo failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
-  }, [project, activeScope, setUndoRedo, markDirty, addToast]);
+  }, [activeScope, setUndoRedo, markDirty, addToast]);
 
   const redo = useCallback(async () => {
-    if (project === null || activeScope === null) return;
+    const proj = projectRef.current;
+    if (proj === null || activeScope === null) return;
     try {
-      const result = await aec.command.redo(project.path, activeScope);
+      const result = await aec.command.redo(proj.path, activeScope);
       setUndoRedo(result.undoLen, result.redoLen);
       markDirty();
     } catch (err) {
@@ -116,23 +163,24 @@ function AppCommands({
         `Redo failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
-  }, [project, activeScope, setUndoRedo, markDirty, addToast]);
+  }, [activeScope, setUndoRedo, markDirty, addToast]);
 
   const save = useCallback(async () => {
-    if (project === null) return;
+    const proj = projectRef.current;
+    if (proj === null) return;
     try {
       await saveProject();
-      addToast("success", `Saved ${project.name}`);
+      addToast("success", `Saved ${proj.name}`);
     } catch (err) {
       addToast(
         "error",
         `Save failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
-  }, [project, saveProject, addToast]);
+  }, [saveProject, addToast]);
 
   const close = useCallback(async () => {
-    if (project === null) return;
+    if (projectRef.current === null) return;
     // Wrap the bridge call in try/catch to match the convention
     // used by the sibling `save` / `undo` / `redo` callbacks.
     // Today the main process's `project:close` handler only calls
@@ -159,7 +207,7 @@ function AppCommands({
       );
     }
     navigate("/");
-  }, [project, closeProject, navigate, addToast]);
+  }, [closeProject, navigate, addToast]);
 
   useShortcut({
     id: "undo",
