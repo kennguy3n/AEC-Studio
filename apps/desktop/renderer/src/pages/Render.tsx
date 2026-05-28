@@ -61,6 +61,36 @@ export function Render() {
   >([]);
   const [busy, setBusy] = useState(false);
 
+  // Synchronous mirror of `project?.path` so `enqueueAll` can
+  // detect whether the user transitioned to a different project
+  // (or closed the project entirely) while one of its per-camera
+  // enqueue awaits was in flight. Matches the pattern landed in
+  // `Bim.tsx` (`onInvoke`, `onScheduleGenerate`), `Deliver.tsx`
+  // (`onCompare`, `onCreateRevision`, `onBuildPack`), and the
+  // internal `projectPathRef` in `useActiveProject.saveProject`,
+  // so every async handler that loops or awaits across the bridge
+  // presents one consistent shape: capture `startPath` at entry,
+  // re-check the ref after every await, skip stale state commits
+  // and stale toast announcements when the comparison fails.
+  //
+  // Today the `RequireProject` route guard unmounts the Render
+  // page on every project transition, so a stale `setJobs` /
+  // `addToast` call would no-op on a torn-down component. The
+  // page is safe in production. BUT the route-guard umbrella is
+  // the same brittle contract that motivated the per-project
+  // reset effect (lines 91-180) to NOT rely on it: future in-page
+  // project pickers, a "switch to recent" toolbar action, or any
+  // code path that calls `openProject(...)` without forcing a
+  // route change would let project A's enqueue results land into
+  // project B's queue. Devin Review flagged the absence of this
+  // guard as an INFO-tier inconsistency with `Bim.tsx`'s
+  // exhaustive coverage; threading the ref here closes the gap by
+  // structural construction and removes the inconsistency.
+  const projectPathRef = useRef<string | null>(project?.path ?? null);
+  useEffect(() => {
+    projectPathRef.current = project?.path ?? null;
+  }, [project?.path]);
+
   // Mount-only: detect the hardware tier and pick the recommended
   // preset on the user's first visit to the page. The runtime tier
   // (CPU cores, GPU model, RAM) is static for the renderer process —
@@ -196,6 +226,19 @@ export function Render() {
 
   const enqueueAll = async () => {
     if (selectedCameras.size === 0) return;
+    // Capture the active project path at entry so every commit
+    // site below (the post-loop `setJobs`, the success toast, and
+    // the error toast) can check `projectPathRef.current !==
+    // startPath` and skip the announcement when a project
+    // transition raced the enqueue loop. The bridge writes still
+    // land — every `enqueueRender` call that completed before the
+    // switch did insert a real job row for project A's render
+    // store — but landing project A's job IDs in project B's
+    // `jobs` state (or announcing the queue against project B's
+    // UI with project A's camera IDs in the error toast) is the
+    // exact stale-data problem the per-handler `projectPathRef`
+    // pattern was added to close everywhere else.
+    const startPath = projectPathRef.current;
     setBusy(true);
     // Per-camera enqueue. Each `aec.render.enqueueRender` call is
     // its own bridge round-trip — a single bad camera (stale ID, an
@@ -220,6 +263,17 @@ export function Render() {
     const failures: { cameraId: string; message: string }[] = [];
     try {
       for (const cameraId of selectedCameras) {
+        // Mid-loop guard: if a project transition fires between
+        // two cameras, stop enqueueing the remainder. The bridge's
+        // `withResolvedProjectPath` resolves the active project at
+        // call time so subsequent enqueue calls would either be
+        // rejected outright (wrong project) or, worse, queued
+        // against project B with project A's camera IDs that are
+        // not valid in B's render store. Aborting here also keeps
+        // the post-loop `newJobs` cardinality tied to the cameras
+        // that legitimately landed under project A — the partial
+        // success that the user can recover by switching back to A.
+        if (projectPathRef.current !== startPath) break;
         try {
           const result = (await aec.render.enqueueRender({
             cameraId,
@@ -238,6 +292,14 @@ export function Render() {
           });
         }
       }
+      // Post-loop guard: only commit the partial result and toast
+      // the announcement against the project that started the
+      // batch. If the user has since switched to project B, the
+      // job rows landed correctly in project A's render store
+      // (the bridge is project-scoped at insert time) and the
+      // user will see them on switching back. Announcing them
+      // against B would conflate project A's work with B's UI.
+      if (projectPathRef.current !== startPath) return;
       if (newJobs.length > 0) {
         setJobs((prev) => [...newJobs, ...prev]);
         addToast(
@@ -255,6 +317,13 @@ export function Render() {
         );
       }
     } finally {
+      // `setBusy(false)` ALWAYS runs, even on project switch,
+      // because the button is owned by the current page render
+      // and we need its disabled state to flip back regardless of
+      // whether the toasts fired. The route-guard unmount makes
+      // this a no-op in production, but if a future in-page
+      // switcher keeps the page mounted, leaving `busy=true`
+      // would deadlock the queue button for the new project.
       setBusy(false);
     }
   };

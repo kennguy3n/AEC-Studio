@@ -478,10 +478,29 @@ export function Bim() {
   // produced — calling `generateSchedule` a second time would write
   // the XLSX twice with identical content. We only need to read the
   // rows back from the file the bridge just wrote.
+  //
+  // Per-project guard mirroring the pattern in `onInvoke` above:
+  // capture `projectPathRef.current` at handler entry and re-check
+  // after every await. If the user project-switched while
+  // `regenerate()`'s `generateSchedule` bridge call was in flight,
+  // `ScheduleView.regenerate()` will resolve and dispatch this
+  // `onGenerate` callback against project B's hooks; the readback
+  // await then races the switch a second time. Without the guard,
+  // project A's rows would land into project B's `schedules` state
+  // through the route-guard's unmount window (one paint frame
+  // today, longer with any future in-page project picker or
+  // `openProject` without navigate). Matches the defense-in-depth
+  // tier established by every async branch of `onInvoke` so the
+  // file presents one consistent shape: every async handler
+  // captures `startPath` and checks the ref after each await
+  // before committing to React state. RequireProject unmounting
+  // makes the race unreachable in production today, but the
+  // structural guarantee survives future routing changes.
   const onScheduleGenerate = async (
     kind: ScheduleKind,
     summary: { outPath: string; rows: number },
   ) => {
+    const startPath = projectPathRef.current;
     let rows: ScheduleRow[] = [];
     if (summary.rows > 0) {
       try {
@@ -494,6 +513,15 @@ export function Bim() {
         // XLSX on disk is still authoritative.
       }
     }
+    // Skip the state commit if a project transition (open /
+    // create / close / switch) ran while `regenerate()` or the
+    // readback was in flight. The XLSX on disk still belongs to
+    // project A — landing its rows in project B's `schedules`
+    // would silently leak project A's data into project B's
+    // schedule preview. The bridge call itself is not wasted:
+    // the file was written successfully under project A, and the
+    // user can re-open project A to see it.
+    if (projectPathRef.current !== startPath) return;
     setSchedules((prev) => ({ ...prev, [kind]: rows }));
   };
 

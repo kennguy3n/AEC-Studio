@@ -170,7 +170,33 @@ function AppCommands({
     if (proj === null) return;
     try {
       await saveProject();
-      addToast("success", `Saved ${proj.name}`);
+      // Re-check `projectRef.current` after the await before
+      // surfacing the success toast. `saveProject()` internally
+      // guards its state commit on the same path (see the
+      // `projectPathRef.current === savePath` check in
+      // `useActiveProject.saveProject`'s inflight IIFE), so when
+      // a project transition (open / create / close / switch)
+      // runs mid-save, the promise still RESOLVES — the bytes
+      // landed on disk for project A, which is the durable
+      // contract a save promises — but the renderer is now on
+      // project B. Firing `addToast("success", `Saved ${proj.name}`)`
+      // unconditionally would announce "Saved Project A" against
+      // project B's UI, which is the toast-text analogue of the
+      // same race we already close inside the hook for state
+      // commits. Skipping the toast on path mismatch lets the
+      // disk write stay (correct) while declining to announce
+      // the wrong project name (also correct).
+      //
+      // We compare the path, not the summary reference: the push-
+      // sync listener may have replaced the summary object even
+      // for the same project (e.g. on the very save that just
+      // completed), so reference equality would false-negative.
+      // Path equality is the stable identity used everywhere else
+      // in the hook for the same reason.
+      const current = projectRef.current;
+      if (current !== null && current.path === proj.path) {
+        addToast("success", `Saved ${proj.name}`);
+      }
     } catch (err) {
       addToast(
         "error",

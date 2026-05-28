@@ -556,3 +556,207 @@ describe("Bim page — onInvoke skips stale results across project switches", ()
     openSpy.mockRestore();
   });
 });
+
+/**
+ * Devin Review (commit 627acbe, finding 3315013346) flagged that
+ * `Bim.tsx onScheduleGenerate` lacked the `projectPathRef`
+ * defense-in-depth guard that every other async handler in the
+ * same file uses. The handler is dispatched from
+ * `ScheduleView.regenerate()` after `aec.bim.generateSchedule`
+ * resolves, then itself awaits `aec.bim.readScheduleRows({xlsxPath})`
+ * to read the rows back from the XLSX the bridge just wrote. Two
+ * back-to-back awaits give two race windows in which the user
+ * can transition to a different project, after which the bridge
+ * payload (project A's XLSX rows) would silently land in project
+ * B's `schedules` state. Today the `RequireProject` route guard
+ * unmounts the BIM page on every project transition, so a stale
+ * `setSchedules` call would no-op on a torn-down component — the
+ * race is unreachable in production. But the guard exists to
+ * make the safety structural rather than route-dependent, so any
+ * future in-page project picker or `openProject` without
+ * navigate keeps the invariant.
+ *
+ * The fix captures `startPath = projectPathRef.current` at
+ * handler entry and compares against `projectPathRef.current`
+ * after the readback await; on mismatch it skips the
+ * `setSchedules` commit. The XLSX on disk for project A is
+ * unaffected — the bridge already wrote it — but project B's UI
+ * stays unpolluted.
+ */
+describe("Bim page — onScheduleGenerate skips stale rows across project switches", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("does NOT land project A's schedule rows into project B's state when the readback resolves after a project switch", async () => {
+    const summaryA = {
+      projectId: "proj_sched_a",
+      name: "Project Schedule A",
+      path: "/tmp/sched-a.aecstudio",
+      templateKey: null,
+      modifiedAt: new Date().toISOString(),
+    };
+    const summaryB = {
+      projectId: "proj_sched_b",
+      name: "Project Schedule B",
+      path: "/tmp/sched-b.aecstudio",
+      templateKey: null,
+      modifiedAt: new Date().toISOString(),
+    };
+
+    // Provider mounts on A; openProject(B.path) switches without
+    // unmounting the Bim component (the precondition for the
+    // race to be observable — RequireProject unmounting would
+    // hide it).
+    const currentSpy = vi
+      .spyOn(aec.project, "current")
+      .mockResolvedValue({ summary: summaryA });
+    const openSpy = vi
+      .spyOn(aec.project, "open")
+      .mockImplementation(async (path: string) =>
+        path === summaryA.path ? summaryA : summaryB,
+      );
+
+    // Set up the attach flow so `ifcSourcePath` becomes non-null
+    // (precondition for the regenerate button to be enabled).
+    vi.spyOn(aec.dialog, "openFile").mockResolvedValue({
+      canceled: false,
+      paths: ["/tmp/sched-a.ifc"],
+    });
+    vi.spyOn(aec.bim, "attachIfc").mockResolvedValue({
+      path: "/tmp/sched-a.ifc",
+      projectPath: summaryA.path,
+      parseCacheHit: false,
+      spatialNodesInserted: 1,
+      spatialNodesUpdated: 0,
+      spatialNodesUnchanged: 0,
+      elementsInserted: 5,
+      elementsUpdated: 0,
+      elementsUnchanged: 0,
+      componentsInserted: 0,
+      relationsInserted: 0,
+      cacheRows: 0,
+    });
+
+    // `generateSchedule` resolves promptly with `rows: 2` so the
+    // `onScheduleGenerate` callback's `summary.rows > 0` branch
+    // executes (otherwise the readback await is skipped entirely
+    // and the race window doesn't open).
+    vi.spyOn(aec.bim, "generateSchedule").mockResolvedValue({
+      scheduleId: "sched_room_a",
+      kind: "room",
+      sourcePath: "/tmp/sched-a.ifc",
+      outPath: "/tmp/sched-a/schedules/room.xlsx",
+      rows: 2,
+      columns: 3,
+      bytesWritten: 1024,
+      parseCacheHit: false,
+    });
+
+    // Hold `readScheduleRows` open so the test can drive a
+    // project switch between dispatch and resolution. The
+    // resolved payload uses a deterministic marker entity id
+    // ("RACE_LEAKED_ROW") so the assertion can detect "A's rows
+    // leaked into B's preview" via DOM text match.
+    let resolveReadback:
+      | ((r: {
+          rows: Array<Record<string, string | number | boolean | null>>;
+        }) => void)
+      | null = null;
+    const readbackSpy = vi
+      .spyOn(aec.bim, "readScheduleRows")
+      .mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            resolveReadback = resolve;
+          }),
+      );
+
+    // Slim harness exposes `openProject` so the test can switch
+    // projects without unmounting Bim (same harness as the
+    // `onInvoke` race test above).
+    let switchProject: ((path: string) => Promise<void>) | null = null;
+    function ProjectSwitcher() {
+      const { openProject } = useActiveProject();
+      useEffect(() => {
+        switchProject = (path: string) => openProject(path);
+      }, [openProject]);
+      return null;
+    }
+
+    render(
+      <ToastProvider>
+        <ActiveProjectProvider>
+          <ProjectSwitcher />
+          <Bim />
+          <ToastContainer />
+        </ActiveProjectProvider>
+      </ToastProvider>,
+    );
+
+    // Wait for project A to be the active project (the provider's
+    // `current` call resolved).
+    await waitFor(() => {
+      expect(currentSpy).toHaveBeenCalled();
+    });
+
+    // Attach an IFC so `ifcSourcePath` is non-null and the
+    // regenerate button becomes enabled.
+    fireEvent.click(screen.getByTestId("bim-action-attachIfc"));
+    await waitFor(() => {
+      expect(screen.getByTestId("schedule-regenerate")).toBeEnabled();
+    });
+
+    // Click regenerate. `generateSchedule` resolves promptly,
+    // then `onScheduleGenerate` dispatches `readScheduleRows`
+    // which is held open by the mock.
+    fireEvent.click(screen.getByTestId("schedule-regenerate"));
+    await waitFor(() => {
+      expect(readbackSpy).toHaveBeenCalledTimes(1);
+    });
+
+    // Switch to project B while the readback await is in flight.
+    // The provider commits B, the BIM page's `projectPathRef`
+    // sync useEffect fires, and the per-project reset effect
+    // clears `schedules` to `{}`. Without the guard, the
+    // subsequent `setSchedules` from the resolved readback would
+    // re-populate it with project A's rows.
+    expect(switchProject).not.toBeNull();
+    await waitFor(async () => {
+      await switchProject!(summaryB.path);
+    });
+
+    // Resolve the readback with project A's rows. The handler
+    // reads `projectPathRef.current` (now B) vs `startPath`
+    // (A) and skips `setSchedules`. The XLSX on disk for A is
+    // still authoritative — only the in-memory state commit is
+    // skipped.
+    expect(resolveReadback).not.toBeNull();
+    await waitFor(async () => {
+      resolveReadback!({
+        rows: [
+          {
+            "Entity ID": "RACE_LEAKED_ROW",
+            "Room Name": "Project A Living Room",
+            Area: 42,
+          },
+        ],
+      });
+      // Let the .then() microtask + setState flush.
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // Critical assertion: project A's row data must NOT be in
+    // the DOM. If the guard failed, "RACE_LEAKED_ROW" would
+    // appear in the schedule preview table that the user is
+    // currently viewing against project B.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(
+      screen.queryByText(/RACE_LEAKED_ROW/),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/Project A Living Room/),
+    ).not.toBeInTheDocument();
+  });
+});

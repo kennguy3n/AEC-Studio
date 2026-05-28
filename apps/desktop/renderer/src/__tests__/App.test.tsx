@@ -325,3 +325,171 @@ describe("App — shortcut callbacks read latest project through ref after save"
     expect(scope).toBe("design");
   });
 });
+
+/**
+ * Devin Review (commit 627acbe, finding 3315013227) flagged that
+ * App.tsx's `save` callback captures `projectRef.current` BEFORE
+ * the `await saveProject()` and announces the success toast with
+ * that captured `proj.name` AFTER the await. When the user
+ * project-switches mid-save, `saveProject()` still resolves
+ * (its internal `projectPathRef` guard skips the state commit
+ * but the IIFE itself does NOT reject — the bridge bytes for
+ * project A landed on disk, which is the durable contract a
+ * save promises). The `addToast("success", \`Saved ${proj.name}\`)`
+ * then announces "Saved Project A" against project B's UI.
+ *
+ * The fix re-reads `projectRef.current` after the save resolves
+ * and only toasts when the path still matches the path the save
+ * started under. Path equality (not summary reference equality)
+ * is used because the push-sync listener may have replaced the
+ * summary object even for the same project (e.g. `updateProject`
+ * on the save's own success path), so reference comparison would
+ * false-negative even when the user did NOT switch projects.
+ *
+ * This regression test holds `aec.project.save` open across a
+ * project transition driven through the real in-process backend
+ * (which fires the same push-listener path the production
+ * Electron IPC does). The save's mock then resolves after the
+ * transition, the `save` callback's post-await `projectRef.current`
+ * is project B, the path comparison fails, and the toast is
+ * suppressed.
+ */
+describe("App — save success toast suppressed across mid-save project switch", () => {
+  let saveSpy = vi.spyOn(aec.project, "save");
+  saveSpy.mockRestore();
+
+  beforeEach(async () => {
+    await ensureProjectOpen();
+    saveSpy = vi.spyOn(aec.project, "save");
+  });
+
+  afterEach(() => {
+    saveSpy.mockRestore();
+  });
+
+  it("does NOT toast 'Saved <project A>' when the user opens project B while save is in flight", async () => {
+    // Hold the save mock open so the test can drive a project
+    // transition between dispatch and resolution. The mock
+    // returns a fresh summary on resolve so the renderer's
+    // post-save `updateProject` call mirrors the production
+    // contract (in-process backend's `save` returns the
+    // updated row).
+    let resolveSave:
+      | ((r: {
+          projectId: string;
+          name: string;
+          path: string;
+          templateKey: string | null;
+          modifiedAt: string;
+        }) => void)
+      | null = null;
+    saveSpy.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveSave = resolve;
+        }),
+    );
+
+    renderAt("/design");
+    await waitFor(() => {
+      expect(screen.getByTestId("design-mode")).toBeInTheDocument();
+    });
+
+    // Fire Ctrl+S → App.tsx `save` captures `projectRef.current`
+    // (project A from `ensureProjectOpen`) and dispatches the
+    // save bridge call, which the mock holds open.
+    act(() => {
+      fireEvent.keyDown(document, { key: "s", ctrlKey: true });
+    });
+    await waitFor(() => {
+      expect(saveSpy).toHaveBeenCalled();
+    });
+
+    // While the save is in flight, open project B via the real
+    // in-process backend. This fires the push-listener channel
+    // (`onActiveProjectChange`) which `useActiveProject`
+    // subscribes to on mount; `projectRef.current` becomes
+    // project B's summary BEFORE `resolveSave` runs.
+    let projectBSummary: {
+      projectId: string;
+      name: string;
+      path: string;
+      templateKey: string | null;
+      modifiedAt: string;
+    } | null = null;
+    await act(async () => {
+      const created = await aec.project.createFromTemplate(
+        "apartment",
+        "Project B (race)",
+      );
+      projectBSummary = created as typeof projectBSummary;
+    });
+    expect(projectBSummary).not.toBeNull();
+
+    // Resolve the save with project A's marker name. Without
+    // the post-await re-check, `addToast("success", \`Saved Project A\`)`
+    // would fire on project B's UI. With the fix, the path
+    // comparison detects the switch and skips the toast.
+    expect(resolveSave).not.toBeNull();
+    await act(async () => {
+      resolveSave!({
+        projectId: "proj_stale_a",
+        name: "Project A (stale)",
+        path: "/tmp/stale-project-a.aecstudio",
+        templateKey: null,
+        modifiedAt: new Date().toISOString(),
+      });
+      // Let the .then() microtask + setState flush.
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // Critical assertion: the stale "Saved Project A (stale)"
+    // success toast must NOT be in the DOM. If the guard
+    // regressed, the toast text would appear because the
+    // closure-captured `proj.name` (project A's name from the
+    // pre-switch capture) would be passed to `addToast`.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(
+      screen.queryByText(/Saved Project A \(stale\)/),
+    ).not.toBeInTheDocument();
+    // A negative control: error toasts are still allowed to
+    // fire (they're project-agnostic in their semantics), so
+    // we don't assert "no toast at all" — only the stale-name
+    // success toast specifically.
+    expect(screen.queryByText(/Save failed/)).not.toBeInTheDocument();
+  });
+
+  it("DOES toast 'Saved <name>' when no project switch occurs (positive control)", async () => {
+    // Sanity check: the post-await re-check must NOT regress
+    // the happy path. When the user saves and stays on the
+    // same project, the success toast still fires.
+    //
+    // We pass through to the real in-process `aec.project.save`
+    // (via `vi.spyOn` with no `mockImplementation`) instead of
+    // returning a stubbed summary, because the in-process
+    // backend's `save` returns a summary whose `path` matches
+    // the project's `path` (i.e. `/projects/test_project.aecstudio`
+    // — the path generated by `createFromTemplate("apartment", "Test Project")`).
+    // A naive `mockResolvedValue({path: "/tmp/different.aecstudio"})`
+    // would simulate a project switch (different path) and the
+    // guard would correctly suppress the toast — making the
+    // mock the bug, not the code. Using the real path lets the
+    // happy path actually exercise the toast-firing branch.
+    renderAt("/design");
+    await waitFor(() => {
+      expect(screen.getByTestId("design-mode")).toBeInTheDocument();
+    });
+    act(() => {
+      fireEvent.keyDown(document, { key: "s", ctrlKey: true });
+    });
+    await waitFor(() => {
+      expect(saveSpy).toHaveBeenCalled();
+    });
+    // Match the toast surfacing — the project name from
+    // `ensureProjectOpen` is "Test Project".
+    await waitFor(() => {
+      expect(screen.getByText(/Saved Test Project/)).toBeInTheDocument();
+    });
+  });
+});

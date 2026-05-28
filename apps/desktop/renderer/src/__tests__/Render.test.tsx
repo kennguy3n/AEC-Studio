@@ -634,3 +634,161 @@ describe("Render page — listJobs bridge rejection handled silently", () => {
     }
   });
 });
+
+/**
+ * Devin Review (commit 627acbe, finding 3315013559) flagged that
+ * `Render.tsx enqueueAll` iterates over `selectedCameras` with a
+ * per-camera await but did not capture a `startPath` or check
+ * `projectPathRef.current` between iterations. The bot tagged it
+ * INFO ("consistent with defense-in-depth tier of other Render
+ * handlers, not a regression"), but the inconsistency with
+ * `Bim.tsx`'s exhaustive `projectPathRef` coverage and
+ * `Deliver.tsx`'s same-pattern guards on `onCompare` /
+ * `onCreateRevision` / `onBuildPack` was the kind of structural
+ * gap that the per-handler ref pattern was built to remove
+ * across the file. The fix threads a `projectPathRef` into the
+ * Render page and adds mid-loop + post-loop guards: if the user
+ * project-switches between two camera enqueues, the loop breaks
+ * (no more bridge calls under the wrong project's mental model);
+ * if the switch happens after the loop completes, the success /
+ * failure toasts are suppressed AND the queue commit is skipped
+ * (the job rows for project A are durable in A's render store
+ * and the user will see them when switching back).
+ *
+ * This regression test pins both halves of the contract:
+ *   1. Held-open `enqueueRender` for camera #1, the user
+ *      switches to project B, the post-loop `projectPathRef`
+ *      comparison fails, and NEITHER the success toast NOR the
+ *      `render-job-*` queue entry from project A's enqueue lands
+ *      in the DOM the user is currently viewing.
+ *   2. The mid-loop break aborts subsequent enqueues — only the
+ *      first camera's bridge call is observed by the spy.
+ */
+describe("Render page — enqueueAll skips stale toasts/commits across project switch", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("does NOT commit project A's job rows or toast against project B when switch races the enqueue loop", async () => {
+    const PATH_A = "/tmp/render-race-A.aecstudio";
+    const PATH_B = "/tmp/render-race-B.aecstudio";
+
+    // Seed two cameras under project A so the enqueue loop has
+    // to make two bridge calls — the test holds the first call
+    // open, drives a project switch, then ensures the second
+    // call is NEVER dispatched (mid-loop guard) AND the post-
+    // loop commit/toast is skipped (post-loop guard).
+    vi.spyOn(aec.command, "listGraph").mockImplementation(
+      async (path: string, kind?: string) => {
+        if (kind !== "camera") return [];
+        if (path === PATH_A) {
+          return [
+            {
+              id: "cam_race_1",
+              kind: "camera",
+              parent: null,
+              body: { name: "Race 1" },
+            },
+            {
+              id: "cam_race_2",
+              kind: "camera",
+              parent: null,
+              body: { name: "Race 2" },
+            },
+          ];
+        }
+        return [];
+      },
+    );
+
+    // Hold the first enqueue open so the test can drive the
+    // project switch BEFORE the loop's next iteration. The
+    // marker jobId ("STALE_JOB_FROM_A") makes the assertion
+    // detect "A's commit leaked into B's queue" via DOM testid.
+    let resolveEnqueue1: ((r: { jobId: string }) => void) | null = null;
+    const enqueueSpy = vi
+      .spyOn(aec.render, "enqueueRender")
+      .mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            resolveEnqueue1 = resolve;
+          }),
+      );
+
+    render(
+      <ToastProvider>
+        <ActiveProjectProvider>
+          <OpenSwitch pathA={PATH_A} pathB={PATH_B} />
+          <Render />
+          <ToastContainer />
+        </ActiveProjectProvider>
+      </ToastProvider>,
+    );
+
+    // Wait for project A's cameras to render.
+    await waitFor(() => {
+      expect(screen.getByTestId("camera-tile-cam_race_1")).toBeInTheDocument();
+      expect(screen.getByTestId("camera-tile-cam_race_2")).toBeInTheDocument();
+    });
+
+    // Select both cameras and trigger the queue. The handler
+    // captures `startPath = projectPathRef.current` (PATH_A),
+    // then dispatches the first enqueue which the mock holds
+    // open.
+    fireEvent.click(screen.getByTestId("camera-toggle-cam_race_1"));
+    fireEvent.click(screen.getByTestId("camera-toggle-cam_race_2"));
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("render-enqueue-all"));
+    });
+    await waitFor(() => {
+      expect(enqueueSpy).toHaveBeenCalledTimes(1);
+    });
+
+    // Switch to project B *while* the first enqueue is in
+    // flight. The per-project reset effect fires (clears
+    // `cameras` / `selectedCameras` / `jobs`) and the
+    // `projectPathRef` sync useEffect commits PATH_B.
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("switch-to-B"));
+    });
+
+    // Resolve the held-open first enqueue with project A's
+    // marker. The loop's post-await guard for camera #2 sees
+    // `projectPathRef.current === PATH_B !== startPath === PATH_A`
+    // and breaks BEFORE calling enqueueRender a second time.
+    // The post-loop guard then sees the same mismatch and
+    // skips both the `setJobs` commit and the success toast.
+    expect(resolveEnqueue1).not.toBeNull();
+    await act(async () => {
+      resolveEnqueue1!({ jobId: "STALE_JOB_FROM_A" });
+      // Let the inner-loop continuation + outer continuation
+      // microtasks + setBusy(false) commit flush.
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // Mid-loop guard: only ONE enqueue bridge call must have
+    // been made. If the guard regressed, camera #2 would have
+    // been enqueued against project B (the bridge's
+    // `withResolvedProjectPath` would resolve at call time and
+    // either bind A's camera ID to B's render store, or reject
+    // it as "unknown camera" — both are wrong).
+    expect(enqueueSpy).toHaveBeenCalledTimes(1);
+
+    // Post-loop guard: project A's job ID must NOT appear in
+    // the queue, even though the bridge accepted the enqueue
+    // and returned a job ID. The row lives in project A's
+    // render store; surfacing it under project B's UI would be
+    // a stale-data leak.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(
+      screen.queryByTestId("render-job-STALE_JOB_FROM_A"),
+    ).not.toBeInTheDocument();
+
+    // Post-loop guard: the success toast must NOT fire. If the
+    // guard regressed, "Queued 1 render" would render against
+    // project B's UI.
+    expect(screen.queryByText(/Queued 1 render/)).not.toBeInTheDocument();
+  });
+});
