@@ -217,9 +217,29 @@ impl SnapshotCache {
     /// with the oldest `last_used` to make room (LRU). Re-inserting an
     /// existing key replaces the entry (cheap — same memory footprint;
     /// the stored snapshot is dropped via `Arc` when no readers remain).
+    ///
+    /// **Per-path uniqueness invariant.** Before inserting, any *other*
+    /// entry with the same `canonical_path` but a different
+    /// `(mtime, size)` triple is dropped — those entries describe the
+    /// same file at an obsolete filesystem identity, so they can never
+    /// satisfy a future lookup keyed on the file's current state, and
+    /// retaining them only consumes LRU capacity that the working set
+    /// would otherwise use. This makes the cache enforce the contract
+    /// "at most one live entry per canonical path"; callers
+    /// (`build_for_project`, `bim_import_ifc`, `load_ifc_snapshot`)
+    /// can therefore insert blindly after a parse without each having
+    /// to re-implement the same cleanup. The active session's working
+    /// set of *distinct* files is what bounds memory now, not the
+    /// number of times any one file has been re-exported and re-parsed.
     pub(crate) fn insert(&self, key: SnapshotKey, snapshot: Arc<IfcSnapshot>) {
         let mut cache = self.entries.lock().expect("snapshot cache mutex poisoned");
         self.evict_stale(&mut cache);
+        // Drop obsolete entries for the same canonical path with a
+        // different filesystem identity. This must happen *before* the
+        // LRU capacity check so a re-export of an already-cached file
+        // doesn't spuriously evict an unrelated cache entry to make
+        // room for what is logically a replacement.
+        cache.retain(|k, _| k.canonical_path != key.canonical_path || k == &key);
         if !cache.contains_key(&key) && cache.len() >= self.capacity {
             // LRU eviction: drop the entry with the oldest `last_used`.
             // `min_by_key` over `Instant` is correct since `Instant`'s
@@ -426,28 +446,102 @@ mod tests {
     }
 
     #[test]
-    fn invalidate_path_drops_all_entries_for_path() {
-        // Two distinct (mtime, size) pairs for the same canonical
-        // path can co-exist if the file was overwritten between
-        // imports. `invalidate_path` should drop both regardless of
-        // the secondary key fields. We simulate this by inserting
-        // manually with hand-constructed keys (the size differs).
+    fn invalidate_path_drops_the_single_live_entry_for_path() {
+        // `invalidate_path` is the explicit eviction hook used by
+        // `bim_detach_*` (when wired) and tests. Since `insert` now
+        // enforces "at most one live entry per canonical_path", this
+        // test verifies the explicit-eviction path still drops the
+        // active entry to a clean slate. The legacy "drops MULTIPLE
+        // entries for the same path" scenario the prior version of
+        // this test exercised is no longer reachable — see the
+        // `insert_evicts_obsolete_entries_for_same_canonical_path`
+        // regression below.
         let cache = SnapshotCache::with_config(Duration::from_secs(60), 4);
         let (_td, p) = temp_file_with(b"placeholder");
-        let k1 = SnapshotKey {
+        let k = SnapshotKey::from_canonical_path(&p).unwrap();
+        cache.insert(k.clone(), stub_snapshot());
+        assert_eq!(cache.len(), 1);
+        cache.invalidate_path(&p);
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn insert_evicts_obsolete_entries_for_same_canonical_path() {
+        // Per-path uniqueness invariant: inserting at a new
+        // `(mtime, size)` for the same canonical path must drop the
+        // prior entry — those obsolete entries can never satisfy a
+        // future lookup (the new lookup key reflects the file's new
+        // `(mtime, size)`) and retaining them only wastes LRU
+        // capacity. Hand-construct two keys with the same path but
+        // different filesystem identity so we don't have to wait for
+        // mtime granularity between writes.
+        let cache = SnapshotCache::with_config(Duration::from_secs(60), 4);
+        let (_td, p) = temp_file_with(b"placeholder");
+        let k_old = SnapshotKey {
             canonical_path: p.clone(),
             mtime: SystemTime::UNIX_EPOCH,
             size: 1,
         };
-        let k2 = SnapshotKey {
+        let k_new = SnapshotKey {
             canonical_path: p.clone(),
             mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(60),
             size: 2,
         };
-        cache.insert(k1.clone(), stub_snapshot());
-        cache.insert(k2.clone(), stub_snapshot());
+        cache.insert(k_old.clone(), stub_snapshot());
+        assert_eq!(cache.len(), 1);
+        cache.insert(k_new.clone(), stub_snapshot());
+        assert_eq!(
+            cache.len(),
+            1,
+            "second insert at a new (mtime, size) for the same path must replace the old entry, \
+             not coexist with it"
+        );
+        assert!(
+            cache.get(&k_old).is_none(),
+            "stale key for the same path must have been dropped"
+        );
+        assert!(
+            cache.get(&k_new).is_some(),
+            "fresh key for the same path must remain reachable"
+        );
+    }
+
+    #[test]
+    fn insert_uniqueness_does_not_evict_unrelated_paths() {
+        // Per-path uniqueness must only affect entries that share the
+        // SAME canonical_path — an unrelated cached file (different
+        // path) must survive a re-insert that drops its own stale
+        // siblings. Without this guarantee, a hot-overwrite of file A
+        // could spuriously evict file B's snapshot via the cleanup
+        // path.
+        let cache = SnapshotCache::with_config(Duration::from_secs(60), 4);
+        let (_td_a, pa) = temp_file_with(b"a-bytes");
+        let (_td_b, pb) = temp_file_with(b"b-bytes");
+        let ka_old = SnapshotKey {
+            canonical_path: pa.clone(),
+            mtime: SystemTime::UNIX_EPOCH,
+            size: 1,
+        };
+        let ka_new = SnapshotKey {
+            canonical_path: pa.clone(),
+            mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(60),
+            size: 2,
+        };
+        let kb = SnapshotKey::from_canonical_path(&pb).unwrap();
+        cache.insert(ka_old.clone(), stub_snapshot());
+        cache.insert(kb.clone(), stub_snapshot());
         assert_eq!(cache.len(), 2);
-        cache.invalidate_path(&p);
-        assert_eq!(cache.len(), 0);
+        cache.insert(ka_new.clone(), stub_snapshot());
+        assert_eq!(
+            cache.len(),
+            2,
+            "re-export of A must drop ka_old and keep kb intact"
+        );
+        assert!(cache.get(&ka_new).is_some(), "fresh A must remain");
+        assert!(
+            cache.get(&kb).is_some(),
+            "unrelated B must survive A's per-path cleanup"
+        );
+        assert!(cache.get(&ka_old).is_none(), "stale A must be gone");
     }
 }

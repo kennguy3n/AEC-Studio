@@ -401,7 +401,23 @@ export function registerIpcHandlers(): void {
   });
   ipcMain.handle("export:buildProposalPack", async (_e, p) => {
     assertObject(p, "params");
-    return getBridge().exportBuildProposalPack(p);
+    // Inject the active project path through the shared
+    // `withResolvedProjectPath` helper so this handler obeys the
+    // same caller-supplied-wins / active-tracker-fallback /
+    // typed-error-on-missing contract every other project-scoped
+    // IPC handler (`draft:*`, `ai:plan`, `deliver:*`) uses. The
+    // bridge's `export_proposal_pack` endpoint still accepts
+    // `Option<&str>` so external `aec_export` embedders can call it
+    // without an open project, but every renderer-facing flow is
+    // route-guarded by `RequireProject` so the helper's throw path
+    // is unreachable in practice; aligning here removes the only
+    // bespoke project-path injection in the IPC layer.
+    return getBridge().exportBuildProposalPack(
+      withResolvedProjectPath(p, "exportBuildProposalPack") as Record<
+        string,
+        unknown
+      > & { projectPath: string },
+    );
   });
 
   // ----- Deliver -----
@@ -482,16 +498,22 @@ export function registerIpcHandlers(): void {
       ["eu", "na", "apac"].includes(p.region as string)
         ? (p.region as "eu" | "na" | "apac")
         : undefined;
-    // Inject the active project path so the bridge can build a
-    // `DeliverPackContext` from the real project (renders dir,
-    // schedules from graph, sheets, IFC string). Caller-supplied
-    // `projectPath` wins (e.g. an explicit "export this archived
-    // project" flow); otherwise the active-project tracker is the
-    // source of truth.
-    const projectPath =
-      typeof p.projectPath === "string" && p.projectPath.length > 0
-        ? p.projectPath
-        : peekActiveProjectPath();
+    // Inject the active project path through the same shared helper
+    // every other project-scoped IPC handler (`draft:*`, `ai:plan`,
+    // `deliver:createRevision/listRevisions/compareRevisions`, and
+    // `export:buildProposalPack`) uses. Caller-supplied `projectPath`
+    // wins (e.g. an explicit "export this archived project" flow);
+    // otherwise the active-project tracker is the source of truth,
+    // and an absent project throws `IpcValidationError` rather than
+    // silently degrading to the bridge's `None` fallback. The bridge
+    // endpoint still accepts `Option<String>` so external embedders
+    // can call it without an open project, but every renderer-facing
+    // flow is route-guarded by `RequireProject` so the helper's
+    // throw path is unreachable in production — using the helper
+    // here removes the last bespoke project-path injection in the
+    // IPC layer (`export:buildProposalPack` was the previous holdout,
+    // fixed earlier in this sweep).
+    const resolved = withResolvedProjectPath(p, "deliverBuildPack");
     return getBridge().deliverBuildPack({
       kind: p.kind as "concept" | "interior" | "contractor" | "bim",
       outPath: p.outPath,
@@ -500,7 +522,7 @@ export function registerIpcHandlers(): void {
       // to the generic "Project" string).
       projectName:
         typeof p.projectName === "string" ? p.projectName : undefined,
-      projectPath: projectPath ?? undefined,
+      projectPath: resolved.projectPath as string,
       includeRenders:
         typeof p.includeRenders === "boolean" ? p.includeRenders : undefined,
       includeSheets:

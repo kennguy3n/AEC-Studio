@@ -255,6 +255,65 @@ Key design points:
   is scoped by the current route's `CommandScope` (design / draft / bim /
   render / deliver), so the command engine partitions history correctly.
 
+### Deliver pack context (Phase 13 Group B)
+
+The bridge produces deliver packs (concept / interior / contractor / bim) and
+proposal packs through `aec_export::write_deliver_pack_with_context` /
+`write_proposal_pack_with_context` — never through the legacy no-context
+APIs. The context is built by `aec_bridge::pack_context::build_for_project()`,
+a stateless one-shot function that reconstructs real project state from
+SQLCipher on demand:
+
+* Renders: scans `<project>/renders/` for PNG files and lists them on the
+  context so the export crate embeds the actual rendered thumbnails. Missing
+  files fall back to a real `image::ImageBuffer` gradient — never to the
+  legacy `placeholder_png()` (which has been removed from the crate).
+* Schedules: walks the project graph for the attached IFC (via
+  `bim/spatial/*` entities' `source_path`), reads the file off disk, parses
+  it with `aec_bim::ifc::IfcReader::from_string`, and feeds the snapshot to
+  `aec_bim::schedules::generate_material_schedule` so the contractor /
+  interior packs ship a real OpenXML workbook. Projects with no attached
+  IFC produce an empty-but-real workbook (header row + zero data rows) via
+  `empty_real_xlsx()` — the legacy `placeholder_xlsx()` has been **deleted
+  entirely** from `aec_export`.
+* IFC: the contractor / bim packs reuse the same parsed IFC string from the
+  attach step, so the deliver ZIP's `model/project.ifc` entry round-trips
+  through `IfcWriter::to_string_with_materials` against the canonical
+  attached source rather than the skeleton `build_summary_ifc`.
+* Sheets: CAD sheet definitions + their primitive geometry feed
+  `SheetPdfBuilder` so the contractor pack's sheets contain real
+  `LINE` / `POLYLINE` content streams rather than title-only fallbacks.
+
+Every production code path in the bridge — both `BridgeService::deliver_build_pack`
+and `BridgeService::export_proposal_pack` — constructs and supplies an
+`OwnedPackContext` from the live project state. The no-context library
+APIs `write_deliver_pack` / `write_proposal_pack` remain `#[deprecated]`
+for external embedders that integrate `aec_export` directly without
+project state, but the AEC Studio shell never calls them.
+
+### Extension lifecycle (Phase 13 Group F)
+
+`BridgeService::extensions_install_asset_packs(extensions_dir)`
+is the renderer's hook for the Phase 8 extension lifecycle. The bridge
+loads extensions through `aec_core::extensions::ExtensionLoader`, builds a
+`PermissionEnforcer` from the registry, and installs `AssetPack`
+extensions into the global asset library DB (via `AssetState::with_db_mut`)
+through `aec_assets::extension_host::install_asset_packs`. Every installed
+asset becomes immediately visible to `BridgeService::design_list_assets`
+without any additional cache invalidation — the asset DB is the source of
+truth and the renderer's asset browser reads from it directly.
+
+Trust + integrity invariants the loader enforces:
+
+* Manifest schema validation (`ExtensionManifest::validate()`)
+* BLAKE3 checksum of every payload file against
+  `AssetEntry::blake3` — catches tampered-after-author archives
+* Permission gating: every extension declares the permission set it
+  needs (e.g. `FilesystemRead`, `GeometryRead`); `install_asset_packs`
+  refuses to read payloads off disk for an extension that lacks
+  `FilesystemRead`, returning `AssetExtensionError::PermissionDenied`
+  before any IO touches the manifest's declared paths.
+
 ### TypeScript API interfaces
 
 ```typescript

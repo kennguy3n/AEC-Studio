@@ -343,14 +343,29 @@ pub struct WriteProposalPackResult {
     pub out_path: PathBuf,
 }
 
-/// Write the proposal pack PDF for `(project_name, client_name)`.
+/// Write the proposal pack PDF for `(project_name, client_name)`
+/// **without project context**.
 ///
-/// Routes through [`ProposalPack::to_pdf`], which already produces a
-/// real PDF (cover, scope, schedule, attachments). With no caller-
-/// supplied `ProposalAssets`/`ProposalBranding`, the defaults give a
-/// clean cover + empty body — still a valid PDF the renderer can
-/// open. Phase 11 will thread real branding/assets through this
-/// entry point.
+/// Routes through [`ProposalPack::to_pdf`], which produces a real PDF
+/// (cover, scope, schedule, attachments). With no caller-supplied
+/// `ProposalAssets`/`ProposalBranding`, the cover paragraph is empty
+/// and the schedule body shows the default placeholder — still a
+/// valid PDF the renderer can open.
+///
+/// **Deprecated (Phase 13 Task 10)**: Production callers must use
+/// [`write_proposal_pack_with_context`] with a real
+/// [`DeliverPackContext`] sourced from the open project. The
+/// no-context entry point is retained only for tests / examples /
+/// CLI fixtures that have no project package to source data from.
+/// The bridge itself routes every proposal pack request through the
+/// context-aware variant so the cover prints room/material counts
+/// and template name instead of generic defaults.
+#[deprecated(
+    since = "0.13.0",
+    note = "Use write_proposal_pack_with_context with a real DeliverPackContext \
+            sourced from the open project. The no-context variant produces a \
+            proposal pack with empty cover paragraph and generic schedule body."
+)]
 pub fn write_proposal_pack(
     out_path: &Path,
     project_name: &str,
@@ -482,10 +497,20 @@ pub struct DeliverPackContext<'a> {
     pub material_schedule: Option<&'a ScheduleSheet>,
     /// BOQ (Bill of Quantities) schedule sheet.
     pub boq_schedule: Option<&'a ScheduleSheet>,
-    /// Sheet definitions + DXF entities for `SheetPdfBuilder`. Each
-    /// pair is `(sheet, entities)`; when non-empty the contractor pack
-    /// emits a real multi-page PDF.
-    pub sheets: Option<&'a [(aec_cad::sheets::Sheet, Vec<DxfEntity>)]>,
+    /// CAD sheet definitions for `SheetPdfBuilder`. When non-empty
+    /// the contractor pack emits a real multi-page PDF, one page per
+    /// sheet. Pair with `sheet_primitives` for the shared geometry
+    /// set every sheet draws from — `SheetPdfBuilder::add_sheet`
+    /// clips by each sheet's viewport, so a per-sheet primitive
+    /// filter would be redundant and we avoid `O(sheets × primitives)`
+    /// heap pressure by borrowing one slice instead of cloning the
+    /// `DxfEntity` vec into every tuple.
+    pub sheets: Option<&'a [aec_cad::sheets::Sheet]>,
+    /// Shared DXF entity slice that every entry in [`Self::sheets`]
+    /// draws from. `Some(&[])` is treated the same as `None` on the
+    /// export side — both surface to `SheetPdfBuilder::add_sheet`
+    /// as "no geometry, render frame + title block only".
+    pub sheet_primitives: Option<&'a [DxfEntity]>,
     /// Full IFC STEP string from `IfcWriter::to_string_with_materials`.
     /// When set, replaces the skeletal `build_summary_ifc` output.
     pub ifc_string: Option<&'a str>,
@@ -505,7 +530,8 @@ pub struct WriteDeliverPackResult {
     pub total_bytes: u64,
 }
 
-/// Build the deliver pack ZIP at `out_path`.
+/// Build the deliver pack ZIP at `out_path` **without project
+/// context**.
 ///
 /// Writes a *real* ZIP archive (a downstream `unzip` or
 /// `zip::ZipArchive::new` can open it) — not a stub returning a
@@ -517,10 +543,21 @@ pub struct WriteDeliverPackResult {
 /// sum of payload sizes (excluding the manifest, matching the
 /// renderer's preview expectations).
 ///
-/// The included files are deliberately minimal placeholders for now
-/// (a one-page PDF, a small XLSX-shaped JSON, etc.); the structure
-/// is the load-bearing piece that turns the renderer's deliver UI
-/// from a fake into something a contractor could actually unzip.
+/// **Deprecated (Phase 13 Task 7)**: Production callers must use
+/// [`write_deliver_pack_with_context`] with a real
+/// [`DeliverPackContext`] populated from the open project's
+/// renders directory, BIM snapshot, sheet definitions, and IFC
+/// graph. Without a context the schedule entries are header-only
+/// XLSX (no project data) and the IFC entry falls back to the
+/// skeletal `build_summary_ifc` output. The no-context entry point
+/// is retained only for tests / examples / CLI fixtures that have
+/// no project package to source data from.
+#[deprecated(
+    since = "0.13.0",
+    note = "Use write_deliver_pack_with_context with a real DeliverPackContext \
+            sourced from the open project. The no-context variant produces a pack \
+            with header-only XLSX schedules and skeletal IFC."
+)]
 pub fn write_deliver_pack(
     out_path: &Path,
     kind: DeliverPackKind,
@@ -566,7 +603,8 @@ pub fn write_deliver_pack_with_context(
         let has_real_sheets = ctx.sheets.is_some_and(|s| !s.is_empty());
         if has_real_sheets {
             let sheets = ctx.sheets.unwrap();
-            let sheet_bytes = build_real_sheet_pdf(project_name, sheets)?;
+            let primitives = ctx.sheet_primitives.unwrap_or(&[]);
+            let sheet_bytes = build_real_sheet_pdf(project_name, sheets, primitives)?;
             planned.push(("sheets/project_sheets.pdf".to_string(), sheet_bytes));
         } else {
             // Fallback: synthesised title-only PDFs by kind.
@@ -611,22 +649,26 @@ pub fn write_deliver_pack_with_context(
         }
     }
 
-    // --- Schedules (Task 12): real XLSX from schedule sheets
-    // when context supplies them. ---------------------------------
+    // --- Schedules (Tasks 12 + 9): real XLSX from schedule sheets
+    // when context supplies them. When the context lacks a
+    // schedule (e.g. project has no IFC attached yet), we still
+    // emit a *real* XLSX — just header-only — via
+    // `empty_real_xlsx`. Every production code path produces a
+    // real OpenXML workbook; the legacy `placeholder_xlsx()`
+    // hand-rolled scaffolding has been removed from the crate
+    // entirely (Phase 13 Task 9).
     if kind == DeliverPackKind::Interior || kind == DeliverPackKind::Contractor {
-        let mat_bytes = ctx
-            .material_schedule
-            .map(build_real_xlsx)
-            .transpose()?
-            .unwrap_or_else(placeholder_xlsx);
+        let mat_bytes = match ctx.material_schedule {
+            Some(sheet) => build_real_xlsx(sheet)?,
+            None => empty_real_xlsx("Materials", &["Material", "Count"])?,
+        };
         planned.push(("schedules/materials.xlsx".to_string(), mat_bytes));
     }
     if kind == DeliverPackKind::Contractor && options.include_boq {
-        let boq_bytes = ctx
-            .boq_schedule
-            .map(build_real_xlsx)
-            .transpose()?
-            .unwrap_or_else(placeholder_xlsx);
+        let boq_bytes = match ctx.boq_schedule {
+            Some(sheet) => build_real_xlsx(sheet)?,
+            None => empty_real_xlsx("BOQ", &["Item", "Quantity", "Unit", "Notes"])?,
+        };
         planned.push(("schedules/boq.xlsx".to_string(), boq_bytes));
     }
 
@@ -902,66 +944,6 @@ fn build_summary_ifc(project_name: &str) -> Result<Vec<u8>, ProjectExportError> 
     Ok(bytes)
 }
 
-/// Minimal valid XLSX (real ZIP container with the minimum
-/// `xl/workbook.xml` + `[Content_Types].xml` + `_rels/.rels`
-/// Open XML scaffolding). Excel opens it without complaints.
-fn placeholder_xlsx() -> Vec<u8> {
-    let mut buf: Vec<u8> = Vec::new();
-    let cursor = std::io::Cursor::new(&mut buf);
-    let mut zw = ZipWriter::new(cursor);
-    let opts: SimpleFileOptions =
-        SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
-
-    let files: &[(&str, &str)] = &[
-        (
-            "[Content_Types].xml",
-            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
-<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
-<Default Extension="xml" ContentType="application/xml"/>
-<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
-<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
-</Types>"#,
-        ),
-        (
-            "_rels/.rels",
-            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
-</Relationships>"#,
-        ),
-        (
-            "xl/_rels/workbook.xml.rels",
-            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
-</Relationships>"#,
-        ),
-        (
-            "xl/workbook.xml",
-            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
-          xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
-<sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>
-</workbook>"#,
-        ),
-        (
-            "xl/worksheets/sheet1.xml",
-            r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
-<sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>AEC Studio placeholder</t></is></c></row></sheetData>
-</worksheet>"#,
-        ),
-    ];
-
-    for (name, body) in files {
-        zw.start_file(*name, opts).unwrap();
-        zw.write_all(body.as_bytes()).unwrap();
-    }
-    zw.finish().unwrap();
-    buf
-}
-
 // --- Phase 12 real-content helpers (Tasks 11-15) ----------------------
 
 /// Convert an `aec_bim::schedules::ScheduleSheet` to the
@@ -1040,20 +1022,57 @@ fn build_real_xlsx(sheet: &ScheduleSheet) -> Result<Vec<u8>, ProjectExportError>
     Ok(bytes)
 }
 
+/// Build a header-only real XLSX workbook (Phase 13 Task 9).
+///
+/// Used when the deliver pack's `DeliverPackContext` does not carry
+/// a populated schedule (e.g. a project with no IFC attached yet, or
+/// a draft project without classified BIM data). Produces a real
+/// `rust_xlsxwriter`-generated workbook with one sheet, one header
+/// row carrying the supplied column display names, and zero data
+/// rows — so the contractor still gets an Excel-openable file with
+/// the expected schema instead of the legacy `placeholder_xlsx()`
+/// hand-rolled Open-XML scaffolding.
+///
+/// `sheet_title` is the worksheet name (visible in Excel's tab bar);
+/// `column_titles` populate row 1. Both feed the same
+/// `aec_bim::schedules::xlsx` writer the data-bearing path uses, so
+/// the resulting workbook is structurally identical to a populated
+/// schedule — just with zero data rows.
+fn empty_real_xlsx(
+    sheet_title: &str,
+    column_titles: &[&str],
+) -> Result<Vec<u8>, ProjectExportError> {
+    let columns: Vec<aec_bim::schedules::ScheduleColumn> = column_titles
+        .iter()
+        .map(|title| aec_bim::schedules::ScheduleColumn {
+            key: title.to_ascii_lowercase().replace(' ', "_"),
+            display: (*title).to_owned(),
+        })
+        .collect();
+    let sheet = aec_bim::schedules::ScheduleSheet::new(sheet_title, columns);
+    build_real_xlsx(&sheet)
+}
+
 /// Build a real multi-page PDF from CAD sheet definitions (Phase 12
-/// Task 13). Each `(Sheet, Vec<DxfEntity>)` pair becomes a page in
-/// the output PDF via `SheetPdfBuilder`.
+/// Task 13). Each sheet becomes a page in the output PDF via
+/// `SheetPdfBuilder::add_sheet`, drawing from the same shared
+/// `primitives` slice. The viewport on each sheet clips the geometry
+/// to its own frame, so a per-sheet primitive filter at this layer
+/// would be redundant — and binding `primitives` once at the call
+/// site avoids the previous `O(sheets × primitives)` clone that the
+/// `(Sheet, Vec<DxfEntity>)` tuple required.
 fn build_real_sheet_pdf(
     project_name: &str,
-    sheets: &[(aec_cad::sheets::Sheet, Vec<DxfEntity>)],
+    sheets: &[aec_cad::sheets::Sheet],
+    primitives: &[DxfEntity],
 ) -> Result<Vec<u8>, ProjectExportError> {
     use crate::pdf_sheet::SheetPdfBuilder;
     use crate::plot_style::PlotStyleTable;
 
     let mut builder = SheetPdfBuilder::new(project_name)?;
     let default_style = PlotStyleTable::new("AEC Studio Default");
-    for (sheet, entities) in sheets {
-        builder.add_sheet(sheet, entities, &default_style)?;
+    for sheet in sheets {
+        builder.add_sheet(sheet, primitives, &default_style)?;
     }
     let tmp = tempfile::NamedTempFile::new()?;
     builder.save(tmp.path())?;
@@ -1062,7 +1081,15 @@ fn build_real_sheet_pdf(
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
+    // The legacy `write_deliver_pack` / `write_proposal_pack` entry
+    // points are `#[deprecated]` (Phase 13 Tasks 7 + 10) but the
+    // existing regression suite continues to exercise them so the
+    // backward-compat call shape is covered by CI. `allow(deprecated)`
+    // here scopes the suppression to the test module only — outside
+    // this `mod tests` block, deprecation warnings still fire and
+    // any new production caller will be caught at build time.
     use super::*;
     use std::io::Read;
 

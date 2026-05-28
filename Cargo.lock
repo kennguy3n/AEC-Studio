@@ -99,7 +99,9 @@ dependencies = [
  "aec_viewport",
  "blake3",
  "chrono",
+ "criterion",
  "glam",
+ "hex",
  "napi",
  "napi-build",
  "napi-derive",
@@ -109,6 +111,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "uuid",
+ "zip",
 ]
 
 [[package]]
