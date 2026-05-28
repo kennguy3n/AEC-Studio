@@ -84,7 +84,20 @@ pub struct OwnedPackContext {
     pub renders_dir: PathBuf,
     pub material_schedule: Option<ScheduleSheet>,
     pub boq_schedule: Option<ScheduleSheet>,
-    pub sheets: Vec<(Sheet, Vec<DxfEntity>)>,
+    /// CAD sheet definitions for the contractor pack's multi-page
+    /// PDF. Paired with [`Self::sheet_primitives`] on the export
+    /// side: every sheet draws from the same shared primitive set
+    /// (the viewport on each sheet clips to its own frame), so
+    /// storing primitives once here instead of cloning them into a
+    /// `(Sheet, Vec<DxfEntity>)` tuple per sheet eliminates the
+    /// previous `O(sheets × primitives)` heap pressure observed by
+    /// the Devin Review sweep on commit a4be685.
+    pub sheets: Vec<Sheet>,
+    /// Shared DXF entity vec backing every sheet's PDF page. Built
+    /// once in [`build_for_project`] from the project graph's
+    /// `kind == "primitive"` rows; borrowed by
+    /// [`Self::as_context`] as `Option<&[DxfEntity]>`.
+    pub sheet_primitives: Vec<DxfEntity>,
     pub ifc_string: Option<String>,
     pub floor_plan_svg: Option<String>,
     pub room_count: Option<usize>,
@@ -115,6 +128,15 @@ impl OwnedPackContext {
                 None
             } else {
                 Some(self.sheets.as_slice())
+            },
+            // Primitives also collapse `[]` → `None` so the export
+            // crate's `unwrap_or(&[])` path matches the same
+            // "no geometry, frame only" semantics whether the field
+            // is genuinely unset or just empty.
+            sheet_primitives: if self.sheet_primitives.is_empty() {
+                None
+            } else {
+                Some(self.sheet_primitives.as_slice())
             },
             ifc_string: self.ifc_string.as_deref(),
             floor_plan_svg: self.floor_plan_svg.as_deref(),
@@ -321,18 +343,22 @@ pub(crate) fn build_for_project(
             all_primitives.push(dxf);
         }
     }
-    let mut sheets: Vec<(Sheet, Vec<DxfEntity>)> = Vec::new();
+    let mut sheets: Vec<Sheet> = Vec::new();
     for entity in graph.entities_of_kind("sheet") {
         let sheet: Sheet = match serde_json::from_value(entity.body.clone()) {
             Ok(s) => s,
             Err(_) => continue,
         };
-        // Pair each sheet with the full primitive set. The
-        // `SheetPdfBuilder::add_sheet` impl clips by the sheet's
-        // viewport so a sheet-specific filter at this layer would
-        // be redundant.
-        sheets.push((sheet, all_primitives.clone()));
+        sheets.push(sheet);
     }
+    // Every sheet draws from the same primitive set — the
+    // `SheetPdfBuilder::add_sheet` impl clips by each sheet's
+    // viewport, so a per-sheet primitive filter at this layer
+    // would be redundant. Storing primitives once here (instead
+    // of cloning into a `(Sheet, Vec<DxfEntity>)` tuple per sheet)
+    // turns the previous `O(sheets × primitives)` allocation into
+    // a single owned vec backed by an `&[DxfEntity]` borrow at
+    // export time.
 
     Ok(OwnedPackContext {
         renders_dir,
@@ -344,6 +370,7 @@ pub(crate) fn build_for_project(
         // this `None` becomes that call's result.
         boq_schedule: None,
         sheets,
+        sheet_primitives: all_primitives,
         ifc_string,
         floor_plan_svg: None,
         room_count,
@@ -364,6 +391,7 @@ mod tests {
             material_schedule: None,
             boq_schedule: None,
             sheets: Vec::new(),
+            sheet_primitives: Vec::new(),
             ifc_string: None,
             floor_plan_svg: None,
             room_count: None,
@@ -390,6 +418,7 @@ mod tests {
             material_schedule: None,
             boq_schedule: None,
             sheets: Vec::new(),
+            sheet_primitives: Vec::new(),
             ifc_string: None,
             floor_plan_svg: None,
             room_count: None,
@@ -400,6 +429,85 @@ mod tests {
         assert!(
             ctx.sheets.is_none(),
             "empty sheets vec must surface as None so export crate takes kind-based fallback list"
+        );
+        assert!(
+            ctx.sheet_primitives.is_none(),
+            "empty sheet_primitives vec must surface as None so SheetPdfBuilder sees no geometry"
+        );
+    }
+
+    /// Regression for the Phase 13 PR-71 Devin Review FLAG:
+    /// before this refactor, [`build_for_project`] cloned the full
+    /// `all_primitives: Vec<DxfEntity>` into every `(Sheet, _)` tuple
+    /// it produced, so a project with N sheets and M primitives
+    /// allocated `N × M` `DxfEntity`s before the contractor pack was
+    /// even emitted. Post-refactor the primitive vec is owned once on
+    /// the [`OwnedPackContext`] and borrowed as `&[DxfEntity]` at
+    /// export time — the test pins both invariants: (a) the owned
+    /// primitives vec is referentially the same backing buffer
+    /// regardless of sheet count, and (b) `as_context()` exposes that
+    /// buffer to every sheet through one shared slice.
+    #[test]
+    fn as_context_shares_one_primitive_slice_across_sheets() {
+        use aec_cad::dxf::{DxfEntity, DxfLine};
+        use aec_cad::sheets::{PaperSize, Sheet};
+        // Two sheets, three primitives — in the old shape the export
+        // crate received a `&[(Sheet, Vec<DxfEntity>)]` with two
+        // tuples each carrying a *clone* of the same primitive vec.
+        // Now both sheets share a single borrowed slice.
+        let primitives = vec![
+            DxfEntity::Line(DxfLine {
+                layer: "WALLS".into(),
+                start: [0.0, 0.0, 0.0],
+                end: [1.0, 0.0, 0.0],
+            }),
+            DxfEntity::Line(DxfLine {
+                layer: "WALLS".into(),
+                start: [1.0, 0.0, 0.0],
+                end: [1.0, 1.0, 0.0],
+            }),
+            DxfEntity::Line(DxfLine {
+                layer: "WALLS".into(),
+                start: [1.0, 1.0, 0.0],
+                end: [0.0, 1.0, 0.0],
+            }),
+        ];
+        let owned = OwnedPackContext {
+            renders_dir: PathBuf::from("."),
+            material_schedule: None,
+            boq_schedule: None,
+            sheets: vec![
+                Sheet::new("A100", PaperSize::IsoA1),
+                Sheet::new("A101", PaperSize::IsoA1),
+            ],
+            sheet_primitives: primitives,
+            ifc_string: None,
+            floor_plan_svg: None,
+            room_count: None,
+            material_count: None,
+            template_name: None,
+        };
+        let ctx = owned.as_context();
+        let exposed = ctx
+            .sheet_primitives
+            .expect("non-empty primitives vec must surface as Some");
+        assert_eq!(
+            exposed.len(),
+            3,
+            "every sheet draws from the same three-primitive set"
+        );
+        // Both the owned vec and the borrowed slice point at the
+        // same heap allocation — no clone happened on `as_context()`.
+        assert_eq!(
+            exposed.as_ptr(),
+            owned.sheet_primitives.as_ptr(),
+            "as_context() must borrow the owned primitive vec, not clone it"
+        );
+        assert_eq!(
+            ctx.sheets
+                .expect("non-empty sheets vec must surface as Some")
+                .len(),
+            2
         );
     }
 

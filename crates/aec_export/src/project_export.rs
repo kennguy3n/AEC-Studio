@@ -497,10 +497,20 @@ pub struct DeliverPackContext<'a> {
     pub material_schedule: Option<&'a ScheduleSheet>,
     /// BOQ (Bill of Quantities) schedule sheet.
     pub boq_schedule: Option<&'a ScheduleSheet>,
-    /// Sheet definitions + DXF entities for `SheetPdfBuilder`. Each
-    /// pair is `(sheet, entities)`; when non-empty the contractor pack
-    /// emits a real multi-page PDF.
-    pub sheets: Option<&'a [(aec_cad::sheets::Sheet, Vec<DxfEntity>)]>,
+    /// CAD sheet definitions for `SheetPdfBuilder`. When non-empty
+    /// the contractor pack emits a real multi-page PDF, one page per
+    /// sheet. Pair with `sheet_primitives` for the shared geometry
+    /// set every sheet draws from — `SheetPdfBuilder::add_sheet`
+    /// clips by each sheet's viewport, so a per-sheet primitive
+    /// filter would be redundant and we avoid `O(sheets × primitives)`
+    /// heap pressure by borrowing one slice instead of cloning the
+    /// `DxfEntity` vec into every tuple.
+    pub sheets: Option<&'a [aec_cad::sheets::Sheet]>,
+    /// Shared DXF entity slice that every entry in [`Self::sheets`]
+    /// draws from. `Some(&[])` is treated the same as `None` on the
+    /// export side — both surface to `SheetPdfBuilder::add_sheet`
+    /// as "no geometry, render frame + title block only".
+    pub sheet_primitives: Option<&'a [DxfEntity]>,
     /// Full IFC STEP string from `IfcWriter::to_string_with_materials`.
     /// When set, replaces the skeletal `build_summary_ifc` output.
     pub ifc_string: Option<&'a str>,
@@ -593,7 +603,8 @@ pub fn write_deliver_pack_with_context(
         let has_real_sheets = ctx.sheets.is_some_and(|s| !s.is_empty());
         if has_real_sheets {
             let sheets = ctx.sheets.unwrap();
-            let sheet_bytes = build_real_sheet_pdf(project_name, sheets)?;
+            let primitives = ctx.sheet_primitives.unwrap_or(&[]);
+            let sheet_bytes = build_real_sheet_pdf(project_name, sheets, primitives)?;
             planned.push(("sheets/project_sheets.pdf".to_string(), sheet_bytes));
         } else {
             // Fallback: synthesised title-only PDFs by kind.
@@ -1043,19 +1054,25 @@ fn empty_real_xlsx(
 }
 
 /// Build a real multi-page PDF from CAD sheet definitions (Phase 12
-/// Task 13). Each `(Sheet, Vec<DxfEntity>)` pair becomes a page in
-/// the output PDF via `SheetPdfBuilder`.
+/// Task 13). Each sheet becomes a page in the output PDF via
+/// `SheetPdfBuilder::add_sheet`, drawing from the same shared
+/// `primitives` slice. The viewport on each sheet clips the geometry
+/// to its own frame, so a per-sheet primitive filter at this layer
+/// would be redundant — and binding `primitives` once at the call
+/// site avoids the previous `O(sheets × primitives)` clone that the
+/// `(Sheet, Vec<DxfEntity>)` tuple required.
 fn build_real_sheet_pdf(
     project_name: &str,
-    sheets: &[(aec_cad::sheets::Sheet, Vec<DxfEntity>)],
+    sheets: &[aec_cad::sheets::Sheet],
+    primitives: &[DxfEntity],
 ) -> Result<Vec<u8>, ProjectExportError> {
     use crate::pdf_sheet::SheetPdfBuilder;
     use crate::plot_style::PlotStyleTable;
 
     let mut builder = SheetPdfBuilder::new(project_name)?;
     let default_style = PlotStyleTable::new("AEC Studio Default");
-    for (sheet, entities) in sheets {
-        builder.add_sheet(sheet, entities, &default_style)?;
+    for sheet in sheets {
+        builder.add_sheet(sheet, primitives, &default_style)?;
     }
     let tmp = tempfile::NamedTempFile::new()?;
     builder.save(tmp.path())?;
