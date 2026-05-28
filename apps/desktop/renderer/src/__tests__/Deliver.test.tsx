@@ -18,7 +18,7 @@ import {
   ActiveProjectProvider,
   useActiveProject,
 } from "../hooks/useActiveProject";
-import { ToastProvider } from "../hooks/useToast";
+import { ToastProvider, ToastContainer } from "../hooks/useToast";
 
 function renderDeliver() {
   return render(
@@ -636,5 +636,209 @@ describe("<Deliver /> per-project state reset on project switch", () => {
       screen.queryByTestId("deliver-export-result"),
     ).not.toBeInTheDocument();
     expect(screen.queryByText(/from-project-A/)).not.toBeInTheDocument();
+  });
+
+  it("resets defaultThreadId when the active project changes so KChatReviewPanel does not render project A's thread for project B", async () => {
+    // Devin Review (commit 29c53ff, finding 3314923488) flagged
+    // that the per-project state reset effect did NOT include
+    // `setDefaultThreadId(null)`. Without that, when a user
+    // switched from project A (with thread "thread-A") to project
+    // B (with thread "thread-B"), the polling effect's mount-only
+    // deps `[]` meant the next bridge fetch wouldn't fire for up
+    // to STATUS_POLL_INTERVAL_MS (5 seconds) — during which the
+    // panel rendered project A's "Reviews · thread-A" heading
+    // against project B's mental model.
+    //
+    // The fix has two parts: (1) reset defaultThreadId synchronously
+    // in the per-project effect so the panel falls back to
+    // `FALLBACK_THREAD_ID` ("kchat-default") immediately on switch,
+    // and (2) re-key the polling effect on `project?.path` so a
+    // switch tears down the old interval and fires an immediate
+    // re-poll for project B's thread. This test pins both: after
+    // switching, the panel must transition project-A heading →
+    // fallback heading → project-B heading without ever showing
+    // project-A heading under project-B's active state.
+    let switchProject: ((path: string) => Promise<void>) | null = null;
+    function ProjectSwitcher() {
+      const { openProject } = useActiveProject();
+      useEffect(() => {
+        switchProject = (path: string) => openProject(path);
+      }, [openProject]);
+      return null;
+    }
+
+    // Track which project is active via a closure that the status
+    // mock reads on each call. This avoids `mockResolvedValueOnce`
+    // ordering fragility — the polling effect can fire on mount,
+    // after switch, and on interval ticks, and the test must
+    // resolve correctly regardless of how many of those fire.
+    let mockActiveProjectPath: string | null = null;
+    vi.spyOn(aec.kchat, "status").mockImplementation(() => {
+      if (mockActiveProjectPath === "/tmp/threadResetB.aecstudio") {
+        return Promise.resolve({
+          state: "connected" as const,
+          publisherKind: "local_ipc" as const,
+          instanceJson: null,
+          defaultThreadId: "thread-B",
+        });
+      }
+      if (mockActiveProjectPath === "/tmp/threadResetA.aecstudio") {
+        return Promise.resolve({
+          state: "connected" as const,
+          publisherKind: "local_ipc" as const,
+          instanceJson: null,
+          defaultThreadId: "thread-A",
+        });
+      }
+      return Promise.resolve({
+        state: "connected" as const,
+        publisherKind: "local_ipc" as const,
+        instanceJson: null,
+        defaultThreadId: null,
+      });
+    });
+    vi.spyOn(aec.kchat, "ingestReviews").mockResolvedValue({
+      threadId: "thread-A",
+      commentsJson: "[]",
+      cardsJson: "[]",
+    });
+
+    render(
+      <ToastProvider>
+        <ActiveProjectProvider>
+          <ProjectSwitcher />
+          <Deliver />
+        </ActiveProjectProvider>
+      </ToastProvider>,
+    );
+
+    expect(switchProject).not.toBeNull();
+
+    // Open project A. The polling effect (now re-keyed on
+    // project?.path) fires an immediate re-poll for project A's
+    // thread, which resolves to "thread-A".
+    mockActiveProjectPath = "/tmp/threadResetA.aecstudio";
+    await act(async () => {
+      await switchProject!("/tmp/threadResetA.aecstudio");
+    });
+    await waitFor(() => {
+      expect(screen.getByText("Reviews · thread-A")).toBeInTheDocument();
+    });
+
+    // Switch to project B. The per-project reset effect synchronously
+    // clears defaultThreadId to null, so the panel falls back to
+    // "Reviews · kchat-default" before the new poll resolves with
+    // "thread-B". The critical assertion: "Reviews · thread-A" must
+    // NOT appear in the DOM at any point after the switch — the
+    // synchronous reset closes the visibility window.
+    mockActiveProjectPath = "/tmp/threadResetB.aecstudio";
+    await act(async () => {
+      await switchProject!("/tmp/threadResetB.aecstudio");
+    });
+
+    // The polling effect's immediate re-poll resolves and the
+    // panel transitions to thread-B.
+    await waitFor(() => {
+      expect(screen.getByText("Reviews · thread-B")).toBeInTheDocument();
+    });
+
+    // Project A's thread must NOT be visible against project B's
+    // active state. The synchronous setDefaultThreadId(null) in the
+    // per-project reset effect ensures this.
+    expect(screen.queryByText("Reviews · thread-A")).not.toBeInTheDocument();
+  });
+
+  it("surfaces an error toast when compareRevisions rejects so the user knows why no diff appeared", async () => {
+    // Devin Review (commit 29c53ff, finding 3314923528) flagged
+    // that `onCompare` had `try/finally` but no `catch`, leaving
+    // bridge rejections unhandled. Without a catch:
+    //   - A bridge failure (corrupt revision row, permission
+    //     denied on the deliver-store DB, locked SQLCipher
+    //     transaction) would surface as "Uncaught (in promise)"
+    //     in the renderer console.
+    //   - The UI would silently sit with the previous diff (or
+    //     empty state), giving the user no indication their
+    //     compare action failed.
+    //   - This diverges from `onBuildPack` (which catches and
+    //     toasts) and `Bim.tsx onInvoke` (whose outer catch toasts
+    //     uniformly), creating an inconsistent error contract
+    //     across the page's async handlers.
+    //
+    // The fix adds a `catch (err)` block that toasts the failure
+    // unconditionally (project-agnostic UX), matching the
+    // `onBuildPack` convention. Toast unconditionally (not gated
+    // on `projectPathRef`) because errors are useful regardless
+    // of project context — telling the user "your last compare
+    // action failed" is accurate even after a project switch.
+    const compareError = new Error("simulated bridge failure");
+    const initialRevisions: RevisionSummary[] = [
+      {
+        revisionId: "rev-1",
+        tag: "v1",
+        description: "first",
+        createdAt: "2026-05-27T12:00:00Z",
+        auditChainHead: "0".repeat(64),
+        manifestName: "Test",
+        manifestAppVersion: "0.1.0",
+        trackedEntities: [],
+      },
+      {
+        revisionId: "rev-2",
+        tag: "v2",
+        description: "second",
+        createdAt: "2026-05-27T12:01:00Z",
+        auditChainHead: "0".repeat(64),
+        manifestName: "Test",
+        manifestAppVersion: "0.1.0",
+        trackedEntities: [],
+      },
+    ];
+    vi.spyOn(aec.deliver, "listRevisions").mockResolvedValue(initialRevisions);
+    vi.spyOn(aec.deliver, "compareRevisions").mockRejectedValue(compareError);
+
+    render(
+      <ToastProvider>
+        <ActiveProjectProvider>
+          <Deliver />
+          <ToastContainer />
+        </ActiveProjectProvider>
+      </ToastProvider>,
+    );
+
+    // Settle initial revisions list.
+    await waitFor(() => {
+      expect(screen.getByText("v1")).toBeInTheDocument();
+      expect(screen.getByText("v2")).toBeInTheDocument();
+    });
+
+    // Select base v1 + head v2 and trigger compare.
+    const baseButtons = screen.getAllByText(/Set as base/);
+    fireEvent.click(baseButtons[0]);
+    const headButtons = screen.getAllByText(/Set as head/);
+    fireEvent.click(headButtons[headButtons.length - 1]);
+    await waitFor(() => {
+      expect(
+        (screen.getByTestId("revision-compare-button") as HTMLButtonElement)
+          .disabled,
+      ).toBe(false);
+    });
+
+    fireEvent.click(screen.getByTestId("revision-compare-button"));
+
+    // The catch block must surface the failure via an error toast.
+    // Asserting the toast's text proves the user-visible feedback
+    // path runs — without the catch, the test would either time
+    // out (no toast renders) or fail with an unhandled rejection
+    // surfaced by the testing-library act() utilities.
+    await waitFor(() => {
+      expect(
+        screen.getByText(/Compare failed: simulated bridge failure/),
+      ).toBeInTheDocument();
+    });
+
+    // The diff section must NOT render (compare failed → no diff).
+    expect(
+      screen.queryByTestId("revision-diff-summary"),
+    ).not.toBeInTheDocument();
   });
 });

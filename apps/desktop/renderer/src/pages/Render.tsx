@@ -127,9 +127,24 @@ export function Render() {
     // `project:save:status` polling on `projectPath !== null` for the
     // same reason.
     if (project?.path) {
-      void aec.render.listJobs().then((rows) => {
-        if (alive) setJobs(rows as RenderJob[]);
-      });
+      void aec.render
+        .listJobs()
+        .then((rows) => {
+          if (alive) setJobs(rows as RenderJob[]);
+        })
+        .catch(() => {
+          // Bridge failure (project closed mid-fetch, corrupt
+          // render-jobs row, permission denied on the render-store
+          // DB) — keep the empty list from the synchronous reset
+          // above so the queue UI doesn't carry stale entries from
+          // a previous successful fetch. Matches the `.catch()` on
+          // `listGraph` below and the `StatusBar.tsx` /
+          // `Deliver.tsx` polling-tick convention: silent fail,
+          // empty/last-known UI, no toast (routine project
+          // switches race the bridge's own teardown and would
+          // otherwise spam transient-failure toasts). The bridge
+          // layer logs the underlying error.
+        });
       void aec.command
         .listGraph(project.path, "camera")
         .then((entities) => {

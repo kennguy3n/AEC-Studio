@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { aec } from "../api/aec";
 import { importIfcWithSizeGuard } from "../api/bim-import";
 import { attachIfcToProject } from "../api/bim-attach";
@@ -91,6 +91,45 @@ export function Bim() {
 
   const projectPath = project?.path ?? null;
 
+  // Synchronous mirror of `projectPath` so `onInvoke` can check
+  // "is the project I started on still the active one?" after each
+  // await. Defense-in-depth against project switches racing in-
+  // flight `importIfc` / `attachIfc` / `validate` / `classify` /
+  // `generateSchedule` / `diff` / `boq` bridge calls and the
+  // dialog round-trips that precede them.
+  //
+  //   * Today the `RequireProject` route guard unmounts Bim on
+  //     every project transition, so a stale `setIfcSourcePath` /
+  //     `setFindings` / `setSchedules` would be a no-op on a
+  //     torn-down component. The page is safe in production.
+  //   * BUT the route-guard umbrella is the same brittle contract
+  //     the per-project reset effect (lines 122-129) chose not to
+  //     rely on. Future in-page project pickers, "switch to
+  //     recent" toolbar actions, or any code path that calls
+  //     `openProject(...)` without forcing a route change would
+  //     let project A's import result land into project B's
+  //     state — worse, the file dialog's resolved path is for
+  //     project A's IFC but `ifcSourcePath` would be associated
+  //     with project B's session, then validate/schedule against
+  //     it would silently target the wrong project.
+  //   * Capturing `projectPath` at the start of `onInvoke` and
+  //     comparing against `projectPathRef.current` after each
+  //     await closes that gap by structural construction. Matches
+  //     the per-call-site guard pattern in `Deliver.tsx` (which
+  //     uses an identical `projectPathRef` for `onCompare` /
+  //     `onCreateRevision` / `onBuildPack`) and the internal
+  //     `projectPathRef` in `useActiveProject.saveProject`.
+  //
+  // Synced via `useEffect` keyed on `projectPath` so the ref
+  // tracks the latest path at microtask boundary — the
+  // `onInvoke` invocation that captured the old path will still
+  // see its captured value, and the ref comparison correctly
+  // identifies the project switch.
+  const projectPathRef = useRef<string | null>(projectPath);
+  useEffect(() => {
+    projectPathRef.current = projectPath;
+  }, [projectPath]);
+
   // Reset every per-project piece of BIM state whenever the active
   // project changes (or closes). Today this is defence in depth —
   // every project-switch path navigates away from `/bim` and the
@@ -118,6 +157,17 @@ export function Bim() {
   }, [projectPath]);
 
   const onInvoke = async (action: BimAction) => {
+    // Capture the active project at handler entry so every
+    // setState / success-toast site below can check
+    // `projectPathRef.current !== startPath` and skip stale
+    // commits when the user project-switched while the bridge
+    // call (or file dialog) was in flight. See the comment on
+    // `projectPathRef` above for the long-form rationale. Errors
+    // surfaced through the outer catch fire unconditionally
+    // (project-agnostic UX: "your last action failed" is useful
+    // even after a project switch), matching the
+    // `Deliver.tsx onBuildPack` / `onCompare` convention.
+    const startPath = projectPath;
     setBusyAction(action);
     try {
       switch (action) {
@@ -127,8 +177,20 @@ export function Bim() {
             filters: IFC_FILTERS,
           });
           if (dialog.canceled || dialog.paths.length === 0) break;
+          // If the user project-switched while the file dialog
+          // was open, the picked path was chosen for project A
+          // but the active project is now B. Importing it into
+          // B's snapshot cache would land a project-A IFC into
+          // project B's state — worse, subsequent
+          // validate/schedule actions would target the wrong
+          // project. Abort the import entirely; the user can
+          // re-trigger from the new project.
+          if (projectPathRef.current !== startPath) break;
           const selectedPath = dialog.paths[0];
           const outcome = await importIfcWithSizeGuard(selectedPath);
+          // Skip stale: don't commit project A's import result
+          // (or its success toast) onto project B's state.
+          if (projectPathRef.current !== startPath) break;
           if (outcome.kind === "imported") {
             setIfcSourcePath(selectedPath);
             if (outcome.result.spatialNodes > 0 || outcome.result.elements > 0) {
@@ -157,12 +219,20 @@ export function Bim() {
               filters: IFC_FILTERS,
             });
             if (dialog.canceled || dialog.paths.length === 0) break;
+            // Picked path was chosen for project A; if the user
+            // switched mid-dialog, attaching it to the (now
+            // different) `projectPath` captured at entry would
+            // bind project A's IFC to project B's DB. Abort.
+            if (projectPathRef.current !== startPath) break;
             attachPath = dialog.paths[0];
           }
           const attachResult = await attachIfcToProject(
             projectPath,
             attachPath,
           );
+          // Skip stale: don't land project A's attach result
+          // (or its toast) onto project B's UI.
+          if (projectPathRef.current !== startPath) break;
           if (attachResult.kind === "attached") {
             setIfcSourcePath(attachPath);
             addToast(
@@ -188,10 +258,26 @@ export function Bim() {
             filters: IFC_FILTERS,
           });
           if (saveResult.canceled || !saveResult.path) break;
+          // If the user project-switched while the save dialog
+          // was open, the chosen output path was picked for
+          // project A's export, but `ifcSourcePath` was reset to
+          // `null` by the per-project reset effect when the
+          // switch fired — so the `aec.bim.exportIfc` call
+          // below would either fail with an empty-source error
+          // (assertString guard) or, if the ref hasn't been
+          // updated by React yet, write project A's IFC to a
+          // path the user chose under project A's mental model.
+          // Abort to avoid both failure modes.
+          if (projectPathRef.current !== startPath) break;
           await aec.bim.exportIfc({
             sourcePath: ifcSourcePath,
             outPath: saveResult.path,
           });
+          // Skip stale success toast: announcing a project-A
+          // export on project B's UI would mislead the user.
+          // The file itself was still written to the user-chosen
+          // path; this just declines to announce it.
+          if (projectPathRef.current !== startPath) break;
           addToast("success", `IFC exported to ${saveResult.path}`);
           break;
         }
@@ -203,6 +289,10 @@ export function Bim() {
           const result = await aec.bim.validate({
             sourcePath: ifcSourcePath,
           });
+          // Skip stale: project A's findings must not land into
+          // project B's panel — the per-project reset effect
+          // already cleared `findings` to `[]` on the switch.
+          if (projectPathRef.current !== startPath) break;
           setFindings(bimReportToFindings(result));
           addToast(
             result.ok ? "success" : "info",
@@ -233,6 +323,12 @@ export function Bim() {
             projectPath,
             scheme: "ifc",
           });
+          // Skip stale: announcing project A's classify counts on
+          // project B's UI would mislead the user about which
+          // graph the counts apply to. The classify itself ran
+          // against project A's DB (bridge holds the write
+          // lock); this just declines to toast it.
+          if (projectPathRef.current !== startPath) break;
           addToast(
             "success",
             `Classified ${result.classified} entit${result.classified === 1 ? "y" : "ies"}` +
@@ -253,6 +349,12 @@ export function Bim() {
             outPath,
             kind: "room",
           });
+          // Skip stale: project A's generated XLSX rows must not
+          // land into project B's schedule preview. The file was
+          // written to disk; this just declines to read it back
+          // into UI state. The per-project reset effect already
+          // cleared `schedules` to `{}` on the switch.
+          if (projectPathRef.current !== startPath) break;
           // Read rows back from the generated file.
           let rows: ScheduleRow[] = [];
           if (summary.rows > 0) {
@@ -265,6 +367,8 @@ export function Bim() {
               // Readback failed; display empty rows.
             }
           }
+          // Re-check after the optional readback await.
+          if (projectPathRef.current !== startPath) break;
           setSchedules((prev) => ({ ...prev, room: rows }));
           addToast(
             "success",
@@ -278,15 +382,25 @@ export function Bim() {
             filters: IFC_FILTERS,
           });
           if (beforeDialog.canceled || beforeDialog.paths.length === 0) break;
+          // If the user switched projects between the two
+          // dialogs (or between the second dialog and the bridge
+          // call), the two picked snapshots were chosen under
+          // project A's mental model but the diff result will be
+          // announced on project B — abort each step that
+          // could land a stale toast on the wrong project's UI.
+          if (projectPathRef.current !== startPath) break;
           const afterDialog = await aec.dialog.openFile({
             title: "Select 'after' IFC snapshot",
             filters: IFC_FILTERS,
           });
           if (afterDialog.canceled || afterDialog.paths.length === 0) break;
+          if (projectPathRef.current !== startPath) break;
           const diffResult = await aec.bim.diff({
             beforePath: beforeDialog.paths[0],
             afterPath: afterDialog.paths[0],
           });
+          // Skip stale success toast.
+          if (projectPathRef.current !== startPath) break;
           addToast(
             "info",
             `Diff: ${diffResult.added.length} added, ${diffResult.removed.length} removed, ${diffResult.modified.length} modified`,
@@ -306,6 +420,8 @@ export function Bim() {
             outPath: boqOut,
             kind: "material",
           });
+          // Skip stale: same rationale as generateSchedule above.
+          if (projectPathRef.current !== startPath) break;
           let boqRows: ScheduleRow[] = [];
           if (boqSummary.rows > 0) {
             try {
@@ -317,6 +433,7 @@ export function Bim() {
               // Readback failed.
             }
           }
+          if (projectPathRef.current !== startPath) break;
           setSchedules((prev) => ({ ...prev, material: boqRows }));
           addToast(
             "success",

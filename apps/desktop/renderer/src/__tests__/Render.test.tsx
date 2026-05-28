@@ -551,3 +551,86 @@ describe("Render page — empty project shows empty-state, not fake cameras", ()
     enqueueSpy.mockRestore();
   });
 });
+
+/**
+ * Devin Review (commit 29c53ff, finding 3314923605) flagged that the
+ * per-project useEffect issued `aec.render.listJobs()` with `.then()`
+ * but no `.catch()`, leaving bridge rejections unhandled. Without a
+ * catch, a bridge failure (project closed mid-fetch, corrupt render-
+ * jobs row, permission denied on the render-store DB) would surface
+ * as "Uncaught (in promise)" in the renderer console — a real risk
+ * during the routine project-switch race window where the previous
+ * project's listJobs call is in flight while the new project's effect
+ * has already cleared the active path.
+ *
+ * The fix adds a silent `.catch()` matching the existing pattern on
+ * `listGraph` immediately below (Render.tsx:156) and the
+ * `StatusBar.tsx` / `Deliver.tsx` polling-tick convention: empty/
+ * last-known UI, no toast (routine project-switch races would
+ * otherwise spam transient-failure toasts). The bridge layer logs
+ * the underlying error.
+ */
+describe("Render page — listJobs bridge rejection handled silently", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("swallows aec.render.listJobs() rejection without surfacing an unhandled rejection", async () => {
+    const PATH = "/tmp/render-listjobs-reject.aecstudio";
+
+    // Mock listGraph to succeed (no cameras) so its catch path is
+    // not exercised — we want to isolate the listJobs catch.
+    vi.spyOn(aec.command, "listGraph").mockResolvedValue([]);
+
+    // Mock listJobs to always reject, regardless of how many times
+    // the effect fires (initial mount, openProject A, any future
+    // re-fire). Counting fires is fragile; mocking every call
+    // means an unhandled rejection from any of them would surface.
+    vi.spyOn(aec.render, "listJobs").mockRejectedValue(
+      new Error("simulated bridge failure"),
+    );
+
+    // Capture unhandled rejections so we can assert none surface.
+    // Without the catch in Render.tsx, the rejected promise from
+    // `aec.render.listJobs()` would surface here.
+    const unhandled: unknown[] = [];
+    const onUnhandled = (event: PromiseRejectionEvent) => {
+      unhandled.push(event.reason);
+      // Prevent jsdom from logging the rejection to console — we
+      // are intentionally exercising the catch path and recording
+      // observations in `unhandled` ourselves.
+      event.preventDefault();
+    };
+    window.addEventListener("unhandledrejection", onUnhandled);
+
+    try {
+      render(
+        <ToastProvider>
+          <ActiveProjectProvider>
+            <OpenSwitch pathA={PATH} pathB={PATH} />
+            <Render />
+          </ActiveProjectProvider>
+        </ToastProvider>,
+      );
+
+      // Wait for openProject + the per-project effect to commit.
+      // The empty-queue state must render (synchronous reset
+      // committed an empty jobs list; the rejected listJobs() did
+      // NOT overwrite it).
+      await waitFor(() => {
+        expect(screen.getByTestId("render-queue")).toHaveClass(
+          "render-queue--empty",
+        );
+      });
+
+      // Yield a few microtasks/macrotasks so any queued
+      // unhandled-rejection events fire before assertion.
+      await new Promise((r) => setTimeout(r, 50));
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(unhandled).toEqual([]);
+    } finally {
+      window.removeEventListener("unhandledrejection", onUnhandled);
+    }
+  });
+});

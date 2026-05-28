@@ -402,3 +402,157 @@ describe("Bim page — per-project state reset on project switch", () => {
     });
   });
 });
+
+/**
+ * Devin Review (commit 29c53ff, finding 3314923706) flagged that
+ * `Bim.tsx onInvoke` lacked the `projectPathRef` defense-in-depth
+ * guard that `Deliver.tsx` and `Render.tsx` already use. Today the
+ * `RequireProject` route guard unmounts the BIM page on every
+ * project transition, so a stale `setIfcSourcePath` / `setFindings`
+ * / `setSchedules` / success toast lands on a torn-down component
+ * (React 18 silently discards updates to unmounted nodes). The
+ * page is safe in production.
+ *
+ * But the route-guard umbrella is the same brittle contract the
+ * per-project reset effect chose NOT to rely on. A future in-page
+ * project picker, "switch to recent" toolbar action, or any code
+ * path that calls `openProject(...)` without forcing a route
+ * change would silently leak project A's import / classify /
+ * validate result into project B's UI — worse, a success toast
+ * saying "Classified 42 entities" against project B's mental
+ * model when the bridge call actually ran against project A's DB.
+ *
+ * The fix captures `startPath = projectPath` at the start of
+ * `onInvoke` and compares against `projectPathRef.current` after
+ * each await. This test exercises the `classify` action because
+ * it's the cleanest case (single bridge call, no
+ * `ifcSourcePath` dependency, success path is a single toast).
+ * The pattern is identical across all `onInvoke` branches.
+ */
+describe("Bim page — onInvoke skips stale results across project switches", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("does NOT surface a success toast when classify resolves after a project switch", async () => {
+    const summaryA = {
+      projectId: "proj_race_a",
+      name: "Project A",
+      path: "/tmp/bim-race-a.aecstudio",
+      templateKey: null,
+      modifiedAt: new Date().toISOString(),
+    };
+    const summaryB = {
+      projectId: "proj_race_b",
+      name: "Project B",
+      path: "/tmp/bim-race-b.aecstudio",
+      templateKey: null,
+      modifiedAt: new Date().toISOString(),
+    };
+
+    // Initial provider mount reports project A; subsequent
+    // `openProject(path)` calls swap by path.
+    const currentSpy = vi
+      .spyOn(aec.project, "current")
+      .mockResolvedValue({ summary: summaryA });
+    const openSpy = vi
+      .spyOn(aec.project, "open")
+      .mockImplementation(async (path: string) =>
+        path === summaryA.path ? summaryA : summaryB,
+      );
+
+    // Hold the classify bridge call open so the test can switch
+    // projects between dispatch and resolution. The result carries
+    // a project-A marker (high `classified` count) so the assertion
+    // can detect "A's toast landed against B" via toast text.
+    let resolveClassify:
+      | ((r: {
+          scheme: string;
+          classified: number;
+          unchanged: number;
+          skipped: number;
+          details: { entityId: string; code: string; title: string }[];
+        }) => void)
+      | null = null;
+    const classifySpy = vi.spyOn(aec.bim, "classify").mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveClassify = resolve;
+        }),
+    );
+
+    // Use a slim harness that exposes `openProject` so the test
+    // can simulate a project switch without unmounting the Bim
+    // component (which is what `RequireProject` would normally do
+    // and what makes the page safe today — but the fix is
+    // defense-in-depth for a future without that umbrella).
+    let switchProject: ((path: string) => Promise<void>) | null = null;
+    function ProjectSwitcher() {
+      const { openProject } = useActiveProject();
+      useEffect(() => {
+        switchProject = (path: string) => openProject(path);
+      }, [openProject]);
+      return null;
+    }
+
+    render(
+      <ToastProvider>
+        <ActiveProjectProvider>
+          <ProjectSwitcher />
+          <Bim />
+          <ToastContainer />
+        </ActiveProjectProvider>
+      </ToastProvider>,
+    );
+
+    // Wait for the provider mount to settle on project A.
+    await waitFor(() => {
+      expect(currentSpy).toHaveBeenCalled();
+    });
+
+    // Trigger classify on project A. The bridge call is dispatched
+    // and held open by the mock.
+    fireEvent.click(screen.getByTestId("bim-action-classify"));
+    await waitFor(() => {
+      expect(classifySpy).toHaveBeenCalledTimes(1);
+    });
+
+    // Switch to project B *while* classify is in flight. The
+    // `projectPathRef` sync useEffect fires after the provider
+    // commits the new project; `projectPathRef.current` becomes
+    // project B's path.
+    expect(switchProject).not.toBeNull();
+    await waitFor(async () => {
+      await switchProject!(summaryB.path);
+    });
+
+    // Now resolve the in-flight classify with a marker payload.
+    // The handler reads `projectPathRef.current` (now project B)
+    // vs `startPath` (project A) and skips the addToast — without
+    // this guard, "Classified 999 entities" would land on
+    // project B's UI claiming a result that ran against A's DB.
+    expect(resolveClassify).not.toBeNull();
+    await waitFor(async () => {
+      resolveClassify!({
+        scheme: "ifc",
+        classified: 999,
+        unchanged: 0,
+        skipped: 0,
+        details: [],
+      });
+      // Let the .then() microtask + setState flush.
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // The critical assertion: project A's classify success toast
+    // must NOT be in the DOM. If the guard failed, the text
+    // "Classified 999 entities" would appear in a toast.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(screen.queryByText(/Classified 999 entit/)).not.toBeInTheDocument();
+
+    classifySpy.mockRestore();
+    currentSpy.mockRestore();
+    openSpy.mockRestore();
+  });
+});

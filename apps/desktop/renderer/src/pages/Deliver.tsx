@@ -174,6 +174,19 @@ export function Deliver(): JSX.Element {
     setExportResult(null);
     setComparing(false);
     setExporting(false);
+    // Also reset `defaultThreadId` synchronously here so the
+    // KChatReviewPanel doesn't render project A's thread for up to
+    // one `STATUS_POLL_INTERVAL_MS` window after switching to
+    // project B. The polling effect below re-keys on `project?.path`
+    // and fires an immediate re-poll on switch, but the previous
+    // poll's resolved value would otherwise survive until the new
+    // poll's promise resolves (typically <1 frame, but a slow
+    // bridge could stretch this to seconds). Falling back to
+    // `FALLBACK_THREAD_ID` (the same constant the bridge publisher
+    // uses when `default_thread_id` is unset on a fresh project)
+    // keeps the panel functional during the brief gap between
+    // reset and first new-project poll resolution.
+    setDefaultThreadId(null);
     void aec.deliver
       .listRevisions()
       .then((rs) => {
@@ -203,6 +216,18 @@ export function Deliver(): JSX.Element {
   // Failures are swallowed: the panel keeps showing the last-known
   // thread (or the fallback constant) rather than flickering on a
   // single missed poll.
+  //
+  // Re-keyed on `project?.path` so a project switch fires an
+  // immediate re-poll (the previous interval is torn down by the
+  // cleanup return). Without this re-keying, the polling effect's
+  // mount-only deps `[]` meant a switch from project A to project
+  // B would wait up to `STATUS_POLL_INTERVAL_MS` (5 seconds) for
+  // the next tick to fetch project B's thread — during which
+  // `KChatReviewPanel` would render project A's thread (or the
+  // fallback after the per-project reset effect's
+  // `setDefaultThreadId(null)` above). Re-keying converts that
+  // 5-second gap to a single bridge round-trip (~1 frame in
+  // production, instant in the vitest in-process backend).
   useEffect(() => {
     let cancelled = false;
     const tick = async () => {
@@ -221,7 +246,7 @@ export function Deliver(): JSX.Element {
       cancelled = true;
       window.clearInterval(id);
     };
-  }, []);
+  }, [project?.path]);
 
   // Reseed deliverables when the kind changes. The exported hook keeps
   // the reseed logic colocated with `defaultDeliverablesFor` so the two
@@ -291,6 +316,32 @@ export function Deliver(): JSX.Element {
       // from overwriting that.
       if (projectPathRef.current !== startPath) return;
       setDiff(d);
+    } catch (err) {
+      // Surface compare failures via toast so the user knows why no
+      // diff appeared. Without this, a bridge rejection (corrupt
+      // revision row, permission denied on the deliver-store DB,
+      // locked SQLCipher transaction) would surface as a silent
+      // "Uncaught (in promise)" in the renderer console while the
+      // UI just sat with the previous diff. Mirrors the
+      // `addToast("error", ...)` pattern used by `onBuildPack`
+      // below (and `Bim.tsx onInvoke`'s outer catch) so all three
+      // async handlers on this page share one user-visible error
+      // contract.
+      //
+      // Toast unconditionally — errors are project-agnostic UX.
+      // Even if the user project-switched while the
+      // `compareRevisions` bridge call was in flight, the failure
+      // still describes "your last compare action failed" which is
+      // useful regardless of the active project. Matches
+      // `onBuildPack`'s catch (which also toasts unconditionally),
+      // diverging only from the success-path setState which IS
+      // gated on path-match (a stale success result on project B
+      // would mislead, but a stale failure tells the user their
+      // recent action did not produce a diff — still accurate).
+      addToast(
+        "error",
+        `Compare failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
     } finally {
       // Mirror the path guard: if the project switched, the per-
       // project reset effect already cleared `comparing` to false,
