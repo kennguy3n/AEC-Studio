@@ -20,11 +20,21 @@
  *      close would break the Home screen's "recently opened" list
  *      and force the user to re-pick the file every session.
  *
- *   3. `onActiveProjectChange(...)` fires synchronously on every
- *      transition (open / create / save of the active project /
- *      close). This mirrors the main-process `onActiveProjectChange`
- *      notification contract so the renderer hook's push
- *      subscription is exercised under vitest, not just stubbed.
+ *   3. `onActiveProjectChange(...)` fires on every transition
+ *      (open / create / save of the active project / close).
+ *      Delivery is deferred to a macrotask to match Electron IPC
+ *      semantics in production (Chromium dispatches webContents.send
+ *      and the invoke-response on separate macrotask boundaries; the
+ *      renderer's microtask drain runs BETWEEN them). This ordering
+ *      is what lets `useActiveProject`'s listener path-equality
+ *      guard correctly skip the redundant write triggered by
+ *      `openProject`/`createProject`/`saveProject`/`closeProject`
+ *      itself — their continuation has already committed the new
+ *      `projectPathRef` by the time the listener fires. Tests that
+ *      assert on listener side-effects therefore await one macrotask
+ *      tick (`await new Promise((r) => setTimeout(r, 0))`) after
+ *      the last transition so the deferred listener callbacks have
+ *      a chance to run.
  */
 
 import { describe, expect, it } from "vitest";
@@ -135,7 +145,7 @@ describe("rendererInProcessBackend — project lifecycle", () => {
     expect((await b.project.current()).summary?.path).toBe(other.path);
   });
 
-  it("onActiveProjectChange fires synchronously on every transition with the latest summary", async () => {
+  it("onActiveProjectChange fires asynchronously after every transition with the latest summary", async () => {
     const b = rendererInProcessBackend();
 
     type ChangeEvent =
@@ -156,6 +166,15 @@ describe("rendererInProcessBackend — project lifecycle", () => {
     await b.project.save(opened.path);
     await b.project.close();
 
+    // Drain the macrotask queue so the deferred listener callbacks
+    // queued by the four transitions above have run. Without this
+    // tick the assertion would observe only 0 events because the
+    // backend defers listener iteration to `setTimeout(..., 0)` to
+    // match Electron IPC's macrotask delivery semantics (see
+    // `notifyActiveChange` in renderer-backend.ts for the
+    // production-parity rationale).
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
     expect(events).toEqual([
       { kind: "set", path: summary.path },
       { kind: "set", path: opened.path },
@@ -165,8 +184,16 @@ describe("rendererInProcessBackend — project lifecycle", () => {
 
     unsubscribe();
 
-    // After unsubscribe, no further events should arrive.
+    // After unsubscribe, no further events should arrive. The
+    // listener removal happens BEFORE the next transition's
+    // deferred macrotask fires; the in-process backend re-reads
+    // listener membership at iteration time (via `Array.from`) so
+    // the unsubscribed listener is dropped before any callback
+    // would have run. This matches production's
+    // `ipcRenderer.off(...)` semantics where the removal lands
+    // before the queued IPC event reaches the dispatcher.
     await b.project.createFromTemplate("apartment", "AfterUnsubscribe");
+    await new Promise((resolve) => setTimeout(resolve, 0));
     expect(events.length).toBe(4);
   });
 
@@ -182,6 +209,9 @@ describe("rendererInProcessBackend — project lifecycle", () => {
     });
 
     const summary = await b.project.createFromTemplate("apartment", "Resilient");
+    // Drain the deferred listener iteration (see
+    // notifyActiveChange's macrotask defer rationale).
+    await new Promise((resolve) => setTimeout(resolve, 0));
     expect(seen).toEqual([summary.path]);
 
     unsubA();

@@ -310,6 +310,21 @@ export function ActiveProjectProvider({
           dirtyRef.current &&
           projectPathRef.current !== null
         ) {
+          // Self-reference is intentional. ESLint's
+          // `react-hooks/exhaustive-deps` does not flag this because
+          // `armAutoSave` is stable (empty dep array) by design — it
+          // never closes over reactive state, only over module-scoped
+          // `AUTO_SAVE_RETRY_DELAYS_MS` and the refs declared above.
+          // The recursive call therefore always invokes the same
+          // identity function and creates a fresh `setTimeout`
+          // callback with `attempt + 1` captured in its closure. The
+          // alternative (mutable ref for the counter) was tried and
+          // rejected: see the comment block above (lines 229-240) —
+          // it broke escalation because `cancelPendingAutoSave()`
+          // fires inside `saveProject`'s entry (still inside this
+          // timer callback's lifetime) and would wipe the counter
+          // before the catch could observe it. Closure-captured
+          // `attempt` is immune to that race.
           armAutoSave(attempt + 1);
         }
       });

@@ -1861,3 +1861,151 @@ describe("useActiveProject — auto-save retries with exponential backoff on fai
     saveSpy.mockRestore();
   });
 });
+
+describe("useActiveProject — push listener does not cause a double commit on openProject", () => {
+  it("openProject commits state exactly once (production-like timing): listener path-equality guard correctly skips the redundant push", async () => {
+    // Devin Review (finding 3314624754) flagged that in the in-process
+    // backend, `onActiveProjectChange` listeners formerly fired
+    // synchronously inside `upsert()` — BEFORE the awaiter's
+    // continuation in `useActiveProject.openProject` had a chance to
+    // call `updateProject(summary)` and commit `projectPathRef`. The
+    // listener's path-equality guard (useActiveProject.tsx:370) would
+    // then observe a STALE `projectPathRef` value, fail the
+    // equality check, and call `updateProject(summary)` itself —
+    // causing a second React commit that production never sees
+    // (because Electron IPC delivers the push notification on a
+    // macrotask boundary that lands AFTER the openProject
+    // continuation's microtask drain).
+    //
+    // The fix landed in renderer-backend.ts: `notifyActiveChange`
+    // defers listener iteration to `setTimeout(..., 0)`, which is
+    // strictly after every microtask boundary including the
+    // continuation. This test pins the post-fix contract: each
+    // `openProject` invocation must produce exactly one `project`
+    // identity change (one render where `project?.path` changed),
+    // not two.
+    //
+    // The component below counts only those renders where `project`
+    // changed identity (not every render — context value identity
+    // change can re-render children even when their relevant slice
+    // didn't change). That's the production-relevant metric: how
+    // many times did the consumer see a NEW project summary?
+    const projectIdentityCounts: Array<string | null> = [];
+    function ProjectIdentitySpy() {
+      const { project } = useActiveProject();
+      // Record the path on every render. We then count distinct
+      // adjacent values to determine commits-that-changed-project.
+      projectIdentityCounts.push(project?.path ?? null);
+      return null;
+    }
+    function Harness() {
+      const { openProject } = useActiveProject();
+      useEffect(() => {
+        void openProject("/tmp/single-commit.aecstudio");
+      }, [openProject]);
+      return null;
+    }
+
+    render(
+      <ActiveProjectProvider>
+        <Harness />
+        <ProjectIdentitySpy />
+      </ActiveProjectProvider>,
+    );
+
+    // Wait for the openProject promise to resolve and the listener
+    // macrotask to fire. `waitFor` retries with a short interval so
+    // we cover both the openProject continuation commit and any
+    // additional commits the listener might have caused.
+    await waitFor(() =>
+      expect(
+        projectIdentityCounts.includes("/tmp/single-commit.aecstudio"),
+      ).toBe(true),
+    );
+    // Extra macrotask drain so any deferred listener iteration has
+    // definitely run. If the listener were going to spuriously
+    // re-commit, it would have done so by this point.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    // Reduce the per-render snapshots to a list of distinct adjacent
+    // project paths. Each transition counts as one "project-changed
+    // commit"; everything between is a stable-identity commit (which
+    // we don't count against this test, as `value` memo identity can
+    // legitimately change without `project` changing).
+    const projectTransitions: Array<string | null> = [];
+    for (const path of projectIdentityCounts) {
+      if (
+        projectTransitions.length === 0 ||
+        projectTransitions[projectTransitions.length - 1] !== path
+      ) {
+        projectTransitions.push(path);
+      }
+    }
+
+    // Expected transitions: initial null (from `useState(null)`) →
+    // "/tmp/single-commit.aecstudio" (from openProject's
+    // updateProject). The push listener MUST NOT cause a third
+    // transition (it would be a redundant re-commit of the same
+    // path, but React schedules a render anyway because `setProject`
+    // is called with a different object reference). Two transitions
+    // total = correct; three = the regression.
+    expect(projectTransitions).toEqual([null, "/tmp/single-commit.aecstudio"]);
+  });
+
+  it("createProject commits state exactly once (same production-parity contract)", async () => {
+    // createProject follows the same flow as openProject — the
+    // listener path-equality guard must skip the push because the
+    // continuation has already committed `projectPathRef` before
+    // the deferred listener fires. Test the create flow explicitly
+    // so future refactors of `createFromTemplate` don't accidentally
+    // diverge from the production-parity contract.
+    const projectIdentityCounts: Array<string | null> = [];
+    function ProjectIdentitySpy() {
+      const { project } = useActiveProject();
+      projectIdentityCounts.push(project?.path ?? null);
+      return null;
+    }
+    function Harness() {
+      const { createProject } = useActiveProject();
+      useEffect(() => {
+        void createProject("apartment", "SingleCommitCreate");
+      }, [createProject]);
+      return null;
+    }
+
+    render(
+      <ActiveProjectProvider>
+        <Harness />
+        <ProjectIdentitySpy />
+      </ActiveProjectProvider>,
+    );
+
+    await waitFor(() =>
+      expect(
+        projectIdentityCounts.some((p) => p?.includes("singlecommitcreate")),
+      ).toBe(true),
+    );
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const projectTransitions: Array<string | null> = [];
+    for (const path of projectIdentityCounts) {
+      if (
+        projectTransitions.length === 0 ||
+        projectTransitions[projectTransitions.length - 1] !== path
+      ) {
+        projectTransitions.push(path);
+      }
+    }
+
+    // Initial null → created project path. Exactly two transitions.
+    expect(projectTransitions.length).toBe(2);
+    expect(projectTransitions[0]).toBe(null);
+    expect(projectTransitions[1]).toMatch(/singlecommitcreate/);
+  });
+});

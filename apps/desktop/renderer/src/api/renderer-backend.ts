@@ -49,24 +49,63 @@ export function rendererInProcessBackend(): AecApi {
   // Listeners subscribed via `project.onActiveProjectChange`. The
   // in-process backend mirrors the main-process `active-project.ts`
   // notification contract: every transition (open / create / save of
-  // the active project / close) fires `notifyActiveChange()`
-  // synchronously with the latest summary (or `null` for close).
-  // This lets the renderer hook's push-subscription useEffect exercise
-  // the same code path under vitest that production exercises against
-  // the real Electron IPC channel.
+  // the active project / close) fires `notifyActiveChange()` with
+  // the latest summary (or `null` for close). This lets the renderer
+  // hook's push-subscription useEffect exercise the same code path
+  // under vitest that production exercises against the real Electron
+  // IPC channel.
+  //
+  // Production-timing parity: in Electron, `webContents.send(
+  // "project:active-changed", summary)` from the main process is
+  // delivered to the renderer via a Chromium IPC dispatch on a
+  // macrotask boundary. The corresponding `ipcRenderer.invoke`
+  // response that resolves the awaiter's promise is delivered on a
+  // SEPARATE macrotask boundary; the renderer's microtask drain
+  // (await continuations) runs BETWEEN the two. As a result, the
+  // push listener in production fires AFTER
+  // `useActiveProject.openProject`'s continuation has already called
+  // `updateProject(summary)` and committed `projectPathRef`, so the
+  // listener's path-equality guard (see useActiveProject.tsx:370)
+  // correctly skips the redundant write and there is no double
+  // commit.
+  //
+  // To match this exactly under vitest, we defer the listener
+  // iteration to a macrotask (`setTimeout(..., 0)`). Without the
+  // defer, the listeners would fire synchronously inside `upsert()`
+  // — BEFORE the awaiter's continuation runs — and the path-equality
+  // guard would observe a stale `projectPathRef`, causing a spurious
+  // second commit that production never sees. Tests that need to
+  // assert on listener side-effects await one macrotask tick (e.g.
+  // `await new Promise((r) => setTimeout(r, 0))`) before reading the
+  // observed events, mirroring the way a real renderer would let the
+  // IPC channel drain.
+  //
+  // The summary snapshot is captured *eagerly* (at call time, not at
+  // listener-invocation time) so the listener sees the state that
+  // was active when the transition happened. This matches
+  // production where the main process serialises the summary into
+  // the IPC payload at send time, not at receive time. Listener
+  // membership IS re-read at invocation time (via `Array.from`), so
+  // a late `unsubscribe()` that lands between queue and run still
+  // drops the callback — matching the production semantics of
+  // `ipcRenderer.off` removing the listener before the queued IPC
+  // event reaches it.
   const activeListeners = new Set<(s: Recent | null) => void>();
   const notifyActiveChange = () => {
     const snapshot = current === null ? null : { ...current };
-    for (const l of Array.from(activeListeners)) {
-      try {
-        l(snapshot);
-      } catch {
-        // Match the main-process tracker's defensive try/catch — a
-        // listener throwing must not corrupt other listeners or the
-        // backend state. Production has no global handler that would
-        // catch a sync throw out of `ipcRenderer.on(...)`.
+    setTimeout(() => {
+      for (const l of Array.from(activeListeners)) {
+        try {
+          l(snapshot);
+        } catch {
+          // Match the main-process tracker's defensive try/catch — a
+          // listener throwing must not corrupt other listeners or
+          // the backend state. Production has no global handler
+          // that would catch a sync throw out of
+          // `ipcRenderer.on(...)`.
+        }
       }
-    }
+    }, 0);
   };
   let nextId = 1;
   const newId = (prefix: string) =>
