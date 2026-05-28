@@ -152,6 +152,31 @@ export function Render() {
     setCameras(EMPTY_CAMERAS);
     setSelectedCameras(new Set());
     setJobs([]);
+    // RenderDoctor state is per-project too: `doctorJobId` is a job
+    // identifier issued by the previous project's render store and
+    // `doctorSuggestions` is the diagnostic output for that specific
+    // job. Without clearing them on transition, RenderDoctor would
+    // receive `jobId={doctorJobId ?? jobs[0]?.jobId ?? null}` where
+    // the stale `doctorJobId` non-null shadows the now-empty
+    // `jobs[0]?.jobId` fallback — so the panel addresses a render
+    // job in project A's store while the user is staring at project
+    // B's queue. The `<select>` for picking a specific job also
+    // shows the stale ID as its `value` while its options list
+    // (derived from the now-empty `jobs`) contains only "(latest)";
+    // any subsequent `aec.render.diagnose` call keyed off the stale
+    // ID would either fail (job not in B's store) or — worse — hit
+    // a coincidentally-existing job ID and surface unrelated
+    // diagnostic output as if it described project B's last render.
+    // Completes the reset pattern so RenderDoctor transitions
+    // together with cameras / selectedCameras / jobs and Render's
+    // entire per-project state surface is closed under project
+    // switch — matching the established convention in `Bim.tsx`
+    // (ifcSourcePath/root/selectedId/psets/schedules/findings),
+    // `Deliver.tsx` (revisions/baseId/headId/diff/exportResult/
+    // comparing/exporting/defaultThreadId), and `Draft.tsx`
+    // (activeTool/layers/sheets/activeSheet/log).
+    setDoctorJobId(null);
+    setDoctorSuggestions([]);
     // Gate every bridge fetch on a live project. Both `listJobs` and
     // `listGraph` are project-scoped queries: with no active project,
     // the native handlers have no DB to address and the fallback

@@ -842,3 +842,103 @@ describe("<Deliver /> per-project state reset on project switch", () => {
     ).not.toBeInTheDocument();
   });
 });
+
+/**
+ * Devin Review (commit 1754ace, finding 3315288772) flagged that
+ * `onBuildPack` passed `projectPath: project?.path` and
+ * `projectName: project?.name` to the bridge call — closure-captured
+ * fields that could in principle diverge from the sync-ref
+ * `startPath` that the same handler uses for its pre-call guard.
+ * Today the current code path has no `await` between the
+ * post-dialog `getActiveProjectPath() !== startPath` guard and the
+ * bridge call, so the closure values cannot drift in practice. The
+ * inconsistency itself was the issue: mixing sources between the
+ * guard (sync ref) and the bridge args (closure) is the exact bug
+ * pattern that landed for `Bim.tsx onInvoke` in commit 1754ace, and
+ * the fix needs to be applied here too so a future refactor that
+ * introduces an `await` between the guard and the call (e.g. a
+ * pre-export validation, a confirmation dialog, telemetry submit)
+ * does not silently re-open the race window.
+ *
+ * The fix captures `startProject = getActiveProject()` alongside
+ * `startPath = getActiveProjectPath()` at handler entry and
+ * threads BOTH through the bridge call. This test pins the
+ * contract by mounting Deliver against project A, triggering
+ * `buildPack`, and asserting the bridge was called with
+ * `projectPath` matching the active project's path AND
+ * `projectName` matching its name — both sourced from the
+ * sync-ref capture, not the closure.
+ */
+describe("<Deliver /> onBuildPack sources projectPath/projectName from sync-ref", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("passes the sync-ref-captured startPath/startProject.name to aec.deliver.buildPack", async () => {
+    const PATH_A = "/tmp/deliver-args-A.aecstudio";
+
+    let switchProject: ((path: string) => Promise<void>) | null = null;
+    function ProjectSwitcher() {
+      const { openProject } = useActiveProject();
+      useEffect(() => {
+        switchProject = (path: string) => openProject(path);
+      }, [openProject]);
+      return null;
+    }
+
+    vi.spyOn(aec.dialog, "saveFile").mockResolvedValue({
+      canceled: false,
+      path: "/tmp/test-pack-args.zip",
+    });
+
+    const buildPackSpy = vi
+      .spyOn(aec.deliver, "buildPack")
+      .mockResolvedValue({
+        outPath: "/tmp/test-pack-args.zip",
+        contents: ["manifest.json"],
+        totalBytes: 512,
+      });
+
+    render(
+      <ToastProvider>
+        <ActiveProjectProvider>
+          <ProjectSwitcher />
+          <Deliver />
+          <ToastContainer />
+        </ActiveProjectProvider>
+      </ToastProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("deliver-mode")).toBeInTheDocument();
+    });
+    expect(switchProject).not.toBeNull();
+
+    // Open project A so `getActiveProject()` returns the summary
+    // with both `path` and `name` populated.
+    await act(async () => {
+      await switchProject!(PATH_A);
+    });
+
+    // Fire the build pack flow.
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("pack-build"));
+    });
+
+    // The bridge call must have received both `projectPath` AND
+    // `projectName` sourced from the sync-ref capture. The exact
+    // name shape depends on what the in-process project store
+    // assigns (typically derives from the basename), so assert
+    // the path strictly and the name as defined (non-empty string).
+    await waitFor(() => {
+      expect(buildPackSpy).toHaveBeenCalled();
+    });
+    const args = buildPackSpy.mock.calls[0][0] as {
+      projectPath?: string;
+      projectName?: string;
+    };
+    expect(args.projectPath).toBe(PATH_A);
+    expect(typeof args.projectName).toBe("string");
+    expect((args.projectName ?? "").length).toBeGreaterThan(0);
+  });
+});

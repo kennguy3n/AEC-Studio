@@ -51,7 +51,7 @@ const FALLBACK_THREAD_ID = "kchat-default";
 const STATUS_POLL_INTERVAL_MS = 5_000;
 
 export function Deliver(): JSX.Element {
-  const { project, getActiveProjectPath } = useActiveProject();
+  const { project, getActiveProjectPath, getActiveProject } = useActiveProject();
   const { addToast } = useToast();
   const [kind, setKind] = useState<PackKind>("concept");
   const [deliverables, setDeliverables] = useState<PackDeliverables>(() =>
@@ -351,7 +351,22 @@ export function Deliver(): JSX.Element {
 
   const onBuildPack = async () => {
     if (!selectedTarget) return;
+    // Capture BOTH the sync-ref path AND the sync-ref summary at
+    // handler entry. Reading `project?.path` / `project?.name` from
+    // the closure here would see the value as of the render that
+    // produced this onBuildPack identity; if a project transition
+    // landed between that render and this handler firing, the
+    // closure-captured fields would describe a different project
+    // than the `getActiveProjectPath()` checks below detect. Using
+    // the sync getters makes every read in this handler — both the
+    // guard comparisons and the bridge-call arguments — share one
+    // source of truth (`projectPathRef` / `projectSummaryRef`),
+    // which `updateProject` writes synchronously at the same call
+    // site so they cannot drift. Matches the `startPath` pattern
+    // landed in `Bim.tsx onInvoke` (see the long-form rationale
+    // there for the timing analysis).
     const startPath = getActiveProjectPath();
+    const startProject = getActiveProject();
     // Open a save dialog so the user can choose the output path.
     const dialog = await aec.dialog.saveFile({
       title: `Export ${kind} pack`,
@@ -373,17 +388,33 @@ export function Deliver(): JSX.Element {
       const result = await aec.deliver.buildPack({
         kind,
         outPath: dialog.path,
-        // Pass `projectPath` explicitly even though the main-process
-        // IPC handler falls back to `peekActiveProjectPath()` when it
-        // is omitted. Threading it through here matches the pattern
-        // every other page (BIM, Draft, Render) follows: the page
-        // *owns* the active-project reference via `useActiveProject`,
-        // and the IPC handler's fallback is defense-in-depth, not the
-        // primary path. Without this, a future refactor that drops
-        // the IPC fallback (e.g. to support multi-project workspaces)
-        // would silently break Deliver export but no other page.
-        projectPath: project?.path,
-        projectName: project?.name,
+        // Source `projectPath` / `projectName` from the sync-ref
+        // captures at handler entry (`startPath` / `startProject`)
+        // rather than the closure-captured `project?.path` /
+        // `project?.name`. The current code path has no `await`
+        // between the post-dialog `getActiveProjectPath() !== startPath`
+        // guard above and this bridge call, so a closure read would
+        // also be safe today — but mixing sources between the guard
+        // (sync ref) and the bridge args (closure) is the exact
+        // inconsistency Devin Review flagged in `Bim.tsx onInvoke`
+        // and that we just closed there. Threading `startPath` /
+        // `startProject` keeps Deliver structurally aligned with BIM
+        // so a future refactor that introduces an `await` between
+        // the guard and the call (e.g. a pre-export validation
+        // round-trip, a confirmation dialog, telemetry submit) does
+        // not silently re-open the race window.
+        //
+        // Threading the project explicitly (not relying on the IPC
+        // handler's `peekActiveProjectPath()` fallback) also matches
+        // the pattern every other page (BIM, Draft, Render) follows:
+        // the page *owns* the active-project reference via
+        // `useActiveProject`, and the IPC handler's fallback is
+        // defense-in-depth, not the primary path. Without this, a
+        // future refactor that drops the IPC fallback (e.g. to
+        // support multi-project workspaces) would silently break
+        // Deliver export but no other page.
+        projectPath: startPath ?? undefined,
+        projectName: startProject?.name,
         includeRenders: deliverables.renders,
         includeSheets: deliverables.sheets,
         includeIfc: deliverables.ifc,

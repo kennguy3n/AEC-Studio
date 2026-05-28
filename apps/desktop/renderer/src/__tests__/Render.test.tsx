@@ -792,3 +792,143 @@ describe("Render page — enqueueAll skips stale toasts/commits across project s
     expect(screen.queryByText(/Queued 1 render/)).not.toBeInTheDocument();
   });
 });
+
+/**
+ * Devin Review (commit 1754ace) flagged that the per-project reset
+ * effect cleared `cameras` / `selectedCameras` / `jobs` on project
+ * switch but left `doctorJobId` and `doctorSuggestions` carrying
+ * across — leaking stale diagnostic data from project A into
+ * project B's RenderDoctor panel.
+ *
+ *   - `doctorJobId` is a job identifier issued by project A's render
+ *     store. Surfacing it as `jobId={doctorJobId ?? jobs[0]?.jobId ?? null}`
+ *     after switching to project B addresses a job that does not
+ *     exist in B's store; a subsequent `Diagnose` click would either
+ *     fail (job not found) or — worse — hit a coincidental ID in B's
+ *     store and surface unrelated diagnostic output as if it
+ *     described B's last render.
+ *   - `doctorSuggestions` is the diagnostic output for project A's
+ *     job and would render under B's UI with no indication it
+ *     describes a different project.
+ *
+ * The fix adds `setDoctorJobId(null)` and `setDoctorSuggestions([])`
+ * to the synchronous reset block so RenderDoctor's full per-project
+ * state surface transitions together with `cameras` / `jobs` —
+ * matching the established convention in `Bim.tsx` (ifcSourcePath
+ * et al), `Deliver.tsx` (revisions/diff/exportResult et al), and
+ * `Draft.tsx` (activeTool/layers/sheets et al).
+ *
+ * This test pins the contract by selecting a doctor job + producing
+ * suggestions in project A, switching to project B, and asserting:
+ *   1. The doctor-job picker `<select>` value === "" (doctorJobId
+ *      reset to null).
+ *   2. The doctor-empty placeholder renders (suggestions.length === 0
+ *      AND jobId === null, which is the empty-state condition in
+ *      RenderDoctor.tsx).
+ *   3. No `render-doctor-item-*` rows remain.
+ */
+describe("Render page — project switch resets RenderDoctor state", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("clears doctorJobId and doctorSuggestions on project switch", async () => {
+    const PATH_A = "/tmp/render-doctor-A.aecstudio";
+    const PATH_B = "/tmp/render-doctor-B.aecstudio";
+
+    // Project A has one render job; project B has none. The
+    // in-process backend mirrors the active-project path through its
+    // own `current` state, but the page also calls `listJobs()` after
+    // its own per-project effect commits — easier and more direct to
+    // count `listJobs` invocations: the first call (project A's
+    // mount) returns A's job; subsequent calls (project B's switch)
+    // return empty. The page's `[project?.path]` deps fire the
+    // effect once per transition, so this seq matches the user flow.
+    let listJobsCall = 0;
+    vi.spyOn(aec.render, "listJobs").mockImplementation(async () => {
+      listJobsCall += 1;
+      if (listJobsCall === 1) {
+        return [
+          {
+            jobId: "job_A_diagnose",
+            status: "completed",
+            startedAt: 0,
+            completedAt: 1,
+            durationMs: 1,
+            elapsedMs: 1,
+            errorCode: null,
+            errorMessage: null,
+          },
+        ];
+      }
+      return [];
+    });
+    vi.spyOn(aec.command, "listGraph").mockResolvedValue([]);
+
+    // Diagnose response — surfaces as suggestions under project A.
+    vi.spyOn(aec.render, "diagnose").mockResolvedValue({
+      suggestions: [
+        {
+          code: "tier.downgrade",
+          severity: "warning",
+          message: "Rendered at lower preset due to thermal throttle.",
+          fix: null,
+          materialId: null,
+        },
+      ],
+    });
+
+    render(
+      <ToastProvider>
+        <ActiveProjectProvider>
+          <OpenSwitch pathA={PATH_A} pathB={PATH_B} />
+          <Render />
+        </ActiveProjectProvider>
+      </ToastProvider>,
+    );
+
+    // Wait for project A's job to land in the queue, then the
+    // doctor-job-picker options.
+    await waitFor(() => {
+      expect(screen.getByTestId("render-job-job_A_diagnose")).toBeInTheDocument();
+    });
+
+    // Pick the job in the doctor picker → setDoctorJobId.
+    const picker = screen.getByTestId(
+      "render-doctor-job-picker",
+    ) as HTMLSelectElement;
+    fireEvent.change(picker, { target: { value: "job_A_diagnose" } });
+    expect(picker.value).toBe("job_A_diagnose");
+
+    // Run diagnose → setDoctorSuggestions populated.
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("render-doctor-diagnose"));
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId("render-doctor-item-0")).toBeInTheDocument();
+    });
+
+    // Switch to project B. The per-project reset effect must clear
+    // doctorJobId AND doctorSuggestions synchronously, alongside
+    // cameras / jobs.
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("switch-to-B"));
+    });
+
+    await waitFor(() => {
+      // (1) doctor-job-picker value reset to "" — doctorJobId cleared.
+      expect(
+        (screen.getByTestId("render-doctor-job-picker") as HTMLSelectElement)
+          .value,
+      ).toBe("");
+      // (2) Empty-state placeholder renders — suggestions.length === 0
+      //     AND jobId === null (jobs is also empty for project B, so
+      //     the `jobs[0]?.jobId ?? null` fallback resolves to null).
+      expect(
+        screen.getByTestId("render-doctor-empty"),
+      ).toBeInTheDocument();
+      // (3) No stale suggestion rows remain in the DOM.
+      expect(screen.queryByTestId("render-doctor-item-0")).toBeNull();
+    });
+  });
+});
