@@ -51,6 +51,36 @@ export interface ActiveProjectState {
 
 const ActiveProjectContext = createContext<ActiveProjectState | null>(null);
 
+// Auto-save retry backoff schedule. The first auto-save (or any
+// auto-save that fires after a user mutation or a successful save)
+// uses the 5s default; consecutive failures escalate through this
+// table and cap at the last value, so we keep retrying every 5
+// minutes indefinitely until the underlying cause resolves
+// (transient: disk pressure, anti-virus lock, network drive blip;
+// permanent: disk full, permission revoked — those require user
+// intervention which is signalled via the StatusBar's persistent
+// "Unsaved" badge).
+//
+// Why an explicit table rather than `2 ** n * 5_000`: the user-
+// facing semantics ("retry within 10s, then 30s, then a minute")
+// are easier to reason about and pin in tests than an exponential
+// formula that crosses a perceptible threshold somewhere between
+// n=4 and n=5. The cap on the final element prevents the runaway
+// "retry in 8 days" behaviour that a pure exponential would reach
+// if the user leaves a project open for a week.
+//
+// Module-scoped (rather than declared inside the provider) so
+// `armAutoSave`'s `useCallback([])` does not need to list it as a
+// dep — the array identity must be stable for the hook's identity
+// guarantee to hold across renders.
+export const AUTO_SAVE_RETRY_DELAYS_MS = [
+  5_000,
+  10_000,
+  30_000,
+  60_000,
+  300_000,
+] as const;
+
 export function useActiveProject(): ActiveProjectState {
   const ctx = useContext(ActiveProjectContext);
   if (ctx === null) {
@@ -73,6 +103,7 @@ export function ActiveProjectProvider({
   const [undoLen, setUndoLen] = useState(0);
   const [redoLen, setRedoLen] = useState(0);
   const autoSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
 
   // Mirror `dirty` into a ref so stable callbacks (`armAutoSave`,
   // open/create catch blocks) can read the latest value without
@@ -196,6 +227,17 @@ export function ActiveProjectProvider({
   // address the wrong project. Centralizing the cancel in one helper
   // ensures future project-transition branches (e.g., "switch to
   // recent") inherit the guarantee without re-deriving it.
+  //
+  // Note this only clears the *timer* slot. It deliberately does NOT
+  // touch the backoff state, which lives in the closure-captured
+  // `attempt` argument of the most recent `armAutoSave` call. The
+  // `armAutoSave(0)` re-arm in `markDirty` and in the catch blocks
+  // of open/create/close establishes the fresh-cadence semantics
+  // explicitly; conflating that into `cancelPendingAutoSave` would
+  // (and previously did) corrupt the retry escalation by resetting
+  // the captured attempt from inside `saveProject`'s entry-cancel,
+  // which fires inside the auto-save timer callback itself — the
+  // very place we need the escalated attempt to survive.
   const cancelPendingAutoSave = useCallback(() => {
     if (autoSaveTimerRef.current !== null) {
       clearTimeout(autoSaveTimerRef.current);
@@ -203,29 +245,75 @@ export function ActiveProjectProvider({
     }
   }, []);
 
-  // Arm (or re-arm) the 5s debounced auto-save timer. Used by
-  // `markDirty` on every mutation and by the open/create catch
+  // Arm (or re-arm) the debounced auto-save timer. Used by
+  // `markDirty` on every mutation, by the open/create/close catch
   // blocks to restore auto-save protection when a project transition
-  // fails mid-flight. Kept stable (empty dep array) by dispatching
-  // through `saveProjectRef` rather than capturing `saveProject`
-  // directly — this preserves the identity of every callback that
-  // depends on `armAutoSave` (including `openProject`/`createProject`),
-  // so consumer `useEffect`s that list them don't refire on every
+  // fails mid-flight, and by the timer callback itself on auto-save
+  // failure to keep retrying with exponential backoff. Kept stable
+  // (empty dep array) by dispatching through `saveProjectRef` rather
+  // than capturing `saveProject` directly — this preserves the
+  // identity of every callback that depends on `armAutoSave`
+  // (including `openProject`/`createProject`/`closeProject`), so
+  // consumer `useEffect`s that list them don't refire on every
   // dirty-flag flip.
-  const armAutoSave = useCallback(() => {
+  //
+  // `attempt` selects the delay from `AUTO_SAVE_RETRY_DELAYS_MS`.
+  // Default `0` (the 5s normal-cadence slot) is what every
+  // user-driven caller wants — markDirty, catch-rearm, etc. —
+  // because those represent *fresh* save events that should start
+  // from the natural debounce, not inherit backoff from a previous
+  // failed cycle. Only the failure path inside the timer callback
+  // itself escalates `attempt + 1`.
+  //
+  // Walk-away data-loss prevention: prior to retry, the only path
+  // back from a failed auto-save was the next user mutation calling
+  // `markDirty` to re-arm. A user who walked away after the failed
+  // save would never get another save attempt, even if the failure
+  // cause (network blip on a mapped network drive, brief disk
+  // pressure, anti-virus mid-scan lock) cleared 30 seconds later.
+  // The retry schedule closes that window: as long as the project
+  // remains dirty and active, we keep retrying the persistence,
+  // bounded at the cap so we never spin a hot loop on a permanent
+  // failure mode.
+  const armAutoSave = useCallback((attempt: number = 0) => {
     if (autoSaveTimerRef.current !== null) {
       clearTimeout(autoSaveTimerRef.current);
     }
+    const delay =
+      AUTO_SAVE_RETRY_DELAYS_MS[
+        Math.min(attempt, AUTO_SAVE_RETRY_DELAYS_MS.length - 1)
+      ];
     autoSaveTimerRef.current = setTimeout(() => {
       autoSaveTimerRef.current = null;
-      // Auto-save is fire-and-forget: a transient failure (network
-      // blip, disk pressure) shouldn't crash the timer or trigger an
-      // error toast — the next mutation will re-arm and retry.
+      // Auto-save is fire-and-forget for the *user* (no toast on
+      // transient failure) but the hook must still drive retries
+      // until the save lands. On failure: re-arm with the next
+      // backoff tier — but only if the project is still dirty AND
+      // still active AND no user-driven mutation has armed a
+      // competing fresh-cadence timer in the meantime. The
+      // competing-timer check prevents the retry path from clobbering
+      // a user's expected 5s debounce with a longer backoff delay
+      // (the user just edited; they expect the natural save cadence,
+      // not the failure-recovery schedule).
+      //
+      // The escalation uses the closure-captured `attempt` rather
+      // than reading a mutable ref — inside `saveProject`'s entry,
+      // `cancelPendingAutoSave()` runs (clearing this timer slot,
+      // already null), so any ref-based counter would be wiped
+      // before the catch could observe it. Capturing on the stack
+      // makes the escalation immune to internal cancel calls and is
+      // also simpler to reason about: each timer carries its own
+      // attempt number for the lifetime of the callback.
       saveProjectRef.current().catch(() => {
-        // Intentional swallow: dirty flag stays set so the next
-        // `markDirty` debounce will retry.
+        if (
+          autoSaveTimerRef.current === null &&
+          dirtyRef.current &&
+          projectPathRef.current !== null
+        ) {
+          armAutoSave(attempt + 1);
+        }
       });
-    }, 5_000);
+    }, delay);
   }, []);
 
   const refreshProject = useCallback(async () => {

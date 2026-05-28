@@ -1450,3 +1450,414 @@ describe("useActiveProject — context value identity is memoised", () => {
     expect(after).toBe(before);
   });
 });
+
+/**
+ * Devin Review (commit 31f975e) flagged that auto-save failure had no
+ * retry path: the timer callback's `.catch()` swallowed the rejection
+ * with the rationale "next mutation will re-arm". For a user who walked
+ * away after the failing save (network drive blip on the file's
+ * volume, transient disk pressure, anti-virus mid-scan lock), no
+ * further mutation arrives — so pending changes would never be
+ * persisted even after the underlying cause cleared 30s later.
+ *
+ * The fix introduces an exponential-backoff retry schedule
+ * (`AUTO_SAVE_RETRY_DELAYS_MS = [5_000, 10_000, 30_000, 60_000, 300_000]`).
+ * On failure, the timer callback re-arms with the next slot; on
+ * success, the attempt counter resets to 0. User-driven mutations
+ * (markDirty) and project transitions (cancelPendingAutoSave) also
+ * reset the counter so fresh save events start from the natural
+ * 5s debounce. These tests pin the contract:
+ *   1. A first failure schedules a retry at 10s, not 5s.
+ *   2. Consecutive failures escalate through the schedule.
+ *   3. A successful save resets the counter (next failure starts
+ *      at 10s again, not at the deepest backoff tier).
+ *   4. A markDirty during a pending retry cancels the backoff timer
+ *      and re-arms at the natural 5s debounce.
+ *   5. If the project transitions away (closeProject), the pending
+ *      retry is cancelled and does NOT fire a stale save on the
+ *      abandoned project.
+ *   6. If the project becomes clean during a pending retry (e.g.
+ *      manual save succeeds), no further retry is armed.
+ */
+function DirtyOnly({
+  initialPath,
+}: {
+  initialPath: string;
+}) {
+  const { project, openProject, markDirty, closeProject, saveProject } =
+    useActiveProject();
+  useEffect(() => {
+    void openProject(initialPath);
+  }, [openProject, initialPath]);
+  return (
+    <div>
+      <span data-testid="proj-path">{project?.path ?? ""}</span>
+      <button
+        type="button"
+        data-testid="dirty"
+        onClick={() => markDirty()}
+      >
+        dirty
+      </button>
+      <button
+        type="button"
+        data-testid="close"
+        onClick={() => {
+          void closeProject();
+        }}
+      >
+        close
+      </button>
+      <button
+        type="button"
+        data-testid="manual-save"
+        onClick={() => {
+          void saveProject();
+        }}
+      >
+        manual save
+      </button>
+    </div>
+  );
+}
+
+describe("useActiveProject — auto-save retries with exponential backoff on failure", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("re-arms at the next backoff tier (10s) after a single failure", async () => {
+    let saveCallCount = 0;
+    const saveSpy = vi
+      .spyOn(aec.project, "save")
+      .mockImplementation(async () => {
+        saveCallCount += 1;
+        throw new Error("disk busy");
+      });
+
+    render(
+      <ActiveProjectProvider>
+        <DirtyOnly initialPath="/tmp/retry-A.aecstudio" />
+      </ActiveProjectProvider>,
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("proj-path").textContent).toBe(
+        "/tmp/retry-A.aecstudio",
+      ),
+    );
+
+    await act(async () => {
+      screen.getByTestId("dirty").click();
+    });
+
+    // First auto-save fires at 5s. Bridge rejects → counter
+    // escalates to attempt=1.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_000);
+    });
+    expect(saveCallCount).toBe(1);
+
+    // 5s later (10s mark) still no retry — backoff slot for
+    // attempt=1 is 10s, not the default 5s.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_000);
+    });
+    expect(saveCallCount).toBe(1);
+
+    // 10s after the first failure (15s mark) the retry fires.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_000);
+    });
+    expect(saveCallCount).toBe(2);
+
+    saveSpy.mockRestore();
+  });
+
+  it("escalates through 10s → 30s → 60s on consecutive failures", async () => {
+    let saveCallCount = 0;
+    const callMarks: number[] = [];
+    const startTime = Date.now();
+    const saveSpy = vi
+      .spyOn(aec.project, "save")
+      .mockImplementation(async () => {
+        saveCallCount += 1;
+        callMarks.push(Date.now() - startTime);
+        throw new Error("disk busy");
+      });
+
+    render(
+      <ActiveProjectProvider>
+        <DirtyOnly initialPath="/tmp/retry-B.aecstudio" />
+      </ActiveProjectProvider>,
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("proj-path").textContent).toBe(
+        "/tmp/retry-B.aecstudio",
+      ),
+    );
+
+    await act(async () => {
+      screen.getByTestId("dirty").click();
+    });
+
+    // Walk through the schedule: 5s → 10s → 30s → 60s (totals
+    // 5, 15, 45, 105 elapsed).
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_000); // attempt 0 fires
+    });
+    expect(saveCallCount).toBe(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000); // attempt 1 fires
+    });
+    expect(saveCallCount).toBe(2);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30_000); // attempt 2 fires
+    });
+    expect(saveCallCount).toBe(3);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000); // attempt 3 fires
+    });
+    expect(saveCallCount).toBe(4);
+
+    saveSpy.mockRestore();
+  });
+
+  it("resets the attempt counter after a successful save (next failure starts at 10s, not deeper)", async () => {
+    let saveCallCount = 0;
+    const saveSpy = vi
+      .spyOn(aec.project, "save")
+      .mockImplementation(async (path: string) => {
+        saveCallCount += 1;
+        // Calls 1 and 2 fail; call 3 succeeds; call 4 fails.
+        if (saveCallCount === 3) {
+          return {
+            path,
+            name: "Reset",
+            modifiedAt: new Date().toISOString(),
+          };
+        }
+        throw new Error("disk busy");
+      });
+
+    render(
+      <ActiveProjectProvider>
+        <DirtyOnly initialPath="/tmp/retry-C.aecstudio" />
+      </ActiveProjectProvider>,
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("proj-path").textContent).toBe(
+        "/tmp/retry-C.aecstudio",
+      ),
+    );
+
+    await act(async () => {
+      screen.getByTestId("dirty").click();
+    });
+
+    // Two failures: attempts 0 (5s) and 1 (10s).
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_000);
+    });
+    expect(saveCallCount).toBe(1);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+    expect(saveCallCount).toBe(2);
+
+    // attempt 2 (30s) fires — succeeds. Counter resets to 0.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30_000);
+    });
+    expect(saveCallCount).toBe(3);
+
+    // Successful save's `updateDirty(false)` clears dirty. We need
+    // another mutation to arm the next cycle.
+    await act(async () => {
+      screen.getByTestId("dirty").click();
+    });
+
+    // The next failure must restart at attempt=0 (5s), proving the
+    // success path reset the counter.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_000);
+    });
+    expect(saveCallCount).toBe(4);
+
+    saveSpy.mockRestore();
+  });
+
+  it("a user mutation during a pending retry cancels the backoff and re-arms at 5s", async () => {
+    let saveCallCount = 0;
+    const callMarks: number[] = [];
+    const startTime = Date.now();
+    const saveSpy = vi
+      .spyOn(aec.project, "save")
+      .mockImplementation(async () => {
+        saveCallCount += 1;
+        callMarks.push(Date.now() - startTime);
+        throw new Error("disk busy");
+      });
+
+    render(
+      <ActiveProjectProvider>
+        <DirtyOnly initialPath="/tmp/retry-D.aecstudio" />
+      </ActiveProjectProvider>,
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("proj-path").textContent).toBe(
+        "/tmp/retry-D.aecstudio",
+      ),
+    );
+
+    await act(async () => {
+      screen.getByTestId("dirty").click();
+    });
+
+    // First failure at 5s. Counter now at attempt=1 (10s slot armed).
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_000);
+    });
+    expect(saveCallCount).toBe(1);
+
+    // 2s later the user mutates again. markDirty resets counter to 0
+    // and re-arms at 5s; the pending 10s retry is cancelled.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+      screen.getByTestId("dirty").click();
+    });
+
+    // 5s after the new mutation (12s mark) the next save fires;
+    // would have been at 15s elapsed if the backoff had survived.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_000);
+    });
+    expect(saveCallCount).toBe(2);
+    // 5s + 2s + 5s = 12s for the second call. If the backoff had
+    // survived, the second call would have fired at the 15s mark
+    // (5s + 10s = 15s).
+    expect(callMarks[1]).toBeLessThan(callMarks[0] + 10_000);
+
+    saveSpy.mockRestore();
+  });
+
+  it("stops retrying when the project is closed mid-backoff (no stale save on abandoned project)", async () => {
+    let saveCallCount = 0;
+    const lastSavePaths: string[] = [];
+    const saveSpy = vi
+      .spyOn(aec.project, "save")
+      .mockImplementation(async (path: string) => {
+        saveCallCount += 1;
+        lastSavePaths.push(path);
+        throw new Error("disk busy");
+      });
+
+    render(
+      <ActiveProjectProvider>
+        <DirtyOnly initialPath="/tmp/retry-E.aecstudio" />
+      </ActiveProjectProvider>,
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("proj-path").textContent).toBe(
+        "/tmp/retry-E.aecstudio",
+      ),
+    );
+
+    await act(async () => {
+      screen.getByTestId("dirty").click();
+    });
+
+    // First failure at 5s.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_000);
+    });
+    expect(saveCallCount).toBe(1);
+    expect(lastSavePaths).toEqual(["/tmp/retry-E.aecstudio"]);
+
+    // Close the project while the 10s retry is pending. `closeProject`
+    // calls `cancelPendingAutoSave` which clears the timer AND the
+    // attempt counter; the IIFE marks dirty=false and project=null.
+    await act(async () => {
+      screen.getByTestId("close").click();
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("proj-path").textContent).toBe(""),
+    );
+
+    // Advance well past the 10s retry slot. No save should fire —
+    // there's no active project to save.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+
+    // Still only one save call (the first failure). No stale save
+    // landed on the abandoned project.
+    expect(saveCallCount).toBe(1);
+
+    saveSpy.mockRestore();
+  });
+
+  it("stops retrying when a manual save succeeds during a pending retry", async () => {
+    let saveCallCount = 0;
+    const saveSpy = vi
+      .spyOn(aec.project, "save")
+      .mockImplementation(async (path: string) => {
+        saveCallCount += 1;
+        // Call 1 (auto-save) fails; call 2 (manual save) succeeds.
+        if (saveCallCount === 2) {
+          return {
+            path,
+            name: "Recovered",
+            modifiedAt: new Date().toISOString(),
+          };
+        }
+        throw new Error("disk busy");
+      });
+
+    render(
+      <ActiveProjectProvider>
+        <DirtyOnly initialPath="/tmp/retry-F.aecstudio" />
+      </ActiveProjectProvider>,
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("proj-path").textContent).toBe(
+        "/tmp/retry-F.aecstudio",
+      ),
+    );
+
+    await act(async () => {
+      screen.getByTestId("dirty").click();
+    });
+
+    // First auto-save attempt fails at 5s.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5_000);
+    });
+    expect(saveCallCount).toBe(1);
+
+    // Manual save mid-backoff. Succeeds; clears dirty;
+    // cancelPendingAutoSave resets the timer + counter.
+    await act(async () => {
+      screen.getByTestId("manual-save").click();
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(saveCallCount).toBe(2);
+
+    // Advance well past the 10s retry slot. The backoff retry must
+    // NOT fire — the project is clean and the timer was cancelled.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000);
+    });
+    expect(saveCallCount).toBe(2);
+
+    saveSpy.mockRestore();
+  });
+});

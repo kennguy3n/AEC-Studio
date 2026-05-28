@@ -27,20 +27,21 @@ function recommendedFor(tier: RuntimeStatus["tier"]): RenderPresetKey {
   return recommendedPresetFor(tier);
 }
 
-const FALLBACK_CAMERAS: CameraTile[] = [
-  {
-    id: "cam_living",
-    name: "Living wide",
-    preset: "wide_angle",
-    thumbnailDataUri: null,
-  },
-  {
-    id: "cam_kitchen",
-    name: "Kitchen close",
-    preset: "interior_close_up",
-    thumbnailDataUri: null,
-  },
-];
+// Empty list is the *only* legal starting state for the camera
+// selector. A previous incarnation seeded `FALLBACK_CAMERAS` with two
+// fake demo entries (`cam_living`, `cam_kitchen`) so the UI looked
+// populated on a brand-new project. Devin Review flagged the
+// resulting UX hazard: the fallback persisted whenever `listGraph`
+// returned zero camera entities, so the user could `toggleCamera` a
+// fake ID and click "Queue renders" — the per-camera
+// `aec.render.enqueueRender({ cameraId: "cam_living", ... })` call
+// would either fail (native bridge rejecting the unknown entity) or
+// silently enqueue an orphaned job that no diagnose / cancel call
+// could subsequently address. The correct contract is: cameras list
+// is exactly what the bridge reports for the active project, and
+// `CameraSelector` renders its built-in empty-state when the list is
+// empty (see `CameraSelector.tsx:14-27`).
+const EMPTY_CAMERAS: CameraTile[] = [];
 
 export function Render() {
   const { project } = useActiveProject();
@@ -50,7 +51,7 @@ export function Render() {
   const [lighting, setLighting] = useState<LightingPresetId>("daylight");
   const [tier, setTier] = useState<RuntimeStatus["tier"] | null>(null);
   const userChosePresetRef = useRef(false);
-  const [cameras, setCameras] = useState<CameraTile[]>(FALLBACK_CAMERAS);
+  const [cameras, setCameras] = useState<CameraTile[]>(EMPTY_CAMERAS);
   const [selectedCameras, setSelectedCameras] = useState<Set<string>>(
     new Set(),
   );
@@ -93,31 +94,42 @@ export function Render() {
     // Without this, the `cameras` list and `selectedCameras` set carry
     // over from the previous project — the user would see project A's
     // cameras (or worse, project A's IDs in the selection set) after
-    // opening project B. If the new project has zero cameras, the
-    // async branch below won't run `setCameras`, so the fallback list
-    // takes over and the user is never left looking at a stale list.
-    // The selection set is always cleared because camera IDs are not
-    // valid across projects: enqueueing a render with a stale ID
-    // creates an orphaned job that the native backend will reject.
+    // opening project B. The selection set is always cleared because
+    // camera IDs are not valid across projects: enqueueing a render
+    // with a stale ID creates an orphaned job that the native backend
+    // would reject. When the active project closes (`project?.path`
+    // becomes nullish), the reset still runs so the queue / camera
+    // grid don't strand the user looking at the previous project's
+    // entities on the route-guard's home page.
     //
     // `jobs` is also reset synchronously even though the immediately-
-    // following `listJobs()` will repopulate it. Without the
-    // synchronous reset there is a one-microtask window after the
-    // project transition (between this effect committing and the
-    // `listJobs()` promise resolving) where the previous project's
-    // jobs would render in the queue. The flash is brief but visible,
-    // and a stale entry whose job ID belongs to the previous project
-    // would also fail any subsequent `cancelJob` / `diagnose` calls
-    // that key off it. Mirrors the `setCameras` / `setSelectedCameras`
-    // pattern so all per-project queue state transitions together.
-    setCameras(FALLBACK_CAMERAS);
+    // following `listJobs()` (when a project is open) will repopulate
+    // it. Without the synchronous reset there is a one-microtask
+    // window after the project transition (between this effect
+    // committing and the `listJobs()` promise resolving) where the
+    // previous project's jobs would render in the queue. The flash is
+    // brief but visible, and a stale entry whose job ID belongs to
+    // the previous project would also fail any subsequent
+    // `cancelJob` / `diagnose` calls that key off it. Mirrors the
+    // `setCameras` / `setSelectedCameras` pattern so all per-project
+    // queue state transitions together.
+    setCameras(EMPTY_CAMERAS);
     setSelectedCameras(new Set());
     setJobs([]);
-    void aec.render.listJobs().then((rows) => {
-      if (alive) setJobs(rows as RenderJob[]);
-    });
-    // Load cameras from the project graph when a project is open.
+    // Gate every bridge fetch on a live project. Both `listJobs` and
+    // `listGraph` are project-scoped queries: with no active project,
+    // the native handlers have no DB to address and the fallback
+    // backend short-circuits to `[]`. Issuing the calls anyway burns
+    // one IPC round-trip per route transition for no observable
+    // benefit, and the resulting `setJobs([])` triggers a redundant
+    // commit that the synchronous reset above already covered.
+    // Matches the `StatusBar.tsx:62-93` pattern, which gates
+    // `project:save:status` polling on `projectPath !== null` for the
+    // same reason.
     if (project?.path) {
+      void aec.render.listJobs().then((rows) => {
+        if (alive) setJobs(rows as RenderJob[]);
+      });
       void aec.command
         .listGraph(project.path, "camera")
         .then((entities) => {
@@ -138,9 +150,13 @@ export function Render() {
             });
             setCameras(mapped);
           }
+          // entities is `[]` → cameras stays empty (synchronous reset
+          // above); `CameraSelector` renders the empty-state UI.
         })
         .catch(() => {
-          // Project has no cameras yet — keep the fallback set.
+          // Bridge failure (corrupt DB, permission denied) — keep the
+          // empty list so the user sees the empty-state instead of
+          // stale or fake entries. Logged at the bridge layer.
         });
     }
     return () => {
