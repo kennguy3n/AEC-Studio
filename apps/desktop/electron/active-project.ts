@@ -166,6 +166,77 @@ export function peekActiveProjectSummary(): ActiveProjectSummary | null {
 }
 
 /**
+ * Resolve the currently-open project for the renderer's
+ * `project:current` IPC channel. The renderer's `useActiveProject`
+ * hook polls this on mount (and after every push notification) to
+ * surface the current project to every mode page.
+ *
+ * Three branches:
+ *   1. A cached summary exists → return it directly (fast path).
+ *   2. Only the path is set (renderer hot-reload, push notification
+ *      raced with a state commit) → look it up via the supplied
+ *      `listRecents` callback and re-cache the summary.
+ *   3. Nothing is set → return `{ summary: null }` so the renderer's
+ *      route guard sends the user to Home.
+ *
+ * Critically, branch (2) is asynchronous: between the path read at
+ * function entry and the `setActiveProject(found)` re-cache after
+ * the await, the active path can change (the user closes the
+ * project, or opens a different one) because the event loop yields
+ * across the await. Without a re-check, this handler would
+ * silently re-activate a project the user just closed — leaving
+ * the renderer (which already committed the close) out of sync
+ * with the main-process tracker until the next push notification
+ * (which itself fires from the offending `setActiveProject` call,
+ * meaning the renderer would be told to *re-open* the project it
+ * just closed). The TOCTOU guard below — re-reading
+ * `peekActiveProjectPath()` after the await and bailing if it
+ * diverges from the pre-await value — closes this window.
+ *
+ * Factored out of the `project:current` IPC handler so the
+ * resolution logic (and especially the TOCTOU guard) can be unit-
+ * tested without spinning up Electron's `ipcMain`. The IPC handler
+ * is then a thin one-liner that wires `getBridge().projectListRecents`
+ * into this function.
+ */
+export async function resolveCurrentProjectForRenderer(
+  listRecents: () => Promise<ActiveProjectSummary[]>,
+): Promise<{ summary: ActiveProjectSummary | null }> {
+  const summary = peekActiveProjectSummary();
+  const pathAtEntry = peekActiveProjectPath();
+  if (summary !== null) {
+    return { summary };
+  }
+  if (pathAtEntry === null) {
+    return { summary: null };
+  }
+  const recents = await listRecents();
+  // Re-check after the await: if the user closed (or switched)
+  // projects during the recents lookup, the pre-await path no
+  // longer represents intent. Compare path-at-entry vs path-now
+  // rather than just `peekActiveProjectPath() !== null` because the
+  // user could have *switched* to a different project during the
+  // await — in that case the new project's open handler already
+  // cached its summary, so the `summary !== null` branch at the
+  // top of the next `project:current` poll will return the new
+  // project. Falling through to the `setActiveProject(found)` call
+  // here with the *old* path would silently overwrite the new
+  // active slot. Bail to the `summary: null` branch and let the
+  // renderer re-poll (or the push subscription deliver) the new
+  // state.
+  const pathNow = peekActiveProjectPath();
+  if (pathNow !== pathAtEntry) {
+    return { summary: null };
+  }
+  const found = recents.find((p) => p.path === pathAtEntry);
+  if (found) {
+    setActiveProject(found);
+    return { summary: found };
+  }
+  return { summary: null };
+}
+
+/**
  * Reset the tracker. Three callers:
  *
  *   1. Unit tests (`vitest`) that need a clean slot between cases

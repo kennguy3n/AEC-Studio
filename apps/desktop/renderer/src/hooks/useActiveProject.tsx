@@ -420,7 +420,21 @@ export function ActiveProjectProvider({
       // equality check before re-clearing the slot, so a new
       // inflight armed by B is not accidentally clobbered when A's
       // promise eventually settles.
+      //
+      // Reset the `saving` indicator alongside the inflight clear. The
+      // old IIFE's finally is now equality-guarded (it only clears
+      // `saving` when the slot still holds *its* promise), so if no
+      // transition cleared the slot the indicator still flips off when
+      // that IIFE eventually resolves. But on transition the old IIFE
+      // is abandoned — its `setSaving(false)` will be skipped because
+      // the slot no longer matches — so we must reset the indicator
+      // here. Without this, the StatusBar would keep showing "Saving…"
+      // forever for a project the user has already left, because no
+      // subsequent code path ever sets `saving=false` (a new
+      // `saveProject` for the next project will only set it to `true`
+      // again, not `false`).
       savingPromiseRef.current = null;
+      setSaving(false);
       try {
         const summary = (await aec.project.open(path)) as ProjectSummary;
         updateProject(summary);
@@ -450,11 +464,12 @@ export function ActiveProjectProvider({
 
   const createProject = useCallback(
     async (templateKey: string, name: string) => {
-      // Same cancel-before-await + catch-rearm + clear-saving-slot
-      // pattern as `openProject` — see that callback for the full
-      // rationale on each step.
+      // Same cancel-before-await + clear-saving-slot + reset-saving-
+      // indicator + catch-rearm pattern as `openProject` — see that
+      // callback for the full rationale on each step.
       cancelPendingAutoSave();
       savingPromiseRef.current = null;
+      setSaving(false);
       setLoading(true);
       try {
         const summary = (await aec.project.createFromTemplate(
@@ -502,8 +517,14 @@ export function ActiveProjectProvider({
     // `openProject` / `createProject` — see those callbacks. The
     // user is leaving the active project; any in-flight save belongs
     // to a project they no longer have open, and a subsequent
-    // openProject must not coalesce against it.
+    // openProject must not coalesce against it. Resetting `saving`
+    // here matches the `openProject` / `createProject` paths: without
+    // it, the StatusBar would keep showing "Saving…" forever after
+    // the user closes the project mid-save (the old IIFE's now-
+    // equality-guarded `setSaving(false)` skips the write because the
+    // slot no longer matches).
     savingPromiseRef.current = null;
+    setSaving(false);
     try {
       await aec.project.close();
       updateProject(null);
@@ -601,14 +622,21 @@ export function ActiveProjectProvider({
         // a clean coalescing slot — without this, a failed save
         // would permanently lock out future `saveProject` calls.
         //
-        // Equality-guard the clear: if a project transition cleared
-        // the slot and a fresh save was dispatched for the new
-        // project, that fresh inflight is now in the slot. Clearing
-        // unconditionally would lose the new inflight and break
-        // coalescing for the new project. Only clear when the slot
-        // still holds *this* IIFE's promise.
-        setSaving(false);
+        // Equality-guard both the clear AND the `setSaving(false)`:
+        // if a project transition cleared the slot and a fresh save
+        // was dispatched for the new project, that fresh inflight is
+        // now in the slot. Clearing the ref unconditionally would lose
+        // the new inflight and break coalescing for the new project.
+        // Flipping `setSaving(false)` unconditionally would clear the
+        // "Saving…" indicator while the new project's save is still in
+        // flight — the StatusBar would briefly show "Saved" for a
+        // project that has not yet finished saving, then flip back to
+        // "Saving…" when the new IIFE updates the indicator on its own
+        // resolution. The project-transition callbacks reset the
+        // indicator explicitly when they clear the slot, so a
+        // transition does not leave the indicator stuck on either.
         if (savingPromiseRef.current === inflight) {
+          setSaving(false);
           savingPromiseRef.current = null;
         }
       }

@@ -85,16 +85,66 @@ export function Deliver(): JSX.Element {
     totalBytes: number;
   } | null>(null);
 
-  // Initial load of revisions from the backend.
+  // Per-project state reset + revisions load on project switch.
+  //
+  // The `revisions`, `diff`, `baseId`, `headId`, and `exportResult`
+  // state are all *per-project*: revision IDs are not valid across
+  // projects (the deliver-store keys them on the project root, so a
+  // stale ID from project A passed to `aec.deliver.compareRevisions`
+  // on project B would either resolve to the wrong revision or be
+  // rejected by the bridge); `diff` and `exportResult` reference
+  // revision IDs by string so they share the same fate; the
+  // base/head selection drives the compare button enablement and is
+  // meaningless against a different revision list.
+  //
+  // Today the `RequireProject` route guard unmounts the Deliver page
+  // on every project transition, which `useState`-resets the page for
+  // free — so this effect is *defense-in-depth*. The route-guard
+  // umbrella is the same brittle contract that `Bim.tsx:111-118` and
+  // `Render.tsx:91-165` chose not to rely on: future in-page project
+  // pickers, "switch to recent" toolbar actions, or any code path
+  // that calls `openProject(...)` without forcing a route change
+  // would silently leak project A's revisions / diff into project B
+  // without this reset. The synchronous clear runs *before* the
+  // async `listRevisions()` so the reset is observable before the
+  // bridge response arrives, mirroring the `setCameras(EMPTY)` /
+  // `setJobs([])` pattern in Render.tsx that closes the
+  // one-microtask flash window. `comparing` and `exporting` are also
+  // reset because their `true` value would otherwise prevent the
+  // user from re-enqueuing compare / export against the new project.
+  //
+  // The `listRevisions()` call is unconditional (not gated on
+  // `project?.path`). In production the page is route-guarded by
+  // `RequireProject` so a missing active project is impossible — the
+  // bridge would throw `no project is currently open` anyway. In the
+  // vitest fixture the in-process deliver mock returns the shared
+  // revisions array regardless of project state, and several smoke
+  // tests in `Deliver.test.tsx` mount the page directly (without
+  // `RequireProject`) and rely on listRevisions surfacing fixture
+  // state. The bridge-side `getActiveProjectPath` validation is the
+  // single point of enforcement; this hook should not duplicate it.
+  //
+  // Keyed on `project?.path` (matching Render.tsx, StatusBar.tsx, and
+  // Bim.tsx) rather than `project` so the effect does NOT re-fire on
+  // every save — `updateProject(summary)` runs after each save and
+  // recreates the summary reference, which would otherwise tear down
+  // and recreate the listRevisions call on every 5s auto-save.
   useEffect(() => {
     let alive = true;
+    setRevisions([]);
+    setBaseId(null);
+    setHeadId(null);
+    setDiff(null);
+    setExportResult(null);
+    setComparing(false);
+    setExporting(false);
     void aec.deliver.listRevisions().then((rs) => {
       if (alive) setRevisions(rs);
     });
     return () => {
       alive = false;
     };
-  }, []);
+  }, [project?.path]);
 
   // Poll the bridge for the per-project KChat thread id. Mirrors the
   // cadence used by `KChatStatusIndicator` so the Deliver review

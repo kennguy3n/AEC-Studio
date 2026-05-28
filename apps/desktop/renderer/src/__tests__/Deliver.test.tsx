@@ -8,11 +8,16 @@
  */
 
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { act, render, screen, fireEvent, waitFor } from "@testing-library/react";
 
+import { useEffect } from "react";
+import type { RevisionSummary } from "../../../electron/bridge";
 import { aec } from "../api/aec";
 import { Deliver } from "../pages/Deliver";
-import { ActiveProjectProvider } from "../hooks/useActiveProject";
+import {
+  ActiveProjectProvider,
+  useActiveProject,
+} from "../hooks/useActiveProject";
 import { ToastProvider } from "../hooks/useToast";
 
 function renderDeliver() {
@@ -210,6 +215,136 @@ describe("<Deliver /> KChat thread wiring", () => {
       expect(ingestSpy).toHaveBeenCalledWith(
         expect.objectContaining({ threadId: "kchat-default" }),
       );
+    });
+  });
+});
+
+/**
+ * Regression: Devin Review (commit 913b768) flagged that the Deliver
+ * page did not reset its per-project state (`revisions`, `diff`,
+ * `baseId`, `headId`, `exportResult`) when the active project
+ * changed — unlike Bim.tsx:111-118, Draft.tsx:58-64, and
+ * Render.tsx:91-165 which all do. Today this is hidden by
+ * `RequireProject` unmounting the page on every transition, but
+ * the same fragility comment that motivates the per-project reset
+ * on the other mode pages applies: a future in-page project
+ * picker, "switch to recent" toolbar action, or any code path that
+ * calls `openProject` without forcing a route change would silently
+ * leak project A's revisions / diff into project B.
+ *
+ * The fix adds a `useEffect([project?.path])` to Deliver.tsx that
+ * synchronously clears per-project state before any async load.
+ * This test pins the contract by:
+ *   1. Mounting Deliver under a harness that exposes `openProject`,
+ *   2. Creating revisions for project A,
+ *   3. Switching to project B *without unmounting Deliver*,
+ *   4. Asserting the revision list (and diff / export / etc.) is
+ *      cleared synchronously, not by component unmount.
+ */
+describe("<Deliver /> per-project state reset on project switch", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("clears revisions synchronously when the active project changes (without unmount)", async () => {
+    // The Deliver page is normally route-guarded by `RequireProject`
+    // which unmounts it on every project transition. This test
+    // mounts the page WITHOUT the guard to verify the defense-in-
+    // depth reset effect (`useEffect([project?.path])`) clears
+    // per-project state on transition even when the component
+    // stays mounted. A future in-page project picker, "switch to
+    // recent" toolbar action, or any code path that calls
+    // `openProject` without forcing a route change would otherwise
+    // silently leak project A's revisions / diff into project B.
+    let switchProject: ((path: string) => Promise<void>) | null = null;
+    function ProjectSwitcher() {
+      const { openProject } = useActiveProject();
+      useEffect(() => {
+        switchProject = (path: string) => openProject(path);
+      }, [openProject]);
+      return null;
+    }
+
+    // Mock listRevisions to return different lists per call so we
+    // can observe the reset → refetch sequence. The first call
+    // (initial mount, project null) returns project-A revisions
+    // (one row, distinct tag "rev-from-A"), then subsequent calls
+    // after the switch return project-B revisions ("rev-from-B").
+    // Using a distinct tag per project avoids the fixture's
+    // duplicate-tag rejection in `createRevision`, and the
+    // mockResolvedValueOnce sequence is independent of the in-
+    // process backend's shared state.
+    const revisionA: RevisionSummary = {
+      revisionId: "rev-A1",
+      tag: "rev-from-A",
+      description: "from project A",
+      createdAt: "2026-05-27T12:00:00Z",
+      auditChainHead: "0".repeat(64),
+      manifestName: "Project A",
+      manifestAppVersion: "0.1.0",
+      trackedEntities: [],
+    };
+    const revisionB: RevisionSummary = {
+      revisionId: "rev-B1",
+      tag: "rev-from-B",
+      description: "from project B",
+      createdAt: "2026-05-27T12:05:00Z",
+      auditChainHead: "0".repeat(64),
+      manifestName: "Project B",
+      manifestAppVersion: "0.1.0",
+      trackedEntities: [],
+    };
+    vi.spyOn(aec.deliver, "listRevisions")
+      .mockResolvedValueOnce([revisionA]) // initial mount (project null)
+      .mockResolvedValueOnce([revisionA]) // after openProject A
+      .mockResolvedValue([revisionB]); // after switch to B
+
+    render(
+      <ToastProvider>
+        <ActiveProjectProvider>
+          <ProjectSwitcher />
+          <Deliver />
+        </ActiveProjectProvider>
+      </ToastProvider>,
+    );
+
+    // Settle initial mount.
+    await waitFor(() => {
+      expect(screen.getByText("rev-from-A")).toBeInTheDocument();
+    });
+
+    // Switch to project A so the effect re-fires for the first
+    // project transition. Even though listRevisions returns the
+    // same revisionA list, the test exercises the effect's reset
+    // → refetch sequence: the synchronous setRevisions([]) wipes
+    // the list, then the async listRevisions repopulates it.
+    expect(switchProject).not.toBeNull();
+    await act(async () => {
+      await switchProject!("/tmp/deliverA.aecstudio");
+    });
+    await waitFor(() => {
+      expect(screen.getByText("rev-from-A")).toBeInTheDocument();
+    });
+
+    // Now switch to project B. The effect must:
+    //   1. Reset revisions to [] synchronously (so rev-from-A is
+    //      no longer in the DOM).
+    //   2. Fetch project B's revisions and render rev-from-B.
+    // Without the per-project reset effect, the page would
+    // continue to show rev-from-A until the async listRevisions
+    // for project B resolves, leaking project A's state into
+    // project B's UI.
+    await act(async () => {
+      await switchProject!("/tmp/deliverB.aecstudio");
+    });
+
+    // After the transition, rev-from-A must be gone (reset took
+    // effect) and rev-from-B must be visible (refetch took effect).
+    await waitFor(() => {
+      expect(screen.queryByText("rev-from-A")).not.toBeInTheDocument();
+    });
+    await waitFor(() => {
+      expect(screen.getByText("rev-from-B")).toBeInTheDocument();
     });
   });
 });

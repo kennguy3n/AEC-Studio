@@ -2009,3 +2009,250 @@ describe("useActiveProject — push listener does not cause a double commit on o
     expect(projectTransitions[1]).toMatch(/singlecommitcreate/);
   });
 });
+
+// Regression: Devin Review (commit 913b768) flagged that the
+// `saveProject` IIFE's `finally` called `setSaving(false)`
+// unconditionally. When a project transition (open/create/close)
+// fires while an old project's save is in flight, the old IIFE's
+// `finally` would clear the `saving` flag even if a *new* save for
+// the new project is in flight — the StatusBar would briefly show
+// "Saved" for a project whose save has not yet completed.
+//
+// The fix guards `setSaving(false)` behind the same
+// `savingPromiseRef.current === inflight` check that protects the
+// slot clear, AND the project-transition callbacks reset `saving`
+// alongside `savingPromiseRef.current = null` so the indicator
+// doesn't stay stuck "Saving…" forever for the abandoned project.
+describe("useActiveProject — saving indicator survives mid-flight project switch", () => {
+  it("does not flicker 'Saved' for B while B's save is still in flight", async () => {
+    let resolveSaveA: ((summary: unknown) => void) | null = null;
+    let resolveSaveB: ((summary: unknown) => void) | null = null;
+    const saveSpy = vi
+      .spyOn(aec.project, "save")
+      .mockImplementation((path: string) => {
+        if (path === "/tmp/projectA.aecstudio") {
+          return new Promise<unknown>((resolve) => {
+            resolveSaveA = resolve;
+          });
+        }
+        if (path === "/tmp/projectB.aecstudio") {
+          return new Promise<unknown>((resolve) => {
+            resolveSaveB = resolve;
+          });
+        }
+        throw new Error(`unexpected save path: ${path}`);
+      });
+
+    // `saving` snapshots recorded on every render — we assert the
+    // value never flips to `false` during the window when B's save
+    // is in flight (after openProject(B) settled, after saveProject(B)
+    // dispatched, before resolveSaveB).
+    const savingSnapshots: boolean[] = [];
+    function SavingSpy() {
+      const { saving } = useActiveProject();
+      savingSnapshots.push(saving);
+      return <span data-testid="saving">{saving ? "yes" : "no"}</span>;
+    }
+
+    const onSaveError = vi.fn();
+    render(
+      <ActiveProjectProvider>
+        <OpenAThenSwitchToB
+          pathA="/tmp/projectA.aecstudio"
+          pathB="/tmp/projectB.aecstudio"
+          onSaveError={onSaveError}
+        />
+        <SavingSpy />
+      </ActiveProjectProvider>,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByTestId("proj-path").textContent).toBe(
+        "/tmp/projectA.aecstudio",
+      ),
+    );
+
+    // Save A → parks on resolveSaveA. `saving === true`.
+    await act(async () => {
+      screen.getByTestId("save-A").click();
+    });
+    expect(saveSpy).toHaveBeenCalledTimes(1);
+    await waitFor(() =>
+      expect(screen.getByTestId("saving").textContent).toBe("yes"),
+    );
+
+    // Switch to B. The transition callback resets `saving` to false
+    // (the abandoned old project's IIFE will no-op its
+    // setSaving(false) thanks to the equality guard).
+    await act(async () => {
+      screen.getByTestId("open-B").click();
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("proj-path").textContent).toBe(
+        "/tmp/projectB.aecstudio",
+      ),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("saving").textContent).toBe("no"),
+    );
+
+    // Save B → parks on resolveSaveB. `saving === true` for B's IIFE.
+    await act(async () => {
+      screen.getByTestId("save-B").click();
+    });
+    expect(saveSpy).toHaveBeenCalledTimes(2);
+    await waitFor(() =>
+      expect(screen.getByTestId("saving").textContent).toBe("yes"),
+    );
+
+    // Resolve A's stale save FIRST. Without the equality-guard on
+    // `setSaving(false)`, A's IIFE finally would set saving=false
+    // here — the StatusBar would flicker "Saved" for B while B's
+    // save is still in flight. With the fix, A's IIFE detects
+    // `savingPromiseRef.current !== inflight` (B's promise is in
+    // the slot) and skips both the ref clear AND the saving
+    // indicator reset.
+    const lengthBeforeA = savingSnapshots.length;
+    await act(async () => {
+      resolveSaveA!({
+        path: "/tmp/projectA.aecstudio",
+        name: "projectA",
+        template_key: "blank",
+        room_count: 0,
+        material_count: 0,
+      });
+    });
+
+    // After A's stale resolution, `saving` must STILL be true (B's
+    // save is in flight). The fix's equality guard prevents the
+    // false-then-true flicker.
+    expect(screen.getByTestId("saving").textContent).toBe("yes");
+    // No snapshot recorded in the window between A resolving and
+    // B resolving should be `false`.
+    const lengthAfterAResolve = savingSnapshots.length;
+    const sliceAfterA = savingSnapshots.slice(lengthBeforeA, lengthAfterAResolve);
+    expect(sliceAfterA.every((s) => s === true)).toBe(true);
+
+    // Resolve B's save. Now saving must flip to false (B's own
+    // IIFE finally runs the equality-guarded setSaving(false)).
+    await act(async () => {
+      resolveSaveB!({
+        path: "/tmp/projectB.aecstudio",
+        name: "projectB",
+        template_key: "blank",
+        room_count: 0,
+        material_count: 0,
+      });
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("saving").textContent).toBe("no"),
+    );
+
+    expect(onSaveError).not.toHaveBeenCalled();
+    saveSpy.mockRestore();
+  });
+
+  it("clears 'Saving…' on close when a save is in flight (transition resets the indicator)", async () => {
+    // The dual contract: if no transition happens, the IIFE's
+    // equality-guarded finally clears the indicator. If a transition
+    // happens, the IIFE's finally skips (slot no longer matches),
+    // so the transition callback itself must clear the indicator to
+    // prevent the StatusBar from sticking on "Saving…" forever.
+    let resolveSaveA: ((summary: unknown) => void) | null = null;
+    const saveSpy = vi
+      .spyOn(aec.project, "save")
+      .mockImplementation(() => {
+        return new Promise<unknown>((resolve) => {
+          resolveSaveA = resolve;
+        });
+      });
+
+    function Harness({
+      onSaveError,
+    }: {
+      onSaveError: (err: unknown) => void;
+    }) {
+      const { project, openProject, saveProject, closeProject, saving } =
+        useActiveProject();
+      useEffect(() => {
+        void openProject("/tmp/projectA.aecstudio");
+      }, [openProject]);
+      return (
+        <div>
+          <span data-testid="proj-path">{project?.path ?? ""}</span>
+          <span data-testid="saving">{saving ? "yes" : "no"}</span>
+          <button
+            type="button"
+            data-testid="save"
+            onClick={() => {
+              saveProject().catch(onSaveError);
+            }}
+          >
+            save
+          </button>
+          <button
+            type="button"
+            data-testid="close"
+            onClick={() => {
+              closeProject().catch(onSaveError);
+            }}
+          >
+            close
+          </button>
+        </div>
+      );
+    }
+
+    const onSaveError = vi.fn();
+    render(
+      <ActiveProjectProvider>
+        <Harness onSaveError={onSaveError} />
+      </ActiveProjectProvider>,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByTestId("proj-path").textContent).toBe(
+        "/tmp/projectA.aecstudio",
+      ),
+    );
+
+    // Save A → parks awaiting resolveSaveA. saving === true.
+    await act(async () => {
+      screen.getByTestId("save").click();
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("saving").textContent).toBe("yes"),
+    );
+
+    // Close. The transition callback clears `saving` to false
+    // synchronously, so the StatusBar reflects "no save in flight"
+    // even though the bridge promise for A is still pending.
+    await act(async () => {
+      screen.getByTestId("close").click();
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("proj-path").textContent).toBe(""),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("saving").textContent).toBe("no"),
+    );
+
+    // Resolve A's stale save AFTER close. The equality-guarded
+    // finally skips setSaving(false) (slot was cleared by close,
+    // so `savingPromiseRef.current === inflight` is false). The
+    // indicator must remain false — no flicker.
+    await act(async () => {
+      resolveSaveA!({
+        path: "/tmp/projectA.aecstudio",
+        name: "projectA",
+        template_key: "blank",
+        room_count: 0,
+        material_count: 0,
+      });
+    });
+    expect(screen.getByTestId("saving").textContent).toBe("no");
+
+    expect(onSaveError).not.toHaveBeenCalled();
+    saveSpy.mockRestore();
+  });
+});

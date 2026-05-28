@@ -3,7 +3,7 @@ import { getBridge } from "./bridge";
 import {
   clearActiveProjectPath,
   peekActiveProjectPath,
-  peekActiveProjectSummary,
+  resolveCurrentProjectForRenderer,
   setActiveProject,
   setActiveProjectIfMatchesActive,
 } from "./active-project";
@@ -72,24 +72,16 @@ export function registerIpcHandlers(): void {
   // an IPC push channel) to surface the currently-open project to
   // every page. Returns `null` when no project is open so the
   // hook can route the user to the Home screen via a route guard.
+  //
+  // The resolution logic — including the TOCTOU guard that prevents
+  // a closed-during-await project from being silently re-activated
+  // — lives in `resolveCurrentProjectForRenderer` on
+  // `active-project.ts` so it can be unit-tested without Electron's
+  // `ipcMain`. This handler is intentionally a thin one-liner.
   ipcMain.handle("project:current", async () => {
-    const summary = peekActiveProjectSummary();
-    const path = peekActiveProjectPath();
-    if (summary !== null) {
-      return { summary };
-    }
-    if (path !== null) {
-      // We have a path but no cached summary (e.g. the renderer
-      // reloaded after a hot-reload). Look it up from the recents
-      // store so the hook can still show the project name.
-      const recents = await getBridge().projectListRecents();
-      const found = recents.find((p) => p.path === path);
-      if (found) {
-        setActiveProject(found);
-        return { summary: found };
-      }
-    }
-    return { summary: null };
+    return resolveCurrentProjectForRenderer(() =>
+      getBridge().projectListRecents(),
+    );
   });
   // `project:close` returns the user to the Home screen and clears
   // the active-project slot so subsequent `draft:*` / `deliver:*` /
