@@ -248,16 +248,82 @@ fn deliver_pack_with_project_path_emits_real_schedule_and_ifc() {
     );
 
     // ── Assertion 4: every entry is non-trivial in the real pack ──
+    //
+    // The deliver pack's auto-generated manifest is named
+    // `manifest.json` (see `write_deliver_pack_with_context` in
+    // `aec_export::project_export` — the `_aec_archive_manifest.json`
+    // name belongs to the *project-package* zip path, a different
+    // export). We don't want to bypass it for the >= 4 bytes check
+    // (the pretty-printed JSON object easily clears that bar), but
+    // we do want to assert its structural shape so a future
+    // regression that strips fields out gets caught here rather than
+    // by a downstream consumer.
     let entries = list_entries(&real_out);
     for name in &entries {
-        if name == "_archive_manifest.json" {
-            continue;
-        }
         let body = read_entry(&real_out, name).unwrap();
         assert!(
             body.len() >= 4,
             "real-context pack entry `{name}` is suspiciously small ({} bytes); expected real content not a stub",
             body.len()
+        );
+    }
+    let manifest_bytes = read_entry(&real_out, "manifest.json")
+        .expect("deliver pack must include an auto-generated manifest.json");
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+        .expect("manifest.json must parse as JSON (write_deliver_pack_with_context serialises it with serde_json::to_vec_pretty)");
+    assert_eq!(
+        manifest.get("kind").and_then(serde_json::Value::as_str),
+        Some("contractor"),
+        "manifest.kind must match the requested DeliverPackKind::Contractor; got {manifest:?}"
+    );
+    assert!(
+        manifest
+            .get("project_name")
+            .and_then(serde_json::Value::as_str)
+            .is_some(),
+        "manifest.project_name must be a string; got {manifest:?}"
+    );
+    assert!(
+        manifest
+            .get("created_at")
+            .and_then(serde_json::Value::as_str)
+            .is_some(),
+        "manifest.created_at must be an RFC3339 string; got {manifest:?}"
+    );
+    let manifest_entries = manifest
+        .get("entries")
+        .and_then(serde_json::Value::as_array)
+        .expect("manifest.entries must be an array");
+    // The manifest enumerates every file in the pack *except* itself,
+    // so its length is the entry count minus the manifest row.
+    assert_eq!(
+        manifest_entries.len() + 1,
+        entries.len(),
+        "manifest.entries must list every other file in the pack; got {} manifest rows vs {} zip entries",
+        manifest_entries.len(),
+        entries.len(),
+    );
+    for entry in manifest_entries {
+        let name = entry
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .expect("each manifest entry must carry a string `name`");
+        assert!(
+            entry
+                .get("bytes")
+                .and_then(serde_json::Value::as_u64)
+                .is_some(),
+            "manifest entry `{name}` must carry a numeric `bytes`; got {entry:?}"
+        );
+        let blake3 = entry
+            .get("blake3")
+            .and_then(serde_json::Value::as_str)
+            .expect("each manifest entry must carry a hex `blake3` digest");
+        assert_eq!(
+            blake3.len(),
+            64,
+            "manifest entry `{name}` blake3 must be 32 bytes hex-encoded (64 chars); got {} chars",
+            blake3.len()
         );
     }
 }

@@ -181,10 +181,29 @@ pub(crate) fn build_for_project(
     let project_root = PathBuf::from(project_path);
     let renders_dir = project_root.join("renders");
 
-    let (pkg, conn) = ProjectPackage::open_with_master_key_and_database(project_path, master_key)?;
-    let template_name = pkg.manifest().template_id.clone();
-
-    let graph = ProjectGraph::load(&conn)?;
+    // Scope the SQLite connection (and the `ProjectPackage` handle
+    // that owns the file descriptor) to a tight block so both drop
+    // — releasing the database file handle, the WAL fd, and the
+    // shared-lock — *before* the slower I/O below
+    // (`std::fs::canonicalize` + `std::fs::read` + `IfcReader::
+    // from_string` + cache writes). Holding `conn` across those calls
+    // doesn't cause correctness issues (SQLCipher uses WAL +
+    // `busy_timeout`), but it widens the lock-contention window
+    // against concurrent `bim_attach_ifc` / `command_apply` calls
+    // taking write locks on the same project — multi-tab editing
+    // or auto-save against the same project package while a deliver
+    // pack is in flight could see noisier `SQLITE_BUSY` retries.
+    // Read everything the export needs into owned values inside the
+    // block; the function body below operates purely on those.
+    let (graph, template_name) = {
+        let (pkg, conn) =
+            ProjectPackage::open_with_master_key_and_database(project_path, master_key)?;
+        let template_name = pkg.manifest().template_id.clone();
+        let graph = ProjectGraph::load(&conn)?;
+        (graph, template_name)
+        // `conn` and `pkg` are dropped here, before the canonicalize
+        // / read / parse / cache calls below.
+    };
 
     // --- IFC: recover canonical source path from any spatial row.
     //
