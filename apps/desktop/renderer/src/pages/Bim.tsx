@@ -218,7 +218,7 @@ export function Bim() {
           break;
         }
         case "attachIfc": {
-          if (!projectPath) {
+          if (!startPath) {
             addToast("error", "No project open — open or create one first");
             break;
           }
@@ -231,13 +231,31 @@ export function Bim() {
             if (dialog.canceled || dialog.paths.length === 0) break;
             // Picked path was chosen for project A; if the user
             // switched mid-dialog, attaching it to the (now
-            // different) `projectPath` captured at entry would
+            // different) `startPath` captured at entry would
             // bind project A's IFC to project B's DB. Abort.
             if (getActiveProjectPath() !== startPath) break;
             attachPath = dialog.paths[0];
           }
+          // Bind the IFC to the project that was active when the
+          // handler dispatched (the `startPath` capture), not the
+          // closure-captured `project?.path` from render time.
+          // `getActiveProjectPath()` reads through `projectPathRef`
+          // which `updateProject` writes synchronously, while
+          // `project` updates through React's batched commit phase.
+          // The two can diverge inside the microsecond window
+          // between a synchronous `updateProject(B)` call and
+          // React committing the re-render — if a click handler
+          // fires `onInvoke` in that window, `startPath` reflects
+          // B while the closure `projectPath` still reflects A.
+          // The post-await guard `getActiveProjectPath() !== startPath`
+          // would pass (B === B) while a closure-captured
+          // `attachIfcToProject(projectPath, ...)` call would address
+          // A — silently binding project A's IFC to project B's DB.
+          // Reading from `startPath` closes that theoretical gap and
+          // keeps every bridge-call argument inside this handler
+          // sourced from the same ref the post-await guards read.
           const attachResult = await attachIfcToProject(
-            projectPath,
+            startPath,
             attachPath,
           );
           // Skip stale: don't land project A's attach result
@@ -260,10 +278,17 @@ export function Bim() {
             addToast("error", "Import an IFC first before exporting");
             break;
           }
+          // Source the default-path prefix from `startPath` (the
+          // sync-ref capture at handler entry) rather than the
+          // closure-captured `project?.path`. See the long-form
+          // rationale on the `attachIfc` bridge-call argument
+          // above — same race window, same correctness argument:
+          // the dialog-default-path the user sees must match the
+          // project the post-await guards check against.
           const saveResult = await aec.dialog.saveFile({
             title: "Export IFC",
-            defaultPath: projectPath
-              ? `${projectPath}/export.ifc`
+            defaultPath: startPath
+              ? `${startPath}/export.ifc`
               : "export.ifc",
             filters: IFC_FILTERS,
           });
@@ -325,12 +350,15 @@ export function Bim() {
           // `omniclass-21` via a small picker; surfacing the
           // counts in a toast keeps the operation observable
           // without that UI.
-          if (!projectPath) {
+          if (!startPath) {
             addToast("error", "No project open — open or create one first");
             break;
           }
+          // Address `classify` at the project that was active when
+          // the handler dispatched. See the long-form rationale on
+          // the `attachIfc` bridge-call argument above.
           const result = await aec.bim.classify({
-            projectPath,
+            projectPath: startPath,
             scheme: "ifc",
           });
           // Skip stale: announcing project A's classify counts on
@@ -351,8 +379,19 @@ export function Bim() {
             addToast("error", "Import an IFC first before generating schedules");
             break;
           }
-          const outPath = projectPath
-            ? `${projectPath}/schedules/rooms.xlsx`
+          // Build the output path against the project that was
+          // active when the handler dispatched (the `startPath`
+          // sync-ref capture), not the closure-captured
+          // `project?.path`. See the long-form rationale on the
+          // `attachIfc` bridge-call argument above for the timing
+          // analysis — the same microsecond window between
+          // synchronous `updateProject(B)` and React's batched
+          // commit applies here. Writing the XLSX into project A's
+          // schedules folder while `startPath` already addresses
+          // project B would leave an orphaned file under A's tree
+          // and announce success under B's UI — both ends wrong.
+          const outPath = startPath
+            ? `${startPath}/schedules/rooms.xlsx`
             : "rooms.xlsx";
           const summary = await aec.bim.generateSchedule({
             sourcePath: ifcSourcePath,
@@ -422,8 +461,13 @@ export function Bim() {
             addToast("error", "Import an IFC first");
             break;
           }
-          const boqOut = projectPath
-            ? `${projectPath}/schedules/materials.xlsx`
+          // Same `startPath` sourcing as `generateSchedule`
+          // above — keep every bridge-call argument inside this
+          // handler sourced from the same ref the post-await guards
+          // read. See the long-form rationale on the `attachIfc`
+          // branch.
+          const boqOut = startPath
+            ? `${startPath}/schedules/materials.xlsx`
             : "materials.xlsx";
           const boqSummary = await aec.bim.generateSchedule({
             sourcePath: ifcSourcePath,
