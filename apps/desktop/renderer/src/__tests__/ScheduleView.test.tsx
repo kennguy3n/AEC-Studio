@@ -1,10 +1,11 @@
 import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { ScheduleView, ScheduleRow } from "../components/bim/ScheduleView";
+import { aec } from "../api/aec";
 
 const baseProps = {
-  sourcePath: "demo://project.ifc",
-  outPathForKind: (kind: string) => `demo://project.${kind}.xlsx`,
+  sourcePath: "/test/project.ifc",
+  outPathForKind: (kind: string) => `/test/project.${kind}.xlsx`,
 };
 
 describe("ScheduleView", () => {
@@ -70,6 +71,135 @@ describe("ScheduleView", () => {
     const [kind, summary] = onGenerate.mock.calls[0];
     expect(kind).toBe("room");
     expect(typeof summary.scheduleId).toBe("string");
-    expect(summary.outPath).toBe("demo://project.room.xlsx");
+    expect(summary.outPath).toBe("/test/project.room.xlsx");
+  });
+
+  it("disables the Regenerate button when no IFC is imported (empty sourcePath)", () => {
+    const onGenerate = vi.fn();
+    render(
+      <ScheduleView
+        sourcePath=""
+        outPathForKind={baseProps.outPathForKind}
+        rowsByKind={{}}
+        onGenerate={onGenerate}
+      />,
+    );
+    const btn = screen.getByTestId("schedule-regenerate") as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
+    // Clicking a disabled button must not invoke the parent callback;
+    // without the empty-string guard the bridge would receive an empty
+    // path and fail on the native side.
+    fireEvent.click(btn);
+    expect(onGenerate).not.toHaveBeenCalled();
+  });
+
+  // Defense-in-depth regression: Devin Review flagged that the
+  // `regenerate` callback itself lacks an internal empty-`sourcePath`
+  // guard. Today the button-disabled check (`disabled={busy ||
+  // sourcePath === ""}`) makes the bug unreachable from the UI, but
+  // a future non-button caller (parent-driven re-generation on mount,
+  // a keyboard shortcut, a "regenerate all" toolbar action) could
+  // invoke the function programmatically with an empty path. The
+  // internal `if (busy || sourcePath === "") return;` guard at the
+  // top of `regenerate` makes that programmatic path safe too.
+  // We simulate the future caller by force-removing the button's
+  // disabled attribute and firing a click — without the internal
+  // guard the IPC spy would record a call with `sourcePath: ""`.
+  it("regenerate() internal guard skips the IPC when sourcePath is empty", async () => {
+    const onGenerate = vi.fn();
+    const generateSpy = vi.spyOn(aec.bim, "generateSchedule");
+    render(
+      <ScheduleView
+        sourcePath=""
+        outPathForKind={baseProps.outPathForKind}
+        rowsByKind={{}}
+        onGenerate={onGenerate}
+      />,
+    );
+    const btn = screen.getByTestId("schedule-regenerate") as HTMLButtonElement;
+    // Simulate a future caller that bypasses the disabled-button UX
+    // (e.g. wires the click handler to a keyboard shortcut and forgets
+    // to mirror the disabled check). The internal guard must hold.
+    btn.removeAttribute("disabled");
+    fireEvent.click(btn);
+    // Give any unguarded promise a tick to settle so a missed guard
+    // would surface as a spy invocation before this assertion runs.
+    await Promise.resolve();
+    expect(generateSpy).not.toHaveBeenCalled();
+    expect(onGenerate).not.toHaveBeenCalled();
+    generateSpy.mockRestore();
+  });
+
+  // Regression test: Devin Review flagged that the `regenerate`
+  // callback had `try { ... } finally { ... }` with no `catch`.
+  // Pre-Phase 13 every branch hit `demo://` paths (in-process
+  // fallback never throws), so missing catch was benign; Phase 13
+  // wires real OS paths from the file picker so disk-full /
+  // permission-denied / locked-DB errors became silent unhandled
+  // promise rejections. The fix routes bridge failures through the
+  // optional `onError` callback so the parent (Bim.tsx) can surface
+  // them via `addToast("error", ...)`.
+  it("regenerate() surfaces bridge failures via onError", async () => {
+    const onGenerate = vi.fn();
+    const onError = vi.fn();
+    const generateSpy = vi
+      .spyOn(aec.bim, "generateSchedule")
+      .mockRejectedValueOnce(new Error("disk full"));
+    render(
+      <ScheduleView
+        {...baseProps}
+        rowsByKind={{}}
+        onGenerate={onGenerate}
+        onError={onError}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("schedule-regenerate"));
+    await waitFor(() => expect(onError).toHaveBeenCalledTimes(1));
+    // The display message must include the bridge error so the user
+    // can act on it (retry / free disk / pick a different out-path).
+    expect(onError.mock.calls[0][0]).toMatch(
+      /Regenerate room schedule failed: disk full/,
+    );
+    // onGenerate must NOT fire on failure — the XLSX wasn't written.
+    expect(onGenerate).not.toHaveBeenCalled();
+    // The button must re-enable for retry (finally block clears busy).
+    const btn = screen.getByTestId(
+      "schedule-regenerate",
+    ) as HTMLButtonElement;
+    await waitFor(() => expect(btn.disabled).toBe(false));
+    generateSpy.mockRestore();
+  });
+
+  // Companion regression: when `onError` is omitted (isolated unit
+  // tests, hypothetical future callers that forget to wire it), the
+  // panel falls back to `console.error` so the failure is still
+  // observable in dev rather than silently swallowed. The button
+  // must still re-enable for retry.
+  it("regenerate() logs to console when onError is omitted", async () => {
+    const consoleSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const generateSpy = vi
+      .spyOn(aec.bim, "generateSchedule")
+      .mockRejectedValueOnce(new Error("permission denied"));
+    render(
+      <ScheduleView
+        {...baseProps}
+        rowsByKind={{}}
+        onGenerate={() => undefined}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("schedule-regenerate"));
+    await waitFor(() => expect(consoleSpy).toHaveBeenCalled());
+    const message = consoleSpy.mock.calls[0][0] as string;
+    expect(message).toMatch(
+      /Regenerate room schedule failed: permission denied/,
+    );
+    const btn = screen.getByTestId(
+      "schedule-regenerate",
+    ) as HTMLButtonElement;
+    await waitFor(() => expect(btn.disabled).toBe(false));
+    generateSpy.mockRestore();
+    consoleSpy.mockRestore();
   });
 });

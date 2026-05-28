@@ -333,6 +333,16 @@ export interface BridgeBackend {
     outPath: string;
   }): Promise<BimScheduleSummary>;
   /**
+   * Read back the row data from a previously-generated XLSX schedule
+   * file. The bridge reads the file, parses the first worksheet, and
+   * returns an array of row objects keyed by column header. The
+   * renderer's `ScheduleView` calls this after `bimGenerateSchedule`
+   * so it can display real row data inline.
+   */
+  bimReadScheduleRows(params: {
+    xlsxPath: string;
+  }): Promise<BimScheduleRows>;
+  /**
    * Parse an IFC file and run the rule-based BIM validator against
    * the resulting snapshot. Findings are split by severity (errors
    * / warnings / infos) so the renderer's three-panel view can
@@ -479,6 +489,14 @@ export interface BridgeBackend {
      * archive's summary PDF must thread it through here.
      */
     projectName?: string;
+    /**
+     * Path to the `.aecstudio` project package. When supplied the
+     * bridge builds a `DeliverPackContext` from the real project
+     * (renders from `<project>/renders/`, schedules from the graph,
+     * sheets from Sheet definitions, IFC from the graph serialiser)
+     * instead of falling back to placeholder content.
+     */
+    projectPath?: string;
     includeRenders?: boolean;
     includeSheets?: boolean;
     includeIfc?: boolean;
@@ -1185,6 +1203,18 @@ export interface BimScheduleSummary {
 }
 
 /**
+ * Rows read back from a previously-generated XLSX schedule via
+ * `bimReadScheduleRows`. Each row is a plain object keyed by column
+ * header (e.g. `{ Name: "Living", Area: 28.5 }`). The type is the
+ * deserialized output of `aec_bim::schedules::read_schedule_rows`
+ * which reads the first worksheet of the XLSX and returns a Vec of
+ * `BTreeMap<String, serde_json::Value>`.
+ */
+export interface BimScheduleRows {
+  rows: Array<Record<string, string | number | boolean | null>>;
+}
+
+/**
  * Engine status for the renderer's status pane. Field-for-field
  * mirror of `EngineStatusJs` in
  * `crates/aec_bridge/src/napi_api.rs::EngineStatusJs`. Drift between
@@ -1490,6 +1520,7 @@ interface NativeApi {
     kind: string,
     out_path: string,
   ): unknown;
+  bim_read_schedule_rows(xlsx_path: string): unknown;
   // Asset library wired in PR-U. The napi side narrows the loosely-
   // typed `Record<string, unknown>` query to the four documented
   // fields; unknown extra keys are silently dropped by napi-rs.
@@ -1691,6 +1722,7 @@ export const NATIVE_WIRED_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   "bimValidate",
   "bimDiff",
   "bimGenerateSchedule",
+  "bimReadScheduleRows",
   // Asset library wired in PR-U. `designListAssets` routes through
   // a real `aec_assets::AssetDatabase` (`<state_dir>/asset_library/
   // assets.sqlite`) with first-open seeding of the 4 demo assets the
@@ -2019,6 +2051,8 @@ function adaptNative(n: NativeApi): BridgeBackend {
         params.kind,
         params.outPath,
       ) as BimScheduleSummary,
+    bimReadScheduleRows: async (params) =>
+      n.bim_read_schedule_rows(params.xlsxPath) as BimScheduleRows,
     // PR-U: asset library backed by `aec_assets::AssetDatabase`.
     // `query` is `Record<string, unknown>` on the BridgeBackend
     // interface so the renderer can pass arbitrary extra filter
@@ -2797,7 +2831,7 @@ export function inProcessBackend(): BridgeBackend {
     // Rationale: this dev-mode/test backend is invoked by the
     // renderer when the .node artefact isn't loaded. The demo
     // `Bim.tsx` page (and other UI surfaces wired in this PR) pass
-    // synthetic `demo://project.ifc` paths that aren't expected to
+    // synthetic paths that aren't expected to
     // exist on disk; an earlier draft of these stubs called
     // `fs.promises.access(...)` against the source path, which
     // raised `ENOENT` and broke every BIM-toolbar action in dev
@@ -2872,6 +2906,10 @@ export function inProcessBackend(): BridgeBackend {
         bytesWritten: 0,
         parseCacheHit: false,
       };
+    },
+    async bimReadScheduleRows(_params) {
+      // In-process fallback: no real XLSX file exists, return empty rows.
+      return { rows: [] };
     },
     async bimValidate(params) {
       return {

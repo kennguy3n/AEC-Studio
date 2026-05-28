@@ -12,8 +12,10 @@
  * right now" — it's the side that runs `project:open` and
  * `project:createFromTemplate` and holds the on-disk handle. This
  * module keeps a single process-wide slot for the active project
- * path; the IPC handlers update it on open/create and read it when
- * forwarding a no-projectPath call into the bridge.
+ * (path + cached `ProjectSummary`); the IPC handlers update it on
+ * open/create/save/close and read it when forwarding a no-projectPath
+ * call into the bridge or answering a `project:current` poll from
+ * the renderer's `useActiveProject` hook.
  *
  * If a draft / deliver / command handler runs before a project is
  * open, `getActiveProjectPath` throws a clear validation error
@@ -22,13 +24,61 @@
  * in-process fallback — silently no-op).
  */
 
+/**
+ * Project summary shape mirrored from `crates/aec_core::package::ProjectSummary`.
+ * Inlined here rather than imported from `bridge.ts` so the
+ * tracker has no compile-time dependency on the bridge module
+ * (which pulls in the napi binary). The bridge `ProjectSummary`
+ * type is structurally compatible — the tracker accepts any
+ * object with these fields, and `setActiveProject` runs a
+ * structural check.
+ */
+export interface ActiveProjectSummary {
+  projectId: string;
+  name: string;
+  path: string;
+  templateKey: string | null;
+  modifiedAt: string;
+}
+
 let activeProjectPath: string | null = null;
+let activeProjectSummary: ActiveProjectSummary | null = null;
+
+type ChangeListener = (
+  summary: ActiveProjectSummary | null,
+) => void;
+
+const listeners = new Set<ChangeListener>();
 
 /**
- * Record the project path of the currently open project. Called
- * from the `project:open` and `project:createFromTemplate` IPC
- * handlers right after the bridge successfully opens / creates
- * the project package on disk.
+ * Record the project path WITHOUT a cached `ProjectSummary`.
+ *
+ * **Test-only fixture helper.** No production IPC handler calls
+ * this — `project:open` / `project:createFromTemplate` / `project:
+ * save` all dispatch through [`setActiveProject`] (full summary) or
+ * [`setActiveProjectIfMatchesActive`] (summary, guarded against
+ * cross-project promotion). This function exists exclusively to
+ * exercise the "path is set but no summary cached" branch of
+ * [`resolveCurrentProjectForRenderer`] — the documented hot-reload
+ * / renderer-state-commit race recovery path — without forcing
+ * tests to manually clear a previously-set summary.
+ *
+ * Devin Review flagged that the previous incarnation of this
+ * function called `notify()` after writing the slot, which would
+ * broadcast a `null` summary to every renderer listener if the
+ * cached summary did not match the new path. That broadcast was
+ * test-fixture noise (no production caller invokes this function)
+ * but a future contributor that reused `setActiveProjectPath` for
+ * production lifecycle work would inadvertently signal renderers
+ * to clear their `useActiveProject` state. The current
+ * implementation does NOT notify; tests that need the
+ * notification semantics should use [`setActiveProject`] (which
+ * carries a real summary) or [`clearActiveProjectPath`].
+ *
+ * Validation parity with [`setActiveProject`] is retained
+ * (non-empty string) so test fixtures cannot accidentally place
+ * the tracker into an invalid state that production callers could
+ * not reach.
  */
 export function setActiveProjectPath(projectPath: string): void {
   if (typeof projectPath !== "string" || projectPath.length === 0) {
@@ -37,6 +87,35 @@ export function setActiveProjectPath(projectPath: string): void {
     );
   }
   activeProjectPath = projectPath;
+  // If the cached summary doesn't match the new path, clear it so a
+  // follow-up `project:current` returns `null`-summary with the
+  // path-only fallback rather than the previous project's summary.
+  // No `notify()` call follows: see the docblock above for the
+  // rationale (test-only fixture; production listeners would
+  // misinterpret a `null` broadcast as "no project active" while
+  // the path slot is in fact set).
+  if (
+    activeProjectSummary !== null &&
+    activeProjectSummary.path !== projectPath
+  ) {
+    activeProjectSummary = null;
+  }
+}
+
+/**
+ * Record the full summary of the currently open project. Used by
+ * `project:open`, `project:createFromTemplate`, and `project:save`
+ * so the renderer's hook can render the project name in the app
+ * header without a bridge round-trip. Throws if `summary.path` is
+ * empty (mirrors `setActiveProjectPath`).
+ */
+export function setActiveProject(summary: ActiveProjectSummary): void {
+  if (typeof summary.path !== "string" || summary.path.length === 0) {
+    throw new Error("setActiveProject: summary.path must be a non-empty string");
+  }
+  activeProjectPath = summary.path;
+  activeProjectSummary = { ...summary };
+  notify();
 }
 
 /**
@@ -67,26 +146,164 @@ export function peekActiveProjectPath(): string | null {
 }
 
 /**
- * Reset the tracker. Two callers:
+ * Refresh the cached summary *only* when the given summary belongs
+ * to the currently-open project. Returns `true` when the cache was
+ * updated, `false` otherwise.
+ *
+ * Used by the `project:save` IPC handler so that saving the active
+ * project picks up the new `modifiedAt` for the header, while a
+ * non-active caller (a future background export pipeline that saves
+ * an archived project, a multi-project bulk-save batch job) cannot
+ * silently promote a different project into the active slot — which
+ * would race with the renderer's `useActiveProject` hook and trip
+ * the `RequireProject` route guard mid-edit. The active slot only
+ * ever changes via `project:open` / `project:createFromTemplate` /
+ * `project:close`, or a save of the project that is already active.
+ *
+ * The cross-handler invariant ("only project-lifecycle IPC handlers
+ * move the active slot") is enforced *here* rather than inlined at
+ * each call site so future handlers that need the same behaviour
+ * (e.g. `project:exportPackage` if it grows a save-side-effect)
+ * pick up the same contract by importing this helper.
+ */
+export function setActiveProjectIfMatchesActive(
+  summary: ActiveProjectSummary,
+): boolean {
+  if (activeProjectPath !== summary.path) {
+    return false;
+  }
+  setActiveProject(summary);
+  return true;
+}
+
+/**
+ * Look up the cached summary of the currently open project. Returns
+ * `null` if no project is open or no summary has been cached (only
+ * `setActiveProjectPath` was called — in that case the renderer
+ * should fall back to `aec.project.listRecents()` to look up the
+ * full summary).
+ */
+export function peekActiveProjectSummary(): ActiveProjectSummary | null {
+  return activeProjectSummary === null ? null : { ...activeProjectSummary };
+}
+
+/**
+ * Resolve the currently-open project for the renderer's
+ * `project:current` IPC channel. The renderer's `useActiveProject`
+ * hook polls this on mount (and after every push notification) to
+ * surface the current project to every mode page.
+ *
+ * Three branches:
+ *   1. A cached summary exists → return it directly (fast path).
+ *   2. Only the path is set (renderer hot-reload, push notification
+ *      raced with a state commit) → look it up via the supplied
+ *      `listRecents` callback and re-cache the summary.
+ *   3. Nothing is set → return `{ summary: null }` so the renderer's
+ *      route guard sends the user to Home.
+ *
+ * Critically, branch (2) is asynchronous: between the path read at
+ * function entry and the `setActiveProject(found)` re-cache after
+ * the await, the active path can change (the user closes the
+ * project, or opens a different one) because the event loop yields
+ * across the await. Without a re-check, this handler would
+ * silently re-activate a project the user just closed — leaving
+ * the renderer (which already committed the close) out of sync
+ * with the main-process tracker until the next push notification
+ * (which itself fires from the offending `setActiveProject` call,
+ * meaning the renderer would be told to *re-open* the project it
+ * just closed). The TOCTOU guard below — re-reading
+ * `peekActiveProjectPath()` after the await and bailing if it
+ * diverges from the pre-await value — closes this window.
+ *
+ * Factored out of the `project:current` IPC handler so the
+ * resolution logic (and especially the TOCTOU guard) can be unit-
+ * tested without spinning up Electron's `ipcMain`. The IPC handler
+ * is then a thin one-liner that wires `getBridge().projectListRecents`
+ * into this function.
+ */
+export async function resolveCurrentProjectForRenderer(
+  listRecents: () => Promise<ActiveProjectSummary[]>,
+): Promise<{ summary: ActiveProjectSummary | null }> {
+  const summary = peekActiveProjectSummary();
+  const pathAtEntry = peekActiveProjectPath();
+  if (summary !== null) {
+    return { summary };
+  }
+  if (pathAtEntry === null) {
+    return { summary: null };
+  }
+  const recents = await listRecents();
+  // Re-check after the await: if the user closed (or switched)
+  // projects during the recents lookup, the pre-await path no
+  // longer represents intent. Compare path-at-entry vs path-now
+  // rather than just `peekActiveProjectPath() !== null` because the
+  // user could have *switched* to a different project during the
+  // await — in that case the new project's open handler already
+  // cached its summary, so the `summary !== null` branch at the
+  // top of the next `project:current` poll will return the new
+  // project. Falling through to the `setActiveProject(found)` call
+  // here with the *old* path would silently overwrite the new
+  // active slot. Bail to the `summary: null` branch and let the
+  // renderer re-poll (or the push subscription deliver) the new
+  // state.
+  const pathNow = peekActiveProjectPath();
+  if (pathNow !== pathAtEntry) {
+    return { summary: null };
+  }
+  const found = recents.find((p) => p.path === pathAtEntry);
+  if (found) {
+    setActiveProject(found);
+    return { summary: found };
+  }
+  return { summary: null };
+}
+
+/**
+ * Reset the tracker. Three callers:
  *
  *   1. Unit tests (`vitest`) that need a clean slot between cases
  *      — the test file uses `afterEach(clearActiveProjectPath)`.
- *   2. A future `project:close` IPC handler, when one exists.
+ *   2. The `project:close` IPC handler (Phase 13 Task 22).
+ *   3. Window-close cleanup on the main process side, when added.
  *
- * The Electron app today has no `project:close` channel: the only
- * way the user can transition out of a project is to open another
- * one (`project:open` / `project:createFromTemplate`), and both of
- * those overwrite the slot via `setActiveProjectPath` after the
- * bridge has successfully opened the new project package. We
- * deliberately do *not* clear on window close either — if the
- * renderer reloads (e.g. a dev `Cmd+R`) the main process keeps the
- * active project so the renderer can re-attach without a
- * round-trip through the open flow.
- *
- * Resolves PR-X round 4 ANALYSIS-0001 (active-project tracker not
- * cleared on close): the design is intentional and the function
- * is plumbed for the day a `project:close` handler is added.
+ * Earlier the only way the user could transition out of a project
+ * was to open another one (`project:open` /
+ * `project:createFromTemplate`), and both of those overwrite the
+ * slot via `setActiveProjectPath` after the bridge has successfully
+ * opened the new project package. Phase 13 adds the
+ * `project:close` handler so the renderer can return the user to
+ * the Home screen without a hard reload.
  */
 export function clearActiveProjectPath(): void {
   activeProjectPath = null;
+  activeProjectSummary = null;
+  notify();
+}
+
+/**
+ * Subscribe to active-project changes. The listener is called
+ * synchronously from `setActive*` / `clear*` calls so the renderer's
+ * `project:current` IPC channel can stream live updates if a
+ * future feature wants push-based notifications. Returns an
+ * unsubscribe function.
+ */
+export function onActiveProjectChange(listener: ChangeListener): () => void {
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+  };
+}
+
+function notify(): void {
+  const snapshot = activeProjectSummary === null ? null : { ...activeProjectSummary };
+  for (const l of Array.from(listeners)) {
+    try {
+      l(snapshot);
+    } catch {
+      // Defensive: a listener throwing must not corrupt the tracker
+      // state or block other listeners. The Electron main process
+      // has no global error handler that would catch a sync throw
+      // out of an `ipcMain.handle` callback, so swallow here.
+    }
+  }
 }

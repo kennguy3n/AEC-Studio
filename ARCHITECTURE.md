@@ -189,6 +189,72 @@ React renderer → typed IPC → Electron main → N-API → Rust core → in-pr
 | Renderer talking to the AI sidecar directly | Bypasses the safety validator and audit trail |
 | Renderer accessing the encrypted DB | Exposes the encryption key to the web context |
 
+### Active project state (Phase 13)
+
+The Electron main process owns the **canonical active-project state**. Renderer
+pages never hold a project path of their own — they read it from the React
+`ActiveProjectProvider` (`apps/desktop/renderer/src/hooks/useActiveProject.tsx`),
+which mirrors the main-process state through the `project:current` /
+`project:close` IPC handlers.
+
+```
+Renderer (React)                     Electron main (active-project.ts)
+─────────────────                    ─────────────────────────────────
+ActiveProjectProvider  ◄──────────►  ActiveProjectSummary { path, summary }
+  │   useActiveProject()                  ▲
+  │     · project, dirty, saving          │  setActiveProject(summary)
+  │     · undoLen, redoLen                │     (from project:open /
+  │     · openProject(), createProject(),       project:createFromTemplate /
+  │     · closeProject(), saveProject(),        project:save IPC handlers)
+  │     · markDirty(), setUndoRedo()      │
+  │                                        │
+  └──► <RequireProject>                    │
+        redirects to "/" when project       │
+        is null                             │
+                                           │
+                              ┌────────────┘
+                              │
+                       withResolvedProjectPath()
+                       (ipc.ts wrapper)
+                              │
+                              ▼
+                     Bridge IPC calls — `draft:*`, `deliver:*`,
+                     `command:*` — auto-inject the active project
+                     path if the caller didn't supply one
+```
+
+Key design points:
+
+* The main process exposes `peekActiveProjectPath()` and
+  `peekActiveProjectSummary()` for IPC handlers that need to inject the path
+  into bridge calls without round-tripping to the renderer.
+* `withResolvedProjectPath(handlerName, handler)` is a wrapper that resolves
+  the project path from (a) an explicit `projectPath` argument, falling back
+  to (b) `peekActiveProjectPath()`, and errors when neither is available. Used
+  by every `draft:*`, `deliver:*`, `command:*` handler so the renderer can
+  call bridge methods without manually threading the path on every gesture.
+* The renderer's `useActiveProject` hook subscribes to `onActiveProjectChange`
+  via the preload's `project.current` observer so a project open/close from
+  one window propagates to all renderer contexts.
+* Auto-save: `markDirty()` arms a 5 s debounced `project:save` call. The
+  StatusBar renders the live dirty/saving/saved indicator. Failures
+  re-arm the timer on the next mutation rather than silently losing the
+  change.
+* Route guards: every mode route (`/design`, `/draft`, `/bim`, `/render`,
+  `/deliver`) is wrapped in `<RequireProject>` which redirects to `/` when
+  no project is open. The `/settings` route is unguarded — the user can
+  edit preferences with no project loaded.
+* Error boundaries: each mode is also wrapped in an `<ErrorBoundary>` so a
+  runtime exception in a deeply-nested component (e.g. a malformed XLSX
+  row in the schedule view) surfaces a friendly fallback with a "Retry"
+  button instead of crashing the entire shell.
+* Keyboard shortcuts: `Ctrl/Cmd+Z` (undo), `Ctrl/Cmd+Shift+Z` (redo),
+  `Ctrl/Cmd+S` (save), `Ctrl/Cmd+W` (close project), and `Shift+?` /
+  `Ctrl/Cmd+/` (shortcut help overlay) are registered via the global
+  `shortcutRegistry` so the help overlay reads them dynamically. Undo/redo
+  is scoped by the current route's `CommandScope` (design / draft / bim /
+  render / deliver), so the command engine partitions history correctly.
+
 ### TypeScript API interfaces
 
 ```typescript

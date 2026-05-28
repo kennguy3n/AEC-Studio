@@ -20,6 +20,108 @@ const api = {
     listRecents: () => ipcRenderer.invoke("project:listRecents"),
     exportPackage: (projectPath: string, outPath: string) =>
       ipcRenderer.invoke("project:exportPackage", { projectPath, outPath }),
+    current: () =>
+      ipcRenderer.invoke("project:current") as Promise<{
+        summary: {
+          projectId: string;
+          name: string;
+          path: string;
+          templateKey: string | null;
+          modifiedAt: string;
+        } | null;
+      }>,
+    close: () =>
+      ipcRenderer.invoke("project:close") as Promise<{ ok: true }>,
+    // Push subscription to active-project changes. The main process
+    // (`active-project.ts → onActiveProjectChange`) calls every
+    // listener synchronously on every `setActive*` / `clear*` site;
+    // the IPC bridge fans those notifications out to every renderer
+    // window via `webContents.send("project:active-changed", summary)`.
+    //
+    // The renderer's `useActiveProject` hook subscribes once on mount
+    // so that future multi-window scenarios — a second BrowserWindow
+    // is added (e.g. "Open project in new window", Print Preview,
+    // pop-out viewport), a future test harness mutates the tracker
+    // directly, or the bridge auto-recovers by routing to a fallback
+    // project after a corrupt-DB read — all keep the renderer-side
+    // active-project state coherent without a full reload.
+    //
+    // Today there is a single renderer window so the listener is a
+    // defensive no-op for any push that originated from the same
+    // window's own `openProject` / `createProject` / `saveProject` /
+    // `closeProject` (the renderer already updated its state before
+    // the push round-tripped back). The push channel does NOT
+    // duplicate the renderer-only fields (`dirty`, `saving`,
+    // `undoLen`, `redoLen`) — those are window-local and stay in the
+    // renderer's `useActiveProject` state.
+    //
+    // Returns an unsubscribe function. The hook calls it in its
+    // `useEffect` cleanup to prevent leaked listeners across HMR
+    // reloads in dev. We use `ipcRenderer.on` (NOT `addListener` /
+    // `once`) because the channel emits indefinitely.
+    onActiveProjectChange: (
+      listener: (
+        summary: {
+          projectId: string;
+          name: string;
+          path: string;
+          templateKey: string | null;
+          modifiedAt: string;
+        } | null,
+      ) => void,
+    ): (() => void) => {
+      const channel = "project:active-changed";
+      const handler = (
+        _event: Electron.IpcRendererEvent,
+        summary: {
+          projectId: string;
+          name: string;
+          path: string;
+          templateKey: string | null;
+          modifiedAt: string;
+        } | null,
+      ) => {
+        listener(summary);
+      };
+      ipcRenderer.on(channel, handler);
+      return () => {
+        ipcRenderer.removeListener(channel, handler);
+      };
+    },
+  },
+
+  // ----- Dialog (Phase 13) -----
+  dialog: {
+    openFile: (params?: {
+      title?: string;
+      defaultPath?: string;
+      filters?: Array<{ name: string; extensions: string[] }>;
+      message?: string;
+      allowMultiple?: boolean;
+    }) =>
+      ipcRenderer.invoke("dialog:openFile", params ?? {}) as Promise<{
+        canceled: boolean;
+        paths: string[];
+      }>,
+    openDirectory: (params?: {
+      title?: string;
+      defaultPath?: string;
+      message?: string;
+    }) =>
+      ipcRenderer.invoke("dialog:openDirectory", params ?? {}) as Promise<{
+        canceled: boolean;
+        path: string | null;
+      }>,
+    saveFile: (params?: {
+      title?: string;
+      defaultPath?: string;
+      filters?: Array<{ name: string; extensions: string[] }>;
+      message?: string;
+    }) =>
+      ipcRenderer.invoke("dialog:saveFile", params ?? {}) as Promise<{
+        canceled: boolean;
+        path: string | null;
+      }>,
   },
 
   // ----- Design -----
@@ -128,8 +230,27 @@ const api = {
         bytesWritten: number;
         parseCacheHit: boolean;
       }>,
-    classify: (params: Record<string, unknown>) =>
-      ipcRenderer.invoke("bim:classify", params),
+    /**
+     * Run `bim_classify` on the active project's entity graph for
+     * the requested `scheme` (`"ifc"` / `"uniformat-ii"` /
+     * `"omniclass-21"`). The inline result type mirrors
+     * `BimClassifyResult` in `electron/bridge.ts` 1:1 so the
+     * renderer can react to counts without an extra import; drift
+     * here would surface as `undefined` on the classify toast,
+     * which the bridge's `adaptNative` self-check guards against.
+     */
+    classify: (params: { projectPath: string; scheme: string }) =>
+      ipcRenderer.invoke("bim:classify", params) as Promise<{
+        scheme: string;
+        classified: number;
+        unchanged: number;
+        skipped: number;
+        details: Array<{
+          entityId: string;
+          code: string;
+          title: string;
+        }>;
+      }>,
     setProperty: (params: Record<string, unknown>) =>
       ipcRenderer.invoke("bim:setProperty", params),
     /**
@@ -137,6 +258,10 @@ const api = {
      * room / material). Inline type mirrors `BimScheduleSummary`
      * in `electron/bridge.ts` 1:1.
      */
+    readScheduleRows: (params: { xlsxPath: string }) =>
+      ipcRenderer.invoke("bim:readScheduleRows", params) as Promise<{
+        rows: Array<Record<string, string | number | boolean | null>>;
+      }>,
     generateSchedule: (params: {
       sourcePath: string;
       outPath: string;
@@ -287,6 +412,13 @@ const api = {
       // backend falls back to the generic "Project" label — see
       // `crates/aec_bridge/src/napi_api.rs::deliver_build_pack`.
       projectName?: string;
+      // Explicit project path for the "archived project" flow
+      // documented in `bridge.ts`. When omitted the main-process IPC
+      // handler falls back to `peekActiveProjectPath()` (the active
+      // project). Aligning the preload type with the handler keeps
+      // the renderer-side call type-safe end-to-end instead of
+      // relying on structural-typing leakage at the IPC boundary.
+      projectPath?: string;
       includeRenders?: boolean;
       includeSheets?: boolean;
       includeIfc?: boolean;

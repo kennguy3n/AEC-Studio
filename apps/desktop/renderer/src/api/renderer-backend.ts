@@ -2,6 +2,40 @@
  * Renderer-side fallback backend used by Vitest. Mirrors the
  * in-process backend that the Electron main process uses when the
  * native bridge artefact is absent.
+ *
+ * # Factory pattern (not a singleton)
+ *
+ * {@link rendererInProcessBackend} is a *factory*, not a singleton.
+ * Every call creates a fresh closure with isolated `recents`,
+ * `current`, `activeListeners`, and `nextId` state.
+ *
+ * Two consumers, two intentionally different lifetimes:
+ *
+ * 1. **Production renderer**: `apps/desktop/renderer/src/api/aec.ts`
+ *    calls the factory exactly *once* at module-evaluation time and
+ *    exports the result as the `aec` constant. Because ES modules
+ *    are singletons within a renderer process, every component import
+ *    of `aec` gets the same backend instance — so opening a project
+ *    in one mode page is visible from every other mode page, the
+ *    StatusBar polling site, etc. This matches main-process semantics
+ *    where the active-project state lives in one
+ *    `apps/desktop/electron/active-project.ts` module.
+ *
+ * 2. **Vitest fixtures**: `renderer-backend-project-lifecycle.test.ts`
+ *    and similar tests call the factory *per test* to get a hermetic
+ *    backend instance. This is what makes the test suite deterministic
+ *    against an in-process backend: project A opened in test 1 cannot
+ *    leak into test 2's `recents` list, listener subscriptions cleared
+ *    in `afterEach` cannot accidentally fire against a later test's
+ *    state, and the `nextId` counter starts at 1 for every test
+ *    (stable assertions on generated thread / camera / job ids).
+ *
+ * Earlier iterations briefly returned a top-level singleton and let
+ * tests reach into module-private state for reset; that pattern
+ * caused intermittent test-ordering flakes whenever a previous test
+ * left a `defaultThreadId` poller running. The factory contract
+ * eliminates that class of flake entirely — there is no shared state
+ * to reset because there is no shared state.
  */
 
 import type { AecApi } from "../../../electron/preload";
@@ -33,7 +67,80 @@ interface Recent {
 }
 
 export function rendererInProcessBackend(): AecApi {
+  // The renderer in-process backend models two distinct pieces of
+  // state: the *recents history* (which persists across close+reopen,
+  // mirroring the user's most-recently-opened project list) and the
+  // *currently-open project* (which becomes `null` after `close()`,
+  // mirroring the main-process `clearActiveProjectPath()` contract).
+  //
+  // An earlier version conflated these by returning `recents[0]` from
+  // `current()` — which caused `close()` to be a no-op (since clearing
+  // the head would also destroy the user's recents list). Splitting
+  // them lets `close()` clear the active slot without wiping recents,
+  // matching production's main-process semantics exactly.
   const recents: Recent[] = [];
+  let current: Recent | null = null;
+  // Listeners subscribed via `project.onActiveProjectChange`. The
+  // in-process backend mirrors the main-process `active-project.ts`
+  // notification contract: every transition (open / create / save of
+  // the active project / close) fires `notifyActiveChange()` with
+  // the latest summary (or `null` for close). This lets the renderer
+  // hook's push-subscription useEffect exercise the same code path
+  // under vitest that production exercises against the real Electron
+  // IPC channel.
+  //
+  // Production-timing parity: in Electron, `webContents.send(
+  // "project:active-changed", summary)` from the main process is
+  // delivered to the renderer via a Chromium IPC dispatch on a
+  // macrotask boundary. The corresponding `ipcRenderer.invoke`
+  // response that resolves the awaiter's promise is delivered on a
+  // SEPARATE macrotask boundary; the renderer's microtask drain
+  // (await continuations) runs BETWEEN the two. As a result, the
+  // push listener in production fires AFTER
+  // `useActiveProject.openProject`'s continuation has already called
+  // `updateProject(summary)` and committed `projectPathRef`, so the
+  // listener's path-equality guard (see useActiveProject.tsx:370)
+  // correctly skips the redundant write and there is no double
+  // commit.
+  //
+  // To match this exactly under vitest, we defer the listener
+  // iteration to a macrotask (`setTimeout(..., 0)`). Without the
+  // defer, the listeners would fire synchronously inside `upsert()`
+  // — BEFORE the awaiter's continuation runs — and the path-equality
+  // guard would observe a stale `projectPathRef`, causing a spurious
+  // second commit that production never sees. Tests that need to
+  // assert on listener side-effects await one macrotask tick (e.g.
+  // `await new Promise((r) => setTimeout(r, 0))`) before reading the
+  // observed events, mirroring the way a real renderer would let the
+  // IPC channel drain.
+  //
+  // The summary snapshot is captured *eagerly* (at call time, not at
+  // listener-invocation time) so the listener sees the state that
+  // was active when the transition happened. This matches
+  // production where the main process serialises the summary into
+  // the IPC payload at send time, not at receive time. Listener
+  // membership IS re-read at invocation time (via `Array.from`), so
+  // a late `unsubscribe()` that lands between queue and run still
+  // drops the callback — matching the production semantics of
+  // `ipcRenderer.off` removing the listener before the queued IPC
+  // event reaches it.
+  const activeListeners = new Set<(s: Recent | null) => void>();
+  const notifyActiveChange = () => {
+    const snapshot = current === null ? null : { ...current };
+    setTimeout(() => {
+      for (const l of Array.from(activeListeners)) {
+        try {
+          l(snapshot);
+        } catch {
+          // Match the main-process tracker's defensive try/catch — a
+          // listener throwing must not corrupt other listeners or
+          // the backend state. Production has no global handler
+          // that would catch a sync throw out of
+          // `ipcRenderer.on(...)`.
+        }
+      }
+    }, 0);
+  };
   let nextId = 1;
   const newId = (prefix: string) =>
     `${prefix}_${(nextId++).toString(36).padStart(4, "0")}`;
@@ -42,6 +149,8 @@ export function rendererInProcessBackend(): AecApi {
     if (i >= 0) recents.splice(i, 1);
     recents.unshift(r);
     while (recents.length > 16) recents.pop();
+    current = { ...r };
+    notifyActiveChange();
   };
 
   const assets = [
@@ -110,6 +219,19 @@ export function rendererInProcessBackend(): AecApi {
         const now = new Date().toISOString();
         if (idx >= 0 && recents[idx]) {
           recents[idx].modifiedAt = now;
+          // Keep the active-project mirror in lockstep with the
+          // recents entry so the next `current()` call reflects the
+          // refreshed `modifiedAt` — matching production where the
+          // main-process active-project tracker is updated on save.
+          // Only fire `notifyActiveChange()` when the saved project
+          // IS the active one; saving a non-active project from a
+          // future background-export pipeline must not promote that
+          // project into the active slot (same contract as
+          // `setActiveProjectIfMatchesActive` on the main side).
+          if (current?.path === projectPath) {
+            current = { ...recents[idx] };
+            notifyActiveChange();
+          }
           return { ...recents[idx] };
         }
         return {
@@ -124,6 +246,45 @@ export function rendererInProcessBackend(): AecApi {
       },
       listRecents: async () => [...recents],
       exportPackage: async (_p, outPath) => ({ outPath }),
+      current: async () => ({
+        summary: current === null ? null : { ...current },
+      }),
+      close: async () => {
+        // Clear the active-project mirror so `current()` returns `null`
+        // after close — matching the main-process `clearActiveProjectPath()`
+        // contract. The `recents` history is preserved so a subsequent
+        // open from the Home screen's recently-opened list still works.
+        current = null;
+        notifyActiveChange();
+        return { ok: true as const };
+      },
+      // Push-subscription channel mirroring
+      // `aec.project.onActiveProjectChange` from the preload bridge.
+      // The renderer's `useActiveProject` hook subscribes once on
+      // mount and unsubscribes on unmount; the returned unsubscribe
+      // function removes the listener from the internal Set so
+      // long-running tests that mount/unmount the provider don't leak.
+      onActiveProjectChange: (
+        listener: (
+          summary: {
+            projectId: string;
+            name: string;
+            path: string;
+            templateKey: string | null;
+            modifiedAt: string;
+          } | null,
+        ) => void,
+      ): (() => void) => {
+        activeListeners.add(listener);
+        return () => {
+          activeListeners.delete(listener);
+        };
+      },
+    },
+    dialog: {
+      openFile: async () => ({ canceled: true, paths: [] }),
+      openDirectory: async () => ({ canceled: true, path: null }),
+      saveFile: async () => ({ canceled: true, path: null }),
     },
     design: {
       placeFurniture: async () => ({ entityId: newId("ent") }),
@@ -205,8 +366,8 @@ export function rendererInProcessBackend(): AecApi {
       // and these renderer-side mocks intentionally do NOT touch
       // the filesystem — they return zeroed-out, wire-format-
       // compliant payloads so the renderer can exercise its
-      // status panes against synthetic `demo://project.ifc`
-      // paths that don't exist on disk. The actual IFC pipeline
+      // status panes against synthetic paths that don't exist
+      // on disk. The actual IFC pipeline
       // is exercised end-to-end by
       // `crates/aec_bridge/tests/bim_readonly_ops.rs`.
       exportIfc: async (params) => ({
@@ -216,8 +377,24 @@ export function rendererInProcessBackend(): AecApi {
         bytesWritten: 0,
         parseCacheHit: false,
       }),
-      classify: async () => ({ classified: 0 }),
+      // Mirrors `BimClassifyResult` in `electron/bridge.ts` and the
+      // typed preload signature. The in-process fallback can't run
+      // the real `bim_classify` (no SQLCipher project on disk under
+      // vitest), so it returns the empty-success shape and lets the
+      // caller's "0 classified" toast render. Earlier this method
+      // returned only `{ classified: 0 }`, which silently hid a
+      // production bug where the Bim page sent the wrong params —
+      // matching the full shape here means future drift will trip
+      // the bridge's `adaptNative` self-check instead of the user.
+      classify: async () => ({
+        scheme: "ifc",
+        classified: 0,
+        unchanged: 0,
+        skipped: 0,
+        details: [],
+      }),
       setProperty: async () => ({ ok: true }),
+      readScheduleRows: async () => ({ rows: [] }),
       generateSchedule: async (params) => ({
         scheduleId: newId("sched"),
         kind: params.kind,
@@ -622,6 +799,15 @@ function deliverMock(newId: (prefix: string) => string) {
     async buildPack(params: {
       kind: "concept" | "interior" | "contractor" | "bim";
       outPath: string;
+      // Optional `projectPath` and `projectName` mirror the preload
+      // signature so vitest-side callers and electron-side callers
+      // share the same typed contract. The vitest fixture doesn't
+      // need either value to compute its synthetic inventory, but
+      // accepting them keeps the renderer's `aec.deliver.buildPack`
+      // call site polymorphic across both backends and prevents
+      // structural-typing leakage at the IPC boundary.
+      projectPath?: string;
+      projectName?: string;
       includeRenders?: boolean;
       includeSheets?: boolean;
       includeIfc?: boolean;
