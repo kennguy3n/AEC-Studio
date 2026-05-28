@@ -51,15 +51,34 @@ type ChangeListener = (
 const listeners = new Set<ChangeListener>();
 
 /**
- * Record the project path of the currently open project. Called
- * from the `project:open` and `project:createFromTemplate` IPC
- * handlers right after the bridge successfully opens / creates
- * the project package on disk.
+ * Record the project path WITHOUT a cached `ProjectSummary`.
  *
- * Prefer [`setActiveProject`] when a full `ProjectSummary` is
- * available — it caches the summary so the renderer's
- * `useActiveProject` hook can resolve `name` / `templateKey`
- * without a follow-up bridge round-trip.
+ * **Test-only fixture helper.** No production IPC handler calls
+ * this — `project:open` / `project:createFromTemplate` / `project:
+ * save` all dispatch through [`setActiveProject`] (full summary) or
+ * [`setActiveProjectIfMatchesActive`] (summary, guarded against
+ * cross-project promotion). This function exists exclusively to
+ * exercise the "path is set but no summary cached" branch of
+ * [`resolveCurrentProjectForRenderer`] — the documented hot-reload
+ * / renderer-state-commit race recovery path — without forcing
+ * tests to manually clear a previously-set summary.
+ *
+ * Devin Review flagged that the previous incarnation of this
+ * function called `notify()` after writing the slot, which would
+ * broadcast a `null` summary to every renderer listener if the
+ * cached summary did not match the new path. That broadcast was
+ * test-fixture noise (no production caller invokes this function)
+ * but a future contributor that reused `setActiveProjectPath` for
+ * production lifecycle work would inadvertently signal renderers
+ * to clear their `useActiveProject` state. The current
+ * implementation does NOT notify; tests that need the
+ * notification semantics should use [`setActiveProject`] (which
+ * carries a real summary) or [`clearActiveProjectPath`].
+ *
+ * Validation parity with [`setActiveProject`] is retained
+ * (non-empty string) so test fixtures cannot accidentally place
+ * the tracker into an invalid state that production callers could
+ * not reach.
  */
 export function setActiveProjectPath(projectPath: string): void {
   if (typeof projectPath !== "string" || projectPath.length === 0) {
@@ -71,13 +90,16 @@ export function setActiveProjectPath(projectPath: string): void {
   // If the cached summary doesn't match the new path, clear it so a
   // follow-up `project:current` returns `null`-summary with the
   // path-only fallback rather than the previous project's summary.
+  // No `notify()` call follows: see the docblock above for the
+  // rationale (test-only fixture; production listeners would
+  // misinterpret a `null` broadcast as "no project active" while
+  // the path slot is in fact set).
   if (
     activeProjectSummary !== null &&
     activeProjectSummary.path !== projectPath
   ) {
     activeProjectSummary = null;
   }
-  notify();
 }
 
 /**

@@ -6,7 +6,7 @@ import {
   ActiveProjectProvider,
   useActiveProject,
 } from "../hooks/useActiveProject";
-import { ToastProvider } from "../hooks/useToast";
+import { ToastContainer, ToastProvider } from "../hooks/useToast";
 import { aec } from "../api/aec";
 
 function renderDraft() {
@@ -141,5 +141,225 @@ describe("Draft page — project switch resets per-project state", () => {
     });
 
     createSheetSpy.mockRestore();
+  });
+});
+
+/**
+ * Devin Review finding 3315107576 (commit fb34260) flagged
+ * `Draft.tsx`'s `onImportDxf` / `onExportDxf` for missing the
+ * `getActiveProjectPath` defense-in-depth guard pattern that
+ * `Bim.tsx onInvoke` / `Deliver.tsx onBuildPack` / `Render.tsx
+ * enqueueAll` all use. The race is observable when the file dialog
+ * is held open across a project switch: the picked DXF path was
+ * chosen under project A's mental model, but the
+ * `aec.draft.importDxf` IPC handler (in `electron/ipc.ts`) resolves
+ * the project via `withResolvedProjectPath` at *dispatch* time —
+ * so after the switch, the bridge call would attach project A's
+ * DXF entities to project B's session.
+ *
+ * Real fix landed by capturing `startPath = getActiveProjectPath()`
+ * at handler entry and re-checking after each dialog + bridge
+ * await. On mismatch the handler aborts before dispatching the
+ * bridge call and skips the success toast. These tests pin the
+ * structural guarantee: a project switch that lands while the
+ * dialog promise is pending must prevent the bridge call AND the
+ * announcement toast.
+ */
+function DraftToolbarHarness({
+  pathA,
+  pathB,
+}: {
+  pathA: string;
+  pathB: string;
+}) {
+  const { openProject } = useActiveProject();
+  useEffect(() => {
+    void openProject(pathA);
+  }, [openProject, pathA]);
+  return (
+    <>
+      <button
+        type="button"
+        data-testid="switch-to-B"
+        onClick={() => {
+          void openProject(pathB);
+        }}
+      >
+        switch
+      </button>
+      <Draft />
+    </>
+  );
+}
+
+describe("Draft page — DXF handlers guard against project-switch race", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("aborts onImportDxf when the file dialog is held open across a project switch", async () => {
+    const PATH_A = "/tmp/draft-import-A.aecstudio";
+    const PATH_B = "/tmp/draft-import-B.aecstudio";
+
+    // Hold the open-file dialog promise so the test can switch
+    // projects between dialog dispatch and dialog resolution — the
+    // race the guard exists to close.
+    let resolveDialog: (value: {
+      canceled: boolean;
+      paths: string[];
+    }) => void = () => {
+      /* assigned in mockImplementation */
+    };
+    const dialogPromise = new Promise<{
+      canceled: boolean;
+      paths: string[];
+    }>((res) => {
+      resolveDialog = res;
+    });
+    const openFileSpy = vi
+      .spyOn(aec.dialog, "openFile")
+      .mockReturnValue(dialogPromise);
+    const importDxfSpy = vi
+      .spyOn(aec.draft, "importDxf")
+      .mockResolvedValue({ imported: 42 });
+
+    render(
+      <ToastProvider>
+        <ActiveProjectProvider>
+          <DraftToolbarHarness pathA={PATH_A} pathB={PATH_B} />
+        </ActiveProjectProvider>
+      </ToastProvider>,
+    );
+
+    // Wait for project A to settle, then dispatch the import.
+    await waitFor(() => {
+      expect(screen.getByTestId("draft-import-dxf")).toBeInTheDocument();
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("draft-import-dxf"));
+    });
+
+    // Switch to project B *while* the file dialog is still pending.
+    // This is the only window the guard protects — `RequireProject`
+    // is not wrapped in this harness, so the page stays mounted.
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("switch-to-B"));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // Now resolve the dialog with a picked path. Without the guard,
+    // the handler would call `aec.draft.importDxf` with project A's
+    // path against project B's active state.
+    await act(async () => {
+      resolveDialog({ canceled: false, paths: ["/tmp/some.dxf"] });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // The bridge call MUST NOT have been dispatched.
+    expect(importDxfSpy).not.toHaveBeenCalled();
+    // And no success toast was announced for project A on project B's UI.
+    expect(screen.queryByText(/Imported 42 entities/)).toBeNull();
+
+    openFileSpy.mockRestore();
+    importDxfSpy.mockRestore();
+  });
+
+  it("aborts onExportDxf when the save dialog is held open across a project switch", async () => {
+    const PATH_A = "/tmp/draft-export-A.aecstudio";
+    const PATH_B = "/tmp/draft-export-B.aecstudio";
+
+    let resolveSave: (value: { canceled: boolean; path: string }) => void = () => {
+      /* assigned in mockImplementation */
+    };
+    const savePromise = new Promise<{
+      canceled: boolean;
+      path: string;
+    }>((res) => {
+      resolveSave = res;
+    });
+    const saveFileSpy = vi
+      .spyOn(aec.dialog, "saveFile")
+      .mockReturnValue(savePromise);
+    const exportDxfSpy = vi
+      .spyOn(aec.draft, "exportDxf")
+      .mockResolvedValue({ exported: true, path: "/tmp/output.dxf" });
+
+    render(
+      <ToastProvider>
+        <ActiveProjectProvider>
+          <DraftToolbarHarness pathA={PATH_A} pathB={PATH_B} />
+        </ActiveProjectProvider>
+      </ToastProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("draft-export-dxf")).toBeInTheDocument();
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("draft-export-dxf"));
+    });
+
+    // Switch projects mid-save-dialog.
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("switch-to-B"));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      resolveSave({ canceled: false, path: "/tmp/output.dxf" });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // Bridge export must not fire against project B with project A's
+    // intent. The success toast must also be suppressed.
+    expect(exportDxfSpy).not.toHaveBeenCalled();
+    expect(screen.queryByText(/Exported DXF to/)).toBeNull();
+
+    saveFileSpy.mockRestore();
+    exportDxfSpy.mockRestore();
+  });
+
+  it("dispatches onImportDxf normally when no project switch occurs", async () => {
+    const PATH_A = "/tmp/draft-import-no-switch.aecstudio";
+
+    const openFileSpy = vi
+      .spyOn(aec.dialog, "openFile")
+      .mockResolvedValue({ canceled: false, paths: ["/tmp/x.dxf"] });
+    const importDxfSpy = vi
+      .spyOn(aec.draft, "importDxf")
+      .mockResolvedValue({ imported: 7 });
+
+    render(
+      <ToastProvider>
+        <ActiveProjectProvider>
+          <DraftToolbarHarness pathA={PATH_A} pathB={PATH_A} />
+          <ToastContainer />
+        </ActiveProjectProvider>
+      </ToastProvider>,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId("draft-import-dxf")).toBeInTheDocument();
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("draft-import-dxf"));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // Positive control: when no project switch lands, the bridge
+    // call IS dispatched and the success toast appears. This pins
+    // that the guard does not break the normal happy-path.
+    expect(importDxfSpy).toHaveBeenCalledWith({ dxfPath: "/tmp/x.dxf" });
+    await waitFor(() => {
+      expect(screen.queryByText(/Imported 7 entities/)).not.toBeNull();
+    });
+
+    openFileSpy.mockRestore();
+    importDxfSpy.mockRestore();
   });
 });

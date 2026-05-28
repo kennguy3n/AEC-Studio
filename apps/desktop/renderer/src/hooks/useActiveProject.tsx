@@ -47,6 +47,56 @@ export interface ActiveProjectState {
   markDirty: () => void;
   markClean: () => void;
   setUndoRedo: (undoLen: number, redoLen: number) => void;
+
+  // Synchronous accessors for the latest active project state.
+  //
+  // Mode pages (BIM, Deliver, Render, Draft, App.tsx) need a
+  // "what project is active *right now*" snapshot inside async
+  // handlers — both at handler entry (to capture `startPath` for
+  // the per-handler guard) AND after each `await` (to detect a
+  // project transition that landed during the in-flight bridge
+  // call). Reading `project?.path` from the closure captures the
+  // value at render time, which is fine for entry; but reading the
+  // *latest* value after an await requires a ref because React
+  // state is not reactive inside a single async function body.
+  //
+  // Before this getter existed, every mode page mirrored
+  // `project?.path` into its own local `useRef + useEffect`. That
+  // pattern has a one-render-cycle lag: `useEffect` runs *after*
+  // the commit phase of the render that produced the new
+  // `project?.path`. So in the window between (a) the provider's
+  // `updateProject(B)` running (which sets the internal
+  // `projectPathRef` synchronously, then schedules `setProject(B)`)
+  // and (b) the consuming page's `useEffect` firing to sync its
+  // local ref, the page-local ref still holds the old path. If a
+  // bridge promise resolves in that window (microtask boundary
+  // before React commits), the per-handler guard reads the stale
+  // local ref and the comparison incorrectly passes — committing
+  // project A's result onto project B's state.
+  //
+  // `getActiveProjectPath` / `getActiveProject` read from
+  // `projectPathRef` / `projectSummaryRef` — refs that
+  // `updateProject` writes *synchronously* at the same call site
+  // as `setProject`. The synchronous write means the ref reflects
+  // the latest intent immediately, before React commits and
+  // before any consumer's `useEffect` runs. Every consumer of
+  // these accessors sees the same value at the same moment, so
+  // the defense-in-depth guard is structural rather than timing-
+  // dependent. Devin Review explicitly called this out as the
+  // single inconsistency that made the per-page guards "slightly
+  // weaker than the comments suggest"; exposing the central refs
+  // closes the gap.
+  //
+  // Both accessors are `useCallback`-stable so consumers can list
+  // them in `useEffect` / `useCallback` dep arrays without
+  // triggering refresh loops. Returning the path AND the full
+  // summary covers both the "I only need to check identity"
+  // (path-only — cheaper string compare) and "I need to read
+  // `project.name` for a toast" (full summary) call sites that
+  // currently maintain separate local refs in `Bim.tsx` /
+  // `Deliver.tsx` / `Render.tsx` (path) and `App.tsx` (summary).
+  getActiveProjectPath: () => string | null;
+  getActiveProject: () => ProjectSummary | null;
 }
 
 const ActiveProjectContext = createContext<ActiveProjectState | null>(null);
@@ -163,15 +213,49 @@ export function ActiveProjectProvider({
   // and the ref atomically) to keep the two in lockstep.
   const projectPathRef = useRef<string | null>(null);
 
+  // Parallel synchronous mirror of the full `ProjectSummary` so the
+  // `getActiveProject` accessor (exposed through context) can hand
+  // every consumer the same value the path-ref hands them — kept in
+  // lockstep with `projectPathRef` so a consumer that reads both
+  // can never observe a mid-update split (path = B, summary = A).
+  // `App.tsx`'s save-success toast reads `proj.name` after an await,
+  // so the full summary needs the same sync-write guarantee that
+  // `projectPathRef` provides — a `useEffect`-synced `projectRef`
+  // in App.tsx would have the same one-cycle lag the per-page
+  // path refs had.
+  const projectSummaryRef = useRef<ProjectSummary | null>(null);
+
   // Atomic project mutator. Single entry point for changing the
-  // active project — assigns React state and the synchronous ref
-  // mirror in one place so the two cannot drift. Same rationale and
-  // pattern as `updateDirty`. Stable identity so callers can list it
-  // in their dep arrays without triggering refresh loops.
+  // active project — assigns React state and BOTH synchronous ref
+  // mirrors in one place so the three cannot drift. Same rationale
+  // and pattern as `updateDirty`. Stable identity so callers can
+  // list it in their dep arrays without triggering refresh loops.
   const updateProject = useCallback((next: ProjectSummary | null) => {
     setProject(next);
     projectPathRef.current = next?.path ?? null;
+    projectSummaryRef.current = next;
   }, []);
+
+  // Sync getters exposed through context. See the interface docblock
+  // on `getActiveProjectPath` for the full rationale; in short, the
+  // refs lead `project` state by zero-or-more render cycles because
+  // `updateProject` writes them synchronously while `setProject`
+  // batches through React. Consumers that previously mirrored
+  // `project?.path` into their own local `useEffect`-synced ref were
+  // therefore one render cycle behind these refs, opening a tiny
+  // window where a bridge promise resolving in a microtask between
+  // the sync ref-write and the consumer's `useEffect` would see a
+  // stale local ref. These two callbacks expose the central refs
+  // so every consumer reads the same source of truth at the same
+  // moment.
+  const getActiveProjectPath = useCallback(
+    () => projectPathRef.current,
+    [],
+  );
+  const getActiveProject = useCallback(
+    () => projectSummaryRef.current,
+    [],
+  );
 
   // Mirror `saveProject` into a ref so the stable `armAutoSave`
   // helper can dispatch through the latest closure without taking
@@ -713,6 +797,8 @@ export function ActiveProjectProvider({
       markDirty,
       markClean,
       setUndoRedo,
+      getActiveProjectPath,
+      getActiveProject,
     }),
     [
       project,
@@ -729,6 +815,8 @@ export function ActiveProjectProvider({
       markDirty,
       markClean,
       setUndoRedo,
+      getActiveProjectPath,
+      getActiveProject,
     ],
   );
 

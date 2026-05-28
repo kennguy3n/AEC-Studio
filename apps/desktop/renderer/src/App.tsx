@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Routes, Route, Navigate, useLocation, useNavigate } from "react-router-dom";
 import { ModeRail } from "./components/ModeRail";
 import { StatusBar } from "./components/StatusBar";
@@ -52,48 +52,50 @@ function AppCommands({
 }): null {
   const navigate = useNavigate();
   const location = useLocation();
-  const { project, saveProject, closeProject, setUndoRedo, markDirty } =
-    useActiveProject();
+  const {
+    saveProject,
+    closeProject,
+    setUndoRedo,
+    markDirty,
+    getActiveProject,
+  } = useActiveProject();
   const { addToast } = useToast();
 
-  // Mirror `project` into a ref so the four shortcut callbacks below
-  // (undo / redo / save / close) can read the active project without
-  // listing `project` in their `useCallback` dep arrays.
-  //
-  // Without this ref, every successful save churns the callback
-  // identities — `useActiveProject.saveProject` calls
-  // `updateProject(summary)` after each save to surface the
-  // refreshed `modifiedAt`, which creates a fresh `ProjectSummary`
-  // reference and forces React to re-derive `undo` / `redo` / `save`
-  // / `close`. The same churn happens on every `project:active-
-  // changed` push from the main process (e.g. multi-window or test
-  // harnesses mutating the tracker directly). Those new closures
-  // then cascade through the `useMemo` context `value` identity in
-  // `ActiveProjectProvider` (`useActiveProject.tsx:700-733`), which
-  // would re-render every consumer that depends on the context on
-  // every 5s auto-save even when the fields they consume have not
-  // changed.
+  // The four shortcut callbacks below (undo / redo / save / close)
+  // need to read the latest active project inside async handlers,
+  // but listing `project` in their `useCallback` dep arrays would
+  // churn callback identity on every successful save —
+  // `useActiveProject.saveProject` calls `updateProject(summary)`
+  // after each save to surface the refreshed `modifiedAt`, which
+  // creates a fresh `ProjectSummary` reference and forces React to
+  // re-derive `undo` / `redo` / `save` / `close`. The same churn
+  // happens on every `project:active-changed` push from the main
+  // process (e.g. multi-window or test harnesses mutating the
+  // tracker directly). Those new closures then cascade through the
+  // `useMemo` context `value` identity in `ActiveProjectProvider`,
+  // which would re-render every consumer that depends on the
+  // context on every 5s auto-save even when the fields they
+  // consume have not changed.
   //
   // The shortcut dispatcher (`useShortcut` → `cmdRef.current` in
   // `useKeyboardShortcuts.ts:153`) already reads the latest handler
   // through a ref on every keypress, so the keybindings always fire
   // the current callback regardless of identity churn — but child
   // components or effects that list these callbacks as deps would
-  // refire needlessly. Mirroring `project` into a ref here decouples
-  // callback identity from per-save summary updates, matching the
-  // exact pattern `useActiveProject.saveProject` already uses with
-  // its internal `projectPathRef` (`useActiveProject.tsx:206-218`).
+  // refire needlessly. Reading the active project through
+  // `getActiveProject()` (a stable getter exposed by
+  // `useActiveProject` that reads the central synchronous
+  // `projectSummaryRef`) decouples callback identity from per-save
+  // summary updates without any per-component ref mirroring.
   //
-  // Synced via `useEffect` rather than written directly during
-  // render to keep the render path side-effect-free; the timing is
-  // sufficient because the callbacks only read this ref from inside
-  // event handlers (key dispatch, navigation), which always run
-  // after the commit phase of the render that produced the new
-  // `project` reference.
-  const projectRef = useRef<typeof project>(project);
-  useEffect(() => {
-    projectRef.current = project;
-  }, [project]);
+  // The previous incarnation of this file maintained its own
+  // `projectRef + useEffect` sync; Devin Review flagged the
+  // resulting one-render-cycle lag versus `useActiveProject`'s
+  // internal sync ref (see the `getActiveProject` docblock on
+  // `ActiveProjectState`). Routing through the central getter
+  // closes that gap by structural construction so the save toast
+  // sees the same project name the bridge wrote, even when a
+  // project transition races the in-flight save.
 
   // The command engine partitions undo/redo by mode scope; map the
   // current route to the matching scope so Ctrl/Cmd+Z undoes within
@@ -104,9 +106,9 @@ function AppCommands({
   // chair in Design, navigated to Home (project still open), and
   // reflexively hit Ctrl/Cmd+Z would silently undo that placement
   // from a screen with no visual affordance for the action. The
-  // `project === null` guard below catches the no-project-open case;
-  // this `activeScope === null` guard catches the
-  // project-open-but-not-in-a-mode case.
+  // `proj === null` guard inside each callback catches the
+  // no-project-open case; this `activeScope === null` guard catches
+  // the project-open-but-not-in-a-mode case.
   const activeScope: CommandScope | null = (() => {
     const path = location.pathname.split("/")[1] ?? "";
     if (path === "design" || path === "draft" || path === "bim" ||
@@ -130,13 +132,13 @@ function AppCommands({
   // depths in sync via `setUndoRedo` so the StatusBar reflects the
   // current state.
   //
-  // Reads project state through `projectRef.current` (see ref
-  // declaration above) so the callback identity stays stable across
-  // per-save summary updates. `activeScope` is derived from
-  // `useLocation()` and only changes on navigation, so it stays in
-  // the dep array.
+  // Reads project state through `getActiveProject()` (the central
+  // sync getter from `useActiveProject`) so the callback identity
+  // stays stable across per-save summary updates. `activeScope` is
+  // derived from `useLocation()` and only changes on navigation, so
+  // it stays in the dep array.
   const undo = useCallback(async () => {
-    const proj = projectRef.current;
+    const proj = getActiveProject();
     if (proj === null || activeScope === null) return;
     try {
       const result = await aec.command.undo(proj.path, activeScope);
@@ -148,10 +150,10 @@ function AppCommands({
         `Undo failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
-  }, [activeScope, setUndoRedo, markDirty, addToast]);
+  }, [activeScope, setUndoRedo, markDirty, addToast, getActiveProject]);
 
   const redo = useCallback(async () => {
-    const proj = projectRef.current;
+    const proj = getActiveProject();
     if (proj === null || activeScope === null) return;
     try {
       const result = await aec.command.redo(proj.path, activeScope);
@@ -163,14 +165,14 @@ function AppCommands({
         `Redo failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
-  }, [activeScope, setUndoRedo, markDirty, addToast]);
+  }, [activeScope, setUndoRedo, markDirty, addToast, getActiveProject]);
 
   const save = useCallback(async () => {
-    const proj = projectRef.current;
+    const proj = getActiveProject();
     if (proj === null) return;
     try {
       await saveProject();
-      // Re-check `projectRef.current` after the await before
+      // Re-check the active project after the await before
       // surfacing the success toast. `saveProject()` internally
       // guards its state commit on the same path (see the
       // `projectPathRef.current === savePath` check in
@@ -192,8 +194,14 @@ function AppCommands({
       // for the same project (e.g. on the very save that just
       // completed), so reference equality would false-negative.
       // Path equality is the stable identity used everywhere else
-      // in the hook for the same reason.
-      const current = projectRef.current;
+      // in the hook for the same reason. `getActiveProject()`
+      // reads the central sync ref, so a project switch that
+      // landed in the microtask between the bridge resolution and
+      // this check is observed immediately — the previous
+      // `projectRef` + `useEffect` pattern had a one-render-cycle
+      // lag here that could let project A's name toast on
+      // project B's UI.
+      const current = getActiveProject();
       if (current !== null && current.path === proj.path) {
         addToast("success", `Saved ${proj.name}`);
       }
@@ -203,10 +211,10 @@ function AppCommands({
         `Save failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
-  }, [saveProject, addToast]);
+  }, [saveProject, addToast, getActiveProject]);
 
   const close = useCallback(async () => {
-    if (projectRef.current === null) return;
+    if (getActiveProject() === null) return;
     // Wrap the bridge call in try/catch to match the convention
     // used by the sibling `save` / `undo` / `redo` callbacks.
     // Today the main process's `project:close` handler only calls
@@ -233,7 +241,7 @@ function AppCommands({
       );
     }
     navigate("/");
-  }, [closeProject, navigate, addToast]);
+  }, [closeProject, navigate, addToast, getActiveProject]);
 
   useShortcut({
     id: "undo",

@@ -44,7 +44,7 @@ function recommendedFor(tier: RuntimeStatus["tier"]): RenderPresetKey {
 const EMPTY_CAMERAS: CameraTile[] = [];
 
 export function Render() {
-  const { project } = useActiveProject();
+  const { project, getActiveProjectPath } = useActiveProject();
   const { addToast } = useToast();
   const [jobs, setJobs] = useState<RenderJob[]>([]);
   const [preset, setPreset] = useState<RenderPresetKey>("standard");
@@ -61,17 +61,21 @@ export function Render() {
   >([]);
   const [busy, setBusy] = useState(false);
 
-  // Synchronous mirror of `project?.path` so `enqueueAll` can
-  // detect whether the user transitioned to a different project
-  // (or closed the project entirely) while one of its per-camera
-  // enqueue awaits was in flight. Matches the pattern landed in
-  // `Bim.tsx` (`onInvoke`, `onScheduleGenerate`), `Deliver.tsx`
+  // Defense-in-depth for `enqueueAll` so it can detect whether
+  // the user transitioned to a different project (or closed the
+  // project entirely) while one of its per-camera enqueue awaits
+  // was in flight. Each call site reads through
+  // `getActiveProjectPath()` so the per-handler guard routes
+  // through the central synchronous ref exposed by
+  // `useActiveProject` — matching the pattern landed in
+  // `Bim.tsx` (`onInvoke`, `onScheduleGenerate`) and `Deliver.tsx`
   // (`onCompare`, `onCreateRevision`, `onBuildPack`), and the
-  // internal `projectPathRef` in `useActiveProject.saveProject`,
-  // so every async handler that loops or awaits across the bridge
-  // presents one consistent shape: capture `startPath` at entry,
-  // re-check the ref after every await, skip stale state commits
-  // and stale toast announcements when the comparison fails.
+  // internal guard in `useActiveProject.saveProject`. Every async
+  // handler that loops or awaits across the bridge presents one
+  // consistent shape: capture `startPath` at entry via
+  // `getActiveProjectPath()`, re-check via `getActiveProjectPath()`
+  // after every await, skip stale state commits and stale toast
+  // announcements when the comparison fails.
   //
   // Today the `RequireProject` route guard unmounts the Render
   // page on every project transition, so a stale `setJobs` /
@@ -82,14 +86,16 @@ export function Render() {
   // project pickers, a "switch to recent" toolbar action, or any
   // code path that calls `openProject(...)` without forcing a
   // route change would let project A's enqueue results land into
-  // project B's queue. Devin Review flagged the absence of this
-  // guard as an INFO-tier inconsistency with `Bim.tsx`'s
-  // exhaustive coverage; threading the ref here closes the gap by
-  // structural construction and removes the inconsistency.
-  const projectPathRef = useRef<string | null>(project?.path ?? null);
-  useEffect(() => {
-    projectPathRef.current = project?.path ?? null;
-  }, [project?.path]);
+  // project B's queue.
+  //
+  // The page used to mirror `project?.path` into a local
+  // `useRef + useEffect`; that pattern had a one-render-cycle lag
+  // versus `useActiveProject`'s internal synchronous ref (see the
+  // `getActiveProjectPath` docblock on `ActiveProjectState` for
+  // the full timing analysis). Reading through `getActiveProjectPath()`
+  // on every guard site routes the check through the central sync
+  // ref so every consumer reads the same source of truth at the
+  // same moment.
 
   // Mount-only: detect the hardware tier and pick the recommended
   // preset on the user's first visit to the page. The runtime tier
@@ -228,7 +234,7 @@ export function Render() {
     if (selectedCameras.size === 0) return;
     // Capture the active project path at entry so every commit
     // site below (the post-loop `setJobs`, the success toast, and
-    // the error toast) can check `projectPathRef.current !==
+    // the error toast) can check `getActiveProjectPath() !==
     // startPath` and skip the announcement when a project
     // transition raced the enqueue loop. The bridge writes still
     // land — every `enqueueRender` call that completed before the
@@ -236,9 +242,9 @@ export function Render() {
     // store — but landing project A's job IDs in project B's
     // `jobs` state (or announcing the queue against project B's
     // UI with project A's camera IDs in the error toast) is the
-    // exact stale-data problem the per-handler `projectPathRef`
-    // pattern was added to close everywhere else.
-    const startPath = projectPathRef.current;
+    // exact stale-data problem the per-handler guard pattern was
+    // added to close everywhere else.
+    const startPath = getActiveProjectPath();
     setBusy(true);
     // Per-camera enqueue. Each `aec.render.enqueueRender` call is
     // its own bridge round-trip — a single bad camera (stale ID, an
@@ -273,7 +279,7 @@ export function Render() {
         // the post-loop `newJobs` cardinality tied to the cameras
         // that legitimately landed under project A — the partial
         // success that the user can recover by switching back to A.
-        if (projectPathRef.current !== startPath) break;
+        if (getActiveProjectPath() !== startPath) break;
         try {
           const result = (await aec.render.enqueueRender({
             cameraId,
@@ -299,7 +305,7 @@ export function Render() {
       // (the bridge is project-scoped at insert time) and the
       // user will see them on switching back. Announcing them
       // against B would conflate project A's work with B's UI.
-      if (projectPathRef.current !== startPath) return;
+      if (getActiveProjectPath() !== startPath) return;
       if (newJobs.length > 0) {
         setJobs((prev) => [...newJobs, ...prev]);
         addToast(

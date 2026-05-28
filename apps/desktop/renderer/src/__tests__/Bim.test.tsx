@@ -611,11 +611,11 @@ describe("Bim page — onScheduleGenerate skips stale rows across project switch
     const currentSpy = vi
       .spyOn(aec.project, "current")
       .mockResolvedValue({ summary: summaryA });
-    const openSpy = vi
-      .spyOn(aec.project, "open")
-      .mockImplementation(async (path: string) =>
-        path === summaryA.path ? summaryA : summaryB,
-      );
+    // Auto-restored by `restoreAllMocks` in `afterEach`; no local
+    // binding needed because the spy is only configured here.
+    vi.spyOn(aec.project, "open").mockImplementation(async (path: string) =>
+      path === summaryA.path ? summaryA : summaryB,
+    );
 
     // Set up the attach flow so `ifcSourcePath` becomes non-null
     // (precondition for the regenerate button to be enabled).
