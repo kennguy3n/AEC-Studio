@@ -2,6 +2,40 @@
  * Renderer-side fallback backend used by Vitest. Mirrors the
  * in-process backend that the Electron main process uses when the
  * native bridge artefact is absent.
+ *
+ * # Factory pattern (not a singleton)
+ *
+ * {@link rendererInProcessBackend} is a *factory*, not a singleton.
+ * Every call creates a fresh closure with isolated `recents`,
+ * `current`, `activeListeners`, and `nextId` state.
+ *
+ * Two consumers, two intentionally different lifetimes:
+ *
+ * 1. **Production renderer**: `apps/desktop/renderer/src/api/aec.ts`
+ *    calls the factory exactly *once* at module-evaluation time and
+ *    exports the result as the `aec` constant. Because ES modules
+ *    are singletons within a renderer process, every component import
+ *    of `aec` gets the same backend instance — so opening a project
+ *    in one mode page is visible from every other mode page, the
+ *    StatusBar polling site, etc. This matches main-process semantics
+ *    where the active-project state lives in one
+ *    `apps/desktop/electron/active-project.ts` module.
+ *
+ * 2. **Vitest fixtures**: `renderer-backend-project-lifecycle.test.ts`
+ *    and similar tests call the factory *per test* to get a hermetic
+ *    backend instance. This is what makes the test suite deterministic
+ *    against an in-process backend: project A opened in test 1 cannot
+ *    leak into test 2's `recents` list, listener subscriptions cleared
+ *    in `afterEach` cannot accidentally fire against a later test's
+ *    state, and the `nextId` counter starts at 1 for every test
+ *    (stable assertions on generated thread / camera / job ids).
+ *
+ * Earlier iterations briefly returned a top-level singleton and let
+ * tests reach into module-private state for reset; that pattern
+ * caused intermittent test-ordering flakes whenever a previous test
+ * left a `defaultThreadId` poller running. The factory contract
+ * eliminates that class of flake entirely — there is no shared state
+ * to reset because there is no shared state.
  */
 
 import type { AecApi } from "../../../electron/preload";
