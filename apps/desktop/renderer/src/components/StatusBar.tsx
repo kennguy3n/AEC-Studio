@@ -75,13 +75,44 @@ export function StatusBar() {
     }
     let alive = true;
     const tick = () => {
-      void aec.render.listJobs().then((jobs) => {
-        if (!alive) return;
-        const active = (jobs as Array<{ status: string }>).filter(
-          (j) => j.status === "queued" || j.status === "running",
-        ).length;
-        setRenderJobCount(active);
-      });
+      // Defensive `.catch` on the bridge promise. The `listJobs` bridge
+      // is generally infallible (it reads from the project's render-jobs
+      // table — a local SQLCipher query — and returns an empty list when
+      // the project closes mid-poll). But "generally infallible" is
+      // exactly the failure mode that produces unhandled rejections in
+      // edge cases: a project close that races a poll, a corrupt
+      // render-jobs row, a future bridge change that adds a precondition
+      // check, an integrity-check enhancement on the underlying DB. None
+      // of those should crash the StatusBar — the next tick will
+      // recover — but without this catch they surface as
+      // "Uncaught (in promise)" warnings in the renderer console.
+      //
+      // Matches the convention used at every other polling site in the
+      // renderer: `Deliver.tsx` listRevisions tick, `Render.tsx`
+      // listJobs tick, the per-project state-reset paths in
+      // `useActiveProject`. Adopting the same shape here closes the only
+      // outlier and makes "polling tick" a one-pattern shape across the
+      // codebase, so future contributors don't have to memorize
+      // per-call-site exceptions.
+      void aec.render
+        .listJobs()
+        .then((jobs) => {
+          if (!alive) return;
+          const active = (jobs as Array<{ status: string }>).filter(
+            (j) => j.status === "queued" || j.status === "running",
+          ).length;
+          setRenderJobCount(active);
+        })
+        .catch(() => {
+          // Silent: a failed poll just means this tick's count is not
+          // refreshed. The next 5s tick will retry against the latest
+          // state. We deliberately don't reset `renderJobCount` to 0 on
+          // failure — the previous successful value is more useful UX
+          // than flashing "0 jobs" when the underlying issue is a
+          // transient bridge hiccup (e.g., the bridge holding its
+          // write-lock during a save). React state writes after unmount
+          // are guarded by the `alive` flag in the .then() handler.
+        });
     };
     tick();
     const id = window.setInterval(tick, 5000);

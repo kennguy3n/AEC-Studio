@@ -383,4 +383,71 @@ describe("StatusBar — render job polling gates on active project", () => {
 
     listJobsSpy.mockRestore();
   });
+
+  it("swallows aec.render.listJobs rejections without surfacing as unhandled promise rejection", async () => {
+    // Devin Review (commit 619e171) flagged that the polling tick
+    // function chained `.then()` on `aec.render.listJobs()` but
+    // omitted a `.catch()` handler. If the bridge rejects (project
+    // closed mid-poll, corrupt render-jobs row, future precondition
+    // check), the rejection becomes an "Uncaught (in promise)"
+    // warning in the renderer console. The fix appends a silent
+    // `.catch(() => {})` to the chain, matching the convention used
+    // at every other polling site (Deliver.tsx listRevisions,
+    // Render.tsx listGraph). This test pins the contract by
+    // installing a rejecting mock and asserting that the renderer
+    // does NOT raise an unhandled-rejection event during multiple
+    // polling cycles, even though the spy is invoked repeatedly.
+    const listJobsSpy = vi
+      .spyOn(aec.render, "listJobs")
+      .mockRejectedValue(new Error("bridge unavailable"));
+
+    const unhandled: PromiseRejectionEvent[] = [];
+    const onUnhandled = (e: PromiseRejectionEvent) => {
+      unhandled.push(e);
+      // Don't actually surface it to the test runner — capture and
+      // assert below.
+      e.preventDefault();
+    };
+    window.addEventListener("unhandledrejection", onUnhandled);
+
+    try {
+      render(
+        <ActiveProjectProvider>
+          <OpenAndCloseHarness pathToOpen="/tmp/StatusBarCatch.aecstudio" />
+        </ActiveProjectProvider>,
+      );
+
+      await act(async () => {
+        await Promise.resolve();
+      });
+
+      await act(async () => {
+        screen.getByTestId("open").click();
+      });
+      // Initial tick runs and rejects.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      // Advance through multiple poll windows so multiple rejections
+      // accumulate — the spy is called many times, but none of them
+      // surfaces as an unhandled rejection.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(20_000);
+      });
+
+      expect(listJobsSpy.mock.calls.length).toBeGreaterThan(2);
+      // The critical assertion: NO unhandled rejections, even though
+      // every single bridge call rejected.
+      expect(unhandled).toEqual([]);
+
+      // And the render-count chip must remain absent (the .catch
+      // does not flash "0 jobs" — the previous successful count
+      // would persist; here there was no prior success so the chip
+      // is naturally hidden).
+      expect(screen.queryByTestId("status-render-count")).toBeNull();
+    } finally {
+      window.removeEventListener("unhandledrejection", onUnhandled);
+      listJobsSpy.mockRestore();
+    }
+  });
 });

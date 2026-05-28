@@ -410,4 +410,231 @@ describe("<Deliver /> per-project state reset on project switch", () => {
       window.removeEventListener("unhandledrejection", onUnhandled);
     }
   });
+
+  it("does NOT land project A's compareRevisions result into project B's diff state when a project switch races the in-flight call", async () => {
+    // Devin Review (commit 619e171) flagged that `onCompare` (and
+    // `onCreateRevision`, `onBuildPack`) lacked a guard against
+    // project-switch racing an in-flight bridge call. Today the
+    // `RequireProject` route guard makes this unreachable, but the
+    // page is mounted *without* the guard in this test to simulate
+    // a future in-page project picker / `openProject` without a
+    // route change. The fix captures `startPath = project?.path`
+    // at the start of each handler and compares against the latest
+    // `projectPathRef.current` after each await — if the project
+    // switched, the result is silently discarded.
+    let switchProject: ((path: string) => Promise<void>) | null = null;
+    function ProjectSwitcher() {
+      const { openProject } = useActiveProject();
+      useEffect(() => {
+        switchProject = (path: string) => openProject(path);
+      }, [openProject]);
+      return null;
+    }
+
+    const revisionA1: RevisionSummary = {
+      revisionId: "rev-A1",
+      tag: "v1",
+      description: "first",
+      createdAt: "2026-05-27T12:00:00Z",
+      auditChainHead: "0".repeat(64),
+      manifestName: "Project A",
+      manifestAppVersion: "0.1.0",
+      trackedEntities: [],
+    };
+    const revisionA2: RevisionSummary = {
+      revisionId: "rev-A2",
+      tag: "v2",
+      description: "second",
+      createdAt: "2026-05-27T12:01:00Z",
+      auditChainHead: "0".repeat(64),
+      manifestName: "Project A",
+      manifestAppVersion: "0.1.0",
+      trackedEntities: [],
+    };
+    // Track which project path is active via a closure that the
+    // listRevisions mock reads on each call. This avoids the
+    // fragility of `mockResolvedValueOnce` ordering (the effect can
+    // fire more times than expected if React schedules an extra
+    // render pass) and lets the test deterministically simulate
+    // "project A has v1/v2 revisions, project B has none."
+    let mockProjectPath: string | null = null;
+    vi.spyOn(aec.deliver, "listRevisions").mockImplementation(() => {
+      if (mockProjectPath === "/tmp/deliverRaceB.aecstudio") {
+        return Promise.resolve<RevisionSummary[]>([]);
+      }
+      return Promise.resolve<RevisionSummary[]>([revisionA1, revisionA2]);
+    });
+
+    // Hold compareRevisions open so we can switch projects between
+    // dispatch and resolution. The diff carries the stale-result
+    // marker ("from-project-A") so the assertion can distinguish
+    // "A's diff landed" from "B's empty state".
+    let resolveCompare: ((diff: unknown) => void) | null = null;
+    vi.spyOn(aec.deliver, "compareRevisions").mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveCompare = resolve;
+        }),
+    );
+
+    render(
+      <ToastProvider>
+        <ActiveProjectProvider>
+          <ProjectSwitcher />
+          <Deliver />
+        </ActiveProjectProvider>
+      </ToastProvider>,
+    );
+
+    // Settle initial mount + revision list.
+    await waitFor(() => {
+      expect(screen.getByText("v1")).toBeInTheDocument();
+    });
+    expect(switchProject).not.toBeNull();
+
+    // Open project A so the page is anchored to A's path.
+    await act(async () => {
+      await switchProject!("/tmp/deliverRaceA.aecstudio");
+    });
+    await waitFor(() => {
+      expect(screen.getByText("v1")).toBeInTheDocument();
+    });
+
+    // Pick base = v1, head = v2 and click compare → handler
+    // dispatches the bridge call which is held open.
+    const baseButtons = screen.getAllByText(/Set as base/);
+    fireEvent.click(baseButtons[0]);
+    const headButtons = screen.getAllByText(/Set as head/);
+    fireEvent.click(headButtons[headButtons.length - 1]);
+    await waitFor(() => {
+      expect(
+        (screen.getByTestId("revision-compare-button") as HTMLButtonElement)
+          .disabled,
+      ).toBe(false);
+    });
+    fireEvent.click(screen.getByTestId("revision-compare-button"));
+
+    // Switch to project B *while* compareRevisions is in-flight.
+    // The per-project reset effect runs synchronously and clears
+    // diff/baseId/headId; revisions refetches to [].
+    mockProjectPath = "/tmp/deliverRaceB.aecstudio";
+    await act(async () => {
+      await switchProject!("/tmp/deliverRaceB.aecstudio");
+    });
+    await waitFor(() => {
+      expect(screen.queryByText("v1")).not.toBeInTheDocument();
+    });
+
+    // Now resolve the in-flight compareRevisions with A's diff.
+    // The handler's guard MUST detect that
+    // `projectPathRef.current === '/tmp/deliverRaceB.aecstudio'`
+    // !== `startPath === '/tmp/deliverRaceA.aecstudio'` and skip
+    // the setDiff. The DOM must remain in project B's empty state
+    // (no diff summary).
+    expect(resolveCompare).not.toBeNull();
+    await act(async () => {
+      resolveCompare!({
+        added: [{ category: "manifest", id: "from-project-A" }],
+        removed: [],
+        modified: [],
+      });
+      // Let the .then() microtask + setState flush.
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // The critical assertion: project B's DOM must NOT contain
+    // project A's diff. The "from-project-A" marker would appear
+    // in the revision-diff-summary if the guard failed.
+    expect(screen.queryByTestId("revision-diff-summary")).not.toBeInTheDocument();
+    expect(screen.queryByText(/from-project-A/)).not.toBeInTheDocument();
+  });
+
+  it("does NOT land project A's buildPack result into project B's exportResult state when a project switch races the in-flight call", async () => {
+    // Same race as onCompare, but for onBuildPack: the user clicks
+    // export, selects a save path, the bridge call is in-flight,
+    // and a project switch fires before the result lands. The
+    // guard must silently discard the stale result AND the success
+    // toast so the user doesn't see "Project B exported" when the
+    // pack was actually built against project A's bridge state.
+    let switchProject: ((path: string) => Promise<void>) | null = null;
+    function ProjectSwitcher() {
+      const { openProject } = useActiveProject();
+      useEffect(() => {
+        switchProject = (path: string) => openProject(path);
+      }, [openProject]);
+      return null;
+    }
+
+    vi.spyOn(aec.dialog, "saveFile").mockResolvedValue({
+      canceled: false,
+      path: "/tmp/test-pack-race.zip",
+    });
+
+    let resolveBuildPack:
+      | ((r: { outPath: string; contents: string[]; totalBytes: number }) => void)
+      | null = null;
+    vi.spyOn(aec.deliver, "buildPack").mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveBuildPack = resolve;
+        }),
+    );
+
+    render(
+      <ToastProvider>
+        <ActiveProjectProvider>
+          <ProjectSwitcher />
+          <Deliver />
+        </ActiveProjectProvider>
+      </ToastProvider>,
+    );
+
+    // Wait for first render to settle.
+    await waitFor(() => {
+      expect(screen.getByTestId("deliver-mode")).toBeInTheDocument();
+    });
+    expect(switchProject).not.toBeNull();
+
+    // Open project A.
+    await act(async () => {
+      await switchProject!("/tmp/deliverBuildRaceA.aecstudio");
+    });
+
+    // Click build pack → save dialog returns path → buildPack is
+    // dispatched and held open.
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("pack-build"));
+      // Let the saveFile dialog mock resolve so onBuildPack reaches
+      // the buildPack call (which we've held open).
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // Project switches while buildPack is in flight.
+    await act(async () => {
+      await switchProject!("/tmp/deliverBuildRaceB.aecstudio");
+    });
+
+    // Resolve buildPack with project A's result. The guard MUST
+    // detect the path change and skip both setExportResult AND
+    // the success toast.
+    expect(resolveBuildPack).not.toBeNull();
+    await act(async () => {
+      resolveBuildPack!({
+        outPath: "/tmp/test-pack-race.zip",
+        contents: ["manifest.json", "from-project-A.txt"],
+        totalBytes: 4096,
+      });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // The export-result section must NOT render — the stale result
+    // was correctly discarded by the path guard.
+    expect(
+      screen.queryByTestId("deliver-export-result"),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText(/from-project-A/)).not.toBeInTheDocument();
+  });
 });

@@ -7,7 +7,7 @@
  * controlled.
  */
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { aec } from "../api/aec";
 import { useActiveProject } from "../hooks/useActiveProject";
@@ -84,6 +84,42 @@ export function Deliver(): JSX.Element {
     contents: string[];
     totalBytes: number;
   } | null>(null);
+
+  // Synchronous mirror of `project?.path` so event handlers can check
+  // "is the project I started on still the active one?" after each
+  // async bridge call. Defense-in-depth against project switches
+  // racing in-flight `compareRevisions` / `createRevision` /
+  // `buildPack` work:
+  //
+  //   * Today the `RequireProject` route guard unmounts Deliver on
+  //     every project transition, so a stale `setDiff` / `setRevisions`
+  //     / `setExportResult` would be a no-op on a torn-down component
+  //     (React 18 silently discards updates to unmounted nodes — no
+  //     warning since the strict-mode warning was removed). The page
+  //     is safe in production.
+  //   * BUT the route-guard umbrella is the same brittle contract
+  //     the per-project reset effect (lines 132-162) chose not to
+  //     rely on. Future in-page project pickers, "switch to recent"
+  //     toolbar actions, or any code path that calls
+  //     `openProject(...)` without forcing a route change would let
+  //     project A's bridge response land into project B's state.
+  //   * Capturing `project?.path` at the start of each handler and
+  //     comparing against `projectPathRef.current` after each await
+  //     closes that gap by structural construction — even if the
+  //     route-guard contract changes, the per-handler guard
+  //     enforces "only apply result if the project that initiated
+  //     this work is still active." Matches the per-call-site
+  //     guard pattern in `useActiveProject.saveProject` (which uses
+  //     its own internal `projectPathRef` for the same reason).
+  //
+  // Synced via `useEffect` keyed on `project?.path` so the ref
+  // tracks the latest path at microtask boundary — the handler that
+  // captured the old path will still see its captured value, and
+  // the ref comparison correctly identifies the project switch.
+  const projectPathRef = useRef<string | undefined>(project?.path);
+  useEffect(() => {
+    projectPathRef.current = project?.path;
+  }, [project?.path]);
 
   // Per-project state reset + revisions load on project switch.
   //
@@ -201,12 +237,21 @@ export function Deliver(): JSX.Element {
   const canCompare = baseId !== null && headId !== null && baseId !== headId;
   const canExport = selectedTarget !== undefined;
 
-  const refreshRevisions = async () => {
+  // `refreshRevisions` is called both by the initial-mount effect and
+  // by `onCreateRevision`. The handler-driven path needs a project
+  // guard so a project switch racing an in-flight `createRevision`
+  // doesn't refresh project A's revisions onto project B's state.
+  // The caller captures `startPath` and threads it through so the
+  // guard is enforced at the setState site rather than relying on
+  // the caller to re-check.
+  const refreshRevisions = async (startPath: string | undefined) => {
     const rs = await aec.deliver.listRevisions();
+    if (projectPathRef.current !== startPath) return;
     setRevisions(rs);
   };
 
   const onCreateRevision = async (tag: string, description: string) => {
+    const startPath = project?.path;
     await aec.deliver.createRevision({
       tag,
       description,
@@ -222,25 +267,45 @@ export function Deliver(): JSX.Element {
         },
       ],
     });
-    await refreshRevisions();
+    // Skip the refresh if the user project-switched while the
+    // createRevision bridge call was in flight. The new project's
+    // per-project reset effect (lines 132-162) already cleared
+    // revisions/baseId/headId, and `refreshRevisions` would otherwise
+    // overwrite that clean state with project A's revisions.
+    if (projectPathRef.current !== startPath) return;
+    await refreshRevisions(startPath);
   };
 
   const onCompare = async () => {
     if (!canCompare) return;
+    const startPath = project?.path;
     setComparing(true);
     try {
       const d = await aec.deliver.compareRevisions({
         baseId: baseId!,
         headId: headId!,
       });
+      // Skip stale: project A's diff must not land into project B's
+      // state. The per-project reset effect already cleared diff to
+      // null on the switch; this just prevents the in-flight result
+      // from overwriting that.
+      if (projectPathRef.current !== startPath) return;
       setDiff(d);
     } finally {
-      setComparing(false);
+      // Mirror the path guard: if the project switched, the per-
+      // project reset effect already cleared `comparing` to false,
+      // so we must NOT re-set it (a redundant write would tear down
+      // a newly-started compare on the new project that may have
+      // begun before this handler's finally fires).
+      if (projectPathRef.current === startPath) {
+        setComparing(false);
+      }
     }
   };
 
   const onBuildPack = async () => {
     if (!selectedTarget) return;
+    const startPath = project?.path;
     // Open a save dialog so the user can choose the output path.
     const dialog = await aec.dialog.saveFile({
       title: `Export ${kind} pack`,
@@ -248,6 +313,14 @@ export function Deliver(): JSX.Element {
       filters: [{ name: "ZIP Archives", extensions: ["zip"] }],
     });
     if (dialog.canceled || !dialog.path) return;
+    // If the user project-switched while the save dialog was open,
+    // the dialog's selected path is for project A's output but the
+    // active project is now B. Honoring the export would write
+    // project A's pack against project B's bridge state — worse,
+    // the success toast would announce a write that happened
+    // against the wrong project. Abort the export entirely; the
+    // user can re-trigger from the new project's Deliver page.
+    if (projectPathRef.current !== startPath) return;
     setExporting(true);
     setExportResult(null);
     try {
@@ -271,18 +344,31 @@ export function Deliver(): JSX.Element {
         includeBoq: deliverables.boq,
         includeProposal: deliverables.proposal,
       });
+      // Skip stale result + toast: if the user project-switched
+      // mid-export, the result describes a pack built against
+      // project A's bridge state — surfacing it on project B's
+      // page would mislead the user. The pack itself still wrote
+      // to the user-chosen path; this just declines to announce it.
+      if (projectPathRef.current !== startPath) return;
       setExportResult(result);
       addToast(
         "success",
         `${kind} pack exported: ${result.contents.length} files`,
       );
     } catch (err) {
+      // Errors are project-agnostic UX: even after a project
+      // switch, a failure to write the file is still useful to the
+      // user ("your last action failed"). Toast unconditionally.
       addToast(
         "error",
         `Pack export failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     } finally {
-      setExporting(false);
+      // Same rationale as onCompare's finally: skip the setState if
+      // the project switched.
+      if (projectPathRef.current === startPath) {
+        setExporting(false);
+      }
     }
   };
 
