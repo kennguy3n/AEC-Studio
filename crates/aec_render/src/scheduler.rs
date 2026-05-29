@@ -22,7 +22,7 @@
 //! The scheduler does NOT own the rendering kernel — it composes the
 //! kernel exposed by [`crate::path_trace::render_tile_pass`]. This keeps
 //! the kernel testable in isolation and lets the GPU backend
-//! ([`crate::gpu_trace`]) plug in via the same interface in PR2 follow-ups.
+//! ([`crate::gpu_trace`]) plug in via the same tile-kernel interface.
 
 use std::sync::{Arc, Mutex};
 

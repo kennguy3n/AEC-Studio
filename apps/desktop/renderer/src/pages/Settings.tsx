@@ -9,12 +9,12 @@
  *
  * Persistence is **in-memory only** in this build: the page holds the
  * user's choices for the duration of the session and surfaces a
- * `Saved at …` timestamp when the user clicks Save. A persistent
- * `aec.settings.*` bridge method is on the Phase 7 follow-up list; once
- * it lands, `onSave` will write through to the project file. Until
- * then, deliberately do **not** add a fake IPC — surfacing a Save
- * action that silently does nothing on app restart would be worse
- * than the honest in-memory state.
+ * `Saved at …` timestamp when the user clicks Save. There is no
+ * `aec.settings.*` bridge method yet — when one is added, `onSave`
+ * will write through to the project file. Until then, deliberately do
+ * **not** add a fake IPC — surfacing a Save action that silently
+ * does nothing on app restart would be worse than the honest
+ * in-memory state.
  */
 
 import { useCallback, useEffect, useMemo, useState } from "react";

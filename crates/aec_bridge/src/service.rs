@@ -984,10 +984,12 @@ pub struct AssetSummary {
     pub vendor: Option<String>,
     /// Pre-base64'd PNG thumbnail data URI, or `None` for assets
     /// that haven't been thumbnailed yet (the renderer falls back
-    /// to a procedural placeholder card). The PR-U seed library is
-    /// `None` for all 4 demo assets — real thumbnail wiring lands
-    /// in the follow-up that hooks up the asset-import pipeline to
-    /// the napi surface.
+    /// to a procedural placeholder card). The seed library ships
+    /// `None` for all 4 demo assets — `aec_assets::pipeline` knows
+    /// how to generate thumbnails on import, but the `design_list_*`
+    /// napi surface deliberately does NOT base64-encode every
+    /// thumbnail blob on each list call; the asset detail panel
+    /// fetches the blob on demand instead.
     pub thumbnail_data_uri: Option<String>,
 }
 
@@ -2052,12 +2054,11 @@ impl BridgeService {
     ///   empty vendor display string is mapped to `None` so the JS
     ///   side sees a missing vendor field rather than an empty
     ///   string (UX: no "by " line on the card vs " by ").
-    /// * `thumbnail_data_uri` is always `None` in PR-U — real
-    ///   thumbnail wiring lands in the follow-up that hooks the
-    ///   asset-import pipeline up to the napi surface (the schema
-    ///   already carries `thumbnail_hash` + the blob is in
-    ///   `asset_blobs`, but base64-encoding on every list call is
-    ///   wasteful; the asset detail panel will fetch on demand).
+    /// * `thumbnail_data_uri` is always `None` on the list surface —
+    ///   the schema carries `thumbnail_hash` and the blob lives in
+    ///   `asset_blobs`, but base64-encoding every thumbnail on each
+    ///   list call is wasteful, so the asset detail panel fetches
+    ///   the blob on demand instead.
     pub fn design_list_assets(
         &self,
         query: &AssetListQuery,
@@ -2082,11 +2083,11 @@ impl BridgeService {
     ///
     /// This is a *parse-only* operation: nothing is written into the
     /// active project. The renderer uses the returned counts to render
-    /// a preview ("123 walls, 45 slabs, …"), and a follow-up
-    /// `bim_attach_*` call (PR-L) will actually fold the parsed model
-    /// into the project's authoring graph. Splitting the parse from
-    /// the attach keeps the parse path safely re-runnable on bad
-    /// files without polluting project state.
+    /// a preview ("123 walls, 45 slabs, …"), and a subsequent
+    /// [`Self::bim_attach_ifc`] call folds the parsed model into the
+    /// project's authoring graph. Splitting the parse from the
+    /// attach keeps the parse path safely re-runnable on bad files
+    /// without polluting project state.
     ///
     /// **Schema support**: IFC2x3 and IFC4 (both base and `IFC4X3`
     /// when found in `FILE_SCHEMA`; IFC4x3-specific entities still
@@ -2833,7 +2834,8 @@ impl BridgeService {
     /// validation, and for producing golden files for the regression
     /// suite. The renderer's "Export BIM" button invokes this to
     /// re-emit the active project's source IFC after edits land via
-    /// the future PR-T.5 / PR-U write methods.
+    /// [`Self::bim_attach_ifc`] and the command engine
+    /// (`command_apply`).
     ///
     /// Routes through `with_service_ref_fallible` (read-only) so a
     /// long IFC parse / write doesn't block status polls. The
@@ -5416,9 +5418,8 @@ END-ISO-10303-21;\n",
         // absolute path" — verify the implementation honours that by
         // pointing the importer at a non-canonical form (a `./`
         // segment) and asserting the returned path matches
-        // `std::fs::canonicalize` on the same input. The future PR-L
-        // snapshot cache will key on this field, so the contract has
-        // to hold up.
+        // `std::fs::canonicalize` on the same input. The snapshot
+        // cache keys on this field, so the contract has to hold up.
         let (s, _g) = service();
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("canonical.ifc");
@@ -6887,7 +6888,7 @@ END-ISO-10303-21;\n";
         assert_eq!(kivik.vendor.as_deref(), Some("IKEA"));
         assert!(
             kivik.thumbnail_data_uri.is_none(),
-            "PR-U seed has no thumbnail blobs; renderer falls back to placeholder card"
+            "seed library has no thumbnail blobs on the list surface; renderer falls back to placeholder card"
         );
         assert!(kivik.tags.contains(&"sofa".to_string()));
         assert!(kivik.style_tags.contains(&"scandinavian".to_string()));

@@ -18,10 +18,11 @@ export interface ScheduleRow {
  * Summary returned to the parent after "Regenerate". The bridge
  * writes the schedule directly to an XLSX file at `outPath` (via
  * `ScheduleSheet::write_xlsx` in `aec_bim`), so the renderer just
- * surfaces the file path and row/column counts — the inline
- * preview table reflects whatever rows the parent retains in
- * `rowsByKind` (typically empty until a future PR adds an
- * XLSX-to-row-list parse step).
+ * surfaces the file path and row/column counts. The inline
+ * preview table renders whatever rows the parent retains in
+ * `rowsByKind`; `Bim.tsx` reads them back from the just-written
+ * XLSX via `aec.bim.readScheduleRows({ xlsxPath })` so the table
+ * mirrors the file on disk.
  */
 export interface ScheduleGenerationSummary {
   scheduleId: string;

@@ -495,7 +495,7 @@ impl From<crate::service::BimImportSummary> for BimImportSummaryJs {
 /// Parse an `.ifc` file from disk and return a structured import
 /// summary. The renderer uses this for the "Import BIM" preview
 /// panel — the file is NOT yet folded into the active project
-/// (that's the `bim_attach_*` follow-up in PR-L).
+/// (that's [`bim_attach_ifc`]).
 ///
 /// Declared `async` and dispatched via [`napi::tokio::task::spawn_blocking`]
 /// so the multi-second-to-multi-minute IFC parse does NOT block the
@@ -806,9 +806,10 @@ pub struct DesignListAssetsQueryJs {
 /// `thumbnail_data_uri` is intentionally `Option<String>` (not
 /// `String`) so the renderer can distinguish "no thumbnail yet"
 /// (placeholder card) from "thumbnail is an empty data URI" (which
-/// would be a real-world bug worth surfacing). The PR-U seed library
-/// is `None` for every demo asset — real thumbnail wiring lands in a
-/// follow-up.
+/// would be a real-world bug worth surfacing). The seed library
+/// ships `None` for every demo asset — see [`crate::service::
+/// BridgeService::design_list_assets`] for why the list surface
+/// deliberately doesn't base64-encode the underlying blob.
 #[napi(object)]
 pub struct AssetSummaryJs {
     pub asset_id: String,

@@ -210,12 +210,14 @@ fn vendor_field_carries_display_name_not_id() {
 
 #[test]
 fn thumbnail_data_uri_none_for_seed_library() {
-    // PR-U deliberately defers thumbnail wiring — the seed library
-    // ships `thumbnail_data_uri = None` for all 4 demo assets so
-    // the renderer falls back to a procedural placeholder card.
-    // Pins this so a future PR that adds thumbnail support to the
-    // seed has to deliberately remove this test rather than rely
-    // on implicit `None`.
+    // The seed library ships `thumbnail_data_uri = None` for all 4
+    // demo assets — the list surface deliberately doesn't base64-
+    // encode thumbnail blobs on every call (see the rationale on
+    // `BridgeService::design_list_assets`), and the renderer falls
+    // back to a procedural placeholder card. This pins the
+    // contract so anyone wiring thumbnails onto the list surface
+    // has to deliberately update this test rather than rely on
+    // implicit `None`.
     let (svc, _g) = make_service();
     let assets = svc
         .design_list_assets(&AssetListQuery::default())
@@ -223,7 +225,7 @@ fn thumbnail_data_uri_none_for_seed_library() {
     for asset in &assets {
         assert!(
             asset.thumbnail_data_uri.is_none(),
-            "PR-U seed asset `{}` has no thumbnail blob; renderer renders placeholder card",
+            "seed asset `{}` has no thumbnail blob; renderer renders placeholder card",
             asset.asset_id
         );
     }
