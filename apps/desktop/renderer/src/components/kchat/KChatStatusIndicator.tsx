@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import type { AecApi } from "../../../../electron/preload";
 import { aec } from "../../api/aec";
+import { parseLoopbackInstance } from "./loopbackInstance";
 
 /**
  * Status chip for the StatusBar.
@@ -110,53 +111,49 @@ export function KChatStatusIndicator() {
     disconnected: "offline",
   };
 
-  const instance = parseInstance(status.instanceJson);
-  const baseTitle = instance
-    ? `KChat Desktop ${instance.version} at ${instance.socket_path}`
-    : "No KChat Desktop instance detected";
+  // The bridge-persisted master toggle has priority over the
+  // transport state — when the integration is disabled, the
+  // Electron `kchat:publish` IPC handler refuses publishes
+  // regardless of whether the loopback server / extension are up,
+  // so reading "offline" here would be misleadingly transport-
+  // sounding. Surface "disabled" explicitly so the user knows
+  // they need to flip the Settings toggle, not restart KChat.
+  const displayLabel = status.enabled
+    ? stateLabel[status.state]
+    : "disabled";
+
+  const instance = parseLoopbackInstance(status.instanceJson);
+  // Phase 15: surface the loopback API port + heartbeat instead
+  // of the socket path + version. "never" reads better in a
+  // tooltip than the wire-level `null`.
+  const baseTitle = !status.enabled
+    ? "KChat integration is disabled — enable it in Settings to start publishing"
+    : instance
+      ? `KChat loopback API on 127.0.0.1:${instance.apiServerPort ?? "?"} · last extension heartbeat ${instance.lastExtensionContactAt ?? "never"}`
+      : "KChat loopback API not running";
   const title = reloadError
     ? `Reload failed: ${reloadError}\n\n${baseTitle}`
     : baseTitle;
   const ariaLabel = reloadError
-    ? `KChat: ${stateLabel[status.state]} — reload failed: ${reloadError} (click to retry)`
-    : `KChat: ${stateLabel[status.state]} (click to reload)`;
+    ? `KChat: ${displayLabel} — reload failed: ${reloadError} (click to retry)`
+    : `KChat: ${displayLabel} (click to reload)`;
 
   return (
     <button
       type="button"
       data-testid="kchat-status-chip"
       data-state={status.state}
+      data-enabled={status.enabled ? "true" : "false"}
       data-reload-error={reloadError ?? undefined}
-      className={`status-bar__chip is-kchat is-${status.state}`}
+      className={`status-bar__chip is-kchat is-${status.state}${status.enabled ? "" : " is-disabled"}`}
       onClick={onReload}
       disabled={pending}
       aria-label={ariaLabel}
       title={title}
     >
-      KChat · {stateLabel[status.state]}
+      KChat · {displayLabel}
     </button>
   );
 }
 
-function parseInstance(json: string | null): {
-  socket_path: string;
-  version: string;
-  health: string;
-} | null {
-  if (!json) return null;
-  try {
-    const parsed = JSON.parse(json) as {
-      socket_path?: string;
-      version?: string;
-      health?: string;
-    };
-    if (!parsed.socket_path || !parsed.version) return null;
-    return {
-      socket_path: parsed.socket_path,
-      version: parsed.version,
-      health: parsed.health ?? "unknown",
-    };
-  } catch {
-    return null;
-  }
-}
+

@@ -526,84 +526,141 @@ crates/aec_render/
 
 ---
 
-## 9.6 KChat integration
+## 9.6 KChat integration (Phase 15 — loopback HTTP + `.kcz` extension)
 
-KChat integration is the **only** optional cross-organisation surface in AEC Studio. It is gated on three axes:
+KChat integration is the **only** optional cross-organisation surface in AEC Studio. Phase 12 shipped a UNIX-socket / named-pipe transport against a hypothetical KChat-side listener, but auditing `uneycom/uney-chat-desktop` revealed that KChat Desktop's Extension Platform is a JS-only sandbox with no socket listener (the same conclusion KCreate and Tessera reached). **Phase 15 replaces the socket transport with a loopback HTTP API hosted by AEC Studio's Electron main process plus a `.kcz` companion extension installed inside KChat Desktop.** Bidirectional navigation uses custom URL schemes (`aecstudio://` inbound, `kchat://` outbound).
 
-1. **Compile-time** by the `kchat` cargo feature on `aec_core` (default-enabled). Disabling default features strips the `kchat`, `kchat_config`, and `kchat_sync` modules and their re-exports from the compiled crate; the `ActorKind::KChat` enum variant stays unconditional so the audit-log type remains stable across feature configurations.
-2. **Runtime project toggle** by the `KChatConfig::enabled` flag persisted in the project manifest — the per-project knob, primarily for "don't publish from this client / project".
-3. **Process-wide master switch** by `KChatState::set_enabled(false)` (Phase 12). This flips a bit on the bridge-wide `KChatState::Inner` so every `publish` / `ingest_reviews` call returns `KChatError::Disabled` *before* touching the transport, regardless of which publisher is currently installed. The Settings page wires the toggle through `BridgeService::kchat_set_enabled`.
+The integration is gated on three axes:
+
+1. **Compile-time** by the `kchat` cargo feature on `aec_core` (default-enabled). Disabling default features strips the `kchat`, `kchat_config`, and `kchat_sync` modules and their re-exports; the `ActorKind::KChat` enum variant stays unconditional so the audit-log type remains stable.
+2. **Runtime project toggle** — `KChatConfig::enabled` persisted in the project manifest.
+3. **Process-wide master switch** — `KChatState::set_enabled(false)` on the bridge.
+
+### Rust surface (transport-agnostic)
 
 ```
 crates/aec_core/
-├── kchat.rs                    # KChatArtifact (incl. AssetPack variant), ArtifactCard, KChatPublisher
-│                               # trait, InMemoryPublisher (tests), ReviewComment / ApprovalStatus /
-│                               # ReviewCard, AssetPackReference + AssetPackManifest::artifact_card,
-│                               # KChatError::Disabled
-├── kchat_sync.rs               # One-way comment sync (KChat thread → audit trail) with dedup by
-│                               # (thread_id, timestamp, commenter, blake3(text)) — edits become new
-│                               # rows, re-imports of unchanged comments are no-ops
-├── kchat_transport.rs          # LocalIpcTransport (Phase 12): UNIX socket (macOS/Linux) or named pipe
-│                               # (Windows); JSON-line envelope with `kind` discriminator (ping /
-│                               # publish / ingest_reviews); 5-step exponential reconnect backoff;
-│                               # heartbeat freshness timer for the StatusBar indicator
-├── local_ipc_publisher.rs      # LocalIpcPublisher (Phase 12): KChatPublisher impl that wraps
-│                               # LocalIpcTransport; per-publisher (thread_id, project_link, caption)
-│                               # dedup set; `ingest_reviews` polling hook for the bridge
-├── kchat_discovery.rs          # KChatDiscovery::probe() (Phase 12): walks the platform-canonical
-│                               # paths (macOS ~/Library/Application Support/KChat/ipc.sock, Linux
-│                               # $XDG_RUNTIME_DIR/kchat/ipc.sock, Windows \\.\pipe\kchat-ipc) plus
-│                               # the AEC_KCHAT_SOCKET_PATH env override used by tests
-└── kchat_config.rs             # Local-first config (enabled: bool, default_thread_id: Option<String>);
-                                # `KChatIntegration` gates every operation on `enabled`. Its
-                                # `publish_asset_pack` routes the manifest *through* the transport as
-                                # an asset-pack ArtifactCard and returns `AssetPackPublishOutcome`
-                                # (reference + PublishResult).
+├── kchat.rs            # KChatArtifact (incl. AssetPack variant), ArtifactCard,
+│                       # KChatPublisher trait, InMemoryPublisher, ReviewComment /
+│                       # ApprovalStatus / ReviewCard, AssetPackReference +
+│                       # AssetPackManifest::artifact_card, KChatError::Disabled,
+│                       # DEFAULT_THREAD_ID
+├── kchat_sync.rs       # One-way comment sync (KChat thread → audit trail) with
+│                       # dedup by (thread_id, timestamp, commenter, blake3(text))
+└── kchat_config.rs     # Local-first config (enabled: bool, default_thread_id:
+                        # Option<String>); KChatIntegration gates every operation
+                        # on `enabled`.
 ```
 
 ```
 crates/aec_bridge/src/
-├── kchat_state.rs              # Process-wide KChatState — owns the currently-installed publisher,
-│                               # selects LocalIpcPublisher when KChatDiscovery::probe succeeds and
-│                               # falls back to InMemoryPublisher otherwise, exposes set_enabled /
-│                               # is_enabled (the master switch), surfaces a KChatStatusReport
-│                               # (publisher_kind, state, version, socket_path, seconds_since_heartbeat)
-└── service.rs                  # BridgeService::kchat_publish / kchat_ingest_reviews /
-                                # kchat_status / kchat_set_enabled / kchat_is_enabled — every method
-                                # consults the master switch before delegating to the publisher.
+├── kchat_state.rs      # Headless KChatState — always uses InMemoryPublisher; the
+│                       # loopback HTTP queue lives in Electron. `mark_loopback_active`
+│                       # / `mark_loopback_inactive` let the Electron host promote /
+│                       # demote the publisher_kind marker (in_memory / loopback_http)
+│                       # so the renderer's status chip reflects reality.
+└── service.rs          # BridgeService::kchat_publish / kchat_ingest_reviews /
+                        # kchat_status / kchat_set_enabled / kchat_is_enabled —
+                        # every method consults the master switch before delegating.
 ```
+
+The Phase 12 socket transport modules (`kchat_transport.rs`, `local_ipc_publisher.rs`, `kchat_discovery.rs`) were deleted because there was no listener on the KChat side to talk to.
+
+### Electron surface (loopback HTTP + deeplinks)
+
+```
+apps/desktop/electron/kchat/
+├── kchatLocalApi.ts          # node:http server on 127.0.0.1:<random-port>. Bearer
+│                             # token rotated on every start. Host-header SSRF guard,
+│                             # 64 KiB body cap, atomic 0600 discovery file at
+│                             # {userData}/aec-kchat-port.json. Routes: GET /api/status,
+│                             # GET /api/queued-publishes, POST /api/publish-to-thread,
+│                             # POST /api/review-comments, GET /api/reviews.
+├── kchatAppState.ts          # In-memory queue + reviews map the loopback handlers
+│                             # operate over. The renderer's kchat:* IPC channels go
+│                             # through this state too.
+├── kchatDeeplinkBridge.ts    # Registers aecstudio:// via app.setAsDefaultProtocolClient.
+│                             # Single-instance lock; second-instance + open-url
+│                             # handlers; pre-ready deeplink buffer flushed on
+│                             # did-finish-load. Allow-list of routes.
+├── kchatOutboundDeeplink.ts  # kchat:openInDesktop IPC handler — builds
+│                             # kchat://app/conversation/<id>; rate-limited via a
+│                             # shared bucket; calls shell.openExternal.
+└── types.ts                  # Wire types shared between handlers and the renderer.
+```
+
+### `.kcz` companion extension
+
+```
+extensions/aec-studio-kchat/
+├── manifest.json                 # Declares kchat.query_messages,
+│                                 # kchat.send_message, kchat.query_conversations;
+│                                 # contributes the AEC Studio Publish rightbar view.
+├── src/types.ts                  # Hand-rolled wire mirror of kchatLocalApi.ts.
+├── src/portFile.ts               # Reads {userData}/aec-kchat-port.json with strict
+│                                 # validation (version=1, host=127.0.0.1, token ≥ 32
+│                                 # chars).
+├── src/client.ts                 # Bearer-authenticated HTTP client; redirect:"error";
+│                                 # 5 s timeout; defence-in-depth token-length check.
+├── src/host.ts                   # Typed wrapper around globalThis.__kchatHost
+│                                 # exposing queryMessages / sendMessage /
+│                                 # queryConversations / openDeeplink.
+├── src/views/publish-panel.tsx   # Rightbar view that drains the queue (post via
+│                                 # kchat.send_message, ack via /api/publish-to-thread)
+│                                 # and mirrors recent channel messages back to AEC
+│                                 # Studio as review comments.
+├── scripts/build.mjs             # Deterministic .kcz builder + sha256 sidecar.
+└── scripts/zipWriter.mjs         # Hand-rolled minimal zip writer (no `archiver` dep).
+```
+
+### Renderer surface
 
 ```
 apps/desktop/renderer/src/components/kchat/
-├── PublishCardModal.tsx        # Preview an ArtifactCard before publishing; wired to the real
-│                               # kchat:publish IPC (Phase 12)
-├── ArtifactCardPreview.tsx     # Image + caption + metadata preview tile
-├── KChatStatusIndicator.tsx    # StatusBar dot — green (connected) / yellow (reconnecting) / red
-│                               # (disconnected) with the server-reported version on hover
-└── KChatReviewPanel.tsx        # Deliver-mode panel showing ingested comments with thread context
+├── PublishCardModal.tsx       # Previews an ArtifactCard; wired to kchat:publish IPC.
+├── ArtifactCardPreview.tsx    # Image + caption + metadata preview tile.
+├── KChatStatusIndicator.tsx   # StatusBar dot — connected (loopback API live +
+│                              # extension heartbeat fresh) / disconnected.
+└── KChatReviewPanel.tsx       # Deliver-mode panel showing comments mirrored back
+                               # from the extension.
 ```
 
-### Data flow
+### Data flow (Phase 15)
 
 ```
-┌──────────────────────────────┐
-│  AEC Studio (local-first)    │
-│                              │
-│  ┌────────┐    ┌──────────┐  │           ┌─────────────────┐
-│  │ Render │───▶│ Artifact │──┼──publish──▶│  KChat thread   │
-│  │  Sheet │    │   Card   │  │  (one-way) │  (user owned)   │
-│  └────────┘    └──────────┘  │           └────────┬────────┘
-│                              │                    │ inline comments
-│  ┌──────────────────────┐    │                    ▼
-│  │ AuditEntry           │◀───┼──ingest_review─── ReviewComment
-│  │  actor.kind=KChat    │    │  (kchat_sync.rs, dedup'd)
-│  └──────────────────────┘    │
-└──────────────────────────────┘
+┌────────────────────────────────────┐                ┌──────────────────────────────┐
+│  AEC Studio (Electron)             │                │  KChat Desktop               │
+│                                    │                │                              │
+│  ┌─────────┐    ┌──────────┐       │                │  ┌────────────────────────┐  │
+│  │ Render  │───▶│ Artifact │──┐    │                │  │ aec-studio-kchat .kcz  │  │
+│  │  Sheet  │    │   Card   │  │    │  loopback HTTP │  │                        │  │
+│  └─────────┘    └──────────┘  ▼    │  127.0.0.1     │  │  ┌──────────────────┐  │  │
+│             ┌──────────────────┐   │ ◀──────────────┼──▶│ client.ts        │  │  │
+│             │ kchatAppState.ts │   │   bearer token │  │  │ /api/*           │  │  │
+│             └─────┬────────────┘   │                │  │  └──────────────────┘  │  │
+│                   │ queued         │                │  │           │            │  │
+│                   ▼                │                │  │           │ invokeProc │  │
+│             ┌──────────────────┐   │                │  │           ▼            │  │
+│             │ kchatLocalApi.ts │   │                │  │   kchat.send_message   │  │
+│             │  /api/queued-... │   │                │  │   kchat.query_messages │  │
+│             │  /api/publish-...│   │                │  └────────────┬───────────┘  │
+│             │  /api/review-... │   │                │               │              │
+│             │  /api/reviews    │   │                │               ▼              │
+│             └──────────────────┘   │                │       KChat thread           │
+│                                    │                └──────────────────────────────┘
+│  ┌──────────────────────┐          │                              │
+│  │ AuditEntry           │◀─────────┼── /api/review-comments ──────┘
+│  │  actor.kind=KChat    │          │
+│  └──────────────────────┘          │
+└────────────────────────────────────┘
 ```
 
-- **Outbound only.** Project data never leaves AEC Studio except through an explicit publish. `KChatPublisher` is a trait; the user supplies the transport (HTTP, IPC, file drop) — there is no centralised AEC Studio service.
-- **Inbound is comments only.** `kchat_sync.rs` imports `ReviewComment`s and turns them into `AuditEntry` rows with `ActorKind::KChat`. No project blobs are downloaded; team asset packs use the user's own transport for blobs and only sync manifest hashes.
-- **Local-first guarantee.** Tests in `crates/aec_core/src/kchat_config.rs` confirm that a disabled config rejects every publish/sync method. The Settings page exposes the toggle so users can keep AEC Studio entirely offline.
+- **No public network.** Both directions go through `127.0.0.1`. The bearer token rotates on every AEC Studio start and the discovery file is `0600`.
+- **Outbound only for artifact data.** Project data never leaves AEC Studio except through an explicit publish that the user reviews via `PublishCardModal`.
+- **Inbound is comments only.** The extension mirrors KChat messages back as `ReviewComment` rows in `kchatAppState`; the renderer's review panel surfaces them as `AuditEntry` rows with `ActorKind::KChat`. No project blobs are downloaded.
+- **Local-first guarantee.** Tests in `crates/aec_core/src/kchat_config.rs` confirm that a disabled config rejects every publish/sync method. The Settings page toggle stops the loopback API server, so the only network surface AEC Studio offers is gone the moment the user turns the integration off.
+
+For the canonical wire schema and operational notes see [`docs/KCHAT_LOOPBACK_API.md`](docs/KCHAT_LOOPBACK_API.md) and [`docs/KCHAT_EXTENSION.md`](docs/KCHAT_EXTENSION.md).
 
 ---
 

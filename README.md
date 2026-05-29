@@ -102,16 +102,17 @@ A Ctrl/Cmd+K **command palette** opens from any mode, fuzzy-searching every regi
 
 ---
 
-## KChat integration (optional, Phase 7 + Phase 12)
+## KChat integration (optional, Phase 7 → 15)
 
 AEC Studio ships with optional **KChat** integration that's strictly local-first:
 
-- **Outbound** — artefacts (renders, sheets, revision packs, BOQ snapshots) can be published as inline cards to a KChat thread with one click. The transport is a **local IPC link to a running KChat Desktop instance** (`LocalIpcTransport` over a UNIX domain socket on macOS/Linux or a named pipe on Windows, discovered by `KChatDiscovery::probe()` at the platform-canonical path), so nothing routes through a centralised AEC Studio service.
-- **Inbound** — review and approval comments on those cards are ingested back into the project's audit trail with `ActorKind::KChat` so every decision is traceable. `aec_core::kchat_sync::CommentSync` dedupes on `(thread_id, timestamp, commenter, blake3(text))` so re-imports don't double the audit log, and edits land as new rows.
-- **Status surface** — the StatusBar shows a `KChatStatusIndicator` (connected / reconnecting / disconnected with the server-reported version), the Deliver mode shows a `KChatReviewPanel` of ingested comments, and the Settings page shows the detected KChat Desktop instance info (version + socket path).
-- **Off by default** — when the KChat toggle in Settings is off, every publish/sync method returns `KChatError::Disabled` *before* touching the transport, and the corresponding UI hides itself. AEC Studio remains fully functional without ever touching KChat.
+- **Outbound** — artefacts (renders, sheets, revision packs, BOQ snapshots) can be published as inline cards to a KChat thread with one click. AEC Studio queues the card on the Electron main process, then a **`.kcz` companion extension installed inside KChat Desktop** (source: `extensions/aec-studio-kchat/`) reads the queue over a **loopback HTTP API** (`127.0.0.1:<kernel-assigned-port>`, bearer-authenticated, discovery file at `{userData}/aec-kchat-port.json`) and posts the card via the KChat host's `kchat.send_message` procedure. Nothing routes through a centralised AEC Studio service.
+- **Inbound** — review and approval comments on those cards are ingested back into the project's audit trail with `ActorKind::KChat` so every decision is traceable. The extension pulls recent thread messages via `kchat.query_messages` and pushes them to AEC Studio via `POST /api/review-comments`; `aec_core::kchat_sync::CommentSync` dedupes on `(thread_id, timestamp, commenter, blake3(text))` so re-imports don't double the audit log.
+- **Deeplinks** — `aecstudio://review?thread=<id>` (KChat → AEC Studio) and `kchat://app/conversation/<id>` (AEC Studio → KChat) handle bidirectional navigation. AEC Studio registers `aecstudio://` via `app.setAsDefaultProtocolClient`; outbound `kchat://` is handled by the new `kchat:openInDesktop` IPC handler that calls `shell.openExternal` with a shared rate-limit bucket.
+- **Status surface** — the StatusBar shows a `KChatStatusIndicator` (connected when the loopback API is live AND the extension heartbeat is fresh / disconnected otherwise), the Deliver mode shows a `KChatReviewPanel` of ingested comments, and the Settings page shows the loopback API port + extension installation hint.
+- **Off by default** — when the KChat toggle in Settings is off, every publish/sync method returns `KChatError::Disabled` *before* touching the queue, the loopback HTTP server stops listening, and the corresponding UI hides itself. AEC Studio remains fully functional without ever touching KChat.
 
-The full Phase 7 component listing lives in [PHASES.md](PHASES.md); the production-depth local-IPC transport, publisher, and discovery code landed in Phase 12. The technical design is in [ARCHITECTURE.md](ARCHITECTURE.md#96-kchat-integration).
+The Phase 7 baseline + Phase 12 production hardening landed before the architecture migration; the auditing finding that drove the Phase 15 replatform (KChat Desktop's Extension Platform is JS-only — no socket listener on the KChat side) is documented in PROGRESS.md. The technical design is in [ARCHITECTURE.md §9.6](ARCHITECTURE.md#96-kchat-integration--phase-15--loopback-http---kcz-extension). The canonical wire schema is in [`docs/KCHAT_LOOPBACK_API.md`](docs/KCHAT_LOOPBACK_API.md); extension internals are in [`docs/KCHAT_EXTENSION.md`](docs/KCHAT_EXTENSION.md).
 
 ---
 

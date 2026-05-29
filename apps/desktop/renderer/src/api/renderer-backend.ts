@@ -609,6 +609,10 @@ function kchatMock(newId: (prefix: string) => string) {
         // absent. The Deliver page's review panel falls back to
         // its `kchat-default` constant when this is null.
         defaultThreadId: null,
+        // Vitest mock mirrors `KChatConfig::default()` so component
+        // tests that render the Settings card observe a non-
+        // disabled bridge by default.
+        enabled: true,
       }) as Awaited<ReturnType<AecApi["kchat"]["status"]>>,
     reload: async () =>
       ({
@@ -616,7 +620,16 @@ function kchatMock(newId: (prefix: string) => string) {
         publisherKind: "in_memory",
         instanceJson: null,
         defaultThreadId: null,
+        enabled: true,
       }) as Awaited<ReturnType<AecApi["kchat"]["reload"]>>,
+    setEnabled: async ({ enabled }: { enabled: boolean }) =>
+      ({
+        state: "disconnected",
+        publisherKind: "in_memory",
+        instanceJson: null,
+        defaultThreadId: null,
+        enabled,
+      }) as Awaited<ReturnType<AecApi["kchat"]["setEnabled"]>>,
     publish: async (_params: { cardJson: string }) => ({
       messageId: newId("kchat_msg"),
       threadId: "kchat-default",
@@ -630,6 +643,17 @@ function kchatMock(newId: (prefix: string) => string) {
       commentsJson: "[]",
       cardsJson: "[]",
     }),
+    // Phase 15: vitest contexts never have a real KChat Desktop
+    // running, so deeplink open requests + inbound deeplinks are
+    // no-ops. We deliberately return a rate_limited-looking
+    // shape rather than `{ ok: true }` so renderer code that
+    // surfaces "opened" feedback doesn't trigger a misleading
+    // toast in headless tests.
+    openInDesktop: async (_params: { url: string }) => ({
+      ok: false as const,
+      reason: "scheme_not_allowed" as const,
+    }),
+    onDeeplink: (_cb: (route: never) => void) => () => undefined,
   } satisfies AecApi["kchat"];
 }
 

@@ -19,6 +19,10 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { aec, RuntimeStatus } from "../api/aec";
+import {
+  parseLoopbackInstance,
+  type KChatLoopbackInstance,
+} from "../components/kchat/loopbackInstance";
 
 type AiModelTier = "tiny" | "small" | "medium" | "large";
 type RenderPresetKey = "quick" | "standard" | "high" | "studio";
@@ -28,14 +32,12 @@ interface SettingsState {
   aiModelTierOverride: AiModelTier | "auto";
   defaultRenderPreset: RenderPresetKey;
   region: Region;
-  kchatEnabled: boolean;
 }
 
 const DEFAULT_SETTINGS: SettingsState = {
   aiModelTierOverride: "auto",
   defaultRenderPreset: "standard",
   region: "metric",
-  kchatEnabled: false,
 };
 
 export function Settings() {
@@ -45,10 +47,29 @@ export function Settings() {
   const [error, setError] = useState<string | null>(null);
   const [kchatStatus, setKchatStatus] = useState<{
     state: "connected" | "reconnecting" | "disconnected";
-    publisherKind: "local_ipc" | "in_memory";
-    instance: { socket_path: string; version: string; health: string } | null;
+    publisherKind: "loopback_http" | "in_memory";
+    instance: KChatLoopbackInstance | null;
+    /**
+     * Bridge-persisted master enable flag mirroring
+     * `KChatConfig::enabled`. Source of truth for the
+     * "Enable KChat integration" checkbox — we render
+     * directly from this rather than keeping a separate
+     * `settings.kchatEnabled` so the toggle stays in lockstep
+     * with the publish gate on every status poll / project
+     * open.
+     */
+    enabled: boolean;
   } | null>(null);
   const [kchatReloading, setKchatReloading] = useState(false);
+  // Inline feedback for the bridge-persisted enable-toggle round
+  // trip. `kchat:setEnabled` is fast (read+write on a single
+  // `RwLock` inside the bridge) but still async, so the checkbox
+  // is disabled while the call is in flight to keep the UI from
+  // sending two flips before the first one lands.
+  const [kchatTogglePending, setKchatTogglePending] = useState(false);
+  const [kchatToggleError, setKchatToggleError] = useState<string | null>(
+    null,
+  );
   // Surfaces the last `kchat:reload` failure inline next to the
   // reload button. The `onClick={() => void onReloadKChat()}` call
   // site cannot observe a rejected promise (React ignores returned
@@ -78,9 +99,10 @@ export function Settings() {
         const s = await aec.kchat.status();
         if (!cancelled) {
           setKchatStatus({
+            enabled: s.enabled,
             state: s.state,
             publisherKind: s.publisherKind,
-            instance: parseKChatInstance(s.instanceJson),
+            instance: parseLoopbackInstance(s.instanceJson),
           });
         }
       } catch {
@@ -98,9 +120,10 @@ export function Settings() {
     try {
       const s = await aec.kchat.reload();
       setKchatStatus({
+        enabled: s.enabled,
         state: s.state,
         publisherKind: s.publisherKind,
-        instance: parseKChatInstance(s.instanceJson),
+        instance: parseLoopbackInstance(s.instanceJson),
       });
       // Clear any prior failure once we've successfully refreshed.
       setKchatReloadError(null);
@@ -117,6 +140,35 @@ export function Settings() {
       setKchatReloadError(e instanceof Error ? e.message : String(e));
     } finally {
       setKchatReloading(false);
+    }
+  }, []);
+
+  /**
+   * Flip the bridge-persisted master KChat enable switch via
+   * `kchat:setEnabled`. Mirrors the fresh status snapshot the IPC
+   * call returns onto local state so the checkbox / chip / state
+   * line all converge in a single round trip — no follow-up
+   * `kchat:status` poll required.
+   */
+  const onToggleKChatEnabled = useCallback(async (next: boolean) => {
+    setKchatTogglePending(true);
+    setKchatToggleError(null);
+    try {
+      const s = await aec.kchat.setEnabled({ enabled: next });
+      setKchatStatus({
+        enabled: s.enabled,
+        state: s.state,
+        publisherKind: s.publisherKind,
+        instance: parseLoopbackInstance(s.instanceJson),
+      });
+    } catch (e) {
+      // The bridge can only fail here on a panic in the
+      // `RwLock` or a serialization error — neither is
+      // user-actionable, but surfacing the message keeps the
+      // user from thinking the checkbox is silently broken.
+      setKchatToggleError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setKchatTogglePending(false);
     }
   }, []);
 
@@ -272,24 +324,50 @@ export function Settings() {
         <p>
           Optional one-way publishing of artefacts (renders, sheets,
           packs) to a KChat thread, with inline review comments
-          flowing back into the audit trail. Disabled by default —
-          AEC Studio remains fully functional without it.
+          flowing back into the audit trail. AEC Studio remains
+          fully functional without it. The toggle below is
+          bridge-persisted onto the active project's
+          <code> settings.kchat.enabled </code> manifest field via
+          <code> kchat:setEnabled </code> and gates the
+          <code> kchat:publish </code> IPC handler in the Electron
+          main process — disabling it stops publishes at the
+          source, not just in the UI.
         </p>
         <label>
           <input
             type="checkbox"
             data-testid="settings-kchat-enabled"
-            checked={settings.kchatEnabled}
-            onChange={(e) => updateSetting("kchatEnabled", e.target.checked)}
+            checked={kchatStatus?.enabled ?? false}
+            disabled={kchatStatus === null || kchatTogglePending}
+            onChange={(e) => void onToggleKChatEnabled(e.target.checked)}
           />
           Enable KChat integration
+          {kchatTogglePending && (
+            <span
+              data-testid="settings-kchat-enabled-pending"
+              className="settings-page__inline-pending"
+              aria-live="polite"
+            >
+              {" "}
+              (saving…)
+            </span>
+          )}
         </label>
+        {kchatToggleError && (
+          <p
+            data-testid="settings-kchat-enabled-error"
+            className="settings-page__inline-error"
+            role="alert"
+          >
+            Toggle failed: {kchatToggleError}
+          </p>
+        )}
         <div
           className="settings-kchat-instance"
           data-testid="settings-kchat-instance"
         >
           {kchatStatus === null ? (
-            <p>Checking for KChat Desktop…</p>
+            <p>Checking for KChat Desktop&hellip;</p>
           ) : kchatStatus.instance ? (
             <ul>
               <li>
@@ -299,19 +377,38 @@ export function Settings() {
                 Connection: <code>{kchatStatus.state}</code>
               </li>
               <li>
-                Socket: <code>{kchatStatus.instance.socket_path}</code>
+                Loopback API:{" "}
+                <code>
+                  {kchatStatus.instance.apiServerRunning
+                    ? `127.0.0.1:${kchatStatus.instance.apiServerPort ?? "?"}`
+                    : "not running"}
+                </code>
               </li>
               <li>
-                Version: <code>{kchatStatus.instance.version}</code>
+                Port file:{" "}
+                <code>{kchatStatus.instance.portFilePath ?? "\u2014"}</code>
               </li>
               <li>
-                Health: <code>{kchatStatus.instance.health}</code>
+                Extension heartbeat:{" "}
+                <code>
+                  {kchatStatus.instance.lastExtensionContactAt ??
+                    "never (not yet seen this session)"}
+                </code>
+              </li>
+              <li>
+                Publish queue:{" "}
+                <code>{kchatStatus.instance.queuedPublishCount} card(s)</code>
+              </li>
+              <li>
+                Review threads:{" "}
+                <code>{kchatStatus.instance.reviewThreadCount}</code>
               </li>
             </ul>
           ) : (
             <p>
-              No KChat Desktop instance detected on this machine. AEC
-              Studio will use the in-memory fallback publisher.
+              The loopback API is not running on this process. Install
+              the AEC Studio companion extension inside KChat Desktop
+              and restart AEC Studio to enable publishing.
             </p>
           )}
           <button
@@ -361,26 +458,3 @@ export function Settings() {
 }
 
 export default Settings;
-
-function parseKChatInstance(json: string | null | undefined): {
-  socket_path: string;
-  version: string;
-  health: string;
-} | null {
-  if (!json) return null;
-  try {
-    const parsed = JSON.parse(json) as {
-      socket_path?: string;
-      version?: string;
-      health?: string;
-    };
-    if (!parsed.socket_path || !parsed.version) return null;
-    return {
-      socket_path: parsed.socket_path,
-      version: parsed.version,
-      health: parsed.health ?? "unknown",
-    };
-  } catch {
-    return null;
-  }
-}

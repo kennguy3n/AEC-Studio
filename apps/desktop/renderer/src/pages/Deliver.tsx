@@ -33,11 +33,12 @@ import { RevisionManager } from "../components/deliver/RevisionManager";
 import { DeliverToolbar } from "../components/deliver/DeliverToolbar";
 
 /**
- * Fallback thread id used when no per-project `KChatConfig` has been
- * adopted by the bridge yet (no project open, or the manifest left
- * `default_thread_id` unset). Matches `DEFAULT_THREAD_ID` from
- * `crates/aec_core/src/local_ipc_publisher.rs` so the Deliver review
- * panel and the bridge publisher converge on the same default.
+ * Fallback thread id used when no per-project `KChatConfig` has
+ * been adopted by the bridge yet (no project open, or the
+ * manifest left `default_thread_id` unset). Mirrors
+ * `DEFAULT_THREAD_ID` in `crates/aec_core/src/kchat.rs` so the
+ * Deliver review panel and the Rust-side publisher converge on
+ * the same default thread.
  */
 const FALLBACK_THREAD_ID = "kchat-default";
 

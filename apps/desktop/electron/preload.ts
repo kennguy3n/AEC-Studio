@@ -567,21 +567,42 @@ const api = {
     status: () => ipcRenderer.invoke("runtime:status"),
   },
 
-  // ----- KChat (Phase 12) -----
+  // ----- KChat (Phase 15: loopback HTTP + .kcz extension) -----
+  //
+  // Phase 12's socket / named-pipe transport is gone; the
+  // `publisherKind` discriminator is now `loopback_http`
+  // (production) or `in_memory` (tests / headless). The
+  // `instanceJson` shape changed too — see
+  // `bridge.ts:KChatStatusReport` for the new schema.
   kchat: {
     status: () =>
       ipcRenderer.invoke("kchat:status") as Promise<{
         state: "connected" | "reconnecting" | "disconnected";
-        publisherKind: "local_ipc" | "in_memory";
+        publisherKind: "loopback_http" | "in_memory";
         instanceJson: string | null;
         defaultThreadId: string | null;
+        enabled: boolean;
       }>,
     reload: () =>
       ipcRenderer.invoke("kchat:reload") as Promise<{
         state: "connected" | "reconnecting" | "disconnected";
-        publisherKind: "local_ipc" | "in_memory";
+        publisherKind: "loopback_http" | "in_memory";
         instanceJson: string | null;
         defaultThreadId: string | null;
+        enabled: boolean;
+      }>,
+    /**
+     * Flip the bridge-persisted KChat enable switch. Returns the
+     * fresh status snapshot so the Settings card can update its
+     * UI without a follow-up `status()` poll.
+     */
+    setEnabled: (params: { enabled: boolean }) =>
+      ipcRenderer.invoke("kchat:setEnabled", params) as Promise<{
+        state: "connected" | "reconnecting" | "disconnected";
+        publisherKind: "loopback_http" | "in_memory";
+        instanceJson: string | null;
+        defaultThreadId: string | null;
+        enabled: boolean;
       }>,
     publish: (params: { cardJson: string }) =>
       ipcRenderer.invoke("kchat:publish", params) as Promise<{
@@ -595,6 +616,42 @@ const api = {
         commentsJson: string;
         cardsJson: string;
       }>,
+    /**
+     * Open a `kchat://app/...` deeplink in the OS-registered
+     * KChat Desktop binary. Rate-limited; scheme-checked.
+     * Returns `{ ok: false, reason }` when blocked.
+     */
+    openInDesktop: (params: { url: string }) =>
+      ipcRenderer.invoke("kchat:openInDesktop", params) as Promise<{
+        ok: boolean;
+        reason?: "rate_limited" | "scheme_not_allowed";
+      }>,
+    /**
+     * Subscribe to inbound `aecstudio://...` deeplinks parsed
+     * by the main-process bridge. The callback receives the
+     * typed `DeeplinkRoute` directly; unsubscribe via the
+     * returned disposer.
+     */
+    onDeeplink: (
+      cb: (
+        route:
+          | { kind: "review"; threadId: string }
+          | { kind: "project"; projectId: string }
+          | { kind: "deliver"; packId: string },
+      ) => void,
+    ) => {
+      const handler = (
+        _e: Electron.IpcRendererEvent,
+        route:
+          | { kind: "review"; threadId: string }
+          | { kind: "project"; projectId: string }
+          | { kind: "deliver"; packId: string },
+      ): void => cb(route);
+      ipcRenderer.on("kchat:deeplink", handler);
+      return () => {
+        ipcRenderer.removeListener("kchat:deeplink", handler);
+      };
+    },
   },
 
   // ----- Viewport (Phase 12) -----

@@ -1,4 +1,5 @@
 import { ipcMain } from "electron";
+import { randomUUID } from "node:crypto";
 import { getBridge } from "./bridge";
 import {
   clearActiveProjectPath,
@@ -7,6 +8,168 @@ import {
   setActiveProject,
   setActiveProjectIfMatchesActive,
 } from "./active-project";
+import {
+  enqueuePublish,
+  getKchatRendererSnapshot,
+  getReviewCommentsForThread,
+} from "./kchat/kchatAppState";
+import { openKchatDeeplink } from "./kchat/kchatOutboundDeeplink";
+import { mapStoredReviewCommentsToRows } from "./kchat/reviewWireFormat";
+
+/**
+ * Heartbeat-freshness window for the loopback API's
+ * `connected`/`reconnecting`/`disconnected` ternary. 30 s covers an
+ * entire `.kcz` extension activation cycle plus the bot's
+ * idle-polling cadence; tighter than this would flap, looser would
+ * mask a dead extension for too long.
+ */
+const KCHAT_HEARTBEAT_FRESH_MS = 30_000;
+
+/**
+ * Build the renderer-facing kchat status payload.
+ *
+ * Centralised so the `kchat:status` IPC handler and the
+ * `kchat:reload` handler compute the connection state with
+ * identical logic. Previously `kchat:reload` short-circuited to
+ * `apiServerRunning ? "reconnecting" : "disconnected"`, which
+ * meant clicking "Re-detect" on the Settings card with a healthy
+ * extension flashed the indicator to `reconnecting` until the next
+ * 5 s status poll healed it — visible UX bug.
+ *
+ * The Phase 15 transport is local-only (no socket reconnect to
+ * negotiate), so "reload" is just "snapshot the current state".
+ */
+function buildKchatStatusResponse(
+  defaultThreadId: string | null,
+  enabled: boolean,
+): {
+  state: "connected" | "reconnecting" | "disconnected";
+  publisherKind: "loopback_http";
+  instanceJson: string;
+  defaultThreadId: string | null;
+  enabled: boolean;
+} {
+  const snap = getKchatRendererSnapshot();
+  const nowMs = Date.now();
+  const lastMs =
+    snap.lastExtensionContactAt === null
+      ? null
+      : Date.parse(snap.lastExtensionContactAt);
+  let state: "connected" | "reconnecting" | "disconnected";
+  if (!enabled) {
+    // The bridge-persisted master toggle is off. The Settings
+    // toggle / per-project manifest flipped it; the
+    // `kchat:publish` handler refuses publishes in this state
+    // before they ever reach the loopback queue. Forcing
+    // `disconnected` here keeps the renderer's chip honest — a
+    // running loopback server with a fresh extension heartbeat
+    // would otherwise read "online" while every publish bounces
+    // off the gate.
+    state = "disconnected";
+  } else if (!snap.apiServerRunning) {
+    // The server itself isn't up — typically a boot failure or a
+    // shutdown in progress. The renderer treats this as a hard
+    // disconnect and hides the Settings affordances.
+    state = "disconnected";
+  } else if (lastMs !== null && nowMs - lastMs < KCHAT_HEARTBEAT_FRESH_MS) {
+    // We heard from the extension recently — it's alive on the
+    // other end of the loopback.
+    state = "connected";
+  } else {
+    // Server is up but no fresh heartbeat. This is the legitimate
+    // "extension not installed / not activated yet" state and
+    // also the "boot finished but no extension activation has
+    // happened this session" state.
+    state = "reconnecting";
+  }
+  return {
+    state,
+    publisherKind: "loopback_http",
+    instanceJson: JSON.stringify({
+      apiServerRunning: snap.apiServerRunning,
+      apiServerPort: snap.apiServerPort,
+      portFilePath: snap.portFilePath,
+      lastExtensionContactAt: snap.lastExtensionContactAt,
+      queuedPublishCount: snap.queuedPublishCount,
+      reviewThreadCount: snap.reviewThreadCount,
+    }),
+    defaultThreadId,
+    enabled,
+  };
+}
+
+/**
+ * Single-call helper that returns both the master enabled flag
+ * and the per-project default thread id from the Rust bridge's
+ * `kchatStatus()` snapshot. Issuing a single `kchatStatus()` call
+ * for both fields is the only way to read them: every renderer-
+ * facing handler (`kchat:status`, `kchat:reload`, `kchat:publish`,
+ * `kchat:setEnabled`) needs both, and the N-API call + read-lock
+ * acquire on the Rust side is the dominant cost. Doing it twice
+ * (one round-trip per field) was a latency regression on the
+ * 5 s status poll hot path that this helper closes.
+ *
+ * This variant FAILS OPEN. Returns `{ enabled: true,
+ * defaultThreadId: null }` if the bridge is temporarily
+ * unavailable (typical at boot — `kchat:status` is the very first
+ * call the renderer issues): surfacing the error would hide the
+ * loopback / extension status from the indicator chip even though
+ * that signal is still meaningful. `enabled=true` matches
+ * `KChatConfig::default` so the first poll doesn't flash a
+ * disabled chip; `defaultThreadId=null` lets the renderer fall
+ * back to its `kchat-default` constant.
+ *
+ * Use this ONLY on read-only display paths (`kchat:status`,
+ * `kchat:reload`). Any write path or data-exposure path that gates
+ * on `enabled` must use the strict variant below — defaulting to
+ * `enabled=true` on a bridge blip silently overrides an explicit
+ * user disable and would have been a real bug on the publish
+ * gate (Phase 15 round-9 BUG_0001).
+ */
+export async function resolveEnabledAndDefaultThreadFromBridge(): Promise<{
+  enabled: boolean;
+  defaultThreadId: string | null;
+}> {
+  try {
+    return await resolveEnabledAndDefaultThreadFromBridgeStrict();
+  } catch (err) {
+    console.warn(
+      `[ipc] resolveEnabledAndDefaultThreadFromBridge: bridge kchat_status failed (${
+        err instanceof Error ? err.message : String(err)
+      }); defaulting enabled=true, defaultThreadId=null`,
+    );
+    return { enabled: true, defaultThreadId: null };
+  }
+}
+
+/**
+ * Strict single-call helper — same shape as the soft variant
+ * above, but propagates bridge errors instead of swallowing them.
+ *
+ * Use this on any write path or data-exposure path that gates on
+ * `enabled` (currently `kchat:publish` and `kchat:ingestReviews`).
+ * If the bridge is unreachable we MUST NOT default to
+ * `enabled=true`: doing so would silently override an explicit
+ * user disable and let publishes through (or expose review
+ * comments) during a bridge outage. Fail closed by propagating
+ * the error; the renderer's PublishCardModal surfaces it inline
+ * via `setError(msg)`, and the review panel treats it as a
+ * polling error (stops the loop, surfaces a retry affordance).
+ *
+ * The error message intentionally includes the underlying cause
+ * so a missing bridge.node / NAPI panic is recognisable in the
+ * UI rather than masquerading as "disabled".
+ */
+export async function resolveEnabledAndDefaultThreadFromBridgeStrict(): Promise<{
+  enabled: boolean;
+  defaultThreadId: string | null;
+}> {
+  const status = await getBridge().kchatStatus();
+  return {
+    enabled: status.enabled,
+    defaultThreadId: status.defaultThreadId ?? null,
+  };
+}
 
 /**
  * Register every IPC handler the preload bridge expects. Handlers are
@@ -586,23 +749,124 @@ export function registerIpcHandlers(): void {
   // ----- Runtime -----
   ipcMain.handle("runtime:status", async () => getBridge().runtimeStatus());
 
-  // ----- KChat (Phase 12) -----
-  ipcMain.handle("kchat:status", async () => getBridge().kchatStatus());
-  ipcMain.handle("kchat:reload", async () => getBridge().kchatReload());
+  // ----- KChat (Phase 15: loopback HTTP + .kcz extension) -----
+  //
+  // Phase 12's socket / named-pipe transport is gone. The
+  // Electron main process now hosts a loopback HTTP API on
+  // 127.0.0.1 that the `.kcz` extension installed in KChat
+  // Desktop talks to (see `kchat/kchatLocalApi.ts`). These IPC
+  // handlers route the renderer-facing surface through the
+  // Electron-side `kchatAppState` singleton; the Rust bridge's
+  // KChat methods are kept for in-process tests / fallback only.
+  ipcMain.handle("kchat:status", async () => {
+    // Single bridge round-trip — see
+    // `resolveEnabledAndDefaultThreadFromBridge`. Polled every
+    // ~5 s by the renderer; splitting into two parallel calls
+    // would double the N-API + RwLock acquisitions on the hot
+    // path for no benefit since both fields come from the same
+    // `kchatStatus()` payload.
+    const { defaultThreadId, enabled } =
+      await resolveEnabledAndDefaultThreadFromBridge();
+    return buildKchatStatusResponse(defaultThreadId, enabled);
+  });
+  ipcMain.handle("kchat:reload", async () => {
+    // In Phase 15 there is nothing to "reload" at the transport
+    // layer — the loopback API has no upstream connection to
+    // re-establish. Reload is now a synonym for "snapshot the
+    // current status"; the renderer keeps the affordance for
+    // backward compatibility (the Settings card's "Re-detect"
+    // button maps to this). Critically, we must compute the
+    // connection state with the SAME logic as `kchat:status`
+    // (heartbeat-freshness based, not just "is the server up")
+    // so that clicking "Re-detect" while the extension is
+    // connected doesn't flash the indicator to `reconnecting`
+    // until the next 5 s status poll corrects it.
+    //
+    // Same single-call optimisation as `kchat:status` above.
+    const { defaultThreadId, enabled } =
+      await resolveEnabledAndDefaultThreadFromBridge();
+    return buildKchatStatusResponse(defaultThreadId, enabled);
+  });
+  ipcMain.handle("kchat:setEnabled", async (_e, params) => {
+    // Settings page "Enable KChat integration" toggle. The bridge
+    // persists the flag onto `KChatConfig::enabled`; subsequent
+    // `kchat:publish` IPC calls observe it via the status payload
+    // and refuse the publish *before* enqueueing into the
+    // loopback queue when disabled. We return the fresh status
+    // snapshot so the renderer can avoid a follow-up
+    // `kchat:status` round trip.
+    assertObject(params, "params");
+    const enabled = (params as { enabled?: unknown }).enabled;
+    if (typeof enabled !== "boolean") {
+      throw new Error("kchatSetEnabled: enabled must be a boolean");
+    }
+    const bridgeStatus = await getBridge().kchatSetEnabled({ enabled });
+    return buildKchatStatusResponse(
+      bridgeStatus.defaultThreadId ?? null,
+      bridgeStatus.enabled,
+    );
+  });
   ipcMain.handle("kchat:publish", async (_e, params) => {
     assertObject(params, "params");
+    // Snapshot the bridge once for both the enabled gate and the
+    // per-project default-thread lookup further down. Phase 12's
+    // `KChatState::publish` checked `enabled` *before* touching
+    // the transport; Phase 15's loopback queue lives outside the
+    // Rust state, so the gate has to live here too. Refusing
+    // publishes before they reach `enqueuePublish` is the
+    // correct semantic: a queued card implies AEC Studio intends
+    // to send it, and we don't intend anything when the user has
+    // switched the integration off. The error is surfaced
+    // verbatim in `PublishCardModal`'s inline error pane via
+    // `setError(msg)`.
+    //
+    // FAIL CLOSED on bridge errors (round-9 BUG_0001 fix). The
+    // soft helper defaults to `enabled=true` when the bridge is
+    // unreachable, which is correct for the status indicator but
+    // wrong for a write path: a transient bridge blip during a
+    // publish would silently override an explicit user disable.
+    // The strict variant propagates the underlying error so the
+    // renderer surfaces it (and a retry rather than a silent
+    // bypass-then-queue is the right UX).
+    const bridgeKchat = await resolveEnabledAndDefaultThreadFromBridgeStrict();
+    if (!bridgeKchat.enabled) {
+      throw new Error(
+        "kchatPublish: KChat integration is disabled \u2014 enable it in Settings before publishing.",
+      );
+    }
     const cardJson = (params as { cardJson?: unknown }).cardJson;
     assertString(cardJson, "cardJson");
-    // Surface obviously-broken payloads at the IPC boundary so the
-    // caller gets a descriptive error rather than a generic
-    // GenericFailure from `serde_json::from_str` on the Rust side.
+    // The renderer's `PublishCardModal` posts the canonical
+    // `ArtifactCard` shape mirrored from
+    // `aec_core::kchat::ArtifactCard`
+    // (artifact / caption / project_link / thumbnail_blake3 /
+    // metadata). The local-queue `QueuedPublish` row needs a
+    // different shape (cardId / threadId / body) so the .kcz
+    // extension can drain it into KChat with a one-shot
+    // `invokeProcedure("kchat.send_message")` call. We transform
+    // at this boundary so neither side has to know about the
+    // other's shape: the renderer keeps the wire-stable
+    // ArtifactCard contract, and the loopback queue keeps the
+    // QueuedPublish contract.
+    let card: {
+      artifact?: unknown;
+      caption?: unknown;
+      project_link?: unknown;
+      thumbnail_blake3?: unknown;
+      metadata?: unknown;
+    };
     try {
       const parsed = JSON.parse(cardJson) as unknown;
-      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      if (
+        parsed === null ||
+        typeof parsed !== "object" ||
+        Array.isArray(parsed)
+      ) {
         throw new Error(
-          "kchatPublish: cardJson must encode an object (ArtifactCard)",
+          "kchatPublish: cardJson must encode an ArtifactCard object",
         );
       }
+      card = parsed as typeof card;
     } catch (err) {
       if (err instanceof SyntaxError) {
         throw new Error(
@@ -611,22 +875,124 @@ export function registerIpcHandlers(): void {
       }
       throw err;
     }
-    return getBridge().kchatPublish({ cardJson });
+    // The fields the renderer must always supply. Validate at the
+    // IPC boundary so a misconfigured caller gets a descriptive
+    // error rather than an opaque .kcz-extension failure later
+    // on. These mirror `ArtifactCard::validate` on the Rust side.
+    if (typeof card.artifact !== "string" || card.artifact.length === 0) {
+      throw new Error("kchatPublish: cardJson.artifact is required");
+    }
+    if (typeof card.caption !== "string" || card.caption.trim().length === 0) {
+      throw new Error("kchatPublish: cardJson.caption is required");
+    }
+    if (
+      typeof card.project_link !== "string" ||
+      !card.project_link.startsWith("aecstudio://")
+    ) {
+      throw new Error(
+        "kchatPublish: cardJson.project_link must start with aecstudio://",
+      );
+    }
+    // Resolve the per-project default thread the active project
+    // has configured via its manifest's
+    // `settings.kchat.default_thread_id`. The bridge tracks this
+    // as `KChatConfig::default_thread_id`; when no project is
+    // open or the project leaves the field unset we fall back to
+    // `aec_core::DEFAULT_THREAD_ID` (`"kchat-default"`), matching
+    // the renderer's `FALLBACK_THREAD_ID` constant and the
+    // publisher-side default. The .kcz extension is free to map
+    // this to a real KChat thread id when it acks via
+    // POST /api/publish-to-thread. Reuses the bridge snapshot
+    // taken above so we don't re-enter `kchatStatus()` for this
+    // single handler invocation.
+    const projectThread = bridgeKchat.defaultThreadId;
+    const threadId =
+      projectThread !== null && projectThread.length > 0
+        ? projectThread
+        : "kchat-default";
+    // Mint a UUID v4 for the card id. The .kcz extension uses
+    // it purely as a correlation handle; ordering is preserved
+    // by the queue's append-only structure, not by the id.
+    const cardId = randomUUID();
+    // Body shown in the KChat thread. The renderer's caption
+    // already includes any artifact-kind decoration the user
+    // wants surfaced, so we forward it verbatim. The extension
+    // gets the full ArtifactCard JSON via `cardJson` if it wants
+    // to render richer markup (thumbnail link, project deeplink,
+    // metadata chips).
+    const body = card.caption;
+    const queued = enqueuePublish({
+      cardId,
+      threadId,
+      body,
+      cardJson,
+    });
+    // Mirror the Phase 12 return shape so the renderer / tests
+    // don't have to change. `messageId` is the cardId until the
+    // extension reports the real KChat message id via
+    // POST /api/publish-to-thread; the renderer uses the
+    // messageId only as a correlation handle, never as a key.
+    return {
+      messageId: queued.cardId,
+      threadId: queued.threadId,
+      publishedAt: queued.queuedAt,
+    };
   });
   ipcMain.handle("kchat:ingestReviews", async (_e, params) => {
     assertObject(params, "params");
     const threadId = (params as { threadId?: unknown }).threadId;
     assertString(threadId, "threadId");
     const rawSince = (params as { sinceIso?: unknown }).sinceIso;
-    let sinceIso: string | null | undefined;
+    let sinceIso: string | null;
     if (rawSince === undefined || rawSince === null) {
-      sinceIso = rawSince ?? undefined;
+      sinceIso = null;
     } else if (typeof rawSince === "string") {
       sinceIso = rawSince;
     } else {
       throw new Error("kchatIngestReviews: sinceIso must be a string or null");
     }
-    return getBridge().kchatIngestReviews({ threadId, sinceIso });
+    // Phase 12 contract: the bridge's `kchat_ingest_reviews`
+    // returned `KChatError::Disabled` when the master toggle was
+    // off. Phase 15 moved the read out of the bridge and into the
+    // Electron-side `kchatAppState` buffer, but the gate has to
+    // survive the move — otherwise a disabled integration would
+    // still hand out review-comment payloads to any caller that
+    // bypassed the renderer's panel-level gate (extensions over
+    // the loopback API, future scripted IPC). Fail closed on
+    // bridge errors via the strict helper for the same reason
+    // `kchat:publish` does (round-9 ANALYSIS_0002).
+    const bridgeKchat = await resolveEnabledAndDefaultThreadFromBridgeStrict();
+    if (!bridgeKchat.enabled) {
+      throw new Error(
+        "kchatIngestReviews: KChat integration is disabled \u2014 enable it in Settings before ingesting reviews.",
+      );
+    }
+    const stored = getReviewCommentsForThread(threadId, sinceIso);
+    // Map `StoredReviewComment` (the shape `kchatAppState.ts`
+    // accumulates from the `.kcz` extension's
+    // `POST /api/review-comments` calls) to `ReviewCommentRow` —
+    // the shape `KChatReviewPanel.tsx` already decodes against.
+    // The pure helper lives in `./kchat/reviewWireFormat` so the
+    // renderer test suite can exercise the real wire-format
+    // transform with a `ReviewCommentPayload[]` payload (closes
+    // the round-5 ANALYSIS_0005 test-quality gap).
+    const comments = mapStoredReviewCommentsToRows(stored);
+    return {
+      threadId,
+      // Mirror the Phase 12 envelope (JSON-encoded arrays so the
+      // renderer can keep its existing decoder). `cardsJson` is
+      // empty in Phase 15 — review cards (extra metadata cards
+      // attached to comments) are not yet emitted by the .kcz
+      // extension.
+      commentsJson: JSON.stringify(comments),
+      cardsJson: "[]",
+    };
+  });
+  ipcMain.handle("kchat:openInDesktop", async (_e, params) => {
+    assertObject(params, "params");
+    const url = (params as { url?: unknown }).url;
+    assertString(url, "url");
+    return openKchatDeeplink(url);
   });
 
   // ----- Viewport (Phase 12) -----

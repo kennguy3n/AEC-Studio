@@ -24,6 +24,7 @@ describe("KChatStatusIndicator", () => {
       publisherKind: "in_memory",
       instanceJson: null,
       defaultThreadId: null,
+      enabled: true,
     });
     render(<KChatStatusIndicator />);
     await waitFor(() =>
@@ -39,13 +40,17 @@ describe("KChatStatusIndicator", () => {
   it("renders the connected chip with version tooltip", async () => {
     vi.spyOn(aec.kchat, "status").mockResolvedValue({
       state: "connected",
-      publisherKind: "local_ipc",
+      publisherKind: "loopback_http",
       instanceJson: JSON.stringify({
-        socket_path: "/tmp/kchat.sock",
-        version: "1.4.2",
-        health: "ok",
+        apiServerRunning: true,
+        apiServerPort: 52345,
+        portFilePath: "/tmp/kchat.sock",
+        lastExtensionContactAt: "2025-05-29T09:00:00.000Z",
+        queuedPublishCount: 0,
+        reviewThreadCount: 1,
       }),
       defaultThreadId: null,
+      enabled: true,
     });
     render(<KChatStatusIndicator />);
     await waitFor(() =>
@@ -55,7 +60,7 @@ describe("KChatStatusIndicator", () => {
     );
     expect(
       screen.getByTestId("kchat-status-chip").getAttribute("title"),
-    ).toContain("1.4.2");
+    ).toContain("127.0.0.1:52345");
   });
 
   it("invokes reload when the chip is clicked", async () => {
@@ -64,16 +69,21 @@ describe("KChatStatusIndicator", () => {
       publisherKind: "in_memory",
       instanceJson: null,
       defaultThreadId: null,
+      enabled: true,
     });
     const reload = vi.spyOn(aec.kchat, "reload").mockResolvedValue({
       state: "connected",
-      publisherKind: "local_ipc",
+      publisherKind: "loopback_http",
       instanceJson: JSON.stringify({
-        socket_path: "/tmp/kchat.sock",
-        version: "2.0.0",
-        health: "ok",
+        apiServerRunning: true,
+        apiServerPort: 52345,
+        portFilePath: "/tmp/kchat.sock",
+        lastExtensionContactAt: "2025-05-29T09:00:00.000Z",
+        queuedPublishCount: 0,
+        reviewThreadCount: 1,
       }),
       defaultThreadId: null,
+      enabled: true,
     });
     render(<KChatStatusIndicator />);
     await waitFor(() =>
@@ -103,6 +113,7 @@ describe("KChatStatusIndicator", () => {
       publisherKind: "in_memory",
       instanceJson: null,
       defaultThreadId: null,
+      enabled: true,
     });
     vi.spyOn(aec.kchat, "reload").mockRejectedValue(
       new Error("socket unreachable"),
@@ -229,6 +240,7 @@ describe("KChatReviewPanel", () => {
       publisherKind: "in_memory",
       instanceJson: null,
       defaultThreadId: null,
+      enabled: true,
     });
     render(<KChatReviewPanel threadId="kchat-default" />);
     const panel = await screen.findByTestId("kchat-review-panel");
@@ -237,16 +249,117 @@ describe("KChatReviewPanel", () => {
     );
   });
 
+  // Regression test for Devin Review finding "offline detection
+  // is dead code in production". `buildKchatStatusResponse`
+  // hard-codes `publisherKind: "loopback_http"` for every
+  // production payload (the bridge-persisted master toggle is
+  // surfaced via `enabled` and the transport state via `state`),
+  // so the prior `publisherKind !== "loopback_http"` conjunct
+  // was always false in production and the panel would never
+  // collapse to its offline placeholder even with the Settings
+  // toggle off. We now gate strictly on `enabled` + `state ===
+  // "disconnected"` — these two cases cover the production-shape
+  // payloads:
+  //
+  //   1. Settings toggle off (`enabled: false`). The loopback
+  //      server may still be running, but the `kchat:publish`
+  //      handler rejects publishes in this state, so ingesting
+  //      reviews would be polling a disabled integration.
+  //   2. Loopback server crashed / boot-failed
+  //      (`enabled: true, state: "disconnected"`). The server
+  //      isn't up, so even though the user has KChat enabled,
+  //      there's nothing to poll until it comes back.
+  it("renders offline when the Settings toggle is off, even with the loopback publisher reporting loopback_http", async () => {
+    vi.spyOn(aec.kchat, "status").mockResolvedValue({
+      state: "disconnected",
+      publisherKind: "loopback_http",
+      instanceJson: JSON.stringify({
+        apiServerRunning: false,
+        apiServerPort: null,
+        portFilePath: null,
+        lastExtensionContactAt: null,
+        queuedPublishCount: 0,
+        reviewThreadCount: 0,
+      }),
+      defaultThreadId: null,
+      enabled: false,
+    });
+    render(<KChatReviewPanel threadId="kchat-default" />);
+    const panel = await screen.findByTestId("kchat-review-panel");
+    await waitFor(() =>
+      expect(panel.getAttribute("data-offline")).toBe("true"),
+    );
+  });
+
+  it("renders offline when the loopback server is disconnected even though KChat is enabled", async () => {
+    vi.spyOn(aec.kchat, "status").mockResolvedValue({
+      state: "disconnected",
+      publisherKind: "loopback_http",
+      instanceJson: JSON.stringify({
+        apiServerRunning: false,
+        apiServerPort: null,
+        portFilePath: null,
+        lastExtensionContactAt: null,
+        queuedPublishCount: 0,
+        reviewThreadCount: 0,
+      }),
+      defaultThreadId: null,
+      enabled: true,
+    });
+    render(<KChatReviewPanel threadId="kchat-default" />);
+    const panel = await screen.findByTestId("kchat-review-panel");
+    await waitFor(() =>
+      expect(panel.getAttribute("data-offline")).toBe("true"),
+    );
+  });
+
+  // Reconnecting is the "server up, extension hasn't pinged yet"
+  // state and must NOT collapse the panel — the extension may
+  // come online mid-session and we want the next poll to pick up
+  // its first heartbeat without forcing a full panel re-render.
+  it("does not render offline when the loopback server is reconnecting (extension may come online)", async () => {
+    const ingest = vi.spyOn(aec.kchat, "ingestReviews").mockResolvedValue({
+      threadId: "kchat-default",
+      commentsJson: "[]",
+      cardsJson: "[]",
+    });
+    vi.spyOn(aec.kchat, "status").mockResolvedValue({
+      state: "reconnecting",
+      publisherKind: "loopback_http",
+      instanceJson: JSON.stringify({
+        apiServerRunning: true,
+        apiServerPort: 52345,
+        portFilePath: "/tmp/kchat.sock",
+        lastExtensionContactAt: null,
+        queuedPublishCount: 0,
+        reviewThreadCount: 0,
+      }),
+      defaultThreadId: null,
+      enabled: true,
+    });
+    render(<KChatReviewPanel threadId="kchat-default" />);
+    const panel = await screen.findByTestId("kchat-review-panel");
+    await waitFor(() =>
+      expect(panel.getAttribute("data-offline")).toBe("false"),
+    );
+    // `reconnecting` keeps polling — `ingestReviews` must fire.
+    await waitFor(() => expect(ingest).toHaveBeenCalled());
+  });
+
   it("renders ingested comments when the bridge reports connected", async () => {
     vi.spyOn(aec.kchat, "status").mockResolvedValue({
       state: "connected",
-      publisherKind: "local_ipc",
+      publisherKind: "loopback_http",
       instanceJson: JSON.stringify({
-        socket_path: "/tmp/kchat.sock",
-        version: "1.0.0",
-        health: "ok",
+        apiServerRunning: true,
+        apiServerPort: 52345,
+        portFilePath: "/tmp/kchat.sock",
+        lastExtensionContactAt: "2025-05-29T09:00:00.000Z",
+        queuedPublishCount: 0,
+        reviewThreadCount: 1,
       }),
       defaultThreadId: null,
+      enabled: true,
     });
     vi.spyOn(aec.kchat, "ingestReviews").mockResolvedValue({
       threadId: "kchat-default",
@@ -293,13 +406,17 @@ describe("KChatReviewPanel", () => {
 
     vi.spyOn(aec.kchat, "status").mockResolvedValue({
       state: "connected",
-      publisherKind: "local_ipc",
+      publisherKind: "loopback_http",
       instanceJson: JSON.stringify({
-        socket_path: "/tmp/kchat.sock",
-        version: "1.0.0",
-        health: "ok",
+        apiServerRunning: true,
+        apiServerPort: 52345,
+        portFilePath: "/tmp/kchat.sock",
+        lastExtensionContactAt: "2025-05-29T09:00:00.000Z",
+        queuedPublishCount: 0,
+        reviewThreadCount: 1,
       }),
       defaultThreadId: null,
+      enabled: true,
     });
     vi.spyOn(aec.kchat, "ingestReviews").mockRejectedValue(
       new Error("bridge timed out"),
@@ -333,13 +450,17 @@ describe("KChatReviewPanel", () => {
   it("resets comments and sinceIso cursor when threadId prop changes", async () => {
     vi.spyOn(aec.kchat, "status").mockResolvedValue({
       state: "connected",
-      publisherKind: "local_ipc",
+      publisherKind: "loopback_http",
       instanceJson: JSON.stringify({
-        socket_path: "/tmp/kchat.sock",
-        version: "1.0.0",
-        health: "ok",
+        apiServerRunning: true,
+        apiServerPort: 52345,
+        portFilePath: "/tmp/kchat.sock",
+        lastExtensionContactAt: "2025-05-29T09:00:00.000Z",
+        queuedPublishCount: 0,
+        reviewThreadCount: 1,
       }),
       defaultThreadId: null,
+      enabled: true,
     });
     const ingest = vi
       .spyOn(aec.kchat, "ingestReviews")
@@ -442,13 +563,17 @@ describe("KChatReviewPanel", () => {
     // The status call always reports connected.
     vi.spyOn(aec.kchat, "status").mockResolvedValue({
       state: "connected",
-      publisherKind: "local_ipc",
+      publisherKind: "loopback_http",
       instanceJson: JSON.stringify({
-        socket_path: "/tmp/kchat.sock",
-        version: "1.0.0",
-        health: "ok",
+        apiServerRunning: true,
+        apiServerPort: 52345,
+        portFilePath: "/tmp/kchat.sock",
+        lastExtensionContactAt: "2025-05-29T09:00:00.000Z",
+        queuedPublishCount: 0,
+        reviewThreadCount: 1,
       }),
       defaultThreadId: null,
+      enabled: true,
     });
 
     // ingestReviews: thread-a resolves after a 100 ms delay (simulating

@@ -1,57 +1,85 @@
 //! Process-wide KChat state held on [`crate::service::BridgeService`].
 //!
-//! The renderer talks to KChat Desktop through three IPC endpoints
-//! (`kchat:status`, `kchat:publish`, `kchat:ingestReviews`). All three
-//! delegate to this state object, which owns the chosen
-//! [`KChatPublisher`] for the running process.
+//! ## Phase 15 transport replatform
 //!
-//! ## Publisher selection
+//! Phase 12 shipped a UNIX-socket / Windows-named-pipe transport
+//! between AEC Studio and KChat Desktop. KChat Desktop's Extension
+//! Platform turned out to be a JS-only sandbox with no socket
+//! listener — the same conclusion KCreate and Tessera reached — so
+//! Phase 15 replaced the socket transport with a loopback HTTP API
+//! served from the Electron main process (see
+//! `apps/desktop/electron/kchat/kchatLocalApi.ts`). The `.kcz`
+//! companion extension installed inside KChat Desktop reads
+//! `{userData}/aec-kchat-port.json` and posts artefact cards back
+//! to the Electron loopback API; the renderer's `kchat:*` IPC
+//! channels also go straight to the Electron loopback state
+//! (`apps/desktop/electron/kchat/kchatAppState.ts`).
 //!
-//! [`KChatState::new`] resolves a publisher at construction time:
+//! That move makes the Rust-side `KChatState` *headless*: it is no
+//! longer the transport, it is only the in-process accounting
+//! object the bridge keeps for tests, journey tests, and the
+//! `aec_bridge` consumers that don't run inside Electron (CLI
+//! tools, integration tests). The publisher it owns is always an
+//! [`InMemoryPublisher`] — the loopback HTTP queue lives outside
+//! this crate.
 //!
-//! 1. If [`aec_core::KChatDiscovery::probe`] returns
-//!    `Some(KChatInstanceInfo)`, the state holds a
-//!    [`LocalIpcPublisher`] and surfaces the discovered instance via
-//!    [`KChatState::status`].
-//! 2. Otherwise the state falls back to an [`InMemoryPublisher`] so
-//!    callers can still exercise the publish path (the bridge tests
-//!    exercise this; CI never has a real KChat Desktop on the box).
+//! ## Surface kept stable
 //!
-//! The publisher choice is sticky for the lifetime of the bridge
-//! process. A `kchat:status` poll re-runs discovery but only updates
-//! the cached `KChatInstanceInfo`; the publisher itself is replaced
-//! only when the renderer hits "Reload KChat connection" in the
-//! Settings page (which calls [`KChatState::reload`]).
+//! The public methods (`status`, `reload`, `publish`,
+//! `ingest_reviews`, `apply_project_config`, `clear_project_config`,
+//! `set_enabled`, `is_enabled`, `default_thread_id`) all keep
+//! their Phase 12 shapes so the bridge service, the napi exports,
+//! and the renderer fallback path don't need to change. What did
+//! change is the *semantics*:
+//!
+//! - `KChatStatusReport::publisher_kind` is now either
+//!   `"loopback_http"` (set when the bridge boots inside the
+//!   Electron host that hosts the loopback API — currently signalled
+//!   by [`KChatState::mark_loopback_active`]) or `"in_memory"`
+//!   (every other context). The `"local_ipc"` variant is gone.
+//! - `KChatStatusReport::instance` is `None`. The Electron-side
+//!   loopback snapshot (port, port-file path, extension heartbeat,
+//!   queue depth) is surfaced via the `kchat:status` IPC channel
+//!   directly from the Electron main process; the Rust state does
+//!   not have, and does not need, visibility into it.
+//! - The probe-cooldown / discovery-throttle machinery is gone —
+//!   there is nothing to probe.
 
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
 
 use aec_core::kchat::{
     ArtifactCard, InMemoryPublisher, KChatError, KChatPublisher, PublishResult, ReviewCard,
     ReviewComment,
 };
 use aec_core::kchat_config::KChatConfig;
-use aec_core::kchat_discovery::{KChatDiscovery, KChatInstanceInfo};
-use aec_core::kchat_transport::DEFAULT_IO_TIMEOUT;
-use aec_core::local_ipc_publisher::LocalIpcPublisher;
 use serde::{Deserialize, Serialize};
 
-/// Snapshot returned by [`KChatState::status`]. Mirrored 1:1 by the
-/// renderer-side `KChatStatusIndicator` so adding fields here is a
-/// breaking change at the IPC boundary.
+/// Snapshot returned by [`KChatState::status`]. The renderer-side
+/// `KChatStatusIndicator` mirrors this shape over the
+/// `kchat:status` IPC channel; adding a field here is a breaking
+/// change at the IPC boundary.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct KChatStatusReport {
-    /// One of `connected` (local IPC publisher with a healthy
-    /// heartbeat), `disconnected` (in-memory fallback, no instance
-    /// discovered), or `reconnecting` (we have a publisher but the
-    /// last heartbeat failed).
+    /// One of `connected` (the Electron host has signalled the
+    /// loopback API is live via
+    /// [`KChatState::mark_loopback_active`] and the integration is
+    /// enabled), or `disconnected` (no loopback signal and / or
+    /// disabled). The intermediate `reconnecting` state from Phase
+    /// 12 is gone — there is no transport to reconnect.
     pub state: String,
-    /// Concrete publisher kind currently in use — `local_ipc` or
-    /// `in_memory`. Surfaced so the Settings page can show "Connected
-    /// to KChat Desktop X.Y.Z" vs "Local-only fallback".
+    /// Publisher kind currently in use — `loopback_http` when the
+    /// Electron host has surfaced the loopback API to this
+    /// process, or `in_memory` for tests / CLI runs / journey
+    /// tests. Surfaced so the Settings page can show
+    /// "Loopback HTTP API on 127.0.0.1:N" vs "Local-only fallback".
     pub publisher_kind: String,
-    /// Discovered instance info, if any.
-    pub instance: Option<KChatInstanceInfo>,
+    /// Phase 12 carried discovery info here (socket path, version,
+    /// health). In Phase 15 the loopback-API snapshot lives in the
+    /// Electron main process, so this field is always `None` on the
+    /// Rust side. The renderer reads the loopback snapshot via the
+    /// `kchat:status` IPC channel directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<serde_json::Value>,
     /// Per-project KChat thread the active project routes publishes
     /// and review-comment ingestion to. Mirrors
     /// [`KChatConfig::default_thread_id`] from the open project's
@@ -60,9 +88,27 @@ pub struct KChatStatusReport {
     ///
     /// `None` either means no project is open yet or the open
     /// project hasn't picked a thread — callers fall back to
-    /// [`aec_core::DEFAULT_THREAD_ID`] (the publisher-side default).
+    /// [`aec_core::DEFAULT_THREAD_ID`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_thread_id: Option<String>,
+    /// Master enable switch mirroring
+    /// [`aec_core::kchat_config::KChatConfig::enabled`]. The
+    /// Electron `kchat:publish` IPC handler reads this through
+    /// `BridgeService::kchat_is_enabled` *before* enqueueing into
+    /// the loopback HTTP queue and refuses the publish with a
+    /// structured `disabled` error when `false`. Surfaced through
+    /// the status payload so the renderer's Settings card and
+    /// status chip stay in sync with the bridge without an extra
+    /// IPC roundtrip. The Rust-side default is `true` (matches
+    /// `KChatConfig::default`); per-project manifests overwrite it
+    /// via [`KChatState::apply_project_config`] and the Settings
+    /// toggle drives it via [`KChatState::set_enabled`].
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 pub struct KChatState {
@@ -76,77 +122,50 @@ impl std::fmt::Debug for KChatState {
         let inner = self.inner.read().expect("kchat state not poisoned");
         f.debug_struct("KChatState")
             .field("publisher_kind", &inner.publisher_kind)
-            .field("instance_present", &inner.discovered.is_some())
             .field("state", &inner.last_status.state)
             .finish_non_exhaustive()
     }
 }
 
 struct Inner {
-    /// Trait-object handle used by [`KChatState::publish`]. Always
-    /// present; the concrete type is either `LocalIpcPublisher` (when
-    /// `local_ipc` is Some) or `InMemoryPublisher`.
+    /// Always an `InMemoryPublisher` in Phase 15 — the loopback API
+    /// publisher lives in the Electron main process and is not
+    /// reachable from `aec_bridge`. The trait object is kept so the
+    /// `publish` method stays generic in case a future phase wires a
+    /// Rust-side HTTP client to the loopback API.
     publisher: Arc<dyn KChatPublisher + Send + Sync>,
-    /// Concrete LocalIpcPublisher reference, present iff the
-    /// `publisher_kind` is `LocalIpc`. Kept alongside the trait
-    /// object so `ingest_reviews` (which isn't on the trait) can
-    /// reach the concrete type without an unsafe downcast.
-    local_ipc: Option<Arc<LocalIpcPublisher>>,
     publisher_kind: PublisherKind,
     last_status: KChatStatusReport,
-    /// Cached discovery info — refreshed by `status()` calls so the
-    /// UI can poll cheaply without re-probing every tick.
-    discovered: Option<KChatInstanceInfo>,
-    /// Phase 12 Task 30 — master enable switch mirroring
-    /// [`aec_core::kchat_config::KChatConfig::enabled`]. When `false`
-    /// every publish / ingest call returns
-    /// [`KChatError::Disabled`] *before* touching the transport, so
-    /// "disable KChat" in Settings is a hard refusal and not a silent
-    /// noop.
+    /// Master enable switch mirroring
+    /// [`aec_core::kchat_config::KChatConfig::enabled`]. When
+    /// `false` every publish / ingest call returns
+    /// [`KChatError::Disabled`] *before* touching the publisher.
     enabled: bool,
     /// Cached per-project thread id mirroring
     /// [`KChatConfig::default_thread_id`] from the currently open
-    /// project's manifest. Refreshed by [`KChatState::apply_project_config`]
-    /// on each `project_open` / `project_save` so the renderer's
-    /// status poll surfaces the right thread the moment a project is
-    /// active. `None` outside of an open project (or when the
-    /// project chose to leave `default_thread_id` unset).
+    /// project's manifest. Refreshed by
+    /// [`KChatState::apply_project_config`] on each `project_open`
+    /// / `project_save` so the renderer's status poll surfaces the
+    /// right thread the moment a project is active. `None` outside
+    /// of an open project (or when the project chose to leave
+    /// `default_thread_id` unset).
     default_thread_id: Option<String>,
-    /// Monotonic timestamp of the most recent
-    /// [`KChatDiscovery::probe_with_timeout`] attempt from the
-    /// `status()` path. Used to throttle re-probes to at most once
-    /// every [`PROBE_COOLDOWN`] so the renderer's 5 s poll doesn't
-    /// block the N-API thread for 200 ms on every tick when KChat
-    /// Desktop isn't installed — particularly on Windows where
-    /// `socket_exists` cannot short-circuit via `path.exists()` and
-    /// every probe goes to a full connect timeout.
-    last_probe_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PublisherKind {
     InMemory,
-    LocalIpc,
+    LoopbackHttp,
 }
 
 impl PublisherKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::InMemory => "in_memory",
-            Self::LocalIpc => "local_ipc",
+            Self::LoopbackHttp => "loopback_http",
         }
     }
 }
-
-/// Minimum interval between consecutive re-probes on the
-/// disconnected path. On macOS/Linux `path.exists()` returns
-/// `false` instantly when the socket file doesn't exist, but on
-/// Windows `KChatDiscovery::socket_exists` always returns `true`
-/// (no filesystem entry for named pipes) so every probe blocks
-/// for the full 200 ms connect timeout. Throttling to once per
-/// 30 s keeps the worst-case Windows-with-no-KChat cost at
-/// ~0.67 % of the N-API thread instead of 4 %.
-const PROBE_COOLDOWN: Duration = Duration::from_secs(30);
 
 impl Default for KChatState {
     fn default() -> Self {
@@ -155,54 +174,22 @@ impl Default for KChatState {
 }
 
 impl KChatState {
-    /// Build a fresh state object. Runs discovery once; if it
-    /// succeeds the state holds a [`LocalIpcPublisher`], otherwise
-    /// it falls back to an [`InMemoryPublisher`].
+    /// Build a fresh state object. The Rust-side publisher is
+    /// always an [`InMemoryPublisher`] in Phase 15 — the Electron
+    /// host promotes the kind to `loopback_http` via
+    /// [`Self::mark_loopback_active`] after the loopback API has
+    /// bound on `127.0.0.1`.
     pub fn new() -> Self {
-        let inner = Inner::detect_and_build();
         Self {
-            inner: RwLock::new(inner),
+            inner: RwLock::new(Inner::initial()),
         }
     }
 
-    /// Snapshot the current connection status.
-    ///
-    /// When the state is already "connected" (a live
-    /// [`LocalIpcPublisher`] is installed and the last discovery
-    /// returned `Some(_)`), this takes only a read-lock — it does
-    /// NOT re-probe the IPC socket. Crash detection for an
-    /// already-connected instance flows through the publisher
-    /// itself: [`Self::publish`] downgrades to the in-memory
-    /// fallback on a [`KChatError::Transport`] result, which flips
-    /// the cached state to "disconnected" and re-enables probing.
-    ///
-    /// When the state is "disconnected" (or the cached publisher is
-    /// in-memory because boot-time discovery returned `None`), this
-    /// re-runs [`KChatDiscovery::probe_with_timeout`] so the
-    /// renderer's poll picks up newly started KChat Desktop
-    /// instances without restarting AEC Studio. The probe is capped
-    /// at 200 ms (socket connect + ping) and further throttled by
-    /// [`PROBE_COOLDOWN`] (30 s) so the worst-case cost on Windows
-    /// (where `socket_exists` cannot short-circuit) is one 200 ms
-    /// block per 30 s rather than per 5 s poll. The steady-state
-    /// renderer poll (every 5 s while connected) costs only a
-    /// read-lock acquire.
+    /// Snapshot the current connection status. Cheap read-only
+    /// access — no I/O, no socket probes (there is no socket in
+    /// Phase 15). The renderer's 5 s status poll therefore costs
+    /// only a read-lock acquire.
     pub fn status(&self) -> KChatStatusReport {
-        // Fast path: read-lock only. We re-probe iff we're currently
-        // disconnected AND the probe cooldown has elapsed — see the
-        // doc comment for why connected sessions don't need a
-        // periodic probe, and `PROBE_COOLDOWN` for why we throttle
-        // disconnected ones.
-        let needs_refresh = {
-            let inner = self.inner.read().expect("kchat state not poisoned");
-            inner.last_status.state == "disconnected"
-                && inner
-                    .last_probe_at
-                    .map_or(true, |t| t.elapsed() >= PROBE_COOLDOWN)
-        };
-        if needs_refresh {
-            self.refresh_status();
-        }
         self.inner
             .read()
             .expect("kchat state not poisoned")
@@ -210,50 +197,56 @@ impl KChatState {
             .clone()
     }
 
-    /// Re-run discovery and rebuild the publisher accordingly. Used
-    /// by Settings "Reload KChat connection".
-    ///
-    /// **Preserves per-project state across the reload.** "Reload"
-    /// is a *transport* operation — the user is telling us to
-    /// re-discover the KChat Desktop socket — so it must not
-    /// silently drop properties that belong to the *open project*:
-    ///
-    /// - [`Inner::default_thread_id`] — the per-project review
-    ///   thread, populated by [`Self::apply_project_config`] when a
-    ///   project is opened. If we dropped this, the Deliver page
-    ///   would silently fall back to the publisher-side
-    ///   `kchat-default` constant until the next `project_open`
-    ///   fired (which never happens — projects only open when the
-    ///   user explicitly picks one).
-    /// - [`Inner::enabled`] — the master toggle, also mirrored from
-    ///   the open project's [`KChatConfig`]. Resetting this to
-    ///   `true` on reload would re-enable publishes that the
-    ///   project explicitly disabled.
-    ///
-    /// We snapshot both fields before swapping the publisher, then
-    /// reapply them onto the freshly built `Inner`. The renderer's
-    /// next `status()` poll will therefore see the new publisher
-    /// kind but the same `default_thread_id` and `enabled` it had
-    /// before reload.
+    /// Re-emit the cached status report. Phase 12 used this to
+    /// re-run socket discovery and rebuild the publisher; Phase 15
+    /// has no transport to rebuild, so this returns the current
+    /// snapshot unchanged. The Settings page's "Reload KChat
+    /// connection" button still calls through to this method so the
+    /// IPC contract stays stable; on the Electron side, the
+    /// `kchat:reload` IPC handler also re-emits the loopback
+    /// snapshot rather than restarting the HTTP server.
     pub fn reload(&self) -> KChatStatusReport {
-        let mut inner = self.inner.write().expect("kchat state not poisoned");
-        let preserved_thread = inner.default_thread_id.clone();
-        let preserved_enabled = inner.enabled;
-        let mut rebuilt = Inner::detect_and_build();
-        rebuilt
-            .last_status
-            .default_thread_id
-            .clone_from(&preserved_thread);
-        rebuilt.default_thread_id = preserved_thread;
-        rebuilt.enabled = preserved_enabled;
-        *inner = rebuilt;
-        inner.last_status.clone()
+        self.status()
     }
 
-    /// Publish an artifact card through whichever publisher is
-    /// currently active. Returns [`KChatError::Disabled`] *before*
-    /// touching the transport when the integration has been disabled
-    /// via [`Self::set_enabled`] (Phase 12 Task 30).
+    /// Promote the publisher kind to `loopback_http`. Called by the
+    /// Electron host once `kchatLocalApi` has bound on `127.0.0.1`
+    /// and written the port file. Demoting back to `in_memory` is
+    /// done via [`Self::mark_loopback_inactive`] (e.g. on Electron
+    /// shutdown).
+    ///
+    /// Idempotent — repeated calls with the same state are no-ops.
+    pub fn mark_loopback_active(&self) {
+        let mut inner = self.inner.write().expect("kchat state not poisoned");
+        if inner.publisher_kind == PublisherKind::LoopbackHttp {
+            return;
+        }
+        inner.publisher_kind = PublisherKind::LoopbackHttp;
+        inner.last_status.publisher_kind = PublisherKind::LoopbackHttp.as_str().into();
+        inner.last_status.state = if inner.enabled {
+            "connected".into()
+        } else {
+            "disconnected".into()
+        };
+    }
+
+    /// Demote the publisher kind back to `in_memory`. Called by the
+    /// Electron host on shutdown so the next status snapshot
+    /// surfaces the headless state honestly.
+    pub fn mark_loopback_inactive(&self) {
+        let mut inner = self.inner.write().expect("kchat state not poisoned");
+        if inner.publisher_kind == PublisherKind::InMemory {
+            return;
+        }
+        inner.publisher_kind = PublisherKind::InMemory;
+        inner.last_status.publisher_kind = PublisherKind::InMemory.as_str().into();
+        inner.last_status.state = "disconnected".into();
+    }
+
+    /// Publish an artifact card through the in-process publisher.
+    /// Returns [`KChatError::Disabled`] *before* touching the
+    /// publisher when the integration has been disabled via
+    /// [`Self::set_enabled`] or via the project manifest.
     pub fn publish(&self, card: ArtifactCard) -> Result<PublishResult, KChatError> {
         let publisher = {
             let inner = self.inner.read().expect("kchat state not poisoned");
@@ -262,88 +255,50 @@ impl KChatState {
             }
             Arc::clone(&inner.publisher)
         };
-        let result = publisher.publish(card);
-        // A transport failure on the local IPC path likely means
-        // KChat Desktop crashed; downgrade to in-memory fallback so
-        // the renderer's status indicator shows "disconnected"
-        // immediately rather than waiting for the next status poll.
-        if matches!(&result, Err(KChatError::Transport(_))) {
-            self.downgrade_to_fallback();
-        }
-        result
+        publisher.publish(card)
     }
 
-    /// Poll new review comments. Only meaningful when the local IPC
-    /// publisher is active; the in-memory fallback returns
-    /// `(vec![], vec![])` so the renderer's poll loop is a no-op.
+    /// Poll new review comments. In Phase 15 the Rust-side
+    /// publisher is always in-memory; review-comment ingestion is
+    /// driven by the Electron loopback API (which the `.kcz`
+    /// extension feeds from KChat Desktop). This method therefore
+    /// always returns `(vec![], vec![])` once the disabled-state
+    /// check has cleared.
     pub fn ingest_reviews(
         &self,
-        thread_id: &str,
-        since_iso: Option<String>,
+        _thread_id: &str,
+        _since_iso: Option<String>,
     ) -> Result<(Vec<ReviewComment>, Vec<ReviewCard>), KChatError> {
-        let local = {
-            let inner = self.inner.read().expect("kchat state not poisoned");
-            if !inner.enabled {
-                return Err(KChatError::Disabled);
-            }
-            inner.local_ipc.as_ref().map(Arc::clone)
-        };
-        match local {
-            Some(p) => p.ingest_reviews(thread_id.to_string(), since_iso),
-            None => Ok((Vec::new(), Vec::new())),
+        let inner = self.inner.read().expect("kchat state not poisoned");
+        if !inner.enabled {
+            return Err(KChatError::Disabled);
         }
+        Ok((Vec::new(), Vec::new()))
     }
 
-    fn refresh_status(&self) {
-        let mut inner = self.inner.write().expect("kchat state not poisoned");
-        inner.last_probe_at = Some(Instant::now());
-        // Re-run discovery cheaply (200 ms timeout).
-        let probed = KChatDiscovery::probe_with_timeout(Duration::from_millis(200));
-        inner.discovered.clone_from(&probed);
-        let state_str = match (inner.publisher_kind, &probed) {
-            (PublisherKind::LocalIpc, Some(_)) => "connected",
-            (PublisherKind::LocalIpc, None) => "reconnecting",
-            (PublisherKind::InMemory, Some(_)) => "reconnecting",
-            (PublisherKind::InMemory, None) => "disconnected",
-        };
-        inner.last_status = KChatStatusReport {
-            state: state_str.into(),
-            publisher_kind: inner.publisher_kind.as_str().into(),
-            instance: probed,
-            default_thread_id: inner.default_thread_id.clone(),
-        };
-    }
-
-    fn downgrade_to_fallback(&self) {
-        let mut inner = self.inner.write().expect("kchat state not poisoned");
-        if inner.publisher_kind == PublisherKind::InMemory {
-            return;
-        }
-        inner.publisher = Arc::new(InMemoryPublisher::new("aecstudio-fallback"));
-        inner.local_ipc = None;
-        inner.publisher_kind = PublisherKind::InMemory;
-        inner.last_status = KChatStatusReport {
-            state: "disconnected".into(),
-            publisher_kind: PublisherKind::InMemory.as_str().into(),
-            instance: inner.discovered.clone(),
-            default_thread_id: inner.default_thread_id.clone(),
-        };
-    }
-
-    /// Phase 12 Task 30 — master enable / disable switch. Setting
-    /// this to `false` causes every subsequent [`Self::publish`] and
+    /// Master enable / disable switch. Setting this to `false`
+    /// causes every subsequent [`Self::publish`] and
     /// [`Self::ingest_reviews`] call to return
-    /// [`KChatError::Disabled`] without touching the transport.
+    /// [`KChatError::Disabled`] without touching the publisher.
     /// Idempotent — flipping back to `true` resumes through the
     /// already-installed publisher.
     pub fn set_enabled(&self, enabled: bool) {
         let mut inner = self.inner.write().expect("kchat state not poisoned");
         inner.enabled = enabled;
+        inner.last_status.enabled = enabled;
+        // The cached state string follows the enabled flag so the
+        // renderer's chip flips to "disconnected" the moment a
+        // project disables KChat, without waiting for the next
+        // status poll to re-derive it.
+        inner.last_status.state = match (inner.enabled, inner.publisher_kind) {
+            (true, PublisherKind::LoopbackHttp) => "connected".into(),
+            _ => "disconnected".into(),
+        };
     }
 
-    /// Mirror of [`Self::set_enabled`] — useful for the Settings page
-    /// to reflect the current toggle state without re-reading from
-    /// the underlying project config.
+    /// Mirror of [`Self::set_enabled`] — useful for the Settings
+    /// page to reflect the current toggle state without re-reading
+    /// from the underlying project config.
     pub fn is_enabled(&self) -> bool {
         self.inner.read().expect("kchat state not poisoned").enabled
     }
@@ -360,8 +315,8 @@ impl KChatState {
     ///   bit [`Self::set_enabled`] flips; we route through both so
     ///   the Settings toggle and project-open both converge on the
     ///   same observable state.
-    /// - `default_thread_id` — cached so [`Self::status`] surfaces it
-    ///   to the renderer. The Deliver page's review panel reads
+    /// - `default_thread_id` — cached so [`Self::status`] surfaces
+    ///   it to the renderer. The Deliver page's review panel reads
     ///   this field and falls back to the publisher-side default
     ///   only when it's `None`.
     ///
@@ -370,6 +325,7 @@ impl KChatState {
     pub fn apply_project_config(&self, config: &KChatConfig) {
         let mut inner = self.inner.write().expect("kchat state not poisoned");
         inner.enabled = config.enabled;
+        inner.last_status.enabled = config.enabled;
         inner
             .default_thread_id
             .clone_from(&config.default_thread_id);
@@ -377,6 +333,10 @@ impl KChatState {
             .last_status
             .default_thread_id
             .clone_from(&config.default_thread_id);
+        inner.last_status.state = match (inner.enabled, inner.publisher_kind) {
+            (true, PublisherKind::LoopbackHttp) => "connected".into(),
+            _ => "disconnected".into(),
+        };
     }
 
     /// Drop any per-project state cached from a prior
@@ -394,7 +354,7 @@ impl KChatState {
     /// Mirror of [`KChatConfig::default_thread_id`] for the
     /// currently open project. Returned by [`Self::status`] as
     /// `default_thread_id`; exposed separately so tests can assert
-    /// without re-running the discovery probe in `status()`.
+    /// without re-running discovery.
     pub fn default_thread_id(&self) -> Option<String> {
         self.inner
             .read()
@@ -404,91 +364,40 @@ impl KChatState {
     }
 
     /// Test helper — force the state into an in-memory publisher
-    /// pointed at the supplied origin tag.
+    /// pointed at the supplied origin tag. Kept under `__test_`
+    /// so it's clearly out of the public API surface.
     #[doc(hidden)]
     pub fn __test_force_in_memory(&self, origin: &str) {
         let mut inner = self.inner.write().expect("kchat state not poisoned");
         inner.publisher = Arc::new(InMemoryPublisher::new(origin));
-        inner.local_ipc = None;
         inner.publisher_kind = PublisherKind::InMemory;
+        let enabled = inner.enabled;
         inner.last_status = KChatStatusReport {
             state: "disconnected".into(),
             publisher_kind: PublisherKind::InMemory.as_str().into(),
             instance: None,
             default_thread_id: inner.default_thread_id.clone(),
-        };
-        inner.discovered = None;
-    }
-
-    /// Test helper — install a `LocalIpcPublisher` targeted at a
-    /// caller-supplied socket path so phase-7 e2e tests can drive
-    /// the full IPC path against a mock socket server.
-    #[doc(hidden)]
-    pub fn __test_force_local_ipc(&self, socket_path: std::path::PathBuf) {
-        let publisher_local = Arc::new(LocalIpcPublisher::with_socket_timeout(
-            socket_path.clone(),
-            DEFAULT_IO_TIMEOUT,
-        ));
-        let mut inner = self.inner.write().expect("kchat state not poisoned");
-        inner.publisher = Arc::clone(&publisher_local) as Arc<dyn KChatPublisher + Send + Sync>;
-        inner.local_ipc = Some(publisher_local);
-        inner.publisher_kind = PublisherKind::LocalIpc;
-        let info = KChatInstanceInfo {
-            socket_path,
-            version: "test-fixture".into(),
-            health: "connected".into(),
-        };
-        inner.discovered = Some(info.clone());
-        inner.last_status = KChatStatusReport {
-            state: "connected".into(),
-            publisher_kind: PublisherKind::LocalIpc.as_str().into(),
-            instance: Some(info),
-            default_thread_id: inner.default_thread_id.clone(),
+            enabled,
         };
     }
 }
 
 impl Inner {
-    fn detect_and_build() -> Self {
-        if let Some(info) = KChatDiscovery::probe_with_timeout(Duration::from_millis(200)) {
-            let publisher_local = Arc::new(LocalIpcPublisher::with_socket_timeout(
-                info.socket_path.clone(),
-                DEFAULT_IO_TIMEOUT,
-            ));
-            let publisher: Arc<dyn KChatPublisher + Send + Sync> =
-                Arc::clone(&publisher_local) as Arc<dyn KChatPublisher + Send + Sync>;
-            return Self {
-                publisher,
-                local_ipc: Some(publisher_local),
-                publisher_kind: PublisherKind::LocalIpc,
-                last_status: KChatStatusReport {
-                    state: "connected".into(),
-                    publisher_kind: PublisherKind::LocalIpc.as_str().into(),
-                    instance: Some(info.clone()),
-                    default_thread_id: None,
-                },
-                discovered: Some(info),
-                enabled: true,
-                default_thread_id: None,
-                last_probe_at: None,
-            };
-        }
+    fn initial() -> Self {
         let publisher: Arc<dyn KChatPublisher + Send + Sync> =
             Arc::new(InMemoryPublisher::new("aecstudio-fallback"));
         Self {
             publisher,
-            local_ipc: None,
             publisher_kind: PublisherKind::InMemory,
             last_status: KChatStatusReport {
                 state: "disconnected".into(),
                 publisher_kind: PublisherKind::InMemory.as_str().into(),
                 instance: None,
                 default_thread_id: None,
+                enabled: true,
             },
-            discovered: None,
             enabled: true,
             default_thread_id: None,
-            last_probe_at: None,
         }
     }
 }
@@ -508,52 +417,136 @@ mod tests {
         }
     }
 
+    /// A fresh state must report the in-memory fallback (no
+    /// Electron host has signalled the loopback API yet).
     #[test]
-    fn default_falls_back_to_in_memory_publisher_when_no_kchat_running() {
-        // Make sure the test env has no real socket pointed at it.
-        std::env::remove_var(aec_core::kchat_discovery::KCHAT_SOCKET_PATH_ENV);
+    fn default_starts_in_memory_until_loopback_marks_active() {
         let st = KChatState::new();
         let s = st.status();
-        // On a CI box there is no KChat Desktop, so the publisher
-        // must be in-memory.
         assert_eq!(s.publisher_kind, "in_memory");
+        assert_eq!(s.state, "disconnected");
+        assert!(s.instance.is_none());
+        // Default starts enabled; the Settings toggle / per-project
+        // config flip this off explicitly. The Electron
+        // `kchat:publish` handler reads this field through the
+        // status payload to gate enqueue decisions, so an
+        // unintentional default of `false` would break publishing
+        // on every fresh install.
+        assert!(s.enabled);
+    }
+
+    /// The `enabled` field on the status payload must follow
+    /// [`KChatState::set_enabled`] so the Electron `kchat:publish`
+    /// gate observes the same flag the Settings toggle just
+    /// flipped without a per-call bridge round-trip.
+    #[test]
+    fn status_enabled_field_follows_set_enabled() {
+        let st = KChatState::new();
+        assert!(st.status().enabled);
+        st.set_enabled(false);
+        assert!(!st.status().enabled);
+        st.set_enabled(true);
+        assert!(st.status().enabled);
+    }
+
+    /// `apply_project_config` adopts the manifest's `enabled` flag
+    /// *and* mirrors it onto the status payload so a fresh
+    /// `project_open` flips the renderer's chip without waiting
+    /// for the next 5 s status poll.
+    #[test]
+    fn apply_project_config_mirrors_enabled_onto_status() {
+        let st = KChatState::new();
+        st.mark_loopback_active();
+        let mut cfg = KChatConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        st.apply_project_config(&cfg);
+        let s = st.status();
+        assert!(!s.enabled);
+        assert_eq!(s.state, "disconnected");
+
+        cfg.enabled = true;
+        st.apply_project_config(&cfg);
+        let s = st.status();
+        assert!(s.enabled);
+        assert_eq!(s.state, "connected");
+    }
+
+    /// `mark_loopback_active` promotes the kind to `loopback_http`
+    /// and flips the connection state to `connected` when the
+    /// integration is enabled.
+    #[test]
+    fn mark_loopback_active_promotes_status_when_enabled() {
+        let st = KChatState::new();
+        st.mark_loopback_active();
+        let s = st.status();
+        assert_eq!(s.publisher_kind, "loopback_http");
+        assert_eq!(s.state, "connected");
+    }
+
+    /// When the integration is disabled, even an active loopback
+    /// API must still report `disconnected` so the renderer's chip
+    /// honestly reflects "publishes are refused" rather than
+    /// "online".
+    #[test]
+    fn disabled_overrides_loopback_active_state() {
+        let st = KChatState::new();
+        st.mark_loopback_active();
+        st.set_enabled(false);
+        let s = st.status();
+        assert_eq!(s.publisher_kind, "loopback_http");
         assert_eq!(s.state, "disconnected");
     }
 
+    /// Re-emitting status without a loopback signal must continue
+    /// to report `in_memory` — `reload` is a no-op now that there
+    /// is no socket transport to rebuild.
+    #[test]
+    fn reload_is_a_noop_in_phase_15() {
+        let st = KChatState::new();
+        let before = st.status();
+        let after = st.reload();
+        assert_eq!(before, after);
+    }
+
+    /// In-memory publish always succeeds when enabled.
     #[test]
     fn in_memory_publisher_round_trips() {
-        std::env::remove_var(aec_core::kchat_discovery::KCHAT_SOCKET_PATH_ENV);
         let st = KChatState::new();
         let r = st.publish(card()).expect("in-memory publish never fails");
         assert!(!r.message_id.is_empty());
     }
 
+    /// Disabled state refuses publishes before touching the
+    /// publisher.
     #[test]
-    fn ingest_returns_empty_for_in_memory_kind() {
-        std::env::remove_var(aec_core::kchat_discovery::KCHAT_SOCKET_PATH_ENV);
+    fn disabled_state_refuses_publish_without_touching_publisher() {
+        let st = KChatState::new();
+        st.set_enabled(false);
+        let err = st
+            .publish(card())
+            .expect_err("disabled publisher must refuse");
+        assert!(matches!(err, KChatError::Disabled));
+    }
+
+    /// Ingest always returns empty in Phase 15 — review comments
+    /// flow through the Electron loopback API, not the Rust state.
+    #[test]
+    fn ingest_returns_empty_in_phase_15() {
         let st = KChatState::new();
         let (c, k) = st.ingest_reviews("any-thread", None).unwrap();
         assert!(c.is_empty());
         assert!(k.is_empty());
     }
 
-    /// `apply_project_config` must propagate
-    /// [`KChatConfig::default_thread_id`] to both the cached
-    /// `default_thread_id` and the next `status()` snapshot so the
-    /// renderer's poll surfaces the per-project thread on the very
-    /// next tick.
+    /// `apply_project_config` propagates the thread id and the
+    /// enabled flag to the next status snapshot.
     #[test]
     fn apply_project_config_threads_through_status_payload() {
-        std::env::remove_var(aec_core::kchat_discovery::KCHAT_SOCKET_PATH_ENV);
         let st = KChatState::new();
-        assert!(
-            st.default_thread_id().is_none(),
-            "fresh state must have no per-project thread"
-        );
-        assert!(
-            st.status().default_thread_id.is_none(),
-            "status payload must mirror cached state"
-        );
+        assert!(st.default_thread_id().is_none());
+        assert!(st.status().default_thread_id.is_none());
 
         st.apply_project_config(&KChatConfig::enabled_with_thread("project-thread-xyz"));
         assert_eq!(
@@ -562,19 +555,15 @@ mod tests {
         );
         let s = st.status();
         assert_eq!(s.default_thread_id, Some("project-thread-xyz".to_string()));
-        assert!(
-            st.is_enabled(),
-            "applying an enabled config must enable publishes"
-        );
+        assert!(st.is_enabled());
     }
 
-    /// Reopening a project that omitted `default_thread_id` must
+    /// Opening a project that omitted `default_thread_id` must
     /// clear the previously cached value so the renderer falls
     /// back to its `kchat-default` constant instead of continuing
     /// to read from the prior project's thread.
     #[test]
     fn apply_project_config_clears_stale_thread_when_new_config_omits_it() {
-        std::env::remove_var(aec_core::kchat_discovery::KCHAT_SOCKET_PATH_ENV);
         let st = KChatState::new();
         st.apply_project_config(&KChatConfig::enabled_with_thread("first-thread"));
         assert_eq!(st.default_thread_id(), Some("first-thread".to_string()));
@@ -584,12 +573,10 @@ mod tests {
         assert!(st.status().default_thread_id.is_none());
     }
 
-    /// `clear_project_config` is the explicit "close project" hook;
-    /// it must drop the cached thread regardless of whether a
-    /// project was previously opened.
+    /// `clear_project_config` drops the cached thread regardless
+    /// of whether a project was previously opened.
     #[test]
     fn clear_project_config_drops_cached_thread() {
-        std::env::remove_var(aec_core::kchat_discovery::KCHAT_SOCKET_PATH_ENV);
         let st = KChatState::new();
         st.apply_project_config(&KChatConfig::enabled_with_thread("to-be-cleared"));
         assert!(st.default_thread_id().is_some());
@@ -598,95 +585,16 @@ mod tests {
         assert!(st.status().default_thread_id.is_none());
     }
 
-    /// "Reload KChat connection" is a transport operation — it must
-    /// re-run discovery + rebuild the publisher, but it must NOT
-    /// silently drop the per-project `default_thread_id` or reset
-    /// the project's `enabled` toggle. Both of those properties
-    /// belong to the open project, not the transport, and would
-    /// otherwise vanish until the next `project_open` (which only
-    /// fires when the user explicitly picks a project).
+    /// `mark_loopback_inactive` demotes the kind back to in-memory
+    /// on Electron shutdown.
     #[test]
-    fn reload_preserves_project_default_thread_and_enabled_toggle() {
-        std::env::remove_var(aec_core::kchat_discovery::KCHAT_SOCKET_PATH_ENV);
+    fn mark_loopback_inactive_demotes_to_in_memory() {
         let st = KChatState::new();
-        // Apply a project that picked a custom thread and disabled
-        // KChat publishes (e.g. an offline-only project).
-        let mut cfg = KChatConfig::enabled_with_thread("preserved-thread");
-        cfg.enabled = false;
-        st.apply_project_config(&cfg);
-        assert_eq!(st.default_thread_id(), Some("preserved-thread".to_string()));
-        assert!(!st.is_enabled());
-
-        // User clicks "Reload" in Settings. The transport rebuilds,
-        // but the project-scoped state must survive.
-        let s = st.reload();
-        assert_eq!(
-            s.default_thread_id,
-            Some("preserved-thread".to_string()),
-            "reload must not drop the per-project thread"
-        );
-        assert_eq!(
-            st.default_thread_id(),
-            Some("preserved-thread".to_string()),
-            "cached default_thread_id must also survive reload"
-        );
-        assert!(
-            !st.is_enabled(),
-            "reload must not re-enable a project that disabled publishes"
-        );
-    }
-
-    /// Even after the publisher transparently downgrades to the
-    /// in-memory fallback, the per-project thread id must survive
-    /// because it's a property of the open project, not the
-    /// transport.
-    #[test]
-    fn downgrade_to_fallback_preserves_default_thread_id() {
-        std::env::remove_var(aec_core::kchat_discovery::KCHAT_SOCKET_PATH_ENV);
-        let st = KChatState::new();
-        st.apply_project_config(&KChatConfig::enabled_with_thread("survive-downgrade"));
-        // The `__test_force_in_memory` helper rewrites
-        // `last_status` directly, mirroring the downgrade path;
-        // we still expect the cached `default_thread_id` to win.
-        st.__test_force_in_memory("forced-origin");
-        assert_eq!(
-            st.status().default_thread_id,
-            Some("survive-downgrade".to_string())
-        );
-    }
-
-    /// The probe cooldown prevents `status()` from blocking the
-    /// N-API thread with a 200 ms connect attempt on every 5 s
-    /// renderer poll when KChat Desktop isn't installed. After
-    /// the first probe, subsequent calls within [`PROBE_COOLDOWN`]
-    /// must return the cached snapshot without re-running discovery.
-    #[test]
-    fn status_cooldown_prevents_rapid_reprobes() {
-        std::env::remove_var(aec_core::kchat_discovery::KCHAT_SOCKET_PATH_ENV);
-        let st = KChatState::new();
-        // First call triggers a probe (last_probe_at is None).
-        let s1 = st.status();
-        assert_eq!(s1.state, "disconnected");
-        // Record the probe timestamp.
-        let probe_ts = st
-            .inner
-            .read()
-            .expect("not poisoned")
-            .last_probe_at
-            .expect("first status() must set last_probe_at");
-        // Second call within the cooldown must NOT update the
-        // timestamp — i.e. no re-probe happened.
-        let s2 = st.status();
-        assert_eq!(s2.state, "disconnected");
-        let probe_ts2 = st
-            .inner
-            .read()
-            .expect("not poisoned")
-            .last_probe_at
-            .expect("still set");
-        assert_eq!(
-            probe_ts, probe_ts2,
-            "second status() within cooldown must reuse cached probe"
-        );
+        st.mark_loopback_active();
+        assert_eq!(st.status().publisher_kind, "loopback_http");
+        st.mark_loopback_inactive();
+        let s = st.status();
+        assert_eq!(s.publisher_kind, "in_memory");
+        assert_eq!(s.state, "disconnected");
     }
 }

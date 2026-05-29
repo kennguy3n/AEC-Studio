@@ -1,0 +1,54 @@
+{
+  "manifestVersion": 1,
+  "identity": {
+    "id": "com.aecstudio.kchat-bridge",
+    "name": "AEC Studio",
+    "version": "0.1.0",
+    "description": "Surfaces AEC Studio's artifact publish queue inside KChat Desktop and ingests review-thread comments back into AEC Studio over its loopback HTTP API.",
+    "publisher": {
+      "name": "AEC Studio",
+      "homepage": "https://github.com/kennguy3n/AEC-Studio"
+    }
+  },
+  "permissions": {
+    "procedures": [
+      {
+        "id": "kchat.query_messages",
+        "category": "read",
+        "rationale": "Read the review-thread messages the user opted in to share with AEC Studio so the bridge can mirror them back as ReviewComment rows on the Deliver page."
+      },
+      {
+        "id": "kchat.query_conversations",
+        "category": "read",
+        "rationale": "Enumerate conversations so the publish panel can show which thread the active project will publish into."
+      },
+      {
+        "id": "kchat.send_message",
+        "category": "write",
+        "rationale": "Post a queued AEC Studio artifact card (deliver-pack share, render bundle, BIM export) into the user-selected KChat thread."
+      }
+    ]
+  },
+  "views": [
+    {
+      "slotId": "rightbar",
+      "viewId": "aecstudio.publish-panel",
+      "title": "AEC Studio Publish",
+      "icon": "puzzle",
+      "description": "Shows the AEC Studio artifact cards queued for the current thread, with one-click publish and a live count of review comments mirrored back into AEC Studio."
+    }
+  ],
+  "commands": [],
+  "host": {
+    "aecStudioLocalApi": {
+      "portFile": "aec-kchat-port.json",
+      "minAecStudioVersion": "0.15.0"
+    }
+  },
+  "entryPoints": {
+    "main": "dist/index.js",
+    "views": {
+      "aecstudio.publish-panel": "dist/views/publish-panel.js"
+    }
+  }
+}

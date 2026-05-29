@@ -1,0 +1,32 @@
+{
+  "name": "@aecstudio/kchat-extension",
+  "version": "0.1.0",
+  "private": true,
+  "description": "KChat Desktop (.kcz) extension that bridges AEC Studio's publish queue and review-comment ingestion through the AEC Studio loopback HTTP API.",
+  "license": "MIT",
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node --enable-source-maps ./scripts/build.mjs",
+    "build:kcz": "npm run build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --enable-source-maps --test ./scripts/build.test.mjs"
+  },
+  "dependencies": {},
+  "//peerDependencies": "React is injected by the KChat Desktop extension host at activation time (the .kcz model — every extension shares the host's React instance to avoid the two-React-instances hooks bug when contributing views to slots). The peer declaration makes that contract explicit: npm/pnpm/yarn warn if the host doesn't satisfy it, TypeScript and editor tooling find a real module to type-check against, and a future contributor cannot accidentally migrate React into `dependencies` (which would bundle a duplicate copy into the .kcz).",
+  "peerDependencies": {
+    "react": ">=18.0.0",
+    "react-dom": ">=18.0.0"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": false
+    },
+    "react-dom": {
+      "optional": false
+    }
+  },
+  "devDependencies": {
+    "@types/react": "^18.2.0",
+    "@types/react-dom": "^18.2.0",
+    "typescript": "^5.4.5"
+  }
+}

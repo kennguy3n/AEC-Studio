@@ -2704,6 +2704,15 @@ pub struct KChatStatusJs {
     ///
     /// [cfg]: aec_core::kchat_config::KChatConfig
     pub default_thread_id: Option<String>,
+    /// Master enable switch mirroring
+    /// [`aec_core::kchat_config::KChatConfig::enabled`]. The
+    /// Electron `kchat:publish` IPC handler reads this through the
+    /// status payload *before* enqueueing into the loopback HTTP
+    /// queue and refuses the publish when `false`. Exposed via the
+    /// same payload the renderer already polls so the Settings
+    /// toggle and the publish-gate stay in lockstep without a
+    /// per-call bridge round trip.
+    pub enabled: bool,
 }
 
 #[napi(object)]
@@ -2737,6 +2746,15 @@ pub struct KChatIngestResultJs {
 }
 
 fn kchat_status_to_js(rep: crate::kchat_state::KChatStatusReport) -> KChatStatusJs {
+    // Phase 15: the loopback-API snapshot (port, port-file path,
+    // extension heartbeat, queue depth) is owned by the Electron
+    // main process, not by the Rust bridge — so `instance` on the
+    // Rust side is always `None`. The Electron `kchat:status`
+    // IPC handler synthesises the loopback snapshot directly from
+    // `kchatAppState.ts` and bypasses this napi export for the
+    // production path. We still serialise any payload that might
+    // be there (future Rust-side loopback client) for forward
+    // compatibility.
     let instance_json = rep
         .instance
         .as_ref()
@@ -2746,6 +2764,7 @@ fn kchat_status_to_js(rep: crate::kchat_state::KChatStatusReport) -> KChatStatus
         publisher_kind: rep.publisher_kind,
         instance_json,
         default_thread_id: rep.default_thread_id,
+        enabled: rep.enabled,
     }
 }
 
@@ -2758,6 +2777,52 @@ pub fn kchat_status() -> Result<KChatStatusJs> {
 #[napi]
 pub fn kchat_reload() -> Result<KChatStatusJs> {
     let rep = with_service_ref(super::service::BridgeService::kchat_reload)?;
+    Ok(kchat_status_to_js(rep))
+}
+
+/// Flip the master KChat enable switch. When `enabled` is `false`,
+/// subsequent `kchat_publish` / `kchat_ingest_reviews` calls refuse
+/// to touch the publisher (`KChatError::Disabled`). Mirrored onto
+/// the status payload so the Electron-side `kchat:publish` gate and
+/// the renderer's Settings card observe the same flag without a
+/// per-call bridge round trip.
+#[napi]
+pub fn kchat_set_enabled(enabled: bool) -> Result<KChatStatusJs> {
+    let rep = with_service_ref(|svc| {
+        svc.kchat_set_enabled(enabled);
+        svc.kchat_status()
+    })?;
+    Ok(kchat_status_to_js(rep))
+}
+
+/// Read the current value of the master KChat enable switch. Cheap
+/// read-lock on the bridge-side state; exposed separately so the
+/// renderer's Settings card can hydrate its toggle without parsing
+/// the full status payload.
+#[napi]
+pub fn kchat_is_enabled() -> Result<bool> {
+    with_service_ref(super::service::BridgeService::kchat_is_enabled)
+}
+
+/// Phase 15 — Electron host signals that the loopback API has bound
+/// on `127.0.0.1`. Promotes the Rust-side `publisher_kind` marker
+/// to `loopback_http` so any future Rust-side consumer (telemetry,
+/// audit, the in-process journey tests) sees the same kind the
+/// Electron `kchat:status` IPC reports to the renderer. Idempotent;
+/// safe to call on every Electron startup.
+#[napi]
+pub fn kchat_mark_loopback_active() -> Result<KChatStatusJs> {
+    let rep = with_service_ref(super::service::BridgeService::kchat_mark_loopback_active)?;
+    Ok(kchat_status_to_js(rep))
+}
+
+/// Phase 15 — Electron host signals that the loopback API is being
+/// torn down (typically during `app.on("will-quit", ...)`). Demotes
+/// the marker back to `in_memory` so the next snapshot is honest
+/// about the headless state. Idempotent.
+#[napi]
+pub fn kchat_mark_loopback_inactive() -> Result<KChatStatusJs> {
+    let rep = with_service_ref(super::service::BridgeService::kchat_mark_loopback_inactive)?;
     Ok(kchat_status_to_js(rep))
 }
 

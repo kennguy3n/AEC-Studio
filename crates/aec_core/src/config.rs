@@ -40,8 +40,8 @@ pub struct ProjectSettings {
     ///
     /// `None` means “no per-project override” — publishers and the
     /// review panel fall back to their own defaults
-    /// (`local_ipc_publisher::DEFAULT_THREAD_ID` and the renderer’s
-    /// hard-coded `"kchat-default"` constant respectively).
+    /// (`kchat::DEFAULT_THREAD_ID` and the renderer’s hard-coded
+    /// `"kchat-default"` constant respectively).
     #[cfg(feature = "kchat")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kchat: Option<KChatConfig>,

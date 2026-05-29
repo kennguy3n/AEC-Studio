@@ -609,10 +609,15 @@ export interface BridgeBackend {
   // ----- KChat (Phase 12) -----
 
   /**
-   * Current KChat connection status. Returns the publisher kind
-   * (`local_ipc` for a discovered KChat Desktop instance,
-   * `in_memory` for the fallback) and the connection state
-   * (`connected` / `reconnecting` / `disconnected`).
+   * Current KChat connection status. Phase 15 returns the
+   * loopback HTTP API state — server up + bound port + most
+   * recent extension heartbeat — instead of the Phase 12
+   * socket-path probe result.
+   *
+   * `publisherKind` is `loopback_http` when the Electron main
+   * process is hosting the loopback API (the production
+   * arrangement), or `in_memory` for tests / headless builds
+   * where the API was not stood up.
    */
   kchatStatus(): Promise<KChatStatusReport>;
   /** Re-run discovery and rebuild the publisher. */
@@ -624,6 +629,35 @@ export interface BridgeBackend {
     threadId: string;
     sinceIso?: string | null;
   }): Promise<KChatIngestReport>;
+  /**
+   * Flip the bridge-persisted master KChat enable switch.
+   * When `enabled` is `false`, the Electron `kchat:publish` IPC
+   * handler refuses to enqueue into the loopback queue before
+   * touching the publisher; the Rust bridge's
+   * `KChatState::set_enabled` also blocks the in-process publish
+   * path. Returns the fresh status snapshot so callers can update
+   * their UI without an extra status poll.
+   */
+  kchatSetEnabled(params: { enabled: boolean }): Promise<KChatStatusReport>;
+  /**
+   * Phase 15 — Electron host promotes the Rust-side
+   * `publisher_kind` marker to `loopback_http` once the loopback
+   * API has bound on `127.0.0.1`. Without this signal the Rust
+   * snapshot would stay `in_memory` even though the Electron
+   * `kchat:status` IPC reports `loopback_http`, and any future
+   * Rust-side consumer (telemetry, audit, the in-process journey
+   * tests) would see the stale kind. Idempotent — repeated calls
+   * with the same publisher_kind are no-ops. Returns the fresh
+   * status snapshot.
+   */
+  kchatMarkLoopbackActive(): Promise<KChatStatusReport>;
+  /**
+   * Phase 15 — Electron host demotes the Rust-side
+   * `publisher_kind` marker back to `in_memory` during
+   * `app.on("will-quit", ...)` so the next status snapshot is
+   * honest about the headless state. Idempotent.
+   */
+  kchatMarkLoopbackInactive(): Promise<KChatStatusReport>;
 
   // ----- Viewport (Phase 12) -----
   /** Current viewport status (GPU readiness, dimensions, frame count). */
@@ -643,11 +677,32 @@ export interface BridgeBackend {
   viewportRequestFrame(): Promise<ViewportFrameReport>;
 }
 
-/** Renderer-facing KChat connection status. */
+/**
+ * Renderer-facing KChat connection status.
+ *
+ * Phase 15 replaced the Phase 12 socket / named-pipe transport
+ * with a loopback HTTP API the `.kcz` extension installed in
+ * KChat Desktop talks to. The publisherKind reflects the
+ * runtime arrangement:
+ *
+ *   - `loopback_http`: the Electron main process is hosting the
+ *     loopback API (default for production). `instanceJson`
+ *     carries the renderer-side snapshot (server running,
+ *     port, last extension heartbeat, queue depth).
+ *   - `in_memory`: tests / headless builds where the loopback
+ *     API is not stood up; publishes are kept in process for
+ *     unit-test inspection.
+ */
 export interface KChatStatusReport {
   state: "connected" | "reconnecting" | "disconnected";
-  publisherKind: "local_ipc" | "in_memory";
-  /** Discovered instance JSON, when `publisherKind` is `local_ipc`. */
+  publisherKind: "loopback_http" | "in_memory";
+  /**
+   * JSON-encoded snapshot of the loopback API state when
+   * `publisherKind` is `loopback_http`. Shape:
+   *   { apiServerRunning, apiServerPort, portFilePath,
+   *     lastExtensionContactAt, queuedPublishCount,
+   *     reviewThreadCount }
+   */
   instanceJson?: string | null;
   /**
    * Per-project default thread id sourced from the active project's
@@ -657,6 +712,18 @@ export interface KChatStatusReport {
    * that case.
    */
   defaultThreadId?: string | null;
+  /**
+   * Master enable switch mirroring
+   * `aec_core::kchat_config::KChatConfig::enabled` (the
+   * bridge-persisted Settings toggle / per-project manifest
+   * field). When `false`, the Electron `kchat:publish` IPC
+   * handler refuses publishes before enqueueing into the
+   * loopback HTTP queue — the toggle is *not* cosmetic. The
+   * status `state` field is also forced to `"disconnected"` so
+   * the status chip honestly reads "offline" instead of
+   * claiming the integration is live.
+   */
+  enabled: boolean;
 }
 
 /** Result of `kchatPublish`. */
@@ -1643,6 +1710,10 @@ interface NativeApi {
   // sub-millisecond when KChat Desktop is local.
   kchat_status(): unknown;
   kchat_reload(): unknown;
+  kchat_set_enabled(enabled: boolean): unknown;
+  kchat_is_enabled(): boolean;
+  kchat_mark_loopback_active(): unknown;
+  kchat_mark_loopback_inactive(): unknown;
   kchat_publish(params: { cardJson: string }): unknown;
   kchat_ingest_reviews(params: {
     threadId: string;
@@ -1799,8 +1870,11 @@ export const NATIVE_WIRED_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   // for CI / dev runs without a real KChat install.
   "kchatStatus",
   "kchatReload",
+  "kchatSetEnabled",
   "kchatPublish",
   "kchatIngestReviews",
+  "kchatMarkLoopbackActive",
+  "kchatMarkLoopbackInactive",
   // Viewport domain wired in Phase 12. `viewportStatus` /
   // `viewportResize` / `viewportInput` / `viewportRequestFrame`
   // all route through `ViewportService` which owns its own wgpu
@@ -2476,12 +2550,14 @@ function adaptNative(n: NativeApi): BridgeBackend {
         publisherKind: string;
         instanceJson: string | null | undefined;
         defaultThreadId: string | null | undefined;
+        enabled: boolean;
       };
       return {
         state: raw.state as KChatStatusReport["state"],
         publisherKind: raw.publisherKind as KChatStatusReport["publisherKind"],
         instanceJson: raw.instanceJson ?? null,
         defaultThreadId: raw.defaultThreadId ?? null,
+        enabled: raw.enabled,
       };
     },
     kchatReload: async () => {
@@ -2490,12 +2566,62 @@ function adaptNative(n: NativeApi): BridgeBackend {
         publisherKind: string;
         instanceJson: string | null | undefined;
         defaultThreadId: string | null | undefined;
+        enabled: boolean;
       };
       return {
         state: raw.state as KChatStatusReport["state"],
         publisherKind: raw.publisherKind as KChatStatusReport["publisherKind"],
         instanceJson: raw.instanceJson ?? null,
         defaultThreadId: raw.defaultThreadId ?? null,
+        enabled: raw.enabled,
+      };
+    },
+    kchatSetEnabled: async (params) => {
+      const raw = n.kchat_set_enabled(params.enabled) as {
+        state: string;
+        publisherKind: string;
+        instanceJson: string | null | undefined;
+        defaultThreadId: string | null | undefined;
+        enabled: boolean;
+      };
+      return {
+        state: raw.state as KChatStatusReport["state"],
+        publisherKind: raw.publisherKind as KChatStatusReport["publisherKind"],
+        instanceJson: raw.instanceJson ?? null,
+        defaultThreadId: raw.defaultThreadId ?? null,
+        enabled: raw.enabled,
+      };
+    },
+    kchatMarkLoopbackActive: async () => {
+      const raw = n.kchat_mark_loopback_active() as {
+        state: string;
+        publisherKind: string;
+        instanceJson: string | null | undefined;
+        defaultThreadId: string | null | undefined;
+        enabled: boolean;
+      };
+      return {
+        state: raw.state as KChatStatusReport["state"],
+        publisherKind: raw.publisherKind as KChatStatusReport["publisherKind"],
+        instanceJson: raw.instanceJson ?? null,
+        defaultThreadId: raw.defaultThreadId ?? null,
+        enabled: raw.enabled,
+      };
+    },
+    kchatMarkLoopbackInactive: async () => {
+      const raw = n.kchat_mark_loopback_inactive() as {
+        state: string;
+        publisherKind: string;
+        instanceJson: string | null | undefined;
+        defaultThreadId: string | null | undefined;
+        enabled: boolean;
+      };
+      return {
+        state: raw.state as KChatStatusReport["state"],
+        publisherKind: raw.publisherKind as KChatStatusReport["publisherKind"],
+        instanceJson: raw.instanceJson ?? null,
+        defaultThreadId: raw.defaultThreadId ?? null,
+        enabled: raw.enabled,
       };
     },
     kchatPublish: async (params) => {
@@ -3444,12 +3570,46 @@ export function inProcessBackend(): BridgeBackend {
       // renderer falls back to its `kchat-default` constant in
       // this case.
       defaultThreadId: null,
+      // The in-process fallback mirrors `KChatConfig::default()`
+      // (enabled = true) so journey tests and headless runs
+      // observe a non-disabled bridge by default. Production
+      // `state` is still `disconnected` because there is no real
+      // loopback API in this codepath.
+      enabled: true,
     }),
     kchatReload: async () => ({
       state: "disconnected",
       publisherKind: "in_memory",
       instanceJson: null,
       defaultThreadId: null,
+      enabled: true,
+    }),
+    kchatSetEnabled: async ({ enabled }) => ({
+      state: "disconnected",
+      publisherKind: "in_memory",
+      instanceJson: null,
+      defaultThreadId: null,
+      enabled,
+    }),
+    // In-process fallback mirrors a no-op promotion / demotion —
+    // the in-process bridge has no real loopback transport. The
+    // shape matches `KChatStatusReport` so the Electron host can
+    // call these unconditionally without branching on
+    // `isNativeWired()`. `publisherKind` reports the post-call
+    // state honestly (`loopback_http` / `in_memory`).
+    kchatMarkLoopbackActive: async () => ({
+      state: "disconnected",
+      publisherKind: "loopback_http",
+      instanceJson: null,
+      defaultThreadId: null,
+      enabled: true,
+    }),
+    kchatMarkLoopbackInactive: async () => ({
+      state: "disconnected",
+      publisherKind: "in_memory",
+      instanceJson: null,
+      defaultThreadId: null,
+      enabled: true,
     }),
     kchatPublish: async (_params) => ({
       messageId: id("kchat_msg"),
