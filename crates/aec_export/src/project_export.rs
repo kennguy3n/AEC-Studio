@@ -935,22 +935,33 @@ fn build_summary_ifc(project_name: &str) -> Result<Vec<u8>, ProjectExportError> 
     Ok(bytes)
 }
 
-/// Empty `Materials` [`ScheduleSheet`] used as the fallback when the
+/// Empty material [`ScheduleSheet`] used as the fallback when the
 /// deliver-pack context doesn't carry a real material schedule. The
-/// sheet has the canonical header row only — `build_real_xlsx` turns
-/// it into a valid header-only XLSX workbook.
+/// sheet name + columns match `aec_bridge::deliver_context::build_material_schedule`
+/// exactly so downstream consumers see one stable schema regardless of
+/// whether a project was open at export time — the only difference is
+/// the empty body. `build_real_xlsx` turns it into a valid header-only
+/// XLSX workbook.
 fn empty_materials_schedule() -> ScheduleSheet {
     use aec_bim::schedules::ScheduleColumn;
     ScheduleSheet::new(
-        "Materials",
+        "Material schedule",
         vec![
             ScheduleColumn {
                 key: "material".to_string(),
                 display: "Material".to_string(),
             },
             ScheduleColumn {
-                key: "count".to_string(),
-                display: "Count".to_string(),
+                key: "walls".to_string(),
+                display: "Walls".to_string(),
+            },
+            ScheduleColumn {
+                key: "floors".to_string(),
+                display: "Floors".to_string(),
+            },
+            ScheduleColumn {
+                key: "ceilings".to_string(),
+                display: "Ceilings".to_string(),
             },
             ScheduleColumn {
                 key: "area_m2".to_string(),
@@ -960,18 +971,21 @@ fn empty_materials_schedule() -> ScheduleSheet {
     )
 }
 
-/// Empty `Bill of Quantities` [`ScheduleSheet`] used as the fallback
+/// Empty bill-of-quantities [`ScheduleSheet`] used as the fallback
 /// when the deliver-pack context doesn't carry a real BOQ. The sheet
-/// has the canonical header row only — `build_real_xlsx` turns it
-/// into a valid header-only XLSX workbook.
+/// name + columns match `aec_bridge::deliver_context::build_boq_schedule`
+/// exactly so downstream consumers see one stable schema regardless of
+/// whether a project was open at export time — the only difference is
+/// the empty body. `build_real_xlsx` turns it into a valid header-only
+/// XLSX workbook.
 fn empty_boq_schedule() -> ScheduleSheet {
     use aec_bim::schedules::ScheduleColumn;
     ScheduleSheet::new(
-        "Bill of Quantities",
+        "Bill of quantities",
         vec![
             ScheduleColumn {
-                key: "item".to_string(),
-                display: "Item".to_string(),
+                key: "category".to_string(),
+                display: "Category".to_string(),
             },
             ScheduleColumn {
                 key: "count".to_string(),
@@ -979,7 +993,7 @@ fn empty_boq_schedule() -> ScheduleSheet {
             },
             ScheduleColumn {
                 key: "area_m2".to_string(),
-                display: "Area (m²)".to_string(),
+                display: "Total area (m²)".to_string(),
             },
         ],
     )

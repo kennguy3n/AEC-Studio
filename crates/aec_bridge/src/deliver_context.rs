@@ -145,6 +145,36 @@ pub fn build_for_project(
     })
 }
 
+/// Best-effort variant of [`build_for_project`] used by deliver /
+/// proposal pack call sites: open the project at `project_path` and
+/// build a [`BuiltDeliverContext`], OR — if the package can't be
+/// opened or the graph can't be loaded (stale / deleted / corrupt
+/// path) — log a warning to stderr and return `None`.
+///
+/// The deliver and proposal packs are contractually best-effort
+/// exports (the cover degrades to placeholder counts when no project
+/// is open). This helper extends that same graceful-degradation
+/// contract to the case where the renderer threaded through a stale
+/// `peekActiveProjectPath()` that points at a project file the user
+/// has since deleted or moved. The pack still emits a structurally
+/// valid archive built from the default empty context rather than
+/// hard-failing the whole export.
+pub fn try_build_for_project(
+    project_path: &str,
+    master_key: &[u8; 32],
+) -> Option<BuiltDeliverContext> {
+    match build_for_project(project_path, master_key) {
+        Ok(ctx) => Some(ctx),
+        Err(e) => {
+            eprintln!(
+                "aec_bridge::deliver_context: project at {project_path:?} \
+                 unavailable ({e}); falling back to default empty context"
+            );
+            None
+        }
+    }
+}
+
 /// Walk the project graph and aggregate element counts + areas by
 /// `material_id`. Walls / floors / ceilings carry an optional
 /// `material_id` on their command body (see

@@ -2340,9 +2340,15 @@ impl BridgeService {
     /// [`aec_export::write_proposal_pack_with_context`]. When
     /// `project_path` is supplied, opens the project's encrypted
     /// graph and threads real room / material / template counts and
-    /// the project's floor-plan SVG into the proposal cover. When
-    /// `None`, falls back to the default empty context (the PDF is
-    /// still a valid `printpdf`-serialised file).
+    /// the project's floor-plan SVG into the proposal cover.
+    ///
+    /// Both the no-`project_path` case AND the case where the path
+    /// turned out to be stale / corrupt fall back to the default
+    /// empty context (the PDF is still a valid
+    /// `printpdf`-serialised file). Mirrors the
+    /// graceful-degradation contract documented on the
+    /// `export:buildProposalPack` IPC handler — see
+    /// `apps/desktop/electron/ipc.ts`.
     pub fn export_proposal_pack(
         &self,
         out_path: &str,
@@ -2351,10 +2357,9 @@ impl BridgeService {
         project_path: Option<&str>,
     ) -> Result<ExportProposalPackResult, BridgeServiceError> {
         let built = match project_path {
-            Some(p) if !p.is_empty() => Some(crate::deliver_context::build_for_project(
-                p,
-                &self.master_key,
-            )?),
+            Some(p) if !p.is_empty() => {
+                crate::deliver_context::try_build_for_project(p, &self.master_key)
+            }
             _ => None,
         };
         let ctx = built.as_ref().map(|b| b.as_ctx()).unwrap_or_default();
@@ -2406,14 +2411,17 @@ impl BridgeService {
         };
         // When the renderer threads through a `project_path`, open
         // the encrypted package and build a real `DeliverPackContext`
-        // from its graph. Otherwise fall back to the default empty
-        // context (callers without an open project still get a
-        // structurally valid ZIP, just without project-specific data).
+        // from its graph. Otherwise (or when the path turns out to
+        // be stale / corrupt — `peekActiveProjectPath()` can return a
+        // path to a project the user has since deleted or moved) fall
+        // back to the default empty context. Callers still get a
+        // structurally valid ZIP, just without project-specific data.
+        // Mirrors the graceful-degradation contract documented on the
+        // `deliver:buildPack` IPC handler.
         let built = match project_path.as_deref() {
-            Some(p) if !p.is_empty() => Some(crate::deliver_context::build_for_project(
-                p,
-                &self.master_key,
-            )?),
+            Some(p) if !p.is_empty() => {
+                crate::deliver_context::try_build_for_project(p, &self.master_key)
+            }
             _ => None,
         };
         let ctx = built.as_ref().map(|b| b.as_ctx()).unwrap_or_default();
