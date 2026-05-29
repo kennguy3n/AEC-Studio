@@ -891,6 +891,36 @@ pub struct BimScheduleSummary {
     pub parse_cache_hit: bool,
 }
 
+/// Rows read back from a previously-written schedule XLSX via
+/// [`BridgeService::bim_read_schedule_rows`]. Mirror of
+/// `BimScheduleRows` in `apps/desktop/electron/bridge.ts` — kept
+/// shape-stable so the renderer's `ScheduleView` can render the
+/// table from a single round-trip:
+/// `bim_generate_schedule(...)` → `bim_read_schedule_rows(...)` →
+/// `rows`.
+///
+/// `header` is the ordered list of column display names from row 0
+/// of the worksheet; `rows` is one `BTreeMap<header_name, cell>`
+/// per body row. The map is alphabetized by `BTreeMap` semantics,
+/// so the renderer iterates `header` for column order and indexes
+/// the row map by name. Cell values are always strings — the
+/// writer in [`aec_bim::schedules::xlsx::write_into`] uses
+/// `write_string_with_format`, so round-tripping back to strings is
+/// loss-free.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BimScheduleRows {
+    /// Column display names in the order they appear in the
+    /// worksheet header row. Useful for the renderer to lay out
+    /// table columns; the row maps themselves are keyed by these
+    /// same names.
+    pub header: Vec<String>,
+    /// One entry per non-empty body row in the worksheet. Every
+    /// map has exactly `header.len()` entries, with empty cells
+    /// stored as `""` (never absent) so the renderer can iterate
+    /// the columns uniformly.
+    pub rows: Vec<std::collections::BTreeMap<String, String>>,
+}
+
 /// Query parameters for [`BridgeService::design_list_assets`]. The
 /// shape mirrors the TypeScript `query` object that the renderer's
 /// asset browser passes through `designListAssets(query)` in
@@ -3217,6 +3247,34 @@ impl BridgeService {
             bytes_written,
             parse_cache_hit,
         })
+    }
+
+    /// Read row data back from a previously-written XLSX schedule.
+    ///
+    /// The renderer's `ScheduleView` calls this immediately after
+    /// `bim_generate_schedule` so the table can display the actual
+    /// row contents inline (not just the row count). This closes the
+    /// XLSX-to-row-list round trip: every cell rendered in the UI
+    /// goes through `aec_bim::xlsx_reader::read_xlsx_rows`, which
+    /// reads the file calamine-style — the same file the writer just
+    /// produced — so manual edits, future schedule extensions that
+    /// mutate cells before save, and the renderer's display all
+    /// agree on ground truth.
+    ///
+    /// Error mapping: every variant of
+    /// [`aec_bim::xlsx_reader::XlsxReadError`] flattens to
+    /// [`BridgeServiceError::Bim`] with a single-line description.
+    /// The renderer side maps these to a user-facing toast via the
+    /// existing IPC error envelope; no new error variant is needed
+    /// on the bridge surface.
+    pub fn bim_read_schedule_rows(
+        &self,
+        xlsx_path: &str,
+    ) -> Result<BimScheduleRows, BridgeServiceError> {
+        let (header, rows) =
+            aec_bim::xlsx_reader::read_xlsx_rows_with_header(Path::new(xlsx_path), None)
+                .map_err(|e| BridgeServiceError::Bim(format!("read_schedule_rows: {e}")))?;
+        Ok(BimScheduleRows { header, rows })
     }
 
     /// Return the recents list (most-recent first), in the API shape.

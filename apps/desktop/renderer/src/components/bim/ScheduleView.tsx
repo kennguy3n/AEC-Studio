@@ -17,12 +17,19 @@ export interface ScheduleRow {
 /**
  * Summary returned to the parent after "Regenerate". The bridge
  * writes the schedule directly to an XLSX file at `outPath` (via
- * `ScheduleSheet::write_xlsx` in `aec_bim`), so the renderer just
- * surfaces the file path and row/column counts. The inline
- * preview table renders whatever rows the parent retains in
- * `rowsByKind`; `Bim.tsx` reads them back from the just-written
- * XLSX via `aec.bim.readScheduleRows({ xlsxPath })` so the table
- * mirrors the file on disk.
+ * `ScheduleSheet::write_xlsx` in `aec_bim`), so this component
+ * itself stays a pure presenter — it surfaces the file path and
+ * row/column counts to the parent through `onGenerate` and renders
+ * whatever rows the parent has populated into `rowsByKind`.
+ *
+ * The full round-trip is wired in the parent (`Bim.tsx`): after
+ * `aec.bim.generateSchedule` resolves, the parent calls
+ * `aec.bim.readScheduleRows({ xlsxPath: summary.outPath })` against
+ * the just-written file and pushes the parsed rows into
+ * `rowsByKind` via `setSchedules`. The IPC handler that backs that
+ * readback lives at `bim:readScheduleRows` in `electron/ipc.ts` and
+ * uses `aec_bim::xlsx_reader::read_xlsx_rows`, so the inline
+ * preview shows real schedule data, not just the row count.
  */
 export interface ScheduleGenerationSummary {
   scheduleId: string;

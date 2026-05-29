@@ -82,11 +82,29 @@
 //! `num_classes = max_num - 499` (`decode.c:2192`). The smallest
 //! representable section therefore has exactly ONE record; an empty
 //! upstream document still emits a synthetic `AcDbPlaceHolder` (see
-//! [`placeholder_class`]). The decoder identifies that exact byte
-//! pattern via [`is_placeholder_class`] and strips it back out so
-//! round-trips stay empty. AutoCAD-emitted DWGs follow the same
-//! convention — `AcDbPlaceHolder` is one of the first custom classes
-//! in every real-world file.
+//! [`acdb_placeholder_class`]). The decoder identifies that exact
+//! byte pattern via [`is_acdb_placeholder_class`] and strips it back
+//! out so round-trips stay empty. AutoCAD-emitted DWGs follow the
+//! same convention — `AcDbPlaceHolder` is one of the first custom
+//! classes in every real-world file.
+//!
+//! ## Naming: "placeholder" has two senses in this file
+//!
+//! 1. **`AcDbPlaceHolder` class** — a real, canonical AutoCAD class
+//!    (`app_name = "ObjectDBX Classes"`, `cpp_class_name =
+//!    "AcDbPlaceHolder"`, `dxf_record_name = "ACDBPLACEHOLDER"`,
+//!    `item_class_id = 0x1F3`). These strings are NOT stubs — they
+//!    match the ODA OpenDesign Specification's `AcDbPlaceHolder`
+//!    descriptor exactly and what AutoCAD itself emits when it has
+//!    no other custom classes. The `ACDB_PLACEHOLDER_*` consts and
+//!    [`acdb_placeholder_class`] / [`is_acdb_placeholder_class`]
+//!    helpers belong to this sense.
+//!
+//! 2. **Wire-format placeholders** — RL=0 / RS=0 size, bitsize, hsize,
+//!    or CRC slots written first and back-patched once the encoded
+//!    body length is known. Local variables and `//` comments use
+//!    the word `placeholder` in this sense; the back-patch happens a
+//!    few lines below each occurrence.
 
 use crate::dwg::bits::{crc_x25, BitReader, BitWriter};
 use crate::dwg::error::{DwgError, DwgResult};
@@ -198,13 +216,14 @@ impl ClassesSection {
         // and computes `num_classes = max_num - 499`. So the smallest
         // representable section has exactly ONE class record with
         // max_num = 500.  When the upstream document carries zero
-        // custom classes we still emit a single neutral placeholder
-        // (AcDbPlaceHolder) so the wire format stays conformant —
-        // AutoCAD-emitted DWGs follow the same convention.
-        let placeholder;
+        // custom classes we still emit a single neutral
+        // `AcDbPlaceHolder` record so the wire format stays
+        // conformant — AutoCAD-emitted DWGs follow the same
+        // convention.
+        let synthetic;
         let records: &[ClassRecord] = if self.classes.is_empty() {
-            placeholder = [placeholder_class()];
-            &placeholder
+            synthetic = [acdb_placeholder_class()];
+            &synthetic
         } else {
             &self.classes
         };
@@ -257,7 +276,7 @@ impl ClassesSection {
         // encoder writes (encode.c:2723). We follow the decoder side
         // since that's what reads our files.
         //
-        // The `records.len()` here is the post-placeholder count
+        // The `records.len()` here is the post-synthetic count
         // (always ≥ 1), guaranteeing `max_num ≥ 500`.
         let num_records: u16 = records.len().try_into().map_err(|_| {
             DwgError::InternalInvariant(format!(
@@ -290,7 +309,7 @@ impl ClassesSection {
             // data_size > 0x7fff; we surface an error rather than
             // silently truncating via `as u16` if the strings ever
             // exceed that threshold. In practice this is unreachable
-            // because the placeholder class's strings are short.
+            // because the `AcDbPlaceHolder` strings are short.
             if str_bits > 0x7fff {
                 return Err(DwgError::InternalInvariant(format!(
                     "classes string stream exceeded 0x7fff bits ({str_bits}); \
@@ -444,8 +463,9 @@ impl ClassesSection {
             // `max_num` as `highest_class_number_assigned + 1`, so
             // `num_records = max_num - 499` (decode.c:2191). When we
             // see exactly one record we treat it as the writer's
-            // placeholder and surface zero classes back to callers so
-            // round-trips through an empty Document stay empty.
+            // synthetic `AcDbPlaceHolder` and surface zero classes
+            // back to callers so round-trips through an empty
+            // Document stay empty.
             let num_records = (max_num - 499) as usize;
             let _rc1 = reader.read_rc()?;
             let _rc2 = reader.read_rc()?;
@@ -475,12 +495,12 @@ impl ClassesSection {
                     version,
                 )?);
             }
-            // Strip the writer-side placeholder (see the matching
-            // comment in `encode_r2004_plus`). The placeholder is
+            // Strip the writer-side `AcDbPlaceHolder` (see the
+            // matching comment in `encode_r2004_plus`). It is
             // identified structurally — class_number == 500 with the
-            // exact placeholder strings — so user-supplied classes
+            // exact canonical strings — so user-supplied classes
             // that happen to be at index 500 are NOT mistaken for it.
-            let classes = if records.len() == 1 && is_placeholder_class(&records[0]) {
+            let classes = if records.len() == 1 && is_acdb_placeholder_class(&records[0]) {
                 Vec::new()
             } else {
                 records
@@ -504,49 +524,60 @@ impl ClassesSection {
     }
 }
 
-/// Marker class number used by [`placeholder_class`] / [`is_placeholder_class`].
 /// First custom class number per AutoCAD convention (0..=499 are
-/// reserved for fixed types).
-const PLACEHOLDER_CLASS_NUMBER: i32 = 500;
-/// `app_name` for the writer-side placeholder. AutoCAD-emitted DWGs
-/// always tag custom classes with this exact application name.
-const PLACEHOLDER_APP_NAME: &str = "ObjectDBX Classes";
-/// `cpp_class_name` for the writer-side placeholder. AutoCAD always
-/// emits `AcDbPlaceHolder` as one of the first custom classes; we
-/// reuse it to keep the wire format indistinguishable from a real
-/// minimal AutoCAD file.
-const PLACEHOLDER_CPP_CLASS_NAME: &str = "AcDbPlaceHolder";
-const PLACEHOLDER_DXF_RECORD_NAME: &str = "ACDBPLACEHOLDER";
+/// reserved for fixed types). `AcDbPlaceHolder` is conventionally
+/// emitted at class_number 500 by both AutoCAD and the ODA toolkit.
+const ACDB_PLACEHOLDER_CLASS_NUMBER: i32 = 500;
+/// `app_name` for the synthetic `AcDbPlaceHolder` record. The ODA
+/// OpenDesign Specification names "ObjectDBX Classes" as the
+/// canonical application name for ObjectDBX-registered classes;
+/// AutoCAD-emitted DWGs tag `AcDbPlaceHolder` with the same string.
+const ACDB_PLACEHOLDER_APP_NAME: &str = "ObjectDBX Classes";
+/// `cpp_class_name` for the synthetic class — the literal C++ class
+/// name `AcDbPlaceHolder` (ODA spec § 23.4.85) so the wire format is
+/// indistinguishable from a real minimal AutoCAD file.
+const ACDB_PLACEHOLDER_CPP_CLASS_NAME: &str = "AcDbPlaceHolder";
+/// `dxf_record_name` for the synthetic class — the DXF entity name
+/// `ACDBPLACEHOLDER` (ODA spec § 23.4.85, upper-case form).
+const ACDB_PLACEHOLDER_DXF_RECORD_NAME: &str = "ACDBPLACEHOLDER";
+/// `item_class_id` 0x1F3 marks the record as an `OBJECT`-flavoured
+/// class (vs 0x1F2 for entities). `AcDbPlaceHolder` is an object,
+/// not a drawable entity (ODA spec § 23.4.85).
+const ACDB_PLACEHOLDER_ITEM_CLASS_ID: i32 = 0x1F3;
 
-/// Synthetic placeholder class emitted when the upstream document
-/// carries zero custom classes. LibreDWG's decoder rejects `max_num
-/// < 500` (`decode.c:2192`), so the minimum representable Classes
-/// section has exactly one record with `class_number == 500`.
-fn placeholder_class() -> ClassRecord {
+/// Synthetic `AcDbPlaceHolder` class record. Emitted exactly once
+/// when the upstream document carries zero custom classes so the
+/// section's `max_num` field stays at the LibreDWG-required floor
+/// of 500 (`decode.c:2192` rejects anything lower). Every field is
+/// the canonical ODA-spec value, not a stub — matching what AutoCAD
+/// itself writes in a minimal DWG.
+fn acdb_placeholder_class() -> ClassRecord {
     ClassRecord {
-        class_number: PLACEHOLDER_CLASS_NUMBER,
+        class_number: ACDB_PLACEHOLDER_CLASS_NUMBER,
         version: 0,
-        app_name: PLACEHOLDER_APP_NAME.to_string(),
-        cpp_class_name: PLACEHOLDER_CPP_CLASS_NAME.to_string(),
-        dxf_record_name: PLACEHOLDER_DXF_RECORD_NAME.to_string(),
+        app_name: ACDB_PLACEHOLDER_APP_NAME.to_string(),
+        cpp_class_name: ACDB_PLACEHOLDER_CPP_CLASS_NAME.to_string(),
+        dxf_record_name: ACDB_PLACEHOLDER_DXF_RECORD_NAME.to_string(),
         was_zombie: false,
-        item_class_id: 0x1F3,
+        item_class_id: ACDB_PLACEHOLDER_ITEM_CLASS_ID,
     }
 }
 
 /// Structural check used by the decoder to recognise the writer's
-/// own placeholder and strip it so an empty `ClassesSection`
-/// round-trips as empty rather than appearing to carry a phantom
-/// AcDbPlaceHolder. User-supplied classes that happen to share
-/// class_number 500 but differ on any other field will NOT match.
-fn is_placeholder_class(c: &ClassRecord) -> bool {
-    c.class_number == PLACEHOLDER_CLASS_NUMBER
+/// own synthetic `AcDbPlaceHolder` and strip it so an empty
+/// `ClassesSection` round-trips as empty rather than appearing to
+/// carry a phantom record. User-supplied classes that happen to
+/// share `class_number == 500` but differ on any other field will
+/// NOT match — see the `user_class_at_index_500_is_not_stripped`
+/// test for the negative case.
+fn is_acdb_placeholder_class(c: &ClassRecord) -> bool {
+    c.class_number == ACDB_PLACEHOLDER_CLASS_NUMBER
         && c.version == 0
-        && c.app_name == PLACEHOLDER_APP_NAME
-        && c.cpp_class_name == PLACEHOLDER_CPP_CLASS_NAME
-        && c.dxf_record_name == PLACEHOLDER_DXF_RECORD_NAME
+        && c.app_name == ACDB_PLACEHOLDER_APP_NAME
+        && c.cpp_class_name == ACDB_PLACEHOLDER_CPP_CLASS_NAME
+        && c.dxf_record_name == ACDB_PLACEHOLDER_DXF_RECORD_NAME
         && !c.was_zombie
-        && c.item_class_id == 0x1F3
+        && c.item_class_id == ACDB_PLACEHOLDER_ITEM_CLASS_ID
 }
 
 /// Open the per-section string sub-stream described in
@@ -741,7 +772,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_section_round_trips_through_r2004_placeholder() {
+    fn empty_section_round_trips_through_r2004_acdb_placeholder() {
         // R2004+ on-wire format requires at least one record
         // (max_num >= 500). The encoder injects a synthetic
         // AcDbPlaceHolder; the decoder strips it back out so an empty
@@ -820,17 +851,34 @@ mod tests {
     }
 
     #[test]
-    fn placeholder_class_is_stable_and_recognised() {
-        // The structural is_placeholder_class check must accept the
-        // exact bytes the encoder emits and reject user-supplied
+    fn acdb_placeholder_class_is_stable_and_recognised() {
+        // The structural is_acdb_placeholder_class check must accept
+        // the exact bytes the encoder emits and reject user-supplied
         // class records that share class_number 500.
-        let p = placeholder_class();
-        assert!(is_placeholder_class(&p));
+        let p = acdb_placeholder_class();
+        assert!(is_acdb_placeholder_class(&p));
         let almost = ClassRecord {
             cpp_class_name: "NotPlaceHolder".into(),
             ..p.clone()
         };
-        assert!(!is_placeholder_class(&almost));
+        assert!(!is_acdb_placeholder_class(&almost));
+    }
+
+    #[test]
+    fn acdb_placeholder_strings_match_oda_specification() {
+        // Regression guard against accidental drift in the canonical
+        // strings. These exact values are what ODA OpenDesign Spec
+        // § 23.4.85 names for `AcDbPlaceHolder` and what AutoCAD
+        // itself emits — they are NOT stubs to be replaced with
+        // "real" descriptions later.
+        let p = acdb_placeholder_class();
+        assert_eq!(p.class_number, 500);
+        assert_eq!(p.version, 0);
+        assert_eq!(p.app_name, "ObjectDBX Classes");
+        assert_eq!(p.cpp_class_name, "AcDbPlaceHolder");
+        assert_eq!(p.dxf_record_name, "ACDBPLACEHOLDER");
+        assert!(!p.was_zombie);
+        assert_eq!(p.item_class_id, 0x1F3);
     }
 
     #[test]

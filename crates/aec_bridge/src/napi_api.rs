@@ -1765,6 +1765,49 @@ pub fn bim_generate_schedule(
         .map(Into::into)
 }
 
+/// JS-facing shape returned by [`bim_read_schedule_rows`]. Mirrors
+/// `BimScheduleRows` in `apps/desktop/electron/bridge.ts`.
+///
+/// `header` is the worksheet's header-row column display names in
+/// order; `rows` is one row per non-empty body row, keyed by header
+/// display name. We materialize `rows` as `HashMap<String, String>`
+/// (not `BTreeMap`) because napi-rs's object marshalling is wired
+/// for `HashMap`; the renderer treats both as plain objects, so the
+/// difference is internal to the bridge.
+#[napi(object)]
+pub struct BimScheduleRowsJs {
+    pub header: Vec<String>,
+    pub rows: Vec<std::collections::HashMap<String, String>>,
+}
+
+impl From<crate::service::BimScheduleRows> for BimScheduleRowsJs {
+    fn from(r: crate::service::BimScheduleRows) -> Self {
+        Self {
+            header: r.header,
+            rows: r
+                .rows
+                .into_iter()
+                .map(|m| m.into_iter().collect::<std::collections::HashMap<_, _>>())
+                .collect(),
+        }
+    }
+}
+
+/// Read rows back from a previously-written XLSX schedule. Called
+/// from the renderer's `ScheduleView` immediately after
+/// `bim_generate_schedule` so the table can render real row data
+/// inline rather than just the row count.
+///
+/// The implementation routes through `with_service_ref_fallible`
+/// because the XLSX read is read-only at the `BridgeService` layer
+/// (no snapshot cache writes, no graph mutation). Errors are
+/// flattened to `napi::Error` via the same `to_napi_error` mapping
+/// used by every other bridge surface.
+#[napi]
+pub fn bim_read_schedule_rows(xlsx_path: String) -> Result<BimScheduleRowsJs> {
+    with_service_ref_fallible(|svc| svc.bim_read_schedule_rows(&xlsx_path)).map(Into::into)
+}
+
 /// JS-facing CPU descriptor. Mirrors `RuntimeStatus["cpu"]` in
 /// `apps/desktop/electron/bridge.ts`.
 #[napi(object)]

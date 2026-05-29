@@ -12,6 +12,7 @@ aec_core = { path = "../aec_core" }
 aec_cad = { path = "../aec_cad" }
 blake3 = { workspace = true }
 rust_xlsxwriter = { workspace = true }
+calamine = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

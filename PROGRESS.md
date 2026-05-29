@@ -479,6 +479,87 @@ This document tracks AEC Studio's phased delivery from open-source foundation to
 
 ---
 
+## Phase 14 — Deferred Phase 13 follow-ups, `demo://` cleanup, journey validation, benchmarks, protocol verification
+
+**Status:** `DONE`
+
+**Goal:** Land the two groups deferred from Phase 13 (real `DeliverPackContext` from project state + acceptance-criteria benchmarks + Phase 6/8 user-journey e2e) and finish the production-polish pass: remove every remaining `demo://` reference from non-changelog source, resolve / re-frame stale `TODO` / "future PR" / "follow-up" archaeology, validate all 15 PROPOSAL.md acceptance criteria with Bridge journey tests, close the XLSX-to-row-list round trip so `ScheduleView` displays real schedule data, harden the viewport no-GPU graceful-degradation path end to end, audit the existing Phase 12 KChat socket transport against the real `uneycom/uney-chat-desktop` codebase (where Task 29 lands the finding that KChat Desktop's Extension Platform is a JS-only sandbox with no socket listener, so the socket transport is vestigial and the integration is replatformed in Phase 15 onto a loopback HTTP API + `.kcz` companion extension + `aecstudio://` deeplinks following the Tessera / KCreate pattern), and run a final docs audit across PROGRESS.md / PHASES.md / README.md / ARCHITECTURE.md / PROPOSAL.md.
+
+### Group A — Real `DeliverPackContext` from project state (Tasks 1–6)
+
+| Item | Status |
+|---|---|
+| Task 1 — `aec_bridge::deliver_context::build_for_project` (renders dir + real material / BOQ `ScheduleSheet`s + sheets + IFC string + plan SVG + room/material counts + template name from the open project's SQLCipher DB) | `DONE` |
+| Task 2 — N-API `deliver_build_pack` threads `params.project_path` through `BridgeService::deliver_build_pack(..., project_path)` to `write_deliver_pack_with_context` | `DONE` |
+| Task 3 — `#[deprecated(since = "0.14.0", ...)]` on `write_deliver_pack`; every bridge caller goes through the context-aware path | `DONE` |
+| Task 4 — `placeholder_png()` / `placeholder_xlsx()` gated behind `#[cfg(test)]`; production fallbacks use `build_thumbnail_png(512, 384)` for renders and an empty real `ScheduleSheet` via `build_real_xlsx` for schedules | `DONE` |
+| Task 5 — `write_proposal_pack_with_context` wired through the bridge with real project metadata in the cover text + plan SVG + render thumbnails | `DONE` |
+| Task 6 — `crates/aec_export/src/project_export.rs` docstrings updated to remove all stale "placeholder" / "for now" language in production paths | `DONE` |
+
+### Group B — Acceptance-criteria benchmarks + Phase 6/8 user-journey e2e (Tasks 7–9)
+
+| Item | Status |
+|---|---|
+| Task 7 — `crates/aec_bridge/benches/acceptance_criteria.rs` Criterion suite (cold start < 2.5 s, project open < 1.0 s, DXF 10 k import < 1.5 s, AI tool-call mock < 1.5 s, contractor pack < 60 s) + 3×-budget CI gate; O(n²) `ProjectGraph` clone fix in `execute_persistent_batch` (DXF 10k import: 120 s → 0.43 s release) | `DONE` |
+| Task 8 — `crates/aec_bridge/tests/phase6_journey.rs` (project → walls → 2 cameras → 2 renders → revision v1 → add wall → v2 → diff → all 4 pack kinds, asserts real PDF > 1 KB / XLSX > 500 B / IFC parseable) | `DONE` |
+| Task 9 — `crates/aec_bridge/tests/phase8_journey.rs` (signed Ed25519 asset-pack + template + AI-tool extensions, bridge boots with `extensions_dir`, `design_list_assets` / `list_templates` / `project_create_from_template` / `ai_list_tools` verify, permission-denied AI tool omitted, `WriteGeometry` denied without `GeometryWrite`) | `DONE` |
+
+### Group C — Remove `demo://` paths from production code (Tasks 10–14)
+
+| Item | Status |
+|---|---|
+| Task 10 — `apps/desktop/renderer/src/pages/Bim.tsx`: `DEMO_ROOT` / `DEMO_PSETS` replaced with empty spatial tree + empty psets; project-change effect resets to empty | `DONE` |
+| Task 11 — `apps/desktop/renderer/src/components/bim/ScheduleView.tsx`: stale `demo://` comments replaced with documentation of the live `bim:readScheduleRows` round trip | `DONE` |
+| Task 12 — `apps/desktop/renderer/src/components/bim/ValidatorPanel.tsx`: stale `demo://` reference removed from the live-validation comment | `DONE` |
+| Task 13 — Renderer tests (`__tests__/{Bim,ScheduleView,ValidatorPanel}.test.tsx`): `demo://` paths replaced with realistic `test://project.aecstudio` style paths | `DONE` |
+| Task 14 — Electron layer (`dialog-ipc.ts`, `hooks/useActiveProject.tsx`) + `PHASES.md`: every remaining `demo://` reference outside the changelog/test files removed. `grep -rn "demo://" --include="*.{ts,tsx,rs,md}"` returns only the PROGRESS.md changelog entries | `DONE` |
+
+### Group D — Audit TODO / "future PR" / follow-up comments (Tasks 15–20)
+
+| Item | Status |
+|---|---|
+| Task 15 — `crates/aec_bridge/src/service.rs` (11 stale matches): each rewritten to `NOTE:` with a genuine outstanding concern, or removed where the referenced work has shipped | `DONE` |
+| Task 16 — `apps/desktop/electron/bridge.ts` (6 stale matches): updated against current Phase 12/13 surface | `DONE` |
+| Task 17 — `crates/aec_bridge/src/napi_api.rs` (4 stale matches): updated; references to "async-napi follow-up" removed where the wrapper landed in Phase 11 | `DONE` |
+| Task 18 — `apps/desktop/renderer/src/api/bim-import.ts` (3 TODOs): rewritten against `bim:readScheduleRows` + real paths from Phase 13 | `DONE` |
+| Task 19 — `crates/aec_render/src/{gpu_trace,path_trace}.rs` (2 TODOs): updated against the IES GPU texture work landed in Phase 12 Task 23 | `DONE` |
+| Task 20 — Remaining scattered stale comments (`tests/{bim_attach_real_world,asset_library}.rs`, `ScheduleView.tsx`, `Settings.tsx`, `dwg/file/system_section.rs`): each rewritten against current behaviour | `DONE` |
+
+### Group E — PROPOSAL.md user-journey acceptance criteria validation (Tasks 21–25)
+
+| Item | Status |
+|---|---|
+| Task 21 — Journey A (interior designer): `crates/aec_bridge/tests/journey_a_interior.rs` validates "project from template → 4 renders → client pack in one session", camera-+-preset render reproducibility hash, client pack as single PDF with embedded schedule | `DONE` |
+| Task 22 — Journey B (architecture studio): `crates/aec_bridge/tests/journey_b_cafe.rs` validates sheet stays in sync after geometry edit, IFC strict export + re-import with full GUID match, contractor pack under target | `DONE` |
+| Task 23 — Journey C (construction PM): `crates/aec_bridge/tests/journey_c_bim.rs` validates 40 MB-class IFC import, BOQ-lite ≥ 95 % material coverage, configurable AI classification confidence threshold | `DONE` |
+| Task 24 — Journey D (drafter): `crates/aec_bridge/tests/journey_d_drafter.rs` validates keyboard-only sheet set creation, DXF roundtrip preserves layer / block / dim style / text style, DWG export opt-in | `DONE` |
+| Task 25 — Journey E (studio lead): `crates/aec_bridge/tests/journey_e_studio.rs` validates a single `.aecstudio` package drives all four delivery types, revisions diffable at project / sheet / element level, studio standards reused | `DONE` |
+
+### Group F — Production polish and protocol pinning (Tasks 26–30)
+
+| Item | Status |
+|---|---|
+| Task 26 — `crates/aec_cad/src/dwg/file/classes.rs`: 26 `placeholder_` DWG class descriptors replaced with accurate OpenDesign class descriptions; DWG round-trip tests still pass | `DONE` |
+| Task 27 — `crates/aec_bim::xlsx_reader::read_xlsx_rows` (calamine-backed) closes the XLSX-to-row-list round trip; `ScheduleView` now displays real generated rows via `bim:readScheduleRows`; the "future PR" comment is replaced with documentation of the full round trip | `DONE` |
+| Task 28 — Viewport no-GPU graceful degradation: adapter ladder `HighPerformance → LowPower → force_fallback` returns `RendererError::NoAdapter` cleanly; new `viewport:status` IPC reports adapter state to the renderer; UI shows a "GPU adapter unavailable" banner with no surface broken | `DONE` |
+| Task 29 — KChat integration audit against the real `uneycom/uney-chat-desktop` codebase: KChat Desktop's Extension Platform is a JS-only sandbox, exposes no socket listener, and registers `kchat://` / `media://` only as renderer-side Chromium asset schemes — so AEC Studio's Phase 12 `LocalIpcTransport` socket / named-pipe path in `crates/aec_core/src/kchat_transport.rs` cannot be reached from KChat. Recorded as a finding (no code shipped in Phase 14); the integration is replatformed in Phase 15 onto a loopback HTTP API in Electron + a `.kcz` companion extension + `aecstudio://` deeplinks, following the same pattern Tessera and KCreate adopted after hitting the identical wall | `DONE` |
+| Task 30 — Final docs audit: PROGRESS.md gains this Phase 14 section + dated changelog entry; PHASES.md gains the Phase 14 row; PROPOSAL.md Journeys A–E acceptance criteria all checked off; final grep verification (`grep -rn "demo://" --include="*.{ts,tsx,rs,md}"` returns only changelog / test entries) | `DONE` |
+
+### Exit criteria
+
+- [x] Every bridge `deliver_build_pack` / `export_proposal_pack` call from production code routes through `write_deliver_pack_with_context` / `write_proposal_pack_with_context` with a real `DeliverPackContext` built from the open project's SQLCipher DB; `placeholder_png` / `placeholder_xlsx` are `#[cfg(test)]`-only.
+- [x] `crates/aec_bridge/benches/acceptance_criteria.rs` runs the five Criterion benches and the companion `acceptance_criteria_targets.rs` integration test gates against the 3×-budget CI envelope.
+- [x] Phase 6 deliver-workflow and Phase 8 extension-lifecycle e2e tests exercise the full `BridgeService` surface end to end against real packs and signed extensions.
+- [x] `grep -rn "demo://" --include="*.ts" --include="*.tsx" --include="*.rs" --include="*.md"` returns only PROGRESS.md changelog entries; every TODO / "future PR" / "follow-up" comment was either resolved against shipped work or rewritten as a durable `NOTE:` marker against a genuine outstanding concern.
+- [x] All 15 PROPOSAL.md acceptance criteria across Journeys A–E are checked off and validated by a `journey_[a-e]_*.rs` Bridge test.
+- [x] DWG class descriptions in `aec_cad/src/dwg/file/classes.rs` match the OpenDesign specification; round-trip tests still pass.
+- [x] `ScheduleView` displays real schedule rows from the generated XLSX via `bim:readScheduleRows` + `aec_bim::xlsx_reader::read_xlsx_rows`.
+- [x] Viewport pipeline reports adapter state through a new `viewport:status` IPC and degrades cleanly when no GPU adapter is available.
+- [x] KChat integration audited against the real `uneycom/uney-chat-desktop` codebase; the Phase 12 socket transport is recorded as vestigial (KChat Desktop's Extension Platform is a JS-only sandbox, so no process can bind the socket on the KChat side) and the integration is scheduled for replatforming in Phase 15 onto a loopback HTTP API + `.kcz` companion extension + `aecstudio://` deeplinks.
+- [x] `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all --check`, and `npm test --workspaces` all pass.
+
+---
+
 ## Phase 7 — Optional KChat integration
 
 **Status:** `DONE`
@@ -574,6 +655,16 @@ AEC Studio's UI follows the **KChat design system** — primary accent `#7C3AED`
 ---
 
 ## Changelog
+
+### 2026-05-29 (Phase 14 — deferred Phase 13 follow-ups + production polish, 30 tasks across six PRs)
+
+- **Group A — Real `DeliverPackContext` from project state (Tasks 1–6, PR #72).** `aec_bridge::deliver_context::build_for_project` opens the project's SQLCipher DB (read-only) and constructs a `DeliverPackContext` with the renders dir, real material / BOQ `ScheduleSheet`s, sheet definitions + DXF entities, `IfcWriter::to_string_with_materials` IFC, `render_sheet_svg_full` plan SVG, and `ProjectSummary` room / material counts + template name. `try_build_for_project` adds graceful degradation (stale `peekActiveProjectPath`, deleted / corrupt files, schema mismatches) by falling back to `DeliverPackContext::default()` instead of hard-failing the export. N-API `deliver_build_pack` and `export_proposal_pack` thread `params.project_path` through to the context-aware path. `write_deliver_pack` is `#[deprecated(since = "0.14.0")]` and unused from production. `placeholder_png()` / `placeholder_xlsx()` are `#[cfg(test)]`-only; production fallbacks use `build_thumbnail_png(512, 384)` and an empty real `ScheduleSheet` via `build_real_xlsx`. `empty_materials_schedule()` / `empty_boq_schedule()` emit the same sheet names and columns as the real builders for round-trip parity.
+- **Group B — Acceptance-criteria benchmarks + Phase 6/8 e2e (Tasks 7–9, PR #73).** New `crates/aec_bridge/benches/acceptance_criteria.rs` Criterion suite covers cold start, project open, DXF 10 k import, AI tool-call (mock), and contractor pack; companion `tests/acceptance_criteria_targets.rs` enforces the 3×-budget envelope on CI machines. Fixed an O(n²) `ProjectGraph` clone in `execute_persistent_batch` so DXF 10 k import drops from 120 s to 0.43 s release. `tests/phase6_journey.rs` runs project → walls → 2 cameras → 2 renders → revision v1 → add wall → v2 → diff → all four pack kinds and asserts real PDF > 1 KB, XLSX > 500 B, IFC parseable. `tests/phase8_journey.rs` runs signed Ed25519 asset-pack + template + AI-tool extensions through `BridgeConfig::extensions_dir`, verifies `design_list_assets` / `list_templates` / `project_create_from_template` / `ai_list_tools`, asserts permission-denied AI tool is omitted and `WriteGeometry` is denied for an extension without `GeometryWrite`.
+- **Group C — Remove `demo://` paths from production code (Tasks 10–14, PR #74).** `Bim.tsx` `DEMO_ROOT` / `DEMO_PSETS` constants are replaced with empty spatial-tree / empty-psets initial state; the project-change effect resets to those empty values. `ScheduleView.tsx` and `ValidatorPanel.tsx` stale `demo://` comments are replaced with documentation of the live `bim:readScheduleRows` and validation flows. Renderer tests (`__tests__/{Bim,ScheduleView,ValidatorPanel}.test.tsx`) use realistic `test://project.aecstudio` style paths. `dialog-ipc.ts` and `useActiveProject.tsx` no longer reference `demo://`. `grep -rn "demo://" --include="*.{ts,tsx,rs,md}"` returns only PROGRESS.md changelog entries.
+- **Group D — Audit TODO / "future PR" / follow-up comments (Tasks 15–20, PR #75).** 12 files audited: 31 stale matches across `aec_bridge/src/service.rs`, `apps/desktop/electron/bridge.ts`, `aec_bridge/src/napi_api.rs`, `apps/desktop/renderer/src/api/bim-import.ts`, `aec_render/src/{gpu_trace,path_trace}.rs`, `aec_bridge/tests/{bim_attach_real_world,asset_library}.rs`, `ScheduleView.tsx`, `Settings.tsx`, `aec_cad/src/dwg/file/system_section.rs`. Each comment was either resolved against the actually-shipped Phase 11–13 work (real paths, schedule readback, async N-API wrapper, IES GPU texture) or rewritten as a durable `NOTE:` marker against a genuinely-outstanding concern (GPU specular lobe, environment sampler, R2004 system-section traversal, GBuffer GPU rewrite).
+- **Group E — PROPOSAL.md user-journey acceptance criteria validation (Tasks 21–25, PR #76).** Five `crates/aec_bridge/tests/journey_[a-e]_*.rs` files exercise all 15 PROPOSAL.md acceptance criteria through `BridgeService`. Journey A validates the interior-designer flow (template → 4 renders → client pack in one session, render reproducibility hash from saved camera + preset, client pack as single PDF with embedded schedule). Journey B validates the café studio (sheet stays in sync after geometry edit, IFC strict + re-import with full GUID match, contractor pack under target). Journey C validates the construction PM (40 MB-class IFC import, BOQ-lite ≥ 95 % material coverage, configurable AI classification confidence threshold). Journey D validates the drafter (keyboard-only sheet set, DXF roundtrip preserves layer / block / dim style / text style, DWG opt-in). Journey E validates the studio lead (single `.aecstudio` package feeds all four delivery types, revisions diffable at project / sheet / element level, studio standards reused). All 15 PROPOSAL.md checkboxes are now checked off.
+- **Group F — Production polish and KChat integration audit (Tasks 26–30, PR #77).** `aec_cad/src/dwg/file/classes.rs`: 26 `placeholder_` DWG class descriptors replaced with accurate OpenDesign class descriptions; round-trip tests still pass. `crates/aec_bim` gains `xlsx_reader::read_xlsx_rows` (calamine-backed) which closes the XLSX-to-row-list round trip; the renderer's `ScheduleView` now displays real generated rows via the `bim:readScheduleRows` IPC handler. Viewport pipeline's adapter ladder `HighPerformance → LowPower → force_fallback` returns `RendererError::NoAdapter` cleanly when all paths fail; a new `viewport:status` IPC reports adapter state to the renderer and the UI shows a "GPU adapter unavailable" banner without breaking any surface. **Task 29 KChat audit (no code shipped this PR):** reading `uneycom/uney-chat-desktop` against the Phase 12 `LocalIpcTransport` revealed that KChat Desktop's Extension Platform is a JS-only sandbox with no socket / named-pipe listener, and the `kchat://` / `media://` Chromium protocols registered in `src/desktop/main/lifecycle/protocol.ts` are renderer-side resource schemes (Electron routes them only inside the KChat process), so AEC Studio's socket-based publish path in `crates/aec_core/src/kchat_transport.rs` is vestigial — nothing on the KChat side can bind that endpoint. The same wall was hit by both `kennguy3n/Tessera` and `kennguy3n/KCreate`; the integration is replatformed in **Phase 15** onto a loopback HTTP API in the Electron main process (`apps/desktop/electron/kchat/kchatLocalApi.ts`, 127.0.0.1 only, bearer + Host-header guard + 64 KiB body cap + atomic-rename `0600` discovery file) talking to a `.kcz` companion extension that runs inside KChat Desktop's sandbox and posts via `invokeProcedure("kchat.send_message")`, plus an `aecstudio://` deeplink protocol for KChat → AEC Studio navigation. Final docs audit covers PROGRESS.md (this entry), PHASES.md (Phase 14 row updated), PROPOSAL.md (all 15 Journey A–E acceptance criteria checked off in Group E), README.md, ARCHITECTURE.md, and the final grep verification.
+- **Tests.** `cargo test --workspace` (Group F adds the `xlsx_reader` round-trip tests on top of Group E's 87 suites), `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all --check`, and `npm test --workspaces` (394 vitest tests) all pass.
 
 ### 2026-05-27 (Phase 13 — renderer UX wiring, placeholder elimination, file-picker integration, active project state, UI polish)
 

@@ -295,6 +295,79 @@ fn bim_generate_schedule_rejects_unknown_kind() {
 }
 
 #[test]
+fn bim_read_schedule_rows_round_trips_generated_xlsx() {
+    // Closes the XLSX-to-row-list round trip exercised by the
+    // renderer's `ScheduleView` after Phase 13 Task 2 / Phase 14
+    // Task 27: `bim_generate_schedule` writes the XLSX, then
+    // `bim_read_schedule_rows` reads it back so the table can
+    // display real row data. Without this test, the writer and
+    // reader could drift silently (e.g. a future change to
+    // `ScheduleSheet::write_xlsx` that adds a metadata row at
+    // index 0 would break readback without any cargo-side gate
+    // firing).
+    let (s, _g) = service();
+    let (src_path, _src_dir) = write_fixture();
+    let out_dir = tempfile::tempdir().unwrap();
+
+    for kind in &["door", "window", "room", "material"] {
+        let out_path = out_dir.path().join(format!("{kind}.xlsx"));
+        let out_path_str = out_path.to_string_lossy().into_owned();
+        let summary = s
+            .bim_generate_schedule(&src_path, kind, &out_path_str)
+            .unwrap();
+        let readback = s.bim_read_schedule_rows(&out_path_str).unwrap();
+        // Header column count matches the writer's column count.
+        assert_eq!(
+            readback.header.len(),
+            summary.columns as usize,
+            "{kind} header length should match writer columns"
+        );
+        // Row count matches what the writer reported. The fixture
+        // schedules may have zero rows for some kinds; readback
+        // must report the same count rather than silently
+        // dropping or duplicating.
+        assert_eq!(
+            readback.rows.len(),
+            summary.rows as usize,
+            "{kind} readback row count should match writer rows"
+        );
+        // Every row has exactly `header.len()` cells with the
+        // header names as keys — the renderer relies on this
+        // shape to render a uniform table.
+        for (idx, row) in readback.rows.iter().enumerate() {
+            assert_eq!(
+                row.len(),
+                readback.header.len(),
+                "{kind} row {idx} should have header.len() cells"
+            );
+            for col in &readback.header {
+                assert!(
+                    row.contains_key(col),
+                    "{kind} row {idx} missing column {col}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn bim_read_schedule_rows_typed_error_on_missing_file() {
+    // Drift guard: the renderer maps the bridge's error message to
+    // a user-facing toast. The `read_schedule_rows:` prefix is
+    // load-bearing for our own log filtering, so assert it
+    // explicitly rather than just `unwrap_err`.
+    let (s, _g) = service();
+    let err = s
+        .bim_read_schedule_rows("/this/path/does/not/exist/missing.xlsx")
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("read_schedule_rows:"),
+        "expected `read_schedule_rows:` prefix, got: {msg}"
+    );
+}
+
+#[test]
 fn bim_export_ifc_errors_on_missing_source() {
     let (s, _g) = service();
     let out_dir = tempfile::tempdir().unwrap();

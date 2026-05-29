@@ -248,8 +248,11 @@ export function registerIpcHandlers(): void {
   // wrote during `bim_generate_schedule` and returns the rows so
   // the renderer's `ScheduleView` can display them without having
   // to re-read the file from the renderer process. The bridge
-  // crate already exposes a `read_schedule_rows` helper; this
-  // handler is a thin wrapper that validates the path.
+  // service routes through `bim_read_schedule_rows`, which in turn
+  // calls `aec_bim::xlsx_reader::read_xlsx_rows_with_header` (pure-
+  // Rust OOXML reader, no native deps). This handler is a thin
+  // wrapper that validates the `xlsxPath` and lets the service
+  // surface read errors via the existing IPC error envelope.
   ipcMain.handle("bim:readScheduleRows", async (_e, p) => {
     assertObject(p, "params");
     const xlsxPath = (p as { xlsxPath?: unknown }).xlsxPath;
