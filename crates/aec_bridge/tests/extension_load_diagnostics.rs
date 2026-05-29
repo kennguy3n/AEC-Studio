@@ -123,7 +123,10 @@ fn bridge_boot_buffers_per_extension_load_failures() {
         "unexpected stage for 02_bad_permission: {stage1}"
     );
     assert!(
-        diags[1].path.to_string_lossy().contains("02_bad_permission"),
+        diags[1]
+            .path
+            .to_string_lossy()
+            .contains("02_bad_permission"),
         "unexpected path: {:?}",
         diags[1].path
     );
