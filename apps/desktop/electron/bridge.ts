@@ -609,10 +609,15 @@ export interface BridgeBackend {
   // ----- KChat (Phase 12) -----
 
   /**
-   * Current KChat connection status. Returns the publisher kind
-   * (`local_ipc` for a discovered KChat Desktop instance,
-   * `in_memory` for the fallback) and the connection state
-   * (`connected` / `reconnecting` / `disconnected`).
+   * Current KChat connection status. Phase 15 returns the
+   * loopback HTTP API state — server up + bound port + most
+   * recent extension heartbeat — instead of the Phase 12
+   * socket-path probe result.
+   *
+   * `publisherKind` is `loopback_http` when the Electron main
+   * process is hosting the loopback API (the production
+   * arrangement), or `in_memory` for tests / headless builds
+   * where the API was not stood up.
    */
   kchatStatus(): Promise<KChatStatusReport>;
   /** Re-run discovery and rebuild the publisher. */
@@ -643,11 +648,32 @@ export interface BridgeBackend {
   viewportRequestFrame(): Promise<ViewportFrameReport>;
 }
 
-/** Renderer-facing KChat connection status. */
+/**
+ * Renderer-facing KChat connection status.
+ *
+ * Phase 15 replaced the Phase 12 socket / named-pipe transport
+ * with a loopback HTTP API the `.kcz` extension installed in
+ * KChat Desktop talks to. The publisherKind reflects the
+ * runtime arrangement:
+ *
+ *   - `loopback_http`: the Electron main process is hosting the
+ *     loopback API (default for production). `instanceJson`
+ *     carries the renderer-side snapshot (server running,
+ *     port, last extension heartbeat, queue depth).
+ *   - `in_memory`: tests / headless builds where the loopback
+ *     API is not stood up; publishes are kept in process for
+ *     unit-test inspection.
+ */
 export interface KChatStatusReport {
   state: "connected" | "reconnecting" | "disconnected";
-  publisherKind: "local_ipc" | "in_memory";
-  /** Discovered instance JSON, when `publisherKind` is `local_ipc`. */
+  publisherKind: "loopback_http" | "in_memory";
+  /**
+   * JSON-encoded snapshot of the loopback API state when
+   * `publisherKind` is `loopback_http`. Shape:
+   *   { apiServerRunning, apiServerPort, portFilePath,
+   *     lastExtensionContactAt, queuedPublishCount,
+   *     reviewThreadCount }
+   */
   instanceJson?: string | null;
   /**
    * Per-project default thread id sourced from the active project's

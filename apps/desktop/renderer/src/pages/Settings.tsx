@@ -45,8 +45,8 @@ export function Settings() {
   const [error, setError] = useState<string | null>(null);
   const [kchatStatus, setKchatStatus] = useState<{
     state: "connected" | "reconnecting" | "disconnected";
-    publisherKind: "local_ipc" | "in_memory";
-    instance: { socket_path: string; version: string; health: string } | null;
+    publisherKind: "loopback_http" | "in_memory";
+    instance: KChatLoopbackInstance | null;
   } | null>(null);
   const [kchatReloading, setKchatReloading] = useState(false);
   // Surfaces the last `kchat:reload` failure inline next to the
@@ -289,7 +289,7 @@ export function Settings() {
           data-testid="settings-kchat-instance"
         >
           {kchatStatus === null ? (
-            <p>Checking for KChat Desktop…</p>
+            <p>Checking for KChat Desktop&hellip;</p>
           ) : kchatStatus.instance ? (
             <ul>
               <li>
@@ -299,19 +299,38 @@ export function Settings() {
                 Connection: <code>{kchatStatus.state}</code>
               </li>
               <li>
-                Socket: <code>{kchatStatus.instance.socket_path}</code>
+                Loopback API:{" "}
+                <code>
+                  {kchatStatus.instance.apiServerRunning
+                    ? `127.0.0.1:${kchatStatus.instance.apiServerPort ?? "?"}`
+                    : "not running"}
+                </code>
               </li>
               <li>
-                Version: <code>{kchatStatus.instance.version}</code>
+                Port file:{" "}
+                <code>{kchatStatus.instance.portFilePath ?? "\u2014"}</code>
               </li>
               <li>
-                Health: <code>{kchatStatus.instance.health}</code>
+                Extension heartbeat:{" "}
+                <code>
+                  {kchatStatus.instance.lastExtensionContactAt ??
+                    "never (not yet seen this session)"}
+                </code>
+              </li>
+              <li>
+                Publish queue:{" "}
+                <code>{kchatStatus.instance.queuedPublishCount} card(s)</code>
+              </li>
+              <li>
+                Review threads:{" "}
+                <code>{kchatStatus.instance.reviewThreadCount}</code>
               </li>
             </ul>
           ) : (
             <p>
-              No KChat Desktop instance detected on this machine. AEC
-              Studio will use the in-memory fallback publisher.
+              The loopback API is not running on this process. Install
+              the AEC Studio companion extension inside KChat Desktop
+              and restart AEC Studio to enable publishing.
             </p>
           )}
           <button
@@ -362,23 +381,51 @@ export function Settings() {
 
 export default Settings;
 
-function parseKChatInstance(json: string | null | undefined): {
-  socket_path: string;
-  version: string;
-  health: string;
-} | null {
+/**
+ * Phase 15: shape of the JSON snapshot returned in
+ * `KChatStatusReport.instanceJson` for the `loopback_http`
+ * publisher. Mirrors `KchatRendererSnapshot` from
+ * `apps/desktop/electron/kchat/kchatAppState.ts` exactly so a
+ * field addition there surfaces here as a type error rather
+ * than a silent `undefined` lookup.
+ */
+export interface KChatLoopbackInstance {
+  apiServerRunning: boolean;
+  apiServerPort: number | null;
+  portFilePath: string | null;
+  lastExtensionContactAt: string | null;
+  queuedPublishCount: number;
+  reviewThreadCount: number;
+}
+
+function parseKChatInstance(
+  json: string | null | undefined,
+): KChatLoopbackInstance | null {
   if (!json) return null;
   try {
-    const parsed = JSON.parse(json) as {
-      socket_path?: string;
-      version?: string;
-      health?: string;
-    };
-    if (!parsed.socket_path || !parsed.version) return null;
+    const parsed = JSON.parse(json) as Partial<KChatLoopbackInstance>;
+    // The four numeric / boolean fields must be present; the
+    // string fields are nullable on the wire so we accept null
+    // / undefined / missing equivalently.
+    if (
+      typeof parsed.apiServerRunning !== "boolean" ||
+      typeof parsed.queuedPublishCount !== "number" ||
+      typeof parsed.reviewThreadCount !== "number"
+    ) {
+      return null;
+    }
     return {
-      socket_path: parsed.socket_path,
-      version: parsed.version,
-      health: parsed.health ?? "unknown",
+      apiServerRunning: parsed.apiServerRunning,
+      apiServerPort:
+        typeof parsed.apiServerPort === "number" ? parsed.apiServerPort : null,
+      portFilePath:
+        typeof parsed.portFilePath === "string" ? parsed.portFilePath : null,
+      lastExtensionContactAt:
+        typeof parsed.lastExtensionContactAt === "string"
+          ? parsed.lastExtensionContactAt
+          : null,
+      queuedPublishCount: parsed.queuedPublishCount,
+      reviewThreadCount: parsed.reviewThreadCount,
     };
   } catch {
     return null;

@@ -2737,6 +2737,15 @@ pub struct KChatIngestResultJs {
 }
 
 fn kchat_status_to_js(rep: crate::kchat_state::KChatStatusReport) -> KChatStatusJs {
+    // Phase 15: the loopback-API snapshot (port, port-file path,
+    // extension heartbeat, queue depth) is owned by the Electron
+    // main process, not by the Rust bridge — so `instance` on the
+    // Rust side is always `None`. The Electron `kchat:status`
+    // IPC handler synthesises the loopback snapshot directly from
+    // `kchatAppState.ts` and bypasses this napi export for the
+    // production path. We still serialise any payload that might
+    // be there (future Rust-side loopback client) for forward
+    // compatibility.
     let instance_json = rep
         .instance
         .as_ref()

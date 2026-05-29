@@ -1334,11 +1334,15 @@ pub struct BridgeService {
     /// touch only the diff registry. See `crate::ai_state` module
     /// doc for the full concurrency rationale.
     ai_state: AiState,
-    /// Process-wide KChat publisher state. Holds either a
-    /// [`aec_core::LocalIpcPublisher`] (when a KChat Desktop
-    /// instance is discovered on the box) or an
-    /// [`aec_core::InMemoryPublisher`] fallback. See
-    /// [`crate::kchat_state`] for the publisher-selection rationale.
+    /// Process-wide KChat accounting state. In Phase 15 the
+    /// in-process publisher is always an
+    /// [`aec_core::InMemoryPublisher`] — the real publisher is the
+    /// loopback HTTP API hosted by the Electron main process (see
+    /// `apps/desktop/electron/kchat/kchatLocalApi.ts`). The state
+    /// owns the per-project enable flag, the default-thread cache,
+    /// and a `loopback_http` / `in_memory` publisher-kind marker
+    /// the Electron host promotes via
+    /// [`crate::kchat_state::KChatState::mark_loopback_active`].
     kchat_state: crate::kchat_state::KChatState,
     /// Real-time viewport service. Owns the wgpu device, the four
     /// core render pipelines, and the off-screen surface. See

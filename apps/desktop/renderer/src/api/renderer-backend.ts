@@ -630,6 +630,17 @@ function kchatMock(newId: (prefix: string) => string) {
       commentsJson: "[]",
       cardsJson: "[]",
     }),
+    // Phase 15: vitest contexts never have a real KChat Desktop
+    // running, so deeplink open requests + inbound deeplinks are
+    // no-ops. We deliberately return a rate_limited-looking
+    // shape rather than `{ ok: true }` so renderer code that
+    // surfaces "opened" feedback doesn't trigger a misleading
+    // toast in headless tests.
+    openInDesktop: async (_params: { url: string }) => ({
+      ok: false as const,
+      reason: "scheme_not_allowed" as const,
+    }),
+    onDeeplink: (_cb: (route: never) => void) => () => undefined,
   } satisfies AecApi["kchat"];
 }
 

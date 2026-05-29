@@ -7,6 +7,12 @@ import {
   setActiveProject,
   setActiveProjectIfMatchesActive,
 } from "./active-project";
+import {
+  enqueuePublish,
+  getKchatRendererSnapshot,
+  getReviewCommentsForThread,
+} from "./kchat/kchatAppState";
+import { openKchatDeeplink } from "./kchat/kchatOutboundDeeplink";
 
 /**
  * Register every IPC handler the preload bridge expects. Handlers are
@@ -586,23 +592,94 @@ export function registerIpcHandlers(): void {
   // ----- Runtime -----
   ipcMain.handle("runtime:status", async () => getBridge().runtimeStatus());
 
-  // ----- KChat (Phase 12) -----
-  ipcMain.handle("kchat:status", async () => getBridge().kchatStatus());
-  ipcMain.handle("kchat:reload", async () => getBridge().kchatReload());
+  // ----- KChat (Phase 15: loopback HTTP + .kcz extension) -----
+  //
+  // Phase 12's socket / named-pipe transport is gone. The
+  // Electron main process now hosts a loopback HTTP API on
+  // 127.0.0.1 that the `.kcz` extension installed in KChat
+  // Desktop talks to (see `kchat/kchatLocalApi.ts`). These IPC
+  // handlers route the renderer-facing surface through the
+  // Electron-side `kchatAppState` singleton; the Rust bridge's
+  // KChat methods are kept for in-process tests / fallback only.
+  ipcMain.handle("kchat:status", async () => {
+    const snap = getKchatRendererSnapshot();
+    // Decide connection state from the heartbeat freshness.
+    // "connected" means the extension has called any
+    // authenticated route within the last 30 s (an entire
+    // extension activation cycle); "reconnecting" means the
+    // server is up but the extension has not yet been heard
+    // from this session; "disconnected" means the server itself
+    // is down (boot failure).
+    const FRESH_MS = 30_000;
+    const nowMs = Date.now();
+    const lastMs =
+      snap.lastExtensionContactAt === null
+        ? null
+        : Date.parse(snap.lastExtensionContactAt);
+    let state: "connected" | "reconnecting" | "disconnected";
+    if (!snap.apiServerRunning) {
+      state = "disconnected";
+    } else if (lastMs !== null && nowMs - lastMs < FRESH_MS) {
+      state = "connected";
+    } else {
+      state = "reconnecting";
+    }
+    return {
+      state,
+      publisherKind: "loopback_http" as const,
+      instanceJson: JSON.stringify({
+        apiServerRunning: snap.apiServerRunning,
+        apiServerPort: snap.apiServerPort,
+        portFilePath: snap.portFilePath,
+        lastExtensionContactAt: snap.lastExtensionContactAt,
+        queuedPublishCount: snap.queuedPublishCount,
+        reviewThreadCount: snap.reviewThreadCount,
+      }),
+      defaultThreadId: null,
+    };
+  });
+  ipcMain.handle("kchat:reload", async () => {
+    // In Phase 15 there is nothing to "reload" at the transport
+    // layer — the loopback API has no upstream connection to
+    // re-establish. Reload is now a synonym for "snapshot the
+    // current status"; the renderer keeps the affordance for
+    // backward compatibility (the Settings card's "Re-detect"
+    // button maps to this).
+    const snap = getKchatRendererSnapshot();
+    return {
+      state: snap.apiServerRunning ? "reconnecting" : "disconnected",
+      publisherKind: "loopback_http" as const,
+      instanceJson: JSON.stringify({
+        apiServerRunning: snap.apiServerRunning,
+        apiServerPort: snap.apiServerPort,
+        portFilePath: snap.portFilePath,
+        lastExtensionContactAt: snap.lastExtensionContactAt,
+        queuedPublishCount: snap.queuedPublishCount,
+        reviewThreadCount: snap.reviewThreadCount,
+      }),
+      defaultThreadId: null,
+    };
+  });
   ipcMain.handle("kchat:publish", async (_e, params) => {
     assertObject(params, "params");
     const cardJson = (params as { cardJson?: unknown }).cardJson;
     assertString(cardJson, "cardJson");
-    // Surface obviously-broken payloads at the IPC boundary so the
-    // caller gets a descriptive error rather than a generic
-    // GenericFailure from `serde_json::from_str` on the Rust side.
+    // Surface obviously-broken payloads at the IPC boundary so
+    // the caller gets a descriptive error rather than a generic
+    // failure when the .kcz extension later tries to publish.
+    let card: { id?: unknown; threadId?: unknown; body?: unknown };
     try {
       const parsed = JSON.parse(cardJson) as unknown;
-      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      if (
+        parsed === null ||
+        typeof parsed !== "object" ||
+        Array.isArray(parsed)
+      ) {
         throw new Error(
           "kchatPublish: cardJson must encode an object (ArtifactCard)",
         );
       }
+      card = parsed as { id?: unknown; threadId?: unknown; body?: unknown };
     } catch (err) {
       if (err instanceof SyntaxError) {
         throw new Error(
@@ -611,22 +688,62 @@ export function registerIpcHandlers(): void {
       }
       throw err;
     }
-    return getBridge().kchatPublish({ cardJson });
+    if (typeof card.id !== "string" || card.id.length === 0) {
+      throw new Error("kchatPublish: cardJson.id is required");
+    }
+    if (typeof card.threadId !== "string" || card.threadId.length === 0) {
+      throw new Error("kchatPublish: cardJson.threadId is required");
+    }
+    if (typeof card.body !== "string") {
+      throw new Error("kchatPublish: cardJson.body is required");
+    }
+    const queued = enqueuePublish({
+      cardId: card.id,
+      threadId: card.threadId,
+      body: card.body,
+      cardJson,
+    });
+    // Mirror the Phase 12 return shape so the renderer / tests
+    // don't have to change. `messageId` is the cardId until the
+    // extension reports the real KChat message id via
+    // POST /api/publish-to-thread; the renderer uses the
+    // messageId only as a correlation handle, never as a key.
+    return {
+      messageId: queued.cardId,
+      threadId: queued.threadId,
+      publishedAt: queued.queuedAt,
+    };
   });
   ipcMain.handle("kchat:ingestReviews", async (_e, params) => {
     assertObject(params, "params");
     const threadId = (params as { threadId?: unknown }).threadId;
     assertString(threadId, "threadId");
     const rawSince = (params as { sinceIso?: unknown }).sinceIso;
-    let sinceIso: string | null | undefined;
+    let sinceIso: string | null;
     if (rawSince === undefined || rawSince === null) {
-      sinceIso = rawSince ?? undefined;
+      sinceIso = null;
     } else if (typeof rawSince === "string") {
       sinceIso = rawSince;
     } else {
       throw new Error("kchatIngestReviews: sinceIso must be a string or null");
     }
-    return getBridge().kchatIngestReviews({ threadId, sinceIso });
+    const comments = getReviewCommentsForThread(threadId, sinceIso);
+    return {
+      threadId,
+      // Mirror the Phase 12 envelope (JSON-encoded arrays so the
+      // renderer can keep its existing decoder). `cardsJson` is
+      // empty in Phase 15 — review cards (extra metadata cards
+      // attached to comments) are not yet emitted by the .kcz
+      // extension.
+      commentsJson: JSON.stringify(comments),
+      cardsJson: "[]",
+    };
+  });
+  ipcMain.handle("kchat:openInDesktop", async (_e, params) => {
+    assertObject(params, "params");
+    const url = (params as { url?: unknown }).url;
+    assertString(url, "url");
+    return openKchatDeeplink(url);
   });
 
   // ----- Viewport (Phase 12) -----

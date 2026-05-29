@@ -165,7 +165,7 @@ describe("<Deliver /> KChat thread wiring", () => {
   it("forwards the active project's defaultThreadId to the review panel", async () => {
     vi.spyOn(aec.kchat, "status").mockResolvedValue({
       state: "connected",
-      publisherKind: "local_ipc",
+      publisherKind: "loopback_http",
       instanceJson: null,
       defaultThreadId: "thread-from-project",
     });
@@ -193,7 +193,7 @@ describe("<Deliver /> KChat thread wiring", () => {
   it("falls back to 'kchat-default' when no project thread is set", async () => {
     vi.spyOn(aec.kchat, "status").mockResolvedValue({
       state: "connected",
-      publisherKind: "local_ipc",
+      publisherKind: "loopback_http",
       instanceJson: null,
       defaultThreadId: null,
     });
@@ -677,7 +677,7 @@ describe("<Deliver /> per-project state reset on project switch", () => {
       if (mockActiveProjectPath === "/tmp/threadResetB.aecstudio") {
         return Promise.resolve({
           state: "connected" as const,
-          publisherKind: "local_ipc" as const,
+          publisherKind: "loopback_http" as const,
           instanceJson: null,
           defaultThreadId: "thread-B",
         });
@@ -685,14 +685,14 @@ describe("<Deliver /> per-project state reset on project switch", () => {
       if (mockActiveProjectPath === "/tmp/threadResetA.aecstudio") {
         return Promise.resolve({
           state: "connected" as const,
-          publisherKind: "local_ipc" as const,
+          publisherKind: "loopback_http" as const,
           instanceJson: null,
           defaultThreadId: "thread-A",
         });
       }
       return Promise.resolve({
         state: "connected" as const,
-        publisherKind: "local_ipc" as const,
+        publisherKind: "loopback_http" as const,
         instanceJson: null,
         defaultThreadId: null,
       });

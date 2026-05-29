@@ -111,9 +111,12 @@ export function KChatStatusIndicator() {
   };
 
   const instance = parseInstance(status.instanceJson);
+  // Phase 15: surface the loopback API port + heartbeat instead
+  // of the socket path + version. "never" reads better in a
+  // tooltip than the wire-level `null`.
   const baseTitle = instance
-    ? `KChat Desktop ${instance.version} at ${instance.socket_path}`
-    : "No KChat Desktop instance detected";
+    ? `KChat loopback API on 127.0.0.1:${instance.apiServerPort ?? "?"} · last extension heartbeat ${instance.lastExtensionContactAt ?? "never"}`
+    : "KChat loopback API not running";
   const title = reloadError
     ? `Reload failed: ${reloadError}\n\n${baseTitle}`
     : baseTitle;
@@ -138,23 +141,45 @@ export function KChatStatusIndicator() {
   );
 }
 
-function parseInstance(json: string | null): {
-  socket_path: string;
-  version: string;
-  health: string;
-} | null {
+/**
+ * Phase 15: loopback-API snapshot shape returned by
+ * `kchat:status`'s `instanceJson`. Mirrors
+ * `KchatRendererSnapshot` from `kchatAppState.ts`.
+ */
+interface KChatLoopbackInstance {
+  apiServerRunning: boolean;
+  apiServerPort: number | null;
+  portFilePath: string | null;
+  lastExtensionContactAt: string | null;
+  queuedPublishCount: number;
+  reviewThreadCount: number;
+}
+
+function parseInstance(
+  json: string | null,
+): KChatLoopbackInstance | null {
   if (!json) return null;
   try {
-    const parsed = JSON.parse(json) as {
-      socket_path?: string;
-      version?: string;
-      health?: string;
-    };
-    if (!parsed.socket_path || !parsed.version) return null;
+    const parsed = JSON.parse(json) as Partial<KChatLoopbackInstance>;
+    if (
+      typeof parsed.apiServerRunning !== "boolean" ||
+      typeof parsed.queuedPublishCount !== "number" ||
+      typeof parsed.reviewThreadCount !== "number"
+    ) {
+      return null;
+    }
     return {
-      socket_path: parsed.socket_path,
-      version: parsed.version,
-      health: parsed.health ?? "unknown",
+      apiServerRunning: parsed.apiServerRunning,
+      apiServerPort:
+        typeof parsed.apiServerPort === "number" ? parsed.apiServerPort : null,
+      portFilePath:
+        typeof parsed.portFilePath === "string" ? parsed.portFilePath : null,
+      lastExtensionContactAt:
+        typeof parsed.lastExtensionContactAt === "string"
+          ? parsed.lastExtensionContactAt
+          : null,
+      queuedPublishCount: parsed.queuedPublishCount,
+      reviewThreadCount: parsed.reviewThreadCount,
     };
   } catch {
     return null;

@@ -27,13 +27,7 @@ pub mod kchat;
 #[cfg(feature = "kchat")]
 pub mod kchat_config;
 #[cfg(feature = "kchat")]
-pub mod kchat_discovery;
-#[cfg(feature = "kchat")]
 pub mod kchat_sync;
-#[cfg(feature = "kchat")]
-pub mod kchat_transport;
-#[cfg(feature = "kchat")]
-pub mod local_ipc_publisher;
 pub mod manifest;
 pub mod migrations;
 pub mod package;
@@ -56,6 +50,8 @@ pub use extensions::{
     TemplateBody,
 };
 #[cfg(feature = "kchat")]
+pub use kchat::DEFAULT_THREAD_ID;
+#[cfg(feature = "kchat")]
 pub use kchat::{
     ingest_review, ingest_review_card, ApprovalStatus, ArtifactCard, AssetPackEntry,
     AssetPackEntryKind, AssetPackManifest, AssetPackReference, InMemoryPublisher, KChatArtifact,
@@ -64,15 +60,7 @@ pub use kchat::{
 #[cfg(feature = "kchat")]
 pub use kchat_config::{AssetPackPublishOutcome, KChatConfig, KChatIntegration};
 #[cfg(feature = "kchat")]
-pub use kchat_discovery::{KChatDiscovery, KChatInstanceInfo, KCHAT_SOCKET_PATH_ENV};
-#[cfg(feature = "kchat")]
 pub use kchat_sync::CommentSync;
-#[cfg(feature = "kchat")]
-pub use kchat_transport::{
-    IpcRequest, IpcResponse, LocalIpcTransport, DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_IO_TIMEOUT,
-};
-#[cfg(feature = "kchat")]
-pub use local_ipc_publisher::{LocalIpcPublisher, DEFAULT_THREAD_ID};
 pub use manifest::{ProjectManifest, SCHEMA_VERSION};
 pub use package::{ProjectPackage, ProjectSummary, RecentEntry, RecentsStore};
 pub use revision::{

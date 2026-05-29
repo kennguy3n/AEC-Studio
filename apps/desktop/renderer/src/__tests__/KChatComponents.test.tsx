@@ -39,11 +39,14 @@ describe("KChatStatusIndicator", () => {
   it("renders the connected chip with version tooltip", async () => {
     vi.spyOn(aec.kchat, "status").mockResolvedValue({
       state: "connected",
-      publisherKind: "local_ipc",
+      publisherKind: "loopback_http",
       instanceJson: JSON.stringify({
-        socket_path: "/tmp/kchat.sock",
-        version: "1.4.2",
-        health: "ok",
+        apiServerRunning: true,
+        apiServerPort: 52345,
+        portFilePath: "/tmp/kchat.sock",
+        lastExtensionContactAt: "2025-05-29T09:00:00.000Z",
+        queuedPublishCount: 0,
+        reviewThreadCount: 1,
       }),
       defaultThreadId: null,
     });
@@ -55,7 +58,7 @@ describe("KChatStatusIndicator", () => {
     );
     expect(
       screen.getByTestId("kchat-status-chip").getAttribute("title"),
-    ).toContain("1.4.2");
+    ).toContain("127.0.0.1:52345");
   });
 
   it("invokes reload when the chip is clicked", async () => {
@@ -67,11 +70,14 @@ describe("KChatStatusIndicator", () => {
     });
     const reload = vi.spyOn(aec.kchat, "reload").mockResolvedValue({
       state: "connected",
-      publisherKind: "local_ipc",
+      publisherKind: "loopback_http",
       instanceJson: JSON.stringify({
-        socket_path: "/tmp/kchat.sock",
-        version: "2.0.0",
-        health: "ok",
+        apiServerRunning: true,
+        apiServerPort: 52345,
+        portFilePath: "/tmp/kchat.sock",
+        lastExtensionContactAt: "2025-05-29T09:00:00.000Z",
+        queuedPublishCount: 0,
+        reviewThreadCount: 1,
       }),
       defaultThreadId: null,
     });
@@ -240,11 +246,14 @@ describe("KChatReviewPanel", () => {
   it("renders ingested comments when the bridge reports connected", async () => {
     vi.spyOn(aec.kchat, "status").mockResolvedValue({
       state: "connected",
-      publisherKind: "local_ipc",
+      publisherKind: "loopback_http",
       instanceJson: JSON.stringify({
-        socket_path: "/tmp/kchat.sock",
-        version: "1.0.0",
-        health: "ok",
+        apiServerRunning: true,
+        apiServerPort: 52345,
+        portFilePath: "/tmp/kchat.sock",
+        lastExtensionContactAt: "2025-05-29T09:00:00.000Z",
+        queuedPublishCount: 0,
+        reviewThreadCount: 1,
       }),
       defaultThreadId: null,
     });
@@ -293,11 +302,14 @@ describe("KChatReviewPanel", () => {
 
     vi.spyOn(aec.kchat, "status").mockResolvedValue({
       state: "connected",
-      publisherKind: "local_ipc",
+      publisherKind: "loopback_http",
       instanceJson: JSON.stringify({
-        socket_path: "/tmp/kchat.sock",
-        version: "1.0.0",
-        health: "ok",
+        apiServerRunning: true,
+        apiServerPort: 52345,
+        portFilePath: "/tmp/kchat.sock",
+        lastExtensionContactAt: "2025-05-29T09:00:00.000Z",
+        queuedPublishCount: 0,
+        reviewThreadCount: 1,
       }),
       defaultThreadId: null,
     });
@@ -333,11 +345,14 @@ describe("KChatReviewPanel", () => {
   it("resets comments and sinceIso cursor when threadId prop changes", async () => {
     vi.spyOn(aec.kchat, "status").mockResolvedValue({
       state: "connected",
-      publisherKind: "local_ipc",
+      publisherKind: "loopback_http",
       instanceJson: JSON.stringify({
-        socket_path: "/tmp/kchat.sock",
-        version: "1.0.0",
-        health: "ok",
+        apiServerRunning: true,
+        apiServerPort: 52345,
+        portFilePath: "/tmp/kchat.sock",
+        lastExtensionContactAt: "2025-05-29T09:00:00.000Z",
+        queuedPublishCount: 0,
+        reviewThreadCount: 1,
       }),
       defaultThreadId: null,
     });
@@ -442,11 +457,14 @@ describe("KChatReviewPanel", () => {
     // The status call always reports connected.
     vi.spyOn(aec.kchat, "status").mockResolvedValue({
       state: "connected",
-      publisherKind: "local_ipc",
+      publisherKind: "loopback_http",
       instanceJson: JSON.stringify({
-        socket_path: "/tmp/kchat.sock",
-        version: "1.0.0",
-        health: "ok",
+        apiServerRunning: true,
+        apiServerPort: 52345,
+        portFilePath: "/tmp/kchat.sock",
+        lastExtensionContactAt: "2025-05-29T09:00:00.000Z",
+        queuedPublishCount: 0,
+        reviewThreadCount: 1,
       }),
       defaultThreadId: null,
     });

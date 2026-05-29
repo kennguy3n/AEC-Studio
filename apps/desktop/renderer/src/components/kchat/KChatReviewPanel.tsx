@@ -106,9 +106,15 @@ export function KChatReviewPanel(props: KChatReviewPanelProps) {
     try {
       const statusReport = await aec.kchat.status();
       if (threadIdRef.current !== capturedThread) return;
+      // Phase 15: the loopback API publisher reports
+      // `publisherKind: "loopback_http"` once the .kcz extension
+      // has contacted the API at least once this session. While
+      // it is still "reconnecting" (server up, no extension
+      // heartbeat yet), we keep polling because the extension
+      // may come online mid-session.
       const isOffline =
         statusReport.state !== "connected" &&
-        statusReport.publisherKind !== "local_ipc";
+        statusReport.publisherKind !== "loopback_http";
       setOffline(isOffline);
       if (isOffline) {
         setError(null);

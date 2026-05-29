@@ -156,6 +156,13 @@ pub trait KChatPublisher {
     fn publish(&self, card: ArtifactCard) -> Result<PublishResult, KChatError>;
 }
 
+/// Fallback thread id used when no per-project [`KChatConfig::default_thread_id`]
+/// is set. The renderer's `Deliver` page mirrors this constant
+/// (`apps/desktop/renderer/src/pages/Deliver.tsx::FALLBACK_THREAD_ID`)
+/// so the bridge and the review panel converge on the same thread
+/// when the project manifest leaves the field unset.
+pub const DEFAULT_THREAD_ID: &str = "kchat-default";
+
 /// In-memory publisher used by tests and the in-process desktop
 /// fallback. Records every published card so tests can assert against
 /// the published history.
