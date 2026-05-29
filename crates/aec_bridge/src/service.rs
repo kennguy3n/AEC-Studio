@@ -4630,6 +4630,27 @@ impl BridgeService {
         self.kchat_state.is_enabled()
     }
 
+    /// Phase 15 — promote the Rust-side `publisher_kind` marker to
+    /// `loopback_http`. Called by the Electron host once
+    /// `kchatLocalApi` has bound on `127.0.0.1` so the bridge's
+    /// status snapshot (consumed by future Rust-side telemetry /
+    /// audit consumers) agrees with the Electron-side
+    /// `kchat:status` IPC payload. Returns the post-mutation
+    /// status so the caller can avoid a second snapshot.
+    pub fn kchat_mark_loopback_active(&self) -> crate::kchat_state::KChatStatusReport {
+        self.kchat_state.mark_loopback_active();
+        self.kchat_state.status()
+    }
+
+    /// Phase 15 — demote the Rust-side `publisher_kind` marker
+    /// back to `in_memory`. Called by the Electron host on
+    /// shutdown so the next status snapshot surfaces the headless
+    /// state honestly.
+    pub fn kchat_mark_loopback_inactive(&self) -> crate::kchat_state::KChatStatusReport {
+        self.kchat_state.mark_loopback_inactive();
+        self.kchat_state.status()
+    }
+
     /// Publish an artifact card through the active publisher.
     pub fn kchat_publish(
         &self,

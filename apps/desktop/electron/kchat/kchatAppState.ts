@@ -41,6 +41,7 @@ import { app as electronApp } from "electron";
 import { dirname } from "node:path";
 import { mkdirSync } from "node:fs";
 
+import { getBridge } from "../bridge";
 import {
   KchatLocalApiServer,
   type LocalApiHandlers,
@@ -145,6 +146,22 @@ export async function initialiseKchat(
     userDataDir: resolvedUserData,
   });
   await server.start();
+
+  // Phase 15 ANALYSIS_0007 fix-forward: keep the Rust-side
+  // `KChatState` snapshot honest about the active publisher kind.
+  // Without this call the Electron `kchat:status` IPC reports
+  // `loopback_http` while the Rust napi `kchat_status()` reports
+  // `in_memory`, so any future telemetry / audit consumer reading
+  // the Rust snapshot would see a stale value. The call is
+  // idempotent and never blocks (bridge fallback is in-memory).
+  try {
+    await getBridge().kchatMarkLoopbackActive();
+  } catch (err) {
+    console.warn(
+      "[kchatAppState] kchatMarkLoopbackActive() failed; Rust snapshot may report stale publisher kind:",
+      err,
+    );
+  }
 
   const deeplink = new DeeplinkBridge({
     onParseFailure: (raw, reason, detail) => {
@@ -433,6 +450,18 @@ export async function shutdownKchat(): Promise<void> {
     await s.server.stop();
   } catch (err) {
     console.error("[kchatAppState] server.stop() failed:", err);
+  }
+  // Phase 15 ANALYSIS_0007 fix-forward: keep the Rust-side
+  // snapshot honest after the loopback server stops. Idempotent
+  // and safe to call even if `mark_loopback_active` was never
+  // wired (the bridge fallback is in-memory).
+  try {
+    await getBridge().kchatMarkLoopbackInactive();
+  } catch (err) {
+    console.warn(
+      "[kchatAppState] kchatMarkLoopbackInactive() failed; Rust snapshot may report stale publisher kind:",
+      err,
+    );
   }
 }
 

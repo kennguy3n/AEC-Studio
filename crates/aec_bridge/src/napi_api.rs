@@ -2804,6 +2804,28 @@ pub fn kchat_is_enabled() -> Result<bool> {
     with_service_ref(super::service::BridgeService::kchat_is_enabled)
 }
 
+/// Phase 15 — Electron host signals that the loopback API has bound
+/// on `127.0.0.1`. Promotes the Rust-side `publisher_kind` marker
+/// to `loopback_http` so any future Rust-side consumer (telemetry,
+/// audit, the in-process journey tests) sees the same kind the
+/// Electron `kchat:status` IPC reports to the renderer. Idempotent;
+/// safe to call on every Electron startup.
+#[napi]
+pub fn kchat_mark_loopback_active() -> Result<KChatStatusJs> {
+    let rep = with_service_ref(super::service::BridgeService::kchat_mark_loopback_active)?;
+    Ok(kchat_status_to_js(rep))
+}
+
+/// Phase 15 — Electron host signals that the loopback API is being
+/// torn down (typically during `app.on("will-quit", ...)`). Demotes
+/// the marker back to `in_memory` so the next snapshot is honest
+/// about the headless state. Idempotent.
+#[napi]
+pub fn kchat_mark_loopback_inactive() -> Result<KChatStatusJs> {
+    let rep = with_service_ref(super::service::BridgeService::kchat_mark_loopback_inactive)?;
+    Ok(kchat_status_to_js(rep))
+}
+
 #[napi]
 pub fn kchat_publish(params: KChatPublishParamsJs) -> Result<KChatPublishResultJs> {
     let card: aec_core::kchat::ArtifactCard = serde_json::from_str(&params.card_json)

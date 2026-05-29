@@ -14,42 +14,7 @@ import {
   getReviewCommentsForThread,
 } from "./kchat/kchatAppState";
 import { openKchatDeeplink } from "./kchat/kchatOutboundDeeplink";
-
-/**
- * Per-project KChat thread id sourced from the Rust bridge's
- * `kchatStatus()` snapshot, which mirrors
- * `KChatConfig::default_thread_id` for the currently open project
- * (see `crates/aec_bridge/src/kchat_state.rs::apply_project_config`).
- *
- * Returns `null` when no project is open or when the project's
- * manifest omits the field — callers fall back to
- * `aec_core::DEFAULT_THREAD_ID` (`"kchat-default"`) which matches
- * the renderer's `FALLBACK_THREAD_ID` constant. We deliberately do
- * NOT collapse the fallback here so the renderer can distinguish
- * "explicit project thread" from "defaulted" for telemetry.
- *
- * Cheap call — bridge-side `kchat_state.status()` is a read-lock
- * acquire, no I/O.
- */
-async function resolveDefaultThreadIdFromBridge(): Promise<string | null> {
-  try {
-    const status = await getBridge().kchatStatus();
-    return status.defaultThreadId ?? null;
-  } catch (err) {
-    // The bridge can be temporarily unavailable during boot
-    // (`kchat:status` is the very first call the renderer issues).
-    // Surfacing the error would hide the loopback / extension
-    // status from the indicator chip even though that signal is
-    // still meaningful; degrade to `null` so the renderer falls
-    // back to its `kchat-default` constant.
-    console.warn(
-      `[ipc] resolveDefaultThreadIdFromBridge: bridge kchat_status failed (${
-        err instanceof Error ? err.message : String(err)
-      }); falling back to null`,
-    );
-    return null;
-  }
-}
+import { mapStoredReviewCommentsToRows } from "./kchat/reviewWireFormat";
 
 /**
  * Heartbeat-freshness window for the loopback API's
@@ -134,39 +99,24 @@ function buildKchatStatusResponse(
 }
 
 /**
- * Snapshot the bridge-persisted `KChatConfig::enabled` flag.
+ * Single-call helper that returns both the master enabled flag
+ * and the per-project default thread id from the Rust bridge's
+ * `kchatStatus()` snapshot. Issuing a single `kchatStatus()` call
+ * for both fields is the only way to read them: every renderer-
+ * facing handler (`kchat:status`, `kchat:reload`, `kchat:publish`,
+ * `kchat:setEnabled`) needs both, and the N-API call + read-lock
+ * acquire on the Rust side is the dominant cost. Doing it twice
+ * (one round-trip per field) was a latency regression on the
+ * 5 s status poll hot path that this helper closes.
  *
- * Mirrors the lookup pattern used by
- * [`resolveDefaultThreadIdFromBridge`] — the bridge call is
- * synchronous and read-only, but we wrap it in a `try/catch` so a
- * boot-time race (status IPC fires before `BridgeService` is
- * initialised) reads as "enabled" rather than throwing. The
- * fallback matches `KChatConfig::default` so the very first
- * status poll never accidentally surfaces a disabled chip.
- */
-async function resolveEnabledFromBridge(): Promise<boolean> {
-  try {
-    const status = await getBridge().kchatStatus();
-    return status.enabled;
-  } catch (err) {
-    console.warn(
-      `[ipc] resolveEnabledFromBridge: bridge kchat_status failed (${
-        err instanceof Error ? err.message : String(err)
-      }); defaulting enabled=true`,
-    );
-    return true;
-  }
-}
-
-/**
- * Single-call variant for handlers that need both the master
- * enabled flag and the per-project default thread id (e.g.
- * `kchat:publish`). Issuing one `kchatStatus()` instead of two
- * shaves a redundant N-API round-trip + read-lock acquire on the
- * publish hot path. Falls back to `{ enabled: true, defaultThreadId: null }`
- * for the same boot-race reason described on the single-field
- * helpers above so a transient bridge unavailability degrades
- * gracefully instead of throwing.
+ * Returns `{ enabled: true, defaultThreadId: null }` if the bridge
+ * is temporarily unavailable (typical at boot — `kchat:status` is
+ * the very first call the renderer issues): surfacing the error
+ * would hide the loopback / extension status from the indicator
+ * chip even though that signal is still meaningful. `enabled=true`
+ * matches `KChatConfig::default` so the first poll doesn't flash
+ * a disabled chip; `defaultThreadId=null` lets the renderer fall
+ * back to its `kchat-default` constant.
  */
 async function resolveEnabledAndDefaultThreadFromBridge(): Promise<{
   enabled: boolean;
@@ -776,10 +726,14 @@ export function registerIpcHandlers(): void {
   // Electron-side `kchatAppState` singleton; the Rust bridge's
   // KChat methods are kept for in-process tests / fallback only.
   ipcMain.handle("kchat:status", async () => {
-    const [defaultThreadId, enabled] = await Promise.all([
-      resolveDefaultThreadIdFromBridge(),
-      resolveEnabledFromBridge(),
-    ]);
+    // Single bridge round-trip — see
+    // `resolveEnabledAndDefaultThreadFromBridge`. Polled every
+    // ~5 s by the renderer; splitting into two parallel calls
+    // would double the N-API + RwLock acquisitions on the hot
+    // path for no benefit since both fields come from the same
+    // `kchatStatus()` payload.
+    const { defaultThreadId, enabled } =
+      await resolveEnabledAndDefaultThreadFromBridge();
     return buildKchatStatusResponse(defaultThreadId, enabled);
   });
   ipcMain.handle("kchat:reload", async () => {
@@ -794,10 +748,10 @@ export function registerIpcHandlers(): void {
     // so that clicking "Re-detect" while the extension is
     // connected doesn't flash the indicator to `reconnecting`
     // until the next 5 s status poll corrects it.
-    const [defaultThreadId, enabled] = await Promise.all([
-      resolveDefaultThreadIdFromBridge(),
-      resolveEnabledFromBridge(),
-    ]);
+    //
+    // Same single-call optimisation as `kchat:status` above.
+    const { defaultThreadId, enabled } =
+      await resolveEnabledAndDefaultThreadFromBridge();
     return buildKchatStatusResponse(defaultThreadId, enabled);
   });
   ipcMain.handle("kchat:setEnabled", async (_e, params) => {
@@ -955,7 +909,16 @@ export function registerIpcHandlers(): void {
     } else {
       throw new Error("kchatIngestReviews: sinceIso must be a string or null");
     }
-    const comments = getReviewCommentsForThread(threadId, sinceIso);
+    const stored = getReviewCommentsForThread(threadId, sinceIso);
+    // Map `StoredReviewComment` (the shape `kchatAppState.ts`
+    // accumulates from the `.kcz` extension's
+    // `POST /api/review-comments` calls) to `ReviewCommentRow` —
+    // the shape `KChatReviewPanel.tsx` already decodes against.
+    // The pure helper lives in `./kchat/reviewWireFormat` so the
+    // renderer test suite can exercise the real wire-format
+    // transform with a `ReviewCommentPayload[]` payload (closes
+    // the round-5 ANALYSIS_0005 test-quality gap).
+    const comments = mapStoredReviewCommentsToRows(stored);
     return {
       threadId,
       // Mirror the Phase 12 envelope (JSON-encoded arrays so the
