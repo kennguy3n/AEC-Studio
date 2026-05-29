@@ -260,7 +260,8 @@ const api = {
      */
     readScheduleRows: (params: { xlsxPath: string }) =>
       ipcRenderer.invoke("bim:readScheduleRows", params) as Promise<{
-        rows: Array<Record<string, string | number | boolean | null>>;
+        header: string[];
+        rows: Array<Record<string, string>>;
       }>,
     generateSchedule: (params: {
       sourcePath: string;
