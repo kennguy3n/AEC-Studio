@@ -171,22 +171,18 @@ describe("Bim page — classify action", () => {
   });
 });
 
-// Regression: Devin Review flagged that `onInvoke` in `Bim.tsx`
-// had a `try/finally` but no `catch`. Pre-Phase 13 every BIM
-// branch targeted `demo://...` paths handled by the in-process
-// fallback (which never throws), so the missing catch was
-// benign. Phase 13 wires every branch through real OS paths from
-// the file-picker, so bridge failures (disk full, permission
-// denied, malformed IFC, locked SQLCipher DB) are realistic and
-// must surface as a user-visible error toast — silent unhandled
-// promise rejections clear the busy spinner with no feedback.
-// The fix is a single `catch` after the switch that converts any
-// uncaught bridge error into an `error`-severity toast. These
-// tests pin that contract for the `classify` branch (the same
-// catch covers `exportIfc` / `validate` / `diff` /
-// `generateSchedule` / `boq` uniformly — one test is sufficient
-// because the catch is shared, and adding five duplicates would
-// only test the spy harness).
+// Regression: `onInvoke` in `Bim.tsx` runs every BIM branch
+// through real OS paths from the file picker, so bridge failures
+// (disk full, permission denied, malformed IFC, locked SQLCipher
+// DB) are realistic and must surface as a user-visible error
+// toast — silent unhandled promise rejections clear the busy
+// spinner with no feedback. The fix is a single `catch` after
+// the switch that converts any uncaught bridge error into an
+// `error`-severity toast. These tests pin that contract for the
+// `classify` branch (the same catch covers `exportIfc` /
+// `validate` / `diff` / `generateSchedule` / `boq` uniformly —
+// one test is sufficient because the catch is shared, and adding
+// five duplicates would only test the spy harness).
 describe("Bim page — bridge error handling", () => {
   let classifySpy = vi.spyOn(aec.bim, "classify");
   let currentSpy = vi.spyOn(aec.project, "current");

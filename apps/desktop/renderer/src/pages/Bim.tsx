@@ -497,18 +497,16 @@ export function Bim() {
         }
       }
     } catch (err) {
-      // Centralized error surface for every BIM operation. Before
-      // Phase 13 these branches all targeted `demo://...` paths
-      // resolved by the in-process fallback (which never throws), so
-      // a missing catch was benign. Now that `exportIfc` / `validate`
-      // / `classify` / `diff` / `generateSchedule` / `boq` all run
-      // against real OS paths from the file picker, transient
-      // failures (disk full, permission denied, malformed IFC,
-      // locked SQLCipher DB) are realistic and must reach the user.
-      // The single `catch` covers all six branches uniformly and
-      // matches the toast convention used by Draft/Deliver/App save
-      // — putting per-case `try/catch` blocks inline would duplicate
-      // the same toast call six times and let one branch silently
+      // Centralized error surface for every BIM operation.
+      // `exportIfc` / `validate` / `classify` / `diff` /
+      // `generateSchedule` / `boq` all run against real OS paths
+      // from the file picker, so transient failures (disk full,
+      // permission denied, malformed IFC, locked SQLCipher DB) are
+      // realistic and must reach the user. The single `catch`
+      // covers all six branches uniformly and matches the toast
+      // convention used by Draft/Deliver/App save — putting
+      // per-case `try/catch` blocks inline would duplicate the
+      // same toast call six times and let one branch silently
       // diverge from the others in a future patch.
       addToast(
         "error",
@@ -616,14 +614,13 @@ export function Bim() {
           }}
           // Route bridge failures from `ScheduleView.regenerate` into
           // the same toast system used by the toolbar's centralized
-          // `onInvoke` catch (line ~328). Pre-Phase 13 every branch
-          // hit `demo://...` paths (in-process fallback never threw)
-          // so the missing catch was benign; Phase 13 wires real OS
-          // paths from the file picker, so disk-full / permission
-          // denied / locked-DB errors are now real failure surfaces.
-          // The panel handles the catch internally and forwards a
-          // pre-formatted message here so this page doesn't need to
-          // know about the bridge's specific error shapes.
+          // `onInvoke` catch (line ~328). The bridge runs against
+          // real OS paths from the file picker, so disk-full /
+          // permission-denied / locked-DB errors are real failure
+          // surfaces and need to reach the user. The panel handles
+          // the catch internally and forwards a pre-formatted
+          // message here so this page doesn't need to know about
+          // the bridge's specific error shapes.
           onError={(msg) => addToast("error", msg)}
         />
         <ValidatorPanel
