@@ -28,6 +28,41 @@ type AiModelTier = "tiny" | "small" | "medium" | "large";
 type RenderPresetKey = "quick" | "standard" | "high" | "studio";
 type Region = "metric" | "imperial";
 
+/**
+ * Wire shape returned by
+ * `aec.extensions.listLoadDiagnostics()`. Mirrors the
+ * `ExtensionLoadDiagnostic` interface in
+ * `apps/desktop/electron/bridge.ts` — kept structurally identical
+ * so the renderer can render without an extra mapping layer.
+ */
+interface ExtensionLoadDiagnostic {
+  extensionId: string | null;
+  path: string;
+  stage: string;
+  message: string;
+}
+
+/**
+ * User-facing label for a stable `stage` wire tag. The Rust side
+ * pins the strings (see `ExtensionLoadStage::as_wire_str`) so we
+ * can do a static lookup here; unknown values fall through to the
+ * raw tag (forward-compat with new stage variants).
+ */
+const EXTENSION_STAGE_LABELS: Readonly<Record<string, string>> = {
+  manifest_read: "Manifest unreadable",
+  manifest_parse: "Manifest parse error",
+  manifest_validation: "Manifest validation failed",
+  unsafe_path: "Unsafe path reference",
+  signature_verification: "Signature verification failed",
+  duplicate_id: "Duplicate extension id",
+  asset_pack_install: "Asset-pack install failed",
+  ai_tool_resolution: "AI-tool resolution failed",
+};
+
+function extensionStageLabel(stage: string): string {
+  return EXTENSION_STAGE_LABELS[stage] ?? stage;
+}
+
 interface SettingsState {
   aiModelTierOverride: AiModelTier | "auto";
   defaultRenderPreset: RenderPresetKey;
@@ -79,6 +114,16 @@ export function Settings() {
   const [kchatReloadError, setKchatReloadError] = useState<string | null>(
     null,
   );
+  // Per-extension boot diagnostics buffered by the Rust bridge.
+  // `null` while the initial fetch is in flight; the empty array
+  // means the bridge saw no failures (the common path — we hide
+  // the diagnostics card entirely in that case). A non-empty array
+  // is rendered as a read-only list so the user can see which
+  // extension failed and why without the bridge having silently
+  // dropped it.
+  const [extensionDiagnostics, setExtensionDiagnostics] = useState<
+    ExtensionLoadDiagnostic[] | null
+  >(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -108,6 +153,29 @@ export function Settings() {
       } catch {
         // KChat status is best-effort; surfacing a hard error here
         // would prevent the user from changing other preferences.
+      }
+    })();
+    (async () => {
+      try {
+        // Frozen for the lifetime of the bridge (extensions are
+        // not hot-reloaded in this build), so a single fetch on
+        // mount is enough — no polling necessary. The promise
+        // resolves quickly because the underlying napi method is
+        // a sync read on a process-memory slice.
+        const diags = await aec.extensions.listLoadDiagnostics();
+        if (!cancelled) {
+          setExtensionDiagnostics(diags);
+        }
+      } catch {
+        // Treat any failure here as "no diagnostics to show" —
+        // surfacing a hard error in the diagnostics card itself
+        // would be a confusing UX (a diagnostics panel that's
+        // broken because the diagnostics IPC is broken). The
+        // Settings page stays functional for every other
+        // preference.
+        if (!cancelled) {
+          setExtensionDiagnostics([]);
+        }
       }
     })();
     return () => {
@@ -314,6 +382,52 @@ export function Settings() {
           </label>
         </fieldset>
       </section>
+
+      {extensionDiagnostics !== null && extensionDiagnostics.length > 0 && (
+        <section
+          className="settings-section settings-section--extension-diagnostics"
+          data-testid="settings-section-extension-diagnostics"
+          aria-label="Extension load diagnostics"
+          role="region"
+        >
+          <h2>Extension load diagnostics</h2>
+          <p>
+            The following installed extensions failed to load during
+            this AEC Studio session. The remaining extensions are
+            unaffected — AEC Studio remains fully functional — but
+            the assets, templates, schedules, and AI tools shipped
+            by the listed extensions are unavailable until the
+            errors are resolved. Restart AEC Studio after fixing
+            the underlying files to retry loading.
+          </p>
+          <ul
+            className="settings-extension-diagnostics"
+            data-testid="settings-extension-diagnostics-list"
+          >
+            {extensionDiagnostics.map((d, i) => (
+              <li
+                key={`${d.path}__${d.stage}__${i}`}
+                data-testid="settings-extension-diagnostic-item"
+                data-stage={d.stage}
+                data-extension-id={d.extensionId ?? ""}
+              >
+                <div className="settings-extension-diagnostics__heading">
+                  <strong>{d.extensionId ?? "(unknown extension)"}</strong>{" "}
+                  <span className="settings-extension-diagnostics__stage">
+                    {extensionStageLabel(d.stage)}
+                  </span>
+                </div>
+                <div className="settings-extension-diagnostics__path">
+                  <code>{d.path}</code>
+                </div>
+                <div className="settings-extension-diagnostics__message">
+                  {d.message}
+                </div>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
 
       <section
         className="settings-section"

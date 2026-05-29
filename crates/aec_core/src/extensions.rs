@@ -368,6 +368,107 @@ pub enum LoadError {
     UnsafePath { path: PathBuf },
 }
 
+/// Stages of the extension boot pipeline at which a per-extension
+/// failure can be surfaced to the host. The strings are stable wire
+/// tags (the napi → IPC → renderer path serialises this verbatim) so
+/// every variant doubles as a UI-facing label; renaming a variant is
+/// a breaking change for the Settings diagnostics card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExtensionLoadStage {
+    /// `fs::read_to_string(manifest.json)` failed — usually a
+    /// permissions issue or a vanished directory after the loader
+    /// enumerated it.
+    ManifestRead,
+    /// `serde_json` rejected the manifest payload.
+    ManifestParse,
+    /// The manifest parsed but failed structural validation
+    /// (unknown kind, missing required body, out-of-range numeric
+    /// fields, etc.).
+    ManifestValidation,
+    /// A `body` payload path tried to escape the extension dir.
+    UnsafePath,
+    /// The signature block did not verify against the supplied trust
+    /// store (or the embedded self-signed key when no store was
+    /// provided).
+    SignatureVerification,
+    /// Two extensions on disk declared the same `id`. We keep the
+    /// first one we saw — duplicate-id semantics match `registry.insert`.
+    DuplicateId,
+    /// An asset-pack extension parsed cleanly but the asset host
+    /// rejected one of its entries (missing blob, blake3 mismatch,
+    /// permission denied).
+    AssetPackInstall,
+    /// An ai-tool extension parsed cleanly but the AI tool resolver
+    /// rejected it (unknown scope, missing body, permission denied).
+    AiToolResolution,
+}
+
+impl ExtensionLoadStage {
+    /// Stable wire tag used by the napi + IPC layers. Renaming this
+    /// is a breaking change for any Settings UI that switches on it.
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::ManifestRead => "manifest_read",
+            Self::ManifestParse => "manifest_parse",
+            Self::ManifestValidation => "manifest_validation",
+            Self::UnsafePath => "unsafe_path",
+            Self::SignatureVerification => "signature_verification",
+            Self::DuplicateId => "duplicate_id",
+            Self::AssetPackInstall => "asset_pack_install",
+            Self::AiToolResolution => "ai_tool_resolution",
+        }
+    }
+}
+
+/// One per-extension boot failure. Captured by
+/// [`ExtensionLoader::load_with_diagnostics`] (and emitted from the
+/// `aec_bridge` boot path for asset-pack / ai-tool host failures) so
+/// the renderer Settings UI can surface broken extensions instead of
+/// silently dropping them.
+///
+/// Important: this struct is the wire format for the
+/// `extensions:listLoadDiagnostics` IPC (renderer ↔ Electron) and the
+/// `extension_load_diagnostics()` napi method (Electron ↔ Rust bridge).
+/// Fields are stable; new variants of [`ExtensionLoadStage`] must come
+/// with a backwards-compatible wire-string update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionLoadDiagnostic {
+    /// Manifest `id` if we got far enough to parse it. `None` when
+    /// the loader couldn't even read or parse the manifest.
+    pub extension_id: Option<String>,
+    /// Extension directory on disk (or the manifest file path when
+    /// the failure happened before the dir was confirmed valid). This
+    /// is surfaced as a relative-friendly hint in the renderer — the
+    /// full path is intentional because asset packs can ship outside
+    /// the install dir and the user needs to know which on-disk copy
+    /// is broken.
+    pub path: PathBuf,
+    pub stage: ExtensionLoadStage,
+    /// Human-readable error string, suitable for direct display in
+    /// the Settings diagnostics card. Produced by `Display`-printing
+    /// the underlying typed error so callers don't have to know the
+    /// specific error enum.
+    pub message: String,
+}
+
+impl ExtensionLoadDiagnostic {
+    /// Convenience constructor that captures the stable wire string
+    /// for the stage at the same time it captures the message.
+    pub fn new(
+        extension_id: Option<String>,
+        path: impl Into<PathBuf>,
+        stage: ExtensionLoadStage,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            extension_id,
+            path: path.into(),
+            stage,
+            message: message.into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LoadOptions {
     /// Optional trust store. When set, only extensions signed by a known
@@ -538,6 +639,240 @@ impl ExtensionLoader {
         }
         Ok(registry)
     }
+
+    /// Fault-tolerant counterpart of [`Self::load`].
+    ///
+    /// Each per-extension failure is recorded in the returned
+    /// [`ExtensionLoadDiagnostic`] vector instead of aborting the load.
+    /// Healthy extensions still populate the returned
+    /// [`ExtensionRegistry`]. This is what the `aec_bridge` boot path
+    /// calls so a single broken extension doesn't take the entire
+    /// runtime offline — the failures are then surfaced through the
+    /// `extensions:listLoadDiagnostics` IPC for the Settings UI.
+    ///
+    /// The pre-iteration steps (root existence, directory enumeration)
+    /// still return `Err` because they are not extension-scoped — if
+    /// we can't even read `<root>/`, every diagnostic would be the
+    /// same and the host should treat that as a hard error.
+    pub fn load_with_diagnostics(
+        &self,
+        opts: &LoadOptions,
+    ) -> Result<(ExtensionRegistry, Vec<ExtensionLoadDiagnostic>), LoadError> {
+        let mut registry = ExtensionRegistry::default();
+        let mut diagnostics: Vec<ExtensionLoadDiagnostic> = Vec::new();
+        if !self.root.exists() {
+            return Ok((registry, diagnostics));
+        }
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        for entry in fs::read_dir(&self.root).map_err(|e| LoadError::Io {
+            path: self.root.clone(),
+            source: e,
+        })? {
+            let entry = entry.map_err(|e| LoadError::Io {
+                path: self.root.clone(),
+                source: e,
+            })?;
+            let ft = entry.file_type().map_err(|e| LoadError::Io {
+                path: entry.path(),
+                source: e,
+            })?;
+            if ft.is_dir() {
+                dirs.push(entry.path());
+            }
+        }
+        dirs.sort();
+        for ext_dir in dirs {
+            match load_single_extension(&ext_dir, opts) {
+                LoadOutcome::Loaded(loaded) => {
+                    let loaded = *loaded;
+                    let id_str = loaded.manifest.id.0.clone();
+                    if let Err(err) = registry.insert(loaded) {
+                        // `insert` only fails on duplicate id today,
+                        // but match exhaustively so future variants
+                        // surface as diagnostics rather than being
+                        // collapsed into the duplicate-id stage.
+                        let stage = match &err {
+                            LoadError::DuplicateId(_) => ExtensionLoadStage::DuplicateId,
+                            _ => ExtensionLoadStage::ManifestValidation,
+                        };
+                        diagnostics.push(ExtensionLoadDiagnostic::new(
+                            Some(id_str),
+                            ext_dir,
+                            stage,
+                            err.to_string(),
+                        ));
+                    }
+                }
+                LoadOutcome::Skipped => {}
+                LoadOutcome::Failed(diag) => diagnostics.push(diag),
+            }
+        }
+        Ok((registry, diagnostics))
+    }
+}
+
+/// Internal result of attempting to load a single extension dir.
+/// Lets [`ExtensionLoader::load_with_diagnostics`] keep its outer loop
+/// linear (no nested matches against `LoadError`).
+///
+/// `Loaded` is boxed so the `Failed`/`Skipped` paths don't pay the
+/// full `LoadedExtension` payload on every call (`LoadedExtension`
+/// carries the full deserialized manifest plus signing metadata,
+/// which is large relative to the ~80-byte diagnostic). This keeps
+/// `clippy::large_enum_variant` happy without sacrificing the
+/// per-extension fault-tolerance the type exists to enable.
+enum LoadOutcome {
+    /// Manifest read + parsed + validated + signed-check passed.
+    Loaded(Box<LoadedExtension>),
+    /// Directory did not contain a `manifest.json` — silently skipped
+    /// to match the existing strict loader's behaviour.
+    Skipped,
+    /// A typed [`LoadError`] mapped to a per-extension diagnostic.
+    Failed(ExtensionLoadDiagnostic),
+}
+
+/// Attempt to load a single extension directory. Errors are mapped to
+/// the appropriate [`ExtensionLoadStage`] so the renderer Settings
+/// card can surface a precise label for each failure mode.
+///
+/// This helper duplicates a fair amount of [`ExtensionLoader::load`]'s
+/// body deliberately: the strict loader fails the whole boot on the
+/// first error and is preserved for tests/tools that want that
+/// invariant. Sharing a single inner function would require threading
+/// a "is this fault-tolerant?" flag through both code paths and
+/// obscure the strict contract.
+fn load_single_extension(ext_dir: &Path, opts: &LoadOptions) -> LoadOutcome {
+    let manifest_path = ext_dir.join("manifest.json");
+    if !manifest_path.is_file() {
+        return LoadOutcome::Skipped;
+    }
+    let raw = match fs::read_to_string(&manifest_path) {
+        Ok(s) => s,
+        Err(e) => {
+            return LoadOutcome::Failed(ExtensionLoadDiagnostic::new(
+                None,
+                manifest_path.clone(),
+                ExtensionLoadStage::ManifestRead,
+                LoadError::Io {
+                    path: manifest_path,
+                    source: e,
+                }
+                .to_string(),
+            ));
+        }
+    };
+    let manifest: ExtensionManifest = match serde_json::from_str(&raw) {
+        Ok(m) => m,
+        Err(e) => {
+            return LoadOutcome::Failed(ExtensionLoadDiagnostic::new(
+                None,
+                manifest_path.clone(),
+                ExtensionLoadStage::ManifestParse,
+                LoadError::Parse {
+                    path: manifest_path,
+                    source: e,
+                }
+                .to_string(),
+            ));
+        }
+    };
+
+    if path_escapes_root(ext_dir, &manifest) {
+        return LoadOutcome::Failed(ExtensionLoadDiagnostic::new(
+            Some(manifest.id.0.clone()),
+            ext_dir.to_path_buf(),
+            ExtensionLoadStage::UnsafePath,
+            LoadError::UnsafePath {
+                path: ext_dir.to_path_buf(),
+            }
+            .to_string(),
+        ));
+    }
+
+    let validation_errors = validate_manifest(&manifest);
+    if !validation_errors.is_empty() {
+        return LoadOutcome::Failed(ExtensionLoadDiagnostic::new(
+            Some(manifest.id.0.clone()),
+            ext_dir.to_path_buf(),
+            ExtensionLoadStage::ManifestValidation,
+            LoadError::Validation {
+                id: manifest.id.0.clone(),
+                errors: validation_errors,
+            }
+            .to_string(),
+        ));
+    }
+
+    let signed = match (&manifest.signature, &opts.trust_store) {
+        (Some(sig), Some(trust)) => match verify_signature_against(&manifest, sig, trust) {
+            Ok(()) => true,
+            Err(e) => {
+                return LoadOutcome::Failed(ExtensionLoadDiagnostic::new(
+                    Some(manifest.id.0.clone()),
+                    ext_dir.to_path_buf(),
+                    ExtensionLoadStage::SignatureVerification,
+                    LoadError::Signature {
+                        id: manifest.id.0.clone(),
+                        source: e,
+                    }
+                    .to_string(),
+                ));
+            }
+        },
+        (Some(sig), None) => {
+            let self_trust = match TrustStore::single_from_hex(&sig.public_key_hex) {
+                Ok(ts) => ts,
+                Err(e) => {
+                    return LoadOutcome::Failed(ExtensionLoadDiagnostic::new(
+                        Some(manifest.id.0.clone()),
+                        ext_dir.to_path_buf(),
+                        ExtensionLoadStage::SignatureVerification,
+                        LoadError::Signature {
+                            id: manifest.id.0.clone(),
+                            source: e,
+                        }
+                        .to_string(),
+                    ));
+                }
+            };
+            match verify_signature_against(&manifest, sig, &self_trust) {
+                Ok(()) => false,
+                Err(e) => {
+                    return LoadOutcome::Failed(ExtensionLoadDiagnostic::new(
+                        Some(manifest.id.0.clone()),
+                        ext_dir.to_path_buf(),
+                        ExtensionLoadStage::SignatureVerification,
+                        LoadError::Signature {
+                            id: manifest.id.0.clone(),
+                            source: e,
+                        }
+                        .to_string(),
+                    ));
+                }
+            }
+        }
+        (None, Some(_) | None) => {
+            if !opts.allow_unsigned {
+                return LoadOutcome::Failed(ExtensionLoadDiagnostic::new(
+                    Some(manifest.id.0.clone()),
+                    ext_dir.to_path_buf(),
+                    ExtensionLoadStage::SignatureVerification,
+                    LoadError::Signature {
+                        id: manifest.id.0.clone(),
+                        source: SignatureError::MissingSignature,
+                    }
+                    .to_string(),
+                ));
+            }
+            false
+        }
+    };
+
+    LoadOutcome::Loaded(Box::new(LoadedExtension {
+        manifest,
+        root: ext_dir.to_path_buf(),
+        signed,
+    }))
 }
 
 fn path_escapes_root(_root: &Path, manifest: &ExtensionManifest) -> bool {
@@ -879,6 +1214,141 @@ mod tests {
             .unwrap();
         let loaded = reg.get(&ExtensionId("unsigned".into())).unwrap();
         assert!(!loaded.signed);
+    }
+
+    #[test]
+    fn load_with_diagnostics_returns_empty_for_clean_registry() {
+        let td = tempfile::tempdir().unwrap();
+        write_manifest(td.path(), "a", &asset_pack_manifest("a"));
+        write_manifest(td.path(), "b", &asset_pack_manifest("b"));
+        let (reg, diags) = ExtensionLoader::new(td.path())
+            .load_with_diagnostics(&LoadOptions::allow_unsigned())
+            .unwrap();
+        assert_eq!(reg.len(), 2);
+        assert!(diags.is_empty());
+    }
+
+    #[test]
+    fn load_with_diagnostics_captures_unparseable_manifest_and_keeps_healthy_one() {
+        let td = tempfile::tempdir().unwrap();
+        // Healthy extension.
+        write_manifest(td.path(), "ok", &asset_pack_manifest("ok"));
+        // Broken extension — manifest.json that isn't JSON.
+        let broken_dir = td.path().join("broken");
+        fs::create_dir_all(&broken_dir).unwrap();
+        fs::write(broken_dir.join("manifest.json"), "{ not valid json").unwrap();
+
+        let (reg, diags) = ExtensionLoader::new(td.path())
+            .load_with_diagnostics(&LoadOptions::allow_unsigned())
+            .unwrap();
+        assert_eq!(reg.len(), 1, "healthy extension must still load");
+        assert!(reg.get(&ExtensionId("ok".into())).is_some());
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].stage, ExtensionLoadStage::ManifestParse);
+        assert!(diags[0].extension_id.is_none(), "id is unknown pre-parse");
+        assert!(diags[0].path.ends_with("broken/manifest.json"));
+        assert!(!diags[0].message.is_empty());
+    }
+
+    #[test]
+    fn load_with_diagnostics_captures_validation_failure() {
+        let td = tempfile::tempdir().unwrap();
+        // Validation-rejected manifest: world_domination is not a real
+        // permission and serde fails at parse-time, so target a
+        // post-parse validation rejection by zeroing required body.
+        let dir = td.path().join("invalid");
+        fs::create_dir_all(&dir).unwrap();
+        let raw = r#"{
+            "id": "invalid",
+            "name": "Invalid",
+            "version": "1.0.0",
+            "type": "asset_pack",
+            "permissions": [],
+            "license": "AGPL-3.0",
+            "asset_pack": null
+        }"#;
+        fs::write(dir.join("manifest.json"), raw).unwrap();
+
+        let (reg, diags) = ExtensionLoader::new(td.path())
+            .load_with_diagnostics(&LoadOptions::allow_unsigned())
+            .unwrap();
+        assert_eq!(reg.len(), 0);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].stage, ExtensionLoadStage::ManifestValidation);
+        assert_eq!(diags[0].extension_id.as_deref(), Some("invalid"));
+    }
+
+    #[test]
+    fn load_with_diagnostics_captures_unsafe_path() {
+        let td = tempfile::tempdir().unwrap();
+        let mut m = asset_pack_manifest("escape");
+        if let Some(ap) = m.asset_pack.as_mut() {
+            ap.entries[0].source_path = PathBuf::from("../../etc/passwd");
+        }
+        write_manifest(td.path(), "escape", &m);
+
+        let (reg, diags) = ExtensionLoader::new(td.path())
+            .load_with_diagnostics(&LoadOptions::allow_unsigned())
+            .unwrap();
+        assert_eq!(reg.len(), 0);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].stage, ExtensionLoadStage::UnsafePath);
+        assert_eq!(diags[0].extension_id.as_deref(), Some("escape"));
+    }
+
+    #[test]
+    fn load_with_diagnostics_captures_missing_signature_when_required() {
+        let td = tempfile::tempdir().unwrap();
+        write_manifest(td.path(), "unsigned", &asset_pack_manifest("unsigned"));
+        let (_pk_sk, pk_hex) = keygen_test_only();
+        let trust = TrustStore::single_from_hex(&pk_hex).unwrap();
+        let opts = LoadOptions {
+            trust_store: Some(trust),
+            allow_unsigned: false,
+        };
+
+        let (reg, diags) = ExtensionLoader::new(td.path())
+            .load_with_diagnostics(&opts)
+            .unwrap();
+        assert_eq!(reg.len(), 0);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].stage, ExtensionLoadStage::SignatureVerification);
+        assert_eq!(diags[0].extension_id.as_deref(), Some("unsigned"));
+    }
+
+    #[test]
+    fn load_with_diagnostics_wire_strings_are_stable() {
+        // Pin the wire tags — renaming any of them is a breaking
+        // change for the renderer Settings card.
+        assert_eq!(
+            ExtensionLoadStage::ManifestRead.as_wire_str(),
+            "manifest_read"
+        );
+        assert_eq!(
+            ExtensionLoadStage::ManifestParse.as_wire_str(),
+            "manifest_parse"
+        );
+        assert_eq!(
+            ExtensionLoadStage::ManifestValidation.as_wire_str(),
+            "manifest_validation"
+        );
+        assert_eq!(ExtensionLoadStage::UnsafePath.as_wire_str(), "unsafe_path");
+        assert_eq!(
+            ExtensionLoadStage::SignatureVerification.as_wire_str(),
+            "signature_verification"
+        );
+        assert_eq!(
+            ExtensionLoadStage::DuplicateId.as_wire_str(),
+            "duplicate_id"
+        );
+        assert_eq!(
+            ExtensionLoadStage::AssetPackInstall.as_wire_str(),
+            "asset_pack_install"
+        );
+        assert_eq!(
+            ExtensionLoadStage::AiToolResolution.as_wire_str(),
+            "ai_tool_resolution"
+        );
     }
 
     #[test]

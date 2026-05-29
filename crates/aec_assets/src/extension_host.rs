@@ -70,6 +70,11 @@ impl InstallSummary {
 /// Extensions that are not [`ExtensionType::AssetPack`] are ignored —
 /// callers typically run all five hosts and they decide which subset of
 /// the registry to act on.
+///
+/// Fail-fast: the first per-extension failure short-circuits the
+/// install. Use [`install_asset_packs_collect_errors`] when the caller
+/// wants to surface every broken pack at once (e.g. the bridge boot
+/// path that feeds the renderer's Settings diagnostics card).
 pub fn install_asset_packs(
     db: &mut AssetDatabase,
     registry: &ExtensionRegistry,
@@ -80,6 +85,33 @@ pub fn install_asset_packs(
         install_single_pack(db, ext, enforcer, &mut summary)?;
     }
     Ok(summary)
+}
+
+/// Fault-tolerant install — invokes [`install_single_pack`] on every
+/// asset-pack extension and accumulates per-extension failures in the
+/// returned vector. Healthy packs still populate the
+/// [`InstallSummary`].
+///
+/// The first tuple element is the offending
+/// [`aec_core::ExtensionId`] (or the extension's id-string when the
+/// caller only needs the wire form). The second is the typed error,
+/// which exists so the bridge boot path can pluck the
+/// [`AssetExtensionError`] [`Display`](std::fmt::Display) for the
+/// renderer diagnostic without losing the variant information for
+/// future audit-log consumers.
+pub fn install_asset_packs_collect_errors(
+    db: &mut AssetDatabase,
+    registry: &ExtensionRegistry,
+    enforcer: &PermissionEnforcer,
+) -> (InstallSummary, Vec<(String, PathBuf, AssetExtensionError)>) {
+    let mut summary = InstallSummary::default();
+    let mut errors: Vec<(String, PathBuf, AssetExtensionError)> = Vec::new();
+    for ext in registry.by_kind(ExtensionType::AssetPack) {
+        if let Err(e) = install_single_pack(db, ext, enforcer, &mut summary) {
+            errors.push((ext.manifest.id.0.clone(), ext.root.clone(), e));
+        }
+    }
+    (summary, errors)
 }
 
 fn install_single_pack(

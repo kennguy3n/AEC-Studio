@@ -2261,6 +2261,68 @@ pub async fn ai_list_tools() -> Result<Vec<AiToolJs>> {
     .await
 }
 
+/// JS-facing wire shape of an
+/// [`aec_core::ExtensionLoadDiagnostic`]. Mirrors the renderer's
+/// `ExtensionLoadDiagnostic` interface in
+/// `apps/desktop/electron/bridge.ts`. `extension_id` is optional
+/// (None when the manifest could not even be parsed) and surfaces as
+/// `null` over the wire. `stage` is the stable wire string from
+/// [`aec_core::ExtensionLoadStage::as_wire_str`].
+#[napi(object)]
+pub struct ExtensionLoadDiagnosticJs {
+    /// Manifest `id` if the loader got far enough to parse it.
+    /// `None` becomes `null` in JS.
+    pub extension_id: Option<String>,
+    /// Extension directory (or manifest file path) on disk. Encoded
+    /// as a UTF-8 string with the platform's native separators —
+    /// the renderer is responsible for any cosmetic shortening.
+    pub path: String,
+    /// Stable stage tag — one of `manifest_read`, `manifest_parse`,
+    /// `manifest_validation`, `unsafe_path`,
+    /// `signature_verification`, `duplicate_id`,
+    /// `asset_pack_install`, `ai_tool_resolution`. The renderer maps
+    /// each tag to a user-facing label.
+    pub stage: String,
+    /// Human-readable error string — produced from the underlying
+    /// typed error's `Display` impl so the renderer can show it as
+    /// the diagnostic detail without further interpretation.
+    pub message: String,
+}
+
+impl From<&aec_core::ExtensionLoadDiagnostic> for ExtensionLoadDiagnosticJs {
+    fn from(d: &aec_core::ExtensionLoadDiagnostic) -> Self {
+        Self {
+            extension_id: d.extension_id.clone(),
+            path: d.path.to_string_lossy().into_owned(),
+            stage: d.stage.as_wire_str().to_string(),
+            message: d.message.clone(),
+        }
+    }
+}
+
+/// Return every per-extension boot failure that was captured during
+/// [`crate::service::BridgeService::new`]. The renderer reaches this
+/// method through the `extensions:listLoadDiagnostics` IPC and
+/// surfaces the list as a read-only Settings diagnostics card.
+///
+/// Returns an empty vector when no extensions failed to load — the
+/// renderer treats that as the signal to hide the diagnostics card
+/// entirely. The list is frozen for the lifetime of the bridge
+/// (extensions are not hot-reloaded in this revision).
+///
+/// Sync read because the captured diagnostics live in process
+/// memory and the slice copy is O(N) over a list that is almost
+/// always empty in production (broken extensions are rare).
+#[napi]
+pub fn extension_load_diagnostics() -> Result<Vec<ExtensionLoadDiagnosticJs>> {
+    with_service_ref(|svc| {
+        svc.extension_load_diagnostics()
+            .iter()
+            .map(ExtensionLoadDiagnosticJs::from)
+            .collect()
+    })
+}
+
 /// Plan a single AI action against the local LLM sidecar.
 ///
 /// `tool` is the snake_case tool name (e.g. `"style_assistant"`).

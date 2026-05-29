@@ -1395,6 +1395,27 @@ pub struct BridgeService {
     /// [`aec_core::PermissionCheck::Denied`] for an unknown
     /// extension id (the safe default).
     permission_enforcer: aec_core::PermissionEnforcer,
+    /// Per-extension boot failures buffered during
+    /// [`BridgeService::new`]. The bridge boot path is
+    /// intentionally fault-tolerant — a broken extension cannot take
+    /// the whole runtime offline — but those silent failures used to
+    /// be invisible to the user. The renderer reads this vector
+    /// through the `extension_load_diagnostics()` napi method ↔
+    /// `extensions:listLoadDiagnostics` IPC and renders a read-only
+    /// Settings card so the user knows which extension didn't load
+    /// and why.
+    ///
+    /// Populated at boot from three sources and frozen for the
+    /// lifetime of the service:
+    /// 1. [`aec_core::ExtensionLoader::load_with_diagnostics`] — manifest read/parse/validate, signature, duplicate id, unsafe path.
+    /// 2. [`aec_assets::install_asset_packs_collect_errors`] — asset-pack install failures (missing blob, blake3 mismatch, permission denied).
+    /// 3. [`aec_ai::list_extension_ai_tools`] — AI-tool resolution failures (unknown scope, missing body, permission denied).
+    ///
+    /// Order is deterministic (sources are processed in the listed
+    /// order; each source iterates the registry in `iter_sorted`
+    /// order). Empty when there are no failures — the renderer hides
+    /// the diagnostics card entirely in that case.
+    extension_load_diagnostics: Vec<aec_core::ExtensionLoadDiagnostic>,
 }
 
 /// Process-wide render state held by [`BridgeService::render_state`].
@@ -1414,6 +1435,24 @@ impl RenderState {
             queue: RenderQueue::new(),
             preset_store: RenderPresetStore::default(),
         }
+    }
+}
+
+/// Extract the offending extension id from a typed
+/// [`aec_ai::ExtensionAiToolError`]. All current variants carry an
+/// `ext` field (the extension id), and exhaustive matching makes
+/// adding a new variant a compile error here so we can't drop the id
+/// silently if the error enum grows. Returns the bare `String`
+/// (not `Option<String>`) because every current variant guarantees
+/// the id is present — if a future variant lands that genuinely
+/// can't name the extension, this signature must change in
+/// lockstep with the matching arm so the diagnostic path stays
+/// explicit.
+fn ai_tool_error_ext_id(err: &aec_ai::ExtensionAiToolError) -> String {
+    match err {
+        aec_ai::ExtensionAiToolError::PermissionDenied { ext, .. }
+        | aec_ai::ExtensionAiToolError::NotAnAiTool { ext }
+        | aec_ai::ExtensionAiToolError::UnknownScope { ext, .. } => ext.clone(),
     }
 }
 
@@ -1491,39 +1530,111 @@ impl BridgeService {
         // Errors during extension loading or asset-pack install do
         // NOT crash the bridge: an unparseable / missing manifest in
         // an extension dir would otherwise block the whole renderer
-        // from booting. Instead we degrade to an empty registry,
-        // matching the `extensions_dir = None` default.
+        // from booting. Instead we degrade to an empty registry plus
+        // a buffered [`ExtensionLoadDiagnostic`] entry per failure
+        // — see `extension_load_diagnostics` on `BridgeService` for
+        // the renderer surfacing.
+        let mut extension_load_diagnostics: Vec<aec_core::ExtensionLoadDiagnostic> = Vec::new();
         let (extension_registry, permission_enforcer) = match config.extensions_dir.as_ref() {
             Some(dir) if dir.is_dir() => {
                 let loader = aec_core::ExtensionLoader::new(dir);
-                let registry = loader
-                    .load(&aec_core::LoadOptions::allow_unsigned())
-                    .unwrap_or_default();
+                let (registry, loader_diags) = loader
+                    .load_with_diagnostics(&aec_core::LoadOptions::allow_unsigned())
+                    .unwrap_or_else(|err| {
+                        // A top-level loader error (root dir
+                        // disappeared mid-enumeration, permission
+                        // denied on the dir itself) is rare; surface
+                        // it as a single ManifestRead diagnostic and
+                        // continue with an empty registry.
+                        (
+                            aec_core::ExtensionRegistry::default(),
+                            vec![aec_core::ExtensionLoadDiagnostic::new(
+                                None,
+                                dir.clone(),
+                                aec_core::ExtensionLoadStage::ManifestRead,
+                                err.to_string(),
+                            )],
+                        )
+                    });
+                extension_load_diagnostics.extend(loader_diags);
                 let enforcer = aec_core::PermissionEnforcer::from_registry(&registry);
                 // Run the asset-pack host once at boot. Any
                 // per-extension failure (missing file, blake3
-                // mismatch, permission denied) is logged but does
-                // NOT fail the bridge boot — the asset rows simply
-                // don't show up, which is the same UX the user gets
-                // when the extension is uninstalled. Production
-                // builds can surface these failures through a
-                // dedicated diagnostics IPC.
+                // mismatch, permission denied) is captured into
+                // `extension_load_diagnostics` but does NOT fail the
+                // bridge boot — the asset rows simply don't show up,
+                // which is the same UX the user gets when the
+                // extension is uninstalled. The Settings diagnostics
+                // card surfaces the full list to the user.
                 if registry
                     .iter()
                     .any(|e| matches!(e.manifest.kind, aec_core::ExtensionType::AssetPack))
                 {
-                    // `install_asset_packs` returns its own typed
-                    // error; the `with_db_mut` closure returns
-                    // `Result<_, AssetError>`. Threading the install
-                    // result through an inner `Ok(...)` keeps the
-                    // typed install error available to the caller
-                    // *without* a lossy wrap into `AssetError`. We
-                    // drop both layers with `let _ =` per the
-                    // doc-comment above (any per-extension failure
-                    // here must not block bridge boot).
-                    let _ = asset_state.with_db_mut(|db| {
-                        Ok(aec_assets::install_asset_packs(db, &registry, &enforcer))
+                    // `with_db_mut` returns `Result<_, AssetError>`
+                    // around our inner `(InstallSummary,
+                    // Vec<(id, path, AssetExtensionError)>)`. The
+                    // outer error happens when the asset DB itself
+                    // is unreachable — captured as a single
+                    // `AssetPackInstall` diagnostic. Per-extension
+                    // errors are unpacked from the inner vector.
+                    let install_result = asset_state.with_db_mut(|db| {
+                        Ok(aec_assets::install_asset_packs_collect_errors(
+                            db, &registry, &enforcer,
+                        ))
                     });
+                    match install_result {
+                        Ok((_summary, per_ext_errs)) => {
+                            for (ext_id, ext_path, err) in per_ext_errs {
+                                extension_load_diagnostics.push(
+                                    aec_core::ExtensionLoadDiagnostic::new(
+                                        Some(ext_id),
+                                        ext_path,
+                                        aec_core::ExtensionLoadStage::AssetPackInstall,
+                                        err.to_string(),
+                                    ),
+                                );
+                            }
+                        }
+                        Err(db_err) => {
+                            extension_load_diagnostics.push(
+                                aec_core::ExtensionLoadDiagnostic::new(
+                                    None,
+                                    dir.clone(),
+                                    aec_core::ExtensionLoadStage::AssetPackInstall,
+                                    db_err.to_string(),
+                                ),
+                            );
+                        }
+                    }
+                }
+                // Run the AI-tool resolver once at boot to surface
+                // resolution failures (unknown scope, missing body,
+                // permission denied) before the renderer ever calls
+                // `ai_list_tools`. Tool dispatch goes through the
+                // registry lazily, so without this pre-walk a broken
+                // AI-tool extension would only show up the first
+                // time the user opened the AI sidebar.
+                if registry
+                    .iter()
+                    .any(|e| matches!(e.manifest.kind, aec_core::ExtensionType::AiTool))
+                {
+                    let (_ok, errs) = aec_ai::list_extension_ai_tools(&registry, &enforcer);
+                    for err in errs {
+                        // The error carries the offending ext id; we
+                        // re-resolve the on-disk path through the
+                        // registry so the renderer can show the user
+                        // exactly which extension directory to look at.
+                        let ext_id = ai_tool_error_ext_id(&err);
+                        let path = registry
+                            .get(&aec_core::ExtensionId(ext_id.clone()))
+                            .map_or_else(|| dir.clone(), |e| e.root.clone());
+                        extension_load_diagnostics.push(aec_core::ExtensionLoadDiagnostic::new(
+                            Some(ext_id),
+                            path,
+                            aec_core::ExtensionLoadStage::AiToolResolution,
+                            err.to_string(),
+                        ));
+                    }
                 }
                 (registry, enforcer)
             }
@@ -1546,6 +1657,7 @@ impl BridgeService {
             viewport_service: crate::viewport_service::ViewportService::new(),
             extension_registry,
             permission_enforcer,
+            extension_load_diagnostics,
         })
     }
 
@@ -1555,6 +1667,19 @@ impl BridgeService {
     #[doc(hidden)]
     pub fn __kchat_state(&self) -> &crate::kchat_state::KChatState {
         &self.kchat_state
+    }
+
+    /// Borrow the buffered extension load diagnostics that were
+    /// captured during [`Self::new`]. The renderer reaches this slice
+    /// through the `extension_load_diagnostics()` napi method, which
+    /// converts each entry to the JS-friendly wire shape consumed by
+    /// the `extensions:listLoadDiagnostics` IPC.
+    ///
+    /// Returns an empty slice when no extensions failed to load —
+    /// callers can use that as the signal to hide the Settings
+    /// diagnostics card entirely.
+    pub fn extension_load_diagnostics(&self) -> &[aec_core::ExtensionLoadDiagnostic] {
+        &self.extension_load_diagnostics
     }
 
     /// Canonicalise a caller-supplied project path so the same project

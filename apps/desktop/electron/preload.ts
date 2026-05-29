@@ -384,6 +384,24 @@ const api = {
     runtimeStatus: () => ipcRenderer.invoke("ai:runtimeStatus"),
   },
 
+  // ----- Extensions (Phase 16) -----
+  //
+  // Per-extension boot diagnostics. The Settings page reads this
+  // once on mount and renders any captured failures as a
+  // non-blocking read-only card. Returns
+  // `ExtensionLoadDiagnostic[]` (see `bridge.ts` for the wire
+  // shape) — empty when no extensions failed to load.
+  extensions: {
+    listLoadDiagnostics: (): Promise<
+      Array<{
+        extensionId: string | null;
+        path: string;
+        stage: string;
+        message: string;
+      }>
+    > => ipcRenderer.invoke("extensions:listLoadDiagnostics"),
+  },
+
   // ----- Export -----
   export: {
     exportPdf: (params: Record<string, unknown>) =>

@@ -91,6 +91,78 @@ describe("Settings page", () => {
     vi.useRealTimers();
   });
 
+  it("hides the extension diagnostics card when there are no failures", async () => {
+    // The renderer in-process backend returns an empty array from
+    // `extensions.listLoadDiagnostics()`, which is the same signal
+    // the production bridge sends on the no-broken-extensions path.
+    render(
+      <MemoryRouter>
+        <Settings />
+      </MemoryRouter>,
+    );
+    // Wait for the diagnostics fetch to complete so we know the
+    // absence of the card is the no-failures path, not the
+    // still-loading path. Anchoring on hardware tier resolution
+    // (same useEffect cycle) keeps the assertion robust to any
+    // future reordering of the effects.
+    await waitFor(() => {
+      const tier = screen.getByTestId("settings-hw-tier");
+      expect(tier.textContent).not.toEqual("Detecting…");
+    });
+    expect(
+      screen.queryByTestId("settings-section-extension-diagnostics"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("renders the extension diagnostics card when failures are present", async () => {
+    // Spy on `extensions.listLoadDiagnostics` so we drive the
+    // diagnostics card via the real Settings → aec API path
+    // rather than reaching into component internals. The wire
+    // shape mirrors `ExtensionLoadDiagnostic` in `bridge.ts`.
+    const diagSpy = vi
+      .spyOn(aec.extensions, "listLoadDiagnostics")
+      .mockResolvedValueOnce([
+        {
+          extensionId: "demo.broken-assets",
+          path: "/extensions/demo.broken-assets",
+          stage: "asset_pack_install",
+          message: "blake3 mismatch on cabinet.glb",
+        },
+        {
+          extensionId: null,
+          path: "/extensions/unparseable/manifest.json",
+          stage: "manifest_parse",
+          message: "expected `,` or `}` at line 17 column 3",
+        },
+      ]);
+    render(
+      <MemoryRouter>
+        <Settings />
+      </MemoryRouter>,
+    );
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("settings-section-extension-diagnostics"),
+      ).toBeInTheDocument();
+    });
+    const items = screen.getAllByTestId("settings-extension-diagnostic-item");
+    expect(items).toHaveLength(2);
+    // First diagnostic: named extension, asset-pack-install stage.
+    expect(items[0].getAttribute("data-extension-id")).toEqual(
+      "demo.broken-assets",
+    );
+    expect(items[0].getAttribute("data-stage")).toEqual("asset_pack_install");
+    expect(items[0].textContent).toContain("demo.broken-assets");
+    expect(items[0].textContent).toContain("Asset-pack install failed");
+    expect(items[0].textContent).toContain("blake3 mismatch on cabinet.glb");
+    // Second diagnostic: unparseable manifest, no extension id.
+    expect(items[1].getAttribute("data-extension-id")).toEqual("");
+    expect(items[1].getAttribute("data-stage")).toEqual("manifest_parse");
+    expect(items[1].textContent).toContain("(unknown extension)");
+    expect(items[1].textContent).toContain("Manifest parse error");
+    diagSpy.mockRestore();
+  });
+
   it("region radios switch between metric and imperial", () => {
     render(
       <MemoryRouter>

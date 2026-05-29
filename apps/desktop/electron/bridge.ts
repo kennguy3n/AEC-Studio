@@ -128,6 +128,63 @@ export interface AiAcceptOutcome {
 }
 
 /**
+ * Per-extension boot failure surfaced by
+ * {@link BridgeBackend.extensionsListLoadDiagnostics}. The Rust
+ * bridge captures one of these every time
+ * `BridgeService::new` encounters a broken extension during the
+ * fault-tolerant boot path and the Settings page renders them as
+ * a read-only diagnostics card.
+ *
+ * The wire format is stable across releases — adding a new
+ * {@link ExtensionLoadDiagnostic.stage} value is additive (the
+ * renderer falls back to the raw stage string) but renaming an
+ * existing value is a breaking change.
+ */
+export interface ExtensionLoadDiagnostic {
+  /**
+   * The extension's manifest `id`, or `null` if the failure
+   * happened before the manifest could be parsed (e.g. unreadable
+   * file, syntactically invalid JSON).
+   */
+  extensionId: string | null;
+  /**
+   * On-disk path of the extension directory (or the manifest file
+   * itself, for parse-stage failures). UTF-8 string with the
+   * platform's native separators.
+   */
+  path: string;
+  /**
+   * Stable wire tag for the boot pipeline stage at which the
+   * failure surfaced — one of:
+   *
+   * - `manifest_read` — couldn't open `manifest.json`
+   * - `manifest_parse` — JSON syntax error
+   * - `manifest_validation` — manifest violates structural
+   *   invariants (missing required body, empty id, …)
+   * - `unsafe_path` — manifest references a path outside the
+   *   extension directory
+   * - `signature_verification` — signature missing, malformed, or
+   *   the public key isn't trusted
+   * - `duplicate_id` — another loaded extension already claimed
+   *   this id
+   * - `asset_pack_install` — asset-pack host couldn't materialise
+   *   the pack (missing blob, BLAKE3 mismatch, permission denied)
+   * - `ai_tool_resolution` — AI-tool host couldn't resolve the
+   *   tool (unknown scope, missing body, permission denied)
+   *
+   * New stages may be added in future versions; the renderer
+   * shows the raw string when it doesn't recognise the value.
+   */
+  stage: string;
+  /**
+   * Human-readable error string from the underlying typed
+   * error's `Display` impl. Suitable for showing as the
+   * diagnostic detail without further interpretation.
+   */
+  message: string;
+}
+
+/**
  * Rich outcome surfaced by {@link BridgeBackend.aiRejectDiff}.
  *
  * Mirrors the accept outcome shape so the renderer can use a
@@ -431,6 +488,24 @@ export interface BridgeBackend {
   ): Promise<AiRejectOutcome>;
   aiCancelJob(jobId: string): Promise<{ cancelled: true }>;
   aiRuntimeStatus(): Promise<{ state: string; lastError: string | null }>;
+
+  /**
+   * List per-extension boot failures captured by the Rust bridge
+   * during {@link BridgeBackend} construction.
+   *
+   * The bridge boot path intentionally degrades on per-extension
+   * errors (a single broken manifest must not block the whole
+   * renderer from starting) but those silent failures used to be
+   * invisible to the user. The Settings page reads this list and
+   * renders a non-blocking diagnostics card so the user can see
+   * which extension failed, where, and why.
+   *
+   * Returns an empty array when no extensions failed — Settings
+   * uses that as the signal to hide the card entirely. The list
+   * is frozen for the lifetime of the bridge; reloading
+   * extensions requires a process restart.
+   */
+  extensionsListLoadDiagnostics(): Promise<ExtensionLoadDiagnostic[]>;
 
   exportPdf(
     params: Record<string, unknown>,
@@ -1658,6 +1733,11 @@ interface NativeApi {
   ai_reject_diff(diff_id: string, reason?: string | null): Promise<unknown>;
   ai_cancel_job(job_id: string): Promise<unknown>;
   ai_runtime_status(): Promise<unknown>;
+  // Extension load diagnostics — see `BridgeBackend.extensionsListLoadDiagnostics`.
+  // Sync N-API export (the captured slice lives in process memory
+  // and is empty in the common no-broken-extensions case), so the
+  // adaptor below does NOT need to await.
+  extension_load_diagnostics(): unknown;
   // Group A (Phase 10) — draft.* / deliver.*. Symmetric to the
   // design.* / bim.* facades above: `params_json` is a stringified
   // command struct, the napi side routes through `command_apply` so
@@ -1846,6 +1926,7 @@ export const NATIVE_WIRED_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   "aiRejectDiff",
   "aiCancelJob",
   "aiRuntimeStatus",
+  "extensionsListLoadDiagnostics",
   // Group A (Phase 10) — draft.* / deliver.* parity with
   // design.* / bim.*. Each routes through a `#[napi]` export
   // in `crates/aec_bridge/src/napi_api.rs` that wraps the
@@ -2423,6 +2504,16 @@ function adaptNative(n: NativeApi): BridgeBackend {
       // "3 pending diffs" badge, widen the interface in a follow-up.
       return { state: r.state, lastError: r.lastError };
     },
+    // Phase 16 — per-extension boot diagnostics. Sync N-API export
+    // (the captured slice lives in process memory and is empty in
+    // the common no-broken-extensions case) so we just call and
+    // wrap in `Promise.resolve` to satisfy the async backend
+    // contract. The Rust side returns an array of objects that
+    // already match the `ExtensionLoadDiagnostic` interface
+    // (`extensionId`, `path`, `stage`, `message`) because
+    // `#[napi(object)]` auto-converts snake_case to camelCase.
+    extensionsListLoadDiagnostics: async () =>
+      n.extension_load_diagnostics() as ExtensionLoadDiagnostic[],
     // ----- Group A (Phase 10) draft.* / deliver.* -----
     //
     // Symmetric to the design.* adapters above:
@@ -3302,6 +3393,15 @@ export function inProcessBackend(): BridgeBackend {
     },
     async aiRuntimeStatus() {
       return { state: "idle", lastError: null };
+    },
+
+    async extensionsListLoadDiagnostics() {
+      // Vitest / SSR fallback: the in-process backend does not boot
+      // extensions, so there cannot be any load failures to surface.
+      // Returning an empty array matches the native bridge's "no
+      // broken extensions" path and tells the Settings page to hide
+      // the diagnostics card entirely.
+      return [];
     },
 
     async exportPdf(params) {
