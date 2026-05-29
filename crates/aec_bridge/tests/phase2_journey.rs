@@ -294,6 +294,7 @@ fn phase2_apartment_designer_journey_through_bridge_service() {
                 include_boq: false,
                 include_proposal: true,
             },
+            project_path: Some(summary.path.clone()),
         })
         .expect("deliver concept pack");
 

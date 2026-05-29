@@ -634,6 +634,18 @@ pub struct DeliverBuildPackParams {
     pub kind: String,
     pub project_name: String,
     pub options: DeliverPackInventoryFlags,
+    /// Path to the `.aecstudio` project package. When supplied, the
+    /// bridge opens the project's encrypted DB and builds a real
+    /// `DeliverPackContext` so the pack carries actual project
+    /// content — renders from `<project>/renders/`, schedules built
+    /// from the project graph, sheets serialised to real PDFs, an
+    /// IFC string from the graph, and a floor-plan SVG. When `None`
+    /// the bridge falls back to an empty `DeliverPackContext` for
+    /// backward compatibility with callers that don't have an open
+    /// project (e.g. early renderer code paths that exported before
+    /// Phase 13 wired the active-project tracker).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_path: Option<String>,
 }
 
 /// Result of a successful [`BridgeService::deliver_build_pack`]
@@ -2325,16 +2337,33 @@ impl BridgeService {
     }
 
     /// Export a real client-facing proposal PDF via
-    /// [`aec_export::write_proposal_pack`]. The output is a
-    /// printpdf-serialised file with the `aec_export::proposal`
-    /// branding + asset scaffolding pre-applied.
+    /// [`aec_export::write_proposal_pack_with_context`]. When
+    /// `project_path` is supplied, opens the project's encrypted
+    /// graph and threads real room / material / template counts and
+    /// the project's floor-plan SVG into the proposal cover. When
+    /// `None`, falls back to the default empty context (the PDF is
+    /// still a valid `printpdf`-serialised file).
     pub fn export_proposal_pack(
         &self,
         out_path: &str,
         project_name: &str,
         client_name: &str,
+        project_path: Option<&str>,
     ) -> Result<ExportProposalPackResult, BridgeServiceError> {
-        let res = aec_export::write_proposal_pack(Path::new(out_path), project_name, client_name)?;
+        let built = match project_path {
+            Some(p) if !p.is_empty() => Some(crate::deliver_context::build_for_project(
+                p,
+                &self.master_key,
+            )?),
+            _ => None,
+        };
+        let ctx = built.as_ref().map(|b| b.as_ctx()).unwrap_or_default();
+        let res = aec_export::write_proposal_pack_with_context(
+            Path::new(out_path),
+            project_name,
+            client_name,
+            &ctx,
+        )?;
         Ok(ExportProposalPackResult {
             out_path: res.out_path.to_string_lossy().into_owned(),
         })
@@ -2342,10 +2371,20 @@ impl BridgeService {
 
     /// Build a contractor deliverable ZIP archive at `out_path`.
     /// Kind + options control the inventory; see
-    /// [`aec_export::write_deliver_pack`] for the per-kind asset
-    /// list. The returned `contents` matches the inventory the
-    /// renderer preview pane shows pre-archive, and `total_bytes` is
-    /// the sum of payload sizes (manifest excluded).
+    /// [`aec_export::write_deliver_pack_with_context`] for the per-
+    /// kind asset list.
+    ///
+    /// When `params.project_path` is supplied, the bridge opens the
+    /// project's encrypted SQLCipher DB, builds a [`ProjectGraph`],
+    /// and constructs a real `DeliverPackContext` (renders dir,
+    /// material + BOQ schedules, sheets, IFC string, floor-plan SVG,
+    /// room / material / template metadata). When absent, the pack
+    /// degrades to a structurally valid archive built from a default
+    /// empty context.
+    ///
+    /// The returned `contents` matches the inventory the renderer
+    /// preview pane shows pre-archive, and `total_bytes` is the sum
+    /// of payload sizes (manifest excluded).
     pub fn deliver_build_pack(
         &self,
         params: DeliverBuildPackParams,
@@ -2355,6 +2394,7 @@ impl BridgeService {
             kind,
             project_name,
             options,
+            project_path,
         } = params;
         let kind = aec_export::DeliverPackKind::parse(&kind)?;
         let opts = aec_export::DeliverPackOptions {
@@ -2364,7 +2404,26 @@ impl BridgeService {
             include_boq: options.include_boq,
             include_proposal: options.include_proposal,
         };
-        let res = aec_export::write_deliver_pack(Path::new(&out_path), kind, &opts, &project_name)?;
+        // When the renderer threads through a `project_path`, open
+        // the encrypted package and build a real `DeliverPackContext`
+        // from its graph. Otherwise fall back to the default empty
+        // context (callers without an open project still get a
+        // structurally valid ZIP, just without project-specific data).
+        let built = match project_path.as_deref() {
+            Some(p) if !p.is_empty() => Some(crate::deliver_context::build_for_project(
+                p,
+                &self.master_key,
+            )?),
+            _ => None,
+        };
+        let ctx = built.as_ref().map(|b| b.as_ctx()).unwrap_or_default();
+        let res = aec_export::write_deliver_pack_with_context(
+            Path::new(&out_path),
+            kind,
+            &opts,
+            &project_name,
+            &ctx,
+        )?;
         Ok(DeliverPackResult {
             out_path: res.out_path.to_string_lossy().into_owned(),
             contents: res.contents,

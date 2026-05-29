@@ -41,13 +41,17 @@ pub use pdf::{PdfBuilder, PdfBuilderError};
 pub use pdf_sheet::SheetPdfBuilder;
 pub use plot_style::{PlotStyle, PlotStyleTable};
 pub use project_export::{
-    write_deliver_pack, write_deliver_pack_with_context, write_project_dxf, write_project_gltf,
-    write_project_ifc, write_project_package_zip, write_project_pdf, write_proposal_pack,
-    write_proposal_pack_with_context, DeliverPackContext, DeliverPackKind, DeliverPackOptions,
-    ProjectExportError, WriteDeliverPackResult, WriteProjectDxfResult, WriteProjectGltfResult,
-    WriteProjectIfcResult, WriteProjectPackageResult, WriteProjectPdfResult,
-    WriteProposalPackResult,
+    write_deliver_pack_with_context, write_project_dxf, write_project_gltf, write_project_ifc,
+    write_project_package_zip, write_project_pdf, write_proposal_pack_with_context,
+    DeliverPackContext, DeliverPackKind, DeliverPackOptions, ProjectExportError,
+    WriteDeliverPackResult, WriteProjectDxfResult, WriteProjectGltfResult, WriteProjectIfcResult,
+    WriteProjectPackageResult, WriteProjectPdfResult, WriteProposalPackResult,
 };
+// Deprecated facades kept for backward compatibility; allowed at the
+// re-export site so downstream callers see the deprecation once they
+// actually invoke the function rather than via the prelude.
+#[allow(deprecated)]
+pub use project_export::{write_deliver_pack, write_proposal_pack};
 pub use proposal::{
     ProposalAssets, ProposalBranding, ProposalPack, ProposalPageOrder, RenderAttachment,
 };

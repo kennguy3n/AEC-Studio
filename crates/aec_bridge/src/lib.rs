@@ -8,6 +8,7 @@
 pub mod ai_state;
 mod asset_state;
 mod bim_attach;
+pub mod deliver_context;
 mod engine_status_cache;
 pub mod kchat_state;
 pub mod recents;

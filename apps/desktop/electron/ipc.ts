@@ -401,7 +401,20 @@ export function registerIpcHandlers(): void {
   });
   ipcMain.handle("export:buildProposalPack", async (_e, p) => {
     assertObject(p, "params");
-    return getBridge().exportBuildProposalPack(p);
+    // Inject the active project path so the bridge can thread real
+    // room / material / template counts and the floor-plan SVG into
+    // the proposal cover. Caller-supplied wins; otherwise the
+    // active-project tracker is the source of truth. Mirrors the
+    // `deliver:buildPack` handler's resolution semantics.
+    const projectPath =
+      typeof p.projectPath === "string" && p.projectPath.length > 0
+        ? p.projectPath
+        : peekActiveProjectPath();
+    const merged: Record<string, unknown> = { ...p };
+    if (projectPath) {
+      merged.projectPath = projectPath;
+    }
+    return getBridge().exportBuildProposalPack(merged);
   });
 
   // ----- Deliver -----

@@ -256,6 +256,7 @@ fn phase4_construction_pm_bim_lite_and_boq_journey() {
                 include_boq: true,
                 include_proposal: false,
             },
+            project_path: Some(summary.path.clone()),
         })
         .expect("deliver contractor boq pack");
     assert!(boq_path.exists());
@@ -287,6 +288,7 @@ fn phase4_construction_pm_bim_lite_and_boq_journey() {
                 include_boq: true,
                 include_proposal: false,
             },
+            project_path: Some(summary.path.clone()),
         })
         .expect("deliver bim pack");
     assert!(bim_pack_path.exists());
