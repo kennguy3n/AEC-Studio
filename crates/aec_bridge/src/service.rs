@@ -3731,15 +3731,39 @@ impl BridgeService {
             let advertised_cap = t
                 .max_entities_modified
                 .min(host_schema.max_entities_modified);
+            // The advertised `allowed_scopes` MUST be the
+            // INTERSECTION of the extension's declared scopes and
+            // the host tool's schema scopes — same architectural
+            // pattern as the cap clamp above. The host schema is
+            // load-bearing: the planner's grammar/diff validator
+            // enforces the host scopes regardless of what the
+            // extension manifest declares, so advertising a scope
+            // that's only in the extension's set (but missing from
+            // the host's) would surface a value in the renderer
+            // that `resolve_ai_tool_alias` is guaranteed to reject
+            // at dispatch. Mirrors the cap-clamp posture: shrink
+            // toward the host's smaller set rather than the
+            // extension's wider one.
+            let advertised_scopes: Vec<String> = t
+                .allowed_scopes
+                .iter()
+                .filter(|sc| host_schema.allowed_scopes.contains(sc))
+                .map(|sc| sc.as_str().to_owned())
+                .collect();
+            // An extension whose declared scopes share zero overlap
+            // with the host schema is unreachable at dispatch — the
+            // intersection is empty, so every `ai_plan` call would
+            // be rejected at the scope check below. Drop the tool
+            // from the picker entirely, matching the unreachable-
+            // grammar_key and host-cap=0 dispositions above.
+            if advertised_scopes.is_empty() {
+                continue;
+            }
             tools.push(AiToolDescriptor {
                 name: t.tool_id,
                 display_name: t.display_name,
                 description: t.description,
-                allowed_scopes: t
-                    .allowed_scopes
-                    .iter()
-                    .map(|sc| sc.as_str().to_owned())
-                    .collect(),
+                allowed_scopes: advertised_scopes,
                 max_entities_modified: advertised_cap,
                 grammar_key: t.grammar_key,
                 // Extensions don't compose child tools today —
@@ -3912,12 +3936,16 @@ impl BridgeService {
     /// extension tools we additionally enforce:
     ///   * the extension is loaded + has the `AiTools` permission
     ///     (already checked by `list_extension_ai_tools`);
-    ///   * the requested `scope` is in the extension's declared
-    ///     `allowed_scopes`;
     ///   * the extension's `grammar_key` maps to a known built-in
     ///     [`AiToolName`] (extensions piggy-back on the host's
     ///     grammar + diff engine surface — they cannot introduce a
-    ///     new model output shape).
+    ///     new model output shape);
+    ///   * the requested `scope` is in the INTERSECTION of the
+    ///     extension's declared `allowed_scopes` and the host
+    ///     tool's schema `allowed_scopes` — the same intersection
+    ///     `ai_list_tools` advertises to the renderer, so a scope
+    ///     surfaced in the picker is guaranteed to dispatch
+    ///     cleanly (cap-clamp pattern, applied to scopes).
     ///
     /// Note on grammar_key disambiguation: more than one built-in
     /// schema may declare the same `grammar_key` when the variants
@@ -3970,22 +3998,15 @@ impl BridgeService {
             .into_iter()
             .find(|t| t.tool_id == tool)
             .ok_or_else(|| BridgeServiceError::Ai(format!("unknown ai tool `{tool}`")))?;
-        if !ext.allowed_scopes.contains(&scope) {
-            return Err(BridgeServiceError::Ai(format!(
-                "extension ai tool `{}` does not allow scope `{}` (allowed: {:?})",
-                ext.tool_id,
-                scope.as_str(),
-                ext.allowed_scopes
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect::<Vec<_>>()
-            )));
-        }
-        // Pick the host tool that owns this grammar_key. When more
-        // than one match (today `plan_detection` and `plan_to_wall`
-        // both declare `grammar_key: "plan_detection"`), prefer the
-        // canonical home — see [`canonical_builtin_for_grammar_key`]
-        // and the doc comment on this method.
+        // Pick the host tool that owns this grammar_key FIRST, so
+        // the scope check below can clamp the effective scope set
+        // against the host's `allowed_scopes` — the same
+        // intersection `ai_list_tools` advertises to the renderer.
+        // When more than one match (today `plan_detection` and
+        // `plan_to_wall` both declare `grammar_key:
+        // "plan_detection"`), prefer the canonical home — see
+        // [`canonical_builtin_for_grammar_key`] and the doc comment
+        // on this method.
         let schemas = ai_tool_schemas();
         let builtin =
             canonical_builtin_for_grammar_key(&ext.grammar_key, schemas).ok_or_else(|| {
@@ -3994,6 +4015,36 @@ impl BridgeService {
                     ext.tool_id, ext.grammar_key
                 ))
             })?;
+        // Effective scope set is the INTERSECTION of the extension's
+        // declared scopes and the host tool's schema scopes — the
+        // same shape `ai_list_tools` advertises to the renderer.
+        // The host schema is load-bearing: the planner's
+        // grammar/diff validator enforces it regardless of what the
+        // extension manifest claims, so a scope only present in the
+        // extension's set is unreachable at dispatch. Mirroring the
+        // cap-clamp pattern below: shrink toward the host's smaller
+        // set, not the extension's wider one.
+        //
+        // The `.expect("…")` is safe for the same reason as the cap
+        // clamp: `canonical_builtin_for_grammar_key` above only
+        // returns `Some(name)` for names that exist in `schemas`.
+        let host_schema = schemas
+            .get(builtin)
+            .expect("canonical_builtin_for_grammar_key only returns names present in schemas");
+        if !ext.allowed_scopes.contains(&scope) || !host_schema.allowed_scopes.contains(&scope) {
+            let effective: Vec<&str> = ext
+                .allowed_scopes
+                .iter()
+                .filter(|sc| host_schema.allowed_scopes.contains(sc))
+                .map(|sc| sc.as_str())
+                .collect();
+            return Err(BridgeServiceError::Ai(format!(
+                "extension ai tool `{}` does not allow scope `{}` (effective allowed: {:?})",
+                ext.tool_id,
+                scope.as_str(),
+                effective,
+            )));
+        }
         // The effective cap must be the smallest of:
         //   - the caller's requested cap (`max_entities_modified`),
         //   - the extension's manifest cap (`ext.max_entities_modified`),
@@ -4005,18 +4056,9 @@ impl BridgeService {
         // would be rejected at dispatch even when the extension
         // manifest declares a higher ceiling (e.g. extension says
         // 100, host caps at 16). Clamping here keeps the
-        // contract symmetric with `ai_list_tools`'s advertised
-        // cap and means the renderer's slider never produces a
-        // value the planner is going to reject. The
-        // `expect("…")` is safe because `canonical_builtin_for_grammar_key`
-        // above only returns `Some(name)` for names that exist in
-        // `schemas` — the helper iterates `schemas.iter_sorted()`
-        // and picks one of its own entries. If that invariant ever
-        // breaks (catalogue bug), the panic surfaces it loudly
-        // instead of silently advertising an impossible cap.
-        let host_schema = schemas
-            .get(builtin)
-            .expect("canonical_builtin_for_grammar_key only returns names present in schemas");
+        // contract symmetric with `ai_list_tools`'s advertised cap
+        // and means the renderer's slider never produces a value
+        // the planner is going to reject.
         let effective_cap = max_entities_modified
             .min(ext.max_entities_modified)
             .min(host_schema.max_entities_modified);

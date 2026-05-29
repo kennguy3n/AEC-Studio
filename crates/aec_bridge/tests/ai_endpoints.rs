@@ -1467,3 +1467,155 @@ fn ai_list_tools_keeps_non_colliding_extension_tools_alongside_colliding_one() {
         "exactly one entry must surface for the colliding `lighting_assistant` (saw: {names:?})",
     );
 }
+
+#[test]
+fn ai_list_tools_clamps_extension_scopes_against_canonical_host_scopes() {
+    // Plant an extension that aliases the built-in
+    // `layout_suggestion` grammar (host schema scopes = `["design"]`)
+    // but declares an inflated manifest scope set
+    // `["design", "deliver"]`. The advertised scopes in
+    // `ai_list_tools` MUST be the INTERSECTION with the host's
+    // schema scopes — same architectural pattern as the cap clamp.
+    // Otherwise the renderer's scope picker would expose values
+    // (`deliver`) that the planner / `resolve_ai_tool_alias` are
+    // guaranteed to reject at dispatch.
+    let (s, _g, _path) = make_service_with_ai_extensions(|root| {
+        plant_ai_tool_extension_alias(
+            root,
+            "acme.inflated.scope",
+            "acme.inflated.scope.layouter",
+            "layout_suggestion",
+            vec!["design", "deliver"],
+            8,
+        );
+    });
+    let tools = s.ai_list_tools().expect("ai_list_tools");
+    let entry = tools
+        .iter()
+        .find(|t| t.name == "acme.inflated.scope.layouter")
+        .expect("extension AI tool must surface in ai_list_tools");
+    assert_eq!(
+        entry.allowed_scopes,
+        vec!["design".to_string()],
+        "ai_list_tools must clamp the advertised scopes against the canonical \
+         host's schema scopes (`layout_suggestion` = [\"design\"]) — got {:?} \
+         from manifest scopes [\"design\", \"deliver\"]",
+        entry.allowed_scopes,
+    );
+}
+
+#[test]
+fn ai_list_tools_keeps_extension_scopes_when_subset_of_host() {
+    // Symmetric pin: when the extension's manifest scopes are a
+    // proper SUBSET of the host schema scopes, the advertised set
+    // stays at the extension's narrower declaration. The clamp is
+    // an intersection, not a hard override that widens to the host
+    // ceiling. This stops a future refactor from accidentally
+    // widening every extension's surface up to the host's scopes.
+    //
+    // Host `plan_detection` schema declares `["design", "draft"]`,
+    // extension declares only `["design"]` → advertised stays
+    // `["design"]`.
+    let (s, _g, _path) = make_service_with_ai_extensions(|root| {
+        plant_ai_tool_extension_alias(
+            root,
+            "acme.narrow.scope",
+            "acme.narrow.scope.detector",
+            "plan_detection",
+            vec!["design"],
+            4,
+        );
+    });
+    let tools = s.ai_list_tools().expect("ai_list_tools");
+    let entry = tools
+        .iter()
+        .find(|t| t.name == "acme.narrow.scope.detector")
+        .expect("extension AI tool must surface in ai_list_tools");
+    assert_eq!(
+        entry.allowed_scopes,
+        vec!["design".to_string()],
+        "ai_list_tools must keep the extension's narrower scope set when it is \
+         a subset of the host schema scopes; got {:?}",
+        entry.allowed_scopes,
+    );
+}
+
+#[test]
+fn ai_list_tools_drops_extension_when_scopes_disjoint_from_host() {
+    // When the extension's declared scopes share zero overlap with
+    // the host schema's scopes, the tool is unreachable at
+    // dispatch — every `ai_plan` call would be rejected by the
+    // scope-intersection guard in `resolve_ai_tool_alias`. Drop it
+    // from the picker entirely, matching the unreachable-
+    // grammar_key and host-cap = 0 dispositions: a tool that
+    // can't be dispatched should not appear in the picker either.
+    //
+    // Host `layout_suggestion` allows only `["design"]`; the
+    // extension declares only `["deliver"]` → disjoint.
+    let (s, _g, _path) = make_service_with_ai_extensions(|root| {
+        plant_ai_tool_extension_alias(
+            root,
+            "acme.disjoint.scope",
+            "acme.disjoint.scope.layouter",
+            "layout_suggestion",
+            vec!["deliver"],
+            4,
+        );
+    });
+    let tools = s.ai_list_tools().expect("ai_list_tools");
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+    assert!(
+        !names.contains(&"acme.disjoint.scope.layouter"),
+        "extension whose declared scopes are disjoint from the host schema \
+         scopes must NOT surface in ai_list_tools (it cannot be dispatched \
+         by ai_plan, so showing it in the picker would be a guaranteed \
+         failure path); saw: {names:?}",
+    );
+}
+
+#[test]
+fn ai_plan_rejects_extension_scope_outside_host_intersection() {
+    // Defense-in-depth dispatch-side check on the scope clamp the
+    // picker enforces. An extension declares both `design` and
+    // `deliver`, but aliases `layout_suggestion` (host =
+    // `["design"]`). A caller asking for `Scope::Deliver` is in
+    // the extension's declared set but NOT in the effective
+    // intersection — `resolve_ai_tool_alias` MUST reject it
+    // before the planner sees it. Mirrors
+    // `ai_plan_rejects_extension_tool_when_scope_not_allowed`
+    // for the intersection case.
+    let (s, _g, project_path) = make_service_with_ai_extensions(|root| {
+        plant_ai_tool_extension_alias(
+            root,
+            "acme.deliver.attempt",
+            "acme.deliver.attempt.layouter",
+            "layout_suggestion",
+            vec!["design", "deliver"],
+            8,
+        );
+    });
+    let err = s
+        .ai_plan(
+            &project_path,
+            "acme.deliver.attempt.layouter",
+            Scope::Deliver,
+            "lay out",
+            "{}",
+            8,
+        )
+        .expect_err(
+            "ai_plan must reject a scope present in the extension manifest but \
+             absent from the host schema intersection",
+        );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("acme.deliver.attempt.layouter") && msg.contains("scope"),
+        "scope-rejection error must name the extension and the scope; got: {msg}",
+    );
+    assert!(
+        msg.contains("effective allowed"),
+        "scope-rejection error must surface the EFFECTIVE allowed scopes \
+         (intersection with host schema), not just the extension's \
+         declared set; got: {msg}",
+    );
+}
