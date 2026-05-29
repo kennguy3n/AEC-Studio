@@ -656,7 +656,8 @@ describe("Bim page — onScheduleGenerate skips stale rows across project switch
     // leaked into B's preview" via DOM text match.
     let resolveReadback:
       | ((r: {
-          rows: Array<Record<string, string | number | boolean | null>>;
+          header: string[];
+          rows: Array<Record<string, string>>;
         }) => void)
       | null = null;
     const readbackSpy = vi
@@ -730,11 +731,12 @@ describe("Bim page — onScheduleGenerate skips stale rows across project switch
     expect(resolveReadback).not.toBeNull();
     await waitFor(async () => {
       resolveReadback!({
+        header: ["Entity ID", "Room Name", "Area"],
         rows: [
           {
             "Entity ID": "RACE_LEAKED_ROW",
             "Room Name": "Project A Living Room",
-            Area: 42,
+            Area: "42",
           },
         ],
       });

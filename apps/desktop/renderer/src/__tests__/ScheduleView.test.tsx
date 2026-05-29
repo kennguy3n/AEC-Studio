@@ -40,6 +40,35 @@ describe("ScheduleView", () => {
     expect(body.querySelectorAll("tr").length).toBe(2);
   });
 
+  it("renders columns in the writer-supplied header order, not the row's key order", () => {
+    // Regression: the napi layer transports rows as
+    // `HashMap<String, String>` so `Object.keys(rows[0])` is
+    // non-deterministic across runs / V8 builds for non-integer
+    // string keys. The writer's `header` is the source of truth
+    // for column order, so the table headers must match
+    // `headersByKind`, not the row's `Object.keys` ordering.
+    const rows: ScheduleRow[] = [
+      // Intentionally insert keys in a different order than the
+      // writer's header to prove the component prefers the header.
+      { area: 23.5, name: "Living", number: "101" },
+      { area: 14.2, name: "Bedroom", number: "102" },
+    ];
+    render(
+      <ScheduleView
+        {...baseProps}
+        rowsByKind={{ room: rows }}
+        headersByKind={{ room: ["number", "name", "area"] }}
+        onGenerate={() => undefined}
+      />,
+    );
+    const headers = Array.from(
+      screen
+        .getByTestId("schedule-view")
+        .querySelectorAll("thead th"),
+    ).map((th) => th.textContent);
+    expect(headers).toEqual(["number", "name", "area"]);
+  });
+
   it("switches to door tab when clicked", () => {
     render(
       <ScheduleView

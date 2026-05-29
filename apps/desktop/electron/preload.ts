@@ -260,7 +260,16 @@ const api = {
      */
     readScheduleRows: (params: { xlsxPath: string }) =>
       ipcRenderer.invoke("bim:readScheduleRows", params) as Promise<{
-        rows: Array<Record<string, string | number | boolean | null>>;
+        // `header` carries the writer's column order. The bridge
+        // returns rows as `Record<string, string>` (an unordered
+        // map at the napi boundary), so without `header` the
+        // renderer would have to derive column order from
+        // `Object.keys(rows[0])`, which is non-deterministic across
+        // V8 builds for non-integer string keys. Threading
+        // `header` through preserves the deterministic ordering
+        // the schedule writer emitted.
+        header: string[];
+        rows: Array<Record<string, string>>;
       }>,
     generateSchedule: (params: {
       sourcePath: string;
