@@ -45,6 +45,51 @@ boundary.
    case and reports "AEC Studio is not running" without exposing
    the stale file.
 
+## Master enable switch
+
+The integration has a bridge-persisted master enable switch
+mirroring `aec_core::kchat_config::KChatConfig::enabled`:
+
+* The Settings page's "Enable KChat integration" checkbox writes
+  through the `kchat:setEnabled` IPC handler, which calls
+  `BridgeService::kchat_set_enabled` (defined in
+  `crates/aec_bridge/src/service.rs`). The bridge stores the flag
+  on `KChatState`, mirrors it onto the next
+  `kchat_status()` payload, and (when a project is open) writes
+  it back through `apply_project_config` so the manifest's
+  `settings.kchat.enabled` follows the toggle.
+* `apply_project_config` runs on every `project_open` /
+  `project_save`, so opening a project with
+  `settings.kchat.enabled = false` automatically flips the
+  Settings card without an extra round trip.
+* The Electron `kchat:publish` IPC handler reads the flag from
+  the bridge before enqueueing into the loopback queue
+  (`apps/desktop/electron/ipc.ts`). When `enabled = false`, the
+  handler throws *before* touching `enqueuePublish` and the
+  renderer surfaces the error inline in
+  `PublishCardModal`. The Rust-side `KChatState::publish` /
+  `KChatState::ingest_reviews` paths short-circuit with
+  `KChatError::Disabled` for symmetry with the headless
+  in-process fallback used by component tests.
+* `kchat:status` returns `enabled` alongside `state` and
+  `defaultThreadId`. When `enabled = false` the response also
+  forces `state = "disconnected"` so the renderer's status chip
+  honestly reads `"disabled"` (chip implementation:
+  `apps/desktop/renderer/src/components/kchat/KChatStatusIndicator.tsx`)
+  rather than claiming the integration is live while every
+  publish bounces off the gate.
+* The `/api/status` extension-facing `connected` field is left
+  unchanged by the toggle — it strictly reflects whether the
+  loopback HTTP server has bound a port. Disabling the
+  integration short-circuits at the `kchat:publish` IPC, so the
+  extension simply observes an empty queue (`queuedPublishCount:
+  0`) on its next poll and the rightbar panel naturally renders
+  idle. We deliberately do NOT thread `enabled` into
+  `/api/status` because the extension treats `connected: false`
+  as "AEC Studio is not running" and prompts the user to launch
+  it — which is the wrong remediation when AEC Studio is up but
+  KChat is toggled off in Settings.
+
 ## Authentication
 
 Every request must carry `Authorization: Bearer <token>`. The

@@ -629,6 +629,16 @@ export interface BridgeBackend {
     threadId: string;
     sinceIso?: string | null;
   }): Promise<KChatIngestReport>;
+  /**
+   * Flip the bridge-persisted master KChat enable switch.
+   * When `enabled` is `false`, the Electron `kchat:publish` IPC
+   * handler refuses to enqueue into the loopback queue before
+   * touching the publisher; the Rust bridge's
+   * `KChatState::set_enabled` also blocks the in-process publish
+   * path. Returns the fresh status snapshot so callers can update
+   * their UI without an extra status poll.
+   */
+  kchatSetEnabled(params: { enabled: boolean }): Promise<KChatStatusReport>;
 
   // ----- Viewport (Phase 12) -----
   /** Current viewport status (GPU readiness, dimensions, frame count). */
@@ -683,6 +693,18 @@ export interface KChatStatusReport {
    * that case.
    */
   defaultThreadId?: string | null;
+  /**
+   * Master enable switch mirroring
+   * `aec_core::kchat_config::KChatConfig::enabled` (the
+   * bridge-persisted Settings toggle / per-project manifest
+   * field). When `false`, the Electron `kchat:publish` IPC
+   * handler refuses publishes before enqueueing into the
+   * loopback HTTP queue — the toggle is *not* cosmetic. The
+   * status `state` field is also forced to `"disconnected"` so
+   * the status chip honestly reads "offline" instead of
+   * claiming the integration is live.
+   */
+  enabled: boolean;
 }
 
 /** Result of `kchatPublish`. */
@@ -1669,6 +1691,8 @@ interface NativeApi {
   // sub-millisecond when KChat Desktop is local.
   kchat_status(): unknown;
   kchat_reload(): unknown;
+  kchat_set_enabled(enabled: boolean): unknown;
+  kchat_is_enabled(): boolean;
   kchat_publish(params: { cardJson: string }): unknown;
   kchat_ingest_reviews(params: {
     threadId: string;
@@ -1825,6 +1849,7 @@ export const NATIVE_WIRED_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   // for CI / dev runs without a real KChat install.
   "kchatStatus",
   "kchatReload",
+  "kchatSetEnabled",
   "kchatPublish",
   "kchatIngestReviews",
   // Viewport domain wired in Phase 12. `viewportStatus` /
@@ -2502,12 +2527,14 @@ function adaptNative(n: NativeApi): BridgeBackend {
         publisherKind: string;
         instanceJson: string | null | undefined;
         defaultThreadId: string | null | undefined;
+        enabled: boolean;
       };
       return {
         state: raw.state as KChatStatusReport["state"],
         publisherKind: raw.publisherKind as KChatStatusReport["publisherKind"],
         instanceJson: raw.instanceJson ?? null,
         defaultThreadId: raw.defaultThreadId ?? null,
+        enabled: raw.enabled,
       };
     },
     kchatReload: async () => {
@@ -2516,12 +2543,30 @@ function adaptNative(n: NativeApi): BridgeBackend {
         publisherKind: string;
         instanceJson: string | null | undefined;
         defaultThreadId: string | null | undefined;
+        enabled: boolean;
       };
       return {
         state: raw.state as KChatStatusReport["state"],
         publisherKind: raw.publisherKind as KChatStatusReport["publisherKind"],
         instanceJson: raw.instanceJson ?? null,
         defaultThreadId: raw.defaultThreadId ?? null,
+        enabled: raw.enabled,
+      };
+    },
+    kchatSetEnabled: async (params) => {
+      const raw = n.kchat_set_enabled(params.enabled) as {
+        state: string;
+        publisherKind: string;
+        instanceJson: string | null | undefined;
+        defaultThreadId: string | null | undefined;
+        enabled: boolean;
+      };
+      return {
+        state: raw.state as KChatStatusReport["state"],
+        publisherKind: raw.publisherKind as KChatStatusReport["publisherKind"],
+        instanceJson: raw.instanceJson ?? null,
+        defaultThreadId: raw.defaultThreadId ?? null,
+        enabled: raw.enabled,
       };
     },
     kchatPublish: async (params) => {
@@ -3470,12 +3515,26 @@ export function inProcessBackend(): BridgeBackend {
       // renderer falls back to its `kchat-default` constant in
       // this case.
       defaultThreadId: null,
+      // The in-process fallback mirrors `KChatConfig::default()`
+      // (enabled = true) so journey tests and headless runs
+      // observe a non-disabled bridge by default. Production
+      // `state` is still `disconnected` because there is no real
+      // loopback API in this codepath.
+      enabled: true,
     }),
     kchatReload: async () => ({
       state: "disconnected",
       publisherKind: "in_memory",
       instanceJson: null,
       defaultThreadId: null,
+      enabled: true,
+    }),
+    kchatSetEnabled: async ({ enabled }) => ({
+      state: "disconnected",
+      publisherKind: "in_memory",
+      instanceJson: null,
+      defaultThreadId: null,
+      enabled,
     }),
     kchatPublish: async (_params) => ({
       messageId: id("kchat_msg"),

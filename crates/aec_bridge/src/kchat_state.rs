@@ -91,6 +91,24 @@ pub struct KChatStatusReport {
     /// [`aec_core::DEFAULT_THREAD_ID`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_thread_id: Option<String>,
+    /// Master enable switch mirroring
+    /// [`aec_core::kchat_config::KChatConfig::enabled`]. The
+    /// Electron `kchat:publish` IPC handler reads this through
+    /// `BridgeService::kchat_is_enabled` *before* enqueueing into
+    /// the loopback HTTP queue and refuses the publish with a
+    /// structured `disabled` error when `false`. Surfaced through
+    /// the status payload so the renderer's Settings card and
+    /// status chip stay in sync with the bridge without an extra
+    /// IPC roundtrip. The Rust-side default is `true` (matches
+    /// `KChatConfig::default`); per-project manifests overwrite it
+    /// via [`KChatState::apply_project_config`] and the Settings
+    /// toggle drives it via [`KChatState::set_enabled`].
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 pub struct KChatState {
@@ -267,6 +285,7 @@ impl KChatState {
     pub fn set_enabled(&self, enabled: bool) {
         let mut inner = self.inner.write().expect("kchat state not poisoned");
         inner.enabled = enabled;
+        inner.last_status.enabled = enabled;
         // The cached state string follows the enabled flag so the
         // renderer's chip flips to "disconnected" the moment a
         // project disables KChat, without waiting for the next
@@ -306,6 +325,7 @@ impl KChatState {
     pub fn apply_project_config(&self, config: &KChatConfig) {
         let mut inner = self.inner.write().expect("kchat state not poisoned");
         inner.enabled = config.enabled;
+        inner.last_status.enabled = config.enabled;
         inner
             .default_thread_id
             .clone_from(&config.default_thread_id);
@@ -351,11 +371,13 @@ impl KChatState {
         let mut inner = self.inner.write().expect("kchat state not poisoned");
         inner.publisher = Arc::new(InMemoryPublisher::new(origin));
         inner.publisher_kind = PublisherKind::InMemory;
+        let enabled = inner.enabled;
         inner.last_status = KChatStatusReport {
             state: "disconnected".into(),
             publisher_kind: PublisherKind::InMemory.as_str().into(),
             instance: None,
             default_thread_id: inner.default_thread_id.clone(),
+            enabled,
         };
     }
 }
@@ -372,6 +394,7 @@ impl Inner {
                 publisher_kind: PublisherKind::InMemory.as_str().into(),
                 instance: None,
                 default_thread_id: None,
+                enabled: true,
             },
             enabled: true,
             default_thread_id: None,
@@ -403,6 +426,51 @@ mod tests {
         assert_eq!(s.publisher_kind, "in_memory");
         assert_eq!(s.state, "disconnected");
         assert!(s.instance.is_none());
+        // Default starts enabled; the Settings toggle / per-project
+        // config flip this off explicitly. The Electron
+        // `kchat:publish` handler reads this field through the
+        // status payload to gate enqueue decisions, so an
+        // unintentional default of `false` would break publishing
+        // on every fresh install.
+        assert!(s.enabled);
+    }
+
+    /// The `enabled` field on the status payload must follow
+    /// [`KChatState::set_enabled`] so the Electron `kchat:publish`
+    /// gate observes the same flag the Settings toggle just
+    /// flipped without a per-call bridge round-trip.
+    #[test]
+    fn status_enabled_field_follows_set_enabled() {
+        let st = KChatState::new();
+        assert!(st.status().enabled);
+        st.set_enabled(false);
+        assert!(!st.status().enabled);
+        st.set_enabled(true);
+        assert!(st.status().enabled);
+    }
+
+    /// `apply_project_config` adopts the manifest's `enabled` flag
+    /// *and* mirrors it onto the status payload so a fresh
+    /// `project_open` flips the renderer's chip without waiting
+    /// for the next 5 s status poll.
+    #[test]
+    fn apply_project_config_mirrors_enabled_onto_status() {
+        let st = KChatState::new();
+        st.mark_loopback_active();
+        let mut cfg = KChatConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        st.apply_project_config(&cfg);
+        let s = st.status();
+        assert!(!s.enabled);
+        assert_eq!(s.state, "disconnected");
+
+        cfg.enabled = true;
+        st.apply_project_config(&cfg);
+        let s = st.status();
+        assert!(s.enabled);
+        assert_eq!(s.state, "connected");
     }
 
     /// `mark_loopback_active` promotes the kind to `loopback_http`

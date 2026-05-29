@@ -2704,6 +2704,15 @@ pub struct KChatStatusJs {
     ///
     /// [cfg]: aec_core::kchat_config::KChatConfig
     pub default_thread_id: Option<String>,
+    /// Master enable switch mirroring
+    /// [`aec_core::kchat_config::KChatConfig::enabled`]. The
+    /// Electron `kchat:publish` IPC handler reads this through the
+    /// status payload *before* enqueueing into the loopback HTTP
+    /// queue and refuses the publish when `false`. Exposed via the
+    /// same payload the renderer already polls so the Settings
+    /// toggle and the publish-gate stay in lockstep without a
+    /// per-call bridge round trip.
+    pub enabled: bool,
 }
 
 #[napi(object)]
@@ -2755,6 +2764,7 @@ fn kchat_status_to_js(rep: crate::kchat_state::KChatStatusReport) -> KChatStatus
         publisher_kind: rep.publisher_kind,
         instance_json,
         default_thread_id: rep.default_thread_id,
+        enabled: rep.enabled,
     }
 }
 
@@ -2768,6 +2778,30 @@ pub fn kchat_status() -> Result<KChatStatusJs> {
 pub fn kchat_reload() -> Result<KChatStatusJs> {
     let rep = with_service_ref(super::service::BridgeService::kchat_reload)?;
     Ok(kchat_status_to_js(rep))
+}
+
+/// Flip the master KChat enable switch. When `enabled` is `false`,
+/// subsequent `kchat_publish` / `kchat_ingest_reviews` calls refuse
+/// to touch the publisher (`KChatError::Disabled`). Mirrored onto
+/// the status payload so the Electron-side `kchat:publish` gate and
+/// the renderer's Settings card observe the same flag without a
+/// per-call bridge round trip.
+#[napi]
+pub fn kchat_set_enabled(enabled: bool) -> Result<KChatStatusJs> {
+    let rep = with_service_ref(|svc| {
+        svc.kchat_set_enabled(enabled);
+        svc.kchat_status()
+    })?;
+    Ok(kchat_status_to_js(rep))
+}
+
+/// Read the current value of the master KChat enable switch. Cheap
+/// read-lock on the bridge-side state; exposed separately so the
+/// renderer's Settings card can hydrate its toggle without parsing
+/// the full status payload.
+#[napi]
+pub fn kchat_is_enabled() -> Result<bool> {
+    with_service_ref(super::service::BridgeService::kchat_is_enabled)
 }
 
 #[napi]

@@ -168,6 +168,7 @@ describe("<Deliver /> KChat thread wiring", () => {
       publisherKind: "loopback_http",
       instanceJson: null,
       defaultThreadId: "thread-from-project",
+      enabled: true,
     });
     const ingestSpy = vi
       .spyOn(aec.kchat, "ingestReviews")
@@ -196,6 +197,7 @@ describe("<Deliver /> KChat thread wiring", () => {
       publisherKind: "loopback_http",
       instanceJson: null,
       defaultThreadId: null,
+      enabled: true,
     });
     const ingestSpy = vi
       .spyOn(aec.kchat, "ingestReviews")
@@ -680,6 +682,7 @@ describe("<Deliver /> per-project state reset on project switch", () => {
           publisherKind: "loopback_http" as const,
           instanceJson: null,
           defaultThreadId: "thread-B",
+          enabled: true,
         });
       }
       if (mockActiveProjectPath === "/tmp/threadResetA.aecstudio") {
@@ -688,6 +691,7 @@ describe("<Deliver /> per-project state reset on project switch", () => {
           publisherKind: "loopback_http" as const,
           instanceJson: null,
           defaultThreadId: "thread-A",
+          enabled: true,
         });
       }
       return Promise.resolve({
@@ -695,6 +699,7 @@ describe("<Deliver /> per-project state reset on project switch", () => {
         publisherKind: "loopback_http" as const,
         instanceJson: null,
         defaultThreadId: null,
+        enabled: true,
       });
     });
     vi.spyOn(aec.kchat, "ingestReviews").mockResolvedValue({

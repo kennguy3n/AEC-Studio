@@ -609,6 +609,10 @@ function kchatMock(newId: (prefix: string) => string) {
         // absent. The Deliver page's review panel falls back to
         // its `kchat-default` constant when this is null.
         defaultThreadId: null,
+        // Vitest mock mirrors `KChatConfig::default()` so component
+        // tests that render the Settings card observe a non-
+        // disabled bridge by default.
+        enabled: true,
       }) as Awaited<ReturnType<AecApi["kchat"]["status"]>>,
     reload: async () =>
       ({
@@ -616,7 +620,16 @@ function kchatMock(newId: (prefix: string) => string) {
         publisherKind: "in_memory",
         instanceJson: null,
         defaultThreadId: null,
+        enabled: true,
       }) as Awaited<ReturnType<AecApi["kchat"]["reload"]>>,
+    setEnabled: async ({ enabled }: { enabled: boolean }) =>
+      ({
+        state: "disconnected",
+        publisherKind: "in_memory",
+        instanceJson: null,
+        defaultThreadId: null,
+        enabled,
+      }) as Awaited<ReturnType<AecApi["kchat"]["setEnabled"]>>,
     publish: async (_params: { cardJson: string }) => ({
       messageId: newId("kchat_msg"),
       threadId: "kchat-default",

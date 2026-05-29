@@ -581,6 +581,7 @@ const api = {
         publisherKind: "loopback_http" | "in_memory";
         instanceJson: string | null;
         defaultThreadId: string | null;
+        enabled: boolean;
       }>,
     reload: () =>
       ipcRenderer.invoke("kchat:reload") as Promise<{
@@ -588,6 +589,20 @@ const api = {
         publisherKind: "loopback_http" | "in_memory";
         instanceJson: string | null;
         defaultThreadId: string | null;
+        enabled: boolean;
+      }>,
+    /**
+     * Flip the bridge-persisted KChat enable switch. Returns the
+     * fresh status snapshot so the Settings card can update its
+     * UI without a follow-up `status()` poll.
+     */
+    setEnabled: (params: { enabled: boolean }) =>
+      ipcRenderer.invoke("kchat:setEnabled", params) as Promise<{
+        state: "connected" | "reconnecting" | "disconnected";
+        publisherKind: "loopback_http" | "in_memory";
+        instanceJson: string | null;
+        defaultThreadId: string | null;
+        enabled: boolean;
       }>,
     publish: (params: { cardJson: string }) =>
       ipcRenderer.invoke("kchat:publish", params) as Promise<{

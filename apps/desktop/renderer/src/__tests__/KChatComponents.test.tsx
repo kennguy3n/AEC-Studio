@@ -24,6 +24,7 @@ describe("KChatStatusIndicator", () => {
       publisherKind: "in_memory",
       instanceJson: null,
       defaultThreadId: null,
+      enabled: true,
     });
     render(<KChatStatusIndicator />);
     await waitFor(() =>
@@ -49,6 +50,7 @@ describe("KChatStatusIndicator", () => {
         reviewThreadCount: 1,
       }),
       defaultThreadId: null,
+      enabled: true,
     });
     render(<KChatStatusIndicator />);
     await waitFor(() =>
@@ -67,6 +69,7 @@ describe("KChatStatusIndicator", () => {
       publisherKind: "in_memory",
       instanceJson: null,
       defaultThreadId: null,
+      enabled: true,
     });
     const reload = vi.spyOn(aec.kchat, "reload").mockResolvedValue({
       state: "connected",
@@ -80,6 +83,7 @@ describe("KChatStatusIndicator", () => {
         reviewThreadCount: 1,
       }),
       defaultThreadId: null,
+      enabled: true,
     });
     render(<KChatStatusIndicator />);
     await waitFor(() =>
@@ -109,6 +113,7 @@ describe("KChatStatusIndicator", () => {
       publisherKind: "in_memory",
       instanceJson: null,
       defaultThreadId: null,
+      enabled: true,
     });
     vi.spyOn(aec.kchat, "reload").mockRejectedValue(
       new Error("socket unreachable"),
@@ -235,6 +240,7 @@ describe("KChatReviewPanel", () => {
       publisherKind: "in_memory",
       instanceJson: null,
       defaultThreadId: null,
+      enabled: true,
     });
     render(<KChatReviewPanel threadId="kchat-default" />);
     const panel = await screen.findByTestId("kchat-review-panel");
@@ -256,6 +262,7 @@ describe("KChatReviewPanel", () => {
         reviewThreadCount: 1,
       }),
       defaultThreadId: null,
+      enabled: true,
     });
     vi.spyOn(aec.kchat, "ingestReviews").mockResolvedValue({
       threadId: "kchat-default",
@@ -312,6 +319,7 @@ describe("KChatReviewPanel", () => {
         reviewThreadCount: 1,
       }),
       defaultThreadId: null,
+      enabled: true,
     });
     vi.spyOn(aec.kchat, "ingestReviews").mockRejectedValue(
       new Error("bridge timed out"),
@@ -355,6 +363,7 @@ describe("KChatReviewPanel", () => {
         reviewThreadCount: 1,
       }),
       defaultThreadId: null,
+      enabled: true,
     });
     const ingest = vi
       .spyOn(aec.kchat, "ingestReviews")
@@ -467,6 +476,7 @@ describe("KChatReviewPanel", () => {
         reviewThreadCount: 1,
       }),
       defaultThreadId: null,
+      enabled: true,
     });
 
     // ingestReviews: thread-a resolves after a 100 ms delay (simulating

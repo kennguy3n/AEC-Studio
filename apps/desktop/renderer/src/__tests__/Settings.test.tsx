@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { Settings } from "../pages/Settings";
+import { aec } from "../api/aec";
 
 describe("Settings page", () => {
   it("renders all configuration sections", async () => {
@@ -39,7 +40,14 @@ describe("Settings page", () => {
     expect(select.value).toEqual("small");
   });
 
-  it("KChat toggle is off by default and persists toggle", () => {
+  it("KChat toggle hydrates from the bridge and writes through on flip", async () => {
+    // Phase 15 (gate restoration): the Settings toggle is no
+    // longer in-memory. It hydrates from `kchat:status.enabled`
+    // (the bridge-persisted `KChatConfig::enabled`) and writes
+    // through via `kchat:setEnabled`. The in-process renderer
+    // backend returns `enabled: true` from status() to mirror
+    // `KChatConfig::default()`.
+    const setEnabledSpy = vi.spyOn(aec.kchat, "setEnabled");
     render(
       <MemoryRouter>
         <Settings />
@@ -48,9 +56,24 @@ describe("Settings page", () => {
     const toggle = screen.getByTestId(
       "settings-kchat-enabled",
     ) as HTMLInputElement;
-    expect(toggle.checked).toBe(false);
+    // Wait for the initial `kchat:status` poll to land.
+    await waitFor(() => {
+      expect(toggle.checked).toBe(true);
+    });
     fireEvent.click(toggle);
-    expect(toggle.checked).toBe(true);
+    await waitFor(() => {
+      expect(setEnabledSpy).toHaveBeenCalledWith({ enabled: false });
+    });
+    await waitFor(() => {
+      expect(toggle.checked).toBe(false);
+    });
+    fireEvent.click(toggle);
+    await waitFor(() => {
+      expect(setEnabledSpy).toHaveBeenLastCalledWith({ enabled: true });
+    });
+    await waitFor(() => {
+      expect(toggle.checked).toBe(true);
+    });
   });
 
   it("Save button records a saved timestamp", async () => {
