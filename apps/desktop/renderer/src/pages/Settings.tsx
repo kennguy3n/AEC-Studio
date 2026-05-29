@@ -19,6 +19,10 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { aec, RuntimeStatus } from "../api/aec";
+import {
+  parseLoopbackInstance,
+  type KChatLoopbackInstance,
+} from "../components/kchat/loopbackInstance";
 
 type AiModelTier = "tiny" | "small" | "medium" | "large";
 type RenderPresetKey = "quick" | "standard" | "high" | "studio";
@@ -98,7 +102,7 @@ export function Settings() {
             enabled: s.enabled,
             state: s.state,
             publisherKind: s.publisherKind,
-            instance: parseKChatInstance(s.instanceJson),
+            instance: parseLoopbackInstance(s.instanceJson),
           });
         }
       } catch {
@@ -119,7 +123,7 @@ export function Settings() {
         enabled: s.enabled,
         state: s.state,
         publisherKind: s.publisherKind,
-        instance: parseKChatInstance(s.instanceJson),
+        instance: parseLoopbackInstance(s.instanceJson),
       });
       // Clear any prior failure once we've successfully refreshed.
       setKchatReloadError(null);
@@ -155,7 +159,7 @@ export function Settings() {
         enabled: s.enabled,
         state: s.state,
         publisherKind: s.publisherKind,
-        instance: parseKChatInstance(s.instanceJson),
+        instance: parseLoopbackInstance(s.instanceJson),
       });
     } catch (e) {
       // The bridge can only fail here on a panic in the
@@ -454,54 +458,3 @@ export function Settings() {
 }
 
 export default Settings;
-
-/**
- * Phase 15: shape of the JSON snapshot returned in
- * `KChatStatusReport.instanceJson` for the `loopback_http`
- * publisher. Mirrors `KchatRendererSnapshot` from
- * `apps/desktop/electron/kchat/kchatAppState.ts` exactly so a
- * field addition there surfaces here as a type error rather
- * than a silent `undefined` lookup.
- */
-export interface KChatLoopbackInstance {
-  apiServerRunning: boolean;
-  apiServerPort: number | null;
-  portFilePath: string | null;
-  lastExtensionContactAt: string | null;
-  queuedPublishCount: number;
-  reviewThreadCount: number;
-}
-
-function parseKChatInstance(
-  json: string | null | undefined,
-): KChatLoopbackInstance | null {
-  if (!json) return null;
-  try {
-    const parsed = JSON.parse(json) as Partial<KChatLoopbackInstance>;
-    // The four numeric / boolean fields must be present; the
-    // string fields are nullable on the wire so we accept null
-    // / undefined / missing equivalently.
-    if (
-      typeof parsed.apiServerRunning !== "boolean" ||
-      typeof parsed.queuedPublishCount !== "number" ||
-      typeof parsed.reviewThreadCount !== "number"
-    ) {
-      return null;
-    }
-    return {
-      apiServerRunning: parsed.apiServerRunning,
-      apiServerPort:
-        typeof parsed.apiServerPort === "number" ? parsed.apiServerPort : null,
-      portFilePath:
-        typeof parsed.portFilePath === "string" ? parsed.portFilePath : null,
-      lastExtensionContactAt:
-        typeof parsed.lastExtensionContactAt === "string"
-          ? parsed.lastExtensionContactAt
-          : null,
-      queuedPublishCount: parsed.queuedPublishCount,
-      reviewThreadCount: parsed.reviewThreadCount,
-    };
-  } catch {
-    return null;
-  }
-}

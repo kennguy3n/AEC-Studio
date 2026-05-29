@@ -119,6 +119,26 @@ function createWindow(): void {
       targetWindow.webContents.send("kchat:deeplink", route);
     });
   });
+
+  // Phase 15: clear the deeplink consumer when the window is
+  // destroyed. On macOS the app keeps running after every window
+  // closes, so the same bridge instance survives across a close
+  // → re-open cycle. Without this handler the consumer still
+  // points at the destroyed `mainWindow`: `DeeplinkBridge.dispatch`
+  // treats `this.consumer !== null` as "delivered", invokes the
+  // closure, the closure short-circuits on `isDestroyed()`, and
+  // the route is silently dropped instead of being parked for
+  // the next `setConsumer()` call. Clearing the consumer here
+  // makes `dispatch` enqueue routes into `this.parked` so the
+  // next window flushes them in FIFO order on its own
+  // `did-finish-load`.
+  mainWindow.on("closed", () => {
+    const bridge = getKchatDeeplinkBridge();
+    if (bridge !== null) {
+      bridge.clearConsumer();
+    }
+    mainWindow = null;
+  });
 }
 
 if (hasSingleInstanceLock) {

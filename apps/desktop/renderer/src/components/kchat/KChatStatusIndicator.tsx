@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import type { AecApi } from "../../../../electron/preload";
 import { aec } from "../../api/aec";
+import { parseLoopbackInstance } from "./loopbackInstance";
 
 /**
  * Status chip for the StatusBar.
@@ -121,7 +122,7 @@ export function KChatStatusIndicator() {
     ? stateLabel[status.state]
     : "disabled";
 
-  const instance = parseInstance(status.instanceJson);
+  const instance = parseLoopbackInstance(status.instanceJson);
   // Phase 15: surface the loopback API port + heartbeat instead
   // of the socket path + version. "never" reads better in a
   // tooltip than the wire-level `null`.
@@ -155,47 +156,4 @@ export function KChatStatusIndicator() {
   );
 }
 
-/**
- * Phase 15: loopback-API snapshot shape returned by
- * `kchat:status`'s `instanceJson`. Mirrors
- * `KchatRendererSnapshot` from `kchatAppState.ts`.
- */
-interface KChatLoopbackInstance {
-  apiServerRunning: boolean;
-  apiServerPort: number | null;
-  portFilePath: string | null;
-  lastExtensionContactAt: string | null;
-  queuedPublishCount: number;
-  reviewThreadCount: number;
-}
 
-function parseInstance(
-  json: string | null,
-): KChatLoopbackInstance | null {
-  if (!json) return null;
-  try {
-    const parsed = JSON.parse(json) as Partial<KChatLoopbackInstance>;
-    if (
-      typeof parsed.apiServerRunning !== "boolean" ||
-      typeof parsed.queuedPublishCount !== "number" ||
-      typeof parsed.reviewThreadCount !== "number"
-    ) {
-      return null;
-    }
-    return {
-      apiServerRunning: parsed.apiServerRunning,
-      apiServerPort:
-        typeof parsed.apiServerPort === "number" ? parsed.apiServerPort : null,
-      portFilePath:
-        typeof parsed.portFilePath === "string" ? parsed.portFilePath : null,
-      lastExtensionContactAt:
-        typeof parsed.lastExtensionContactAt === "string"
-          ? parsed.lastExtensionContactAt
-          : null,
-      queuedPublishCount: parsed.queuedPublishCount,
-      reviewThreadCount: parsed.reviewThreadCount,
-    };
-  } catch {
-    return null;
-  }
-}
