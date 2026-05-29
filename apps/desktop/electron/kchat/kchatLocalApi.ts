@@ -509,7 +509,7 @@ export class KchatLocalApiServer {
       if (req.method === "GET" && path === "/api/queued-publishes") {
         this.requireBearer(req);
         const value = await this.handlers.fetchQueuedPublishes();
-        respond(res, 200, { items: value });
+        respond(res, 200, { queued: value });
         return;
       }
       if (req.method === "POST" && path === "/api/publish-to-thread") {

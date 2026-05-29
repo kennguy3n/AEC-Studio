@@ -57,7 +57,6 @@ import {
 import {
   DeeplinkBridge,
   attachAppEvents,
-  registerProtocolClient,
   type DeeplinkRoute,
 } from "./kchatDeeplinkBridge";
 
@@ -156,7 +155,12 @@ export async function initialiseKchat(
       );
     },
   });
-  registerProtocolClient(electronApp);
+  // NOTE: the `aecstudio://` scheme is claimed BEFORE `whenReady`
+  // in `main.ts` so the very first `open-url` event on macOS isn't
+  // racy. We deliberately do not re-register here — repeating the
+  // `setAsDefaultProtocolClient` call would be a no-op on macOS /
+  // Linux and (silently) succeed on Windows, but the duplicate
+  // hides the lifecycle invariant from readers.
   const detachAppEvents = attachAppEvents(deeplink, electronApp);
 
   state = {

@@ -1,4 +1,5 @@
 import { ipcMain } from "electron";
+import { randomUUID } from "node:crypto";
 import { getBridge } from "./bridge";
 import {
   clearActiveProjectPath,
@@ -13,6 +14,42 @@ import {
   getReviewCommentsForThread,
 } from "./kchat/kchatAppState";
 import { openKchatDeeplink } from "./kchat/kchatOutboundDeeplink";
+
+/**
+ * Per-project KChat thread id sourced from the Rust bridge's
+ * `kchatStatus()` snapshot, which mirrors
+ * `KChatConfig::default_thread_id` for the currently open project
+ * (see `crates/aec_bridge/src/kchat_state.rs::apply_project_config`).
+ *
+ * Returns `null` when no project is open or when the project's
+ * manifest omits the field — callers fall back to
+ * `aec_core::DEFAULT_THREAD_ID` (`"kchat-default"`) which matches
+ * the renderer's `FALLBACK_THREAD_ID` constant. We deliberately do
+ * NOT collapse the fallback here so the renderer can distinguish
+ * "explicit project thread" from "defaulted" for telemetry.
+ *
+ * Cheap call — bridge-side `kchat_state.status()` is a read-lock
+ * acquire, no I/O.
+ */
+async function resolveDefaultThreadIdFromBridge(): Promise<string | null> {
+  try {
+    const status = await getBridge().kchatStatus();
+    return status.defaultThreadId ?? null;
+  } catch (err) {
+    // The bridge can be temporarily unavailable during boot
+    // (`kchat:status` is the very first call the renderer issues).
+    // Surfacing the error would hide the loopback / extension
+    // status from the indicator chip even though that signal is
+    // still meaningful; degrade to `null` so the renderer falls
+    // back to its `kchat-default` constant.
+    console.warn(
+      `[ipc] resolveDefaultThreadIdFromBridge: bridge kchat_status failed (${
+        err instanceof Error ? err.message : String(err)
+      }); falling back to null`,
+    );
+    return null;
+  }
+}
 
 /**
  * Register every IPC handler the preload bridge expects. Handlers are
@@ -635,7 +672,7 @@ export function registerIpcHandlers(): void {
         queuedPublishCount: snap.queuedPublishCount,
         reviewThreadCount: snap.reviewThreadCount,
       }),
-      defaultThreadId: null,
+      defaultThreadId: await resolveDefaultThreadIdFromBridge(),
     };
   });
   ipcMain.handle("kchat:reload", async () => {
@@ -657,17 +694,32 @@ export function registerIpcHandlers(): void {
         queuedPublishCount: snap.queuedPublishCount,
         reviewThreadCount: snap.reviewThreadCount,
       }),
-      defaultThreadId: null,
+      defaultThreadId: await resolveDefaultThreadIdFromBridge(),
     };
   });
   ipcMain.handle("kchat:publish", async (_e, params) => {
     assertObject(params, "params");
     const cardJson = (params as { cardJson?: unknown }).cardJson;
     assertString(cardJson, "cardJson");
-    // Surface obviously-broken payloads at the IPC boundary so
-    // the caller gets a descriptive error rather than a generic
-    // failure when the .kcz extension later tries to publish.
-    let card: { id?: unknown; threadId?: unknown; body?: unknown };
+    // The renderer's `PublishCardModal` posts the canonical
+    // `ArtifactCard` shape mirrored from
+    // `aec_core::kchat::ArtifactCard`
+    // (artifact / caption / project_link / thumbnail_blake3 /
+    // metadata). The local-queue `QueuedPublish` row needs a
+    // different shape (cardId / threadId / body) so the .kcz
+    // extension can drain it into KChat with a one-shot
+    // `invokeProcedure("kchat.send_message")` call. We transform
+    // at this boundary so neither side has to know about the
+    // other's shape: the renderer keeps the wire-stable
+    // ArtifactCard contract, and the loopback queue keeps the
+    // QueuedPublish contract.
+    let card: {
+      artifact?: unknown;
+      caption?: unknown;
+      project_link?: unknown;
+      thumbnail_blake3?: unknown;
+      metadata?: unknown;
+    };
     try {
       const parsed = JSON.parse(cardJson) as unknown;
       if (
@@ -676,10 +728,10 @@ export function registerIpcHandlers(): void {
         Array.isArray(parsed)
       ) {
         throw new Error(
-          "kchatPublish: cardJson must encode an object (ArtifactCard)",
+          "kchatPublish: cardJson must encode an ArtifactCard object",
         );
       }
-      card = parsed as { id?: unknown; threadId?: unknown; body?: unknown };
+      card = parsed as typeof card;
     } catch (err) {
       if (err instanceof SyntaxError) {
         throw new Error(
@@ -688,19 +740,54 @@ export function registerIpcHandlers(): void {
       }
       throw err;
     }
-    if (typeof card.id !== "string" || card.id.length === 0) {
-      throw new Error("kchatPublish: cardJson.id is required");
+    // The fields the renderer must always supply. Validate at the
+    // IPC boundary so a misconfigured caller gets a descriptive
+    // error rather than an opaque .kcz-extension failure later
+    // on. These mirror `ArtifactCard::validate` on the Rust side.
+    if (typeof card.artifact !== "string" || card.artifact.length === 0) {
+      throw new Error("kchatPublish: cardJson.artifact is required");
     }
-    if (typeof card.threadId !== "string" || card.threadId.length === 0) {
-      throw new Error("kchatPublish: cardJson.threadId is required");
+    if (typeof card.caption !== "string" || card.caption.trim().length === 0) {
+      throw new Error("kchatPublish: cardJson.caption is required");
     }
-    if (typeof card.body !== "string") {
-      throw new Error("kchatPublish: cardJson.body is required");
+    if (
+      typeof card.project_link !== "string" ||
+      !card.project_link.startsWith("aecstudio://")
+    ) {
+      throw new Error(
+        "kchatPublish: cardJson.project_link must start with aecstudio://",
+      );
     }
+    // Resolve the per-project default thread the active project
+    // has configured via its manifest's
+    // `settings.kchat.default_thread_id`. The bridge tracks this
+    // as `KChatConfig::default_thread_id`; when no project is
+    // open or the project leaves the field unset we fall back to
+    // `aec_core::DEFAULT_THREAD_ID` (`"kchat-default"`), matching
+    // the renderer's `FALLBACK_THREAD_ID` constant and the
+    // publisher-side default. The .kcz extension is free to map
+    // this to a real KChat thread id when it acks via
+    // POST /api/publish-to-thread.
+    const projectThread = await resolveDefaultThreadIdFromBridge();
+    const threadId =
+      projectThread !== null && projectThread.length > 0
+        ? projectThread
+        : "kchat-default";
+    // Mint a UUID v4 for the card id. The .kcz extension uses
+    // it purely as a correlation handle; ordering is preserved
+    // by the queue's append-only structure, not by the id.
+    const cardId = randomUUID();
+    // Body shown in the KChat thread. The renderer's caption
+    // already includes any artifact-kind decoration the user
+    // wants surfaced, so we forward it verbatim. The extension
+    // gets the full ArtifactCard JSON via `cardJson` if it wants
+    // to render richer markup (thumbnail link, project deeplink,
+    // metadata chips).
+    const body = card.caption;
     const queued = enqueuePublish({
-      cardId: card.id,
-      threadId: card.threadId,
-      body: card.body,
+      cardId,
+      threadId,
+      body,
       cardJson,
     });
     // Mirror the Phase 12 return shape so the renderer / tests

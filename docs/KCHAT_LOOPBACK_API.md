@@ -95,11 +95,13 @@ activation and on user gesture; it does **not** poll continuously.
   "connected": true,
   "lastEventAt": "2026-05-29T09:41:50.000Z",
   "queuedPublishCount": 2,
-  "capabilities": {
-    "publishToThread": true,
-    "ingestReviewComments": true,
-    "deeplinks": true
-  }
+  "capabilities": [
+    "status",
+    "queued_publishes",
+    "publish_to_thread",
+    "review_comments",
+    "reviews"
+  ]
 }
 ```
 
@@ -109,6 +111,11 @@ activation and on user gesture; it does **not** poll continuously.
 * `lastEventAt` — ISO-8601 timestamp of the most recent state
   change (queue mutation, project open, integration toggle). The
   extension uses this for a "Last sync: 3s ago" affordance.
+* `capabilities` — array of route shorthand names AEC Studio's
+  loopback API serves. Mirrors the literal list at
+  `apps/desktop/electron/kchat/kchatAppState.ts::buildHandlers().status`.
+  The extension feature-detects on this array; adding a route here
+  without bumping the list silently hides it from extensions.
 
 ### `GET /api/queued-publishes`
 
