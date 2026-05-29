@@ -60,18 +60,27 @@ malformed tokens return `401 unauthorized`.
 
 ## Host-header guard
 
-`http.IncomingMessage.headers.host` MUST be one of:
+`http.IncomingMessage.headers.host` MUST match the IPv4 loopback
+literal:
 
-* `127.0.0.1:<port>` (the canonical case)
-* `localhost:<port>` (allowed for compatibility with WebKit
-  developer-tool requests; resolved to loopback by every desktop
-  OS)
-* `[::1]:<port>` (IPv6 loopback)
+* `127.0.0.1` (no port)
+* `127.0.0.1:<port>` (any port; the bound port is not enforced
+  because the same security posture holds across restarts)
 
-Anything else returns `403 forbidden` with code `forbidden`. This
-guards against DNS-rebinding attacks where a malicious page on
-`https://attacker.example` sends `fetch("http://127.0.0.1:49321/",
-{credentials: "omit"})` against the loopback API.
+Anything else — including `localhost`, `[::1]`, the machine's
+hostname, or a public DNS name pointed at `127.0.0.1` — returns
+`403 forbidden` with code `forbidden`. The enforcing regex is
+`/^127\.0\.0\.1(?::(\d+))?$/` in
+`apps/desktop/electron/kchat/kchatLocalApi.ts`. The strict literal
+is deliberate: accepting a DNS-resolvable name (`localhost` is the
+most common one) would weaken the DNS-rebinding defence — a
+malicious page on `https://attacker.example` can set
+`Host: localhost:49321` on a cross-origin `fetch` and bypass a
+permissive check, whereas no attacker-controlled origin can spoof
+the literal `127.0.0.1` in the Host header. The companion `.kcz`
+extension is required to use the literal `127.0.0.1` (see
+`extensions/aec-studio-kchat/src/client.ts`), so this restriction
+is invisible in normal operation.
 
 ## Body cap
 
