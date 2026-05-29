@@ -3632,8 +3632,14 @@ impl BridgeService {
     ///   default (an unprivileged extension shouldn't appear in the
     ///   planner's tool picker).
     pub fn ai_list_tools(&self) -> Result<Vec<AiToolDescriptor>, BridgeServiceError> {
-        // `iter_sorted` already orders by tool name, so the wire payload
-        // is deterministic across calls (HashMap iteration order is not).
+        // `iter_sorted` already orders the built-in slice by tool
+        // name, but extension tools come out of
+        // `list_extension_ai_tools` in registry iteration order. A
+        // final sort across the merged set is what makes the wire
+        // payload deterministic across calls regardless of which
+        // extensions are loaded — the renderer pins these by name
+        // and any binary-search consumer downstream depends on the
+        // full list being sorted.
         let mut tools: Vec<AiToolDescriptor> = ai_tool_schemas()
             .iter_sorted()
             .map(AiToolDescriptor::from)
@@ -3666,6 +3672,7 @@ impl BridgeService {
                 child_tools: Vec::new(),
             });
         }
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(tools)
     }
 
@@ -3694,8 +3701,21 @@ impl BridgeService {
         context_json: &str,
         max_entities_modified: u32,
     ) -> Result<AiPlanResult, BridgeServiceError> {
-        let tool_name = AiToolName::from_wire_str(tool)
-            .ok_or_else(|| BridgeServiceError::Ai(format!("unknown ai tool `{tool}`")))?;
+        // Resolve the wire-format tool string into the closed
+        // [`AiToolName`] the planner + diff engine know how to
+        // dispatch. Built-in tool ids (`style_assistant`, etc.)
+        // resolve directly; extension-supplied `tool_id`s
+        // (advertised by [`Self::ai_list_tools`]) resolve through
+        // their declared `grammar_key` — every extension AI tool
+        // must declare a grammar that the host already ships,
+        // because the diff engine can only translate model output
+        // shapes it has a `build_*` arm for. The renderer's
+        // attribution string (returned in [`AiPlanResult::tool`])
+        // is restored to the extension `tool_id` after dispatch
+        // so the audit log and tool-picker round-trip correctly.
+        let (tool_name, extension_attribution, effective_max_entities) =
+            self.resolve_ai_tool_alias(tool, scope, max_entities_modified)?;
+        let max_entities_modified = effective_max_entities;
         let context: serde_json::Value = if context_json.is_empty() {
             serde_json::Value::Object(serde_json::Map::new())
         } else {
@@ -3786,9 +3806,79 @@ impl BridgeService {
         Ok(AiPlanResult {
             diff_id: diff_id.as_str().to_owned(),
             parsed,
-            tool: tool_name.as_str().to_owned(),
+            // Surface the extension's `tool_id` (when the call
+            // originated from an extension AI tool) so the
+            // renderer's tool picker can route the result back
+            // to the originating extension. Built-in tools
+            // return their canonical wire-format name unchanged.
+            tool: extension_attribution.unwrap_or_else(|| tool_name.as_str().to_owned()),
             entities_modified: entities,
         })
+    }
+
+    /// Resolve a wire-format `ai_plan` tool string into:
+    ///   * a built-in [`AiToolName`] the planner + diff engine can
+    ///     dispatch (every AI tool, including extension-provided
+    ///     ones, ultimately routes through a built-in grammar +
+    ///     diff engine `build_*` arm because the diff engine is
+    ///     closed to known output shapes);
+    ///   * an optional extension attribution string (`Some` when
+    ///     the call originated from an extension AI tool, `None`
+    ///     for built-in calls); and
+    ///   * the effective `max_entities_modified` cap, clamped by
+    ///     the extension's manifest cap when applicable so the
+    ///     extension can never authorise a larger blast radius
+    ///     than its manifest declares (defense-in-depth on top of
+    ///     the planner's own safety validator).
+    ///
+    /// For built-in tools this is a single closed-enum lookup; for
+    /// extension tools we additionally enforce:
+    ///   * the extension is loaded + has the `AiTools` permission
+    ///     (already checked by `list_extension_ai_tools`);
+    ///   * the requested `scope` is in the extension's declared
+    ///     `allowed_scopes`;
+    ///   * the extension's `grammar_key` maps to a known built-in
+    ///     [`AiToolName`] (extensions piggy-back on the host's
+    ///     grammar + diff engine surface — they cannot introduce a
+    ///     new model output shape).
+    fn resolve_ai_tool_alias(
+        &self,
+        tool: &str,
+        scope: Scope,
+        max_entities_modified: u32,
+    ) -> Result<(AiToolName, Option<String>, u32), BridgeServiceError> {
+        if let Some(name) = AiToolName::from_wire_str(tool) {
+            return Ok((name, None, max_entities_modified));
+        }
+        let (ext_tools, _errs) =
+            aec_ai::list_extension_ai_tools(&self.extension_registry, &self.permission_enforcer);
+        let ext = ext_tools
+            .into_iter()
+            .find(|t| t.tool_id == tool)
+            .ok_or_else(|| BridgeServiceError::Ai(format!("unknown ai tool `{tool}`")))?;
+        if !ext.allowed_scopes.contains(&scope) {
+            return Err(BridgeServiceError::Ai(format!(
+                "extension ai tool `{}` does not allow scope `{}` (allowed: {:?})",
+                ext.tool_id,
+                scope.as_str(),
+                ext.allowed_scopes
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+            )));
+        }
+        let builtin = ai_tool_schemas()
+            .iter_sorted()
+            .find(|s| s.grammar_key == ext.grammar_key)
+            .map(|s| s.name)
+            .ok_or_else(|| {
+                BridgeServiceError::Ai(format!(
+                    "extension ai tool `{}` declares unknown grammar_key `{}`",
+                    ext.tool_id, ext.grammar_key
+                ))
+            })?;
+        let effective_cap = max_entities_modified.min(ext.max_entities_modified);
+        Ok((builtin, Some(ext.tool_id), effective_cap))
     }
 
     /// Apply an accepted AI diff to the project graph.
