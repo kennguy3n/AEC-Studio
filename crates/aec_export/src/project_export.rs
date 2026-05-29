@@ -582,7 +582,7 @@ pub fn write_deliver_pack_with_context(
 
     let mut planned: Vec<(String, Vec<u8>)> = Vec::new();
 
-    let summary_pdf = build_summary_pdf(project_name, kind)?;
+    let summary_pdf = build_summary_pdf(project_name, kind, ctx)?;
     let summary_name = match kind {
         DeliverPackKind::Concept => "concept_pack.pdf",
         DeliverPackKind::Interior => "interior_summary.pdf",
@@ -612,9 +612,17 @@ pub fn write_deliver_pack_with_context(
                 DeliverPackKind::Interior => vec![],
             };
             for (name, suffix) in fallback_sheets {
+                // Pass an empty context for the fallback sheets so they
+                // stay single-cover synthesised pages — the cover-page
+                // PDFs are placeholder *layouts*, not the headline
+                // summary that carries the schedule.
                 planned.push((
                     name.to_string(),
-                    build_summary_pdf(&format!("{project_name} — {suffix}"), kind)?,
+                    build_summary_pdf(
+                        &format!("{project_name} — {suffix}"),
+                        kind,
+                        &DeliverPackContext::default(),
+                    )?,
                 ));
             }
         }
@@ -901,12 +909,28 @@ fn collect_files_sorted(
     Ok(())
 }
 
-fn build_summary_pdf(title: &str, kind: DeliverPackKind) -> Result<Vec<u8>, ProjectExportError> {
+fn build_summary_pdf(
+    title: &str,
+    kind: DeliverPackKind,
+    ctx: &DeliverPackContext<'_>,
+) -> Result<Vec<u8>, ProjectExportError> {
     // Use `PdfBuilder` directly (rather than `SheetPdfBuilder`, which
     // takes a typed `Sheet` + DXF entity list) so the deliver pack's
-    // synthesised summary doesn't need a sheet layout — a cover +
-    // text page is enough for the contractor to see what's in the
-    // archive without us inventing a fake sheet layout.
+    // synthesised summary doesn't need a sheet layout. The page
+    // composition depends on the pack `kind`:
+    //
+    // * Concept pack — PROPOSAL.md Journey A acceptance criterion:
+    //   "Client pack exports as a single PDF with embedded
+    //   schedule." Concept pack ships exactly one PDF
+    //   (`concept_pack.pdf`); the material schedule, when supplied
+    //   in `ctx`, is embedded as a real tabular page in this PDF
+    //   so the client can review materials without opening the
+    //   accompanying XLSX (the Concept kind doesn't ship one).
+    //
+    // * Interior / Contractor / BIM — the schedule is *also*
+    //   embedded here so the headline summary PDF stands on its
+    //   own; the standalone `schedules/materials.xlsx` is kept as
+    //   the editable workbook for downstream tools.
     let kind_label = match kind {
         DeliverPackKind::Concept => "Concept pack",
         DeliverPackKind::Interior => "Interior pack",
@@ -922,6 +946,36 @@ fn build_summary_pdf(title: &str, kind: DeliverPackKind) -> Result<Vec<u8>, Proj
             format!("Generated {}", Utc::now().to_rfc3339()),
         ],
     )?;
+
+    // Embed the material schedule as a real tabular page when the
+    // project context supplies one. The BIM pack is the validation
+    // report and intentionally omits the schedule — it has a
+    // different audience (engineer / inspector) and content
+    // contract.
+    if !matches!(kind, DeliverPackKind::Bim) {
+        if let Some(sheet) = ctx.material_schedule {
+            if !sheet.rows.is_empty() {
+                let headers: Vec<String> =
+                    sheet.columns.iter().map(|c| c.display.clone()).collect();
+                let rows: Vec<Vec<String>> = sheet.rows.iter().map(|r| r.cells.clone()).collect();
+                b.add_table_page(&sheet.title, &headers, &rows)?;
+            }
+        }
+    }
+
+    // Concept-pack-specific "next steps" closer (PROPOSAL.md A6).
+    if matches!(kind, DeliverPackKind::Concept) {
+        b.add_text_page(
+            "Next Steps",
+            &[
+                "1. Confirm the visual direction and material palette above.".to_string(),
+                "2. Approve the saved cameras as the package's hero views.".to_string(),
+                "3. Sign-off on the schedule — revisions become a new delivery snapshot."
+                    .to_string(),
+            ],
+        )?;
+    }
+
     let tmp = tempfile::NamedTempFile::new()?;
     let saved = b.save(tmp.path())?;
     let bytes = std::fs::read(&saved)?;
