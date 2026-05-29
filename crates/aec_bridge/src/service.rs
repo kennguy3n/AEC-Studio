@@ -71,6 +71,38 @@ fn ai_grammars() -> &'static AiGrammarRegistry {
     AI_GRAMMARS.get_or_init(AiGrammarRegistry::defaults)
 }
 
+/// Map an extension's `grammar_key` to the [`AiToolName`] that owns
+/// it on the host side.
+///
+/// When multiple host tools declare the same `grammar_key` (today
+/// `plan_detection` and `plan_to_wall` both declare
+/// `grammar_key: "plan_detection"`), prefer the tool whose
+/// wire-format name equals the `grammar_key` itself — the
+/// "canonical home" for that grammar. Falls back to the first by
+/// sorted name so the resolution is deterministic across calls if
+/// no canonical home exists (which would indicate a catalogue bug,
+/// guarded by [`AiToolSchemaRegistry::defaults_match_canonical_json`]).
+///
+/// Pure helper so it can be exercised by unit tests with synthetic
+/// schema arrangements — see [`tests::canonical_builtin_for_grammar_key_*`].
+fn canonical_builtin_for_grammar_key(
+    grammar_key: &str,
+    schemas: &AiToolSchemaRegistry,
+) -> Option<AiToolName> {
+    let mut matches = schemas
+        .iter_sorted()
+        .filter(|s| s.grammar_key == grammar_key);
+    let first = matches.next()?;
+    if first.name.as_str() == grammar_key {
+        return Some(first.name);
+    }
+    Some(
+        matches
+            .find(|s| s.name.as_str() == grammar_key)
+            .map_or(first.name, |s| s.name),
+    )
+}
+
 #[derive(Debug, Error)]
 pub enum BridgeServiceError {
     #[error("core: {0}")]
@@ -3841,6 +3873,22 @@ impl BridgeService {
     ///     [`AiToolName`] (extensions piggy-back on the host's
     ///     grammar + diff engine surface — they cannot introduce a
     ///     new model output shape).
+    ///
+    /// Note on grammar_key disambiguation: more than one built-in
+    /// schema may declare the same `grammar_key` when the variants
+    /// share both a model output shape and a diff-engine arm
+    /// (today `plan_detection` and `plan_to_wall` both declare
+    /// `grammar_key: "plan_detection"` and both route through
+    /// [`aec_ai::diff_engine::build_plan_detection`]). When that
+    /// happens, this resolver picks the host tool whose
+    /// wire-format name equals the `grammar_key` ("canonical home"
+    /// for that grammar) rather than falling out of sorted-name
+    /// order non-deterministically. This contract is mirrored in
+    /// `crates/aec_ai/data/ai_tools.json`, where the primary tool
+    /// for a grammar shares its `id` with `grammar_key`. If the
+    /// catalogue ever ships a grammar_key with no matching tool
+    /// name, we fall back to the sorted-name first match so the
+    /// resolution stays deterministic.
     fn resolve_ai_tool_alias(
         &self,
         tool: &str,
@@ -3867,10 +3915,12 @@ impl BridgeService {
                     .collect::<Vec<_>>()
             )));
         }
-        let builtin = ai_tool_schemas()
-            .iter_sorted()
-            .find(|s| s.grammar_key == ext.grammar_key)
-            .map(|s| s.name)
+        // Pick the host tool that owns this grammar_key. When more
+        // than one match (today `plan_detection` and `plan_to_wall`
+        // both declare `grammar_key: "plan_detection"`), prefer the
+        // canonical home — see [`canonical_builtin_for_grammar_key`]
+        // and the doc comment on this method.
+        let builtin = canonical_builtin_for_grammar_key(&ext.grammar_key, ai_tool_schemas())
             .ok_or_else(|| {
                 BridgeServiceError::Ai(format!(
                     "extension ai tool `{}` declares unknown grammar_key `{}`",
@@ -7640,5 +7690,109 @@ END-ISO-10303-21;\n";
         let ch = json["changes"][0].clone();
         assert!(ch.get("beforeHash").is_some());
         assert!(ch.get("afterHash").is_some());
+    }
+
+    /// Build a synthetic [`AiToolSchemaRegistry`] for the grammar_key
+    /// disambiguation tests. The registry shipped via
+    /// [`AiToolSchemaRegistry::defaults`] happens to put the canonical
+    /// home of `plan_detection` first in sorted-name order, so it can
+    /// only exercise the canonical-home-is-sorted-first branch. To
+    /// pin the other two branches (canonical home is NOT sorted-first,
+    /// and no canonical home exists at all) we need to drive the
+    /// helper with a registry whose entries we can choose. Building
+    /// from a `Vec<(ToolName, grammar_key)>` keeps each test case
+    /// self-documenting.
+    fn schemas_with(entries: &[(AiToolName, &str)]) -> AiToolSchemaRegistry {
+        let mut r = AiToolSchemaRegistry::new();
+        for (name, grammar_key) in entries {
+            r.insert(AiToolSchema {
+                name: *name,
+                display_name: name.as_str().to_owned(),
+                allowed_scopes: vec![Scope::Design],
+                max_entities_modified: 8,
+                grammar_key: (*grammar_key).to_owned(),
+                description: String::new(),
+                child_tools: Vec::new(),
+            });
+        }
+        r
+    }
+
+    #[test]
+    fn canonical_builtin_for_grammar_key_picks_canonical_home_when_sorted_first() {
+        // The bundled catalogue already exercises this branch:
+        // `plan_detection` and `plan_to_wall` both declare
+        // `grammar_key: "plan_detection"`, and `plan_detection`
+        // sorts before `plan_to_wall` alphabetically. The canonical
+        // home — the tool whose name matches the grammar_key — must
+        // be picked, NOT just the first match.
+        let schemas = AiToolSchemaRegistry::defaults();
+        let picked = canonical_builtin_for_grammar_key("plan_detection", &schemas)
+            .expect("plan_detection grammar_key has known home in the default catalogue");
+        assert_eq!(
+            picked,
+            AiToolName::PlanDetection,
+            "the tool whose name matches the grammar_key must win even when more than one tool \
+             declares that grammar_key",
+        );
+    }
+
+    #[test]
+    fn canonical_builtin_for_grammar_key_picks_canonical_home_when_not_sorted_first() {
+        // Synthesize a registry where the canonical-home tool sorts
+        // AFTER an aliasing tool by name. Without the canonical-home
+        // tie-break, the helper would pick the sorted-first match
+        // (`CadCleanup`, since `cad_cleanup` < `plan_to_wall`),
+        // which would silently send extension dispatches through the
+        // wrong diff-engine arm. With the tie-break, the canonical
+        // home (`PlanToWall`, whose name equals the grammar_key)
+        // must win.
+        let schemas = schemas_with(&[
+            (AiToolName::PlanToWall, "plan_to_wall"),
+            (AiToolName::CadCleanup, "plan_to_wall"),
+        ]);
+        let picked = canonical_builtin_for_grammar_key("plan_to_wall", &schemas)
+            .expect("synthetic registry declares the grammar_key");
+        assert_eq!(
+            picked,
+            AiToolName::PlanToWall,
+            "canonical home must be selected even when an aliasing tool sorts before it by name",
+        );
+    }
+
+    #[test]
+    fn canonical_builtin_for_grammar_key_falls_back_to_sorted_first_when_no_canonical_home() {
+        // Defensive branch: if a future catalogue ever ships a
+        // grammar_key with NO matching tool name (which would be a
+        // catalogue bug — `defaults_match_canonical_json` guards
+        // against it for the bundled JSON), the helper must still
+        // resolve deterministically. We synthesize that scenario by
+        // pointing two tools at a grammar_key that no host tool
+        // owns; the helper must return the sorted-first match
+        // (`CadCleanup` < `Classification`).
+        let schemas = schemas_with(&[
+            (AiToolName::Classification, "made_up_grammar"),
+            (AiToolName::CadCleanup, "made_up_grammar"),
+        ]);
+        let picked = canonical_builtin_for_grammar_key("made_up_grammar", &schemas)
+            .expect("synthetic registry declares the grammar_key");
+        assert_eq!(
+            picked,
+            AiToolName::CadCleanup,
+            "with no canonical home the helper must fall back to sorted-first deterministically",
+        );
+    }
+
+    #[test]
+    fn canonical_builtin_for_grammar_key_returns_none_for_unknown_grammar_key() {
+        // A grammar_key that no host tool declares must surface as
+        // `None` so the resolver can return an `extension ai tool
+        // declares unknown grammar_key` error instead of silently
+        // routing to some unrelated tool.
+        let schemas = AiToolSchemaRegistry::defaults();
+        assert_eq!(
+            canonical_builtin_for_grammar_key("totally_made_up", &schemas),
+            None,
+        );
     }
 }
