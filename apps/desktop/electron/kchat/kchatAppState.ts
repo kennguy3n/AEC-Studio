@@ -317,12 +317,15 @@ function ingestComments(
     }
   }
   // Bound memory — drop oldest comments past the per-thread cap.
+  // seenIds is intentionally NOT pruned alongside the dropped comments:
+  // the dedup contract with the extension client is "we have seen this
+  // messageId, do not resend it." If we forgot evicted ids the same
+  // comment would be re-ingested on the next poll, defeating the cap.
   if (thread.comments.length > MAX_REVIEW_COMMENTS_PER_THREAD) {
     thread.comments.sort((a, b) => a.postedAt.localeCompare(b.postedAt));
     const overflow =
       thread.comments.length - MAX_REVIEW_COMMENTS_PER_THREAD;
-    const dropped = thread.comments.splice(0, overflow);
-    for (const d of dropped) thread.seenIds.delete(d.messageId);
+    thread.comments.splice(0, overflow);
   }
   return accepted;
 }

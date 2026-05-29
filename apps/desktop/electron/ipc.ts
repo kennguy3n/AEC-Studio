@@ -159,6 +159,36 @@ async function resolveEnabledFromBridge(): Promise<boolean> {
 }
 
 /**
+ * Single-call variant for handlers that need both the master
+ * enabled flag and the per-project default thread id (e.g.
+ * `kchat:publish`). Issuing one `kchatStatus()` instead of two
+ * shaves a redundant N-API round-trip + read-lock acquire on the
+ * publish hot path. Falls back to `{ enabled: true, defaultThreadId: null }`
+ * for the same boot-race reason described on the single-field
+ * helpers above so a transient bridge unavailability degrades
+ * gracefully instead of throwing.
+ */
+async function resolveEnabledAndDefaultThreadFromBridge(): Promise<{
+  enabled: boolean;
+  defaultThreadId: string | null;
+}> {
+  try {
+    const status = await getBridge().kchatStatus();
+    return {
+      enabled: status.enabled,
+      defaultThreadId: status.defaultThreadId ?? null,
+    };
+  } catch (err) {
+    console.warn(
+      `[ipc] resolveEnabledAndDefaultThreadFromBridge: bridge kchat_status failed (${
+        err instanceof Error ? err.message : String(err)
+      }); defaulting enabled=true, defaultThreadId=null`,
+    );
+    return { enabled: true, defaultThreadId: null };
+  }
+}
+
+/**
  * Register every IPC handler the preload bridge expects. Handlers are
  * grouped by API surface (Project / Design / Draft / BIM / Render / AI /
  * Export / Runtime).
@@ -791,16 +821,19 @@ export function registerIpcHandlers(): void {
   });
   ipcMain.handle("kchat:publish", async (_e, params) => {
     assertObject(params, "params");
-    // Bridge-persisted master gate. Phase 12's `KChatState::publish`
-    // checked `enabled` *before* touching the transport; Phase 15's
-    // loopback queue lives outside the Rust state, so the gate has
-    // to live here too. Refusing publishes before they reach
-    // `enqueuePublish` is the correct semantic: a queued card
-    // implies AEC Studio intends to send it, and we don't intend
-    // anything when the user has switched the integration off.
-    // The error is surfaced verbatim in `PublishCardModal`'s
-    // inline error pane via `setError(msg)`.
-    if (!(await resolveEnabledFromBridge())) {
+    // Snapshot the bridge once for both the enabled gate and the
+    // per-project default-thread lookup further down. Phase 12's
+    // `KChatState::publish` checked `enabled` *before* touching
+    // the transport; Phase 15's loopback queue lives outside the
+    // Rust state, so the gate has to live here too. Refusing
+    // publishes before they reach `enqueuePublish` is the
+    // correct semantic: a queued card implies AEC Studio intends
+    // to send it, and we don't intend anything when the user has
+    // switched the integration off. The error is surfaced
+    // verbatim in `PublishCardModal`'s inline error pane via
+    // `setError(msg)`.
+    const bridgeKchat = await resolveEnabledAndDefaultThreadFromBridge();
+    if (!bridgeKchat.enabled) {
       throw new Error(
         "kchatPublish: KChat integration is disabled \u2014 enable it in Settings before publishing.",
       );
@@ -873,8 +906,10 @@ export function registerIpcHandlers(): void {
     // the renderer's `FALLBACK_THREAD_ID` constant and the
     // publisher-side default. The .kcz extension is free to map
     // this to a real KChat thread id when it acks via
-    // POST /api/publish-to-thread.
-    const projectThread = await resolveDefaultThreadIdFromBridge();
+    // POST /api/publish-to-thread. Reuses the bridge snapshot
+    // taken above so we don't re-enter `kchatStatus()` for this
+    // single handler invocation.
+    const projectThread = bridgeKchat.defaultThreadId;
     const threadId =
       projectThread !== null && projectThread.length > 0
         ? projectThread

@@ -304,12 +304,24 @@ export class KchatLocalApiServer {
   private boundPort: number | null = null;
   private portFileAbsPath: string | null = null;
   /**
-   * Monotonic-ms timestamp of the most recent successful
-   * authenticated request from the .kcz extension. `null` until
-   * the extension has been heard from at least once since this
-   * process started. Used by `snapshotForRenderer()` so the
-   * Settings card can show the "KChat Desktop detected"
+   * Wall-clock millisecond timestamp (`Date.now()` in production,
+   * injectable via `nowMsForTesting`) of the most recent
+   * successful authenticated request from the .kcz extension.
+   * `null` until the extension has been heard from at least once
+   * since this process started. Used by `snapshotForRenderer()`
+   * so the Settings card can show the "KChat Desktop detected"
    * affordance without polling.
+   *
+   * Note: `Date.now()` is NOT monotonic — an NTP step or a manual
+   * clock adjustment can make a later sample read smaller than an
+   * earlier one. The only consumer is the freshness window in
+   * `buildKchatStatusResponse` (`now - last < 30s` ⇒ connected),
+   * and that consumer also uses `Date.now()` so the two stay
+   * coherent across a step. Switching to `performance.now()` (or
+   * `process.hrtime.bigint()`) would be more correct in principle
+   * but pointless here because the wire payload exposes
+   * `lastExtensionContactAt` as an ISO timestamp, which would
+   * still depend on wall-clock for the conversion.
    */
   private lastExtensionContactMs: number | null = null;
   private readonly nowMs: () => number;
