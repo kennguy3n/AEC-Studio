@@ -406,6 +406,12 @@ export function registerIpcHandlers(): void {
     // the proposal cover. Caller-supplied wins; otherwise the
     // active-project tracker is the source of truth. Mirrors the
     // `deliver:buildPack` handler's resolution semantics.
+    //
+    // We deliberately do NOT use `withResolvedProjectPath` here — that
+    // helper throws `IpcValidationError` when no project is open, but
+    // the proposal pack is allowed to degrade gracefully (cover text
+    // just omits the project-specific counts). Same design choice the
+    // `deliver:buildPack` handler made for the same reason.
     const projectPath =
       typeof p.projectPath === "string" && p.projectPath.length > 0
         ? p.projectPath
