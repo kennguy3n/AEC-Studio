@@ -3889,6 +3889,27 @@ impl BridgeService {
     /// catalogue ever ships a grammar_key with no matching tool
     /// name, we fall back to the sorted-name first match so the
     /// resolution stays deterministic.
+    ///
+    /// Note on per-call cost: this rebuilds the extension AI tool
+    /// list on every `ai_plan` for an extension tool by walking
+    /// the loaded extension registry, checking `Permission::AiTools`
+    /// on each, and parsing declared scopes. We deliberately do
+    /// NOT cache this list inside [`BridgeService`] today, because:
+    ///   * the cost is bounded by the number of `AiTools`-declaring
+    ///     extensions (single-digit at the expected catalogue
+    ///     scale; permission check short-circuits the rest), and
+    ///   * a stale cache here would be a *correctness* bug rather
+    ///     than a perf bug — the planner would dispatch to a tool
+    ///     the extension no longer owns or has permission for.
+    ///
+    /// If the extension count ever grows to where the per-call
+    /// walk dominates `ai_plan` latency, the right fix is a single
+    /// `extensions_changed` event source feeding a shared cached
+    /// `Arc<Vec<ExtensionAiToolMeta>>` reused by both
+    /// [`Self::ai_list_tools`] and this resolver — invalidated on
+    /// (a) boot, (b) any future hot-reload IPC, and (c) any future
+    /// permission-mutation IPC. Until then keeping the per-call
+    /// walk is the simpler correctness story.
     fn resolve_ai_tool_alias(
         &self,
         tool: &str,
