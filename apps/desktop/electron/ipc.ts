@@ -109,25 +109,29 @@ function buildKchatStatusResponse(
  * (one round-trip per field) was a latency regression on the
  * 5 s status poll hot path that this helper closes.
  *
- * Returns `{ enabled: true, defaultThreadId: null }` if the bridge
- * is temporarily unavailable (typical at boot — `kchat:status` is
- * the very first call the renderer issues): surfacing the error
- * would hide the loopback / extension status from the indicator
- * chip even though that signal is still meaningful. `enabled=true`
- * matches `KChatConfig::default` so the first poll doesn't flash
- * a disabled chip; `defaultThreadId=null` lets the renderer fall
+ * This variant FAILS OPEN. Returns `{ enabled: true,
+ * defaultThreadId: null }` if the bridge is temporarily
+ * unavailable (typical at boot — `kchat:status` is the very first
+ * call the renderer issues): surfacing the error would hide the
+ * loopback / extension status from the indicator chip even though
+ * that signal is still meaningful. `enabled=true` matches
+ * `KChatConfig::default` so the first poll doesn't flash a
+ * disabled chip; `defaultThreadId=null` lets the renderer fall
  * back to its `kchat-default` constant.
+ *
+ * Use this ONLY on read-only display paths (`kchat:status`,
+ * `kchat:reload`). Any write path or data-exposure path that gates
+ * on `enabled` must use the strict variant below — defaulting to
+ * `enabled=true` on a bridge blip silently overrides an explicit
+ * user disable and would have been a real bug on the publish
+ * gate (Phase 15 round-9 BUG_0001).
  */
-async function resolveEnabledAndDefaultThreadFromBridge(): Promise<{
+export async function resolveEnabledAndDefaultThreadFromBridge(): Promise<{
   enabled: boolean;
   defaultThreadId: string | null;
 }> {
   try {
-    const status = await getBridge().kchatStatus();
-    return {
-      enabled: status.enabled,
-      defaultThreadId: status.defaultThreadId ?? null,
-    };
+    return await resolveEnabledAndDefaultThreadFromBridgeStrict();
   } catch (err) {
     console.warn(
       `[ipc] resolveEnabledAndDefaultThreadFromBridge: bridge kchat_status failed (${
@@ -136,6 +140,35 @@ async function resolveEnabledAndDefaultThreadFromBridge(): Promise<{
     );
     return { enabled: true, defaultThreadId: null };
   }
+}
+
+/**
+ * Strict single-call helper — same shape as the soft variant
+ * above, but propagates bridge errors instead of swallowing them.
+ *
+ * Use this on any write path or data-exposure path that gates on
+ * `enabled` (currently `kchat:publish` and `kchat:ingestReviews`).
+ * If the bridge is unreachable we MUST NOT default to
+ * `enabled=true`: doing so would silently override an explicit
+ * user disable and let publishes through (or expose review
+ * comments) during a bridge outage. Fail closed by propagating
+ * the error; the renderer's PublishCardModal surfaces it inline
+ * via `setError(msg)`, and the review panel treats it as a
+ * polling error (stops the loop, surfaces a retry affordance).
+ *
+ * The error message intentionally includes the underlying cause
+ * so a missing bridge.node / NAPI panic is recognisable in the
+ * UI rather than masquerading as "disabled".
+ */
+export async function resolveEnabledAndDefaultThreadFromBridgeStrict(): Promise<{
+  enabled: boolean;
+  defaultThreadId: string | null;
+}> {
+  const status = await getBridge().kchatStatus();
+  return {
+    enabled: status.enabled,
+    defaultThreadId: status.defaultThreadId ?? null,
+  };
 }
 
 /**
@@ -786,7 +819,16 @@ export function registerIpcHandlers(): void {
     // switched the integration off. The error is surfaced
     // verbatim in `PublishCardModal`'s inline error pane via
     // `setError(msg)`.
-    const bridgeKchat = await resolveEnabledAndDefaultThreadFromBridge();
+    //
+    // FAIL CLOSED on bridge errors (round-9 BUG_0001 fix). The
+    // soft helper defaults to `enabled=true` when the bridge is
+    // unreachable, which is correct for the status indicator but
+    // wrong for a write path: a transient bridge blip during a
+    // publish would silently override an explicit user disable.
+    // The strict variant propagates the underlying error so the
+    // renderer surfaces it (and a retry rather than a silent
+    // bypass-then-queue is the right UX).
+    const bridgeKchat = await resolveEnabledAndDefaultThreadFromBridgeStrict();
     if (!bridgeKchat.enabled) {
       throw new Error(
         "kchatPublish: KChat integration is disabled \u2014 enable it in Settings before publishing.",
@@ -908,6 +950,22 @@ export function registerIpcHandlers(): void {
       sinceIso = rawSince;
     } else {
       throw new Error("kchatIngestReviews: sinceIso must be a string or null");
+    }
+    // Phase 12 contract: the bridge's `kchat_ingest_reviews`
+    // returned `KChatError::Disabled` when the master toggle was
+    // off. Phase 15 moved the read out of the bridge and into the
+    // Electron-side `kchatAppState` buffer, but the gate has to
+    // survive the move — otherwise a disabled integration would
+    // still hand out review-comment payloads to any caller that
+    // bypassed the renderer's panel-level gate (extensions over
+    // the loopback API, future scripted IPC). Fail closed on
+    // bridge errors via the strict helper for the same reason
+    // `kchat:publish` does (round-9 ANALYSIS_0002).
+    const bridgeKchat = await resolveEnabledAndDefaultThreadFromBridgeStrict();
+    if (!bridgeKchat.enabled) {
+      throw new Error(
+        "kchatIngestReviews: KChat integration is disabled \u2014 enable it in Settings before ingesting reviews.",
+      );
     }
     const stored = getReviewCommentsForThread(threadId, sinceIso);
     // Map `StoredReviewComment` (the shape `kchatAppState.ts`
