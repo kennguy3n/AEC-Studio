@@ -106,15 +106,35 @@ export function KChatReviewPanel(props: KChatReviewPanelProps) {
     try {
       const statusReport = await aec.kchat.status();
       if (threadIdRef.current !== capturedThread) return;
-      // Phase 15: the loopback API publisher reports
-      // `publisherKind: "loopback_http"` once the .kcz extension
-      // has contacted the API at least once this session. While
-      // it is still "reconnecting" (server up, no extension
-      // heartbeat yet), we keep polling because the extension
-      // may come online mid-session.
+      // Phase 15 offline gate. Two independent signals collapse
+      // the panel to its offline placeholder:
+      //
+      //   1. The bridge-persisted master toggle is off
+      //      (`enabled === false`). The Settings card flipped it
+      //      or the per-project manifest never opted in. The
+      //      `kchat:publish` IPC handler rejects publishes in
+      //      this state, so ingesting reviews would be polling
+      //      an integration the user has explicitly disabled.
+      //
+      //   2. The transport state is `disconnected`. In Phase 15
+      //      `buildKchatStatusResponse` only emits this when the
+      //      master toggle is off *or* the loopback API server
+      //      itself isn't running (boot failure / shutdown). We
+      //      still keep polling on `reconnecting` (server up,
+      //      no extension heartbeat yet) because the .kcz
+      //      extension may come online mid-session.
+      //
+      // We deliberately do NOT branch on `publisherKind` here:
+      // `buildKchatStatusResponse` hard-codes it to
+      // `"loopback_http"` for every production payload, so any
+      // condition that conjoined it would be dead in production.
+      // The two signals above are the authoritative source of
+      // truth — `state === "disconnected"` already covers the
+      // server-not-running case, so this stays honest whether
+      // the Rust-side `KChatState::publisher_kind` is `loopback`
+      // or `in_memory`.
       const isOffline =
-        statusReport.state !== "connected" &&
-        statusReport.publisherKind !== "loopback_http";
+        !statusReport.enabled || statusReport.state === "disconnected";
       setOffline(isOffline);
       if (isOffline) {
         setError(null);
