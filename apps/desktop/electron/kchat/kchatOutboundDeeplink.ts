@@ -47,12 +47,20 @@ export function openKchatDeeplink(
   const shellModule = opts.shellModule ?? shell;
   const now = (opts.nowMs ?? Date.now)();
   // Sliding-window refill: every `REFILL_MS` since the last
-  // call, recover one token.
+  // call, recover one token. We advance `lastRefillMs` by exactly
+  // the time we accounted for (`refill * REFILL_MS`) rather than
+  // snapping it to `now`, so sub-interval progress carries into
+  // the next call. Snapping would silently discard up to
+  // `REFILL_MS - 1` ms of accrued time on every refill — at a
+  // 500 ms cadence and a 2 Hz click stream that's a steady-state
+  // ~50 % refill-rate loss; the proportional update keeps the
+  // bucket honest at its nominal `CAPACITY / REFILL_MS` rate
+  // regardless of how the caller spaces their requests.
   const elapsed = now - lastRefillMs;
   if (elapsed >= KCHAT_DEEPLINK_BUCKET_REFILL_MS) {
     const refill = Math.floor(elapsed / KCHAT_DEEPLINK_BUCKET_REFILL_MS);
     tokens = Math.min(KCHAT_DEEPLINK_BUCKET_CAPACITY, tokens + refill);
-    lastRefillMs = now;
+    lastRefillMs += refill * KCHAT_DEEPLINK_BUCKET_REFILL_MS;
   }
   if (tokens <= 0) {
     return { ok: false, reason: "rate_limited" };
@@ -70,8 +78,13 @@ export function openKchatDeeplink(
   return { ok: true };
 }
 
-/** Reset for unit tests. */
-export function __resetOutboundBucketForTesting(): void {
+/**
+ * Reset for unit tests. Optional `nowMs` lets a test pin
+ * `lastRefillMs` to a deterministic timestamp so subsequent
+ * `openKchatDeeplink({ nowMs })` calls can assert refill math
+ * against a known baseline.
+ */
+export function __resetOutboundBucketForTesting(nowMs?: number): void {
   tokens = KCHAT_DEEPLINK_BUCKET_CAPACITY;
-  lastRefillMs = Date.now();
+  lastRefillMs = nowMs ?? Date.now();
 }
