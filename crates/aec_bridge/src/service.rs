@@ -3685,6 +3685,7 @@ impl BridgeService {
         // these via a dedicated diagnostics IPC.
         let (ext_tools, _errs) =
             aec_ai::list_extension_ai_tools(&self.extension_registry, &self.permission_enforcer);
+        let schemas = ai_tool_schemas();
         for t in ext_tools {
             // Defense-in-depth: filter out extension tools whose
             // `tool_id` collides with a built-in `AiToolName`. The
@@ -3708,6 +3709,28 @@ impl BridgeService {
             if AiToolName::from_wire_str(&t.tool_id).is_some() {
                 continue;
             }
+            // Resolve the canonical host tool that will actually
+            // dispatch this extension when `ai_plan` runs (same
+            // helper `resolve_ai_tool_alias` uses). The advertised
+            // cap MUST be clamped against the host tool's own
+            // `max_entities_modified` — the planner's diff-safety
+            // validator enforces the host cap regardless of what
+            // the extension manifest declares, so advertising the
+            // raw extension cap (e.g. 100) when the host caps at
+            // 16 would surface slider values in the renderer that
+            // are guaranteed to be rejected at dispatch. Skipping
+            // tools with an unknown grammar_key matches
+            // `resolve_ai_tool_alias`, which errors out on the
+            // same condition — a tool that can't be dispatched
+            // should not appear in the picker either.
+            let Some(host_schema) = canonical_builtin_for_grammar_key(&t.grammar_key, schemas)
+                .and_then(|name| schemas.get(name))
+            else {
+                continue;
+            };
+            let advertised_cap = t
+                .max_entities_modified
+                .min(host_schema.max_entities_modified);
             tools.push(AiToolDescriptor {
                 name: t.tool_id,
                 display_name: t.display_name,
@@ -3717,7 +3740,7 @@ impl BridgeService {
                     .iter()
                     .map(|sc| sc.as_str().to_owned())
                     .collect(),
-                max_entities_modified: t.max_entities_modified,
+                max_entities_modified: advertised_cap,
                 grammar_key: t.grammar_key,
                 // Extensions don't compose child tools today —
                 // their `ai_tool` body declares a single
@@ -3963,14 +3986,40 @@ impl BridgeService {
         // both declare `grammar_key: "plan_detection"`), prefer the
         // canonical home — see [`canonical_builtin_for_grammar_key`]
         // and the doc comment on this method.
-        let builtin = canonical_builtin_for_grammar_key(&ext.grammar_key, ai_tool_schemas())
-            .ok_or_else(|| {
+        let schemas = ai_tool_schemas();
+        let builtin =
+            canonical_builtin_for_grammar_key(&ext.grammar_key, schemas).ok_or_else(|| {
                 BridgeServiceError::Ai(format!(
                     "extension ai tool `{}` declares unknown grammar_key `{}`",
                     ext.tool_id, ext.grammar_key
                 ))
             })?;
-        let effective_cap = max_entities_modified.min(ext.max_entities_modified);
+        // The effective cap must be the smallest of:
+        //   - the caller's requested cap (`max_entities_modified`),
+        //   - the extension's manifest cap (`ext.max_entities_modified`),
+        //   - the host tool's schema cap (`host_schema.max_entities_modified`).
+        //
+        // The host cap is load-bearing: the planner's diff-safety
+        // validator enforces it regardless of what the extension or
+        // the caller claims, so a value that exceeds the host cap
+        // would be rejected at dispatch even when the extension
+        // manifest declares a higher ceiling (e.g. extension says
+        // 100, host caps at 16). Clamping here keeps the
+        // contract symmetric with `ai_list_tools`'s advertised
+        // cap and means the renderer's slider never produces a
+        // value the planner is going to reject. The
+        // `expect("…")` is safe because `canonical_builtin_for_grammar_key`
+        // above only returns `Some(name)` for names that exist in
+        // `schemas` — the helper iterates `schemas.iter_sorted()`
+        // and picks one of its own entries. If that invariant ever
+        // breaks (catalogue bug), the panic surfaces it loudly
+        // instead of silently advertising an impossible cap.
+        let host_schema = schemas
+            .get(builtin)
+            .expect("canonical_builtin_for_grammar_key only returns names present in schemas");
+        let effective_cap = max_entities_modified
+            .min(ext.max_entities_modified)
+            .min(host_schema.max_entities_modified);
         Ok((builtin, Some(ext.tool_id), effective_cap))
     }
 

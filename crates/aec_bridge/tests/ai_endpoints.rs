@@ -1338,6 +1338,99 @@ fn ai_list_tools_filters_extension_tool_ids_that_collide_with_built_ins() {
 }
 
 #[test]
+fn ai_list_tools_clamps_extension_cap_against_canonical_host_cap() {
+    // Plant an extension that aliases the built-in
+    // `layout_suggestion` grammar (host schema cap = 16) but
+    // declares an inflated manifest cap of 100. The advertised
+    // cap in `ai_list_tools` MUST be clamped against the host
+    // cap, not the extension's claimed cap — otherwise the
+    // renderer's slider would expose values (17..=100) that the
+    // planner's diff-safety validator is guaranteed to reject at
+    // dispatch.
+    let (s, _g, _path) = make_service_with_ai_extensions(|root| {
+        plant_ai_tool_extension_alias(
+            root,
+            "acme.inflated",
+            "acme.inflated.layouter",
+            "layout_suggestion",
+            vec!["design"],
+            100, // > host schema cap of 16
+        );
+    });
+    let tools = s.ai_list_tools().expect("ai_list_tools");
+    let entry = tools
+        .iter()
+        .find(|t| t.name == "acme.inflated.layouter")
+        .expect("extension AI tool must surface in ai_list_tools");
+    assert_eq!(
+        entry.max_entities_modified, 16,
+        "ai_list_tools must clamp the advertised cap against the canonical host's \
+         schema cap (`layout_suggestion` = 16) — got {} from manifest cap 100",
+        entry.max_entities_modified,
+    );
+}
+
+#[test]
+fn ai_list_tools_keeps_extension_cap_when_below_host_cap() {
+    // Symmetric pin: when the extension's manifest cap is BELOW
+    // the host's schema cap, the advertised cap stays at the
+    // extension's manifest cap — the clamp is a `min`, not a
+    // hard override. This stops a future refactor from
+    // accidentally raising every extension cap up to the host
+    // ceiling.
+    let (s, _g, _path) = make_service_with_ai_extensions(|root| {
+        plant_ai_tool_extension_alias(
+            root,
+            "acme.modest",
+            "acme.modest.layouter",
+            "layout_suggestion",
+            vec!["design"],
+            4, // < host schema cap of 16
+        );
+    });
+    let tools = s.ai_list_tools().expect("ai_list_tools");
+    let entry = tools
+        .iter()
+        .find(|t| t.name == "acme.modest.layouter")
+        .expect("extension AI tool must surface in ai_list_tools");
+    assert_eq!(
+        entry.max_entities_modified, 4,
+        "ai_list_tools must keep the extension's manifest cap when it is below the \
+         host schema cap; got {}",
+        entry.max_entities_modified,
+    );
+}
+
+#[test]
+fn ai_list_tools_drops_extension_with_unknown_grammar_key() {
+    // An extension whose `grammar_key` does not match any host
+    // tool cannot be dispatched by `ai_plan` (the same
+    // `canonical_builtin_for_grammar_key` lookup that powers
+    // `resolve_ai_tool_alias` returns `None`). Surface it in the
+    // picker anyway and the user would see an entry that always
+    // fails at click time — drop it from the advertised list so
+    // the picker and the dispatcher agree on what's reachable.
+    let (s, _g, _path) = make_service_with_ai_extensions(|root| {
+        plant_ai_tool_extension_alias(
+            root,
+            "acme.orphan",
+            "acme.orphan.layouter",
+            "totally_made_up_grammar_key",
+            vec!["design"],
+            4,
+        );
+    });
+    let tools = s.ai_list_tools().expect("ai_list_tools");
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+    assert!(
+        !names.contains(&"acme.orphan.layouter"),
+        "extension with unknown grammar_key must NOT surface in ai_list_tools \
+         (it cannot be dispatched by ai_plan, so showing it in the picker would \
+         be a guaranteed failure path); saw: {names:?}",
+    );
+}
+
+#[test]
 fn ai_list_tools_keeps_non_colliding_extension_tools_alongside_colliding_one() {
     // When the registry contains BOTH a colliding extension and a
     // properly-namespaced one, the filter must drop only the
