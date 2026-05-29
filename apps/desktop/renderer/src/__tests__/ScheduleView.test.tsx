@@ -130,15 +130,13 @@ describe("ScheduleView", () => {
     generateSpy.mockRestore();
   });
 
-  // Regression test: Devin Review flagged that the `regenerate`
-  // callback had `try { ... } finally { ... }` with no `catch`.
-  // Pre-Phase 13 every branch hit `demo://` paths (in-process
-  // fallback never throws), so missing catch was benign; Phase 13
-  // wires real OS paths from the file picker so disk-full /
-  // permission-denied / locked-DB errors became silent unhandled
-  // promise rejections. The fix routes bridge failures through the
-  // optional `onError` callback so the parent (Bim.tsx) can surface
-  // them via `addToast("error", ...)`.
+  // Regression test: the `regenerate` callback's `try/finally` /
+  // `catch` covers bridge failures from real OS paths supplied by
+  // the file picker. Disk-full / permission-denied / locked-DB
+  // errors would otherwise become silent unhandled promise
+  // rejections. The fix routes bridge failures through the optional
+  // `onError` callback so the parent (Bim.tsx) can surface them
+  // via `addToast("error", ...)`.
   it("regenerate() surfaces bridge failures via onError", async () => {
     const onGenerate = vi.fn();
     const onError = vi.fn();

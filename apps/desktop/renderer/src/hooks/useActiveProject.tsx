@@ -2,11 +2,8 @@
  * Active-project React context and hook.
  *
  * Every mode page (Design, Draft, BIM, Render, Deliver) routes bridge
- * calls through the active project. Until Phase 13 the BIM page
- * hard-coded `"demo://project.ifc"` and the other pages either
- * omitted the project path (relying on the main-process tracker) or
- * used placeholder paths. This context surfaces the active project
- * summary on the renderer side so every page can:
+ * calls through the active project. This context surfaces the active
+ * project summary on the renderer side so every page can:
  *
  *   * Read `project.path` for `commandApply`, `bimImportIfc`, etc.
  *   * Read `project.name` for header / breadcrumb / toast messages.

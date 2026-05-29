@@ -39,16 +39,14 @@ interface Props {
   rowsByKind: Partial<Record<ScheduleKind, ScheduleRow[]>>;
   onGenerate: (kind: ScheduleKind, summary: ScheduleGenerationSummary) => void;
   /**
-   * Error reporter for bridge failures. Phase 13 wires the bridge
-   * to real OS paths from the file picker, so `aec.bim.generateSchedule`
-   * can reject with real errors (file moved between import and
+   * Error reporter for bridge failures. `aec.bim.generateSchedule`
+   * runs against real OS paths from the file picker, so it can
+   * reject with real errors (file moved between import and
    * regenerate, disk full, locked DB, permission denied). Without
    * this callback the rejection would surface as an unhandled
    * promise rejection from `onClick` with zero user feedback — no
    * toast, no error-boundary trigger (async rejections don't bubble
-   * to React error boundaries). Pre-Phase 13 every branch hit
-   * `demo://...` paths that the in-process fallback never throws
-   * for, which is why the missing catch was benign before.
+   * to React error boundaries).
    *
    * Receives a human-readable error message. The parent (`Bim.tsx`)
    * wires this to its `addToast("error", message)` so the failure
@@ -113,19 +111,17 @@ export function ScheduleView({
       });
     } catch (err) {
       // Surface the bridge failure through the parent's error
-      // reporter. Pre-Phase 13 the in-process fallback never
-      // threw (every branch routed through `demo://`), so the
-      // missing catch was benign — but Phase 13 wires real OS
-      // paths from the file picker, so disk-full, permission
-      // denied, locked-DB, and missing-file errors are real
-      // failure surfaces. Without this catch the rejection would
-      // become an unhandled promise rejection from `onClick` with
-      // no user feedback (async rejections don't trigger React
-      // error boundaries). The `finally` below still clears the
-      // `busy` flag so the button re-enables for retry — the
-      // failure is recoverable from the user's perspective.
-      // Mirrors the catch in `ValidatorPanel.revalidate` so the
-      // two BIM panels share one failure contract.
+      // reporter. The bridge runs against real OS paths from the
+      // file picker, so disk-full, permission-denied, locked-DB,
+      // and missing-file errors are real failure surfaces. Without
+      // this catch the rejection would become an unhandled promise
+      // rejection from `onClick` with no user feedback (async
+      // rejections don't trigger React error boundaries). The
+      // `finally` below still clears the `busy` flag so the button
+      // re-enables for retry — the failure is recoverable from
+      // the user's perspective. Mirrors the catch in
+      // `ValidatorPanel.revalidate` so the two BIM panels share
+      // one failure contract.
       const msg = err instanceof Error ? err.message : String(err);
       const display = `Regenerate ${active} schedule failed: ${msg}`;
       if (onError) {

@@ -78,14 +78,12 @@ export function ValidatorPanel({
       onFindings(bimReportToFindings(result));
     } catch (err) {
       // Surface the bridge failure through the parent's error
-      // reporter. Pre-Phase 13 the in-process fallback never
-      // threw (every branch routed through `demo://`), so the
-      // missing catch was benign — but Phase 13 wires real OS
-      // paths from the file picker, so file-moved, permission-
-      // denied, malformed-IFC, and locked-DB errors are real
-      // failure surfaces. Without this catch the rejection would
-      // become an unhandled promise rejection from `onClick` with
-      // no user feedback (async rejections don't trigger React
+      // reporter. The bridge runs against real OS paths from the
+      // file picker, so file-moved, permission-denied,
+      // malformed-IFC, and locked-DB errors are real failure
+      // surfaces. Without this catch the rejection would become
+      // an unhandled promise rejection from `onClick` with no
+      // user feedback (async rejections don't trigger React
       // error boundaries). The `finally` below still clears the
       // `busy` flag so the button re-enables for retry — the
       // failure is recoverable from the user's perspective.

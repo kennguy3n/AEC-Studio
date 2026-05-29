@@ -6,9 +6,8 @@
  * to surface the OS file picker before they invoke the bridge — e.g.
  * "Import IFC" needs the user-selected IFC path before calling
  * `aec.bim.importIfc`, and "Export PDF" needs a save destination
- * before calling `aec.export.exportPdf`. Until Phase 13 the renderer
- * passed `"demo://..."` placeholders into the bridge; this module is
- * the production file-picker surface that replaces them.
+ * before calling `aec.export.exportPdf`. This module is the
+ * production file-picker surface that drives those flows.
  *
  * Why a dedicated module instead of inlining the calls in `ipc.ts`?
  *   1. The handlers depend on a `BrowserWindow` reference (so the
