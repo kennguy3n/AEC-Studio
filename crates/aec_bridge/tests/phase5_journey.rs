@@ -74,6 +74,7 @@ fn boot_service_in(state: &Path, projects: &Path, templates: &Path) -> BridgeSer
         projects_dir: projects.to_path_buf(),
         templates_dir: templates.to_path_buf(),
         max_recents: 10,
+        extensions_dir: None,
     };
     BridgeService::new(cfg, [0x5Au8; 32]).expect("boot BridgeService")
 }

@@ -66,6 +66,7 @@ fn service() -> (BridgeService, tempfile::TempDir) {
         projects_dir: projects,
         templates_dir: templates,
         max_recents: 10,
+        extensions_dir: None,
     };
     let s = BridgeService::new(cfg, [42u8; 32]).unwrap();
     (s, tmp)

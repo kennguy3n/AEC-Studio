@@ -57,6 +57,7 @@ fn boot_service() -> (BridgeService, tempfile::TempDir) {
         projects_dir: projects,
         templates_dir: templates,
         max_recents: 10,
+        extensions_dir: None,
     };
     let svc = BridgeService::new(cfg, [0x4Eu8; 32]).expect("boot BridgeService");
     (svc, tmp)

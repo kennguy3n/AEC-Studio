@@ -1206,6 +1206,24 @@ pub struct BridgeConfig {
     pub templates_dir: PathBuf,
     /// Maximum number of entries to retain in the recents store.
     pub max_recents: usize,
+    /// Optional directory holding installed extension packs. Each
+    /// child directory must hold a `manifest.json` understood by
+    /// [`aec_core::ExtensionLoader`]. When supplied, the bridge:
+    ///
+    /// * loads every manifest at boot,
+    /// * builds a [`aec_core::PermissionEnforcer`] from the registry,
+    /// * installs every asset-pack extension into the asset library
+    ///   DB (so `design_list_assets` surfaces extension assets), and
+    /// * routes [`BridgeService::project_create_from_template`] and
+    ///   [`BridgeService::list_templates`] through
+    ///   [`aec_core::TemplateLoader::load_with_extensions`] so
+    ///   extension templates take precedence over shipped templates
+    ///   with the same key.
+    ///
+    /// `None` (the default) preserves the pre-Phase-14 behaviour: no
+    /// extensions, all bridge surfaces operate against the built-in
+    /// registries.
+    pub extensions_dir: Option<PathBuf>,
 }
 
 pub struct BridgeService {
@@ -1295,6 +1313,20 @@ pub struct BridgeService {
     /// [`crate::viewport_service`] for the rationale around the
     /// "real device when available, fallback otherwise" pattern.
     viewport_service: crate::viewport_service::ViewportService,
+    /// Loaded extension registry. Empty when
+    /// [`BridgeConfig::extensions_dir`] is `None`. Populated once at
+    /// boot — extensions are immutable at runtime in this revision
+    /// (a future patch can add a `bridge.reloadExtensions()` IPC
+    /// once the renderer needs hot-reload UX).
+    extension_registry: aec_core::ExtensionRegistry,
+    /// Permission enforcer derived from the loaded registry. Consulted
+    /// by extension-aware code paths (AI tool dispatch, asset import,
+    /// schedule registry, …) before routing a runtime operation to an
+    /// extension. Empty enforcer when no extensions loaded; every
+    /// permission check returns
+    /// [`aec_core::PermissionCheck::Denied`] for an unknown
+    /// extension id (the safe default).
+    permission_enforcer: aec_core::PermissionEnforcer,
 }
 
 /// Process-wide render state held by [`BridgeService::render_state`].
@@ -1370,6 +1402,69 @@ impl BridgeService {
         let recents =
             RecentsStore::open(config.state_dir.join("recents.json"), config.max_recents)?;
         let asset_state = AssetState::new(&config.state_dir);
+
+        // ---- Extension loading ----
+        //
+        // When the caller pointed us at an `extensions_dir`, walk it
+        // through `ExtensionLoader`, build the
+        // `PermissionEnforcer` from the resulting registry, and feed
+        // every asset-pack extension into the asset library DB so
+        // extension-shipped assets show up alongside the seed library
+        // on the next `design_list_assets` query.
+        //
+        // `LoadOptions::allow_unsigned()` is intentional for the
+        // bridge boot path — the trust store lives one layer up (the
+        // Electron host injects publisher keys before bridge init in
+        // production, and the integration tests in this crate ship
+        // unsigned manifests). Production builds tighten this by
+        // passing a populated `TrustStore` through a future
+        // `extensions_trust` field on `BridgeConfig`.
+        //
+        // Errors during extension loading or asset-pack install do
+        // NOT crash the bridge: an unparseable / missing manifest in
+        // an extension dir would otherwise block the whole renderer
+        // from booting. Instead we degrade to an empty registry,
+        // matching the `extensions_dir = None` default.
+        let (extension_registry, permission_enforcer) = match config.extensions_dir.as_ref() {
+            Some(dir) if dir.is_dir() => {
+                let loader = aec_core::ExtensionLoader::new(dir);
+                let registry = loader
+                    .load(&aec_core::LoadOptions::allow_unsigned())
+                    .unwrap_or_default();
+                let enforcer = aec_core::PermissionEnforcer::from_registry(&registry);
+                // Run the asset-pack host once at boot. Any
+                // per-extension failure (missing file, blake3
+                // mismatch, permission denied) is logged but does
+                // NOT fail the bridge boot — the asset rows simply
+                // don't show up, which is the same UX the user gets
+                // when the extension is uninstalled. Production
+                // builds can surface these failures through a
+                // dedicated diagnostics IPC.
+                if registry
+                    .iter()
+                    .any(|e| matches!(e.manifest.kind, aec_core::ExtensionType::AssetPack))
+                {
+                    // `install_asset_packs` returns its own typed
+                    // error; the `with_db_mut` closure returns
+                    // `Result<_, AssetError>`. Threading the install
+                    // result through an inner `Ok(...)` keeps the
+                    // typed install error available to the caller
+                    // *without* a lossy wrap into `AssetError`. We
+                    // drop both layers with `let _ =` per the
+                    // doc-comment above (any per-extension failure
+                    // here must not block bridge boot).
+                    let _ = asset_state.with_db_mut(|db| {
+                        Ok(aec_assets::install_asset_packs(db, &registry, &enforcer))
+                    });
+                }
+                (registry, enforcer)
+            }
+            _ => (
+                aec_core::ExtensionRegistry::default(),
+                aec_core::PermissionEnforcer::new(),
+            ),
+        };
+
         Ok(Self {
             config,
             recents,
@@ -1381,6 +1476,8 @@ impl BridgeService {
             ai_state: AiState::new(default_ai_runtime_config()),
             kchat_state: crate::kchat_state::KChatState::new(),
             viewport_service: crate::viewport_service::ViewportService::new(),
+            extension_registry,
+            permission_enforcer,
         })
     }
 
@@ -1455,11 +1552,17 @@ impl BridgeService {
     pub fn list_templates(&self) -> Result<Vec<TemplateChoice>, BridgeServiceError> {
         let loader = TemplateLoader::new(self.config.templates_dir.clone());
         let mut out = Vec::new();
+        // Walk the union of shipped templates + extension-supplied
+        // templates. `discover_with_extensions` returns extension
+        // keys at the head of the list when they collide with a
+        // shipped key — the subsequent `load_with_extensions` honours
+        // that precedence by reading the extension's
+        // `definition_path` first.
         for key in loader
-            .discover()
+            .discover_with_extensions(&self.extension_registry)
             .map_err(|e| BridgeServiceError::Template(e.to_string()))?
         {
-            match loader.load(&key) {
+            match loader.load_with_extensions(&self.extension_registry, &key) {
                 Ok(def) => out.push(TemplateChoice {
                     key,
                     name: def.name,
@@ -1491,8 +1594,14 @@ impl BridgeService {
         project_name: &str,
     ) -> Result<ProjectSummary, BridgeServiceError> {
         let loader = TemplateLoader::new(self.config.templates_dir.clone());
+        // Consult the extension registry before the shipped templates
+        // tree so an extension-supplied template with the same key
+        // wins. Falls back to the on-disk `templates/` tree when the
+        // registry has no matching `ExtensionType::Template` entry.
+        // Mirrors the merge order documented on
+        // [`aec_core::TemplateLoader::load_with_extensions`].
         let template = loader
-            .load(template_key)
+            .load_with_extensions(&self.extension_registry, template_key)
             .map_err(|e| BridgeServiceError::Template(e.to_string()))?;
 
         let slug = slugify(project_name);
@@ -3505,13 +3614,58 @@ impl BridgeService {
     /// Enumerate the local AI tools the planner is willing to dispatch.
     /// The renderer's "AI sidebar" calls this once at session start to
     /// populate the tool picker.
+    ///
+    /// The returned list is the union of:
+    ///
+    /// * **built-in tools** — the closed set defined by
+    ///   [`aec_ai::AiToolSchema`] (style_assistant, lighting_assistant,
+    ///   …), ordered by tool name; and
+    /// * **extension AI tools** — every
+    ///   [`aec_core::ExtensionType::AiTool`] in the loaded registry
+    ///   whose manifest declares
+    ///   [`aec_core::Permission::AiTools`]. Each extension tool
+    ///   surfaces with its manifest `tool_id` as `name` and the
+    ///   manifest-declared scopes / grammar key / cap on
+    ///   `max_entities_modified`. Extensions missing the AI-tools
+    ///   permission are *omitted* from the list — the
+    ///   `resolve_extension_ai_tool` permission gate is the safe
+    ///   default (an unprivileged extension shouldn't appear in the
+    ///   planner's tool picker).
     pub fn ai_list_tools(&self) -> Result<Vec<AiToolDescriptor>, BridgeServiceError> {
         // `iter_sorted` already orders by tool name, so the wire payload
         // is deterministic across calls (HashMap iteration order is not).
-        let tools: Vec<AiToolDescriptor> = ai_tool_schemas()
+        let mut tools: Vec<AiToolDescriptor> = ai_tool_schemas()
             .iter_sorted()
             .map(AiToolDescriptor::from)
             .collect();
+
+        // Merge in extension AI tools. We discard the
+        // `(_, errs)` half of `list_extension_ai_tools` here —
+        // permission-denied extensions are *expected* to surface in
+        // `errs`, not in the returned list, and the AI sidebar
+        // shouldn't be reporting them. Production builds can surface
+        // these via a dedicated diagnostics IPC.
+        let (ext_tools, _errs) =
+            aec_ai::list_extension_ai_tools(&self.extension_registry, &self.permission_enforcer);
+        for t in ext_tools {
+            tools.push(AiToolDescriptor {
+                name: t.tool_id,
+                display_name: t.display_name,
+                description: t.description,
+                allowed_scopes: t
+                    .allowed_scopes
+                    .iter()
+                    .map(|sc| sc.as_str().to_owned())
+                    .collect(),
+                max_entities_modified: t.max_entities_modified,
+                grammar_key: t.grammar_key,
+                // Extensions don't compose child tools today —
+                // their `ai_tool` body declares a single
+                // `grammar_key`, so the child-tools list is
+                // intentionally empty.
+                child_tools: Vec::new(),
+            });
+        }
         Ok(tools)
     }
 
@@ -4903,6 +5057,7 @@ mod tests {
             projects_dir: projects,
             templates_dir: templates,
             max_recents: 10,
+            extensions_dir: None,
         };
         let s = BridgeService::new(cfg, [42u8; 32]).unwrap();
         (s, tmp)
@@ -5241,6 +5396,7 @@ mod tests {
             projects_dir: projects.clone(),
             templates_dir: templates.clone(),
             max_recents: 10,
+            extensions_dir: None,
         };
         let mut s1 = BridgeService::new(cfg.clone(), [42u8; 32]).unwrap();
         let summary = s1

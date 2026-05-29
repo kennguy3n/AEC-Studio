@@ -158,6 +158,13 @@ pub struct InitOptions {
     pub max_recents: u32,
     /// 32-byte master key (hex-encoded).
     pub master_key_hex: String,
+    /// Optional path to the directory holding installed extension
+    /// packs (asset packs, template extensions, AI tool extensions,
+    /// …). Each child directory must hold a `manifest.json`
+    /// understood by [`aec_core::ExtensionLoader`]. Empty or absent
+    /// (`None`) preserves the pre-Phase-14 behaviour where no
+    /// extensions are loaded.
+    pub extensions_dir: Option<String>,
 }
 
 #[napi]
@@ -174,6 +181,10 @@ pub fn bridge_init(opts: InitOptions) -> Result<()> {
         projects_dir: PathBuf::from(opts.projects_dir),
         templates_dir: PathBuf::from(opts.templates_dir),
         max_recents: opts.max_recents as usize,
+        extensions_dir: opts
+            .extensions_dir
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from),
     };
     let svc = BridgeService::new(cfg, key).map_err(|e| Error::from_reason(e.to_string()))?;
     // Same poison-tolerant pattern as `with_service` so a previously-

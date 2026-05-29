@@ -77,6 +77,7 @@ fn boot_service() -> (BridgeService, tempfile::TempDir) {
         projects_dir: projects,
         templates_dir: templates,
         max_recents: 10,
+        extensions_dir: None,
     };
     let svc = BridgeService::new(cfg, [0x4Au8; 32]).expect("boot BridgeService");
     (svc, tmp)
@@ -395,6 +396,7 @@ fn phase2_journey_persists_across_service_restart() {
         projects_dir: tmp.path().join("projects"),
         templates_dir: tmp.path().join("templates"),
         max_recents: 10,
+        extensions_dir: None,
     };
     let mut svc2 = BridgeService::new(cfg, [0x4Au8; 32]).expect("reboot");
     svc2.project_open(&summary.path).expect("reopen");
