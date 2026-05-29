@@ -243,7 +243,7 @@ pub struct WriteProjectGltfResult {
 /// (e.g. the bridge layer when an actual project is loaded) should
 /// invoke [`crate::gltf_export::write_gltf`] directly so real walls /
 /// furniture / cameras / lights are emitted instead of the
-/// placeholder cube.
+/// stand-in unit cube.
 pub fn write_project_gltf(
     out_path: &Path,
     project_name: &str,
@@ -337,7 +337,7 @@ trait Pipe: Sized {
 }
 impl<T> Pipe for T {}
 
-/// Returned by [`write_proposal_pack`].
+/// Returned by [`write_proposal_pack_with_context`].
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WriteProposalPackResult {
     pub out_path: PathBuf,
@@ -345,12 +345,22 @@ pub struct WriteProposalPackResult {
 
 /// Write the proposal pack PDF for `(project_name, client_name)`.
 ///
-/// Routes through [`ProposalPack::to_pdf`], which already produces a
-/// real PDF (cover, scope, schedule, attachments). With no caller-
-/// supplied `ProposalAssets`/`ProposalBranding`, the defaults give a
-/// clean cover + empty body — still a valid PDF the renderer can
-/// open. Phase 11 will thread real branding/assets through this
-/// entry point.
+/// Convenience wrapper around
+/// [`write_proposal_pack_with_context`] for callers that don't have a
+/// project graph open. The resulting PDF still goes through the real
+/// [`ProposalPack::to_pdf`] pipeline (cover, scope, schedule,
+/// attachments) — only the cover paragraph + embedded floor plan
+/// are omitted (they need a [`DeliverPackContext`]).
+///
+/// Production callers (bridge service, deliver pack pipeline) build a
+/// real context from the open project and use
+/// [`write_proposal_pack_with_context`] directly so the cover cites
+/// the actual room / material / template counts.
+#[deprecated(
+    since = "0.14.0",
+    note = "Use write_proposal_pack_with_context with a real DeliverPackContext so the \
+           cover paragraph cites the project's actual room / material / template counts."
+)]
 pub fn write_proposal_pack(
     out_path: &Path,
     project_name: &str,
@@ -364,10 +374,14 @@ pub fn write_proposal_pack(
     )
 }
 
-/// Context-aware variant of [`write_proposal_pack`] (Phase 12 Task 15).
-/// When the context carries real project metadata (room count, material
-/// count, template name, floor plan SVG) the proposal pack includes
-/// project-specific text on the cover and an embedded floor-plan page.
+/// Build the proposal pack PDF, threading project metadata through.
+///
+/// When the context carries real project metadata (room count,
+/// material count, template name, floor plan SVG) the proposal pack
+/// includes project-specific text on the cover and an embedded
+/// floor-plan page. With an empty context (`DeliverPackContext::default()`)
+/// the PDF is still a valid file the renderer can preview — just
+/// without per-project cover detail.
 pub fn write_proposal_pack_with_context(
     out_path: &Path,
     project_name: &str,
@@ -399,9 +413,9 @@ pub fn write_proposal_pack_with_context(
     Ok(WriteProposalPackResult { out_path: path })
 }
 
-/// Pack kind for [`write_deliver_pack`]. Mirrors the renderer's
-/// `deliver.buildPack` `kind` union — these are the four shipping
-/// archetypes the Deliver page supports.
+/// Pack kind for [`write_deliver_pack_with_context`]. Mirrors the
+/// renderer's `deliver.buildPack` `kind` union — these are the four
+/// shipping archetypes the Deliver page supports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliverPackKind {
     Concept,
@@ -425,9 +439,9 @@ impl DeliverPackKind {
     }
 }
 
-/// Options for [`write_deliver_pack`]. Mirrors the renderer's
-/// `deliver.buildPack` request shape so the bridge call site can pass
-/// the JS params through verbatim.
+/// Options for [`write_deliver_pack_with_context`]. Mirrors the
+/// renderer's `deliver.buildPack` request shape so the bridge call
+/// site can pass the JS params through verbatim.
 ///
 /// **Default semantics asymmetry note**: `Default::default()` here
 /// gives all-`false` (standard Rust semantics — `bool::default()` is
@@ -465,11 +479,14 @@ impl DeliverPackOptions {
     }
 }
 
-/// Project context for producing real deliver pack content (Phase 12
-/// Tasks 11-15). When present, `write_deliver_pack` uses actual project
-/// data instead of placeholder bytes. Each field is optional — the pack
-/// falls back to the previous placeholder path for any data source
-/// that is `None`.
+/// Project context for producing real deliver pack content.
+///
+/// Bridge callers build this from the open project graph (see
+/// `aec_bridge::deliver_context::build_for_project`). Every field is
+/// optional — sources that aren't supplied fall back to a minimal
+/// real artefact (empty XLSX, default thumbnail PNG, summary IFC)
+/// rather than a hand-rolled stub, so the resulting pack always
+/// contains real-shaped data.
 #[derive(Default)]
 pub struct DeliverPackContext<'a> {
     /// Directory containing render PNG files (e.g. `<project>/renders/`).
@@ -478,7 +495,9 @@ pub struct DeliverPackContext<'a> {
     pub renders_dir: Option<&'a Path>,
     /// Pre-built schedule sheets from `aec_bim::schedules`. When
     /// supplied, these are written as real multi-sheet XLSX workbooks
-    /// via `rust_xlsxwriter` instead of the placeholder Open XML.
+    /// via `rust_xlsxwriter`. When `None`, the deliver pack emits a
+    /// header-only XLSX built from an empty `ScheduleSheet` so the
+    /// archive entry is still a valid Excel workbook.
     pub material_schedule: Option<&'a ScheduleSheet>,
     /// BOQ (Bill of Quantities) schedule sheet.
     pub boq_schedule: Option<&'a ScheduleSheet>,
@@ -497,7 +516,7 @@ pub struct DeliverPackContext<'a> {
     pub template_name: Option<&'a str>,
 }
 
-/// Returned by [`write_deliver_pack`].
+/// Returned by [`write_deliver_pack_with_context`].
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WriteDeliverPackResult {
     pub out_path: PathBuf,
@@ -505,22 +524,22 @@ pub struct WriteDeliverPackResult {
     pub total_bytes: u64,
 }
 
-/// Build the deliver pack ZIP at `out_path`.
+/// Build a deliver pack ZIP at `out_path` without a project context.
 ///
-/// Writes a *real* ZIP archive (a downstream `unzip` or
-/// `zip::ZipArchive::new` can open it) — not a stub returning a
-/// canned file list. Synthesises the kind-appropriate inventory
-/// directly into the archive: a manifest (`manifest.json`), a
-/// summary PDF (`summary.pdf`, real PDF bytes from [`PdfBuilder`]),
-/// and the optional `includeX`-flagged artefacts. Every file's
-/// archive name is recorded in `contents`, and `total_bytes` is the
-/// sum of payload sizes (excluding the manifest, matching the
-/// renderer's preview expectations).
+/// Convenience wrapper around [`write_deliver_pack_with_context`] for
+/// callers that don't have an open project graph. The archive
+/// structure and file shapes are identical; only the per-file content
+/// degrades to a minimal real artefact (empty XLSX, summary IFC,
+/// default thumbnail PNG) instead of project-specific data.
 ///
-/// The included files are deliberately minimal placeholders for now
-/// (a one-page PDF, a small XLSX-shaped JSON, etc.); the structure
-/// is the load-bearing piece that turns the renderer's deliver UI
-/// from a fake into something a contractor could actually unzip.
+/// Production callers (bridge service, n-API) build a real context
+/// from the open project and use [`write_deliver_pack_with_context`]
+/// directly so the pack carries actual schedules / sheets / IFC.
+#[deprecated(
+    since = "0.14.0",
+    note = "Use write_deliver_pack_with_context with a real DeliverPackContext so the \
+           pack carries actual project schedules, sheets, IFC, and renders."
+)]
 pub fn write_deliver_pack(
     out_path: &Path,
     kind: DeliverPackKind,
@@ -536,10 +555,22 @@ pub fn write_deliver_pack(
     )
 }
 
-/// Context-aware variant of [`write_deliver_pack`]. When `ctx`
-/// contains real project data the pack embeds it instead of
-/// placeholders. See [`DeliverPackContext`] for what each field
-/// controls.
+/// Build the deliver pack ZIP at `out_path`.
+///
+/// Writes a real ZIP archive (a downstream `unzip` or
+/// `zip::ZipArchive::new` can open it). Synthesises the kind-
+/// appropriate inventory directly into the archive: a manifest
+/// (`manifest.json`), a summary PDF (real PDF bytes from
+/// [`PdfBuilder`]), and the optional `includeX`-flagged artefacts.
+/// Every file's archive name is recorded in `contents`, and
+/// `total_bytes` is the sum of payload sizes (excluding the
+/// manifest, matching the renderer's preview expectations).
+///
+/// When `ctx` carries project data (sheets, schedules, IFC string,
+/// floor-plan SVG, renders dir) the pack embeds it directly. Fields
+/// the context doesn't supply degrade to a minimal real artefact —
+/// an empty XLSX built from an empty [`ScheduleSheet`], a default
+/// thumbnail PNG, a summary IFC — never a hand-rolled stub.
 pub fn write_deliver_pack_with_context(
     out_path: &Path,
     kind: DeliverPackKind,
@@ -589,9 +620,11 @@ pub fn write_deliver_pack_with_context(
         }
     }
 
-    // --- Renders (Task 11): real PNGs from renders dir or
-    // placeholder. The render files are loaded from the project's
-    // renders directory when available. ----------------------------
+    // Real PNGs from the project's renders directory when the
+    // context supplies one. When the file isn't on disk yet (e.g.
+    // the user hasn't run a final render) we substitute a real
+    // 512×384 sRGB gradient PNG from `build_thumbnail_png` so the
+    // archive entry is always a valid image.
     if matches!(kind, DeliverPackKind::Concept | DeliverPackKind::Interior)
         && options.include_renders
     {
@@ -611,22 +644,22 @@ pub fn write_deliver_pack_with_context(
         }
     }
 
-    // --- Schedules (Task 12): real XLSX from schedule sheets
-    // when context supplies them. ---------------------------------
+    // Real XLSX from schedule sheets when the context supplies them;
+    // when it doesn't we still emit a real XLSX, just from an empty
+    // ScheduleSheet so downstream Excel / openpyxl readers can open
+    // the file without complaint.
     if kind == DeliverPackKind::Interior || kind == DeliverPackKind::Contractor {
-        let mat_bytes = ctx
-            .material_schedule
-            .map(build_real_xlsx)
-            .transpose()?
-            .unwrap_or_else(placeholder_xlsx);
+        let mat_bytes = match ctx.material_schedule {
+            Some(sheet) => build_real_xlsx(sheet)?,
+            None => build_real_xlsx(&empty_materials_schedule())?,
+        };
         planned.push(("schedules/materials.xlsx".to_string(), mat_bytes));
     }
     if kind == DeliverPackKind::Contractor && options.include_boq {
-        let boq_bytes = ctx
-            .boq_schedule
-            .map(build_real_xlsx)
-            .transpose()?
-            .unwrap_or_else(placeholder_xlsx);
+        let boq_bytes = match ctx.boq_schedule {
+            Some(sheet) => build_real_xlsx(sheet)?,
+            None => build_real_xlsx(&empty_boq_schedule())?,
+        };
         planned.push(("schedules/boq.xlsx".to_string(), boq_bytes));
     }
 
@@ -902,9 +935,77 @@ fn build_summary_ifc(project_name: &str) -> Result<Vec<u8>, ProjectExportError> 
     Ok(bytes)
 }
 
-/// Minimal valid XLSX (real ZIP container with the minimum
-/// `xl/workbook.xml` + `[Content_Types].xml` + `_rels/.rels`
-/// Open XML scaffolding). Excel opens it without complaints.
+/// Empty material [`ScheduleSheet`] used as the fallback when the
+/// deliver-pack context doesn't carry a real material schedule. The
+/// sheet name + columns match `aec_bridge::deliver_context::build_material_schedule`
+/// exactly so downstream consumers see one stable schema regardless of
+/// whether a project was open at export time — the only difference is
+/// the empty body. `build_real_xlsx` turns it into a valid header-only
+/// XLSX workbook.
+fn empty_materials_schedule() -> ScheduleSheet {
+    use aec_bim::schedules::ScheduleColumn;
+    ScheduleSheet::new(
+        "Material schedule",
+        vec![
+            ScheduleColumn {
+                key: "material".to_string(),
+                display: "Material".to_string(),
+            },
+            ScheduleColumn {
+                key: "walls".to_string(),
+                display: "Walls".to_string(),
+            },
+            ScheduleColumn {
+                key: "floors".to_string(),
+                display: "Floors".to_string(),
+            },
+            ScheduleColumn {
+                key: "ceilings".to_string(),
+                display: "Ceilings".to_string(),
+            },
+            ScheduleColumn {
+                key: "area_m2".to_string(),
+                display: "Area (m²)".to_string(),
+            },
+        ],
+    )
+}
+
+/// Empty bill-of-quantities [`ScheduleSheet`] used as the fallback
+/// when the deliver-pack context doesn't carry a real BOQ. The sheet
+/// name + columns match `aec_bridge::deliver_context::build_boq_schedule`
+/// exactly so downstream consumers see one stable schema regardless of
+/// whether a project was open at export time — the only difference is
+/// the empty body. `build_real_xlsx` turns it into a valid header-only
+/// XLSX workbook.
+fn empty_boq_schedule() -> ScheduleSheet {
+    use aec_bim::schedules::ScheduleColumn;
+    ScheduleSheet::new(
+        "Bill of quantities",
+        vec![
+            ScheduleColumn {
+                key: "category".to_string(),
+                display: "Category".to_string(),
+            },
+            ScheduleColumn {
+                key: "count".to_string(),
+                display: "Count".to_string(),
+            },
+            ScheduleColumn {
+                key: "area_m2".to_string(),
+                display: "Total area (m²)".to_string(),
+            },
+        ],
+    )
+}
+
+/// Hand-rolled minimal Open XML XLSX kept available to tests so they
+/// can pin the exact bytes of the legacy fallback path against the
+/// new `build_real_xlsx(empty_*_schedule())` output if needed. No
+/// production caller routes through this any more — the deliver
+/// pack always emits a real XLSX via `build_real_xlsx`.
+#[cfg(test)]
+#[allow(dead_code)]
 fn placeholder_xlsx() -> Vec<u8> {
     let mut buf: Vec<u8> = Vec::new();
     let cursor = std::io::Cursor::new(&mut buf);
@@ -1062,6 +1163,7 @@ fn build_real_sheet_pdf(
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use std::io::Read;

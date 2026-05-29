@@ -1038,6 +1038,13 @@ pub struct ExportProposalPackParamsJs {
     /// page. The export still succeeds when `None` is passed (the
     /// cover renders `"(client)"` as the placeholder).
     pub client_name: Option<String>,
+    /// Path to the `.aecstudio` package. When supplied, the bridge
+    /// builds a `DeliverPackContext` from the project graph so the
+    /// proposal's cover paragraph cites the real room / material /
+    /// template counts and embeds the project's floor-plan SVG.
+    /// Optional for backward compatibility with renderer code that
+    /// pre-dates Phase 14.
+    pub project_path: Option<String>,
 }
 
 /// JS-facing result of [`export_build_proposal_pack`].
@@ -1062,7 +1069,12 @@ pub fn export_build_proposal_pack(
 ) -> Result<ExportProposalPackResultJs> {
     let client = params.client_name.as_deref().unwrap_or("(client)");
     with_service_ref_fallible(|svc| {
-        svc.export_proposal_pack(&params.out_path, &params.project_name, client)
+        svc.export_proposal_pack(
+            &params.out_path,
+            &params.project_name,
+            client,
+            params.project_path.as_deref(),
+        )
     })
     .map(Into::into)
 }
@@ -1077,6 +1089,12 @@ pub struct DeliverBuildPackParamsJs {
     /// Project label printed on the in-archive PDF summary; the
     /// renderer defaults this to the open project's name.
     pub project_name: Option<String>,
+    /// Path to the open `.aecstudio` package. When supplied the
+    /// bridge opens its SQLCipher DB and builds a real
+    /// `DeliverPackContext` from the project graph (renders dir,
+    /// material / BOQ schedules, sheets, IFC string, floor-plan
+    /// SVG). Renderer code threads the active project path here.
+    pub project_path: Option<String>,
     pub include_renders: Option<bool>,
     pub include_sheets: Option<bool>,
     pub include_ifc: Option<bool>,
@@ -1138,6 +1156,7 @@ pub fn deliver_build_pack(params: DeliverBuildPackParamsJs) -> Result<DeliverBui
             include_boq: params.include_boq.unwrap_or(true),
             include_proposal: params.include_proposal.unwrap_or(true),
         },
+        project_path: params.project_path,
     };
     // `with_service_ref_fallible` takes `FnOnce` (see helper declaration
     // ~600 LoC above) so the closure can consume `svc_params` directly
