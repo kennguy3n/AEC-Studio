@@ -832,9 +832,10 @@ fn build_camera_frame(camera: &RenderCamera) -> CameraFrame {
 /// [`crate::path_trace::fill_first_hit_aux`] for the per-sample
 /// convention and accumulator-format details.
 ///
-/// A future PR can replace the CPU companion pass with a native WGSL
-/// GBuffer emission; that change is a pure perf optimisation (the
-/// quality contract is already met by the hybrid path).
+/// NOTE: The CPU companion pass could be replaced with a native WGSL
+/// GBuffer emission. That change is a pure perf optimisation — the
+/// quality contract is already met by the hybrid path — and is left
+/// out of the current pipeline to keep the GPU shader small.
 pub fn render_or_fallback(
     scene: &PathTraceScene,
     camera: &RenderCamera,

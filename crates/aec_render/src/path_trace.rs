@@ -1307,7 +1307,7 @@ fn trace_path(
             // The environment background itself is not currently
             // sampled by NEE (there is no sky-light sampler), so its
             // contribution always has MIS weight 1.0 regardless of
-            // `last_was_specular`. A future PR adding an environment
+            // `last_was_specular`. NOTE: adding an environment
             // sampler would change this branch to a power-heuristic
             // combine like the emitter branch below.
             radiance += throughput * env;

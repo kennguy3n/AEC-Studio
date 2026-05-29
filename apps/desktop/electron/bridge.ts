@@ -1556,14 +1556,14 @@ interface NativeApi {
     key: string,
     value: string,
   ): unknown;
-  // AI endpoints wired in PR-V and made async in the async-napi
-  // follow-up. All six are `#[napi] async fn` on the Rust side —
-  // they route through `spawn_blocking_napi` so the libuv main
-  // thread is never blocked, even during the up-to-30 s cold-spawn
-  // of the llama-server child. Typed as `Promise<unknown>` rather
-  // than the looser `unknown` so a future contributor who writes
-  // `n.ai_runtime_status()` without `await` gets a TS error rather
-  // than silently consuming a pending-promise object.
+  // AI endpoints. All six are `#[napi] async fn` on the Rust
+  // side — they route through `spawn_blocking_napi` so the libuv
+  // main thread is never blocked, even during the up-to-30 s
+  // cold-spawn of the llama-server child. Typed as
+  // `Promise<unknown>` rather than the looser `unknown` so a
+  // future contributor who writes `n.ai_runtime_status()` without
+  // `await` gets a TS error rather than silently consuming a
+  // pending-promise object.
   //
   // `parsed_json` on the result of `ai_plan` is a
   // `JSON.stringify`'d tool-specific payload; the adaptor parses
@@ -1750,8 +1750,7 @@ export const NATIVE_WIRED_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   "designSaveCamera",
   "bimClassify",
   "bimSetProperty",
-  // AI sidecar surface wired in Phase 10 PR-V and refactored in the
-  // async-napi follow-up. Backed by `BridgeService::ai_state`
+  // AI sidecar surface. Backed by `BridgeService::ai_state`
   // (`AiState` by value — interior mutability via per-piece locks:
   // `RwLock<SidecarRuntime>` + `Mutex<Option<SidecarHandle>>` +
   // `Mutex<HashMap<DiffId, Diff>>`) which owns the sidecar handle +

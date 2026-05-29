@@ -917,9 +917,9 @@ pub fn decode_section_info(
 pub fn parse_descriptors(
     _bytes: &[u8],
 ) -> DwgResult<(Vec<PageDescriptor>, Vec<SectionDescriptor>)> {
-    // Full traversal is wired in alongside the R2004+ reader
-    // integration in a follow-up commit. For now, callers that need
-    // the descriptors should compose [`read_system_page`] +
+    // NOTE: full traversal is delivered alongside the R2004+ reader
+    // integration. Until that lands, callers that need the
+    // descriptors should compose [`read_system_page`] +
     // [`decode_page_map`] directly — this top-level convenience is
     // gated on the R2004 reader so it returns a structured error if
     // invoked before the dispatch path is in place.

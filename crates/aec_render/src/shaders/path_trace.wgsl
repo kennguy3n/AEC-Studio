@@ -536,9 +536,9 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 }
             }
 
-            // Cosine-weighted diffuse bounce (specular GPU lobe arrives
-            // in a follow-up; the CPU kernel covers the high-quality
-            // path).
+            // Cosine-weighted diffuse bounce. NOTE: the GPU kernel
+            // does not yet implement a specular lobe; the CPU kernel
+            // covers the high-quality (metallic / dielectric) path.
             let new_dir = cosine_weighted_sample(nn, rand_f32(&rng_state), rand_f32(&rng_state));
             let cos_nd = max(dot(nn, new_dir), 0.0);
             if (cos_nd <= 0.0) {

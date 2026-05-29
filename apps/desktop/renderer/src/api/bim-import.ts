@@ -53,8 +53,8 @@ export type LargeFileConfirm = (info: {
 /**
  * Default confirm callback: renders a human-readable "X MB / Y MB"
  * line via `window.confirm`. Kept here (not inlined in the caller)
- * so the message string is exercised by the unit test and won't
- * drift from the i18n keys we'll add in a future PR.
+ * so the message string is exercised by the unit test and stays a
+ * single source of truth for the wording.
  */
 export const defaultLargeFileConfirm: LargeFileConfirm = ({
   path,
