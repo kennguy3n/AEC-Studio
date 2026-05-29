@@ -19,10 +19,10 @@ interface Props {
   onFindings: (next: ValidationFinding[]) => void;
   onZoomTo?: (entityId: string) => void;
   /**
-   * Error reporter for bridge failures. Phase 13 wires the bridge
-   * to real OS paths from the file picker, so `aec.bim.validate`
-   * can reject with real errors (file moved/deleted between import
-   * and revalidate, permission denied, malformed IFC on re-read,
+   * Error reporter for bridge failures. `aec.bim.validate` runs
+   * against real OS paths from the file picker, so it can reject
+   * with real errors (file moved/deleted between import and
+   * revalidate, permission denied, malformed IFC on re-read,
    * locked DB). Without this callback the rejection would surface
    * as an unhandled promise rejection from `onClick` with zero
    * user feedback — no toast, no error-boundary trigger (async
