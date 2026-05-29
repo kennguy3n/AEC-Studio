@@ -3686,6 +3686,28 @@ impl BridgeService {
         let (ext_tools, _errs) =
             aec_ai::list_extension_ai_tools(&self.extension_registry, &self.permission_enforcer);
         for t in ext_tools {
+            // Defense-in-depth: filter out extension tools whose
+            // `tool_id` collides with a built-in `AiToolName`. The
+            // manifest convention is dotted names (e.g.
+            // `acme.layouter`), so collisions are unlikely in
+            // practice, but if one slips through we'd ship a
+            // duplicate entry to the renderer's tool picker — and
+            // `resolve_ai_tool_alias` would dispatch the call to
+            // the built-in instead of the extension because
+            // `AiToolName::from_wire_str` matches the closed enum
+            // first. That makes the extension entry visible in the
+            // picker but unreachable via dispatch — a confusing UX
+            // we'd rather prevent at the source. Dropping the
+            // colliding entry surfaces the conflict honestly: the
+            // built-in keeps its slot, the extension is omitted,
+            // and the extension author sees their tool fail to
+            // appear (which prompts a rename to a properly
+            // namespaced `tool_id`). The drop is silent in the
+            // public surface; a future diagnostics IPC can surface
+            // the conflict to the extension author.
+            if AiToolName::from_wire_str(&t.tool_id).is_some() {
+                continue;
+            }
             tools.push(AiToolDescriptor {
                 name: t.tool_id,
                 display_name: t.display_name,

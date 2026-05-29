@@ -1294,3 +1294,83 @@ fn ai_plan_unknown_tool_id_still_errors_cleanly() {
         "unknown-tool error must name the rejected wire-format string; got: {msg}",
     );
 }
+
+#[test]
+fn ai_list_tools_filters_extension_tool_ids_that_collide_with_built_ins() {
+    // Defense-in-depth: plant an extension whose `tool_id` shadows
+    // a built-in name (`style_assistant`). Without filtering,
+    // `ai_list_tools` would emit two entries with the same `name`
+    // — visible in the renderer's tool picker but unreachable via
+    // `ai_plan` (because `AiToolName::from_wire_str` matches the
+    // built-in first in `resolve_ai_tool_alias`). The filter must
+    // keep the built-in and drop the colliding extension entry.
+    let (s, _g, _path) = make_service_with_ai_extensions(|root| {
+        plant_ai_tool_extension_alias(
+            root,
+            "shadow.ext",
+            "style_assistant", // collides with the built-in
+            "layout_suggestion",
+            vec!["design"],
+            4,
+        );
+    });
+    let tools = s.ai_list_tools().expect("ai_list_tools");
+    let style_count = tools.iter().filter(|t| t.name == "style_assistant").count();
+    assert_eq!(
+        style_count,
+        1,
+        "exactly one entry must surface for the colliding name (saw: {:?})",
+        tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>()
+    );
+    // Sanity check: the surviving entry is the BUILT-IN, not the
+    // extension. We pin this by the absence of the
+    // "style_assistant (test)" `display_name` the extension
+    // planted via `plant_ai_tool_extension_alias`.
+    let entry = tools
+        .iter()
+        .find(|t| t.name == "style_assistant")
+        .expect("style_assistant entry");
+    assert!(
+        !entry.display_name.contains("(test)"),
+        "the surviving `style_assistant` entry must be the built-in (its display_name should NOT carry the extension's `(test)` suffix); got: {:?}",
+        entry.display_name,
+    );
+}
+
+#[test]
+fn ai_list_tools_keeps_non_colliding_extension_tools_alongside_colliding_one() {
+    // When the registry contains BOTH a colliding extension and a
+    // properly-namespaced one, the filter must drop only the
+    // colliding entry — the well-formed extension still surfaces.
+    // This pins that the filter is a per-entry decision, not a
+    // bulk drop of every extension when ANY one collides.
+    let (s, _g, _path) = make_service_with_ai_extensions(|root| {
+        plant_ai_tool_extension_alias(
+            root,
+            "shadow.ext",
+            "lighting_assistant", // collides with the built-in
+            "layout_suggestion",
+            vec!["design"],
+            4,
+        );
+        plant_ai_tool_extension_alias(
+            root,
+            "good.ext",
+            "good.ext.layouter", // properly namespaced
+            "layout_suggestion",
+            vec!["design"],
+            4,
+        );
+    });
+    let tools = s.ai_list_tools().expect("ai_list_tools");
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+    assert!(
+        names.contains(&"good.ext.layouter"),
+        "non-colliding extension tool must surface (saw: {names:?})",
+    );
+    let lighting_count = names.iter().filter(|n| **n == "lighting_assistant").count();
+    assert_eq!(
+        lighting_count, 1,
+        "exactly one entry must surface for the colliding `lighting_assistant` (saw: {names:?})",
+    );
+}
