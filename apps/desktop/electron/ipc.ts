@@ -52,6 +52,73 @@ async function resolveDefaultThreadIdFromBridge(): Promise<string | null> {
 }
 
 /**
+ * Heartbeat-freshness window for the loopback API's
+ * `connected`/`reconnecting`/`disconnected` ternary. 30 s covers an
+ * entire `.kcz` extension activation cycle plus the bot's
+ * idle-polling cadence; tighter than this would flap, looser would
+ * mask a dead extension for too long.
+ */
+const KCHAT_HEARTBEAT_FRESH_MS = 30_000;
+
+/**
+ * Build the renderer-facing kchat status payload.
+ *
+ * Centralised so the `kchat:status` IPC handler and the
+ * `kchat:reload` handler compute the connection state with
+ * identical logic. Previously `kchat:reload` short-circuited to
+ * `apiServerRunning ? "reconnecting" : "disconnected"`, which
+ * meant clicking "Re-detect" on the Settings card with a healthy
+ * extension flashed the indicator to `reconnecting` until the next
+ * 5 s status poll healed it — visible UX bug.
+ *
+ * The Phase 15 transport is local-only (no socket reconnect to
+ * negotiate), so "reload" is just "snapshot the current state".
+ */
+function buildKchatStatusResponse(defaultThreadId: string | null): {
+  state: "connected" | "reconnecting" | "disconnected";
+  publisherKind: "loopback_http";
+  instanceJson: string;
+  defaultThreadId: string | null;
+} {
+  const snap = getKchatRendererSnapshot();
+  const nowMs = Date.now();
+  const lastMs =
+    snap.lastExtensionContactAt === null
+      ? null
+      : Date.parse(snap.lastExtensionContactAt);
+  let state: "connected" | "reconnecting" | "disconnected";
+  if (!snap.apiServerRunning) {
+    // The server itself isn't up — typically a boot failure or a
+    // shutdown in progress. The renderer treats this as a hard
+    // disconnect and hides the Settings affordances.
+    state = "disconnected";
+  } else if (lastMs !== null && nowMs - lastMs < KCHAT_HEARTBEAT_FRESH_MS) {
+    // We heard from the extension recently — it's alive on the
+    // other end of the loopback.
+    state = "connected";
+  } else {
+    // Server is up but no fresh heartbeat. This is the legitimate
+    // "extension not installed / not activated yet" state and
+    // also the "boot finished but no extension activation has
+    // happened this session" state.
+    state = "reconnecting";
+  }
+  return {
+    state,
+    publisherKind: "loopback_http",
+    instanceJson: JSON.stringify({
+      apiServerRunning: snap.apiServerRunning,
+      apiServerPort: snap.apiServerPort,
+      portFilePath: snap.portFilePath,
+      lastExtensionContactAt: snap.lastExtensionContactAt,
+      queuedPublishCount: snap.queuedPublishCount,
+      reviewThreadCount: snap.reviewThreadCount,
+    }),
+    defaultThreadId,
+  };
+}
+
+/**
  * Register every IPC handler the preload bridge expects. Handlers are
  * grouped by API surface (Project / Design / Draft / BIM / Render / AI /
  * Export / Runtime).
@@ -639,41 +706,7 @@ export function registerIpcHandlers(): void {
   // Electron-side `kchatAppState` singleton; the Rust bridge's
   // KChat methods are kept for in-process tests / fallback only.
   ipcMain.handle("kchat:status", async () => {
-    const snap = getKchatRendererSnapshot();
-    // Decide connection state from the heartbeat freshness.
-    // "connected" means the extension has called any
-    // authenticated route within the last 30 s (an entire
-    // extension activation cycle); "reconnecting" means the
-    // server is up but the extension has not yet been heard
-    // from this session; "disconnected" means the server itself
-    // is down (boot failure).
-    const FRESH_MS = 30_000;
-    const nowMs = Date.now();
-    const lastMs =
-      snap.lastExtensionContactAt === null
-        ? null
-        : Date.parse(snap.lastExtensionContactAt);
-    let state: "connected" | "reconnecting" | "disconnected";
-    if (!snap.apiServerRunning) {
-      state = "disconnected";
-    } else if (lastMs !== null && nowMs - lastMs < FRESH_MS) {
-      state = "connected";
-    } else {
-      state = "reconnecting";
-    }
-    return {
-      state,
-      publisherKind: "loopback_http" as const,
-      instanceJson: JSON.stringify({
-        apiServerRunning: snap.apiServerRunning,
-        apiServerPort: snap.apiServerPort,
-        portFilePath: snap.portFilePath,
-        lastExtensionContactAt: snap.lastExtensionContactAt,
-        queuedPublishCount: snap.queuedPublishCount,
-        reviewThreadCount: snap.reviewThreadCount,
-      }),
-      defaultThreadId: await resolveDefaultThreadIdFromBridge(),
-    };
+    return buildKchatStatusResponse(await resolveDefaultThreadIdFromBridge());
   });
   ipcMain.handle("kchat:reload", async () => {
     // In Phase 15 there is nothing to "reload" at the transport
@@ -681,21 +714,13 @@ export function registerIpcHandlers(): void {
     // re-establish. Reload is now a synonym for "snapshot the
     // current status"; the renderer keeps the affordance for
     // backward compatibility (the Settings card's "Re-detect"
-    // button maps to this).
-    const snap = getKchatRendererSnapshot();
-    return {
-      state: snap.apiServerRunning ? "reconnecting" : "disconnected",
-      publisherKind: "loopback_http" as const,
-      instanceJson: JSON.stringify({
-        apiServerRunning: snap.apiServerRunning,
-        apiServerPort: snap.apiServerPort,
-        portFilePath: snap.portFilePath,
-        lastExtensionContactAt: snap.lastExtensionContactAt,
-        queuedPublishCount: snap.queuedPublishCount,
-        reviewThreadCount: snap.reviewThreadCount,
-      }),
-      defaultThreadId: await resolveDefaultThreadIdFromBridge(),
-    };
+    // button maps to this). Critically, we must compute the
+    // connection state with the SAME logic as `kchat:status`
+    // (heartbeat-freshness based, not just "is the server up")
+    // so that clicking "Re-detect" while the extension is
+    // connected doesn't flash the indicator to `reconnecting`
+    // until the next 5 s status poll corrects it.
+    return buildKchatStatusResponse(await resolveDefaultThreadIdFromBridge());
   });
   ipcMain.handle("kchat:publish", async (_e, params) => {
     assertObject(params, "params");
