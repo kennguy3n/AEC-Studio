@@ -71,6 +71,38 @@ fn ai_grammars() -> &'static AiGrammarRegistry {
     AI_GRAMMARS.get_or_init(AiGrammarRegistry::defaults)
 }
 
+/// Map an extension's `grammar_key` to the [`AiToolName`] that owns
+/// it on the host side.
+///
+/// When multiple host tools declare the same `grammar_key` (today
+/// `plan_detection` and `plan_to_wall` both declare
+/// `grammar_key: "plan_detection"`), prefer the tool whose
+/// wire-format name equals the `grammar_key` itself — the
+/// "canonical home" for that grammar. Falls back to the first by
+/// sorted name so the resolution is deterministic across calls if
+/// no canonical home exists (which would indicate a catalogue bug,
+/// guarded by [`AiToolSchemaRegistry::defaults_match_canonical_json`]).
+///
+/// Pure helper so it can be exercised by unit tests with synthetic
+/// schema arrangements — see [`tests::canonical_builtin_for_grammar_key_*`].
+fn canonical_builtin_for_grammar_key(
+    grammar_key: &str,
+    schemas: &AiToolSchemaRegistry,
+) -> Option<AiToolName> {
+    let mut matches = schemas
+        .iter_sorted()
+        .filter(|s| s.grammar_key == grammar_key);
+    let first = matches.next()?;
+    if first.name.as_str() == grammar_key {
+        return Some(first.name);
+    }
+    Some(
+        matches
+            .find(|s| s.name.as_str() == grammar_key)
+            .map_or(first.name, |s| s.name),
+    )
+}
+
 #[derive(Debug, Error)]
 pub enum BridgeServiceError {
     #[error("core: {0}")]
@@ -3692,8 +3724,14 @@ impl BridgeService {
     ///   default (an unprivileged extension shouldn't appear in the
     ///   planner's tool picker).
     pub fn ai_list_tools(&self) -> Result<Vec<AiToolDescriptor>, BridgeServiceError> {
-        // `iter_sorted` already orders by tool name, so the wire payload
-        // is deterministic across calls (HashMap iteration order is not).
+        // `iter_sorted` already orders the built-in slice by tool
+        // name, but extension tools come out of
+        // `list_extension_ai_tools` in registry iteration order. A
+        // final sort across the merged set is what makes the wire
+        // payload deterministic across calls regardless of which
+        // extensions are loaded — the renderer pins these by name
+        // and any binary-search consumer downstream depends on the
+        // full list being sorted.
         let mut tools: Vec<AiToolDescriptor> = ai_tool_schemas()
             .iter_sorted()
             .map(AiToolDescriptor::from)
@@ -3707,17 +3745,86 @@ impl BridgeService {
         // these via a dedicated diagnostics IPC.
         let (ext_tools, _errs) =
             aec_ai::list_extension_ai_tools(&self.extension_registry, &self.permission_enforcer);
+        let schemas = ai_tool_schemas();
         for t in ext_tools {
+            // Defense-in-depth: filter out extension tools whose
+            // `tool_id` collides with a built-in `AiToolName`. The
+            // manifest convention is dotted names (e.g.
+            // `acme.layouter`), so collisions are unlikely in
+            // practice, but if one slips through we'd ship a
+            // duplicate entry to the renderer's tool picker — and
+            // `resolve_ai_tool_alias` would dispatch the call to
+            // the built-in instead of the extension because
+            // `AiToolName::from_wire_str` matches the closed enum
+            // first. That makes the extension entry visible in the
+            // picker but unreachable via dispatch — a confusing UX
+            // we'd rather prevent at the source. Dropping the
+            // colliding entry surfaces the conflict honestly: the
+            // built-in keeps its slot, the extension is omitted,
+            // and the extension author sees their tool fail to
+            // appear (which prompts a rename to a properly
+            // namespaced `tool_id`). The drop is silent in the
+            // public surface; a future diagnostics IPC can surface
+            // the conflict to the extension author.
+            if AiToolName::from_wire_str(&t.tool_id).is_some() {
+                continue;
+            }
+            // Resolve the canonical host tool that will actually
+            // dispatch this extension when `ai_plan` runs (same
+            // helper `resolve_ai_tool_alias` uses). The advertised
+            // cap MUST be clamped against the host tool's own
+            // `max_entities_modified` — the planner's diff-safety
+            // validator enforces the host cap regardless of what
+            // the extension manifest declares, so advertising the
+            // raw extension cap (e.g. 100) when the host caps at
+            // 16 would surface slider values in the renderer that
+            // are guaranteed to be rejected at dispatch. Skipping
+            // tools with an unknown grammar_key matches
+            // `resolve_ai_tool_alias`, which errors out on the
+            // same condition — a tool that can't be dispatched
+            // should not appear in the picker either.
+            let Some(host_schema) = canonical_builtin_for_grammar_key(&t.grammar_key, schemas)
+                .and_then(|name| schemas.get(name))
+            else {
+                continue;
+            };
+            let advertised_cap = t
+                .max_entities_modified
+                .min(host_schema.max_entities_modified);
+            // The advertised `allowed_scopes` MUST be the
+            // INTERSECTION of the extension's declared scopes and
+            // the host tool's schema scopes — same architectural
+            // pattern as the cap clamp above. The host schema is
+            // load-bearing: the planner's grammar/diff validator
+            // enforces the host scopes regardless of what the
+            // extension manifest declares, so advertising a scope
+            // that's only in the extension's set (but missing from
+            // the host's) would surface a value in the renderer
+            // that `resolve_ai_tool_alias` is guaranteed to reject
+            // at dispatch. Mirrors the cap-clamp posture: shrink
+            // toward the host's smaller set rather than the
+            // extension's wider one.
+            let advertised_scopes: Vec<String> = t
+                .allowed_scopes
+                .iter()
+                .filter(|sc| host_schema.allowed_scopes.contains(sc))
+                .map(|sc| sc.as_str().to_owned())
+                .collect();
+            // An extension whose declared scopes share zero overlap
+            // with the host schema is unreachable at dispatch — the
+            // intersection is empty, so every `ai_plan` call would
+            // be rejected at the scope check below. Drop the tool
+            // from the picker entirely, matching the unreachable-
+            // grammar_key and host-cap=0 dispositions above.
+            if advertised_scopes.is_empty() {
+                continue;
+            }
             tools.push(AiToolDescriptor {
                 name: t.tool_id,
                 display_name: t.display_name,
                 description: t.description,
-                allowed_scopes: t
-                    .allowed_scopes
-                    .iter()
-                    .map(|sc| sc.as_str().to_owned())
-                    .collect(),
-                max_entities_modified: t.max_entities_modified,
+                allowed_scopes: advertised_scopes,
+                max_entities_modified: advertised_cap,
                 grammar_key: t.grammar_key,
                 // Extensions don't compose child tools today —
                 // their `ai_tool` body declares a single
@@ -3726,6 +3833,7 @@ impl BridgeService {
                 child_tools: Vec::new(),
             });
         }
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(tools)
     }
 
@@ -3754,8 +3862,21 @@ impl BridgeService {
         context_json: &str,
         max_entities_modified: u32,
     ) -> Result<AiPlanResult, BridgeServiceError> {
-        let tool_name = AiToolName::from_wire_str(tool)
-            .ok_or_else(|| BridgeServiceError::Ai(format!("unknown ai tool `{tool}`")))?;
+        // Resolve the wire-format tool string into the closed
+        // [`AiToolName`] the planner + diff engine know how to
+        // dispatch. Built-in tool ids (`style_assistant`, etc.)
+        // resolve directly; extension-supplied `tool_id`s
+        // (advertised by [`Self::ai_list_tools`]) resolve through
+        // their declared `grammar_key` — every extension AI tool
+        // must declare a grammar that the host already ships,
+        // because the diff engine can only translate model output
+        // shapes it has a `build_*` arm for. The renderer's
+        // attribution string (returned in [`AiPlanResult::tool`])
+        // is restored to the extension `tool_id` after dispatch
+        // so the audit log and tool-picker round-trip correctly.
+        let (tool_name, extension_attribution, effective_max_entities) =
+            self.resolve_ai_tool_alias(tool, scope, max_entities_modified)?;
+        let max_entities_modified = effective_max_entities;
         let context: serde_json::Value = if context_json.is_empty() {
             serde_json::Value::Object(serde_json::Map::new())
         } else {
@@ -3846,9 +3967,162 @@ impl BridgeService {
         Ok(AiPlanResult {
             diff_id: diff_id.as_str().to_owned(),
             parsed,
-            tool: tool_name.as_str().to_owned(),
+            // Surface the extension's `tool_id` (when the call
+            // originated from an extension AI tool) so the
+            // renderer's tool picker can route the result back
+            // to the originating extension. Built-in tools
+            // return their canonical wire-format name unchanged.
+            tool: extension_attribution.unwrap_or_else(|| tool_name.as_str().to_owned()),
             entities_modified: entities,
         })
+    }
+
+    /// Resolve a wire-format `ai_plan` tool string into:
+    ///   * a built-in [`AiToolName`] the planner + diff engine can
+    ///     dispatch (every AI tool, including extension-provided
+    ///     ones, ultimately routes through a built-in grammar +
+    ///     diff engine `build_*` arm because the diff engine is
+    ///     closed to known output shapes);
+    ///   * an optional extension attribution string (`Some` when
+    ///     the call originated from an extension AI tool, `None`
+    ///     for built-in calls); and
+    ///   * the effective `max_entities_modified` cap, clamped by
+    ///     the extension's manifest cap when applicable so the
+    ///     extension can never authorise a larger blast radius
+    ///     than its manifest declares (defense-in-depth on top of
+    ///     the planner's own safety validator).
+    ///
+    /// For built-in tools this is a single closed-enum lookup; for
+    /// extension tools we additionally enforce:
+    ///   * the extension is loaded + has the `AiTools` permission
+    ///     (already checked by `list_extension_ai_tools`);
+    ///   * the extension's `grammar_key` maps to a known built-in
+    ///     [`AiToolName`] (extensions piggy-back on the host's
+    ///     grammar + diff engine surface — they cannot introduce a
+    ///     new model output shape);
+    ///   * the requested `scope` is in the INTERSECTION of the
+    ///     extension's declared `allowed_scopes` and the host
+    ///     tool's schema `allowed_scopes` — the same intersection
+    ///     `ai_list_tools` advertises to the renderer, so a scope
+    ///     surfaced in the picker is guaranteed to dispatch
+    ///     cleanly (cap-clamp pattern, applied to scopes).
+    ///
+    /// Note on grammar_key disambiguation: more than one built-in
+    /// schema may declare the same `grammar_key` when the variants
+    /// share both a model output shape and a diff-engine arm
+    /// (today `plan_detection` and `plan_to_wall` both declare
+    /// `grammar_key: "plan_detection"` and both route through
+    /// [`aec_ai::diff_engine::build_plan_detection`]). When that
+    /// happens, this resolver picks the host tool whose
+    /// wire-format name equals the `grammar_key` ("canonical home"
+    /// for that grammar) rather than falling out of sorted-name
+    /// order non-deterministically. This contract is mirrored in
+    /// `crates/aec_ai/data/ai_tools.json`, where the primary tool
+    /// for a grammar shares its `id` with `grammar_key`. If the
+    /// catalogue ever ships a grammar_key with no matching tool
+    /// name, we fall back to the sorted-name first match so the
+    /// resolution stays deterministic.
+    ///
+    /// Note on per-call cost: this rebuilds the extension AI tool
+    /// list on every `ai_plan` for an extension tool by walking
+    /// the loaded extension registry, checking `Permission::AiTools`
+    /// on each, and parsing declared scopes. We deliberately do
+    /// NOT cache this list inside [`BridgeService`] today, because:
+    ///   * the cost is bounded by the number of `AiTools`-declaring
+    ///     extensions (single-digit at the expected catalogue
+    ///     scale; permission check short-circuits the rest), and
+    ///   * a stale cache here would be a *correctness* bug rather
+    ///     than a perf bug — the planner would dispatch to a tool
+    ///     the extension no longer owns or has permission for.
+    ///
+    /// If the extension count ever grows to where the per-call
+    /// walk dominates `ai_plan` latency, the right fix is a single
+    /// `extensions_changed` event source feeding a shared cached
+    /// `Arc<Vec<ExtensionAiToolMeta>>` reused by both
+    /// [`Self::ai_list_tools`] and this resolver — invalidated on
+    /// (a) boot, (b) any future hot-reload IPC, and (c) any future
+    /// permission-mutation IPC. Until then keeping the per-call
+    /// walk is the simpler correctness story.
+    fn resolve_ai_tool_alias(
+        &self,
+        tool: &str,
+        scope: Scope,
+        max_entities_modified: u32,
+    ) -> Result<(AiToolName, Option<String>, u32), BridgeServiceError> {
+        if let Some(name) = AiToolName::from_wire_str(tool) {
+            return Ok((name, None, max_entities_modified));
+        }
+        let (ext_tools, _errs) =
+            aec_ai::list_extension_ai_tools(&self.extension_registry, &self.permission_enforcer);
+        let ext = ext_tools
+            .into_iter()
+            .find(|t| t.tool_id == tool)
+            .ok_or_else(|| BridgeServiceError::Ai(format!("unknown ai tool `{tool}`")))?;
+        // Pick the host tool that owns this grammar_key FIRST, so
+        // the scope check below can clamp the effective scope set
+        // against the host's `allowed_scopes` — the same
+        // intersection `ai_list_tools` advertises to the renderer.
+        // When more than one match (today `plan_detection` and
+        // `plan_to_wall` both declare `grammar_key:
+        // "plan_detection"`), prefer the canonical home — see
+        // [`canonical_builtin_for_grammar_key`] and the doc comment
+        // on this method.
+        let schemas = ai_tool_schemas();
+        let builtin =
+            canonical_builtin_for_grammar_key(&ext.grammar_key, schemas).ok_or_else(|| {
+                BridgeServiceError::Ai(format!(
+                    "extension ai tool `{}` declares unknown grammar_key `{}`",
+                    ext.tool_id, ext.grammar_key
+                ))
+            })?;
+        // Effective scope set is the INTERSECTION of the extension's
+        // declared scopes and the host tool's schema scopes — the
+        // same shape `ai_list_tools` advertises to the renderer.
+        // The host schema is load-bearing: the planner's
+        // grammar/diff validator enforces it regardless of what the
+        // extension manifest claims, so a scope only present in the
+        // extension's set is unreachable at dispatch. Mirroring the
+        // cap-clamp pattern below: shrink toward the host's smaller
+        // set, not the extension's wider one.
+        //
+        // The `.expect("…")` is safe for the same reason as the cap
+        // clamp: `canonical_builtin_for_grammar_key` above only
+        // returns `Some(name)` for names that exist in `schemas`.
+        let host_schema = schemas
+            .get(builtin)
+            .expect("canonical_builtin_for_grammar_key only returns names present in schemas");
+        if !ext.allowed_scopes.contains(&scope) || !host_schema.allowed_scopes.contains(&scope) {
+            let effective: Vec<&str> = ext
+                .allowed_scopes
+                .iter()
+                .filter(|sc| host_schema.allowed_scopes.contains(sc))
+                .map(|sc| sc.as_str())
+                .collect();
+            return Err(BridgeServiceError::Ai(format!(
+                "extension ai tool `{}` does not allow scope `{}` (effective allowed: {:?})",
+                ext.tool_id,
+                scope.as_str(),
+                effective,
+            )));
+        }
+        // The effective cap must be the smallest of:
+        //   - the caller's requested cap (`max_entities_modified`),
+        //   - the extension's manifest cap (`ext.max_entities_modified`),
+        //   - the host tool's schema cap (`host_schema.max_entities_modified`).
+        //
+        // The host cap is load-bearing: the planner's diff-safety
+        // validator enforces it regardless of what the extension or
+        // the caller claims, so a value that exceeds the host cap
+        // would be rejected at dispatch even when the extension
+        // manifest declares a higher ceiling (e.g. extension says
+        // 100, host caps at 16). Clamping here keeps the
+        // contract symmetric with `ai_list_tools`'s advertised cap
+        // and means the renderer's slider never produces a value
+        // the planner is going to reject.
+        let effective_cap = max_entities_modified
+            .min(ext.max_entities_modified)
+            .min(host_schema.max_entities_modified);
+        Ok((builtin, Some(ext.tool_id), effective_cap))
     }
 
     /// Apply an accepted AI diff to the project graph.
@@ -7609,5 +7883,109 @@ END-ISO-10303-21;\n";
         let ch = json["changes"][0].clone();
         assert!(ch.get("beforeHash").is_some());
         assert!(ch.get("afterHash").is_some());
+    }
+
+    /// Build a synthetic [`AiToolSchemaRegistry`] for the grammar_key
+    /// disambiguation tests. The registry shipped via
+    /// [`AiToolSchemaRegistry::defaults`] happens to put the canonical
+    /// home of `plan_detection` first in sorted-name order, so it can
+    /// only exercise the canonical-home-is-sorted-first branch. To
+    /// pin the other two branches (canonical home is NOT sorted-first,
+    /// and no canonical home exists at all) we need to drive the
+    /// helper with a registry whose entries we can choose. Building
+    /// from a `Vec<(ToolName, grammar_key)>` keeps each test case
+    /// self-documenting.
+    fn schemas_with(entries: &[(AiToolName, &str)]) -> AiToolSchemaRegistry {
+        let mut r = AiToolSchemaRegistry::new();
+        for (name, grammar_key) in entries {
+            r.insert(AiToolSchema {
+                name: *name,
+                display_name: name.as_str().to_owned(),
+                allowed_scopes: vec![Scope::Design],
+                max_entities_modified: 8,
+                grammar_key: (*grammar_key).to_owned(),
+                description: String::new(),
+                child_tools: Vec::new(),
+            });
+        }
+        r
+    }
+
+    #[test]
+    fn canonical_builtin_for_grammar_key_picks_canonical_home_when_sorted_first() {
+        // The bundled catalogue already exercises this branch:
+        // `plan_detection` and `plan_to_wall` both declare
+        // `grammar_key: "plan_detection"`, and `plan_detection`
+        // sorts before `plan_to_wall` alphabetically. The canonical
+        // home — the tool whose name matches the grammar_key — must
+        // be picked, NOT just the first match.
+        let schemas = AiToolSchemaRegistry::defaults();
+        let picked = canonical_builtin_for_grammar_key("plan_detection", &schemas)
+            .expect("plan_detection grammar_key has known home in the default catalogue");
+        assert_eq!(
+            picked,
+            AiToolName::PlanDetection,
+            "the tool whose name matches the grammar_key must win even when more than one tool \
+             declares that grammar_key",
+        );
+    }
+
+    #[test]
+    fn canonical_builtin_for_grammar_key_picks_canonical_home_when_not_sorted_first() {
+        // Synthesize a registry where the canonical-home tool sorts
+        // AFTER an aliasing tool by name. Without the canonical-home
+        // tie-break, the helper would pick the sorted-first match
+        // (`CadCleanup`, since `cad_cleanup` < `plan_to_wall`),
+        // which would silently send extension dispatches through the
+        // wrong diff-engine arm. With the tie-break, the canonical
+        // home (`PlanToWall`, whose name equals the grammar_key)
+        // must win.
+        let schemas = schemas_with(&[
+            (AiToolName::PlanToWall, "plan_to_wall"),
+            (AiToolName::CadCleanup, "plan_to_wall"),
+        ]);
+        let picked = canonical_builtin_for_grammar_key("plan_to_wall", &schemas)
+            .expect("synthetic registry declares the grammar_key");
+        assert_eq!(
+            picked,
+            AiToolName::PlanToWall,
+            "canonical home must be selected even when an aliasing tool sorts before it by name",
+        );
+    }
+
+    #[test]
+    fn canonical_builtin_for_grammar_key_falls_back_to_sorted_first_when_no_canonical_home() {
+        // Defensive branch: if a future catalogue ever ships a
+        // grammar_key with NO matching tool name (which would be a
+        // catalogue bug — `defaults_match_canonical_json` guards
+        // against it for the bundled JSON), the helper must still
+        // resolve deterministically. We synthesize that scenario by
+        // pointing two tools at a grammar_key that no host tool
+        // owns; the helper must return the sorted-first match
+        // (`CadCleanup` < `Classification`).
+        let schemas = schemas_with(&[
+            (AiToolName::Classification, "made_up_grammar"),
+            (AiToolName::CadCleanup, "made_up_grammar"),
+        ]);
+        let picked = canonical_builtin_for_grammar_key("made_up_grammar", &schemas)
+            .expect("synthetic registry declares the grammar_key");
+        assert_eq!(
+            picked,
+            AiToolName::CadCleanup,
+            "with no canonical home the helper must fall back to sorted-first deterministically",
+        );
+    }
+
+    #[test]
+    fn canonical_builtin_for_grammar_key_returns_none_for_unknown_grammar_key() {
+        // A grammar_key that no host tool declares must surface as
+        // `None` so the resolver can return an `extension ai tool
+        // declares unknown grammar_key` error instead of silently
+        // routing to some unrelated tool.
+        let schemas = AiToolSchemaRegistry::defaults();
+        assert_eq!(
+            canonical_builtin_for_grammar_key("totally_made_up", &schemas),
+            None,
+        );
     }
 }

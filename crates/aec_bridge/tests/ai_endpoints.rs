@@ -1045,3 +1045,577 @@ fn ai_runtime_status_returns_loading_instantly_during_cold_spawn() {
 
     blocker.join().expect("blocker thread");
 }
+
+/// Plant an AI-tool extension on disk so the bridge's boot path
+/// loads it. The manifest declares [`aec_core::Permission::AiTools`]
+/// + [`aec_core::Permission::GeometryRead`] (required by the
+///   permission gate in [`aec_ai::resolve_extension_ai_tool`]) and
+///   reuses an existing host `grammar_key` so the dispatch path can
+///   actually translate the model's output through the host's diff
+///   engine. The extension is left unsigned because the bridge boot
+///   path uses `LoadOptions::allow_unsigned()` (see
+///   `service.rs:1462`).
+fn plant_ai_tool_extension_alias(
+    extensions_root: &std::path::Path,
+    ext_id: &str,
+    tool_id: &str,
+    grammar_key: &str,
+    allowed_scopes: Vec<&str>,
+    cap: u32,
+) {
+    use aec_core::{AiToolBody, ExtensionId, ExtensionManifest, ExtensionType, Permission};
+    let dir = extensions_root.join(ext_id);
+    std::fs::create_dir_all(&dir).unwrap();
+    let manifest = ExtensionManifest {
+        id: ExtensionId(ext_id.into()),
+        name: format!("{} test fixture", ext_id),
+        version: "1.0.0".into(),
+        kind: ExtensionType::AiTool,
+        permissions: vec![Permission::AiTools, Permission::GeometryRead],
+        signature: None,
+        license: "AGPL-3.0".into(),
+        description: format!("test fixture aliasing built-in grammar `{}`", grammar_key),
+        asset_pack: None,
+        template: None,
+        schedule: None,
+        export_target: None,
+        ai_tool: Some(AiToolBody {
+            tool_id: tool_id.into(),
+            display_name: format!("{} (test)", tool_id),
+            description: "Test AI-tool extension".into(),
+            allowed_scopes: allowed_scopes.into_iter().map(String::from).collect(),
+            max_entities_modified: cap,
+            grammar_key: grammar_key.into(),
+        }),
+        importer: None,
+    };
+    std::fs::write(
+        dir.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+}
+
+/// Variant of [`make_service_with_project`] that plants one or more
+/// AI-tool extensions on disk and points the bridge at the
+/// extensions root, so the loaded registry contains the extensions
+/// when the test exercises `ai_list_tools` / `ai_plan`.
+fn make_service_with_ai_extensions(
+    plant: impl Fn(&std::path::Path),
+) -> (BridgeService, TempDir, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let projects = tmp.path().join("projects");
+    let templates = tmp.path().join("templates");
+    let extensions = tmp.path().join("extensions");
+    std::fs::create_dir_all(&templates).unwrap();
+    std::fs::create_dir_all(&extensions).unwrap();
+    write_template(&templates);
+    plant(&extensions);
+    let cfg = BridgeConfig {
+        state_dir: state,
+        projects_dir: projects,
+        templates_dir: templates,
+        max_recents: 10,
+        extensions_dir: Some(extensions),
+    };
+    let mut s = BridgeService::new(cfg, [13u8; 32]).unwrap();
+    let summary = s
+        .project_create_from_template("interior.studio", "AI Ext Project")
+        .expect("create project");
+    let path = summary.path;
+    (s, tmp, path)
+}
+
+/// Wire-format HTTP response for a successful `layout_suggestion`
+/// completion. The payload carries two proposals — both with
+/// `asset_id` — so the diff engine emits exactly two `Insert` ops.
+/// Used by the extension-AI-tool dispatch test to drive a real
+/// end-to-end run through the planner + diff engine via an
+/// extension `tool_id` that aliases the built-in `layout_suggestion`
+/// grammar.
+fn valid_layout_suggestion_response_bytes() -> Vec<u8> {
+    let body = br#"{"content":"{\"room_anchor\":\"ent_living_room\",\"proposals\":[{\"asset_id\":\"asset_sofa_3s\",\"position_mm\":[1000.0,2000.0,0.0],\"rotation_deg\":90.0},{\"asset_id\":\"asset_coffee_table\",\"position_mm\":[1000.0,3500.0,0.0],\"rotation_deg\":0.0}]}","stop":true,"tokens_predicted":42}"#;
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    let mut bytes = head.into_bytes();
+    bytes.extend_from_slice(body);
+    bytes
+}
+
+#[test]
+fn ai_list_tools_sorts_extension_tools_into_the_built_in_list() {
+    // Plant an extension whose `tool_id` falls alphabetically
+    // BEFORE the first built-in (`cad_cleanup`), so any code path
+    // that appended extension tools after the sorted built-in
+    // slice would leave the merged list unsorted.
+    let (s, _g, _path) = make_service_with_ai_extensions(|root| {
+        plant_ai_tool_extension_alias(
+            root,
+            "aaa.zero",
+            "aaa.zero",
+            "layout_suggestion",
+            vec!["design"],
+            4,
+        );
+    });
+    let tools = s.ai_list_tools().expect("ai_list_tools");
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        names, sorted,
+        "ai_list_tools must sort the merged built-in + extension list deterministically"
+    );
+    assert!(
+        names.contains(&"aaa.zero"),
+        "extension tool must be present in the list (saw: {names:?})"
+    );
+    assert_eq!(
+        names.first().copied(),
+        Some("aaa.zero"),
+        "extension `aaa.zero` sorts ahead of every built-in"
+    );
+}
+
+#[test]
+fn ai_plan_dispatches_extension_tool_via_grammar_key_alias() {
+    // Plant an extension that aliases the built-in
+    // `layout_suggestion` grammar. The bridge's `ai_plan` should
+    // accept the extension's `tool_id` as a valid wire-format
+    // tool string, dispatch through the existing planner with the
+    // built-in `LayoutSuggestion` schema (resolved via
+    // `grammar_key`), and return an `AiPlanResult` whose `tool`
+    // field carries the EXTENSION's `tool_id` for renderer
+    // attribution — not the underlying built-in name.
+    let (mut s, _g, project_path) = make_service_with_ai_extensions(|root| {
+        plant_ai_tool_extension_alias(
+            root,
+            "acme.layouter",
+            "acme.layouter",
+            "layout_suggestion",
+            vec!["design"],
+            8,
+        );
+    });
+    let listener = bind_loopback();
+    let port = listener.local_addr().unwrap().port();
+    let resp = canned_response(valid_layout_suggestion_response_bytes());
+    let join = spawn_mock_sidecar(listener, resp, 1);
+    wire_ai_state_to_mock(&mut s, port);
+
+    let result = s
+        .ai_plan(
+            &project_path,
+            "acme.layouter",
+            Scope::Design,
+            "lay out a living room",
+            "{}",
+            8,
+        )
+        .expect("ai_plan should round-trip an extension tool through the sidecar");
+
+    assert!(!result.diff_id.is_empty());
+    assert_eq!(
+        result.tool, "acme.layouter",
+        "AiPlanResult.tool must carry the extension `tool_id` for renderer attribution",
+    );
+    assert_eq!(
+        result.entities_modified, 2,
+        "two layout proposals must materialise as two diff operations",
+    );
+    let _ = join.join();
+}
+
+#[test]
+fn ai_plan_rejects_extension_tool_when_scope_not_allowed() {
+    // The extension's manifest restricts dispatch to the `design`
+    // scope. A call from `Scope::Render` must be rejected BEFORE
+    // any sidecar dispatch — defense in depth on top of the
+    // planner's own scope check.
+    let (s, _g, project_path) = make_service_with_ai_extensions(|root| {
+        plant_ai_tool_extension_alias(
+            root,
+            "acme.layouter",
+            "acme.layouter",
+            "layout_suggestion",
+            vec!["design"],
+            8,
+        );
+    });
+    let err = s
+        .ai_plan(
+            &project_path,
+            "acme.layouter",
+            Scope::Render,
+            "lay out",
+            "{}",
+            8,
+        )
+        .expect_err("ai_plan must reject an out-of-scope extension call");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("acme.layouter") && msg.contains("scope"),
+        "scope-rejection error must name the extension and the scope; got: {msg}",
+    );
+}
+
+#[test]
+fn ai_plan_unknown_tool_id_still_errors_cleanly() {
+    // Sanity check: a tool string that matches NEITHER a built-in
+    // nor a loaded extension surfaces the original
+    // `unknown ai tool` error — extensions widen the set of
+    // accepted names but do not silently coerce typos.
+    let (s, _g, project_path) = make_service_with_ai_extensions(|root| {
+        plant_ai_tool_extension_alias(
+            root,
+            "acme.layouter",
+            "acme.layouter",
+            "layout_suggestion",
+            vec!["design"],
+            8,
+        );
+    });
+    let err = s
+        .ai_plan(
+            &project_path,
+            "totally.not.a.tool",
+            Scope::Design,
+            "x",
+            "{}",
+            1,
+        )
+        .expect_err("typo'd tool name must still surface an error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unknown ai tool") && msg.contains("totally.not.a.tool"),
+        "unknown-tool error must name the rejected wire-format string; got: {msg}",
+    );
+}
+
+#[test]
+fn ai_list_tools_filters_extension_tool_ids_that_collide_with_built_ins() {
+    // Defense-in-depth: plant an extension whose `tool_id` shadows
+    // a built-in name (`style_assistant`). Without filtering,
+    // `ai_list_tools` would emit two entries with the same `name`
+    // — visible in the renderer's tool picker but unreachable via
+    // `ai_plan` (because `AiToolName::from_wire_str` matches the
+    // built-in first in `resolve_ai_tool_alias`). The filter must
+    // keep the built-in and drop the colliding extension entry.
+    let (s, _g, _path) = make_service_with_ai_extensions(|root| {
+        plant_ai_tool_extension_alias(
+            root,
+            "shadow.ext",
+            "style_assistant", // collides with the built-in
+            "layout_suggestion",
+            vec!["design"],
+            4,
+        );
+    });
+    let tools = s.ai_list_tools().expect("ai_list_tools");
+    let style_count = tools.iter().filter(|t| t.name == "style_assistant").count();
+    assert_eq!(
+        style_count,
+        1,
+        "exactly one entry must surface for the colliding name (saw: {:?})",
+        tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>()
+    );
+    // Sanity check: the surviving entry is the BUILT-IN, not the
+    // extension. We pin this by the absence of the
+    // "style_assistant (test)" `display_name` the extension
+    // planted via `plant_ai_tool_extension_alias`.
+    let entry = tools
+        .iter()
+        .find(|t| t.name == "style_assistant")
+        .expect("style_assistant entry");
+    assert!(
+        !entry.display_name.contains("(test)"),
+        "the surviving `style_assistant` entry must be the built-in (its display_name should NOT carry the extension's `(test)` suffix); got: {:?}",
+        entry.display_name,
+    );
+}
+
+#[test]
+fn ai_list_tools_clamps_extension_cap_against_canonical_host_cap() {
+    // Plant an extension that aliases the built-in
+    // `layout_suggestion` grammar (host schema cap = 16) but
+    // declares an inflated manifest cap of 100. The advertised
+    // cap in `ai_list_tools` MUST be clamped against the host
+    // cap, not the extension's claimed cap — otherwise the
+    // renderer's slider would expose values (17..=100) that the
+    // planner's diff-safety validator is guaranteed to reject at
+    // dispatch.
+    let (s, _g, _path) = make_service_with_ai_extensions(|root| {
+        plant_ai_tool_extension_alias(
+            root,
+            "acme.inflated",
+            "acme.inflated.layouter",
+            "layout_suggestion",
+            vec!["design"],
+            100, // > host schema cap of 16
+        );
+    });
+    let tools = s.ai_list_tools().expect("ai_list_tools");
+    let entry = tools
+        .iter()
+        .find(|t| t.name == "acme.inflated.layouter")
+        .expect("extension AI tool must surface in ai_list_tools");
+    assert_eq!(
+        entry.max_entities_modified, 16,
+        "ai_list_tools must clamp the advertised cap against the canonical host's \
+         schema cap (`layout_suggestion` = 16) — got {} from manifest cap 100",
+        entry.max_entities_modified,
+    );
+}
+
+#[test]
+fn ai_list_tools_keeps_extension_cap_when_below_host_cap() {
+    // Symmetric pin: when the extension's manifest cap is BELOW
+    // the host's schema cap, the advertised cap stays at the
+    // extension's manifest cap — the clamp is a `min`, not a
+    // hard override. This stops a future refactor from
+    // accidentally raising every extension cap up to the host
+    // ceiling.
+    let (s, _g, _path) = make_service_with_ai_extensions(|root| {
+        plant_ai_tool_extension_alias(
+            root,
+            "acme.modest",
+            "acme.modest.layouter",
+            "layout_suggestion",
+            vec!["design"],
+            4, // < host schema cap of 16
+        );
+    });
+    let tools = s.ai_list_tools().expect("ai_list_tools");
+    let entry = tools
+        .iter()
+        .find(|t| t.name == "acme.modest.layouter")
+        .expect("extension AI tool must surface in ai_list_tools");
+    assert_eq!(
+        entry.max_entities_modified, 4,
+        "ai_list_tools must keep the extension's manifest cap when it is below the \
+         host schema cap; got {}",
+        entry.max_entities_modified,
+    );
+}
+
+#[test]
+fn ai_list_tools_drops_extension_with_unknown_grammar_key() {
+    // An extension whose `grammar_key` does not match any host
+    // tool cannot be dispatched by `ai_plan` (the same
+    // `canonical_builtin_for_grammar_key` lookup that powers
+    // `resolve_ai_tool_alias` returns `None`). Surface it in the
+    // picker anyway and the user would see an entry that always
+    // fails at click time — drop it from the advertised list so
+    // the picker and the dispatcher agree on what's reachable.
+    let (s, _g, _path) = make_service_with_ai_extensions(|root| {
+        plant_ai_tool_extension_alias(
+            root,
+            "acme.orphan",
+            "acme.orphan.layouter",
+            "totally_made_up_grammar_key",
+            vec!["design"],
+            4,
+        );
+    });
+    let tools = s.ai_list_tools().expect("ai_list_tools");
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+    assert!(
+        !names.contains(&"acme.orphan.layouter"),
+        "extension with unknown grammar_key must NOT surface in ai_list_tools \
+         (it cannot be dispatched by ai_plan, so showing it in the picker would \
+         be a guaranteed failure path); saw: {names:?}",
+    );
+}
+
+#[test]
+fn ai_list_tools_keeps_non_colliding_extension_tools_alongside_colliding_one() {
+    // When the registry contains BOTH a colliding extension and a
+    // properly-namespaced one, the filter must drop only the
+    // colliding entry — the well-formed extension still surfaces.
+    // This pins that the filter is a per-entry decision, not a
+    // bulk drop of every extension when ANY one collides.
+    let (s, _g, _path) = make_service_with_ai_extensions(|root| {
+        plant_ai_tool_extension_alias(
+            root,
+            "shadow.ext",
+            "lighting_assistant", // collides with the built-in
+            "layout_suggestion",
+            vec!["design"],
+            4,
+        );
+        plant_ai_tool_extension_alias(
+            root,
+            "good.ext",
+            "good.ext.layouter", // properly namespaced
+            "layout_suggestion",
+            vec!["design"],
+            4,
+        );
+    });
+    let tools = s.ai_list_tools().expect("ai_list_tools");
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+    assert!(
+        names.contains(&"good.ext.layouter"),
+        "non-colliding extension tool must surface (saw: {names:?})",
+    );
+    let lighting_count = names.iter().filter(|n| **n == "lighting_assistant").count();
+    assert_eq!(
+        lighting_count, 1,
+        "exactly one entry must surface for the colliding `lighting_assistant` (saw: {names:?})",
+    );
+}
+
+#[test]
+fn ai_list_tools_clamps_extension_scopes_against_canonical_host_scopes() {
+    // Plant an extension that aliases the built-in
+    // `layout_suggestion` grammar (host schema scopes = `["design"]`)
+    // but declares an inflated manifest scope set
+    // `["design", "deliver"]`. The advertised scopes in
+    // `ai_list_tools` MUST be the INTERSECTION with the host's
+    // schema scopes — same architectural pattern as the cap clamp.
+    // Otherwise the renderer's scope picker would expose values
+    // (`deliver`) that the planner / `resolve_ai_tool_alias` are
+    // guaranteed to reject at dispatch.
+    let (s, _g, _path) = make_service_with_ai_extensions(|root| {
+        plant_ai_tool_extension_alias(
+            root,
+            "acme.inflated.scope",
+            "acme.inflated.scope.layouter",
+            "layout_suggestion",
+            vec!["design", "deliver"],
+            8,
+        );
+    });
+    let tools = s.ai_list_tools().expect("ai_list_tools");
+    let entry = tools
+        .iter()
+        .find(|t| t.name == "acme.inflated.scope.layouter")
+        .expect("extension AI tool must surface in ai_list_tools");
+    assert_eq!(
+        entry.allowed_scopes,
+        vec!["design".to_string()],
+        "ai_list_tools must clamp the advertised scopes against the canonical \
+         host's schema scopes (`layout_suggestion` = [\"design\"]) — got {:?} \
+         from manifest scopes [\"design\", \"deliver\"]",
+        entry.allowed_scopes,
+    );
+}
+
+#[test]
+fn ai_list_tools_keeps_extension_scopes_when_subset_of_host() {
+    // Symmetric pin: when the extension's manifest scopes are a
+    // proper SUBSET of the host schema scopes, the advertised set
+    // stays at the extension's narrower declaration. The clamp is
+    // an intersection, not a hard override that widens to the host
+    // ceiling. This stops a future refactor from accidentally
+    // widening every extension's surface up to the host's scopes.
+    //
+    // Host `plan_detection` schema declares `["design", "draft"]`,
+    // extension declares only `["design"]` → advertised stays
+    // `["design"]`.
+    let (s, _g, _path) = make_service_with_ai_extensions(|root| {
+        plant_ai_tool_extension_alias(
+            root,
+            "acme.narrow.scope",
+            "acme.narrow.scope.detector",
+            "plan_detection",
+            vec!["design"],
+            4,
+        );
+    });
+    let tools = s.ai_list_tools().expect("ai_list_tools");
+    let entry = tools
+        .iter()
+        .find(|t| t.name == "acme.narrow.scope.detector")
+        .expect("extension AI tool must surface in ai_list_tools");
+    assert_eq!(
+        entry.allowed_scopes,
+        vec!["design".to_string()],
+        "ai_list_tools must keep the extension's narrower scope set when it is \
+         a subset of the host schema scopes; got {:?}",
+        entry.allowed_scopes,
+    );
+}
+
+#[test]
+fn ai_list_tools_drops_extension_when_scopes_disjoint_from_host() {
+    // When the extension's declared scopes share zero overlap with
+    // the host schema's scopes, the tool is unreachable at
+    // dispatch — every `ai_plan` call would be rejected by the
+    // scope-intersection guard in `resolve_ai_tool_alias`. Drop it
+    // from the picker entirely, matching the unreachable-
+    // grammar_key and host-cap = 0 dispositions: a tool that
+    // can't be dispatched should not appear in the picker either.
+    //
+    // Host `layout_suggestion` allows only `["design"]`; the
+    // extension declares only `["deliver"]` → disjoint.
+    let (s, _g, _path) = make_service_with_ai_extensions(|root| {
+        plant_ai_tool_extension_alias(
+            root,
+            "acme.disjoint.scope",
+            "acme.disjoint.scope.layouter",
+            "layout_suggestion",
+            vec!["deliver"],
+            4,
+        );
+    });
+    let tools = s.ai_list_tools().expect("ai_list_tools");
+    let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+    assert!(
+        !names.contains(&"acme.disjoint.scope.layouter"),
+        "extension whose declared scopes are disjoint from the host schema \
+         scopes must NOT surface in ai_list_tools (it cannot be dispatched \
+         by ai_plan, so showing it in the picker would be a guaranteed \
+         failure path); saw: {names:?}",
+    );
+}
+
+#[test]
+fn ai_plan_rejects_extension_scope_outside_host_intersection() {
+    // Defense-in-depth dispatch-side check on the scope clamp the
+    // picker enforces. An extension declares both `design` and
+    // `deliver`, but aliases `layout_suggestion` (host =
+    // `["design"]`). A caller asking for `Scope::Deliver` is in
+    // the extension's declared set but NOT in the effective
+    // intersection — `resolve_ai_tool_alias` MUST reject it
+    // before the planner sees it. Mirrors
+    // `ai_plan_rejects_extension_tool_when_scope_not_allowed`
+    // for the intersection case.
+    let (s, _g, project_path) = make_service_with_ai_extensions(|root| {
+        plant_ai_tool_extension_alias(
+            root,
+            "acme.deliver.attempt",
+            "acme.deliver.attempt.layouter",
+            "layout_suggestion",
+            vec!["design", "deliver"],
+            8,
+        );
+    });
+    let err = s
+        .ai_plan(
+            &project_path,
+            "acme.deliver.attempt.layouter",
+            Scope::Deliver,
+            "lay out",
+            "{}",
+            8,
+        )
+        .expect_err(
+            "ai_plan must reject a scope present in the extension manifest but \
+             absent from the host schema intersection",
+        );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("acme.deliver.attempt.layouter") && msg.contains("scope"),
+        "scope-rejection error must name the extension and the scope; got: {msg}",
+    );
+    assert!(
+        msg.contains("effective allowed"),
+        "scope-rejection error must surface the EFFECTIVE allowed scopes \
+         (intersection with host schema), not just the extension's \
+         declared set; got: {msg}",
+    );
+}

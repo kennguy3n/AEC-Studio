@@ -264,9 +264,29 @@ fn plant_ai_tool_extension(
             tool_id: tool_id.into(),
             display_name: format!("{} (extension)", tool_id),
             description: "Extension-supplied tool for the phase 8 journey".into(),
+            // Declared scopes deliberately exceed what the host
+            // `layout_suggestion` schema allows (`["design"]`). The
+            // journey asserts that `ai_list_tools` advertises only
+            // the INTERSECTION (`["design"]`) — the cap-clamp
+            // pattern applied to scopes. Declaring a wider set
+            // here pins the architectural guard that prevents the
+            // renderer from offering a scope the planner is
+            // guaranteed to reject at dispatch.
             allowed_scopes: vec!["design".into(), "deliver".into()],
+            // Cap matches the host `layout_suggestion` schema cap of 16,
+            // so the advertised cap and the dispatch-side clamp both
+            // resolve to 16 without lossy narrowing — the test pins the
+            // happy-path "declared cap == host cap" branch of
+            // `ai_list_tools`'s cap-clamp.
             max_entities_modified: 16,
-            grammar_key: "phase8.tool.grammar".into(),
+            // Use a real built-in grammar_key (`layout_suggestion`)
+            // rather than a synthetic one — `ai_list_tools` filters
+            // extension AI tools whose grammar_key does not resolve to
+            // a known host schema, matching the dispatch-side guard in
+            // `resolve_ai_tool_alias`. Picking a fixture grammar that
+            // doesn't exist in `ai_tools.json` would (correctly) hide
+            // the tool from the picker and break the journey.
+            grammar_key: "layout_suggestion".into(),
         }),
         importer: None,
     };
@@ -431,13 +451,21 @@ fn phase8_extension_lifecycle_journey_through_bridge_service() {
         .find(|t| t.name == "phase8.ok")
         .expect("permitted extension AI tool not in ai_list_tools");
     assert_eq!(ok_tool.max_entities_modified, 16);
-    assert_eq!(ok_tool.grammar_key, "phase8.tool.grammar");
+    assert_eq!(ok_tool.grammar_key, "layout_suggestion");
     let mut scopes = ok_tool.allowed_scopes.clone();
     scopes.sort();
+    // Advertised scopes are the INTERSECTION of the extension's
+    // declared `["design", "deliver"]` and the host
+    // `layout_suggestion` schema's `["design"]` — same cap-clamp
+    // pattern applied to scopes. The renderer must never see a
+    // scope the planner is guaranteed to reject at dispatch.
     assert_eq!(
         scopes,
-        vec!["deliver".to_string(), "design".to_string()],
-        "extension AI tool scopes mismatch"
+        vec!["design".to_string()],
+        "extension AI tool scopes must be intersected with the host \
+         schema's allowed_scopes; expected only [\"design\"] after \
+         clamping [\"design\", \"deliver\"] against host layout_suggestion \
+         (host = [\"design\"])"
     );
 
     // ---- Step 7: ai_list_tools does NOT include the unprivileged
