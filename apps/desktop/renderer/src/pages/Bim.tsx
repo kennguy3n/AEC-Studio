@@ -80,6 +80,21 @@ export function Bim() {
   const [schedules, setSchedules] = useState<
     Partial<Record<ScheduleKind, ScheduleRow[]>>
   >({});
+  // Column ordering per schedule kind. Sourced from
+  // `BimScheduleRows.header` (the writer's column order) at the napi
+  // boundary; mirrors `rows`-side state shape. Stored separately
+  // from `schedules` so a header-without-rows / rows-without-header
+  // mismatch is structurally impossible (both keys live in the same
+  // per-project reset effect below). Without this header,
+  // `ScheduleView` would have to derive columns from
+  // `Object.keys(rows[0])` — and because the napi layer transports
+  // rows as `HashMap<String, String>` for parity with the bridge's
+  // arbitrary-column XLSX writer, iteration order is non-deterministic
+  // across runs and V8 builds for non-integer string keys. Threading
+  // the header preserves the column order the schedule writer emitted.
+  const [scheduleHeaders, setScheduleHeaders] = useState<
+    Partial<Record<ScheduleKind, string[]>>
+  >({});
   const [findings, setFindings] = useState<ValidationFinding[]>([]);
   const [busyAction, setBusyAction] = useState<BimAction | null>(null);
 
@@ -152,6 +167,7 @@ export function Bim() {
     setSelectedId(null);
     setPsets(DEMO_PSETS);
     setSchedules({});
+    setScheduleHeaders({});
     setFindings([]);
   }, [projectPath]);
 
@@ -406,12 +422,14 @@ export function Bim() {
           if (getActiveProjectPath() !== startPath) break;
           // Read rows back from the generated file.
           let rows: ScheduleRow[] = [];
+          let header: string[] = [];
           if (summary.rows > 0) {
             try {
               const readback = await aec.bim.readScheduleRows({
                 xlsxPath: summary.outPath,
               });
               rows = readback.rows as ScheduleRow[];
+              header = readback.header;
             } catch {
               // Readback failed; display empty rows.
             }
@@ -419,6 +437,7 @@ export function Bim() {
           // Re-check after the optional readback await.
           if (getActiveProjectPath() !== startPath) break;
           setSchedules((prev) => ({ ...prev, room: rows }));
+          setScheduleHeaders((prev) => ({ ...prev, room: header }));
           addToast(
             "success",
             `Generated room schedule: ${summary.rows} rows`,
@@ -477,18 +496,21 @@ export function Bim() {
           // Skip stale: same rationale as generateSchedule above.
           if (getActiveProjectPath() !== startPath) break;
           let boqRows: ScheduleRow[] = [];
+          let boqHeader: string[] = [];
           if (boqSummary.rows > 0) {
             try {
               const readback = await aec.bim.readScheduleRows({
                 xlsxPath: boqSummary.outPath,
               });
               boqRows = readback.rows as ScheduleRow[];
+              boqHeader = readback.header;
             } catch {
               // Readback failed.
             }
           }
           if (getActiveProjectPath() !== startPath) break;
           setSchedules((prev) => ({ ...prev, material: boqRows }));
+          setScheduleHeaders((prev) => ({ ...prev, material: boqHeader }));
           addToast(
             "success",
             `Generated BOQ: ${boqSummary.rows} rows`,
@@ -554,12 +576,14 @@ export function Bim() {
   ) => {
     const startPath = getActiveProjectPath();
     let rows: ScheduleRow[] = [];
+    let header: string[] = [];
     if (summary.rows > 0) {
       try {
         const readback = await aec.bim.readScheduleRows({
           xlsxPath: summary.outPath,
         });
         rows = readback.rows as ScheduleRow[];
+        header = readback.header;
       } catch {
         // Readback failed — leave the inline preview empty; the
         // XLSX on disk is still authoritative.
@@ -575,6 +599,7 @@ export function Bim() {
     // user can re-open project A to see it.
     if (getActiveProjectPath() !== startPath) return;
     setSchedules((prev) => ({ ...prev, [kind]: rows }));
+    setScheduleHeaders((prev) => ({ ...prev, [kind]: header }));
   };
 
   return (
@@ -609,6 +634,7 @@ export function Bim() {
           sourcePath={scheduleSourcePath}
           outPathForKind={scheduleOutPathForKind}
           rowsByKind={schedules}
+          headersByKind={scheduleHeaders}
           onGenerate={(kind, summary) => {
             void onScheduleGenerate(kind, summary);
           }}

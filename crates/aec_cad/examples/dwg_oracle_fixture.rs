@@ -46,11 +46,12 @@ fn main() -> ExitCode {
     // header_vars, sentinel-framed regions, aux header, CRC) is
     // clean against LibreDWG `dwgread` with EXIT=0 / 0 errors / 0
     // warnings, but the per-entity record wire format is still our
-    // internal CRC-framed shape. Once a future PR ports the R12
-    // entity codec to LibreDWG's `decode_preR13_entities` byte
-    // layout (RC type + per-type fixed-record fields + RS CRC at
-    // end), the R12 fixture will pick up the standard 3-entity
-    // geometry. R2007 was lifted out of this list in PR-H1 once
+    // internal CRC-framed shape. NOTE: porting the R12 entity codec
+    // to LibreDWG's `decode_preR13_entities` byte layout (RC type +
+    // per-type fixed-record fields + RS CRC at end) would let the
+    // R12 fixture pick up the standard 3-entity geometry, but the
+    // empty-doc oracle is sufficient for the current contract.
+    // R2007 was lifted out of this list once
     // `assemble_r2007` learned to package real entity records into
     // RS-coded data pages.
     //

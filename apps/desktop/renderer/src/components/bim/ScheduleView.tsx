@@ -17,12 +17,19 @@ export interface ScheduleRow {
 /**
  * Summary returned to the parent after "Regenerate". The bridge
  * writes the schedule directly to an XLSX file at `outPath` (via
- * `ScheduleSheet::write_xlsx` in `aec_bim`), so the renderer just
- * surfaces the file path and row/column counts. The inline
- * preview table renders whatever rows the parent retains in
- * `rowsByKind`; `Bim.tsx` reads them back from the just-written
- * XLSX via `aec.bim.readScheduleRows({ xlsxPath })` so the table
- * mirrors the file on disk.
+ * `ScheduleSheet::write_xlsx` in `aec_bim`), so this component
+ * itself stays a pure presenter — it surfaces the file path and
+ * row/column counts to the parent through `onGenerate` and renders
+ * whatever rows the parent has populated into `rowsByKind`.
+ *
+ * The full round-trip is wired in the parent (`Bim.tsx`): after
+ * `aec.bim.generateSchedule` resolves, the parent calls
+ * `aec.bim.readScheduleRows({ xlsxPath: summary.outPath })` against
+ * the just-written file and pushes the parsed rows into
+ * `rowsByKind` via `setSchedules`. The IPC handler that backs that
+ * readback lives at `bim:readScheduleRows` in `electron/ipc.ts` and
+ * uses `aec_bim::xlsx_reader::read_xlsx_rows`, so the inline
+ * preview shows real schedule data, not just the row count.
  */
 export interface ScheduleGenerationSummary {
   scheduleId: string;
@@ -38,6 +45,24 @@ interface Props {
   /** Path the bridge writes the XLSX to when "Regenerate" is clicked. */
   outPathForKind: (kind: ScheduleKind) => string;
   rowsByKind: Partial<Record<ScheduleKind, ScheduleRow[]>>;
+  /**
+   * Column order per schedule kind, sourced from
+   * `BimScheduleRows.header` at the IPC boundary (the writer's
+   * order). Optional so tests / stand-alone callers that pre-populate
+   * `rowsByKind` without going through the readback can omit it; the
+   * component falls back to `Object.keys(rows[0])` in that case.
+   *
+   * Required in the production data path because the napi layer
+   * transports rows as `HashMap<String, String>` (matching the
+   * bridge's arbitrary-column XLSX writer), so iteration order is
+   * non-deterministic across runs and V8 builds for non-integer
+   * string keys — deriving columns from the first row's `Object.keys`
+   * would reorder columns at every readback. Threading the writer's
+   * `header` through preserves the deterministic ordering the
+   * schedule writer emitted, which matters for human review of the
+   * XLSX and for stable side-by-side diffs across runs.
+   */
+  headersByKind?: Partial<Record<ScheduleKind, string[]>>;
   onGenerate: (kind: ScheduleKind, summary: ScheduleGenerationSummary) => void;
   /**
    * Error reporter for bridge failures. `aec.bim.generateSchedule`
@@ -70,13 +95,26 @@ export function ScheduleView({
   sourcePath,
   outPathForKind,
   rowsByKind,
+  headersByKind,
   onGenerate,
   onError,
 }: Props) {
   const [active, setActive] = useState<ScheduleKind>("room");
   const [busy, setBusy] = useState(false);
   const rows = rowsByKind[active] ?? [];
-  const columns = rows.length === 0 ? [] : Object.keys(rows[0]);
+  // Prefer the writer-supplied header (deterministic, matches the
+  // XLSX on disk). Fall back to `Object.keys(rows[0])` only when a
+  // caller omits `headersByKind` entirely — today only isolated unit
+  // tests that build `rowsByKind` directly without going through the
+  // `readScheduleRows` IPC. The production data path always supplies
+  // the writer's header through `Bim.tsx`.
+  const header = headersByKind?.[active];
+  const columns =
+    header && header.length > 0
+      ? header
+      : rows.length === 0
+        ? []
+        : Object.keys(rows[0]);
 
   const regenerate = async () => {
     // Defense-in-depth: the button is already disabled when

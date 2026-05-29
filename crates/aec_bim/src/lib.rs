@@ -20,6 +20,7 @@ pub mod schedules;
 pub mod spatial;
 pub mod tessellator;
 pub mod validation;
+pub mod xlsx_reader;
 
 pub use boq::{boq_for_project, BoqLine, BoqRegion, BoqReport};
 pub use cache::{BimCache, CachedElement};
@@ -47,3 +48,4 @@ pub use schedules::{
 };
 pub use spatial::{Building, Level, Project, RemovedSubtree, Site, Space, SpatialNode};
 pub use validation::{validate_project, ValidationFinding, ValidationReport, ValidationSeverity};
+pub use xlsx_reader::{read_xlsx_rows, read_xlsx_rows_with_header, ScheduleRowMap, XlsxReadError};

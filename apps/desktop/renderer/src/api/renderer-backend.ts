@@ -394,7 +394,7 @@ export function rendererInProcessBackend(): AecApi {
         details: [],
       }),
       setProperty: async () => ({ ok: true }),
-      readScheduleRows: async () => ({ rows: [] }),
+      readScheduleRows: async () => ({ header: [], rows: [] }),
       generateSchedule: async (params) => ({
         scheduleId: newId("sched"),
         kind: params.kind,

@@ -1205,13 +1205,21 @@ export interface BimScheduleSummary {
 /**
  * Rows read back from a previously-generated XLSX schedule via
  * `bimReadScheduleRows`. Each row is a plain object keyed by column
- * header (e.g. `{ Name: "Living", Area: 28.5 }`). The type is the
- * deserialized output of `aec_bim::schedules::read_schedule_rows`
- * which reads the first worksheet of the XLSX and returns a Vec of
- * `BTreeMap<String, serde_json::Value>`.
+ * display name (e.g. `{ Name: "Living", "Area (m²)": "28.5" }`).
+ * Cell values are always strings because the writer in
+ * `aec_bim::schedules::xlsx::write_into` uses
+ * `write_string_with_format` for every cell — round-tripping back to
+ * strings via `aec_bim::xlsx_reader::read_xlsx_rows` is loss-free.
+ *
+ * `header` carries the worksheet's column order so the renderer can
+ * lay out columns in the same order the writer emitted them; the
+ * `rows` maps themselves are alphabetized by key under the hood
+ * (Rust-side `BTreeMap`), so iterating without `header` would
+ * reorder columns.
  */
 export interface BimScheduleRows {
-  rows: Array<Record<string, string | number | boolean | null>>;
+  header: string[];
+  rows: Array<Record<string, string>>;
 }
 
 /**
@@ -2907,8 +2915,12 @@ export function inProcessBackend(): BridgeBackend {
       };
     },
     async bimReadScheduleRows(_params) {
-      // In-process fallback: no real XLSX file exists, return empty rows.
-      return { rows: [] };
+      // In-process fallback: no native bridge, so no XLSX was
+      // actually written to disk by `bimGenerateSchedule` above
+      // (that fallback returns rows/columns = 0). Match the napi
+      // shape exactly so the renderer's `BimScheduleRows` consumer
+      // doesn't have to special-case it.
+      return { header: [], rows: [] };
     },
     async bimValidate(params) {
       return {

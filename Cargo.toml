@@ -44,6 +44,7 @@ printpdf = "0.7"
 bitflags = { version = "2", features = ["serde"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 rust_xlsxwriter = "0.77"
+calamine = "0.26"
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "rand_core"] }
 rand_core = { version = "0.6", default-features = false, features = ["std"] }
