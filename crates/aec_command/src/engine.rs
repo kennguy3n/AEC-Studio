@@ -546,7 +546,20 @@ impl CommandEngine {
             // error returned by phase 1 specifically about the
             // graph-level validation failure.
             let deltas = Self::compute_deltas_against_graph(&staging, &cmd.kind)?;
-            staging.validate_all(&deltas)?;
+            // `ProjectGraph::apply` is internally validate-then-mutate:
+            // Create checks `contains_key` before insert, Update/Delete
+            // check presence before mutating, and on `Err` no mutation
+            // has occurred for that delta. So driving the deltas through
+            // `apply` directly does the validation work AND the staging
+            // mutation in a single pass. Calling `validate_all` here too
+            // would dry-run the same checks against a *clone* of the
+            // staging graph — and with the graph growing as the batch
+            // walks forward, that turns the loop O(N²) (10k DXF entities
+            // ⇒ ~50M HashMap entry clones ⇒ ~120 s in release). The
+            // batch is all-or-nothing on `Err`: SQL hasn't opened a
+            // transaction yet (phase 2), and `staging` is a local that
+            // gets dropped, so a half-applied multi-delta command in
+            // staging can't leak.
             for d in &deltas {
                 staging.apply(d)?;
             }

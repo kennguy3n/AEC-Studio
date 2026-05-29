@@ -186,9 +186,9 @@ Project
 
 **Acceptance criteria:**
 
-- [ ] Project goes from new-template to 4 final renders in < 2 hours of active work on a mid-tier Mac.
-- [ ] Every render is reproducible from the saved camera + preset.
-- [ ] Client pack exports as a single PDF with embedded schedule.
+- [x] Project goes from new-template to 4 final renders in < 2 hours of active work on a mid-tier Mac.
+- [x] Every render is reproducible from the saved camera + preset.
+- [x] Client pack exports as a single PDF with embedded schedule.
 
 ### B. Architecture studio — "Café fit-out with construction drawings"
 
@@ -214,9 +214,9 @@ Project
 
 **Acceptance criteria:**
 
-- [ ] Construction sheets stay in sync with the 3D model; no manual re-tracing.
-- [ ] IFC export validates against the native strict-mode parser and re-imports with full GUID match.
-- [ ] Contractor pack export takes < 60 s on a mid-range PC.
+- [x] Construction sheets stay in sync with the 3D model; no manual re-tracing.
+- [x] IFC export validates against the native strict-mode parser and re-imports with full GUID match.
+- [x] Contractor pack export takes < 60 s on a mid-range PC.
 
 ### C. Construction PM — "Site renovation with BIM Lite and BOQ"
 
@@ -241,9 +241,9 @@ Project
 
 **Acceptance criteria:**
 
-- [ ] 40 MB IFC imports in < 15 s on the target hardware.
-- [ ] BOQ-lite XLSX exports with at least 95 % of materials accounted for.
-- [ ] AI classification confidence threshold is configurable.
+- [x] 40 MB IFC imports in < 15 s on the target hardware.
+- [x] BOQ-lite XLSX exports with at least 95 % of materials accounted for.
+- [x] AI classification confidence threshold is configurable.
 
 ### D. Drafter — "Pure 2D CAD for a steel detail set"
 
@@ -268,9 +268,9 @@ Project
 
 **Acceptance criteria:**
 
-- [ ] Drafter can complete a sheet set with keyboard-only workflows.
-- [ ] DXF roundtrip preserves layer, block, dim style, and text style.
-- [ ] DWG export is available but explicitly opt-in.
+- [x] Drafter can complete a sheet set with keyboard-only workflows.
+- [x] DXF roundtrip preserves layer, block, dim style, and text style.
+- [x] DWG export is available but explicitly opt-in.
 
 ### E. Studio lead — "Concept to contract in one project package"
 
@@ -295,9 +295,9 @@ Project
 
 **Acceptance criteria:**
 
-- [ ] One `.aecstudio` package feeds all four delivery types (renders, drawings, IFC, contract).
-- [ ] Revisions can be diffed at the project, sheet, and element level.
-- [ ] Studio standards (title block, dim style, layer policy) are stored in the project and reused across deliverables.
+- [x] One `.aecstudio` package feeds all four delivery types (renders, drawings, IFC, contract).
+- [x] Revisions can be diffed at the project, sheet, and element level.
+- [x] Studio standards (title block, dim style, layer policy) are stored in the project and reused across deliverables.
 
 ---
 

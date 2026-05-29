@@ -60,6 +60,21 @@ napi-build = { version = "2", optional = true }
 aec_cad = { path = "../aec_cad" }
 tempfile = { workspace = true }
 zip = { workspace = true }
+criterion = { workspace = true }
+# Phase 14 Group B Task 9 (`tests/phase8_journey.rs`) plants signed
+# extension manifests on disk to drive the bridge's
+# `BridgeConfig::extensions_dir` boot path end-to-end. The journey
+# constructs an Ed25519 keypair via
+# [`aec_core::keygen_test_only`], signs the canonical manifest
+# payload, and hex-encodes the resulting signature for the
+# `ExtensionSignature` JSON. The dev-only deps stay out of the
+# default build.
+ed25519-dalek = { workspace = true }
+hex = { workspace = true }
+
+[[bench]]
+name = "acceptance_criteria"
+harness = false
 
 [lints]
 workspace = true

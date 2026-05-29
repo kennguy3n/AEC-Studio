@@ -43,6 +43,10 @@ pub use cad_cleanup::{
 };
 pub use cover_draft::{CoverDraftError, CoverDraftTone, CoverPageDraft};
 pub use diff_engine::{Diff, DiffEngine, DiffOperation, DiffStatus};
+pub use extension_tools::{
+    enforce_max_entities_modified, list_extension_ai_tools, resolve_extension_ai_tool,
+    ExtensionAiToolError, ExtensionAiToolSchema, SafetyViolation as ExtensionSafetyViolation,
+};
 pub use grammars::{Grammar, GrammarRegistry};
 pub use layout_suggestion::{LayoutProposal, LayoutSuggestionResult, LayoutValidationError};
 pub use lighting_balance::{

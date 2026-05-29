@@ -59,6 +59,7 @@ fn make_service() -> (BridgeService, TempDir) {
         projects_dir: projects,
         templates_dir: templates,
         max_recents: 10,
+        extensions_dir: None,
     };
     let s = BridgeService::new(cfg, [42u8; 32]).unwrap();
     (s, tmp)
@@ -100,6 +101,7 @@ fn second_service_against_same_state_dir_sees_persistent_seed() {
             projects_dir: projects.clone(),
             templates_dir: templates.clone(),
             max_recents: 10,
+            extensions_dir: None,
         };
         let s = BridgeService::new(cfg, [42u8; 32]).unwrap();
         let _ = s.design_list_assets(&AssetListQuery::default()).unwrap();
@@ -110,6 +112,7 @@ fn second_service_against_same_state_dir_sees_persistent_seed() {
         projects_dir: projects,
         templates_dir: templates,
         max_recents: 10,
+        extensions_dir: None,
     };
     let s2 = BridgeService::new(cfg, [42u8; 32]).unwrap();
     let assets = s2
