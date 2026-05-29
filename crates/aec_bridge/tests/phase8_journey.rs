@@ -265,8 +265,20 @@ fn plant_ai_tool_extension(
             display_name: format!("{} (extension)", tool_id),
             description: "Extension-supplied tool for the phase 8 journey".into(),
             allowed_scopes: vec!["design".into(), "deliver".into()],
+            // Cap matches the host `layout_suggestion` schema cap of 16,
+            // so the advertised cap and the dispatch-side clamp both
+            // resolve to 16 without lossy narrowing — the test pins the
+            // happy-path "declared cap == host cap" branch of
+            // `ai_list_tools`'s cap-clamp.
             max_entities_modified: 16,
-            grammar_key: "phase8.tool.grammar".into(),
+            // Use a real built-in grammar_key (`layout_suggestion`)
+            // rather than a synthetic one — `ai_list_tools` filters
+            // extension AI tools whose grammar_key does not resolve to
+            // a known host schema, matching the dispatch-side guard in
+            // `resolve_ai_tool_alias`. Picking a fixture grammar that
+            // doesn't exist in `ai_tools.json` would (correctly) hide
+            // the tool from the picker and break the journey.
+            grammar_key: "layout_suggestion".into(),
         }),
         importer: None,
     };
@@ -431,7 +443,7 @@ fn phase8_extension_lifecycle_journey_through_bridge_service() {
         .find(|t| t.name == "phase8.ok")
         .expect("permitted extension AI tool not in ai_list_tools");
     assert_eq!(ok_tool.max_entities_modified, 16);
-    assert_eq!(ok_tool.grammar_key, "phase8.tool.grammar");
+    assert_eq!(ok_tool.grammar_key, "layout_suggestion");
     let mut scopes = ok_tool.allowed_scopes.clone();
     scopes.sort();
     assert_eq!(
