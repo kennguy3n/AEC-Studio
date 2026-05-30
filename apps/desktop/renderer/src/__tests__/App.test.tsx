@@ -23,6 +23,26 @@ function renderAt(path: string) {
 describe("App", () => {
   beforeEach(async () => {
     await ensureProjectOpen();
+    // Phase 17 Group C Task 19 — these tests render the mode rail
+    // and existing mode pages, not the onboarding flow. Persist the
+    // dismissed flag up-front so the first-run modal doesn't render
+    // on top of Home and double the count of mode labels (the
+    // modal's body itself mentions "Design", "Draft", "BIM",
+    // "Render" — with the modal open `getByText("Design")` would
+    // match the mode rail link AND the modal body, breaking the
+    // selector). Onboarding has its own dedicated tests in
+    // OnboardingModal.test.tsx.
+    window.localStorage.setItem("aec.onboarding.dismissed", "1");
+  });
+
+  afterEach(() => {
+    // Drop the dismissed flag so other test files in the same Vitest
+    // worker that exercise the onboarding flow start from a clean
+    // localStorage. Without this, App.test.tsx leaks a persisted "1"
+    // into any subsequent suite that does not itself remove the key
+    // in its own beforeEach (OnboardingModal.test.tsx already does;
+    // future suites might not).
+    window.localStorage.removeItem("aec.onboarding.dismissed");
   });
 
   it("renders the mode rail with all seven modes", () => {

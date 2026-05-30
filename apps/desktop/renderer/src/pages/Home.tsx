@@ -4,6 +4,11 @@ import { aec, ProjectSummary, RuntimeStatus } from "../api/aec";
 import { ProjectCard } from "../components/ProjectCard";
 import { TemplateCard, DEFAULT_TEMPLATES, TemplateChoice } from "../components/TemplateCard";
 import { HardwareProfileCard } from "../components/HardwareProfileCard";
+import {
+  OnboardingModal,
+  readOnboardingDismissed,
+  writeOnboardingDismissed,
+} from "../components/OnboardingModal";
 import { useActiveProject } from "../hooks/useActiveProject";
 import { useToast } from "../hooks/useToast";
 
@@ -12,13 +17,47 @@ export function Home() {
   const { openProject, createProject } = useActiveProject();
   const { addToast } = useToast();
   const [recents, setRecents] = useState<ProjectSummary[]>([]);
+  // Phase 17 Group C Task 19 (round 6) — gate the onboarding
+  // modal on `recentsLoaded` so it only renders AFTER we know
+  // whether the user has existing projects. Without this gate,
+  // returning users upgrading from a pre-onboarding build (who
+  // have no `aec.onboarding.dismissed` key yet AND existing
+  // projects on disk) would see a one-frame flash of the modal
+  // backdrop during the initial paint, because `recents` starts
+  // as `[]` and only resolves on the `listRecents()` callback.
+  // We flip `recentsLoaded` from both the resolve and reject
+  // paths so a bridge-side failure still lets a true first-run
+  // user reach the onboarding modal.
+  const [recentsLoaded, setRecentsLoaded] = useState(false);
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
+  // Phase 17 Group C Task 19 — first-run onboarding modal.
+  // `dismissed` is hydrated from `localStorage` on mount so the
+  // modal stays hidden after the user has dismissed it once.
+  // `recents.length === 0` is checked at render time; the modal
+  // disappears the moment the user opens or creates their first
+  // project.
+  const [onboardingDismissed, setOnboardingDismissed] = useState<boolean>(
+    () => readOnboardingDismissed(),
+  );
 
   useEffect(() => {
     let alive = true;
-    void aec.project.listRecents().then((r) => {
-      if (alive) setRecents(r as ProjectSummary[]);
-    });
+    void aec.project
+      .listRecents()
+      .then((r) => {
+        if (alive) setRecents(r as ProjectSummary[]);
+      })
+      .catch(() => {
+        // Bridge-side failure: keep recents at [] and let the
+        // hardware card / runtime status surface its own errors.
+        // We still flip `recentsLoaded` below so a genuine
+        // first-run user (no dismissed flag, no recents) can
+        // reach the onboarding modal instead of being trapped
+        // behind a permanent loading gate.
+      })
+      .finally(() => {
+        if (alive) setRecentsLoaded(true);
+      });
     void aec.runtime.status().then((s) => {
       if (alive) setStatus(s as RuntimeStatus);
     });
@@ -26,6 +65,36 @@ export function Home() {
       alive = false;
     };
   }, []);
+
+  const dismissOnboarding = () => {
+    writeOnboardingDismissed();
+    setOnboardingDismissed(true);
+  };
+  const startEmptyFromOnboarding = () => {
+    // Persist before navigating so the next mount of Home doesn't
+    // surface the modal again. We still let the create flow's own
+    // toast surface failures.
+    writeOnboardingDismissed();
+    setOnboardingDismissed(true);
+    // The canonical empty template key is `general.empty` — wired
+    // to `templates/general/empty.json` and surfaced by
+    // `DEFAULT_TEMPLATES[0]` in `TemplateCard.tsx`. An earlier
+    // revision looked up the literal `"empty"` key, which never
+    // matched any template; the `.find()` returned `undefined` and
+    // the `?? DEFAULT_TEMPLATES[0]` fallback silently created the
+    // first listed template (an Apartment) instead. Falling back
+    // here would mask future template-list churn the same way, so
+    // surface the misconfiguration as an error toast instead.
+    const empty = DEFAULT_TEMPLATES.find((t) => t.key === "general.empty");
+    if (empty) {
+      void createFromTemplate(empty);
+    } else {
+      addToast(
+        "error",
+        "Empty template is unavailable. Pick a template from the list below.",
+      );
+    }
+  };
 
   async function createFromTemplate(t: TemplateChoice) {
     try {
@@ -75,6 +144,11 @@ export function Home() {
 
   return (
     <div className="home">
+      <OnboardingModal
+        open={recentsLoaded && recents.length === 0 && !onboardingDismissed}
+        onDismiss={dismissOnboarding}
+        onStartEmpty={startEmptyFromOnboarding}
+      />
       <header className="home__header">
         <div>
           <h1 className="home__title">AEC Studio</h1>

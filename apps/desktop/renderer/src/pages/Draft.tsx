@@ -1,6 +1,11 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { aec } from "../api/aec";
+import { projectGraphList } from "../api/commands";
 import { DraftToolbar, DraftTool } from "../components/draft/DraftToolbar";
+import {
+  extractPrimitives,
+  type Primitive,
+} from "../components/draft/paint-primitives";
 import {
   PanelResizeHandle,
   usePersistentPanelSize,
@@ -52,6 +57,45 @@ export function Draft() {
   );
   const dragStartWidth = useRef<number>(panelWidth);
 
+  // Phase 17 Group C Task 20 — imported DXF primitives hydrated
+  // from the project graph (`projectGraphList(path, "primitive")`).
+  // Reset to `[]` on every project transition, refetched on mount
+  // and after every successful DXF import below.
+  const [primitives, setPrimitives] = useState<Primitive[]>([]);
+
+  const refreshPrimitives = useCallback(
+    async (targetPath: string | null) => {
+      if (!targetPath) {
+        setPrimitives([]);
+        return;
+      }
+      try {
+        const rows = await projectGraphList(targetPath, "primitive");
+        // Defense-in-depth guard: if a project transition raced the
+        // await above, drop the result rather than land project A's
+        // primitives onto project B's canvas. The fetch did execute
+        // against project A and the rows ARE valid for project A's
+        // session — we just decline to display them under project
+        // B's UI. Project B's own mount effect will fire its own
+        // fetch with project B's path.
+        if (getActiveProjectPath() !== targetPath) return;
+        setPrimitives(extractPrimitives(rows));
+      } catch {
+        // Bridge error — keep whatever was already on the canvas
+        // (or the empty state for a fresh project). The user can
+        // re-trigger by reopening the project. Surfaces no toast
+        // because this fetch is a background hydration step, not a
+        // user-initiated gesture.
+      }
+    },
+    [getActiveProjectPath],
+  );
+
+  // Refresh on project mount/change.
+  useEffect(() => {
+    void refreshPrimitives(project?.path ?? null);
+  }, [project?.path, refreshPrimitives]);
+
   // Reset per-project state on project transitions. Today this fires
   // only on initial mount because `RequireProject` unmounts the Draft
   // page on every project switch (so `useState` resets naturally) —
@@ -72,7 +116,26 @@ export function Draft() {
     setSheets([{ id: "sheet-default", name: "Sheet 1" }]);
     setActiveSheet("sheet-default");
     setLog([]);
+    setPrimitives([]);
   }, [project?.path]);
+
+  // Phase 17 Group C Task 20 — the visible-layer set + per-layer
+  // color map derived from the user's LayerPanel state. Memoised
+  // so the `DraftCanvas` repaint effect only re-fires when the
+  // panel state actually changes (not on every keystroke in some
+  // unrelated input). Both maps are passed by-reference into the
+  // canvas; the empty-state where every layer is visible (the
+  // initial `DEFAULT_LAYERS` set) reduces to a no-op filter inside
+  // `paintPrimitives`.
+  const visibleLayers = useMemo(
+    () => new Set(layers.filter((l) => l.visible).map((l) => l.name)),
+    [layers],
+  );
+  const layerColors = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const l of layers) m.set(l.name, l.color);
+    return m;
+  }, [layers]);
 
   // Defense-in-depth guard pattern matching `Bim.tsx`,
   // `Deliver.tsx`, and `Render.tsx`. The DXF import/export handlers
@@ -139,6 +202,10 @@ export function Draft() {
           ? (result as { imported: number }).imported
           : 0;
       addToast("success", `Imported ${imported} entities from DXF`);
+      // Refresh the canvas so the newly imported primitives are
+      // painted immediately — without this the user has to switch
+      // projects + back to see what they just imported.
+      void refreshPrimitives(startPath);
     } catch (err) {
       // Errors are project-agnostic UX (matches the `Bim.tsx`
       // `onInvoke` and `Deliver.tsx onBuildPack` conventions): even
@@ -210,7 +277,12 @@ export function Draft() {
             setActiveSheet(id);
           }}
         />
-        <DraftCanvas activeTool={activeTool} />
+        <DraftCanvas
+          activeTool={activeTool}
+          primitives={primitives}
+          visibleLayers={visibleLayers}
+          layerColors={layerColors}
+        />
         <CommandLine log={log} onLog={setLog} />
       </div>
       <PanelResizeHandle

@@ -28,6 +28,43 @@ function recommendedFor(tier: RuntimeStatus["tier"]): RenderPresetKey {
 }
 
 /**
+ * Phase 17 Group C Task 17 — pick the most-recent running render
+ * job from the queue list so `RenderPreview` can overlay a
+ * "Rendering · NN%" badge on the previous frame. Picks the running
+ * job with the latest `startedAt` (or, as a tiebreaker, the highest
+ * progress, so a quick-started job that has already advanced past a
+ * slow-starting peer is preferred). Returns `null` when no job is
+ * running — the preview falls back to the bare completed frame.
+ */
+function pickInFlight(
+  jobs: RenderJob[],
+): { jobId: string; progress: number; preset?: string } | null {
+  const running = jobs.filter((j) => j.status === "running");
+  if (running.length === 0) return null;
+  const sorted = [...running].sort((a, b) => {
+    const ta = a.startedAt ? Date.parse(a.startedAt) : 0;
+    const tb = b.startedAt ? Date.parse(b.startedAt) : 0;
+    if (tb !== ta) return tb - ta;
+    return (b.progress ?? 0) - (a.progress ?? 0);
+  });
+  const top = sorted[0];
+  return {
+    jobId: top.jobId,
+    // `RenderJob.progress` is normalised to a percentage in `[0, 100]`
+    // at the bridge boundary (see `apps/desktop/electron/bridge.ts`
+    // `renderListJobs` for the napi `[0, 1]` → percent scaling and
+    // the in-process fallback for the percent-native form). Earlier
+    // revisions used a `top.progress > 1` discriminator to accept
+    // either form, but that branch was ambiguous at
+    // `top.progress === 1` (1 % running vs. 100 % production) —
+    // normalising upstream removes the ambiguity and the discriminator
+    // along with it.
+    progress: Math.round(top.progress),
+    preset: top.preset,
+  };
+}
+
+/**
  * Convert a `Uint8Array` (image bytes coming back over the bridge)
  * into a base64 string for use in `data:image/png;base64,…` URIs.
  * Encodes in 8 KB chunks so we don't blow the `String.fromCharCode`
@@ -299,6 +336,79 @@ export function Render() {
     };
   }, [project?.path]);
 
+  // Periodic refresh while at least one job is in-flight (queued or
+  // running). The one-shot fetch above hydrates `jobs` on project
+  // open; `enqueueAll` appends locally-fabricated queued rows after
+  // a successful batch. Without a poll, both pathways leave every
+  // row's `progress`/`status` frozen at the value the bridge first
+  // reported — `RenderQueue.tsx`'s 1 s tick re-renders the ETA
+  // label using the *current* wall-clock, so the countdown
+  // continues decrementing visually even after the underlying job
+  // has long completed (the bridge holds the new state, the UI just
+  // never re-reads it). The Phase 17 Group C Task 18 ETA work made
+  // the staleness directly user-visible — a "00:42 remaining" label
+  // that flips to "00:41", "00:40", … on a completed job is the
+  // kind of small-but-confusing UX regression that Devin Review
+  // (commit 3d5443c) flagged as soon as the ETA shipped.
+  //
+  // The poll period is 3 s — fast enough to track progress on a
+  // multi-minute render without being perceived as stale, slow
+  // enough that a queue full of running jobs doesn't flood the
+  // bridge with IPC round-trips. Polling is *gated* on
+  // `hasInFlight`: when every job is `completed` / `failed` /
+  // `cancelled`, the bridge state is stable and the timer is torn
+  // down — restarted only when the next `enqueueAll` lands at
+  // least one queued row. The `hasInFlight` boolean only flips on
+  // status transitions, not on every progress tick, so the timer
+  // does NOT reset on each poll cycle (which would degenerate the
+  // 3 s cadence to "3 s + jobs-state-update latency" and snap the
+  // ETA countdown).
+  const hasInFlight = jobs.some(
+    (j) => j.status === "queued" || j.status === "running",
+  );
+  useEffect(() => {
+    if (!project?.path) return;
+    if (!hasInFlight) return;
+    // Capture the active project at effect creation. Subsequent
+    // poll resolutions re-check `getActiveProjectPath() !==
+    // startPath` (the synchronous ref-backed getter on
+    // `useActiveProject`) so a `listJobs()` issued under project A
+    // that resolves after the user has navigated to project B is
+    // skipped at commit time. This matches the stale-project guard
+    // pattern used by `enqueueAll` (lines 539, 565) and every
+    // other async handler in the file. The earlier draft of this
+    // poll wrote `if (project?.path)` at the same site, but
+    // `project?.path` is a closure-captured value identical to the
+    // truthiness check at effect entry — the comparison was dead
+    // code and didn't actually re-check the live state. Devin
+    // Review (commit fd44516) flagged the stale-closure pattern;
+    // this is the proper fix.
+    const startPath = project.path;
+    let alive = true;
+    const id = window.setInterval(() => {
+      void aec.render
+        .listJobs()
+        .then((rows) => {
+          if (!alive) return;
+          if (getActiveProjectPath() !== startPath) return;
+          setJobs(rows as RenderJob[]);
+        })
+        .catch(() => {
+          // Bridge failure (transient project-switch race, corrupt
+          // render-jobs row, permission denied) — keep the last
+          // known good `jobs` so a single bad poll doesn't clear
+          // the queue visually. The next poll cycle retries.
+          // Logged at the bridge layer; no user-visible toast for
+          // routine polling errors (matches the one-shot fetch and
+          // the `StatusBar.tsx`/`Deliver.tsx` polling convention).
+        });
+    }, 3000);
+    return () => {
+      alive = false;
+      window.clearInterval(id);
+    };
+  }, [project?.path, hasInFlight, getActiveProjectPath]);
+
   const changePreset = useCallback((next: RenderPresetKey) => {
     setPreset(next);
     userChosePresetRef.current = true;
@@ -530,6 +640,16 @@ export function Render() {
           />
         </aside>
         <main className="render-main">
+          {/*
+            Phase 17 Group C Task 17 — progressive in-flight
+            preview overlay. We pick the most-recent running job
+            (jobs are sorted by `startedAt` desc) and pass its
+            progress to the preview so the user sees "Rendering
+            · 42%" over the previous frame while a new render
+            runs. The previous frame stays visible until the new
+            render completes, at which point the `previewJobId`
+            effect above swaps in the new PNG.
+           */}
           <RenderPreview
             imageDataUri={previewDataUri}
             caption={
@@ -537,6 +657,7 @@ export function Render() {
                 ? `Latest preview · job ${previewJobId}`
                 : "Latest preview"
             }
+            inFlight={pickInFlight(jobs)}
           />
           <CompareJobPicker
             jobs={jobs}

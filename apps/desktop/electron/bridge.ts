@@ -1185,6 +1185,15 @@ export interface RenderJob {
   jobId: string;
   status: "queued" | "running" | "completed" | "failed" | "cancelled";
   preset: string;
+  /**
+   * Progress as a percentage in `[0, 100]`. The Rust napi shim reports
+   * progress on the canonical `[0.0, 1.0]` scale (see
+   * `crates/aec_bridge/src/napi_api.rs` `RenderJobStatusView`); the
+   * bridge boundary in `renderListJobs` scales that to a percent so
+   * every downstream caller (UI + tests + in-process fallback) sees
+   * the same unit. UI overlays / ETA calculations therefore divide by
+   * 100 to obtain a fraction.
+   */
   progress: number;
   /** Camera entity id this job is rendering (batch / matrix submissions). */
   cameraId?: string | null;
@@ -2406,8 +2415,18 @@ function adaptNative(n: NativeApi): BridgeBackend {
         jobIds: string[];
       };
     },
-    renderBatchProgress: async (batchId) =>
-      n.render_batch_progress(batchId) as {
+    renderBatchProgress: async (batchId) => {
+      // Native `BatchProgress.average_progress` is on `[0.0, 1.0]` per
+      // `crates/aec_render/src/queue.rs` (“Average progress across all
+      // jobs in the batch (0.0..1.0).”). Normalise to percent at the
+      // bridge boundary so callers read the same `[0, 100]` unit as
+      // `renderListJobs` does — keeping both render endpoints on a
+      // single scale (“percent everywhere past the bridge”). Without
+      // this, any future UI consumer of `averageProgress` would have
+      // to discriminate which endpoint emitted the value, which is the
+      // exact `progress > 1 ? p : p*100` hazard we paved on the
+      // `renderListJobs` side.
+      const raw = (n.render_batch_progress(batchId) as {
         batchId: string;
         total: number;
         queued: number;
@@ -2416,8 +2435,24 @@ function adaptNative(n: NativeApi): BridgeBackend {
         failed: number;
         cancelled: number;
         averageProgress: number;
-      } | null,
-    renderListJobs: async () => n.render_list_jobs() as RenderJob[],
+      } | null);
+      if (!raw) return null;
+      return { ...raw, averageProgress: raw.averageProgress * 100 };
+    },
+    renderListJobs: async () => {
+      // The napi shim hands back progress on the canonical Rust scale
+      // (`f64` in `[0.0, 1.0]`, see
+      // `crates/aec_bridge/src/napi_api.rs` `RenderJobStatusView`).
+      // Normalise to percent at the bridge boundary so the renderer
+      // and every test fixture see the same unit (`[0, 100]`). This
+      // replaces the older `> 1` discriminator at the UI layer, which
+      // mis-handled the boundary case where `progress === 1` could
+      // legitimately mean either 100 % (production) or 1 % (any
+      // future caller in percent form) — a real bug for tests that
+      // pass `progress: 1`.
+      const raw = n.render_list_jobs() as RenderJob[];
+      return raw.map((j) => ({ ...j, progress: j.progress * 100 }));
+    },
     renderCancelJob: async (jobId) => {
       // Invoke the native call for its side effect (status transition
       // to Cancelled, or a no-op for a job that already reached a
@@ -3736,11 +3771,23 @@ export function inProcessBackend(): BridgeBackend {
         completed,
         failed,
         cancelled,
-        averageProgress: progressSum / inBatch.length,
+        // `progressSum` is the sum of per-job `[0.0, 1.0]` fractions
+        // (running: `j.progress`, completed: `1.0`). Scale the mean to
+        // percent at the boundary so this matches both
+        // `renderListJobs` and the napi `renderBatchProgress` path.
+        averageProgress: (progressSum / inBatch.length) * 100,
       };
     },
     async renderListJobs() {
-      return [...jobs];
+      // Mirror the napi-shim boundary contract (see the comment on the
+      // napi-`renderListJobs` adapter above): the in-process backend
+      // conventionally stores `progress` on the canonical Rust
+      // `[0.0, 1.0]` scale — the in-process `renderBatchProgress` below
+      // assumes that (“`progressSum += 1` for a completed job”) and
+      // submit paths initialise jobs to `progress: 0`. Scale to percent
+      // at the boundary so the renderer never has to discriminate which
+      // backend served the response.
+      return jobs.map((j) => ({ ...j, progress: j.progress * 100 }));
     },
     async renderCancelJob(jobId) {
       // Reject unknown job ids the same way the native side

@@ -28,12 +28,78 @@ describe("Bim page", () => {
     expect(screen.getByTestId("validator-panel")).toBeInTheDocument();
   });
 
-  it("selecting a spatial node opens the property editor for it", () => {
-    renderBim();
-    fireEvent.click(screen.getByTestId("spatial-node-lvl_l1"));
-    expect(
-      screen.getByTestId("property-editor").textContent,
-    ).toContain("lvl_l1");
+  it("selecting a spatial node opens the property editor for it", async () => {
+    // Phase 17 Group C Task 16 — the spatial tree now hydrates from
+    // `aec.command.listGraph(path, "bim/spatial/*" …)`. The previous
+    // version of this test relied on a built-in `DEMO_ROOT` literal
+    // that we removed (ken: "we want the user to see 'Import an IFC
+    // to populate this view', not a built-in fake placeholder").
+    // To exercise the same selection flow we open a real project
+    // and seed `listGraph` with a structurally valid Project →
+    // Site → Building → Storey chain mirroring what the bridge
+    // emits after an IFC import.
+    const currentSpy = vi.spyOn(aec.project, "current");
+    const listGraphSpy = vi.spyOn(aec.command, "listGraph");
+    const summary = {
+      projectId: "proj_spatial",
+      name: "Spatial Test",
+      path: "/tmp/spatial-test.aecstudio",
+      templateKey: null,
+      modifiedAt: new Date().toISOString(),
+    };
+    currentSpy.mockResolvedValue({ summary });
+    // Kinds match the bridge source-of-truth in
+    // `crates/aec_bridge/src/bim_attach.rs` (rows are written as
+    // `kind = "bim/spatial/<IFC type>"` with the PascalCase IFC class
+    // suffix — `IfcProject`, `IfcSite`, `IfcBuilding`,
+    // `IfcBuildingStorey`, `IfcSpace`). Using the lowercase form here
+    // would fall through to the `default` arm of
+    // `mapKind()` in `bim-spatial-tree.ts`, mapping every node to
+    // `IfcElement` and silently bypassing the real kind→badge plumbing
+    // we want this test to exercise.
+    listGraphSpy.mockResolvedValue([
+      {
+        id: "proj_root",
+        kind: "bim/spatial/IfcProject",
+        parent: null,
+        body: { name: "Project" },
+      },
+      {
+        id: "site_a",
+        kind: "bim/spatial/IfcSite",
+        parent: "proj_root",
+        body: { name: "Site A" },
+      },
+      {
+        id: "bldg_main",
+        kind: "bim/spatial/IfcBuilding",
+        parent: "site_a",
+        body: { name: "Main Building" },
+      },
+      {
+        id: "lvl_l1",
+        kind: "bim/spatial/IfcBuildingStorey",
+        parent: "bldg_main",
+        body: { name: "Level 1" },
+      },
+    ]);
+    try {
+      renderBim();
+      // Wait for the hydrate effect to run and the storey node to
+      // appear in the tree.
+      await waitFor(() => {
+        expect(
+          screen.getByTestId("spatial-node-lvl_l1"),
+        ).toBeInTheDocument();
+      });
+      fireEvent.click(screen.getByTestId("spatial-node-lvl_l1"));
+      expect(
+        screen.getByTestId("property-editor").textContent,
+      ).toContain("lvl_l1");
+    } finally {
+      currentSpy.mockRestore();
+      listGraphSpy.mockRestore();
+    }
   });
 });
 

@@ -1,20 +1,51 @@
 import { useEffect, useRef, useState } from "react";
 import type { DraftTool } from "./DraftToolbar";
+import { paintPrimitives, type Primitive } from "./paint-primitives";
 
 interface Props {
   activeTool: DraftTool;
   /** Optional callback when the user clicks in model space. */
   onPick?: (worldX: number, worldY: number) => void;
+  /**
+   * Phase 17 Group C Task 20 — drawing primitives extracted from
+   * the project graph (`projectGraphList(path, "primitive")`,
+   * fed through `extractPrimitives`). When empty, the canvas
+   * paints only the grid + crosshair, preserving the empty-state
+   * UX that existed before DXF import was wired up.
+   */
+  primitives?: Primitive[];
+  /**
+   * Names of layers whose primitives should be drawn. When
+   * `undefined` every primitive draws regardless of its `layer`.
+   */
+  visibleLayers?: Set<string>;
+  /** Map from layer name → stroke color. */
+  layerColors?: Map<string, string>;
 }
 
 /**
- * Lightweight 2D canvas backed by a 2D context. The native CAD canvas
- * (wgpu) is hosted in the Rust `aec_viewport` crate; in unit/component
- * tests we can't create a wgpu surface, so we paint a minimal grid +
- * crosshair to verify the picking math is correct. The production
- * Electron build replaces the inner div with the wgpu surface mount.
+ * Lightweight 2D canvas backed by a 2D context.
+ *
+ * Renders three layers, bottom-to-top:
+ *
+ *   1. Grid (always shown).
+ *   2. Imported DXF primitives (Phase 17 Group C Task 20) — fitted
+ *      into the canvas viewport with a margin, world Y flipped to
+ *      canvas Y-down. Filtered by `visibleLayers`.
+ *   3. Crosshair under the mouse cursor.
+ *
+ * In production this view will be replaced by a wgpu surface
+ * (Phase 18 — shared-memory tile streaming). Until then the
+ * Canvas2D path is the user-visible draft viewport and must
+ * actually display imported geometry.
  */
-export function DraftCanvas({ activeTool, onPick }: Props) {
+export function DraftCanvas({
+  activeTool,
+  onPick,
+  primitives,
+  visibleLayers,
+  layerColors,
+}: Props) {
   const ref = useRef<HTMLCanvasElement | null>(null);
   const [cursor, setCursor] = useState<{ x: number; y: number } | null>(null);
   const [size, setSize] = useState<{ w: number; h: number }>({ w: 600, h: 400 });
@@ -43,6 +74,13 @@ export function DraftCanvas({ activeTool, onPick }: Props) {
       ctx.lineTo(size.w, y);
       ctx.stroke();
     }
+    // Imported DXF primitives.
+    if (primitives && primitives.length > 0) {
+      paintPrimitives(ctx, primitives, size.w, size.h, {
+        visibleLayers,
+        layerColors,
+      });
+    }
     // Crosshair.
     if (cursor) {
       ctx.strokeStyle = "#ffe066";
@@ -54,13 +92,16 @@ export function DraftCanvas({ activeTool, onPick }: Props) {
       ctx.lineTo(cursor.x, size.h);
       ctx.stroke();
     }
-  }, [size, cursor]);
+  }, [size, cursor, primitives, visibleLayers, layerColors]);
+
+  const primitiveCount = primitives?.length ?? 0;
 
   return (
     <section
       className="draft-canvas"
       data-testid="draft-canvas"
       data-active-tool={activeTool}
+      data-primitive-count={primitiveCount}
     >
       <canvas
         ref={ref}
@@ -84,6 +125,11 @@ export function DraftCanvas({ activeTool, onPick }: Props) {
       />
       <div className="draft-canvas__hud" data-testid="draft-canvas-hud">
         <span>Tool: {activeTool}</span>
+        {primitiveCount > 0 && (
+          <span data-testid="draft-canvas-primitive-count">
+            {primitiveCount} primitive{primitiveCount === 1 ? "" : "s"}
+          </span>
+        )}
         {cursor ? (
           <span data-testid="draft-canvas-cursor">
             {Math.round(cursor.x)}, {Math.round(cursor.y)}

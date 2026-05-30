@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { Render } from "../pages/Render";
 import {
@@ -205,7 +205,12 @@ describe("Render page — project switch resets camera selection", () => {
             {
               jobId: "jobA1",
               cameraId: "cam_A_1",
-              progress: 0.5,
+              // `aec.render.listJobs` is the bridge boundary — the
+              // shim in `apps/desktop/electron/bridge.ts` scales
+              // napi's `[0, 1]` to `[0, 100]` here, so this mock
+              // represents the post-bridge value seen by the
+              // renderer.
+              progress: 50,
               status: "running",
               tier: "Workstation",
               preset: "interior_balanced",
@@ -930,5 +935,148 @@ describe("Render page — project switch resets RenderDoctor state", () => {
       // (3) No stale suggestion rows remain in the DOM.
       expect(screen.queryByTestId("render-doctor-item-0")).toBeNull();
     });
+  });
+});
+
+/**
+ * Devin Review (commit 3d5443c) flagged that `RenderQueue`'s 1 s
+ * tick only re-renders the ETA label against the current wall-clock
+ * — it does NOT refetch `jobs` from the bridge. The Render page's
+ * per-project useEffect ran exactly once per `project?.path`
+ * transition, so once a render started, `j.progress` / `j.status`
+ * stayed frozen at the first bridge snapshot. The ETA label
+ * (`useETA(j.startedAt, j.progress, nowMs)`) would continue counting
+ * down linearly even after the underlying job had long completed —
+ * a small-but-confusing UX regression that the new ETA feature made
+ * directly user-visible.
+ *
+ * The fix adds a 3 s periodic poll, gated on `hasInFlight` (at least
+ * one job in `queued` or `running` status). This test pins the
+ * contract:
+ *   1. After the one-shot fetch returns a running job, `listJobs` is
+ *      called periodically — advancing fake timers by 6 s yields at
+ *      least 3 total calls (initial + 2 polls).
+ *   2. When the bridge subsequently reports the job `completed`, the
+ *      `hasInFlight` boolean flips false and the timer tears down —
+ *      advancing the clock by another 6 s yields NO further calls.
+ */
+function OpenA({ pathA }: { pathA: string }) {
+  const { openProject } = useActiveProject();
+  useEffect(() => {
+    void openProject(pathA);
+  }, [openProject, pathA]);
+  return null;
+}
+
+describe("Render page — periodic poll while jobs are in-flight", () => {
+  beforeEach(() => {
+    // Fake timers MUST be installed before `render(<Render />)` so
+    // the `window.setInterval` call inside the polling effect is
+    // intercepted by vitest. `shouldAdvanceTime: true` lets real
+    // wall-clock progress also advance fake time, which keeps
+    // `Promise` microtasks and React's `act()` flushing as
+    // expected (matches the working pattern in
+    // `useActiveProject.test.tsx`). Switching to fake timers
+    // *after* render would leave the already-scheduled interval
+    // anchored to the real timer and the test would never see a
+    // poll fire.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("polls listJobs every 3 s while at least one job is queued/running, and stops once all jobs settle", async () => {
+    const PATH = "/tmp/render-poll.aecstudio";
+
+    // Drive the mock through three phases:
+    //   1. Initial one-shot fetch → one running job (progress=50)
+    //   2. Subsequent polls (calls 2..N-1) → same job, progress
+    //      incrementing each tick so we can observe the UI change.
+    //   3. After the third call → job completes; `hasInFlight`
+    //      flips false; the poll teardown should fire on the next
+    //      effect re-run.
+    let phase = 0;
+    const listJobsSpy = vi
+      .spyOn(aec.render, "listJobs")
+      .mockImplementation(async () => {
+        phase += 1;
+        if (phase < 3) {
+          return [
+            {
+              jobId: "poll-job-1",
+              cameraId: "cam1",
+              progress: 50 + phase * 10,
+              status: "running",
+              tier: "Workstation",
+              preset: "interior_balanced",
+              startedAt: new Date(Date.now() - 60_000).toISOString(),
+              tiles: { completed: 1, total: 2 },
+            },
+          ];
+        }
+        // Phase 3+: job has completed.
+        return [
+          {
+            jobId: "poll-job-1",
+            cameraId: "cam1",
+            progress: 100,
+            status: "completed",
+            tier: "Workstation",
+            preset: "interior_balanced",
+            completedAt: new Date().toISOString(),
+            tiles: { completed: 2, total: 2 },
+          },
+        ];
+      });
+
+    vi.spyOn(aec.command, "listGraph").mockResolvedValue([]);
+
+    render(
+      <ToastProvider>
+        <ActiveProjectProvider>
+          <OpenA pathA={PATH} />
+          <Render />
+        </ActiveProjectProvider>
+      </ToastProvider>,
+    );
+
+    // Flush the initial mount + `openProject` + one-shot
+    // `listJobs` resolution. `shouldAdvanceTime: true` plus a
+    // zero-advance microtask flush is the canonical pattern for
+    // "let React commit then continue under fake timers".
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId("render-job-poll-job-1")).toBeInTheDocument();
+      expect(listJobsSpy).toHaveBeenCalledTimes(1);
+    });
+
+    // Tick 1: 3 s → poll fires → still running (phase=2).
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(listJobsSpy).toHaveBeenCalledTimes(2);
+
+    // Tick 2: another 3 s → poll fires → bridge now returns
+    // `completed` (phase=3). React commits the new jobs list, the
+    // effect dependency `hasInFlight` flips false, the interval is
+    // cleared.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(listJobsSpy).toHaveBeenCalledTimes(3);
+
+    // Tick 3: another 6 s with all jobs settled — NO additional
+    // calls. The teardown of the previous interval (from the
+    // committed state with `hasInFlight=true`) plus the no-op
+    // early-return on `hasInFlight=false` is the structural pin
+    // here.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(6000);
+    });
+    expect(listJobsSpy).toHaveBeenCalledTimes(3);
   });
 });
