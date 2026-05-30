@@ -265,7 +265,48 @@ Trusted public keys live in `~/.config/aec-studio/trusted_keys.json` (Linux), `~
 
 ---
 
-## 8. Security model
+## 8. Load diagnostics
+
+When the host boots, the loader walks every extension directory and collects per-extension failures instead of aborting at the first broken manifest. A broken extension is **skipped, not fatal** — the rest of the host comes up normally and the failure is captured as an `ExtensionLoadDiagnostic` that the user (and the extension author) can read from Settings → Extensions.
+
+A diagnostic carries four fields:
+
+| Field          | Meaning                                                                                                       |
+| -------------- | ------------------------------------------------------------------------------------------------------------- |
+| `extensionId`  | Manifest `id` when the loader got far enough to parse it; `null` if the failure happened before parse.        |
+| `path`         | Absolute path to the extension directory (or the manifest file when the directory itself wasn't valid yet).   |
+| `stage`        | One of the wire-stable stage strings below — pinpoints **where** in the pipeline the failure happened.        |
+| `message`      | Human-readable error string, suitable for direct display in the Settings diagnostics card.                    |
+
+The `stage` field is a stable wire string (see [`ExtensionLoadStage::as_wire_str`](crates/aec_core/src/extensions.rs)). Renaming any of these is a breaking change for the Settings UI:
+
+| `stage` wire string         | When you'll see it                                                                                              |
+| --------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `manifest_read`             | `manifest.json` couldn't be read — usually a permissions issue or a vanished directory.                         |
+| `manifest_parse`            | `serde_json` rejected the manifest payload (invalid JSON or wrong shape at the top level).                      |
+| `manifest_validation`       | The manifest parsed but failed structural validation (unknown kind, missing required body, out-of-range field). |
+| `unsafe_path`               | A `body` payload path tried to escape the extension dir (e.g. `../../etc/passwd`).                              |
+| `signature_verification`    | Missing signature when unsigned manifests are disallowed, public key not in the `TrustStore`, or signature did not verify against the canonical payload. |
+| `duplicate_id`              | Two extensions on disk declared the same `id`. The first one wins; the second is dropped with this diagnostic.  |
+| `asset_pack_install`        | An `asset_pack` extension parsed and signed cleanly but the asset host rejected one of its entries (missing blob, BLAKE3 mismatch, permission denied). |
+| `ai_tool_resolution`        | An `ai_tool` extension parsed and signed cleanly but the AI-tool resolver rejected it (unknown scope, missing body, permission denied). |
+
+The surfacing path:
+
+1. The Rust bridge runs the fault-tolerant loader ([`ExtensionLoader::load_with_diagnostics`](crates/aec_core/src/extensions.rs)) at boot, then the asset-pack install pass, then the AI-tool resolver pre-walk. Each stage appends to `BridgeService::extension_load_diagnostics`.
+2. The N-API method `extension_load_diagnostics()` (in [`crates/aec_bridge/src/napi_api.rs`](crates/aec_bridge/src/napi_api.rs)) returns the buffered list.
+3. The Electron IPC channel `extensions:listLoadDiagnostics` ([`apps/desktop/electron/ipc.ts`](apps/desktop/electron/ipc.ts)) wraps the napi call.
+4. The renderer reads it via the typed surface `aec.extensions.listLoadDiagnostics()` ([`apps/desktop/electron/preload.ts`](apps/desktop/electron/preload.ts)) and renders a read-only diagnostics card in Settings, plus a non-blocking banner when at least one entry is present.
+
+The contract that extension authors can rely on:
+
+- A broken extension never prevents AEC Studio from booting, never panics the bridge, and never crashes the renderer.
+- The `stage` + `message` pair pinpoints the failure mode (e.g. `signature_verification` + `"public key not in trust store"` tells you exactly what to fix).
+- The diagnostics list is captured **once at boot** and frozen for the lifetime of the bridge — extensions are not hot-reloaded in this revision. Re-running the loader requires restarting the host. An empty diagnostics list is the signal the renderer uses to hide the Settings card entirely.
+
+---
+
+## 9. Security model
 
 | Layer                       | Enforcement                                                                                          |
 | --------------------------- | ---------------------------------------------------------------------------------------------------- |
@@ -280,10 +321,11 @@ Network access is disabled in v1 — no host implements the `network` permission
 
 ---
 
-## 9. References
+## 10. References
 
 - [`PROPOSAL.md`](PROPOSAL.md) §8 — high-level extension story
-- [`ARCHITECTURE.md`](ARCHITECTURE.md) — where extensions sit in the crate graph
-- [`PROGRESS.md`](PROGRESS.md) — phase exit criteria including the extension batch
-- [`crates/aec_core/src/extensions.rs`](crates/aec_core/src/extensions.rs) — manifest schema + loader + registry
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — where extensions sit in the crate graph (extension subsystem covered in §9.7)
+- [`PROGRESS.md`](PROGRESS.md) — phase exit criteria including the extension batch and Phase 16 load diagnostics
+- [`crates/aec_core/src/extensions.rs`](crates/aec_core/src/extensions.rs) — manifest schema, loader, registry, and `ExtensionLoadDiagnostic` / `ExtensionLoadStage` wire types
 - [`crates/aec_core/src/extension_permissions.rs`](crates/aec_core/src/extension_permissions.rs) — validator + permission enforcer + Ed25519 verification
+- [`apps/desktop/electron/ipc.ts`](apps/desktop/electron/ipc.ts) — `extensions:listLoadDiagnostics` IPC handler

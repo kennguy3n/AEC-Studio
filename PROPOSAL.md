@@ -561,6 +561,8 @@ asset_pack/
 
 Extensions are signed, declare their permissions up front, and run sandboxed. The renderer never loads extension code directly.
 
+A broken extension never prevents AEC Studio from booting. Per-extension load failures (manifest parse, signature verification, asset-pack install, AI-tool resolution, …) are captured as individual diagnostics and surfaced in Settings → Extensions so the user (and the extension author) can see exactly which extension failed and why. The on-disk wire schema is documented in [`EXTENSIONS.md`](EXTENSIONS.md) §8 and the renderer surface is the `aec.extensions.listLoadDiagnostics()` IPC.
+
 ---
 
 ## Optional KChat integration
