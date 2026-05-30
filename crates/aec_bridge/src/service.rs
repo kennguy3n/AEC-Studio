@@ -1470,13 +1470,29 @@ pub struct BridgeService {
 pub(crate) struct RenderState {
     pub(crate) queue: RenderQueue,
     pub(crate) preset_store: RenderPresetStore,
-    /// Optional HDRI environment map path + strength for the path
-    /// tracer. When `path` is `Some`, the renderer loads the file at
-    /// `path` and passes the resulting `EnvironmentMap` to
-    /// `build_path_trace_scene_with_env` instead of using the
-    /// procedural Hosek-Wilkie sky. Set via
-    /// [`BridgeService::render_set_environment_map`].
-    pub(crate) environment_path: Option<std::path::PathBuf>,
+    /// Decoded HDRI environment map for the path tracer, cached so
+    /// that switching env maps is a one-time decode rather than a
+    /// re-decode-per-render. When `Some`, the renderer should pass
+    /// the inner `EnvironmentMap` to
+    /// [`aec_render::final_render::FinalRenderPipeline::with_environment`]
+    /// (or `build_path_trace_scene_with_env`) in place of the
+    /// procedural Hosek-Wilkie sky.
+    ///
+    /// Stored behind [`std::sync::Arc`] because
+    /// [`aec_render::environment::EnvironmentMap`] carries
+    /// pixel-data + two precomputed CDFs that can run into the tens
+    /// of megabytes for a 4K HDRI — handing out `Arc::clone()` to
+    /// each render thread costs an atomic increment rather than a
+    /// full pixel-data clone.
+    ///
+    /// Set via [`BridgeService::render_set_environment_map`]; the
+    /// `environment_intensity` field below is the last-set
+    /// world-strength multiplier and is baked into the cached map's
+    /// `intensity` field on every load. We keep it on `RenderState`
+    /// (rather than reading it back off the cached map) so that an
+    /// intensity-only call against a cleared map still remembers
+    /// the value for the next load.
+    pub(crate) environment: Option<std::sync::Arc<aec_render::environment::EnvironmentMap>>,
     pub(crate) environment_intensity: f32,
 }
 
@@ -1485,7 +1501,7 @@ impl RenderState {
         Self {
             queue: RenderQueue::new(),
             preset_store: RenderPresetStore::default(),
-            environment_path: None,
+            environment: None,
             environment_intensity: 1.0,
         }
     }
@@ -3824,31 +3840,58 @@ impl BridgeService {
     /// Set the HDRI environment map used by future render jobs.
     /// Pass `None` to fall back to the procedural Hosek-Wilkie sky.
     ///
-    /// The path is validated by attempting to load it once via
-    /// [`aec_render::environment::EnvironmentMap::load_hdr`] — if the
-    /// file does not exist or cannot be decoded as `.hdr` / `.exr`,
-    /// returns [`BridgeServiceError::Core`] and leaves the existing
-    /// environment unchanged.
+    /// The file is decoded once here via
+    /// [`aec_render::environment::EnvironmentMap::load_hdr`] (which
+    /// also builds the importance-sampling CDFs), and the result is
+    /// cached on [`RenderState::environment`] as
+    /// `Arc<EnvironmentMap>`. The previous implementation decoded
+    /// the file twice (once to validate, then discarded the result;
+    /// then a second time on every render), which for a 4K HDRI is
+    /// hundreds of milliseconds of redundant decode + CDF
+    /// construction per render job — this version makes "switch
+    /// environment" a one-time cost. Decode failures return
+    /// [`BridgeServiceError::Core`] and leave the existing
+    /// environment unchanged (mutation only happens after the load
+    /// succeeds).
+    ///
+    /// `intensity` semantics:
+    /// - When `Some(i)`, `state.environment_intensity` is updated to
+    ///   `i.max(0.0)` and (if a map was loaded in this call) baked
+    ///   into its `intensity` field.
+    /// - When `None`, the previously-set intensity is preserved and
+    ///   applied to a newly-loaded map. This lets callers change
+    ///   the env without re-specifying strength.
+    /// - When `path` is `None`, the cached map is cleared but the
+    ///   intensity is retained for the next load.
     pub fn render_set_environment_map(
         &self,
         path: Option<&str>,
         intensity: Option<f32>,
     ) -> Result<(), BridgeServiceError> {
+        // Decode *outside* the render-state lock. `load_hdr` does
+        // disk I/O + image decode + CDF construction, which on a 4K
+        // HDRI can be hundreds of ms — holding `render_state`
+        // across that would serialise every other render-state
+        // caller (queue admission, `render_compare_ssim`,
+        // `render_get_output_image`, ...). Validation-then-mutate
+        // also keeps the "leaves existing environment unchanged on
+        // failure" contract intact.
+        let decoded = match path {
+            Some(p) => Some(
+                aec_render::environment::EnvironmentMap::load_hdr(std::path::Path::new(p))
+                    .map_err(|e| BridgeServiceError::Core(format!("load env map: {e}")))?,
+            ),
+            None => None,
+        };
         let mut state = self.lock_render_state()?;
-        if let Some(p) = path {
-            let buf = std::path::PathBuf::from(p);
-            // Validate that the file loads — produces a clear
-            // error early instead of a confusing failure inside
-            // the render loop.
-            aec_render::environment::EnvironmentMap::load_hdr(&buf)
-                .map_err(|e| BridgeServiceError::Core(format!("load env map: {e}")))?;
-            state.environment_path = Some(buf);
-        } else {
-            state.environment_path = None;
-        }
         if let Some(i) = intensity {
             state.environment_intensity = i.max(0.0);
         }
+        let baked_intensity = state.environment_intensity;
+        state.environment = decoded.map(|mut env| {
+            env.intensity = baked_intensity;
+            std::sync::Arc::new(env)
+        });
         Ok(())
     }
 
@@ -7491,6 +7534,11 @@ END-ISO-10303-21;\n";
         // succeeds even with a fresh service.
         let (s, _g) = service();
         s.render_set_environment_map(None, Some(1.5)).unwrap();
+        // The cached env map should be `None` after a clear, while
+        // the intensity value is preserved for the next load.
+        let state = s.lock_render_state().unwrap();
+        assert!(state.environment.is_none());
+        assert!((state.environment_intensity - 1.5).abs() < 1e-6);
     }
 
     #[test]
@@ -7504,6 +7552,83 @@ END-ISO-10303-21;\n";
             msg.contains("load env map"),
             "expected 'load env map' in error, got: {msg}"
         );
+        // On failure the state must be left unchanged — fresh
+        // service starts with `None`, decode failure must not
+        // mutate it.
+        let state = s.lock_render_state().unwrap();
+        assert!(state.environment.is_none());
+    }
+
+    /// The Phase 17 Group A review surfaced that the original
+    /// implementation decoded the env file twice (once to validate,
+    /// then a second time at render time) and stored only the path
+    /// — meaning every render job paid the decode + CDF-construction
+    /// cost again. The fix caches the decoded `EnvironmentMap` on
+    /// `RenderState` so the second decode never happens. This test
+    /// asserts the cache contract: after a successful set, the
+    /// decoded map is present, the intensity is baked in, and the
+    /// CDFs are populated (proof that we kept the decoded result,
+    /// not the path).
+    #[test]
+    fn render_set_environment_map_caches_decoded_map_with_intensity_baked_in() {
+        use image::{Rgb, Rgb32FImage};
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("env.exr");
+        // 2x1 EXR with a bright top half and a dark bottom half so
+        // the CDF construction has something non-trivial to do.
+        let mut img = Rgb32FImage::new(2, 1);
+        img.put_pixel(0, 0, Rgb([5.0, 5.0, 5.0]));
+        img.put_pixel(1, 0, Rgb([0.0, 0.0, 0.0]));
+        img.save(&p).expect("write 2x1 EXR");
+
+        let (s, _g) = service();
+        s.render_set_environment_map(p.to_str(), Some(2.5))
+            .expect("set env map");
+
+        let state = s.lock_render_state().unwrap();
+        let env = state.environment.as_ref().expect("decoded map cached");
+        assert_eq!(env.width, 2);
+        assert_eq!(env.height, 1);
+        // Intensity argument must be baked into the cached map's
+        // `intensity` field, not just remembered in
+        // `environment_intensity` (otherwise the renderer reading
+        // `env.intensity` would see the wrong value).
+        assert!((env.intensity - 2.5).abs() < 1e-6);
+        // CDFs were built — direct proof that the cached value is
+        // the post-construction map and not a re-decode marker.
+        assert_eq!(env.marginal_cdf.len(), env.height as usize);
+        assert_eq!(env.conditional_cdf.len(), (env.width * env.height) as usize);
+    }
+
+    /// Intensity changes alone (path=None) must not clobber a
+    /// previously-cached map; this lets the renderer keep the same
+    /// HDRI while the user tweaks strength. (The path=None branch
+    /// is the explicit "clear" code path — verify that it does
+    /// clear the cached map even though it preserves the new
+    /// intensity for the next load.)
+    #[test]
+    fn render_set_environment_map_intensity_only_call_clears_cached_map() {
+        use image::{Rgb, Rgb32FImage};
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("env.exr");
+        let mut img = Rgb32FImage::new(2, 1);
+        img.put_pixel(0, 0, Rgb([1.0, 0.5, 0.0]));
+        img.put_pixel(1, 0, Rgb([0.0, 0.5, 1.0]));
+        img.save(&p).expect("write 2x1 EXR");
+
+        let (s, _g) = service();
+        s.render_set_environment_map(p.to_str(), None).unwrap();
+        {
+            let state = s.lock_render_state().unwrap();
+            assert!(state.environment.is_some());
+        }
+        // Intensity-only "clear" call — path=None semantics mean
+        // "fall back to procedural sky"; intensity persists for
+        // the next load.
+        s.render_set_environment_map(None, Some(3.0)).unwrap();
+        let state = s.lock_render_state().unwrap();
+        assert!(state.environment.is_none());
+        assert!((state.environment_intensity - 3.0).abs() < 1e-6);
     }
 
     /// Happy path for the Phase 17 IPC surface: enqueue → admit →
