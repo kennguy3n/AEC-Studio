@@ -26,7 +26,10 @@
 //! use aec_core::extensions::{ExtensionLoader, LoadOptions};
 //!
 //! let loader = ExtensionLoader::new("/path/to/extensions");
-//! let registry = loader.load(&LoadOptions::default()).unwrap();
+//! // `LoadOptions::default()` is the conservative production default and
+//! // rejects any unsigned manifest. For local dev / examples where the
+//! // extension directory isn't signed yet, use `LoadOptions::allow_unsigned()`.
+//! let registry = loader.load(&LoadOptions::allow_unsigned()).unwrap();
 //! for ext in registry.iter() {
 //!     println!("{} {} ({:?})", ext.manifest.id, ext.manifest.version, ext.manifest.kind);
 //! }
@@ -476,9 +479,11 @@ pub struct LoadOptions {
     /// [`LoadError::Signature`].
     pub trust_store: Option<TrustStore>,
     /// If true, unsigned manifests are allowed but
-    /// [`LoadedExtension::signed`] is `false`. Default true to make the
-    /// development loop smooth — production builds set this to false and
-    /// supply a `trust_store`.
+    /// [`LoadedExtension::signed`] is `false`. The derived `Default` is
+    /// `false` — i.e. `LoadOptions::default()` rejects unsigned manifests,
+    /// matching the conservative production posture documented in
+    /// `EXTENSIONS.md`. Local dev tooling that wants to load an unsigned
+    /// directory should construct via [`Self::allow_unsigned`] instead.
     pub allow_unsigned: bool,
 }
 
