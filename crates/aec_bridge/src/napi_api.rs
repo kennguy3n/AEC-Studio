@@ -2131,16 +2131,52 @@ pub fn render_check_materials() -> Result<RenderCheckMaterialsJs> {
 /// returned `Buffer` is base64-encoded by the renderer and used as
 /// the `src` of an `<img>` for `RenderPreview` /
 /// `BeforeAfterCompare`.
+///
+/// Declared `async` and routed through [`spawn_blocking_napi`] so
+/// the underlying `std::fs::read` of a possibly-tens-of-MB PNG runs
+/// on the tokio blocking pool, not the libuv main thread. A 4K
+/// render output is large enough (cold page cache + slow disk) that
+/// a synchronous read would stall the libuv loop for hundreds of
+/// milliseconds, blocking every other IPC handler including
+/// `viewport:requestFrame`. The service-side fix (see
+/// [`BridgeService::render_get_output_image`]) already drops the
+/// `render_state` mutex before the read so other render-state
+/// callers stay live; promoting the napi wrapper completes the fix
+/// by also keeping the JS event loop responsive. Same pattern as
+/// [`bim_import_ifc`].
 #[napi]
-pub fn render_get_output_image(job_id: String) -> Result<RenderOutputImageJs> {
-    with_service_ref_fallible(|svc| svc.render_get_output_image(&job_id)).map(Into::into)
+pub async fn render_get_output_image(job_id: String) -> Result<RenderOutputImageJs> {
+    spawn_blocking_napi(move || {
+        with_service_ref_fallible(|svc| svc.render_get_output_image(&job_id)).map(Into::into)
+    })
+    .await
 }
 
 /// Compute the SSIM between two completed render jobs. Bound to the
 /// renderer as `aec.render.compareSsim({ aJobId, bJobId })`.
+///
+/// Declared `async` and routed through [`spawn_blocking_napi`]
+/// because SSIM (Wang et al. 2004) is O(width*height) over two
+/// decoded images: at 4K that's two PNG decodes plus a sliding 8×8
+/// window over ~33 M pixels, easily reaching a couple of seconds.
+/// Running synchronously on the libuv main thread would freeze the
+/// entire UI — every IPC handler queues behind this single compare
+/// click. The service-side fix (see
+/// [`BridgeService::render_compare_ssim`]) already drops the
+/// `render_state` mutex before SSIM so other render-state callers
+/// stay live; the async promotion here completes the fix by moving
+/// the heavy compute to the tokio blocking pool. Same pattern as
+/// [`bim_import_ifc`] / [`render_get_output_image`].
 #[napi]
-pub fn render_compare_ssim(a_job_id: String, b_job_id: String) -> Result<RenderCompareResultJs> {
-    with_service_ref_fallible(|svc| svc.render_compare_ssim(&a_job_id, &b_job_id)).map(Into::into)
+pub async fn render_compare_ssim(
+    a_job_id: String,
+    b_job_id: String,
+) -> Result<RenderCompareResultJs> {
+    spawn_blocking_napi(move || {
+        with_service_ref_fallible(|svc| svc.render_compare_ssim(&a_job_id, &b_job_id))
+            .map(Into::into)
+    })
+    .await
 }
 
 /// Set the HDRI environment map for future render jobs. Pass `null`

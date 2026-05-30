@@ -3865,20 +3865,38 @@ impl BridgeService {
         &self,
         job_id: &str,
     ) -> Result<RenderOutputImage, BridgeServiceError> {
-        let state = self.lock_render_state()?;
-        let job = state
-            .queue
-            .list_jobs()
-            .into_iter()
-            .find(|j| j.id == job_id)
-            .ok_or_else(|| BridgeServiceError::Core(format!("render job '{job_id}' not found")))?;
-        let path = job.output_path.clone().ok_or_else(|| {
-            BridgeServiceError::Core(format!("render job '{job_id}' has no output yet"))
-        })?;
+        // Resolve the on-disk output path under the `render_state`
+        // mutex, then *drop the guard* before issuing the file read.
+        // PNG/JPEG decode-ready output files routinely run into the
+        // tens-of-megabytes range for 4K renders, and a synchronous
+        // `std::fs::read` can take hundreds of milliseconds (cold
+        // page cache, slow disk, network FS). Holding
+        // `render_state` across that I/O serialises every other
+        // render-state caller — `render_enqueue`, the queue
+        // admission ticker, `render_compare_ssim` — turning a
+        // preview load into an app-wide freeze. The lookup itself is
+        // an in-memory scan of `state.queue.list_jobs()` and
+        // `Clone`s the resulting `PathBuf`, so by the time we hit
+        // disk the mutex is free for the next caller.
+        let (resolved_job_id, path) = {
+            let state = self.lock_render_state()?;
+            let job = state
+                .queue
+                .list_jobs()
+                .into_iter()
+                .find(|j| j.id == job_id)
+                .ok_or_else(|| {
+                    BridgeServiceError::Core(format!("render job '{job_id}' not found"))
+                })?;
+            let path = job.output_path.clone().ok_or_else(|| {
+                BridgeServiceError::Core(format!("render job '{job_id}' has no output yet"))
+            })?;
+            (job.id.clone(), path)
+        };
         let bytes = std::fs::read(&path)
             .map_err(|e| BridgeServiceError::Core(format!("read {}: {e}", path.display())))?;
         Ok(RenderOutputImage {
-            job_id: job.id.clone(),
+            job_id: resolved_job_id,
             path: path.to_string_lossy().to_string(),
             bytes,
         })
@@ -3898,20 +3916,35 @@ impl BridgeService {
         a_job_id: &str,
         b_job_id: &str,
     ) -> Result<RenderCompareResult, BridgeServiceError> {
-        let state = self.lock_render_state()?;
-        let lookup = |id: &str| -> Result<std::path::PathBuf, BridgeServiceError> {
-            let job = state
-                .queue
-                .list_jobs()
-                .into_iter()
-                .find(|j| j.id == id)
-                .ok_or_else(|| BridgeServiceError::Core(format!("render job '{id}' not found")))?;
-            job.output_path.clone().ok_or_else(|| {
-                BridgeServiceError::Core(format!("render job '{id}' has no output yet"))
-            })
+        // Resolve both output paths under the `render_state` mutex,
+        // then *drop the guard* before SSIM computation. SSIM is
+        // O(width*height) over two decoded images and on the hot
+        // path takes hundreds of milliseconds to a few seconds for
+        // 4K outputs (decode-PNG ×2, copy to Vec<f32>, sliding 8×8
+        // window). Holding `render_state` across that work would
+        // serialise the entire render subsystem on a UI compare
+        // click — every queue admission, every `listJobs` poll,
+        // every preview reload from `render_get_output_image` would
+        // wait. The lookup itself is an in-memory scan of
+        // `state.queue.list_jobs()` and clones the two `PathBuf`s,
+        // so by the time we hit `ssim_from_files` the mutex is free.
+        let (a_path, b_path) = {
+            let state = self.lock_render_state()?;
+            let lookup = |id: &str| -> Result<std::path::PathBuf, BridgeServiceError> {
+                let job = state
+                    .queue
+                    .list_jobs()
+                    .into_iter()
+                    .find(|j| j.id == id)
+                    .ok_or_else(|| {
+                        BridgeServiceError::Core(format!("render job '{id}' not found"))
+                    })?;
+                job.output_path.clone().ok_or_else(|| {
+                    BridgeServiceError::Core(format!("render job '{id}' has no output yet"))
+                })
+            };
+            (lookup(a_job_id)?, lookup(b_job_id)?)
         };
-        let a_path = lookup(a_job_id)?;
-        let b_path = lookup(b_job_id)?;
         let ssim = aec_render::compare::ssim_from_files(&a_path, &b_path)
             .map_err(|e| BridgeServiceError::Core(format!("ssim: {e}")))?;
         Ok(RenderCompareResult {

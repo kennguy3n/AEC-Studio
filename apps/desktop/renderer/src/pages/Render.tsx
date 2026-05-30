@@ -212,6 +212,30 @@ export function Render() {
     // (activeTool/layers/sheets/activeSheet/log).
     setDoctorJobId(null);
     setDoctorSuggestions([]);
+    // The Phase 17 render-preview + SSIM compare surface is per-project
+    // too. `previewDataUri` is a base64 data URI decoded from the
+    // previous project's render output PNG, `previewJobId` is the job
+    // ID that produced it, and `compareAId / compareBId /
+    // compareABytes / compareBBytes / compareSsim` capture the
+    // before/after pair currently loaded into `BeforeAfterCompare`.
+    // Without clearing them, switching from project A to project B
+    // leaves the user looking at A's render in the preview pane and
+    // A's SSIM score next to B's empty queue — and any subsequent
+    // user interaction on the compare selector (`setCompareAId(id)`)
+    // would mix B's new job ID with A's stale bytes/ssim, triggering
+    // the `[compareAId, compareBId]` effect to call
+    // `render.getOutputImage` against IDs that don't exist in B's
+    // render store. Mirrors the reset of `doctorJobId /
+    // doctorSuggestions` above so Render's entire per-project state
+    // surface (cameras, selected cameras, jobs, doctor, preview,
+    // compare) transitions atomically on project switch.
+    setPreviewDataUri(null);
+    setPreviewJobId(null);
+    setCompareAId(null);
+    setCompareBId(null);
+    setCompareABytes(null);
+    setCompareBBytes(null);
+    setCompareSsim(null);
     // Gate every bridge fetch on a live project. Both `listJobs` and
     // `listGraph` are project-scoped queries: with no active project,
     // the native handlers have no DB to address and the fallback

@@ -1691,9 +1691,20 @@ interface NativeApi {
   // Phase 17 — read back a completed render's output image and
   // compute SSIM between two completed jobs; surface HDRI env map
   // selection. All three are `#[napi]`-exported from
-  // `crates/aec_bridge/src/napi_api.rs`.
-  render_get_output_image(job_id: string): unknown;
-  render_compare_ssim(a_job_id: string, b_job_id: string): unknown;
+  // `crates/aec_bridge/src/napi_api.rs`. `render_get_output_image`
+  // and `render_compare_ssim` are declared `#[napi] pub async fn`
+  // there (routed through `spawn_blocking_napi` so the multi-MB PNG
+  // read and the O(width·height) SSIM compute don't block the libuv
+  // main thread) — so their N-API surface returns a `Promise`, not
+  // a plain object. We type them as `Promise<unknown>` here so the
+  // bridge wrapper's `await` is correctly typed; without this, TS
+  // would treat the awaited value as a no-op on the `unknown`
+  // return and the renderer would receive an unresolved Promise.
+  // `render_set_environment_map` stays synchronous because the
+  // service-side method only validates and stashes a path; no I/O
+  // runs until the next `render_enqueue`.
+  render_get_output_image(job_id: string): Promise<unknown>;
+  render_compare_ssim(a_job_id: string, b_job_id: string): Promise<unknown>;
   render_set_environment_map(
     path: string | null,
     intensity: number | null,
@@ -2246,7 +2257,14 @@ function adaptNative(n: NativeApi): BridgeBackend {
     // typed bridge surface so renderer consumers get a `Uint8Array`
     // without an `as unknown` round-trip.
     renderGetOutputImage: async (params) => {
-      const out = n.render_get_output_image(params.jobId) as {
+      // `n.render_get_output_image` is `#[napi] pub async fn` on the
+      // Rust side (see `napi_api.rs`), so it returns a `Promise` that
+      // resolves to the NAPI-side `{ jobId, path, bytes }` shape.
+      // Awaiting before narrowing surfaces the resolved value to the
+      // typed bridge surface; without the `await`, the renderer would
+      // receive an unresolved `Promise` that fails any subsequent
+      // `.bytes` access.
+      const out = (await n.render_get_output_image(params.jobId)) as {
         jobId: string;
         path: string;
         bytes: Uint8Array;
@@ -2254,7 +2272,10 @@ function adaptNative(n: NativeApi): BridgeBackend {
       return out;
     },
     renderCompareSsim: async (params) =>
-      n.render_compare_ssim(params.aJobId, params.bJobId) as {
+      // `n.render_compare_ssim` is `#[napi] pub async fn` on the Rust
+      // side too — await before narrowing for the same reason as
+      // `renderGetOutputImage` above.
+      (await n.render_compare_ssim(params.aJobId, params.bJobId)) as {
         aJobId: string;
         bJobId: string;
         ssim: number;
@@ -2270,7 +2291,17 @@ function adaptNative(n: NativeApi): BridgeBackend {
         typeof params.intensity === "number" && Number.isFinite(params.intensity)
           ? params.intensity
           : null;
-      n.render_set_environment_map(path, intensity) as { ok: true };
+      // The Rust binding is `#[napi] pub fn render_set_environment_map(...)
+      // -> Result<()>` — it returns `undefined` on success and
+      // throws on validation failure (unsupported path extension,
+      // unreadable file, malformed RGBE/EXR bytes), so the discarded
+      // return value carries no signal. The previous `as { ok: true }`
+      // cast on the discarded return implied a contract the binding
+      // never provided; dropping it removes the misleading type
+      // assertion while preserving the renderer-facing shape
+      // (`Promise<{ ok: true }>`) which we synthesise below to give
+      // the UI a uniform success ack.
+      n.render_set_environment_map(path, intensity);
       return { ok: true };
     },
     // Export + deliver — typed params struct on the Rust side
