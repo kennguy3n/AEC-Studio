@@ -358,9 +358,17 @@ impl ArbitraryClosedProfile {
 /// Triangulate a (CCW) simple polygon into a flat list of
 /// (i0, i1, i2) triangles indexing into the polygon's vertex list.
 ///
-/// Uses ear clipping (`O(n²)`), which handles arbitrary simple
-/// polygons including non-convex ones — necessary for IFC
-/// arbitrary closed profiles. For a convex polygon ear clipping
+/// Prefers constrained Delaunay
+/// ([`aec_geometry::triangulate_cdt`]) for the
+/// IfcArbitraryClosedProfileDef cross-sections the BIM
+/// tessellator sees in production — CDT produces well-shaped
+/// triangles (high minimum angle) which the BVH and rasterizer
+/// downstream consumers all prefer.
+///
+/// Falls back to ear clipping (`O(n²)`) for the rare inputs
+/// where CDT cannot converge (severe coincidence,
+/// near-self-intersection). Ear clipping handles arbitrary
+/// simple polygons; for a convex polygon ear clipping
 /// degenerates to a fan, so we don't special-case convex inputs.
 ///
 /// **Error semantics**: returns
@@ -383,6 +391,21 @@ fn triangulate_polygon_2d(points: &[[f64; 2]]) -> TessellatorResult<Vec<[u32; 3]
     }
     if n_total == 3 {
         return Ok(vec![[0, 1, 2]]);
+    }
+    // Try CDT first — produces a Delaunay triangulation which
+    // is materially better for the downstream consumers
+    // (path-tracer BVH, BIM validation overlays). On any error
+    // (degenerate input, non-converging constraint enforcement)
+    // we fall through to the ear-clipping path which is robust
+    // for almost every simple polygon.
+    if let Ok(idx_tris) = aec_geometry::triangulate_cdt(points, &[]) {
+        // CDT may emit n-2 triangles for a simple polygon with
+        // no degenerate substructure; if the output is shorter
+        // (e.g. CDT silently dropped a near-duplicate vertex)
+        // fall through to ear-clipping so the cap mesh is closed.
+        if idx_tris.len() == n_total.saturating_sub(2) {
+            return Ok(idx_tris);
+        }
     }
     let mut idx: Vec<usize> = (0..n_total).collect();
     let mut out = Vec::with_capacity(n_total - 2);

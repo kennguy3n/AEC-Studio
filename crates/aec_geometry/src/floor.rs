@@ -1,6 +1,8 @@
 //! Floor primitive. The boundary is a closed polygon in plan-view
-//! coordinates (mm). Triangulation uses ear clipping, which is appropriate
-//! for the simple convex/slightly concave polygons that emerge from rooms.
+//! coordinates (mm). Triangulation prefers
+//! [`crate::triangulate::triangulate_cdt`] (constrained Delaunay)
+//! and falls back to ear-clipping on the rare cases where CDT
+//! cannot converge (extremely degenerate input).
 
 use glam::DVec2;
 use serde::{Deserialize, Serialize};
@@ -9,6 +11,7 @@ use aec_core::types::EntityId;
 
 use crate::error::{GeometryError, GeometryResult};
 use crate::mesh::Mesh;
+use crate::triangulate::triangulate_cdt;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Floor {
@@ -34,7 +37,7 @@ impl Floor {
         let z_top = self.elevation_mm;
         let z_bot = self.elevation_mm - self.thickness_mm;
         let mut mesh = Mesh::new();
-        let triangles = triangulate_ear_clip(&self.boundary_mm)?;
+        let triangles = triangulate_floor(&self.boundary_mm)?;
         let normal_up = [0.0, 0.0, 1.0];
         let normal_dn = [0.0, 0.0, -1.0];
         for tri in &triangles {
@@ -90,8 +93,49 @@ pub fn polygon_area_signed(points: &[[f64; 2]]) -> f64 {
     acc * 0.5
 }
 
+/// Triangulate a simple floor boundary, preferring CDT (which
+/// produces well-shaped triangles and handles concave shapes
+/// cleanly) and falling back to ear-clipping if CDT cannot
+/// converge.
+///
+/// Returns a flat list of triangles `[[ax, ay], [bx, by], [cx, cy]]`
+/// in CCW winding for top-face consumption.
+pub fn triangulate_floor(points: &[[f64; 2]]) -> GeometryResult<Vec<[[f64; 2]; 3]>> {
+    match triangulate_cdt(points, &[]) {
+        Ok(idx_tris) => {
+            let mut out = Vec::with_capacity(idx_tris.len());
+            for tri in idx_tris {
+                let a = points[tri[0] as usize];
+                let b = points[tri[1] as usize];
+                let c = points[tri[2] as usize];
+                out.push([a, b, c]);
+            }
+            // Normalise winding to CCW so callers see deterministic
+            // output regardless of input boundary direction.
+            let mut verts = points.to_vec();
+            if polygon_area_signed(&verts) < 0.0 {
+                verts.reverse();
+            }
+            for tri in &mut out {
+                if (tri[1][0] - tri[0][0]) * (tri[2][1] - tri[0][1])
+                    - (tri[1][1] - tri[0][1]) * (tri[2][0] - tri[0][0])
+                    < 0.0
+                {
+                    tri.swap(1, 2);
+                }
+            }
+            Ok(out)
+        }
+        Err(_) => triangulate_ear_clip(points),
+    }
+}
+
 /// Ear-clipping triangulation. Returns a flat list of triangles
 /// `[[ax, ay], [bx, by], [cx, cy]]`. The output is always CCW.
+///
+/// Kept as the fallback path for inputs where the CDT cannot
+/// converge (extremely degenerate / self-intersecting / collinear
+/// boundaries). Prefer [`triangulate_floor`] for new call sites.
 pub fn triangulate_ear_clip(points: &[[f64; 2]]) -> GeometryResult<Vec<[[f64; 2]; 3]>> {
     if points.len() < 3 {
         return Err(GeometryError::InvalidPolygon);

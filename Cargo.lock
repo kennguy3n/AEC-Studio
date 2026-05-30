@@ -70,6 +70,7 @@ dependencies = [
  "aec_cad",
  "aec_core",
  "aec_export",
+ "aec_geometry",
  "aec_render",
  "blake3",
  "calamine",
