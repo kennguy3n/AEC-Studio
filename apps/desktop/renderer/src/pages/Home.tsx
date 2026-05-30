@@ -4,6 +4,11 @@ import { aec, ProjectSummary, RuntimeStatus } from "../api/aec";
 import { ProjectCard } from "../components/ProjectCard";
 import { TemplateCard, DEFAULT_TEMPLATES, TemplateChoice } from "../components/TemplateCard";
 import { HardwareProfileCard } from "../components/HardwareProfileCard";
+import {
+  OnboardingModal,
+  readOnboardingDismissed,
+  writeOnboardingDismissed,
+} from "../components/OnboardingModal";
 import { useActiveProject } from "../hooks/useActiveProject";
 import { useToast } from "../hooks/useToast";
 
@@ -13,6 +18,15 @@ export function Home() {
   const { addToast } = useToast();
   const [recents, setRecents] = useState<ProjectSummary[]>([]);
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
+  // Phase 17 Group C Task 19 — first-run onboarding modal.
+  // `dismissed` is hydrated from `localStorage` on mount so the
+  // modal stays hidden after the user has dismissed it once.
+  // `recents.length === 0` is checked at render time; the modal
+  // disappears the moment the user opens or creates their first
+  // project.
+  const [onboardingDismissed, setOnboardingDismissed] = useState<boolean>(
+    () => readOnboardingDismissed(),
+  );
 
   useEffect(() => {
     let alive = true;
@@ -26,6 +40,22 @@ export function Home() {
       alive = false;
     };
   }, []);
+
+  const dismissOnboarding = () => {
+    writeOnboardingDismissed();
+    setOnboardingDismissed(true);
+  };
+  const startEmptyFromOnboarding = () => {
+    // Persist before navigating so the next mount of Home doesn't
+    // surface the modal again. We still let the create flow's own
+    // toast surface failures.
+    writeOnboardingDismissed();
+    setOnboardingDismissed(true);
+    const empty =
+      DEFAULT_TEMPLATES.find((t) => t.key === "empty") ??
+      DEFAULT_TEMPLATES[0];
+    if (empty) void createFromTemplate(empty);
+  };
 
   async function createFromTemplate(t: TemplateChoice) {
     try {
@@ -75,6 +105,11 @@ export function Home() {
 
   return (
     <div className="home">
+      <OnboardingModal
+        open={recents.length === 0 && !onboardingDismissed}
+        onDismiss={dismissOnboarding}
+        onStartEmpty={startEmptyFromOnboarding}
+      />
       <header className="home__header">
         <div>
           <h1 className="home__title">AEC Studio</h1>

@@ -28,6 +28,40 @@ function recommendedFor(tier: RuntimeStatus["tier"]): RenderPresetKey {
 }
 
 /**
+ * Phase 17 Group C Task 17 — pick the most-recent running render
+ * job from the queue list so `RenderPreview` can overlay a
+ * "Rendering · NN%" badge on the previous frame. Picks the running
+ * job with the latest `startedAt` (or, as a tiebreaker, the highest
+ * progress, so a quick-started job that has already advanced past a
+ * slow-starting peer is preferred). Returns `null` when no job is
+ * running — the preview falls back to the bare completed frame.
+ */
+function pickInFlight(
+  jobs: RenderJob[],
+): { jobId: string; progress: number; preset?: string } | null {
+  const running = jobs.filter((j) => j.status === "running");
+  if (running.length === 0) return null;
+  const sorted = [...running].sort((a, b) => {
+    const ta = a.startedAt ? Date.parse(a.startedAt) : 0;
+    const tb = b.startedAt ? Date.parse(b.startedAt) : 0;
+    if (tb !== ta) return tb - ta;
+    return (b.progress ?? 0) - (a.progress ?? 0);
+  });
+  const top = sorted[0];
+  return {
+    jobId: top.jobId,
+    // Bridge layer reports progress as 0..1 on the Rust side and
+    // the napi shim multiplies up to 0..100 in `RenderJobJs` — but
+    // the in-process fallback uses 0..100 directly. Normalise to
+    // percent at the read site by checking whether the value is
+    // already > 1; anything in `[0, 1]` is treated as a fraction.
+    progress:
+      top.progress > 1 ? top.progress : Math.round(top.progress * 100),
+    preset: top.preset,
+  };
+}
+
+/**
  * Convert a `Uint8Array` (image bytes coming back over the bridge)
  * into a base64 string for use in `data:image/png;base64,…` URIs.
  * Encodes in 8 KB chunks so we don't blow the `String.fromCharCode`
@@ -530,6 +564,16 @@ export function Render() {
           />
         </aside>
         <main className="render-main">
+          {/*
+            Phase 17 Group C Task 17 — progressive in-flight
+            preview overlay. We pick the most-recent running job
+            (jobs are sorted by `startedAt` desc) and pass its
+            progress to the preview so the user sees "Rendering
+            · 42%" over the previous frame while a new render
+            runs. The previous frame stays visible until the new
+            render completes, at which point the `previewJobId`
+            effect above swaps in the new PNG.
+           */}
           <RenderPreview
             imageDataUri={previewDataUri}
             caption={
@@ -537,6 +581,7 @@ export function Render() {
                 ? `Latest preview · job ${previewJobId}`
                 : "Latest preview"
             }
+            inFlight={pickInFlight(jobs)}
           />
           <CompareJobPicker
             jobs={jobs}

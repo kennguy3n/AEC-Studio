@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { aec } from "../api/aec";
 import {
   PanelResizeHandle,
@@ -28,59 +28,28 @@ import {
   BimToolbar,
   BimAction,
 } from "../components/bim/BimToolbar";
+import { Viewport3DHost } from "../components/viewport/Viewport3DHost";
 import { useActiveProject } from "../hooks/useActiveProject";
 import { useToast } from "../hooks/useToast";
+import { projectGraphList } from "../api/commands";
+import { buildSpatialTree } from "../api/bim-spatial-tree";
 
-const DEMO_ROOT: SpatialNode = {
-  id: "proj_demo",
-  kind: "IfcProject",
-  name: "Project (demo)",
-  children: [
-    {
-      id: "site_demo",
-      kind: "IfcSite",
-      name: "Site 1",
-      children: [
-        {
-          id: "bldg_demo",
-          kind: "IfcBuilding",
-          name: "Building A",
-          children: [
-            {
-              id: "lvl_l1",
-              kind: "IfcBuildingStorey",
-              name: "L1",
-              children: [
-                {
-                  id: "spc_l1_living",
-                  kind: "IfcSpace",
-                  name: "Living",
-                  children: [],
-                },
-              ],
-            },
-          ],
-        },
-      ],
-    },
-  ],
-};
-
-const DEMO_PSETS: PsetData = {
-  Pset_WallCommon: {
-    LoadBearing: true,
-    FireRating: "F60",
-  },
-};
+// Phase 17 Group C Task 16 — the spatial tree always derives from
+// the project's persisted graph (`projectGraphList`). No DEMO_ROOT /
+// DEMO_PSETS fallback: the user must never see fake placeholder
+// hierarchy that could be mistaken for real project data. Until an
+// IFC is imported the tree renders its empty state
+// (`SpatialTree` panels handle `root === null`).
+const EMPTY_PSETS: PsetData = {};
 
 const IFC_FILTERS = [{ name: "IFC Files", extensions: ["ifc"] }];
 
 export function Bim() {
   const { project, getActiveProjectPath } = useActiveProject();
   const { addToast } = useToast();
-  const [root, setRoot] = useState<SpatialNode | null>(DEMO_ROOT);
+  const [root, setRoot] = useState<SpatialNode | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [psets, setPsets] = useState<PsetData>(DEMO_PSETS);
+  const [psets, setPsets] = useState<PsetData>(EMPTY_PSETS);
   const [schedules, setSchedules] = useState<
     Partial<Record<ScheduleKind, ScheduleRow[]>>
   >({});
@@ -185,13 +154,69 @@ export function Bim() {
   // page consistent in how it handles project transitions.
   useEffect(() => {
     setIfcSourcePath(null);
-    setRoot(DEMO_ROOT);
+    setRoot(null);
     setSelectedId(null);
-    setPsets(DEMO_PSETS);
+    setPsets(EMPTY_PSETS);
     setSchedules({});
     setScheduleHeaders({});
     setFindings([]);
   }, [projectPath]);
+
+  // Phase 17 Group C Task 16 — hydrate the spatial tree from the
+  // project's persisted graph on mount / project switch. The bridge's
+  // `project_graph_list` returns every `bim/spatial/*` and
+  // `bim/element/*` entity that was written by an earlier IFC import
+  // / re-attach, so reopening a project preserves the user's tree
+  // without requiring a re-import. `refreshSpatialTree` is also
+  // invoked by the IFC import / attach handlers below so the tree
+  // reflects the new graph immediately, without waiting for a
+  // project remount.
+  //
+  // The `alive`/`startPath` guards close the same project-switch
+  // race the other handlers already protect against: a stale
+  // graph-list result for project A must not commit onto project B.
+  // On failure (project with no graph yet, permission denied, db
+  // locked) we leave `root` at `null` so the tree renders its empty
+  // state — the rest of the page can still proceed and the next
+  // successful IFC import will retrigger the fetch.
+  const refreshSpatialTree = useCallback(
+    async (targetPath: string | null) => {
+      if (!targetPath) {
+        setRoot(null);
+        return;
+      }
+      try {
+        const rows = await projectGraphList(targetPath);
+        if (getActiveProjectPath() !== targetPath) return;
+        const tree = buildSpatialTree(rows);
+        setRoot(tree);
+      } catch {
+        // Tree stays empty — the user sees the empty state with
+        // "Use Import IFC to load a project" rather than fake demo
+        // data, which matches the no-placeholders directive.
+      }
+    },
+    [getActiveProjectPath],
+  );
+
+  useEffect(() => {
+    if (!projectPath) return;
+    let alive = true;
+    (async () => {
+      try {
+        const rows = await projectGraphList(projectPath);
+        if (!alive) return;
+        if (getActiveProjectPath() !== projectPath) return;
+        const tree = buildSpatialTree(rows);
+        setRoot(tree);
+      } catch {
+        // see `refreshSpatialTree` rationale above.
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [projectPath, getActiveProjectPath]);
 
   const onInvoke = async (action: BimAction) => {
     // Capture the active project at handler entry so every
@@ -241,8 +266,14 @@ export function Bim() {
           if (getActiveProjectPath() !== startPath) break;
           if (outcome.kind === "imported") {
             setIfcSourcePath(selectedPath);
-            if (outcome.result.spatialNodes > 0 || outcome.result.elements > 0) {
-              setRoot(DEMO_ROOT);
+            if (
+              outcome.result.spatialNodes > 0 ||
+              outcome.result.elements > 0
+            ) {
+              // The import rewrote the project graph — refetch and
+              // rebuild the spatial tree so the user sees the new
+              // hierarchy without waiting for a project remount.
+              void refreshSpatialTree(startPath);
             }
             addToast(
               "success",
@@ -301,6 +332,10 @@ export function Bim() {
           if (getActiveProjectPath() !== startPath) break;
           if (attachResult.kind === "attached") {
             setIfcSourcePath(attachPath);
+            // Attach mutates the project graph (new + updated
+            // spatial nodes and elements) — refetch and rebuild the
+            // tree so the user sees the merged hierarchy.
+            void refreshSpatialTree(startPath);
             addToast(
               "success",
               `Attached IFC: ${attachResult.result.elementsInserted} new, ` +
@@ -657,17 +692,40 @@ export function Bim() {
           // pointermove — see `usePersistentPanelSize` docstring.
           onResizeEnd={commitTreeWidth}
         />
-        <div
-          className="bim-viewport"
-          aria-label="3D viewport"
-          data-testid="bim-viewport"
-        >
-          {selectedId ? (
-            <p>Showing: {selectedId}</p>
-          ) : (
-            <p>Select an element from the spatial tree.</p>
-          )}
-        </div>
+        {/*
+          Phase 17 Group C Task 15 — real BIM 3D viewport.
+          Hosts the same wgpu surface the Design mode uses (shared
+          [`Viewport3DHost`] component) so importing an IFC populates
+          the viewport with real geometry rather than a placeholder
+          "Select an element from the spatial tree." text. The
+          selected node id is threaded into the HUD's extras slot so
+          the spatial-tree → viewport selection feedback is visible
+          without an extra bridge round-trip. The `activeTool` field
+          carries either the selected element's kind or `"navigate"`
+          when nothing is selected — purely cosmetic in the HUD; the
+          shared host never branches on it.
+         */}
+        <Viewport3DHost
+          mode="bim"
+          activeTool={selectedId ? "select" : "navigate"}
+          hudExtras={
+            selectedId ? (
+              <div
+                style={{ color: "var(--aec-color-text-muted)" }}
+                data-testid="bim-viewport-selected-badge"
+              >
+                Selected: {selectedId}
+              </div>
+            ) : (
+              <div
+                style={{ color: "var(--aec-color-text-muted)" }}
+                data-testid="bim-viewport-hint"
+              >
+                Pick an element in the spatial tree.
+              </div>
+            )
+          }
+        />
         <PanelResizeHandle
           orientation="vertical"
           label="Resize property editor panel"
