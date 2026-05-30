@@ -336,6 +336,71 @@ export function Render() {
     };
   }, [project?.path]);
 
+  // Periodic refresh while at least one job is in-flight (queued or
+  // running). The one-shot fetch above hydrates `jobs` on project
+  // open; `enqueueAll` appends locally-fabricated queued rows after
+  // a successful batch. Without a poll, both pathways leave every
+  // row's `progress`/`status` frozen at the value the bridge first
+  // reported — `RenderQueue.tsx`'s 1 s tick re-renders the ETA
+  // label using the *current* wall-clock, so the countdown
+  // continues decrementing visually even after the underlying job
+  // has long completed (the bridge holds the new state, the UI just
+  // never re-reads it). The Phase 17 Group C Task 18 ETA work made
+  // the staleness directly user-visible — a "00:42 remaining" label
+  // that flips to "00:41", "00:40", … on a completed job is the
+  // kind of small-but-confusing UX regression that Devin Review
+  // (commit 3d5443c) flagged as soon as the ETA shipped.
+  //
+  // The poll period is 3 s — fast enough to track progress on a
+  // multi-minute render without being perceived as stale, slow
+  // enough that a queue full of running jobs doesn't flood the
+  // bridge with IPC round-trips. Polling is *gated* on
+  // `hasInFlight`: when every job is `completed` / `failed` /
+  // `cancelled`, the bridge state is stable and the timer is torn
+  // down — restarted only when the next `enqueueAll` lands at
+  // least one queued row. The `hasInFlight` boolean only flips on
+  // status transitions, not on every progress tick, so the timer
+  // does NOT reset on each poll cycle (which would degenerate the
+  // 3 s cadence to "3 s + jobs-state-update latency" and snap the
+  // ETA countdown).
+  const hasInFlight = jobs.some(
+    (j) => j.status === "queued" || j.status === "running",
+  );
+  useEffect(() => {
+    if (!project?.path) return;
+    if (!hasInFlight) return;
+    let alive = true;
+    const id = window.setInterval(() => {
+      void aec.render
+        .listJobs()
+        .then((rows) => {
+          if (!alive) return;
+          // Re-check the active project at commit time. The poll
+          // races project switches the same way the one-shot fetch
+          // does: a `listJobs()` issued under project A can resolve
+          // after the user navigates to project B. Without this
+          // guard, A's job list would land in B's `jobs` state and
+          // every per-row action (`onCancel`, RenderDoctor's
+          // `diagnose`) would address project A's render store
+          // from a UI keyed off project B.
+          if (project?.path) setJobs(rows as RenderJob[]);
+        })
+        .catch(() => {
+          // Bridge failure (transient project-switch race, corrupt
+          // render-jobs row, permission denied) — keep the last
+          // known good `jobs` so a single bad poll doesn't clear
+          // the queue visually. The next poll cycle retries.
+          // Logged at the bridge layer; no user-visible toast for
+          // routine polling errors (matches the one-shot fetch and
+          // the `StatusBar.tsx`/`Deliver.tsx` polling convention).
+        });
+    }, 3000);
+    return () => {
+      alive = false;
+      window.clearInterval(id);
+    };
+  }, [project?.path, hasInFlight]);
+
   const changePreset = useCallback((next: RenderPresetKey) => {
     setPreset(next);
     userChosePresetRef.current = true;
