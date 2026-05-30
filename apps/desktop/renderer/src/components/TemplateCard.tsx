@@ -23,7 +23,7 @@ export interface TemplateChoice {
   key: string;
   name: string;
   description: string;
-  category: "interior" | "architecture" | "drafting";
+  category: "interior" | "architecture" | "drafting" | "general";
   /** Icon name to render when the preview image isn't available. */
   icon: IconName;
   /**
@@ -117,6 +117,22 @@ export function TemplateCard({ template, onCreate }: Props) {
 
 // eslint-disable-next-line react-refresh/only-export-components
 export const DEFAULT_TEMPLATES: TemplateChoice[] = [
+  // The "general.empty" template is the canonical starting point for
+  // users who want to shape a project from scratch. The Phase 17
+  // Group C onboarding modal's "Start with the Empty template" CTA
+  // looks up this exact key (`Home.tsx::startEmptyFromOnboarding`),
+  // so removing or renaming it would silently divert that flow to
+  // whichever template happens to land at index 0 — the original bug
+  // Devin Review flagged. The matching JSON definition lives at
+  // `templates/general/empty.json` so `project.createFromTemplate`
+  // can resolve the key through `TemplateLoader::load`.
+  {
+    key: "general.empty",
+    name: "Empty",
+    description: "Blank project — no rooms, walls, or presets.",
+    category: "general",
+    icon: "design",
+  },
   {
     key: "interior.apartment",
     name: "Apartment",

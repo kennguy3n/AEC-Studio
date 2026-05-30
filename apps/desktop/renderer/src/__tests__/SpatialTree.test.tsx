@@ -52,7 +52,13 @@ describe("SpatialTree", () => {
     expect(screen.getByTestId("spatial-node-b")).toBeInTheDocument();
     expect(screen.getByTestId("spatial-node-st")).toBeInTheDocument();
     fireEvent.click(screen.getByTestId("spatial-node-b"));
-    expect(onSelect).toHaveBeenCalledWith("b");
+    // SpatialTree now propagates both the IFC id and its `kind` so
+    // callers (notably Bim.tsx) can classify the selection without a
+    // second tree walk. The previous `(id) => …` callback shape lost
+    // the kind on every selection and forced Bim to fall back to a
+    // hard-coded `id === "lvl_l1"` heuristic, which broke as soon as
+    // we dropped DEMO_ROOT in Task 16.
+    expect(onSelect).toHaveBeenCalledWith({ id: "b", kind: "IfcBuilding" });
   });
 
   it("toggles a subtree without firing selection", () => {

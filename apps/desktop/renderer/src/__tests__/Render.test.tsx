@@ -205,7 +205,12 @@ describe("Render page — project switch resets camera selection", () => {
             {
               jobId: "jobA1",
               cameraId: "cam_A_1",
-              progress: 0.5,
+              // `aec.render.listJobs` is the bridge boundary — the
+              // shim in `apps/desktop/electron/bridge.ts` scales
+              // napi's `[0, 1]` to `[0, 100]` here, so this mock
+              // represents the post-bridge value seen by the
+              // renderer.
+              progress: 50,
               status: "running",
               tier: "Workstation",
               preset: "interior_balanced",

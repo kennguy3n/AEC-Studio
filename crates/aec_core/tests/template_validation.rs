@@ -87,10 +87,14 @@ fn every_template_has_content_invariants() {
         let _ = tpl.units; // touched to keep the warning quiet
 
         let room_count = tpl.iter_rooms().count();
-        // Drafting templates have no rooms, and `interior.renovation`
-        // intentionally ships an empty starter (designers carve their
-        // own rooms). Everything else must declare ≥1 room shell.
-        let empty_starter = key == "interior.renovation";
+        // Drafting templates have no rooms by definition. `interior.
+        // renovation` intentionally ships an empty starter (designers
+        // carve their own rooms), and `general.empty` is the canonical
+        // blank-project template wired to the onboarding modal's
+        // "Start with the Empty template" CTA — both legitimately
+        // declare zero rooms. Everything else must declare ≥1 room
+        // shell so the Design viewport opens onto real geometry.
+        let empty_starter = matches!(key.as_str(), "interior.renovation" | "general.empty");
         if !is_drafting(&tpl) && !empty_starter {
             assert!(
                 room_count >= 1,
@@ -122,14 +126,23 @@ fn every_template_has_content_invariants() {
                 "{key}: drafting templates must NOT carry a lighting preset",
             );
         } else {
-            assert!(
-                tpl.lighting_preset.is_some(),
-                "{key}: 3D template must declare a lighting preset",
-            );
-            // Empty-starter templates (e.g. interior.renovation) can
-            // omit camera presets — the user picks them after the
-            // initial scan-import. Everything else must ship at least
-            // one camera so the Design viewport boots with a frame.
+            // 3D templates declare a lighting preset by default so the
+            // Design viewport boots with sensible illumination. The
+            // empty-starter exemption matches the room-shell carve-out
+            // above: `interior.renovation` and `general.empty` ship
+            // intentionally barren so the user picks lighting after
+            // shaping the scene.
+            if !empty_starter {
+                assert!(
+                    tpl.lighting_preset.is_some(),
+                    "{key}: 3D template must declare a lighting preset",
+                );
+            }
+            // Empty-starter templates (e.g. interior.renovation,
+            // general.empty) omit camera presets — the user picks
+            // them after the initial scan-import. Everything else
+            // must ship at least one camera so the Design viewport
+            // boots with a frame.
             if !empty_starter {
                 assert!(
                     !tpl.camera_presets.is_empty(),

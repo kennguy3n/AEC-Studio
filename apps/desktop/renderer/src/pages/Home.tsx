@@ -51,10 +51,24 @@ export function Home() {
     // toast surface failures.
     writeOnboardingDismissed();
     setOnboardingDismissed(true);
-    const empty =
-      DEFAULT_TEMPLATES.find((t) => t.key === "empty") ??
-      DEFAULT_TEMPLATES[0];
-    if (empty) void createFromTemplate(empty);
+    // The canonical empty template key is `general.empty` — wired
+    // to `templates/general/empty.json` and surfaced by
+    // `DEFAULT_TEMPLATES[0]` in `TemplateCard.tsx`. An earlier
+    // revision looked up the literal `"empty"` key, which never
+    // matched any template; the `.find()` returned `undefined` and
+    // the `?? DEFAULT_TEMPLATES[0]` fallback silently created the
+    // first listed template (an Apartment) instead. Falling back
+    // here would mask future template-list churn the same way, so
+    // surface the misconfiguration as an error toast instead.
+    const empty = DEFAULT_TEMPLATES.find((t) => t.key === "general.empty");
+    if (empty) {
+      void createFromTemplate(empty);
+    } else {
+      addToast(
+        "error",
+        "Empty template is unavailable. Pick a template from the list below.",
+      );
+    }
   };
 
   async function createFromTemplate(t: TemplateChoice) {

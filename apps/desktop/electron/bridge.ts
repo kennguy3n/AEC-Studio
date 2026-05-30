@@ -1185,6 +1185,15 @@ export interface RenderJob {
   jobId: string;
   status: "queued" | "running" | "completed" | "failed" | "cancelled";
   preset: string;
+  /**
+   * Progress as a percentage in `[0, 100]`. The Rust napi shim reports
+   * progress on the canonical `[0.0, 1.0]` scale (see
+   * `crates/aec_bridge/src/napi_api.rs` `RenderJobStatusView`); the
+   * bridge boundary in `renderListJobs` scales that to a percent so
+   * every downstream caller (UI + tests + in-process fallback) sees
+   * the same unit. UI overlays / ETA calculations therefore divide by
+   * 100 to obtain a fraction.
+   */
   progress: number;
   /** Camera entity id this job is rendering (batch / matrix submissions). */
   cameraId?: string | null;
@@ -2417,7 +2426,20 @@ function adaptNative(n: NativeApi): BridgeBackend {
         cancelled: number;
         averageProgress: number;
       } | null,
-    renderListJobs: async () => n.render_list_jobs() as RenderJob[],
+    renderListJobs: async () => {
+      // The napi shim hands back progress on the canonical Rust scale
+      // (`f64` in `[0.0, 1.0]`, see
+      // `crates/aec_bridge/src/napi_api.rs` `RenderJobStatusView`).
+      // Normalise to percent at the bridge boundary so the renderer
+      // and every test fixture see the same unit (`[0, 100]`). This
+      // replaces the older `> 1` discriminator at the UI layer, which
+      // mis-handled the boundary case where `progress === 1` could
+      // legitimately mean either 100 % (production) or 1 % (any
+      // future caller in percent form) — a real bug for tests that
+      // pass `progress: 1`.
+      const raw = n.render_list_jobs() as RenderJob[];
+      return raw.map((j) => ({ ...j, progress: j.progress * 100 }));
+    },
     renderCancelJob: async (jobId) => {
       // Invoke the native call for its side effect (status transition
       // to Cancelled, or a no-op for a job that already reached a

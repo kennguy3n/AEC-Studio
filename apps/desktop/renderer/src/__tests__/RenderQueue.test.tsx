@@ -127,11 +127,11 @@ describe("RenderQueue", () => {
   });
 
   it("hides the batch ETA header when no running jobs have a confident ETA", () => {
-    // `progress: 3` is unambiguously in 0-100 form (the bridge's
-    // canonical scale — see `pickInFlight` / `computeEtaMs` for the
-    // > 1 disambiguation), and 3 % sits below the 5 % confidence
-    // floor, so every running job produces `null` and the header
-    // is suppressed.
+    // `progress: 3` is in 0–100 form — the canonical unit at the
+    // bridge boundary (`apps/desktop/electron/bridge.ts`,
+    // `renderListJobs`). 3 % sits below `computeEtaMs`'s 5 %
+    // confidence floor, so every running job produces `null` and the
+    // batch header is suppressed.
     render(
       <RenderQueue
         jobs={[

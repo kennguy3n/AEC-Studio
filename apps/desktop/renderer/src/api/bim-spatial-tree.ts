@@ -92,16 +92,23 @@ export function buildSpatialTree(rows: EntityRecord[]): SpatialNode | null {
   // cap prevents pathological MEP federations from blowing the
   // tree size out — full element navigation is via the viewport
   // selection path, not the tree drill-down.
+  //
+  // We track the per-parent element count in a `Map` so the cap
+  // check is O(1) per insertion. The previous implementation
+  // re-filtered `parent.children` on every iteration, which is
+  // O(n·m) overall (`n` elements × `m` siblings) — fine at the
+  // current `MAX_ELEMENTS_PER_SPATIAL=24` cap but a real cost on
+  // future caps or federations with many spatial nodes.
+  const elementCounts = new Map<string, number>();
   for (const row of rows) {
     if (!row.kind.startsWith(ELEMENT_PREFIX)) continue;
     if (!row.parent) continue;
     const parent = nodes.get(row.parent);
     if (!parent) continue;
+    const current = elementCounts.get(row.parent) ?? 0;
+    if (current >= MAX_ELEMENTS_PER_SPATIAL) continue;
+    elementCounts.set(row.parent, current + 1);
     parent.children ??= [];
-    const currentElements = parent.children.filter(
-      (c) => c.kind === "IfcElement",
-    );
-    if (currentElements.length >= MAX_ELEMENTS_PER_SPATIAL) continue;
     const body = (row.body ?? {}) as PartialBody;
     parent.children.push({
       id: row.id,
@@ -137,6 +144,31 @@ export function buildSpatialTree(rows: EntityRecord[]): SpatialNode | null {
     name: "Project",
     children: roots,
   };
+}
+
+/**
+ * Locate a node in the [`SpatialNode`] tree by id. Used by pages
+ * that need to recover the IFC `kind` for a node identified only by
+ * its `EntityId` (e.g. validator findings' `entityId`, which carry
+ * the id but not the spatial classification). Returns `null` when
+ * the id is not in the tree.
+ *
+ * Walks the tree depth-first; trees are bounded by the per-parent
+ * element cap (`MAX_ELEMENTS_PER_SPATIAL`) plus the spatial-node
+ * count of the project, so a plain recursion is cheaper than
+ * building an auxiliary id→node map for the single-lookup use case.
+ */
+export function findNodeById(
+  root: SpatialNode | null,
+  id: string,
+): SpatialNode | null {
+  if (!root) return null;
+  if (root.id === id) return root;
+  for (const child of root.children ?? []) {
+    const hit = findNodeById(child, id);
+    if (hit) return hit;
+  }
+  return null;
 }
 
 function mapKind(rawKind: string): SpatialNode["kind"] {

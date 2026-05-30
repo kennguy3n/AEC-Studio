@@ -50,13 +50,16 @@ function pickInFlight(
   const top = sorted[0];
   return {
     jobId: top.jobId,
-    // Bridge layer reports progress as 0..1 on the Rust side and
-    // the napi shim multiplies up to 0..100 in `RenderJobJs` — but
-    // the in-process fallback uses 0..100 directly. Normalise to
-    // percent at the read site by checking whether the value is
-    // already > 1; anything in `[0, 1]` is treated as a fraction.
-    progress:
-      top.progress > 1 ? top.progress : Math.round(top.progress * 100),
+    // `RenderJob.progress` is normalised to a percentage in `[0, 100]`
+    // at the bridge boundary (see `apps/desktop/electron/bridge.ts`
+    // `renderListJobs` for the napi `[0, 1]` → percent scaling and
+    // the in-process fallback for the percent-native form). Earlier
+    // revisions used a `top.progress > 1` discriminator to accept
+    // either form, but that branch was ambiguous at
+    // `top.progress === 1` (1 % running vs. 100 % production) —
+    // normalising upstream removes the ambiguity and the discriminator
+    // along with it.
+    progress: Math.round(top.progress),
     preset: top.preset,
   };
 }

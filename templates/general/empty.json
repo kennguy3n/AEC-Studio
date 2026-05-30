@@ -1,0 +1,17 @@
+{
+  "template_id": "general.empty",
+  "category": "general",
+  "name": "Empty",
+  "description": "Start with a blank project. No rooms, walls, lighting, or asset shelves \u2014 just an empty canvas to shape from scratch.",
+  "region_defaults": {
+    "EU": {"units": "mm", "standards": []},
+    "NA": {"units": "inches", "standards": []},
+    "APAC": {"units": "mm", "standards": []}
+  },
+  "units": "mm",
+  "rooms": [],
+  "default_walls": {"exterior_thickness_mm": 250, "interior_thickness_mm": 100, "material": null},
+  "lighting_preset": null,
+  "asset_shelf": [],
+  "camera_presets": []
+}

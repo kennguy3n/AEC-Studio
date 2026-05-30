@@ -48,28 +48,37 @@ describe("Bim page", () => {
       modifiedAt: new Date().toISOString(),
     };
     currentSpy.mockResolvedValue({ summary });
+    // Kinds match the bridge source-of-truth in
+    // `crates/aec_bridge/src/bim_attach.rs` (rows are written as
+    // `kind = "bim/spatial/<IFC type>"` with the PascalCase IFC class
+    // suffix — `IfcProject`, `IfcSite`, `IfcBuilding`,
+    // `IfcBuildingStorey`, `IfcSpace`). Using the lowercase form here
+    // would fall through to the `default` arm of
+    // `mapKind()` in `bim-spatial-tree.ts`, mapping every node to
+    // `IfcElement` and silently bypassing the real kind→badge plumbing
+    // we want this test to exercise.
     listGraphSpy.mockResolvedValue([
       {
         id: "proj_root",
-        kind: "bim/spatial/project",
+        kind: "bim/spatial/IfcProject",
         parent: null,
         body: { name: "Project" },
       },
       {
         id: "site_a",
-        kind: "bim/spatial/site",
+        kind: "bim/spatial/IfcSite",
         parent: "proj_root",
         body: { name: "Site A" },
       },
       {
         id: "bldg_main",
-        kind: "bim/spatial/building",
+        kind: "bim/spatial/IfcBuilding",
         parent: "site_a",
         body: { name: "Main Building" },
       },
       {
         id: "lvl_l1",
-        kind: "bim/spatial/storey",
+        kind: "bim/spatial/IfcBuildingStorey",
         parent: "bldg_main",
         body: { name: "Level 1" },
       },

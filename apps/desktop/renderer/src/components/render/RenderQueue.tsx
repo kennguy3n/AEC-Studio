@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { aec, RenderJob } from "../../api/aec";
 
 interface Props {
@@ -18,7 +18,24 @@ interface Props {
 
 export function RenderQueue({ jobs, onCancel, now }: Props) {
   const [busyId, setBusyId] = useState<string | null>(null);
-  const nowMs = (now ?? Date.now)();
+  // Tick once per second while there's at least one running job so the
+  // per-row + batch ETA labels visibly count down between bridge
+  // polls. Without this, `nowMs` is only refreshed when the parent's
+  // `setJobs([…])` re-renders us — typically every few seconds at the
+  // poll cadence — making the ETA appear frozen for tests / users
+  // who expect a smooth countdown. The tick is suspended once every
+  // job has reached a terminal status to avoid unnecessary renders.
+  // The `now` test override skips the tick entirely so unit tests stay
+  // deterministic against a pinned wall-clock.
+  const [tickMs, setTickMs] = useState(() => Date.now());
+  const hasRunning = jobs.some((j) => j.status === "running");
+  useEffect(() => {
+    if (now !== undefined) return;
+    if (!hasRunning) return;
+    const id = window.setInterval(() => setTickMs(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, [now, hasRunning]);
+  const nowMs = now !== undefined ? now() : tickMs;
 
   const cancel = async (jobId: string) => {
     setBusyId(jobId);
@@ -93,7 +110,7 @@ export function RenderQueue({ jobs, onCancel, now }: Props) {
                   max={100}
                   data-testid={`render-job-progress-${j.jobId}`}
                 />{" "}
-                {j.progress}%
+                {Math.round(j.progress)}%
               </td>
               <td data-testid={`render-job-eta-${j.jobId}`}>
                 {formatRowEta(j, nowMs)}
@@ -139,12 +156,14 @@ function computeEtaMs(j: RenderJob, nowMs: number): number | null {
   if (!j.startedAt) return null;
   const startedMs = Date.parse(j.startedAt);
   if (Number.isNaN(startedMs)) return null;
-  // The bridge serialises progress as `0..1` on the Rust side and
-  // the napi shim scales to `0..100`. The in-process fallback emits
-  // `0..100` directly. Normalise to the fractional form so the
-  // arithmetic below is unit-correct regardless of source path.
-  const fraction =
-    j.progress > 1 ? j.progress / 100 : j.progress;
+  // `RenderJob.progress` is normalised to a percentage in `[0, 100]`
+  // at the bridge boundary (see `apps/desktop/electron/bridge.ts`
+  // `renderListJobs`), so divide here to recover the fraction the
+  // arithmetic below expects. Earlier revisions used a `> 1`
+  // discriminator to accept either `0..1` or `0..100` callers; that
+  // discriminator was ambiguous at `progress === 1` (1 % vs. 100 %)
+  // — normalising at the boundary removes the ambiguity entirely.
+  const fraction = j.progress / 100;
   // Below 5% the elapsed-time extrapolation is dominated by
   // bridge / preset warm-up overhead (BVH build, texture upload,
   // light-tree assembly) and produces wildly pessimistic estimates

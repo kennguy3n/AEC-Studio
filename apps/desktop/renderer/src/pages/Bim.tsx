@@ -32,7 +32,7 @@ import { Viewport3DHost } from "../components/viewport/Viewport3DHost";
 import { useActiveProject } from "../hooks/useActiveProject";
 import { useToast } from "../hooks/useToast";
 import { projectGraphList } from "../api/commands";
-import { buildSpatialTree } from "../api/bim-spatial-tree";
+import { buildSpatialTree, findNodeById } from "../api/bim-spatial-tree";
 
 // Phase 17 Group C Task 16 — the spatial tree always derives from
 // the project's persisted graph (`projectGraphList`). No DEMO_ROOT /
@@ -49,6 +49,17 @@ export function Bim() {
   const { addToast } = useToast();
   const [root, setRoot] = useState<SpatialNode | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  // The IFC class of the selected node, sourced from the spatial
+  // tree's mapped `kind` rather than from any id-based heuristic.
+  // `null` when nothing is selected. Threaded into `classification`
+  // below so badges / property-editor schemas reflect the actual
+  // entity class — a hard-coded `selectedId === "<some-id>"`
+  // shortcut would silently regress the moment the id namespace
+  // changes (DEMO_ROOT removal in Task 16 was exactly that
+  // scenario).
+  const [selectedKind, setSelectedKind] = useState<
+    SpatialNode["kind"] | null
+  >(null);
   const [psets, setPsets] = useState<PsetData>(EMPTY_PSETS);
   const [schedules, setSchedules] = useState<
     Partial<Record<ScheduleKind, ScheduleRow[]>>
@@ -156,11 +167,28 @@ export function Bim() {
     setIfcSourcePath(null);
     setRoot(null);
     setSelectedId(null);
+    setSelectedKind(null);
     setPsets(EMPTY_PSETS);
     setSchedules({});
     setScheduleHeaders({});
     setFindings([]);
   }, [projectPath]);
+
+  // Tracks whether the page is still mounted. `refreshSpatialTree`
+  // is invoked from async event handlers (Import IFC / Attach
+  // success paths), not from a `useEffect`, so the inline `alive`
+  // flag of the hydrate effect below isn't enough — a project-switch
+  // unmount between the bridge `projectGraphList` resolve and the
+  // `setRoot` call would commit state onto an unmounted component.
+  // `RequireProject` makes the race unreachable today, but the
+  // structural guarantee survives future routing changes (in-page
+  // project picker, multi-pane layout).
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   // Phase 17 Group C Task 16 — hydrate the spatial tree from the
   // project's persisted graph on mount / project switch. The bridge's
@@ -187,6 +215,7 @@ export function Bim() {
       }
       try {
         const rows = await projectGraphList(targetPath);
+        if (!mountedRef.current) return;
         if (getActiveProjectPath() !== targetPath) return;
         const tree = buildSpatialTree(rows);
         setRoot(tree);
@@ -596,8 +625,18 @@ export function Bim() {
     }
   };
 
-  const classification =
-    selectedId === "lvl_l1" ? "IfcBuildingStorey" : selectedId ? "IfcWall" : null;
+  // Classification of the currently selected entity. Sourced from
+  // the spatial tree's mapped `kind` so badges + property-editor
+  // schemas reflect the actual IFC class. The previous revision
+  // hard-coded `selectedId === "lvl_l1" ? "IfcBuildingStorey" :
+  // "IfcWall"`, anchored to the now-deleted `DEMO_ROOT` fixture
+  // id-space (Task 16). Threading the kind through `SpatialTree`'s
+  // `onSelect` callback (and via `findNodeById` for selections that
+  // originate elsewhere, e.g. validator-finding zoomTo) keeps the
+  // badge correct for every IFC class — storeys, sites, buildings,
+  // spaces — instead of mis-labelling everything that isn't the
+  // hard-coded id as "IfcWall".
+  const classification: SpatialNode["kind"] | null = selectedKind;
 
   const scheduleSourcePath = ifcSourcePath ?? "";
   const scheduleOutPathForKind = (kind: ScheduleKind): string =>
@@ -675,7 +714,10 @@ export function Bim() {
         <SpatialTree
           root={root}
           selectedId={selectedId}
-          onSelect={setSelectedId}
+          onSelect={({ id, kind }) => {
+            setSelectedId(id);
+            setSelectedKind(kind);
+          }}
         />
         <PanelResizeHandle
           orientation="vertical"
@@ -773,7 +815,16 @@ export function Bim() {
           sourcePath={ifcSourcePath ?? ""}
           findings={findings}
           onFindings={setFindings}
-          onZoomTo={(id) => setSelectedId(id)}
+          onZoomTo={(id) => {
+            // Validator findings carry only an `entityId`; look up
+            // the matching tree node to recover its IFC `kind`. The
+            // tree may not contain the entity (validator can flag
+            // non-spatial errors), in which case `kind` falls back
+            // to `null` and the classification badge clears.
+            const hit = findNodeById(root, id);
+            setSelectedId(id);
+            setSelectedKind(hit?.kind ?? null);
+          }}
           // Same rationale as `ScheduleView.onError` above: route
           // bridge failures from `ValidatorPanel.revalidate` into
           // the toast system so file-moved / permission-denied /

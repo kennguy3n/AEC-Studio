@@ -119,6 +119,14 @@ export type RenderJob = {
   jobId: string;
   status: "queued" | "running" | "completed" | "failed" | "cancelled";
   preset: string;
+  /**
+   * Progress as a percentage in `[0, 100]`. The Rust napi shim reports
+   * progress on `[0.0, 1.0]`; the bridge boundary
+   * (`apps/desktop/electron/bridge.ts`, `renderListJobs`) scales that
+   * to a percent so every renderer-side consumer (UI overlays, ETA
+   * calculators, test fixtures) operates on the same unit. UI code
+   * that needs a `[0, 1]` fraction divides by 100.
+   */
   progress: number;
   cameraId?: string | null;
   batchId?: string | null;

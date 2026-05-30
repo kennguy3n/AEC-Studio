@@ -24,7 +24,16 @@ export interface SpatialNode {
 interface Props {
   root: SpatialNode | null;
   selectedId: string | null;
-  onSelect: (id: string) => void;
+  /**
+   * Called when the user clicks a row. Receives the row's `id` **and**
+   * the mapped IFC `kind` so the page can derive classification badges
+   * / property-editor schemas directly from the spatial graph without
+   * having to hard-code id→class lookups. The kind comes from
+   * `mapKind()` in `bim-spatial-tree.ts`, which mirrors
+   * `crates/aec_bridge/src/bim_attach.rs` (IFC type names as the
+   * `bim/spatial/<…>` suffix).
+   */
+  onSelect: (node: { id: string; kind: SpatialNode["kind"] }) => void;
 }
 
 export function SpatialTree({ root, selectedId, onSelect }: Props) {
@@ -58,7 +67,7 @@ interface RowProps {
   node: SpatialNode;
   depth: number;
   selectedId: string | null;
-  onSelect: (id: string) => void;
+  onSelect: (node: { id: string; kind: SpatialNode["kind"] }) => void;
 }
 
 function SpatialNodeRow({ node, depth, selectedId, onSelect }: RowProps) {
@@ -71,7 +80,7 @@ function SpatialNodeRow({ node, depth, selectedId, onSelect }: RowProps) {
         type="button"
         className={`bim-spatial__btn${isSelected ? " bim-spatial__btn--selected" : ""}`}
         style={{ paddingLeft: `${depth * 12 + 4}px` }}
-        onClick={() => onSelect(node.id)}
+        onClick={() => onSelect({ id: node.id, kind: node.kind })}
         data-testid={`spatial-node-${node.id}`}
       >
         {hasChildren && (
