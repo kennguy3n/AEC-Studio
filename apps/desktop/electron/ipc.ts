@@ -1153,6 +1153,17 @@ export function registerIpcHandlers(): void {
   ipcMain.handle("viewport:requestFrame", async () =>
     getBridge().viewportRequestFrame(),
   );
+  // Phase 17 Task 21 — RGBA8 pixel readback for the renderer's
+  // canvas paint loop. The bridge returns either a `{ bytes,
+  // width, height, frameIndex }` payload (where `bytes` is a Node
+  // Buffer wrapping a zero-copy view into the Rust Vec<u8>) or
+  // `null` (= "viewport not sized yet" — the renderer falls back
+  // to the unavailable overlay). No payload validation is required:
+  // there are no input params and the bridge's return shape is
+  // exhaustively pinned by the BridgeBackend / AecApi interfaces.
+  ipcMain.handle("viewport:readFrameBuffer", async () =>
+    getBridge().viewportReadFrameBuffer(),
+  );
 }
 
 // ----- validation helpers (small, real, not stubs) -----

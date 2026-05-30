@@ -828,6 +828,13 @@ export interface BridgeBackend {
    *  pixel bytes live in the bridge's surface manager and are
    *  picked up by the desktop shell out-of-band. */
   viewportRequestFrame(): Promise<ViewportFrameReport>;
+  /** Phase 17 Task 21 — read the current viewport's RGBA8 pixel
+   *  buffer. Returns `null` until the viewport has been resized.
+   *  The `bytes` field is a zero-copy view into a Rust Vec<u8>
+   *  (napi external Buffer); the renderer's rAF canvas-paint loop
+   *  reads it directly. `frameIndex` is monotonic and coalesces
+   *  on idle so the paint loop can skip duplicate writes. */
+  viewportReadFrameBuffer(): Promise<ViewportFrameBuffer | null>;
 }
 
 /**
@@ -913,6 +920,29 @@ export interface ViewportCameraReport {
   target: [number, number, number];
   up: [number, number, number];
   fov_y_radians: number;
+}
+
+/** Result of `viewportReadFrameBuffer` (Phase 17 Task 21).
+ *
+ *  The `bytes` field is a `Uint8Array` view into a zero-copy
+ *  napi-external buffer. The renderer should treat it as
+ *  *read-only* — mutating it from JS is technically allowed but
+ *  pointless (the next frame allocates a fresh buffer).
+ *
+ *  `width` and `height` are the viewport dimensions at the moment
+ *  the bridge produced the frame; the renderer should always pass
+ *  them to `ctx.putImageData` rather than its own cached size in
+ *  case a resize raced the readback.
+ *
+ *  `frameIndex` is monotonic and coalesces on idle — the renderer
+ *  compares it against its last-painted index and skips the canvas
+ *  write when they match.
+ */
+export interface ViewportFrameBuffer {
+  bytes: Uint8Array;
+  width: number;
+  height: number;
+  frameIndex: number;
 }
 
 /** Result of `viewportRequestFrame`. */
@@ -2087,6 +2117,14 @@ interface NativeApi {
     delta?: number;
   }): unknown;
   viewport_request_frame(): unknown;
+  // Phase 17 Task 21 — RGBA8 pixels for the current viewport
+  // (read back from the off-screen surface). The native side
+  // returns `Option<{ bytes, width, height, frame_index }>` as a
+  // zero-copy `Buffer::from_data` so V8 owns a view into the Rust
+  // allocation; the renderer's rAF canvas paint loop reads it
+  // directly. Typed `unknown` like the other viewport calls so the
+  // adaptor below is the single place that pins the runtime shape.
+  viewport_read_frame_buffer(): unknown;
 }
 
 /**
@@ -2259,6 +2297,11 @@ export const NATIVE_WIRED_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   "viewportResize",
   "viewportInput",
   "viewportRequestFrame",
+  // Phase 17 Task 21 — pixel readback for the renderer's canvas
+  // paint loop. Lives on the same `ViewportService` as the four
+  // calls above so the read returns the same camera state the
+  // bridge just observed.
+  "viewportReadFrameBuffer",
 ];
 
 /**
@@ -3264,6 +3307,30 @@ function adaptNative(n: NativeApi): BridgeBackend {
         height: raw.height,
         state: raw.state as ViewportFrameReport["state"],
         cameraJson: raw.cameraJson,
+      };
+    },
+    // Phase 17 Task 21 — RGBA8 pixel readback. The native side
+    // returns `Option<{ bytes: Buffer, width, height, frame_index }>`.
+    // `bytes` is a Node `Buffer` (which is a subclass of `Uint8Array`)
+    // wrapping the Rust `Vec<u8>` zero-copy, so we hand it through
+    // unchanged. `null` propagates as `null` (= "viewport not sized
+    // yet" — the renderer shows the unavailable overlay).
+    viewportReadFrameBuffer: async () => {
+      const raw = n.viewport_read_frame_buffer() as
+        | {
+            bytes: Buffer;
+            width: number;
+            height: number;
+            frameIndex: number;
+          }
+        | null
+        | undefined;
+      if (!raw) return null;
+      return {
+        bytes: raw.bytes,
+        width: raw.width,
+        height: raw.height,
+        frameIndex: raw.frameIndex,
       };
     },
   };
@@ -4388,6 +4455,11 @@ export function inProcessBackend(): BridgeBackend {
         fov_y_radians: Math.PI / 3,
       }),
     }),
+    // Phase 17 Task 21 — no GPU + no readback in the in-process
+    // fallback. Returning `null` is the explicit "viewport not
+    // available" signal; the renderer renders the unavailable
+    // overlay rather than a fabricated frame.
+    viewportReadFrameBuffer: async () => null,
   };
 }
 

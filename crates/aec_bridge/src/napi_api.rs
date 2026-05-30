@@ -3490,6 +3490,41 @@ pub fn viewport_status() -> Result<ViewportStatusJs> {
     Ok(viewport_status_to_js(rep))
 }
 
+/// JS-facing viewport frame buffer payload. Phase 17 Group D Task 21.
+///
+/// The `bytes` field wraps the Rust `Vec<u8>` via `Buffer::from_data`
+/// so V8 owns a zero-copy view into the allocation — no per-frame
+/// memcpy of the RGBA pixels across the JS boundary. The buffer is
+/// freed when V8 garbage-collects the wrapper, so the renderer can
+/// keep the bytes around for as long as its canvas-paint loop needs
+/// without an explicit handle to drop.
+///
+/// `frame_index` is monotonic across calls for a given viewport size
+/// and increments only when the camera state changes (frame
+/// coalescing). The renderer's rAF loop compares the value to its
+/// last painted index and skips the `putImageData` when they match.
+#[napi(object)]
+pub struct ViewportFrameBufferJs {
+    pub bytes: napi::bindgen_prelude::Buffer,
+    pub width: u32,
+    pub height: u32,
+    pub frame_index: f64,
+}
+
+/// Read the current viewport's CPU-side RGBA8 frame buffer. Returns
+/// `None` when the viewport has not been resized yet (the bridge
+/// treats the "no surface" case as "show the unavailable overlay").
+#[napi]
+pub fn viewport_read_frame_buffer() -> Result<Option<ViewportFrameBufferJs>> {
+    let opt = with_service_ref(super::service::BridgeService::viewport_read_frame_buffer)?;
+    Ok(opt.map(|fb| ViewportFrameBufferJs {
+        width: fb.width,
+        height: fb.height,
+        frame_index: fb.frame_index as f64,
+        bytes: fb.pixels.into(),
+    }))
+}
+
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
     if s.len() % 2 != 0 {
         return None;

@@ -12,6 +12,7 @@ pub mod camera;
 pub mod csm;
 pub mod culling;
 pub mod draft_2d;
+pub mod frame_buffer;
 pub mod gizmo;
 pub mod grid;
 pub mod instancing;
@@ -37,6 +38,7 @@ pub use cad_canvas::{
 pub use camera::{Camera, CameraMode, OrbitController, Ray};
 pub use csm::{CascadeSlice, CsmParams, CsmSplit};
 pub use culling::{cull_visible, project_for_hiz, Aabb, Frustum, HiZQuery, Plane};
+pub use frame_buffer::{render_horizon_frame, FrameBuffer};
 pub use gizmo::{GizmoAxis, GizmoMode, TransformGizmo};
 pub use grid::{Grid, GridStyle};
 pub use instancing::{Instance, InstanceBatch};

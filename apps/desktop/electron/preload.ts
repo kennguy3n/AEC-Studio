@@ -782,6 +782,22 @@ const api = {
         state: "presented" | "coalesced" | "unavailable";
         cameraJson: string;
       }>,
+    // Phase 17 Task 21 — RGBA8 pixel buffer for the renderer's
+    // canvas paint loop. Resolves to `null` when no frame is
+    // available (viewport not sized yet, in-process fallback, or
+    // no GPU); resolves to an opaque pixel buffer otherwise.
+    // `bytes` is a Node `Buffer` (subclass of `Uint8Array`) wrapping
+    // a zero-copy view of the Rust `Vec<u8>` — the renderer should
+    // treat it as read-only and pass it directly to
+    // `new ImageData(new Uint8ClampedArray(bytes), width, height)`
+    // for `ctx.putImageData`.
+    readFrameBuffer: () =>
+      ipcRenderer.invoke("viewport:readFrameBuffer") as Promise<{
+        bytes: Uint8Array;
+        width: number;
+        height: number;
+        frameIndex: number;
+      } | null>,
   },
 };
 
