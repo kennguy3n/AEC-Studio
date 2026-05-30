@@ -586,6 +586,8 @@ User selects artifact → "Publish to KChat" → preview card → confirm → KC
 
 Publishing is one-way (AEC Studio → KChat). Comments and approvals can sync back as audit-trail entries, but no geometry or schedule is mutated by KChat actions.
 
+The integration is implemented as a 127.0.0.1-only HTTP API on AEC Studio's Electron main process (bearer + Host-header SSRF guard + 64 KiB body cap, with the port and bearer published to an atomic-rename `0600` discovery file at `{userData}/aec-kchat-port.json`) plus a signed `.kcz` companion extension that runs inside KChat Desktop's Extension Platform sandbox and is the only thing that talks to the loopback API. Comment sync back works the same way — the `.kcz` extension `POST`s into the loopback `/api/review-comments` route, which writes each comment into the project's audit chain (no geometry or schedule is mutated). AEC Studio also registers `aecstudio://` as a default protocol client (with a single-instance lock, `second-instance` / `open-url` handlers, and pre-ready deeplink buffering) so deeplinks like `aecstudio://review?thread=<id>` route the user to the right artifact, and a rate-limited `kchat:openInDesktop` IPC navigates outbound `kchat://app/conversation/<id>` URLs through `shell.openExternal()`. The technical design is in [ARCHITECTURE.md §9.6](ARCHITECTURE.md#96-kchat-integration--phase-15--loopback-http---kcz-extension); the wire schema is in [`docs/KCHAT_LOOPBACK_API.md`](docs/KCHAT_LOOPBACK_API.md) and the extension internals are in [`docs/KCHAT_EXTENSION.md`](docs/KCHAT_EXTENSION.md).
+
 ---
 
 ## Licensing and compliance strategy
