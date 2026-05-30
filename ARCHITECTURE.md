@@ -677,6 +677,111 @@ For the canonical wire schema and operational notes see [`docs/KCHAT_LOOPBACK_AP
 
 ---
 
+## 9.7 Extension system (Phase 8 + Phase 16 diagnostics)
+
+Extensions ship as Ed25519-signed third-party packages discovered under the user's
+`{userData}/extensions/` directory (or the path passed to `BridgeService::with_extensions_dir`).
+Each extension declares one or more contributions — asset packs, project templates, schedule
+templates, export targets, AI tools, importers — and a typed permission set
+(`GeometryRead` / `GeometryWrite` / `FilesystemRead` / `FilesystemWrite` / `NetworkOut` / …) that
+the bridge clamps every host call against.
+
+### Boot model: fault-tolerant by construction
+
+The bridge boot path **must** continue successfully even if every installed extension is broken.
+A drafter sitting down to open a project should never be blocked by an unrelated malformed
+manifest or invalid signature. This fault-tolerance is structural: it lives in
+`aec_core::extensions::load_with_diagnostics`, the loader the bridge uses at boot.
+
+```
+aec_core::extensions::load_with_diagnostics(extensions_dir)
+  → (ExtensionRegistry, Vec<ExtensionLoadDiagnostic>)
+```
+
+The loader walks every extension directory, attempts to parse / validate / verify each one in
+isolation, and accumulates failures into the diagnostics vector instead of aborting the whole
+load. The strict variant (`ExtensionLoader::load`) is still available for callers that genuinely
+need a single-success-or-failure contract (CLI install tooling, signed-pack verifier).
+
+### `ExtensionLoadDiagnostic` wire format
+
+Each diagnostic captures:
+
+- `extensionId` — populated when the manifest parsed far enough to expose `id`; absent for
+  pre-parse failures like `manifest_read`.
+- `path` — filesystem path of the extension directory or manifest, for human-debug.
+- `stage` — wire-stable string identifier of the failure stage. Stable values:
+  - `manifest_read` — `manifest.json` not found or unreadable
+  - `manifest_parse` — JSON parse failed
+  - `manifest_validation` — schema validation (missing required fields, bad shapes)
+  - `unsafe_path` — manifest declares a path that escapes the extension directory
+  - `signature_verification` — Ed25519 verification failed (or signature absent in a build
+    that requires signatures)
+  - `duplicate_id` — another extension already claimed this id
+  - `asset_pack_install` — asset-pack contribution failed to install into the asset DB
+  - `ai_tool_resolution` — AI-tool contribution's `grammar_key` doesn't match a host schema
+    or its declared scopes are disjoint from the host cap
+- `message` — human-readable error message; not wire-stable across versions.
+
+Wire strings are produced by `ExtensionLoadStage::as_wire_str()` and are part of the public
+N-API surface — renderer code can match on them safely. Adding new stages is additive; renaming
+or removing existing stages is a breaking change.
+
+### Three boot-stage capture points
+
+`BridgeService` buffers diagnostics from three independent sources in order during boot:
+
+1. **Loader stage** — `load_with_diagnostics` returns per-directory failures for manifest read /
+   parse / validation, unsafe paths, signature verification, and duplicate ids.
+2. **Asset-pack install stage** — `aec_assets::install_asset_packs_collect_errors` returns
+   per-extension failure tuples instead of the older single `Result<()>`, so a transient SQLite
+   error during one extension's install doesn't prevent the others from installing or hide
+   diagnostics for the survivors.
+3. **AI-tool resolution stage** — When any `AiTool`-type contribution is present, the bridge
+   pre-walks `aec_ai::list_extension_ai_tools(&registry, &enforcer)` at boot to surface tools
+   whose `grammar_key` is unknown to the host (`canonical_builtin_for_grammar_key` returns
+   `None`) or whose declared scopes have no intersection with the host cap. These tools are
+   filtered out of `ai_list_tools` at runtime; surfacing the diagnostic at boot lets a
+   developer or extension author see the mismatch before the user notices a "missing tool".
+
+The buffered diagnostics are exposed via `BridgeService::extension_load_diagnostics()`.
+
+### IPC surface: `extensions:listLoadDiagnostics`
+
+The `extensions:` IPC namespace was introduced in Phase 16 specifically for extension-system
+diagnostics (it is independent of `kchat:`, `bim:`, `design:` etc. — each subsystem owns its
+own namespace). Initial surface:
+
+| IPC channel | Handler returns | Renderer accessor |
+|---|---|---|
+| `extensions:listLoadDiagnostics` | `ExtensionLoadDiagnostic[]` (empty when boot was clean) | `bridge.extensionsListLoadDiagnostics()` / `aec.extensions.listLoadDiagnostics()` |
+
+The N-API path is sync (`extension_load_diagnostics()` on the bridge); the JS adapter wraps it
+in an `async` function for IPC-handler ergonomics, since the buffered vector is a trivial
+slice copy where the vector is empty in the vast majority of production boots.
+
+### Renderer surface
+
+The Settings page (`apps/desktop/renderer/src/pages/Settings.tsx`) renders a read-only
+"Extension load diagnostics" card with human-readable stage labels (`Manifest read failed`,
+`Signature verification failed`, `Asset pack install failed`, `AI tool resolution failed`, …),
+the offending extension id (when known), and the source path. The card is hidden when the
+diagnostics list is empty, so the common case adds zero visual cost. This is intentionally
+observational — there is no remediation UI in the renderer; the user is expected to fix the
+extension directory and restart the app.
+
+### Compatibility and future work
+
+- `ExtensionLoadStage` wire strings are stable; adding new variants is additive.
+- The diagnostics vector is captured once at boot and never mutated thereafter; reloading
+  extensions at runtime is out of scope for Phase 16.
+- `load_single_extension` deliberately duplicates the per-directory body of
+  `ExtensionLoader::load` so the strict + tolerant loaders can diverge on failure semantics
+  without obscuring either contract. The duplication is documented in-line as a maintenance
+  hazard to revisit if a third loader variant appears.
+
+---
+
 ## 10.1 Resource governor
 
 ```

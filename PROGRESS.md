@@ -560,6 +560,42 @@ This document tracks AEC Studio's phased delivery from open-source foundation to
 
 ---
 
+## Phase 16 — Per-extension boot diagnostics IPC
+
+**Status:** `DONE`
+
+**Goal:** Address the Phase 14 follow-up that broken extensions failed silently at bridge boot. The Phase 12–15 boot path used `unwrap_or_default()` on the registry load and `let _ =` on asset-pack install errors (`crates/aec_bridge/src/service.rs:1428-1466` pre-Phase 16), with an inline TODO that production builds should surface these failures through a dedicated diagnostics IPC. Phase 16 ships that IPC end to end: per-extension load diagnostics are captured at three boot stages (manifest parse / validation / signature, asset-pack install, AI-tool resolution), buffered on `BridgeService`, exported through N-API + a new `extensions:` IPC namespace, and surfaced as a read-only diagnostics card on the Settings page. Fault tolerance is the load-bearing property: broken extension manifests never block renderer boot or core functionality; the diagnostics surface is purely observational.
+
+### Build
+
+| Item | Status |
+|---|---|
+| `aec_core::extensions::ExtensionLoadStage` enum with 8 wire-stable variants (`manifest_read`, `manifest_parse`, `manifest_validation`, `unsafe_path`, `signature_verification`, `duplicate_id`, `asset_pack_install`, `ai_tool_resolution`) + `as_wire_str()` accessor | `DONE` |
+| `aec_core::extensions::ExtensionLoadDiagnostic` struct (extension id when knowable, source path, stage, human-readable message) | `DONE` |
+| `aec_core::extensions::load_with_diagnostics()` fault-tolerant loader returning `(ExtensionRegistry, Vec<ExtensionLoadDiagnostic>)` instead of erroring on the first malformed manifest; covers manifest read / parse / validation / unsafe-path / signature-verification / duplicate-id failures per extension directory | `DONE` |
+| `aec_assets::install_asset_packs_collect_errors()` fault-tolerant variant returning per-extension failure tuples (vs. the previous single `Result<()>`) so a DB-corruption-mid-install case surfaces N rows instead of one | `DONE` |
+| `BridgeService::extension_load_diagnostics: Vec<ExtensionLoadDiagnostic>` buffered at boot from three stages (loader → asset-pack install → AI-tool resolver pre-walk); public `extension_load_diagnostics() -> &[ExtensionLoadDiagnostic]` getter | `DONE` |
+| N-API export `ExtensionLoadDiagnosticJs` `#[napi(object)]` struct (snake_case → camelCase auto-conversion) + `extension_load_diagnostics()` napi method on the bridge | `DONE` |
+| Electron IPC `extensions:listLoadDiagnostics` handler in `apps/desktop/electron/ipc.ts` (new top-level `extensions:` namespace, independent of `kchat:`) | `DONE` |
+| `BridgeBackend.extensionsListLoadDiagnostics()` interface + adapter in `apps/desktop/electron/bridge.ts`; `ExtensionLoadDiagnostic` TS interface mirrors the N-API wire shape | `DONE` |
+| `aec.extensions.listLoadDiagnostics()` typed surface in `apps/desktop/electron/preload.ts` | `DONE` |
+| Settings page (`apps/desktop/renderer/src/pages/Settings.tsx`) renders a read-only "Extension load diagnostics" card with human-readable stage labels (`Manifest read failed`, `Signature verification failed`, …); card is hidden when the diagnostics list is empty | `DONE` |
+| 6 unit tests on `load_with_diagnostics` in `aec_core` (happy path + each failure stage) | `DONE` |
+| 2 integration tests in `crates/aec_bridge/tests/extension_load_diagnostics.rs` (full bridge boot + diagnostics roundtrip through `extension_load_diagnostics()` getter) | `DONE` |
+| Renderer tests in `apps/desktop/renderer/src/__tests__/Settings.test.tsx` cover the diagnostics card render path | `DONE` |
+
+### Exit criteria
+
+- [x] Broken extension manifests, invalid signatures, asset-pack install failures, and AI-tool resolution failures are captured as individual `ExtensionLoadDiagnostic` entries instead of being silently dropped by `unwrap_or_default()` / `let _ =`.
+- [x] Bridge boot continues to succeed regardless of how many extensions fail to load; fault tolerance is preserved.
+- [x] Wire-format strings produced by `ExtensionLoadStage::as_wire_str()` are stable and exhaustively documented in the enum definition.
+- [x] `BridgeService::extension_load_diagnostics()` returns the buffered diagnostics in order across the three boot stages.
+- [x] Electron `extensions:listLoadDiagnostics` IPC returns the same diagnostics to the renderer via `aec.extensions.listLoadDiagnostics()`.
+- [x] Settings page renders the diagnostics card when at least one diagnostic is present and stays hidden when the list is empty.
+- [x] `cargo test` (aec_core + aec_bridge + aec_assets), `cargo clippy -D warnings`, `cargo fmt --check`, `npm test --workspaces`, `npm run lint`, and `tsc` against both `tsconfig.json` and `tsconfig.electron.json` all pass.
+
+---
+
 ## Phase 7 — Optional KChat integration
 
 **Status:** `DONE`
@@ -655,6 +691,17 @@ AEC Studio's UI follows the **KChat design system** — primary accent `#7C3AED`
 ---
 
 ## Changelog
+
+### 2026-05-29 (Phase 16 — per-extension boot diagnostics IPC, PR #80)
+
+- **Finding from Phase 14 / PR #73 Devin Review.** Bridge boot used `unwrap_or_default()` on the registry load and `let _ =` on asset-pack install errors (`crates/aec_bridge/src/service.rs:1428-1466` pre-Phase 16), with an inline TODO that production builds should surface these failures through a dedicated diagnostics IPC. A user with a broken `manifest.json`, an invalid Ed25519 signature, or a duplicate-id collision saw zero indication their extension had failed to load — only that "my extension isn't showing up". Phase 16 ships that diagnostics IPC end to end.
+- **Fault-tolerant loader (`crates/aec_core/src/extensions.rs`).** New `load_with_diagnostics()` returns `(ExtensionRegistry, Vec<ExtensionLoadDiagnostic>)` instead of erroring on the first malformed manifest. Each `ExtensionLoadDiagnostic` carries the extension id (when knowable from the partially-parsed manifest), the source path, an `ExtensionLoadStage` (one of `manifest_read`, `manifest_parse`, `manifest_validation`, `unsafe_path`, `signature_verification`, `duplicate_id`, `asset_pack_install`, `ai_tool_resolution` — wire-stable via `as_wire_str()`), and a human-readable error message. Helper `load_single_extension` deliberately duplicates the per-directory body of `ExtensionLoader::load` so the strict + tolerant loaders can diverge on failure semantics without obscuring either contract; the duplication is documented in-line as a maintenance hazard to revisit if a third loader variant appears.
+- **Fault-tolerant asset-pack install (`crates/aec_assets/src/extension_host.rs`).** New `install_asset_packs_collect_errors()` variant returns per-extension failure tuples instead of a single `Result<()>`. A DB-unreachable failure is captured once at the outer `with_db_mut` boundary; a DB-corruption-mid-install case (extremely unlikely in practice but covered defensively) surfaces N rows for N affected extensions.
+- **Boot capture (`crates/aec_bridge/src/service.rs`).** `BridgeService` gains an `extension_load_diagnostics: Vec<ExtensionLoadDiagnostic>` field populated in order from three boot stages: (1) the fault-tolerant loader, (2) the asset-pack install pass, (3) the AI-tool resolver pre-walk (which runs unconditionally at boot when any `AiTool`-type extension is present and produces diagnostics for tools whose `grammar_key` doesn't match a host schema or whose scopes are disjoint from the cap). Public getter `extension_load_diagnostics() -> &[ExtensionLoadDiagnostic]`.
+- **N-API + IPC plumbing.** `crates/aec_bridge/src/napi_api.rs` exports `ExtensionLoadDiagnosticJs` (`#[napi(object)]` struct, snake_case → camelCase auto-conversion) and the `extension_load_diagnostics()` napi method on the bridge. `apps/desktop/electron/ipc.ts` registers a new top-level `extensions:` namespace (independent of `kchat:`; each subsystem owns its own namespace) with a single handler `extensions:listLoadDiagnostics`. `apps/desktop/electron/bridge.ts` declares the `ExtensionLoadDiagnostic` TS interface + `BridgeBackend.extensionsListLoadDiagnostics()` contract and adapter. `apps/desktop/electron/preload.ts` adds the typed `aec.extensions.listLoadDiagnostics()` surface.
+- **Renderer (`apps/desktop/renderer/src/pages/Settings.tsx`).** Read-only "Extension load diagnostics" card with human-readable stage labels (`Manifest read failed`, `Signature verification failed`, `Asset pack install failed`, `AI tool resolution failed`, etc.) plus the extension id and source path. Card is hidden when the diagnostics list is empty — zero visual cost in the common case.
+- **Tests.** New: 6 unit tests in `aec_core::extensions` (happy path + each failure stage), 2 integration tests in `crates/aec_bridge/tests/extension_load_diagnostics.rs` (full bridge boot + diagnostics roundtrip through the `extension_load_diagnostics()` getter), and renderer tests in `apps/desktop/renderer/src/__tests__/Settings.test.tsx` covering the diagnostics card render path. All gates green: `cargo fmt --check` (rustfmt 1.96), `cargo clippy -D warnings`, `cargo test` (aec_core + aec_bridge + aec_assets), `npm test --workspaces`, `npm run lint`, `tsc -p tsconfig.json`, `tsc -p tsconfig.electron.json`. GitHub CI: 5/5 checks passing.
+- **Fault tolerance contract preserved.** Broken extension manifests, invalid signatures, duplicate ids, asset-pack install failures, and AI-tool resolution failures all surface as diagnostics — but none of them block bridge boot or core functionality. The diagnostics surface is purely observational; the renderer continues to function without any extensions loaded.
 
 ### 2026-05-29 (Phase 15 — KChat replatform: loopback HTTP API + `.kcz` companion extension + `aecstudio://` deeplinks)
 
