@@ -460,6 +460,24 @@ export interface BridgeBackend {
       fix: string | null;
     }>;
   }>;
+  /** Read the output image bytes for a completed render job. */
+  renderGetOutputImage(params: { jobId: string }): Promise<RenderOutputImage>;
+  /** Compute SSIM between two completed render jobs' output images. */
+  renderCompareSsim(params: {
+    aJobId: string;
+    bJobId: string;
+  }): Promise<RenderCompareResult>;
+  /**
+   * Set the HDRI environment map used by future renders. Pass `null`
+   * for `path` to fall back to the procedural Hosek-Wilkie sky. The
+   * `path` field is required (not optional) — callers must explicitly
+   * communicate "no environment" via `null` so the IPC boundary at
+   * `ipc.ts:515` can distinguish "clear" from "leave unchanged".
+   */
+  renderSetEnvironmentMap(params: {
+    path: string | null;
+    intensity?: number;
+  }): Promise<{ ok: true }>;
 
   aiListTools(): Promise<AiTool[]>;
   /**
@@ -1046,6 +1064,32 @@ export interface RenderJob {
   cameraId?: string | null;
   /** Batch id when this job was submitted as part of a batch. */
   batchId?: string | null;
+  /** ISO-8601 timestamp when the renderer started this job. `null` if still queued. */
+  startedAt?: string | null;
+  /** ISO-8601 timestamp when the renderer finished this job. `null` while running. */
+  completedAt?: string | null;
+  /** Absolute path to the output image on disk. `null` until status is `completed`. */
+  outputPath?: string | null;
+}
+
+/**
+ * Raw image bytes for a completed render job. Returned by
+ * `aec.render.getOutputImage({ jobId })` so the renderer can display
+ * the result without re-rendering.
+ */
+export interface RenderOutputImage {
+  jobId: string;
+  path: string;
+  /** Raw PNG/JPEG bytes; renderer base64-encodes for `<img src=...>`. */
+  bytes: Uint8Array;
+}
+
+/** Result of `aec.render.compareSsim({ aJobId, bJobId })`. */
+export interface RenderCompareResult {
+  aJobId: string;
+  bJobId: string;
+  /** SSIM in [-1, 1]; ~1 means visually indistinguishable. */
+  ssim: number;
 }
 
 export interface RuntimeStatus {
@@ -1647,6 +1691,27 @@ interface NativeApi {
   render_apply_preset(preset_id: string): unknown;
   render_diagnose(job_id: string): unknown;
   render_check_materials(): unknown;
+  // Phase 17 — read back a completed render's output image and
+  // compute SSIM between two completed jobs; surface HDRI env map
+  // selection. All three are `#[napi]`-exported from
+  // `crates/aec_bridge/src/napi_api.rs`. `render_get_output_image`
+  // and `render_compare_ssim` are declared `#[napi] pub async fn`
+  // there (routed through `spawn_blocking_napi` so the multi-MB PNG
+  // read and the O(width·height) SSIM compute don't block the libuv
+  // main thread) — so their N-API surface returns a `Promise`, not
+  // a plain object. We type them as `Promise<unknown>` here so the
+  // bridge wrapper's `await` is correctly typed; without this, TS
+  // would treat the awaited value as a no-op on the `unknown`
+  // return and the renderer would receive an unresolved Promise.
+  // `render_set_environment_map` stays synchronous because the
+  // service-side method only validates and stashes a path; no I/O
+  // runs until the next `render_enqueue`.
+  render_get_output_image(job_id: string): Promise<unknown>;
+  render_compare_ssim(a_job_id: string, b_job_id: string): Promise<unknown>;
+  render_set_environment_map(
+    path: string | null,
+    intensity: number | null,
+  ): unknown;
   // Export domain — wired in PR-S. Each takes a typed params object
   // (`#[napi(object)]` struct in `napi_api.rs`) so the renderer can
   // pass the same `Record<string, unknown>` shape it already uses
@@ -1860,6 +1925,13 @@ export const NATIVE_WIRED_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   "renderApplyPreset",
   "renderDiagnose",
   "renderCheckMaterials",
+  // Phase 17: read-back of completed render output (`render:getOutputImage`)
+  // and SSIM comparison (`render:compareSsim`) wired to the new
+  // `aec_render::compare` module via `BridgeService::render_get_output_image`
+  // and `BridgeService::render_compare_ssim`.
+  "renderGetOutputImage",
+  "renderCompareSsim",
+  "renderSetEnvironmentMap",
   // Export + deliver domain wired in PR-S. Each delegates to a real
   // `#[napi]` export in `crates/aec_bridge/src/napi_api.rs` that
   // routes through `aec_export::write_*`. Output files are real
@@ -2183,6 +2255,58 @@ function adaptNative(n: NativeApi): BridgeBackend {
           fix: string | null;
         }>;
       },
+    // Phase 17 — render output read-back + SSIM compare. The native
+    // call returns `{ jobId, path, bytes: Buffer }`; we narrow to the
+    // typed bridge surface so renderer consumers get a `Uint8Array`
+    // without an `as unknown` round-trip.
+    renderGetOutputImage: async (params) => {
+      // `n.render_get_output_image` is `#[napi] pub async fn` on the
+      // Rust side (see `napi_api.rs`), so it returns a `Promise` that
+      // resolves to the NAPI-side `{ jobId, path, bytes }` shape.
+      // Awaiting before narrowing surfaces the resolved value to the
+      // typed bridge surface; without the `await`, the renderer would
+      // receive an unresolved `Promise` that fails any subsequent
+      // `.bytes` access.
+      const out = (await n.render_get_output_image(params.jobId)) as {
+        jobId: string;
+        path: string;
+        bytes: Uint8Array;
+      };
+      return out;
+    },
+    renderCompareSsim: async (params) =>
+      // `n.render_compare_ssim` is `#[napi] pub async fn` on the Rust
+      // side too — await before narrowing for the same reason as
+      // `renderGetOutputImage` above.
+      (await n.render_compare_ssim(params.aJobId, params.bJobId)) as {
+        aJobId: string;
+        bJobId: string;
+        ssim: number;
+      },
+    // Phase 17 — HDRI environment map setter. The native side
+    // stores the path on the active project's render-state so the
+    // next `renderEnqueue` builds a `PathTraceScene` whose
+    // environment is the importance-sampled HDRI rather than the
+    // procedural Hosek-Wilkie sky.
+    renderSetEnvironmentMap: async (params) => {
+      const path = typeof params.path === "string" ? params.path : null;
+      const intensity =
+        typeof params.intensity === "number" && Number.isFinite(params.intensity)
+          ? params.intensity
+          : null;
+      // The Rust binding is `#[napi] pub fn render_set_environment_map(...)
+      // -> Result<()>` — it returns `undefined` on success and
+      // throws on validation failure (unsupported path extension,
+      // unreadable file, malformed RGBE/EXR bytes), so the discarded
+      // return value carries no signal. The previous `as { ok: true }`
+      // cast on the discarded return implied a contract the binding
+      // never provided; dropping it removes the misleading type
+      // assertion while preserving the renderer-facing shape
+      // (`Promise<{ ok: true }>`) which we synthesise below to give
+      // the UI a uniform success ack.
+      n.render_set_environment_map(path, intensity);
+      return { ok: true };
+    },
     // Export + deliver — typed params struct on the Rust side
     // (`ExportPdfParamsJs` etc.), so we forward the renderer's
     // `Record<string, unknown>` verbatim. The N-API layer applies
@@ -3342,6 +3466,51 @@ export function inProcessBackend(): BridgeBackend {
       // RenderScene + material library; the in-process backend has no
       // scene state, so it returns an empty findings array.
       return { findings: [] };
+    },
+    async renderGetOutputImage(params) {
+      // The in-process backend never writes a real PNG to disk, so
+      // any attempt to read back the output should fail the same way
+      // the native bridge does for a job that hasn't produced output.
+      // Match the wording so renderer error-handling code can rely
+      // on a single shape.
+      const j = jobs.find((x) => x.jobId === params.jobId);
+      if (!j) {
+        throw new Error(`render job '${params.jobId}' not found`);
+      }
+      if (!j.outputPath) {
+        throw new Error(`render job '${params.jobId}' has no output yet`);
+      }
+      // Even when an outputPath is set for the in-process backend
+      // (e.g. a deterministic fixture path injected by a test), we
+      // don't actually read the filesystem here — that would couple
+      // the dev/Vitest fallback to a non-existent file. Tests that
+      // exercise this path should mock `aec.render.getOutputImage`
+      // directly.
+      throw new Error(
+        "renderGetOutputImage: in-process backend does not read from disk; mock the bridge call in tests",
+      );
+    },
+    async renderCompareSsim(params) {
+      // The in-process backend has no rendered output to compare;
+      // surfacing a clear error is preferable to returning a
+      // fabricated SSIM value that would mislead callers in dev.
+      const a = jobs.find((x) => x.jobId === params.aJobId);
+      const b = jobs.find((x) => x.jobId === params.bJobId);
+      if (!a) {
+        throw new Error(`render job '${params.aJobId}' not found`);
+      }
+      if (!b) {
+        throw new Error(`render job '${params.bJobId}' not found`);
+      }
+      throw new Error(
+        "renderCompareSsim: in-process backend has no rendered output; mock the bridge call in tests",
+      );
+    },
+    async renderSetEnvironmentMap(_params) {
+      // The in-process backend has no path tracer to reconfigure;
+      // accept the call so the renderer can wire the UI without
+      // gating on the native bridge.
+      return { ok: true };
     },
 
     async aiListTools() {

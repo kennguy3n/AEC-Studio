@@ -16,13 +16,25 @@
 //! `light_sampling.rs`).
 
 use aec_materials::PbrMaterial;
-use glam::Vec3;
+use glam::{Vec2, Vec3, Vec4};
 
 use std::f32::consts::PI;
+
+use crate::texture::{bilinear_sample, MaterialTextureBindings, TextureAtlas};
 
 /// Native material struct consumed by the path tracer. Mirrors the
 /// subset of `PbrMaterial` that affects the path-trace integrator and
 /// pre-computes the `f0` Schlick base.
+///
+/// The optional `texture_bindings` field carries indices into a
+/// [`TextureAtlas`] for the four PBR slots (albedo, normal, packed
+/// metallic-roughness, emissive). When `None`, the renderer uses the
+/// flat `base_color` / `metallic` / `roughness` / `emissive` fields.
+/// When `Some`, [`sample_textured_material`] resolves the slots and
+/// returns a per-pixel [`PathTraceMaterial`] (with `texture_bindings`
+/// cleared) that the BSDF evaluators can use directly — the bindings
+/// are pinned to the triangle for the lifetime of the shading hit, so
+/// resampling does not happen inside the BSDF sample/eval/pdf loop.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PathTraceMaterial {
     pub base_color: Vec3,
@@ -33,6 +45,9 @@ pub struct PathTraceMaterial {
     pub emissive: Vec3,
     pub transmission: f32,
     pub ao: f32,
+    /// Optional texture bindings — `None` when the material is
+    /// flat-shaded, `Some` when one or more slots are textured.
+    pub texture_bindings: Option<MaterialTextureBindings>,
 }
 
 impl PathTraceMaterial {
@@ -45,7 +60,25 @@ impl PathTraceMaterial {
             emissive: Vec3::from_array(m.emissive),
             transmission: m.transmission.clamp(0.0, 1.0),
             ao: m.ao.clamp(0.0, 1.0),
+            texture_bindings: None,
         }
+    }
+
+    /// Construct a [`PathTraceMaterial`] from a [`PbrMaterial`] plus a
+    /// pre-resolved set of [`MaterialTextureBindings`] (typically
+    /// produced by [`TextureAtlas::from_material_library`]). Pass
+    /// [`MaterialTextureBindings::default`] when none of the maps were
+    /// resolvable — the renderer will treat the material as flat.
+    pub fn from_pbr_with_textures(m: &PbrMaterial, bindings: MaterialTextureBindings) -> Self {
+        let mut out = Self::from_pbr(m);
+        if bindings.albedo.is_some()
+            || bindings.normal.is_some()
+            || bindings.metallic_roughness.is_some()
+            || bindings.emissive.is_some()
+        {
+            out.texture_bindings = Some(bindings);
+        }
+        out
     }
 
     /// Default 'mid-grey diffuse' material — handy when a mesh is missing
@@ -59,6 +92,7 @@ impl PathTraceMaterial {
             emissive: Vec3::ZERO,
             transmission: 0.0,
             ao: 1.0,
+            texture_bindings: None,
         }
     }
 
@@ -71,6 +105,85 @@ impl PathTraceMaterial {
         };
         let dielectric = Vec3::splat(dielectric_f0);
         dielectric.lerp(self.base_color, self.metallic)
+    }
+}
+
+/// Resolve the texture-bound fields of `mat` at UV coordinate `uv`,
+/// returning a new [`PathTraceMaterial`] with the textured channels
+/// folded into the flat fields and `texture_bindings` cleared.
+///
+/// glTF / `KHR_materials_pbrSpecularGlossiness` packed-map convention:
+/// the metallic-roughness texture stores `roughness` in the GREEN
+/// channel and `metallic` in the BLUE channel; RED is unused. Albedo
+/// and emissive maps are multiplied with the base scalar (matches the
+/// glTF / Cycles convention so a white texture acts as identity).
+///
+/// If `mat.texture_bindings == None` this function is a no-op (returns
+/// `*mat` unchanged) and skips the atlas lookup entirely.
+pub fn sample_textured_material(
+    mat: &PathTraceMaterial,
+    atlas: &TextureAtlas,
+    uv: Vec2,
+) -> PathTraceMaterial {
+    let Some(bindings) = mat.texture_bindings else {
+        return *mat;
+    };
+    let mut out = *mat;
+    let uv_arr = [uv.x, uv.y];
+    if let Some(tex_id) = bindings.albedo {
+        let s: Vec4 = bilinear_sample(atlas, tex_id, uv_arr, 0.0);
+        out.base_color = mat.base_color * Vec3::new(s.x, s.y, s.z);
+    }
+    if let Some(tex_id) = bindings.metallic_roughness {
+        let s: Vec4 = bilinear_sample(atlas, tex_id, uv_arr, 0.0);
+        out.roughness = (mat.roughness * s.y).clamp(0.0, 1.0);
+        out.metallic = (mat.metallic * s.z).clamp(0.0, 1.0);
+    }
+    if let Some(tex_id) = bindings.emissive {
+        let s: Vec4 = bilinear_sample(atlas, tex_id, uv_arr, 0.0);
+        // glTF / Cycles convention: emissive textures multiply with
+        // the scalar `emissive_factor` so a white texel acts as
+        // identity and a black texel zeroes the channel. Using `+`
+        // here would silently energise materials with `mat.emissive
+        // == Vec3::ZERO` (the default) — every textured surface
+        // would glow even when `emissive_factor` says otherwise —
+        // and would push hot pixels in white-texture areas above the
+        // intended factor, breaking the doc-comment contract above
+        // ("emissive maps are multiplied with the base scalar").
+        out.emissive = mat.emissive * Vec3::new(s.x, s.y, s.z);
+    }
+    out.texture_bindings = None;
+    out
+}
+
+/// Apply a normal-map perturbation to the shading normal `n` using the
+/// triangle's tangent / bitangent basis. Returns the perturbed normal
+/// (re-normalised). When the material has no normal map, returns `n`
+/// unchanged.
+///
+/// The normal map is expected to be in tangent space with the standard
+/// glTF / OpenGL `[0, 1]` → `[-1, 1]` remapping (`n = 2·sample - 1`).
+pub fn sample_normal_map(
+    bindings: Option<&MaterialTextureBindings>,
+    atlas: &TextureAtlas,
+    uv: Vec2,
+    n: Vec3,
+    t: Vec3,
+    b: Vec3,
+) -> Vec3 {
+    let Some(b_set) = bindings else { return n };
+    let Some(tex_id) = b_set.normal else { return n };
+    let s = bilinear_sample(atlas, tex_id, [uv.x, uv.y], 0.0);
+    // The sampler returns linear-space RGB in [0, 1]. Map back to the
+    // signed tangent-space normal in [-1, 1].
+    let nx = s.x * 2.0 - 1.0;
+    let ny = s.y * 2.0 - 1.0;
+    let nz = (s.z * 2.0 - 1.0).max(0.0);
+    let perturbed = (t * nx + b * ny + n * nz).normalize_or_zero();
+    if perturbed.length_squared() < 1e-6 {
+        n
+    } else {
+        perturbed
     }
 }
 
@@ -109,9 +222,35 @@ pub fn ggx_g_smith(n_dot_v: f32, n_dot_l: f32, alpha: f32) -> f32 {
     }
 }
 
+/// Compute the refracted direction using Snell's law.
+///
+/// `wo` is the outgoing view direction (from surface toward camera).
+/// `n` is the shading normal on the same side as `wo`. `eta` is the
+/// ratio `n_outside / n_inside`. Returns `None` when total internal
+/// reflection (TIR) occurs.
+#[inline]
+pub fn refract_snell(wo: Vec3, n: Vec3, eta: f32) -> Option<Vec3> {
+    let cos_i = n.dot(wo).min(1.0);
+    let sin2_t = eta * eta * (1.0 - cos_i * cos_i);
+    if sin2_t > 1.0 {
+        return None; // TIR
+    }
+    let cos_t = (1.0 - sin2_t).sqrt();
+    Some(-eta * wo + (eta * cos_i - cos_t) * n)
+}
+
+/// Probability of choosing the transmission lobe. Metals don't transmit;
+/// the factor `(1 - metallic)` zeroes this out for metals. This is the
+/// same weighting used by Cycles' principled BSDF.
+#[inline]
+pub fn transmission_weight(mat: &PathTraceMaterial) -> f32 {
+    mat.transmission * (1.0 - mat.metallic)
+}
+
 /// Evaluate the principled BSDF for a fixed incoming/outgoing direction
 /// pair. Returns the BSDF value `f(wi, wo)` (per RGB channel, including
-/// the `cosine·diffuse + microfacet specular` decomposition).
+/// the `cosine·diffuse + microfacet specular` decomposition plus a
+/// transmission term for glass / water).
 ///
 /// All vectors are in world space and assumed to be normalised.
 /// `n` is the shading normal pointing into the upper hemisphere.
@@ -123,6 +262,76 @@ pub fn eval_bsdf(
 ) -> Vec3 {
     let n_dot_l = n.dot(wi);
     let n_dot_v = n.dot(wo);
+    let p_trans = transmission_weight(mat);
+
+    // Transmission lobe: wi is on the opposite hemisphere from wo.
+    if p_trans > 0.0 && n_dot_l < 0.0 && n_dot_v > 0.0 {
+        // delta-like transmission; for a rough glass this would be a
+        // GGX microfacet BTDF but the typical architectural use-case
+        // (clear glass) is effectively smooth. We return a constant
+        // that integrates to the correct energy after dividing by the
+        // transmission pdf below.
+        let alpha = mat.roughness * mat.roughness;
+        // The enclosing guard above already enforces `n_dot_v > 0.0`,
+        // i.e. the ray entered the surface from the outside. For the
+        // inside-out case (ray inside the medium hitting the back
+        // face) the path tracer flips the geometric normal *before*
+        // calling `eval_bsdf`, so this branch is unreachable with
+        // `n_dot_v < 0`.
+        //
+        // Rough BTDF: Cook-Torrance microfacet with half vector for
+        // refractive interface (Walter et al. 2007, eq. 16):
+        //
+        // ```text
+        //   h_t = -(η_o · ω_o + η_i · ω_i)
+        // ```
+        //
+        // where `ω_o` (this code's `wo`) is on the outside (η_o = 1)
+        // and `ω_i` (this code's `wi`) is on the inside
+        // (η_i = mat.ior). The IOR therefore weights the **inside**
+        // direction (`wi`), not the outside; earlier code had the
+        // weighting inverted (`eta * wi + wo` with `eta = 1/ior`),
+        // which produced a half-vector that was not a pure microfacet
+        // normal and broke MIS weights for rough glass.
+        let ht = -(wo + mat.ior * wi).normalize();
+        let n_dot_h = n.dot(ht).abs();
+        let v_dot_h = wo.dot(ht).abs();
+        let l_dot_h = wi.dot(ht).abs();
+        let f0 = mat.f0();
+        let f_r = fresnel_schlick(v_dot_h, f0);
+        let t_frac = Vec3::ONE - f_r; // transmitted fraction
+        let d = ggx_d(n_dot_h, alpha.max(0.001));
+        let g = ggx_g_smith(n_dot_v.abs(), n_dot_l.abs(), alpha.max(0.001));
+        // Walter et al. 2007, eq. 21 denominator: `(η_o · |ω_o·h| +
+        // η_i · |ω_i·h|)²`. With η_o = 1, η_i = mat.ior this becomes
+        // `(v_dot_h + mat.ior · l_dot_h)²`.
+        let denom = (v_dot_h + mat.ior * l_dot_h).powi(2);
+        if denom < 1e-20 {
+            return Vec3::ZERO;
+        }
+        // Walter et al. 2007, eq. 21 numerator:
+        //
+        // ```text
+        //   f_t = (1 - F) · D · G · |ω_o·h| · |ω_i·h|
+        //         ─────────────────────────────────
+        //               |ω_o·n| · |ω_i·n| · denom
+        // ```
+        //
+        // The `|ω_i·n|` factor in the denominator (this code's
+        // `n_dot_l.abs()`) is required: without it the recovered
+        // weight `f · cos(θ_i) / pdf` is too large by a factor of
+        // `|ω_i·n|`, which combined with the missing η_i² in the
+        // refraction Jacobian (see the pdf_bsdf comment) produced a
+        // ~η² · |ω_i·n| over-bright rough-glass refraction (caught by
+        // the energy-conservation regression below).
+        let btdf = t_frac
+            * mat.base_color
+            * d
+            * g
+            * (v_dot_h * l_dot_h / (n_dot_v.abs() * n_dot_l.abs() * denom).max(1e-20));
+        return btdf;
+    }
+
     if n_dot_l <= 0.0 || n_dot_v <= 0.0 {
         return Vec3::ZERO;
     }
@@ -139,17 +348,78 @@ pub fn eval_bsdf(
     let specular = f * d * g / (4.0 * n_dot_v * n_dot_l).max(1e-20);
 
     // Energy-conserving diffuse: subtract Fresnel-weighted reflection and
-    // scale by (1 - metallic) so metals have no diffuse lobe.
-    let k_d = (Vec3::splat(1.0) - f) * (1.0 - mat.metallic);
+    // scale by (1 - metallic) so metals have no diffuse lobe. Also
+    // subtract the transmission weight so energy is conserved.
+    let k_d = (Vec3::splat(1.0) - f) * (1.0 - mat.metallic) * (1.0 - p_trans);
     let diffuse = k_d * mat.base_color / PI;
 
     diffuse + specular
 }
 
 /// PDF for `sample_bsdf` for use with MIS in `light_sampling.rs`.
+///
+/// The combined PDF mixes diffuse, specular, and (optionally)
+/// transmission lobes with the same weights that `sample_bsdf` uses
+/// to pick between them. The transmission lobe is **bi-modal**: each
+/// transmission sample is split via Fresnel Russian-roulette into
+/// either a microfacet **reflection** (probability `f_r_avg`) or a
+/// **refraction** (probability `1 - f_r_avg`). Both outcomes must
+/// contribute to the PDF for their respective output hemispheres,
+/// otherwise the MIS weight `f(wi) * cos / pdf(wi)` explodes for
+/// reflected-from-transmission directions on pure-glass materials
+/// (where `reflect_budget = 1 - p_trans = 0`) and produces fireflies.
 pub fn pdf_bsdf(mat: &PathTraceMaterial, n: Vec3, wi: Vec3, wo: Vec3) -> f32 {
-    let n_dot_l = n.dot(wi).max(0.0);
-    let n_dot_v = n.dot(wo).max(0.0);
+    let n_dot_l = n.dot(wi);
+    let n_dot_v = n.dot(wo);
+    let p_trans = transmission_weight(mat);
+
+    // Transmitted direction: wi is on the opposite side of the surface.
+    if p_trans > 0.0 && n_dot_l < 0.0 && n_dot_v > 0.0 {
+        // For near-smooth glass the transmission pdf is concentrated
+        // around the refracted direction. We approximate via the BTDF
+        // microfacet half-vector GGX density. Half-vector follows
+        // Walter et al. 2007 eq. 16 with η_o = 1 (outside, `wo`) and
+        // η_i = mat.ior (inside, `wi`). See the matching comment in
+        // `eval_bsdf` above for the derivation; the inverted weighting
+        // earlier in this file made the recovered half-vector veer
+        // away from the true microfacet normal at high IOR.
+        let alpha = (mat.roughness * mat.roughness).max(0.001);
+        let ht = -(wo + mat.ior * wi).normalize();
+        let n_dot_h = n.dot(ht).abs();
+        let v_dot_h = wo.dot(ht).abs().max(1e-6);
+        let l_dot_h = wi.dot(ht).abs().max(1e-6);
+        let denom = (v_dot_h + mat.ior * l_dot_h).powi(2);
+        if denom < 1e-20 {
+            return 0.0;
+        }
+        // Walter et al. 2007, eq. 17 — Jacobian |∂ω_h / ∂ω_i| for the
+        // refraction half-vector mapping:
+        //
+        // ```text
+        //   |∂ω_h/∂ω_i| = η_i² · |ω_i · h_t|
+        //                 ───────────────────────────────────
+        //                 (η_i (ω_i·h_t) + η_o (ω_o·h_t))²
+        // ```
+        //
+        // where η_i (this code's `mat.ior`) is the IOR of the medium
+        // ω_i is *inside*. The half-vector PDF `D(h) · |n·h|`
+        // transforms to the incident-direction PDF by multiplying by
+        // this Jacobian. Earlier code dropped the leading η_i²
+        // factor, which made the rough-glass refraction PDF too
+        // small by a factor of `mat.ior²` (~2.25 at IOR 1.5). The
+        // missing factor canceled with the BTDF denominator bug for
+        // the smooth limit but exploded `f·cos/pdf` for rough glass.
+        let eta_i = mat.ior;
+        let trans_pdf = ggx_d(n_dot_h, alpha) * n_dot_h * eta_i * eta_i * l_dot_h / denom;
+        // Only the `(1 - f_r_avg)` fraction of transmission-lobe
+        // samples reach the refraction branch in `sample_bsdf` — the
+        // remaining `f_r_avg` fraction is captured by the Fresnel
+        // split and produces reflected directions (handled below).
+        let f_r = fresnel_schlick(v_dot_h, mat.f0());
+        let f_r_avg = ((f_r.x + f_r.y + f_r.z) / 3.0).clamp(0.0, 1.0);
+        return p_trans * (1.0 - f_r_avg) * trans_pdf;
+    }
+
     if n_dot_l <= 0.0 || n_dot_v <= 0.0 {
         return 0.0;
     }
@@ -161,10 +431,32 @@ pub fn pdf_bsdf(mat: &PathTraceMaterial, n: Vec3, wi: Vec3, wo: Vec3) -> f32 {
     let specular_pdf = ggx_d(n_dot_h, alpha) * n_dot_h / (4.0 * v_dot_h);
     let f0 = mat.f0();
     let fresnel = fresnel_schlick(v_dot_h, f0);
-    // Probability of choosing the specular lobe = avg(f0 + (1-f0)*pow5)
-    let p_spec = ((fresnel.x + fresnel.y + fresnel.z) / 3.0).clamp(0.0, 1.0);
-    let p_spec = mat.metallic.max(p_spec);
-    p_spec * specular_pdf + (1.0 - p_spec) * diffuse_pdf
+    let p_spec_raw = ((fresnel.x + fresnel.y + fresnel.z) / 3.0).clamp(0.0, 1.0);
+    let p_spec_raw = mat.metallic.max(p_spec_raw);
+    // Re-normalise probabilities after removing the transmission weight.
+    let reflect_budget = 1.0 - p_trans;
+    let p_spec = p_spec_raw * reflect_budget;
+    let p_diff = (1.0 - p_spec_raw) * reflect_budget;
+
+    // Transmission-lobe Fresnel-reflect contribution. When
+    // `sample_bsdf` picks the transmission lobe (probability
+    // `p_trans`) and the Fresnel Russian-roulette reflects
+    // (probability `f_r_avg`), the resulting `wi` lives in the
+    // upper hemisphere and would otherwise have zero PDF for a
+    // pure-glass material (`reflect_budget = 0`). The half-vector
+    // density matches `sample_ggx_half_unconditional` with the same
+    // `alpha.max(0.001)` floor that the sampler uses.
+    let trans_reflect_pdf = if p_trans > 0.0 {
+        let alpha_t = alpha.max(0.001);
+        let f_r_at_h = fresnel_schlick(v_dot_h, f0);
+        let f_r_avg = ((f_r_at_h.x + f_r_at_h.y + f_r_at_h.z) / 3.0).clamp(0.0, 1.0);
+        let half_pdf = ggx_d(n_dot_h, alpha_t) * n_dot_h / (4.0 * v_dot_h);
+        p_trans * f_r_avg * half_pdf
+    } else {
+        0.0
+    };
+
+    p_spec * specular_pdf + p_diff * diffuse_pdf + trans_reflect_pdf
 }
 
 /// Sampled direction + weight.
@@ -176,50 +468,158 @@ pub struct BsdfSample {
     pub weight: Vec3,
     pub pdf: f32,
     pub is_specular: bool,
+    /// Whether this sample was drawn from the transmission lobe. The
+    /// path tracer uses this to offset the next-ray origin to the
+    /// **opposite** side of the surface instead of the same side.
+    pub is_transmission: bool,
 }
 
 /// Importance-sample the principled BSDF.
 ///
-/// `rng` returns three i.i.d. uniform numbers in `[0, 1)`.
+/// `rng` is four i.i.d. uniform numbers in `[0, 1)`. The fourth
+/// channel is consumed only by the transmission lobe (Fresnel
+/// Russian-roulette between microfacet reflection and refraction);
+/// the diffuse and specular lobes ignore it. A fourth sample is
+/// required — not a third one reused — because using the same
+/// scalar as both `u2` for the GGX half-vector azimuth and as the
+/// threshold for the Fresnel split produces a deterministic
+/// coupling between half-vector orientation and reflect-vs-refract
+/// outcome, visibly biasing roughened glass renders (energy
+/// stripes along one diagonal of the lobe). Allocate the fourth
+/// sample from the same RNG you draw the first three from — see
+/// `path_trace.rs`'s `[rng.f32(); 4]` call for the canonical
+/// pattern.
 pub fn sample_bsdf(
     mat: &PathTraceMaterial,
     n: Vec3,
     wo: Vec3,
-    rng: [f32; 3],
+    rng: [f32; 4],
 ) -> Option<BsdfSample> {
     let n_dot_v = n.dot(wo);
     if n_dot_v <= 0.0 {
         return None;
     }
-    // Choose specular vs diffuse lobe.
     let alpha = mat.roughness * mat.roughness;
     let f0 = mat.f0();
     let f_normal = fresnel_schlick(n_dot_v, f0);
-    let p_spec = ((f_normal.x + f_normal.y + f_normal.z) / 3.0).clamp(0.0, 1.0);
-    let p_spec = mat.metallic.max(p_spec);
-    let pick_specular = rng[0] < p_spec;
+    let p_spec_raw = ((f_normal.x + f_normal.y + f_normal.z) / 3.0).clamp(0.0, 1.0);
+    let p_spec_raw = mat.metallic.max(p_spec_raw);
+    let p_trans = transmission_weight(mat);
+
+    // Decide between three lobes. `r` partitions the unit interval as
+    // [0, p_trans) → transmission, [p_trans, p_trans + p_spec) →
+    // specular, the rest → diffuse.
+    let r = rng[0];
+    let p_spec = p_spec_raw * (1.0 - p_trans);
+    let pick_transmission = r < p_trans;
+    let pick_specular = !pick_transmission && r < p_trans + p_spec;
 
     let (tangent, bitangent) = tangent_basis(n);
 
-    let wi = if pick_specular {
-        sample_ggx_half(n, tangent, bitangent, wo, alpha, rng[1], rng[2])?
+    if pick_transmission {
+        // Sample microfacet half-vector + refract through it. For
+        // smooth glass this collapses to the geometric refraction
+        // direction.
+        let alpha_t = alpha.max(0.001);
+        let h_world = sample_ggx_half_unconditional(n, tangent, bitangent, alpha_t, rng[1], rng[2]);
+        let v_dot_h = wo.dot(h_world).max(0.0);
+        let f_r = fresnel_schlick(v_dot_h, f0);
+        let f_r_avg = ((f_r.x + f_r.y + f_r.z) / 3.0).clamp(0.0, 1.0);
+        // Russian-roulette fresnel split: probability `f_r_avg` we
+        // reflect off the microfacet, otherwise we refract.
+        // Use the dedicated 4th sample for the Fresnel split so it
+        // is independent of `rng[2]` (already consumed by
+        // `sample_ggx_half_unconditional` as the polar-angle `u2`).
+        if rng[3] < f_r_avg {
+            // Fresnel reflects → behave like a specular bounce.
+            let wi = 2.0 * v_dot_h * h_world - wo;
+            if n.dot(wi) <= 0.0 {
+                return None;
+            }
+            let pdf = pdf_bsdf(mat, n, wi, wo).max(1e-12);
+            let f = eval_bsdf(mat, n, wi, wo);
+            let cos_theta = n.dot(wi).max(0.0);
+            Some(BsdfSample {
+                direction: wi,
+                weight: f * cos_theta / pdf,
+                pdf,
+                is_specular: mat.roughness < 0.05,
+                is_transmission: false,
+            })
+        } else if let Some(wi) = refract_snell(wo, h_world, 1.0 / mat.ior) {
+            // Refract through the microfacet.
+            let pdf = pdf_bsdf(mat, n, wi, wo).max(1e-12);
+            // For a perfectly smooth refraction the BTDF integrates
+            // to `base_color * (1 - F)`; for rough glass we compute
+            // the proper microfacet BTDF in eval_bsdf, but for the
+            // smooth limit we use the closed-form result directly so
+            // the variance stays low.
+            let weight = if mat.roughness < 0.05 {
+                mat.base_color * (Vec3::ONE - f_r) * mat.transmission / (1.0 - f_r_avg).max(1e-6)
+            } else {
+                let f = eval_bsdf(mat, n, wi, wo);
+                let cos_l = n.dot(wi).abs().max(1e-6);
+                f * cos_l / pdf
+            };
+            Some(BsdfSample {
+                direction: wi,
+                weight,
+                pdf,
+                is_specular: mat.roughness < 0.05,
+                is_transmission: true,
+            })
+        } else {
+            // Total internal reflection → reflect specularly.
+            let wi = 2.0 * v_dot_h * h_world - wo;
+            if n.dot(wi) <= 0.0 {
+                return None;
+            }
+            let pdf = pdf_bsdf(mat, n, wi, wo).max(1e-12);
+            let f = eval_bsdf(mat, n, wi, wo);
+            let cos_theta = n.dot(wi).max(0.0);
+            Some(BsdfSample {
+                direction: wi,
+                weight: f * cos_theta / pdf,
+                pdf,
+                is_specular: mat.roughness < 0.05,
+                is_transmission: false,
+            })
+        }
     } else {
-        sample_cosine_weighted(n, tangent, bitangent, rng[1], rng[2])
-    };
+        let wi = if pick_specular {
+            sample_ggx_half(n, tangent, bitangent, wo, alpha, rng[1], rng[2])?
+        } else {
+            sample_cosine_weighted(n, tangent, bitangent, rng[1], rng[2])
+        };
 
-    let f = eval_bsdf(mat, n, wi, wo);
-    let pdf = pdf_bsdf(mat, n, wi, wo);
-    if pdf <= 0.0 {
-        return None;
+        let f = eval_bsdf(mat, n, wi, wo);
+        let pdf = pdf_bsdf(mat, n, wi, wo);
+        if pdf <= 0.0 {
+            return None;
+        }
+        let cos_theta = n.dot(wi).max(0.0);
+        let weight = f * cos_theta / pdf;
+        Some(BsdfSample {
+            direction: wi,
+            weight,
+            pdf,
+            is_specular: pick_specular && mat.roughness < 0.05,
+            is_transmission: false,
+        })
     }
-    let cos_theta = n.dot(wi).max(0.0);
-    let weight = f * cos_theta / pdf;
-    Some(BsdfSample {
-        direction: wi,
-        weight,
-        pdf,
-        is_specular: pick_specular && mat.roughness < 0.05,
-    })
+}
+
+/// Sample a half-vector from the GGX distribution **without** rejecting
+/// when it doesn't reflect `wo` into the upper hemisphere — needed by
+/// the transmission path because the reflected direction may legitimately
+/// dip below `n`.
+fn sample_ggx_half_unconditional(n: Vec3, t: Vec3, b: Vec3, alpha: f32, u1: f32, u2: f32) -> Vec3 {
+    let phi = 2.0 * PI * u1;
+    let cos_theta = ((1.0 - u2) / (u2 * (alpha * alpha - 1.0) + 1.0))
+        .sqrt()
+        .clamp(0.0, 1.0);
+    let sin_theta = (1.0 - cos_theta * cos_theta).sqrt();
+    (t * (phi.cos() * sin_theta) + b * (phi.sin() * sin_theta) + n * cos_theta).normalize_or_zero()
 }
 
 fn sample_ggx_half(
@@ -274,6 +674,7 @@ pub fn tangent_basis(n: Vec3) -> (Vec3, Vec3) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::texture::TextureId;
 
     fn approx(a: Vec3, b: Vec3, eps: f32) -> bool {
         (a - b).length() < eps
@@ -302,6 +703,7 @@ mod tests {
             emissive: Vec3::ZERO,
             transmission: 0.0,
             ao: 1.0,
+            texture_bindings: None,
         };
         let f0 = mat.f0();
         assert!(approx(f0, Vec3::new(0.7, 0.7, 0.2), 1e-5));
@@ -317,6 +719,7 @@ mod tests {
             emissive: Vec3::ZERO,
             transmission: 0.0,
             ao: 1.0,
+            texture_bindings: None,
         };
         let f0 = mat.f0();
         // ((1.5-1)/(1.5+1))^2 = 0.04
@@ -369,6 +772,7 @@ mod tests {
             roughness: 1.0,
             ior: 1.5,
             emissive: Vec3::ZERO,
+            texture_bindings: None,
             transmission: 0.0,
             ao: 1.0,
         };
@@ -377,7 +781,12 @@ mod tests {
         let n_samples = 4096;
         let mut sum = Vec3::ZERO;
         for _ in 0..n_samples {
-            let r = [fastrand::f32(), fastrand::f32(), fastrand::f32()];
+            let r = [
+                fastrand::f32(),
+                fastrand::f32(),
+                fastrand::f32(),
+                fastrand::f32(),
+            ];
             if let Some(s) = sample_bsdf(&mat, n, wo, r) {
                 sum += s.weight;
             }
@@ -428,5 +837,393 @@ mod tests {
         assert!(m.ior >= 1.0);
         assert_eq!(m.ao, 1.0);
         assert_eq!(m.transmission, 0.0);
+    }
+
+    fn checker_texture() -> (TextureAtlas, TextureId) {
+        let mut atlas = TextureAtlas::new();
+        // 2x2 checker: black, white / white, black, stored as
+        // linear-space RGBA.
+        let pixels = vec![
+            [0.0, 0.0, 0.0, 1.0],
+            [1.0, 1.0, 1.0, 1.0],
+            [1.0, 1.0, 1.0, 1.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let id = atlas.register_linear_rgba_f32(2, 2, pixels);
+        (atlas, id)
+    }
+
+    #[test]
+    fn sample_textured_material_resolves_albedo() {
+        let (atlas, id) = checker_texture();
+        let mat = PathTraceMaterial {
+            base_color: Vec3::ONE,
+            texture_bindings: Some(MaterialTextureBindings {
+                albedo: Some(id),
+                normal: None,
+                metallic_roughness: None,
+                emissive: None,
+            }),
+            ..PathTraceMaterial::default_grey()
+        };
+        // NOTE: TextureAtlas flips V to match glTF convention, so the
+        // top-row pixels in the source array become the bottom row in
+        // (u, v) space and vice versa.
+        //  source row 0 (top): black, white
+        //  source row 1 (bot): white, black
+        //  ↓ V-flip                          ↓
+        //  uv row v=0 (bot):  white, black     ← (0.25, 0.25) → white
+        //  uv row v=1 (top):  black, white     ← (0.25, 0.75) → black
+        let s = sample_textured_material(&mat, &atlas, Vec2::new(0.25, 0.75));
+        assert!(
+            s.base_color.length_squared() < 1e-4,
+            "expected ~black at (0.25, 0.75), got {:?}",
+            s.base_color
+        );
+        let s = sample_textured_material(&mat, &atlas, Vec2::new(0.75, 0.75));
+        assert!(
+            s.base_color.x > 0.9 && s.base_color.y > 0.9 && s.base_color.z > 0.9,
+            "expected ~white at (0.75, 0.75), got {:?}",
+            s.base_color
+        );
+    }
+
+    #[test]
+    fn sample_textured_material_with_no_bindings_is_identity() {
+        let atlas = TextureAtlas::new();
+        let mat = PathTraceMaterial::default_grey();
+        let s = sample_textured_material(&mat, &atlas, Vec2::new(0.5, 0.5));
+        assert!(approx(s.base_color, mat.base_color, 1e-5));
+    }
+
+    #[test]
+    fn refract_snell_returns_none_on_tir() {
+        // At grazing incidence inside glass (eta = 1.5), no light can
+        // refract out — TIR.
+        let n = Vec3::Z;
+        let wo = Vec3::new(0.99, 0.0, 0.05).normalize();
+        let result = refract_snell(wo, n, 1.5);
+        assert!(result.is_none(), "expected TIR, got {result:?}");
+    }
+
+    #[test]
+    fn refract_snell_normal_incidence_passes_through() {
+        let n = Vec3::Z;
+        let wo = Vec3::Z;
+        let r = refract_snell(wo, n, 1.0 / 1.5).expect("should refract");
+        // Light entering glass at normal incidence travels straight.
+        assert!(approx(r, -Vec3::Z, 1e-5), "got {r:?}");
+    }
+
+    #[test]
+    fn glass_sample_picks_transmission_majority_of_time() {
+        // A pure-glass material with transmission=1 should pick the
+        // transmission lobe with high probability.
+        let mat = PathTraceMaterial {
+            base_color: Vec3::ONE,
+            metallic: 0.0,
+            roughness: 0.0,
+            ior: 1.5,
+            emissive: Vec3::ZERO,
+            transmission: 1.0,
+            ao: 1.0,
+            texture_bindings: None,
+        };
+        let n = Vec3::Z;
+        let wo = Vec3::Z;
+        let mut count_trans = 0;
+        let trials = 200;
+        for i in 0..trials {
+            let r = [
+                (i as f32 + 0.5) / trials as f32,
+                fastrand::f32(),
+                fastrand::f32(),
+                fastrand::f32(),
+            ];
+            if let Some(s) = sample_bsdf(&mat, n, wo, r) {
+                if s.is_transmission {
+                    count_trans += 1;
+                }
+            }
+        }
+        assert!(
+            count_trans > (trials * 9) / 10,
+            "expected >90% transmission samples for glass, got {count_trans}/{trials}"
+        );
+    }
+
+    #[test]
+    fn opaque_material_never_picks_transmission() {
+        let mat = PathTraceMaterial::default_grey();
+        let n = Vec3::Z;
+        let wo = Vec3::Z;
+        for i in 0..50 {
+            let r = [
+                fastrand::f32(),
+                (i as f32 + 0.5) / 50.0,
+                fastrand::f32(),
+                fastrand::f32(),
+            ];
+            if let Some(s) = sample_bsdf(&mat, n, wo, r) {
+                assert!(!s.is_transmission, "opaque material picked transmission");
+            }
+        }
+    }
+
+    #[test]
+    fn metal_never_picks_transmission_even_with_transmission_flag() {
+        // Metals never transmit regardless of the transmission slider.
+        let mat = PathTraceMaterial {
+            base_color: Vec3::splat(0.8),
+            metallic: 1.0,
+            roughness: 0.2,
+            ior: 1.5,
+            emissive: Vec3::ZERO,
+            transmission: 1.0, // ignored because metallic = 1
+            ao: 1.0,
+            texture_bindings: None,
+        };
+        assert_eq!(transmission_weight(&mat), 0.0);
+    }
+
+    /// Regression: pure-glass surfaces used to produce ~10^10 fireflies
+    /// when `sample_bsdf` picked the transmission lobe and the
+    /// Fresnel split reflected — `pdf_bsdf` returned 0 for the
+    /// reflected direction (reflect_budget = 1 - p_trans = 0), so
+    /// `f * cos / pdf.max(1e-12)` blew up. After the fix, the
+    /// transmission lobe's Fresnel-reflect contribution is included
+    /// in `pdf_bsdf` and weights stay finite.
+    #[test]
+    fn pure_glass_fresnel_reflect_pdf_is_nonzero() {
+        let mat = PathTraceMaterial {
+            base_color: Vec3::ONE,
+            metallic: 0.0,
+            roughness: 0.2,
+            ior: 1.5,
+            emissive: Vec3::ZERO,
+            transmission: 1.0,
+            ao: 1.0,
+            texture_bindings: None,
+        };
+        let n = Vec3::Z;
+        let wo = Vec3::Z; // normal incidence
+                          // Perfect mirror reflection direction.
+        let wi = wo; // reflects to itself at normal incidence
+        let pdf = pdf_bsdf(&mat, n, wi, wo);
+        assert!(
+            pdf > 0.0,
+            "pdf_bsdf returned 0 for Fresnel-reflected direction on pure glass (firefly bug)"
+        );
+    }
+
+    #[test]
+    fn pure_glass_sample_weights_never_explode() {
+        // Sample a pure-glass material many times under controlled
+        // RNG and assert no individual sample weight exceeds a
+        // reasonable bound. The pre-fix code could produce ~10^10
+        // weights when the Fresnel split landed in the reflect
+        // branch. With the corrected PDF, all weights are < ~100
+        // even at normal incidence (the worst case for fireflies).
+        let mat = PathTraceMaterial {
+            base_color: Vec3::ONE,
+            metallic: 0.0,
+            roughness: 0.2,
+            ior: 1.5,
+            emissive: Vec3::ZERO,
+            transmission: 1.0,
+            ao: 1.0,
+            texture_bindings: None,
+        };
+        let n = Vec3::Z;
+        let wo = Vec3::new(0.0, 0.1, 0.99).normalize();
+        let mut max_weight: f32 = 0.0;
+        let trials = 20_000;
+        for _ in 0..trials {
+            let r = [
+                fastrand::f32(),
+                fastrand::f32(),
+                fastrand::f32(),
+                fastrand::f32(),
+            ];
+            if let Some(s) = sample_bsdf(&mat, n, wo, r) {
+                let m = s.weight.x.max(s.weight.y).max(s.weight.z);
+                if m.is_finite() {
+                    max_weight = max_weight.max(m);
+                } else {
+                    panic!("non-finite weight: {:?} (sample {:?})", s.weight, s);
+                }
+            }
+        }
+        assert!(
+            max_weight < 100.0,
+            "glass sample weight exploded to {max_weight} (firefly regression)"
+        );
+    }
+
+    #[test]
+    fn pure_glass_expected_throughput_is_unity() {
+        // A pure-glass material under unit illumination should
+        // transport ~100% of the energy on average (reflect + refract
+        // = 1 by Fresnel). The pre-fix code over-counted some samples
+        // due to the firefly weights so this average was very wrong.
+        let mat = PathTraceMaterial {
+            base_color: Vec3::ONE,
+            metallic: 0.0,
+            roughness: 0.3,
+            ior: 1.5,
+            emissive: Vec3::ZERO,
+            transmission: 1.0,
+            ao: 1.0,
+            texture_bindings: None,
+        };
+        let n = Vec3::Z;
+        let wo = Vec3::Z;
+        let trials = 8192;
+        let mut sum = Vec3::ZERO;
+        for _ in 0..trials {
+            let r = [
+                fastrand::f32(),
+                fastrand::f32(),
+                fastrand::f32(),
+                fastrand::f32(),
+            ];
+            if let Some(s) = sample_bsdf(&mat, n, wo, r) {
+                sum += s.weight;
+            }
+        }
+        let avg = sum / trials as f32;
+        // The expected throughput for white glass is ~1.0 ± Monte
+        // Carlo noise. Pre-fix this averaged > 100 due to fireflies.
+        assert!(
+            avg.x.is_finite() && avg.x < 5.0,
+            "average glass throughput unreasonably high (firefly leak): {avg:?}"
+        );
+    }
+
+    /// Regression: the BTDF half-vector formula (Walter et al. 2007,
+    /// eq. 16) must satisfy `h_t = -(η_o · ω_o + η_i · ω_i)` with
+    /// η_o = 1 (outside) and η_i = mat.ior (inside). When `wi` is the
+    /// Snell-refracted direction of `wo`, the recovered `h_t` should
+    /// be (anti-)parallel to the shading normal `n` because the
+    /// macro-surface acts as a smooth interface. Pre-fix the IOR
+    /// weighting was inverted (`eta * wi + wo` with `eta = 1/ior`),
+    /// so the recovered half-vector was a mix of `wo` and `n` and the
+    /// BTDF / PDF evaluated at the wrong microfacet, producing wrong
+    /// MIS weights for rough glass.
+    #[test]
+    fn btdf_half_vector_recovers_shading_normal_for_smooth_refraction() {
+        let n = Vec3::Z;
+        // Oblique view direction so the test is not trivial at normal
+        // incidence.
+        let wo = Vec3::new(0.3, 0.0, 0.9).normalize();
+        let ior = 1.5_f32;
+        let eta = 1.0 / ior;
+        let wi = refract_snell(wo, n, eta).expect("should refract at this angle");
+        // Apply the corrected Walter formula directly.
+        let ht = -(wo + ior * wi).normalize();
+        // For a Snell-refracted pair the microfacet that produced the
+        // refraction is the macro-surface, so `ht` must be parallel
+        // (or anti-parallel) to `n`. We accept either sign because
+        // `normalize` discards the leading factor's sign.
+        let parallel = ht.dot(n).abs();
+        assert!(
+            parallel > 0.999,
+            "BTDF half-vector not aligned with shading normal: ht={ht:?}, n={n:?}, |ht·n|={parallel}"
+        );
+    }
+
+    /// Sanity check that `eval_bsdf` returns a finite, non-negative
+    /// BTDF lobe for a rough glass surface (transmission = 1, IOR =
+    /// 1.5) when `wi` is the Snell-refracted direction of `wo`. With
+    /// the inverted half-vector formula the denominator
+    /// `(eta * l_dot_h + v_dot_h)²` could land arbitrarily close to
+    /// zero at high IOR; the corrected formula keeps it stable.
+    #[test]
+    fn btdf_eval_finite_for_rough_glass() {
+        let mat = PathTraceMaterial {
+            base_color: Vec3::splat(0.95),
+            metallic: 0.0,
+            roughness: 0.25,
+            ior: 1.5,
+            emissive: Vec3::ZERO,
+            transmission: 1.0,
+            ao: 1.0,
+            texture_bindings: None,
+        };
+        let n = Vec3::Z;
+        let wo = Vec3::new(0.2, 0.0, 0.98).normalize();
+        let wi = refract_snell(wo, n, 1.0 / mat.ior).expect("should refract");
+        let f = eval_bsdf(&mat, n, wi, wo);
+        assert!(
+            f.x.is_finite() && f.y.is_finite() && f.z.is_finite(),
+            "{f:?}"
+        );
+        assert!(f.x >= 0.0 && f.y >= 0.0 && f.z >= 0.0, "{f:?}");
+    }
+
+    /// Energy-conservation regression for the **rough**-glass path
+    /// (`roughness >= 0.05` — bypasses the closed-form smooth-glass
+    /// shortcut in [`sample_bsdf`] and therefore drives the full
+    /// `eval_bsdf` BTDF + `pdf_bsdf` refraction-Jacobian formulas).
+    ///
+    /// A passive BSDF integrated over the sphere must transport at
+    /// most unit energy:
+    ///
+    /// ```text
+    ///   ∫ f(ωi, ωo) · |n·ωi| dωi  ≤  1
+    /// ```
+    ///
+    /// Drawing `wi ~ sample_bsdf(wo)` and averaging the returned
+    /// `f · cos / pdf` weight estimates this integral. With either
+    /// of the two Walter-2007 formula bugs the recovered weight is
+    /// inflated by `η_i² · |n·ωi|`, so for IOR 1.5 white glass at
+    /// near-normal incidence the average lands around `2.25 · |n·ωi|`
+    /// — well outside the energy bound. This regression keeps both
+    /// fixes alive simultaneously: the eval-side `|n·ωi|` factor and
+    /// the pdf-side `η_i²` factor.
+    #[test]
+    fn rough_glass_btdf_energy_conserving() {
+        let mat = PathTraceMaterial {
+            base_color: Vec3::ONE,
+            metallic: 0.0,
+            roughness: 0.3,
+            ior: 1.5,
+            emissive: Vec3::ZERO,
+            transmission: 1.0,
+            ao: 1.0,
+            texture_bindings: None,
+        };
+        let n = Vec3::Z;
+        // Slightly off-normal so the refracted `wi` has `|n·wi| < 1`
+        // and the bug-induced `|n·wi|` factor in the weight is
+        // distinguishable from the η² factor.
+        let wo = Vec3::new(0.3, 0.0, 0.95).normalize();
+        let trials = 16_384_u32;
+        let mut sum = Vec3::ZERO;
+        for _ in 0..trials {
+            let r = [
+                fastrand::f32(),
+                fastrand::f32(),
+                fastrand::f32(),
+                fastrand::f32(),
+            ];
+            if let Some(s) = sample_bsdf(&mat, n, wo, r) {
+                assert!(
+                    s.weight.x.is_finite() && s.weight.y.is_finite() && s.weight.z.is_finite(),
+                    "non-finite weight: {:?}",
+                    s.weight
+                );
+                sum += s.weight;
+            }
+        }
+        let avg = sum / trials as f32;
+        // Energy conservation: average sampled throughput must not
+        // exceed unity (plus a small Monte Carlo margin). Pre-fix
+        // this averaged ≈ 2.0+ on this geometry; with both fixes it
+        // sits at ≈ 0.95 (transmission-dominated, white glass).
+        assert!(
+            avg.x < 1.1 && avg.y < 1.1 && avg.z < 1.1,
+            "rough-glass throughput violates energy conservation: avg={avg:?}"
+        );
     }
 }

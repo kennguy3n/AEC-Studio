@@ -369,6 +369,17 @@ const api = {
     batchProgress: (batchId: string) =>
       ipcRenderer.invoke("render:batchProgress", { batchId }),
     checkMaterials: () => ipcRenderer.invoke("render:checkMaterials"),
+    // Phase 17 — output image read-back + SSIM compare. The bridge
+    // returns a Node `Buffer` (or `Uint8Array` after structured
+    // clone) which `Render.tsx` base64-encodes to a data URI.
+    getOutputImage: (params: { jobId: string }) =>
+      ipcRenderer.invoke("render:getOutputImage", params),
+    compareSsim: (params: { aJobId: string; bJobId: string }) =>
+      ipcRenderer.invoke("render:compareSsim", params),
+    setEnvironmentMap: (params: {
+      path: string | null;
+      intensity?: number;
+    }) => ipcRenderer.invoke("render:setEnvironmentMap", params),
   },
 
   // ----- AI -----

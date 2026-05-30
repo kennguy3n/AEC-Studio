@@ -26,4 +26,28 @@ describe("BeforeAfterCompare", () => {
     fireEvent.change(slider, { target: { value: "20" } });
     expect(slider.value).toBe("20");
   });
+
+  it("displays the SSIM percentage when a finite score is provided", () => {
+    render(
+      <BeforeAfterCompare
+        before="data:image/png;base64,BBB"
+        after="data:image/png;base64,AAA"
+        ssim={0.9876}
+      />,
+    );
+    expect(screen.getByTestId("render-compare-ssim").textContent).toContain(
+      "SSIM: 98.8%",
+    );
+  });
+
+  it("hides the SSIM badge for null / non-finite scores", () => {
+    render(
+      <BeforeAfterCompare
+        before="data:image/png;base64,BBB"
+        after="data:image/png;base64,AAA"
+        ssim={null}
+      />,
+    );
+    expect(screen.queryByTestId("render-compare-ssim")).toBeNull();
+  });
 });

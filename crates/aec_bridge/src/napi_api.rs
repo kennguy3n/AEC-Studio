@@ -1905,6 +1905,15 @@ pub struct RenderJobJs {
     pub progress: f64,
     pub camera_id: Option<String>,
     pub batch_id: Option<String>,
+    /// RFC3339 timestamp the render started (or `None` if it is
+    /// still queued). Renderer constructs a JS `Date` to compute
+    /// elapsed time / ETA in `RenderQueue.tsx`.
+    pub started_at: Option<String>,
+    /// RFC3339 timestamp the render completed.
+    pub completed_at: Option<String>,
+    /// Absolute path to the output image on disk (`None` while the
+    /// job is queued or running).
+    pub output_path: Option<String>,
 }
 
 impl From<crate::service::RenderJobSummary> for RenderJobJs {
@@ -1916,6 +1925,9 @@ impl From<crate::service::RenderJobSummary> for RenderJobJs {
             progress: s.progress as f64,
             camera_id: s.camera_id,
             batch_id: s.batch_id,
+            started_at: s.started_at,
+            completed_at: s.completed_at,
+            output_path: s.output_path,
         }
     }
 }
@@ -2112,6 +2124,105 @@ pub fn render_diagnose(job_id: String) -> Result<RenderDiagnoseJs> {
 #[napi]
 pub fn render_check_materials() -> Result<RenderCheckMaterialsJs> {
     with_service_ref_fallible(super::service::BridgeService::render_check_materials).map(Into::into)
+}
+
+/// Read the output image bytes for a completed render job. Bound to
+/// the renderer as `aec.render.getOutputImage({ jobId })`. The
+/// returned `Buffer` is base64-encoded by the renderer and used as
+/// the `src` of an `<img>` for `RenderPreview` /
+/// `BeforeAfterCompare`.
+///
+/// Declared `async` and routed through [`spawn_blocking_napi`] so
+/// the underlying `std::fs::read` of a possibly-tens-of-MB PNG runs
+/// on the tokio blocking pool, not the libuv main thread. A 4K
+/// render output is large enough (cold page cache + slow disk) that
+/// a synchronous read would stall the libuv loop for hundreds of
+/// milliseconds, blocking every other IPC handler including
+/// `viewport:requestFrame`. The service-side fix (see
+/// [`BridgeService::render_get_output_image`]) already drops the
+/// `render_state` mutex before the read so other render-state
+/// callers stay live; promoting the napi wrapper completes the fix
+/// by also keeping the JS event loop responsive. Same pattern as
+/// [`bim_import_ifc`].
+#[napi]
+pub async fn render_get_output_image(job_id: String) -> Result<RenderOutputImageJs> {
+    spawn_blocking_napi(move || {
+        with_service_ref_fallible(|svc| svc.render_get_output_image(&job_id)).map(Into::into)
+    })
+    .await
+}
+
+/// Compute the SSIM between two completed render jobs. Bound to the
+/// renderer as `aec.render.compareSsim({ aJobId, bJobId })`.
+///
+/// Declared `async` and routed through [`spawn_blocking_napi`]
+/// because SSIM (Wang et al. 2004) is O(width*height) over two
+/// decoded images: at 4K that's two PNG decodes plus a sliding 8×8
+/// window over ~33 M pixels, easily reaching a couple of seconds.
+/// Running synchronously on the libuv main thread would freeze the
+/// entire UI — every IPC handler queues behind this single compare
+/// click. The service-side fix (see
+/// [`BridgeService::render_compare_ssim`]) already drops the
+/// `render_state` mutex before SSIM so other render-state callers
+/// stay live; the async promotion here completes the fix by moving
+/// the heavy compute to the tokio blocking pool. Same pattern as
+/// [`bim_import_ifc`] / [`render_get_output_image`].
+#[napi]
+pub async fn render_compare_ssim(
+    a_job_id: String,
+    b_job_id: String,
+) -> Result<RenderCompareResultJs> {
+    spawn_blocking_napi(move || {
+        with_service_ref_fallible(|svc| svc.render_compare_ssim(&a_job_id, &b_job_id))
+            .map(Into::into)
+    })
+    .await
+}
+
+/// Set the HDRI environment map for future render jobs. Pass `null`
+/// to fall back to the procedural Hosek-Wilkie sky. Bound as
+/// `aec.render.setEnvironmentMap({ path, intensity })`.
+#[napi]
+pub fn render_set_environment_map(path: Option<String>, intensity: Option<f64>) -> Result<()> {
+    with_service_ref_fallible(|svc| {
+        svc.render_set_environment_map(path.as_deref(), intensity.map(|v| v as f32))
+    })
+}
+
+/// JS-facing render output image returned by [`render_get_output_image`].
+#[napi(object)]
+pub struct RenderOutputImageJs {
+    pub job_id: String,
+    pub path: String,
+    pub bytes: napi::bindgen_prelude::Buffer,
+}
+
+impl From<crate::service::RenderOutputImage> for RenderOutputImageJs {
+    fn from(o: crate::service::RenderOutputImage) -> Self {
+        Self {
+            job_id: o.job_id,
+            path: o.path,
+            bytes: o.bytes.into(),
+        }
+    }
+}
+
+/// JS-facing render compare result returned by [`render_compare_ssim`].
+#[napi(object)]
+pub struct RenderCompareResultJs {
+    pub a_job_id: String,
+    pub b_job_id: String,
+    pub ssim: f64,
+}
+
+impl From<crate::service::RenderCompareResult> for RenderCompareResultJs {
+    fn from(o: crate::service::RenderCompareResult) -> Self {
+        Self {
+            a_job_id: o.a_job_id,
+            b_job_id: o.b_job_id,
+            ssim: o.ssim,
+        }
+    }
 }
 
 // ---------------------------------------------------------------

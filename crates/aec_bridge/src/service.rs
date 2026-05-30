@@ -429,6 +429,20 @@ pub struct RenderJobSummary {
     pub progress: f32,
     pub camera_id: Option<String>,
     pub batch_id: Option<String>,
+    /// Render started timestamp (RFC3339). `None` if still queued.
+    /// Used by the queue UI to compute "running for N seconds" and
+    /// by the ETA calculation. Always serialised as ISO-8601 so the
+    /// renderer can construct a `Date` object directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    /// Render completed timestamp (RFC3339). `None` while running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+    /// Output image path on disk. Populated when status is
+    /// `completed`. The renderer reads this via
+    /// [`BridgeService::render_get_output_image`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_path: Option<String>,
 }
 
 impl From<&CoreRenderJob> for RenderJobSummary {
@@ -440,8 +454,37 @@ impl From<&CoreRenderJob> for RenderJobSummary {
             progress: j.progress,
             camera_id: j.camera_id.clone(),
             batch_id: j.batch_id.clone(),
+            started_at: j.started_at.map(|t| t.to_rfc3339()),
+            completed_at: j.completed_at.map(|t| t.to_rfc3339()),
+            output_path: j
+                .output_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
         }
     }
+}
+
+/// Raw bytes returned by [`BridgeService::render_get_output_image`].
+/// The renderer base64-encodes `bytes` and constructs a
+/// `data:image/png;base64,…` URL to feed into an `<img>` tag.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RenderOutputImage {
+    pub job_id: String,
+    pub path: String,
+    /// Raw image bytes (PNG, JPEG, or whatever the writer used).
+    /// Transparently materialised as a Node `Buffer` over the napi
+    /// boundary; no base64 round-trip occurs in the bridge itself.
+    pub bytes: Vec<u8>,
+}
+
+/// Result of [`BridgeService::render_compare_ssim`]. SSIM in
+/// `[-1.0, 1.0]`, with `1.0` meaning pixel-identical and `~0.95+`
+/// meaning visually indistinguishable.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RenderCompareResult {
+    pub a_job_id: String,
+    pub b_job_id: String,
+    pub ssim: f64,
 }
 
 fn render_job_status_to_str(s: RenderJobStatus) -> &'static str {
@@ -1427,6 +1470,30 @@ pub struct BridgeService {
 pub(crate) struct RenderState {
     pub(crate) queue: RenderQueue,
     pub(crate) preset_store: RenderPresetStore,
+    /// Decoded HDRI environment map for the path tracer, cached so
+    /// that switching env maps is a one-time decode rather than a
+    /// re-decode-per-render. When `Some`, the renderer should pass
+    /// the inner `EnvironmentMap` to
+    /// [`aec_render::final_render::FinalRenderPipeline::with_environment`]
+    /// (or `build_path_trace_scene_with_env`) in place of the
+    /// procedural Hosek-Wilkie sky.
+    ///
+    /// Stored behind [`std::sync::Arc`] because
+    /// [`aec_render::environment::EnvironmentMap`] carries
+    /// pixel-data + two precomputed CDFs that can run into the tens
+    /// of megabytes for a 4K HDRI — handing out `Arc::clone()` to
+    /// each render thread costs an atomic increment rather than a
+    /// full pixel-data clone.
+    ///
+    /// Set via [`BridgeService::render_set_environment_map`]; the
+    /// `environment_intensity` field below is the last-set
+    /// world-strength multiplier and is baked into the cached map's
+    /// `intensity` field on every load. We keep it on `RenderState`
+    /// (rather than reading it back off the cached map) so that an
+    /// intensity-only call against a cleared map still remembers
+    /// the value for the next load.
+    pub(crate) environment: Option<std::sync::Arc<aec_render::environment::EnvironmentMap>>,
+    pub(crate) environment_intensity: f32,
 }
 
 impl RenderState {
@@ -1434,6 +1501,8 @@ impl RenderState {
         Self {
             queue: RenderQueue::new(),
             preset_store: RenderPresetStore::default(),
+            environment: None,
+            environment_intensity: 1.0,
         }
     }
 }
@@ -3766,6 +3835,171 @@ impl BridgeService {
             }
         }
         Ok(RenderCheckMaterialsReport { findings })
+    }
+
+    /// Set the HDRI environment map used by future render jobs.
+    /// Pass `None` to fall back to the procedural Hosek-Wilkie sky.
+    ///
+    /// The file is decoded once here via
+    /// [`aec_render::environment::EnvironmentMap::load_hdr`] (which
+    /// also builds the importance-sampling CDFs), and the result is
+    /// cached on [`RenderState::environment`] as
+    /// `Arc<EnvironmentMap>`. The previous implementation decoded
+    /// the file twice (once to validate, then discarded the result;
+    /// then a second time on every render), which for a 4K HDRI is
+    /// hundreds of milliseconds of redundant decode + CDF
+    /// construction per render job — this version makes "switch
+    /// environment" a one-time cost. Decode failures return
+    /// [`BridgeServiceError::Core`] and leave the existing
+    /// environment unchanged (mutation only happens after the load
+    /// succeeds).
+    ///
+    /// `intensity` semantics:
+    /// - When `Some(i)`, `state.environment_intensity` is updated to
+    ///   `i.max(0.0)` and (if a map was loaded in this call) baked
+    ///   into its `intensity` field.
+    /// - When `None`, the previously-set intensity is preserved and
+    ///   applied to a newly-loaded map. This lets callers change
+    ///   the env without re-specifying strength.
+    /// - When `path` is `None`, the cached map is cleared but the
+    ///   intensity is retained for the next load.
+    pub fn render_set_environment_map(
+        &self,
+        path: Option<&str>,
+        intensity: Option<f32>,
+    ) -> Result<(), BridgeServiceError> {
+        // Decode *outside* the render-state lock. `load_hdr` does
+        // disk I/O + image decode + CDF construction, which on a 4K
+        // HDRI can be hundreds of ms — holding `render_state`
+        // across that would serialise every other render-state
+        // caller (queue admission, `render_compare_ssim`,
+        // `render_get_output_image`, ...). Validation-then-mutate
+        // also keeps the "leaves existing environment unchanged on
+        // failure" contract intact.
+        let decoded = match path {
+            Some(p) => Some(
+                aec_render::environment::EnvironmentMap::load_hdr(std::path::Path::new(p))
+                    .map_err(|e| BridgeServiceError::Core(format!("load env map: {e}")))?,
+            ),
+            None => None,
+        };
+        let mut state = self.lock_render_state()?;
+        if let Some(i) = intensity {
+            state.environment_intensity = i.max(0.0);
+        }
+        let baked_intensity = state.environment_intensity;
+        state.environment = decoded.map(|mut env| {
+            env.intensity = baked_intensity;
+            std::sync::Arc::new(env)
+        });
+        Ok(())
+    }
+
+    /// Read the on-disk output image for a completed render job and
+    /// return its raw PNG/JPEG bytes. The renderer uses this to populate
+    /// the `RenderPreview` and `BeforeAfterCompare` components via the
+    /// `render:getOutputImage` IPC.
+    ///
+    /// Returns [`BridgeServiceError::Core`] when the job is unknown or
+    /// has no recorded `output_path`, and [`BridgeServiceError::Core`]
+    /// (wrapping the underlying io error) when the path exists in the
+    /// job record but the file cannot be read.
+    pub fn render_get_output_image(
+        &self,
+        job_id: &str,
+    ) -> Result<RenderOutputImage, BridgeServiceError> {
+        // Resolve the on-disk output path under the `render_state`
+        // mutex, then *drop the guard* before issuing the file read.
+        // PNG/JPEG decode-ready output files routinely run into the
+        // tens-of-megabytes range for 4K renders, and a synchronous
+        // `std::fs::read` can take hundreds of milliseconds (cold
+        // page cache, slow disk, network FS). Holding
+        // `render_state` across that I/O serialises every other
+        // render-state caller — `render_enqueue`, the queue
+        // admission ticker, `render_compare_ssim` — turning a
+        // preview load into an app-wide freeze. The lookup itself is
+        // an in-memory scan of `state.queue.list_jobs()` and
+        // `Clone`s the resulting `PathBuf`, so by the time we hit
+        // disk the mutex is free for the next caller.
+        let (resolved_job_id, path) = {
+            let state = self.lock_render_state()?;
+            let job = state
+                .queue
+                .list_jobs()
+                .into_iter()
+                .find(|j| j.id == job_id)
+                .ok_or_else(|| {
+                    BridgeServiceError::Core(format!("render job '{job_id}' not found"))
+                })?;
+            let path = job.output_path.clone().ok_or_else(|| {
+                BridgeServiceError::Core(format!("render job '{job_id}' has no output yet"))
+            })?;
+            (job.id.clone(), path)
+        };
+        let bytes = std::fs::read(&path)
+            .map_err(|e| BridgeServiceError::Core(format!("read {}: {e}", path.display())))?;
+        Ok(RenderOutputImage {
+            job_id: resolved_job_id,
+            path: path.to_string_lossy().to_string(),
+            bytes,
+        })
+    }
+
+    /// Compute the SSIM (Wang et al. 2004) between two completed
+    /// render jobs' output images. Powers the slider widget in
+    /// `Render.tsx`'s `BeforeAfterCompare` — the displayed score
+    /// quantifies how visually similar the two renders are.
+    ///
+    /// SSIM ranges over `[-1.0, 1.0]`; values near `1.0` mean the
+    /// renders are visually indistinguishable. Mismatched image
+    /// dimensions and missing output paths surface as
+    /// [`BridgeServiceError::Core`].
+    pub fn render_compare_ssim(
+        &self,
+        a_job_id: &str,
+        b_job_id: &str,
+    ) -> Result<RenderCompareResult, BridgeServiceError> {
+        // Resolve both output paths under the `render_state` mutex,
+        // then *drop the guard* before SSIM computation. SSIM is
+        // O(width*height) over two decoded images and on the hot
+        // path takes hundreds of milliseconds to a few seconds for
+        // 4K outputs (decode-PNG ×2, copy to Vec<f32>, sliding 8×8
+        // window). Holding `render_state` across that work would
+        // serialise the entire render subsystem on a UI compare
+        // click — every queue admission, every `listJobs` poll,
+        // every preview reload from `render_get_output_image` would
+        // wait. The lookup itself is an in-memory scan of
+        // `state.queue.list_jobs()` and clones the two `PathBuf`s,
+        // so by the time we hit `ssim_from_files` the mutex is free.
+        let (a_path, b_path) = {
+            let state = self.lock_render_state()?;
+            // Snapshot the queue once. `RenderQueue::list_jobs()`
+            // clones the full `Vec<JobRecord>` on every call (it
+            // returns an owned `Vec`, not a borrowed slice, because
+            // the queue's internal storage is wrapped in a mutex it
+            // can't lend out across a return), so calling it twice
+            // — once per `lookup(..)` — doubled the allocation and
+            // copy for what is logically a single read. With the
+            // snapshot the second `find()` walks the same Vec we
+            // already paid for.
+            let jobs = state.queue.list_jobs();
+            let lookup = |id: &str| -> Result<std::path::PathBuf, BridgeServiceError> {
+                let job = jobs.iter().find(|j| j.id == id).ok_or_else(|| {
+                    BridgeServiceError::Core(format!("render job '{id}' not found"))
+                })?;
+                job.output_path.clone().ok_or_else(|| {
+                    BridgeServiceError::Core(format!("render job '{id}' has no output yet"))
+                })
+            };
+            (lookup(a_job_id)?, lookup(b_job_id)?)
+        };
+        let ssim = aec_render::compare::ssim_from_files(&a_path, &b_path)
+            .map_err(|e| BridgeServiceError::Core(format!("ssim: {e}")))?;
+        Ok(RenderCompareResult {
+            a_job_id: a_job_id.to_string(),
+            b_job_id: b_job_id.to_string(),
+            ssim: ssim as f64,
+        })
     }
 
     fn lock_render_state(
@@ -7257,6 +7491,194 @@ END-ISO-10303-21;\n";
         let (s, _g) = service();
         let r = s.render_check_materials().unwrap();
         assert!(r.findings.is_empty());
+    }
+
+    #[test]
+    fn render_get_output_image_unknown_job_is_error() {
+        let (s, _g) = service();
+        let err = s.render_get_output_image("not-a-real-job").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not found"),
+            "expected 'not found' in error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn render_get_output_image_pending_job_is_error() {
+        let (s, _g) = service();
+        let r = s.render_enqueue("cam-1", "quick", 0, None).unwrap();
+        // Job is queued but has not yet run — no output_path.
+        let err = s.render_get_output_image(&r.job_id).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no output"),
+            "expected 'no output' in error for pending job, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn render_compare_ssim_unknown_jobs_are_errors() {
+        let (s, _g) = service();
+        let err = s.render_compare_ssim("missing-a", "missing-b").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not found"),
+            "expected 'not found' in error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn render_set_environment_map_clears_when_path_is_none() {
+        // The clear path doesn't touch the filesystem, so it
+        // succeeds even with a fresh service.
+        let (s, _g) = service();
+        s.render_set_environment_map(None, Some(1.5)).unwrap();
+        // The cached env map should be `None` after a clear, while
+        // the intensity value is preserved for the next load.
+        let state = s.lock_render_state().unwrap();
+        assert!(state.environment.is_none());
+        assert!((state.environment_intensity - 1.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn render_set_environment_map_rejects_missing_file() {
+        let (s, _g) = service();
+        let err = s
+            .render_set_environment_map(Some("/this/path/does/not/exist.hdr"), None)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("load env map"),
+            "expected 'load env map' in error, got: {msg}"
+        );
+        // On failure the state must be left unchanged — fresh
+        // service starts with `None`, decode failure must not
+        // mutate it.
+        let state = s.lock_render_state().unwrap();
+        assert!(state.environment.is_none());
+    }
+
+    /// The Phase 17 Group A review surfaced that the original
+    /// implementation decoded the env file twice (once to validate,
+    /// then a second time at render time) and stored only the path
+    /// — meaning every render job paid the decode + CDF-construction
+    /// cost again. The fix caches the decoded `EnvironmentMap` on
+    /// `RenderState` so the second decode never happens. This test
+    /// asserts the cache contract: after a successful set, the
+    /// decoded map is present, the intensity is baked in, and the
+    /// CDFs are populated (proof that we kept the decoded result,
+    /// not the path).
+    #[test]
+    fn render_set_environment_map_caches_decoded_map_with_intensity_baked_in() {
+        use image::{Rgb, Rgb32FImage};
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("env.exr");
+        // 2x1 EXR with a bright top half and a dark bottom half so
+        // the CDF construction has something non-trivial to do.
+        let mut img = Rgb32FImage::new(2, 1);
+        img.put_pixel(0, 0, Rgb([5.0, 5.0, 5.0]));
+        img.put_pixel(1, 0, Rgb([0.0, 0.0, 0.0]));
+        img.save(&p).expect("write 2x1 EXR");
+
+        let (s, _g) = service();
+        s.render_set_environment_map(p.to_str(), Some(2.5))
+            .expect("set env map");
+
+        let state = s.lock_render_state().unwrap();
+        let env = state.environment.as_ref().expect("decoded map cached");
+        assert_eq!(env.width, 2);
+        assert_eq!(env.height, 1);
+        // Intensity argument must be baked into the cached map's
+        // `intensity` field, not just remembered in
+        // `environment_intensity` (otherwise the renderer reading
+        // `env.intensity` would see the wrong value).
+        assert!((env.intensity - 2.5).abs() < 1e-6);
+        // CDFs were built — direct proof that the cached value is
+        // the post-construction map and not a re-decode marker.
+        assert_eq!(env.marginal_cdf.len(), env.height as usize);
+        assert_eq!(env.conditional_cdf.len(), (env.width * env.height) as usize);
+    }
+
+    /// `render_set_environment_map(None, Some(i))` is the explicit
+    /// "fall back to the procedural Hosek-Wilkie sky" code path. The
+    /// public API contract (see the docstring on
+    /// [`BridgeService::render_set_environment_map`]) is:
+    /// - `path = None` clears the cached map (procedural sky from
+    ///   here on);
+    /// - `intensity = Some(i)` is preserved on `RenderState` so the
+    ///   next `path = Some(...)` call bakes it into the new map
+    ///   without forcing the caller to re-specify the strength.
+    ///
+    /// This test exercises both halves of that contract: after a
+    /// cached map is established, an intensity-only call must (1)
+    /// clear `state.environment`, and (2) leave the new intensity
+    /// remembered on `state.environment_intensity`.
+    #[test]
+    fn render_set_environment_map_intensity_only_call_clears_cached_map() {
+        use image::{Rgb, Rgb32FImage};
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("env.exr");
+        let mut img = Rgb32FImage::new(2, 1);
+        img.put_pixel(0, 0, Rgb([1.0, 0.5, 0.0]));
+        img.put_pixel(1, 0, Rgb([0.0, 0.5, 1.0]));
+        img.save(&p).expect("write 2x1 EXR");
+
+        let (s, _g) = service();
+        s.render_set_environment_map(p.to_str(), None).unwrap();
+        {
+            let state = s.lock_render_state().unwrap();
+            assert!(state.environment.is_some());
+        }
+        // Intensity-only "clear" call — path=None semantics mean
+        // "fall back to procedural sky"; intensity persists for
+        // the next load.
+        s.render_set_environment_map(None, Some(3.0)).unwrap();
+        let state = s.lock_render_state().unwrap();
+        assert!(state.environment.is_none());
+        assert!((state.environment_intensity - 3.0).abs() < 1e-6);
+    }
+
+    /// Happy path for the Phase 17 IPC surface: enqueue → admit →
+    /// complete with a real PNG on disk → read it back via
+    /// `render_get_output_image` and compare to itself via
+    /// `render_compare_ssim`. Covers the bridge's bytes-on-the-wire
+    /// contract end-to-end (file IO + service plumbing) without
+    /// invoking the actual path tracer.
+    #[test]
+    fn render_output_and_ssim_roundtrip_against_real_png() {
+        let (s, _g) = service();
+        // Enqueue + admit so the job is in the running set.
+        let enq = s.render_enqueue("cam-1", "quick", 0, None).unwrap();
+        // Write a small 4×4 deterministic PNG so we can read it back.
+        let tmp = tempfile::tempdir().unwrap();
+        let out_path = tmp.path().join("frame.png");
+        let pixels: Vec<u8> = (0..(4 * 4 * 4)).map(|i| ((i * 17) % 256) as u8).collect();
+        let img = image::RgbaImage::from_raw(4, 4, pixels).expect("RgbaImage::from_raw 4x4 RGBA");
+        img.save(&out_path).expect("write fixture PNG");
+        // Drive the queue forward: admit → complete (the
+        // `RenderQueue` is `pub(crate)` so we can poke it directly
+        // from this module's tests).
+        {
+            let mut state = s.lock_render_state().unwrap();
+            let admitted = state.queue.admit().expect("admit");
+            assert_eq!(admitted.id, enq.job_id);
+            state.queue.complete(&enq.job_id, out_path.clone()).unwrap();
+        }
+        let out = s.render_get_output_image(&enq.job_id).unwrap();
+        assert_eq!(out.job_id, enq.job_id);
+        assert_eq!(out.path, out_path.to_string_lossy().to_string());
+        assert!(!out.bytes.is_empty(), "PNG bytes must not be empty");
+        // Compare the job's output against itself — SSIM is exactly
+        // 1.0 for two pixel-identical images.
+        let cmp = s.render_compare_ssim(&enq.job_id, &enq.job_id).unwrap();
+        assert_eq!(cmp.a_job_id, enq.job_id);
+        assert_eq!(cmp.b_job_id, enq.job_id);
+        assert!(
+            (cmp.ssim - 1.0).abs() < 1e-6,
+            "self-compare SSIM must be ≈ 1.0, got {}",
+            cmp.ssim
+        );
     }
 
     #[test]
