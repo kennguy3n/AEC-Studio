@@ -138,12 +138,7 @@ impl Triangle {
     }
 
     fn other_vertex(&self, a: V, b: V) -> Option<V> {
-        for &x in &self.v {
-            if x != a && x != b {
-                return Some(x);
-            }
-        }
-        None
+        self.v.iter().find(|&&x| x != a && x != b).copied()
     }
 }
 
@@ -308,7 +303,11 @@ impl Cdt {
             if a < offset || b < offset || c < offset {
                 continue;
             }
-            out.push([(a - offset) as u32, (b - offset) as u32, (c - offset) as u32]);
+            out.push([
+                (a - offset) as u32,
+                (b - offset) as u32,
+                (c - offset) as u32,
+            ]);
         }
         out
     }
@@ -338,7 +337,12 @@ impl Cdt {
             if tri.removed {
                 continue;
             }
-            if in_circumcircle(self.points[tri.v[0]], self.points[tri.v[1]], self.points[tri.v[2]], p) {
+            if in_circumcircle(
+                self.points[tri.v[0]],
+                self.points[tri.v[1]],
+                self.points[tri.v[2]],
+                p,
+            ) {
                 bad.push(i);
             }
         }
@@ -445,7 +449,11 @@ impl Cdt {
             if tri.removed {
                 continue;
             }
-            for (a, b) in [(tri.v[0], tri.v[1]), (tri.v[1], tri.v[2]), (tri.v[2], tri.v[0])] {
+            for (a, b) in [
+                (tri.v[0], tri.v[1]),
+                (tri.v[1], tri.v[2]),
+                (tri.v[2], tri.v[0]),
+            ] {
                 edge_to_tris.entry(edge_key(a, b)).or_default().push(i);
             }
         }
@@ -497,7 +505,11 @@ impl Cdt {
             if tri.removed {
                 continue;
             }
-            for (a, b) in [(tri.v[0], tri.v[1]), (tri.v[1], tri.v[2]), (tri.v[2], tri.v[0])] {
+            for (a, b) in [
+                (tri.v[0], tri.v[1]),
+                (tri.v[1], tri.v[2]),
+                (tri.v[2], tri.v[0]),
+            ] {
                 map.entry(edge_key(a, b)).or_default().push(i);
             }
         }
@@ -580,8 +592,8 @@ fn in_circumcircle(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]) -> bool {
     let a_sq = ax * ax + ay * ay;
     let b_sq = bx * bx + by * by;
     let c_sq = cx * cx + cy * cy;
-    let det = ax * (by * c_sq - b_sq * cy) - ay * (bx * c_sq - b_sq * cx)
-        + a_sq * (bx * cy - by * cx);
+    let det =
+        ax * (by * c_sq - b_sq * cy) - ay * (bx * c_sq - b_sq * cx) + a_sq * (bx * cy - by * cx);
     det > 0.0
 }
 
@@ -608,14 +620,7 @@ fn segments_cross_strict(p: [f64; 2], q: [f64; 2], r: [f64; 2], s: [f64; 2]) -> 
     (d1 * d2 < 0.0) && (d3 * d4 < 0.0)
 }
 
-fn ccw_triangle(
-    pa: [f64; 2],
-    pb: [f64; 2],
-    pc: [f64; 2],
-    va: V,
-    vb: V,
-    vc: V,
-) -> Triangle {
+fn ccw_triangle(pa: [f64; 2], pb: [f64; 2], pc: [f64; 2], va: V, vb: V, vc: V) -> Triangle {
     if orient2d(pa, pb, pc) >= 0.0 {
         Triangle::new(va, vb, vc)
     } else {
@@ -665,7 +670,10 @@ mod tests {
             let c = pts[tri[2] as usize];
             total += orient2d(a, b, c).abs() * 0.5;
         }
-        assert!((total - 4.0).abs() < 1e-9, "area must equal 4 (got {total})");
+        assert!(
+            (total - 4.0).abs() < 1e-9,
+            "area must equal 4 (got {total})"
+        );
     }
 
     #[test]
@@ -701,7 +709,7 @@ mod tests {
         // 10x10 outer with 2x2 hole centred at (5, 5).
         let boundary = vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]];
         let hole = vec![[4.0, 4.0], [6.0, 4.0], [6.0, 6.0], [4.0, 6.0]];
-        let tris = triangulate_cdt(&boundary, &[hole.clone()]).unwrap();
+        let tris = triangulate_cdt(&boundary, std::slice::from_ref(&hole)).unwrap();
         assert!(!tris.is_empty(), "donut must produce triangles");
         // Combine the flattened vertex list to compute total area.
         let mut verts = boundary.clone();
