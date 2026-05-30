@@ -175,19 +175,32 @@ export function PanelResizeHandle({
 /**
  * Persist a panel size to localStorage under a stable key.
  *
- * The hook returns a `[size, setSize]` pair — using `setSize` writes
- * through to localStorage. The initial read defaults to `defaultSize`
- * when nothing is stored or the value is corrupt. The min/max
- * clamps are applied on every set so the persisted value can never
- * be re-loaded into an invalid range (e.g. after the user resizes
- * the window much smaller and the persisted value would crush the
- * viewport to zero).
+ * Returns a `[size, setSize, commit]` triple:
+ *  - `size` — the current clamped value (re-rendered live).
+ *  - `setSize(n)` — clamps and updates the in-memory state. Does
+ *    NOT touch localStorage. This is the hot path called from
+ *    `PanelResizeHandle`'s `onResize`, which fires per pointermove
+ *    (60+ Hz). Writing through to localStorage on each move would
+ *    trigger a synchronous storage write per frame plus a
+ *    `StorageEvent` broadcast to every same-origin window — both
+ *    expensive and wasteful when only the final size matters.
+ *  - `commit()` — flushes the latest in-memory size to localStorage.
+ *    Call this from `onResizeEnd` so the drag persists at most one
+ *    write per gesture. Also safe to call programmatically when a
+ *    caller mutates the size outside a drag and wants to persist
+ *    immediately.
+ *
+ * The initial read defaults to `defaultSize` when nothing is
+ * stored or the value is corrupt. The min/max clamps are applied
+ * on every set AND on the initial read, so a persisted value can
+ * never come back out of the hook in an invalid range (e.g. after
+ * the user resizes the window much smaller).
  */
 export function usePersistentPanelSize(
   storageKey: string,
   defaultSize: number,
   opts: { min: number; max: number } = { min: 120, max: 800 },
-): [number, (s: number) => void] {
+): [number, (s: number) => void, () => void] {
   const [size, setSizeState] = useState<number>(() => {
     try {
       if (typeof localStorage === "undefined") return defaultSize;
@@ -200,19 +213,27 @@ export function usePersistentPanelSize(
       return defaultSize;
     }
   });
+  // Latest clamped size mirrored into a ref so `commit` reads the
+  // up-to-date value without recreating the callback on every
+  // render (which would defeat callers that pass it straight to
+  // `<PanelResizeHandle onResizeEnd={commit} />`).
+  const sizeRef = useRef<number>(size);
   const setSize = useCallback(
     (next: number) => {
       const clamped = Math.max(opts.min, Math.min(opts.max, next));
+      sizeRef.current = clamped;
       setSizeState(clamped);
-      try {
-        if (typeof localStorage !== "undefined") {
-          localStorage.setItem(storageKey, String(clamped));
-        }
-      } catch {
-        /* noop */
-      }
     },
-    [storageKey, opts.min, opts.max],
+    [opts.min, opts.max],
   );
-  return [size, setSize];
+  const commit = useCallback(() => {
+    try {
+      if (typeof localStorage !== "undefined") {
+        localStorage.setItem(storageKey, String(sizeRef.current));
+      }
+    } catch {
+      /* noop */
+    }
+  }, [storageKey]);
+  return [size, setSize, commit];
 }

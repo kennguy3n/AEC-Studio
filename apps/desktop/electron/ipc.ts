@@ -326,7 +326,17 @@ export function registerIpcHandlers(): void {
       >[0],
     );
   });
-  ipcMain.handle("design:updateMaterial", async (_e, materialId, update) => {
+  // Object-arg shape (`{ materialId, update }`) matches every other
+  // `design:*` handler above. The preload wraps the renderer's
+  // positional (materialId, update) call into the object form so the
+  // public `aec.design.updateMaterial(materialId, patch)` surface
+  // stays unchanged.
+  ipcMain.handle("design:updateMaterial", async (_e, params) => {
+    assertObject(params, "params");
+    const { materialId, update } = params as {
+      materialId?: unknown;
+      update?: unknown;
+    };
     if (typeof materialId !== "string" || materialId.length === 0) {
       throw new Error("design:updateMaterial: materialId must be a string");
     }

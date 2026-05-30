@@ -186,7 +186,11 @@ const api = {
         transmission?: number;
         emissive?: [number, number, number];
       },
-    ) => ipcRenderer.invoke("design:updateMaterial", materialId, update),
+    ) =>
+      // The IPC handler accepts a single `{ materialId, update }`
+      // object (matches every other `design:*` handler). The renderer
+      // keeps the more ergonomic positional form via this wrapper.
+      ipcRenderer.invoke("design:updateMaterial", { materialId, update }),
   },
 
   // ----- Draft -----

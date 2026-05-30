@@ -21,9 +21,12 @@ import {
  *      once per drag.
  *   3. The handle reports orientation via `aria-orientation` so a
  *      screen reader announces "vertical separator, resize panel".
- *   4. `usePersistentPanelSize` round-trips through localStorage,
- *      clamps to min/max on every set, and tolerates corrupt
- *      stored values without throwing.
+ *   4. `usePersistentPanelSize` exposes a `[size, setSize, commit]`
+ *      triple where `setSize` only updates in-memory state
+ *      (drag-loop hot path) and `commit` flushes the latest size
+ *      to localStorage. Clamps to min/max on every set, tolerates
+ *      corrupt stored values, and round-trips on remount once
+ *      `commit` has been called.
  */
 describe("PanelResizeHandle", () => {
   it("emits the horizontal delta on drag (vertical orientation)", () => {
@@ -106,22 +109,60 @@ describe("usePersistentPanelSize", () => {
     expect(result.current[0]).toBe(240);
   });
 
-  it("round-trips via localStorage and clamps to min/max", () => {
+  it("clamps to min/max on setSize but defers localStorage write to commit", () => {
     localStorage.clear();
     const { result } = renderHook(() =>
       usePersistentPanelSize("panel.test.rt", 300, { min: 100, max: 500 }),
     );
+    // setSize is the drag-loop hot path: it updates state but
+    // must NOT touch localStorage (a pointermove fires 60+ Hz and
+    // each setItem call also broadcasts a StorageEvent).
     act(() => result.current[1](400));
     expect(result.current[0]).toBe(400);
+    expect(localStorage.getItem("panel.test.rt")).toBeNull();
+    // commit flushes the latest in-memory size.
+    act(() => result.current[2]());
     expect(localStorage.getItem("panel.test.rt")).toBe("400");
-    // Above max → clamps.
+    // Above max → clamps in memory.
     act(() => result.current[1](9000));
     expect(result.current[0]).toBe(500);
+    expect(localStorage.getItem("panel.test.rt")).toBe("400");
+    act(() => result.current[2]());
     expect(localStorage.getItem("panel.test.rt")).toBe("500");
-    // Below min → clamps.
+    // Below min → clamps in memory.
     act(() => result.current[1](-10));
     expect(result.current[0]).toBe(100);
+    expect(localStorage.getItem("panel.test.rt")).toBe("500");
+    act(() => result.current[2]());
     expect(localStorage.getItem("panel.test.rt")).toBe("100");
+  });
+
+  it("does not write to localStorage during a simulated drag loop", () => {
+    localStorage.clear();
+    const setItem = vi.spyOn(Storage.prototype, "setItem");
+    try {
+      const { result } = renderHook(() =>
+        usePersistentPanelSize("panel.test.drag", 300, {
+          min: 100,
+          max: 500,
+        }),
+      );
+      // Simulate 60 pointermove frames of a one-second drag — the
+      // hook must NOT call setItem on any of them. (The earlier
+      // implementation called setItem per setSize, which produced
+      // 60+ Hz synchronous storage writes + StorageEvent fan-outs.)
+      act(() => {
+        for (let i = 0; i < 60; i++) result.current[1](200 + i);
+      });
+      expect(setItem).not.toHaveBeenCalled();
+      expect(result.current[0]).toBe(259);
+      // Single commit at the end of the gesture writes once.
+      act(() => result.current[2]());
+      expect(setItem).toHaveBeenCalledTimes(1);
+      expect(setItem).toHaveBeenLastCalledWith("panel.test.drag", "259");
+    } finally {
+      setItem.mockRestore();
+    }
   });
 
   it("recovers stored value on remount", () => {

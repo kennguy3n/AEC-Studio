@@ -45,7 +45,7 @@ export function Draft() {
     layer: null,
   });
   // Phase 17 Group B Task 14 — persisted right-panel width.
-  const [panelWidth, setPanelWidth] = usePersistentPanelSize(
+  const [panelWidth, setPanelWidth, commitPanelWidth] = usePersistentPanelSize(
     "panel.draft.right",
     320,
     { min: 200, max: 600 },
@@ -223,6 +223,9 @@ export function Draft() {
         onResize={(delta) => {
           setPanelWidth(dragStartWidth.current - delta);
         }}
+        // Persist once per gesture rather than on every pointermove
+        // — see `usePersistentPanelSize` docstring.
+        onResizeEnd={commitPanelWidth}
       />
       <div className="draft-panels">
         <LayerPanel layers={layers} onChange={setLayers} />

@@ -27,7 +27,7 @@ export function Design() {
   // the IPC layer injects it from the active-project tracker.
   useActiveProject();
   const [activeTool, setActiveTool] = useState<DesignTool>("select");
-  const [panelWidth, setPanelWidth] = usePersistentPanelSize(
+  const [panelWidth, setPanelWidth, commitPanelWidth] = usePersistentPanelSize(
     "panel.design.inspector",
     DESIGN_PANEL_DEFAULT,
     { min: DESIGN_PANEL_MIN, max: DESIGN_PANEL_MAX },
@@ -59,6 +59,9 @@ export function Design() {
           // shrinks as delta grows. Mirror the sign accordingly.
           setPanelWidth(dragStartWidth.current - delta);
         }}
+        // Persist once per gesture rather than on every pointermove
+        // — see `usePersistentPanelSize` docstring.
+        onResizeEnd={commitPanelWidth}
       />
       <div className="design-panels">
         <DesignInspector activeTool={activeTool} />

@@ -113,16 +113,16 @@ export function Bim() {
   // | property editor). Min/max chosen so neither side panel can
   // collapse beneath usability nor crush the viewport on common
   // 1366×768 laptop screens.
-  const [treeWidth, setTreeWidth] = usePersistentPanelSize(
+  const [treeWidth, setTreeWidth, commitTreeWidth] = usePersistentPanelSize(
     "panel.bim.tree",
     280,
     { min: 200, max: 480 },
   );
-  const [pseditorWidth, setPseditorWidth] = usePersistentPanelSize(
-    "panel.bim.pseditor",
-    320,
-    { min: 240, max: 520 },
-  );
+  const [pseditorWidth, setPseditorWidth, commitPseditorWidth] =
+    usePersistentPanelSize("panel.bim.pseditor", 320, {
+      min: 240,
+      max: 520,
+    });
   const dragStartTreeWidth = useRef<number>(treeWidth);
   const dragStartPseditorWidth = useRef<number>(pseditorWidth);
 
@@ -653,6 +653,9 @@ export function Bim() {
             // Tree is on the LEFT — dragging right grows it.
             setTreeWidth(dragStartTreeWidth.current + delta);
           }}
+          // Persist once per gesture rather than on every
+          // pointermove — see `usePersistentPanelSize` docstring.
+          onResizeEnd={commitTreeWidth}
         />
         <div
           className="bim-viewport"
@@ -677,6 +680,9 @@ export function Bim() {
             // shrinks it. Mirror the sign.
             setPseditorWidth(dragStartPseditorWidth.current - delta);
           }}
+          // Persist once per gesture rather than on every
+          // pointermove — see `usePersistentPanelSize` docstring.
+          onResizeEnd={commitPseditorWidth}
         />
         <PropertyEditor
           entityId={selectedId}

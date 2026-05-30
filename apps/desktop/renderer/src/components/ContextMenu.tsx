@@ -24,7 +24,7 @@
  *   - Window blur dismisses
  */
 
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Icon, type IconName } from "../icons/Icon";
 
@@ -343,7 +343,6 @@ export function ContextMenuTrigger({
   const [coords, setCoords] = useState<{ x: number; y: number } | null>(
     null,
   );
-  const memoItems = useMemo(() => items, [items]);
   const onCtx = useCallback((ev: React.MouseEvent) => {
     ev.preventDefault();
     setCoords({ x: ev.clientX, y: ev.clientY });
@@ -357,7 +356,7 @@ export function ContextMenuTrigger({
       {children}
       {coords !== null && (
         <ContextMenu
-          items={memoItems}
+          items={items}
           x={coords.x}
           y={coords.y}
           label={label}

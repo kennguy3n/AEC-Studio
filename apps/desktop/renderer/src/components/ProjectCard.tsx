@@ -76,8 +76,15 @@ export function ProjectCard({ project, onOpen }: Props) {
         // The bridge surfaces validation / IO failures as rejected
         // promises. The card falls back to the gradient — a missing
         // thumbnail is a soft failure, not a reason to break the
-        // Home grid.
+        // Home grid. Revoke any URL we held before the failed
+        // re-fetch so we don't pin a stale blob in memory until
+        // unmount (the unmount cleanup would eventually catch it,
+        // but freeing immediately is cheaper and clearer).
         if (!cancelled) {
+          if (lastObjectUrl.current) {
+            URL.revokeObjectURL(lastObjectUrl.current);
+            lastObjectUrl.current = null;
+          }
           setThumbUri(null);
           setThumbDims(null);
         }

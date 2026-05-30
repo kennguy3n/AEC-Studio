@@ -296,14 +296,13 @@ export function Settings() {
     // Theme toggles are immediate — the Save button is for the
     // other settings on this page. Don't reset savedAt.
   }, []);
-  const effectiveTheme = useMemo(
-    () => resolveEffectiveTheme(themeMode),
-    // The OS-hint subscription re-renders the component when the
-    // OS dark/light flips, which re-runs this memo; we don't need
-    // the tick itself in the dep array because the rerender brings
-    // us back through this hook regardless.
-    [themeMode],
-  );
+  // Computed on every render. `resolveEffectiveTheme` is a string
+  // compare plus a `matchMedia` read in System mode — microseconds —
+  // so the memo overhead is a net loss. Memoising on `[themeMode]`
+  // alone would also be wrong: when the OS flips under System mode
+  // the dep array is unchanged, so the memo would hand back the
+  // cached resolution against the previous OS preference.
+  const effectiveTheme = resolveEffectiveTheme(themeMode);
 
   const tierLabel = useMemo(() => {
     if (!status) return "Detecting…";
