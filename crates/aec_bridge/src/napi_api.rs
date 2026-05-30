@@ -1017,16 +1017,24 @@ pub struct DesignListMaterialsQueryJs {
 /// the channel values — pre-stringifying here would force the
 /// renderer to parse the CSS form back into floats for shading
 /// math.
+// napi-rs 2.x does NOT implement `FromNapiValue` for `f32` (JS numbers
+// are IEEE-754 doubles, so only `f64` round-trips losslessly), which
+// means `Vec<f32>` is also unsupported at the napi boundary. The
+// `#[napi(object)]` derive macro generates BOTH `FromNapiValue` and
+// `ToNapiValue` impls for object structs unconditionally, so any
+// `Vec<f32>` field would fail to compile under `--all-features`.
+// We use `Vec<f64>` here and cast to/from the service-layer `f32`
+// linear-RGB representation at the conversion boundary.
 #[napi(object)]
 pub struct MaterialSummaryJs {
     pub material_id: String,
     pub name: String,
-    pub albedo: Vec<f32>,
+    pub albedo: Vec<f64>,
     pub metallic: f64,
     pub roughness: f64,
     pub ior: f64,
     pub transmission: f64,
-    pub emissive: Vec<f32>,
+    pub emissive: Vec<f64>,
     pub style_tags: Vec<String>,
     pub tags: Vec<String>,
 }
@@ -1036,12 +1044,12 @@ impl From<crate::service::MaterialSummary> for MaterialSummaryJs {
         Self {
             material_id: s.material_id,
             name: s.name,
-            albedo: s.albedo.to_vec(),
+            albedo: s.albedo.iter().map(|v| *v as f64).collect(),
             metallic: s.metallic as f64,
             roughness: s.roughness as f64,
             ior: s.ior as f64,
             transmission: s.transmission as f64,
-            emissive: s.emissive.to_vec(),
+            emissive: s.emissive.iter().map(|v| *v as f64).collect(),
             style_tags: s.style_tags,
             tags: s.tags,
         }
@@ -1084,32 +1092,34 @@ pub async fn design_list_materials(
 /// field is `Option` so the inspector can `PATCH`-style send only
 /// the slider that moved; unset fields keep their current value.
 ///
-/// `albedo` / `emissive` arrive as JS arrays of three floats — the
-/// `Vec<f32>` shape is forced by napi-rs's lack of fixed-size
-/// array support at the napi-rs 2.x boundary, so the bridge
-/// validates `len() == 3` before forwarding to the service-layer
-/// `[f32; 3]`. Out-of-range values are rejected by the service
-/// layer's `validate_material_update`, surfacing through napi as an
-/// `Error::from_reason("invalid: …")` the renderer can show on the
-/// inspector toast.
+/// `albedo` / `emissive` arrive as JS arrays of three numbers — the
+/// `Vec<f64>` shape is forced by napi-rs's lack of fixed-size
+/// array support at the napi-rs 2.x boundary AND by napi-rs's lack
+/// of a `FromNapiValue` impl for `f32` (JS numbers are IEEE-754
+/// doubles, so only `f64` round-trips through napi natively). The
+/// bridge validates `len() == 3` before forwarding to the service-
+/// layer `[f32; 3]` via `as f32` casts. Out-of-range values are
+/// rejected by the service layer's `validate_material_update`,
+/// surfacing through napi as an `Error::from_reason("invalid: …")`
+/// the renderer can show on the inspector toast.
 #[napi(object)]
 pub struct MaterialUpdateJs {
-    pub albedo: Option<Vec<f32>>,
+    pub albedo: Option<Vec<f64>>,
     pub metallic: Option<f64>,
     pub roughness: Option<f64>,
     pub ior: Option<f64>,
     pub transmission: Option<f64>,
-    pub emissive: Option<Vec<f32>>,
+    pub emissive: Option<Vec<f64>>,
 }
 
-fn rgb_from_vec(field: &str, v: &[f32]) -> Result<[f32; 3]> {
+fn rgb_from_vec(field: &str, v: &[f64]) -> Result<[f32; 3]> {
     if v.len() != 3 {
         return Err(Error::new(
             Status::InvalidArg,
             format!("{field} must have exactly 3 components, got {}", v.len()),
         ));
     }
-    Ok([v[0], v[1], v[2]])
+    Ok([v[0] as f32, v[1] as f32, v[2] as f32])
 }
 
 /// Apply an inspector slider patch to a single material and return
