@@ -3930,15 +3930,20 @@ impl BridgeService {
         // so by the time we hit `ssim_from_files` the mutex is free.
         let (a_path, b_path) = {
             let state = self.lock_render_state()?;
+            // Snapshot the queue once. `RenderQueue::list_jobs()`
+            // clones the full `Vec<JobRecord>` on every call (it
+            // returns an owned `Vec`, not a borrowed slice, because
+            // the queue's internal storage is wrapped in a mutex it
+            // can't lend out across a return), so calling it twice
+            // — once per `lookup(..)` — doubled the allocation and
+            // copy for what is logically a single read. With the
+            // snapshot the second `find()` walks the same Vec we
+            // already paid for.
+            let jobs = state.queue.list_jobs();
             let lookup = |id: &str| -> Result<std::path::PathBuf, BridgeServiceError> {
-                let job = state
-                    .queue
-                    .list_jobs()
-                    .into_iter()
-                    .find(|j| j.id == id)
-                    .ok_or_else(|| {
-                        BridgeServiceError::Core(format!("render job '{id}' not found"))
-                    })?;
+                let job = jobs.iter().find(|j| j.id == id).ok_or_else(|| {
+                    BridgeServiceError::Core(format!("render job '{id}' not found"))
+                })?;
                 job.output_path.clone().ok_or_else(|| {
                     BridgeServiceError::Core(format!("render job '{id}' has no output yet"))
                 })

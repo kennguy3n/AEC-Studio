@@ -141,7 +141,16 @@ pub fn sample_textured_material(
     }
     if let Some(tex_id) = bindings.emissive {
         let s: Vec4 = bilinear_sample(atlas, tex_id, uv_arr, 0.0);
-        out.emissive = mat.emissive + Vec3::new(s.x, s.y, s.z);
+        // glTF / Cycles convention: emissive textures multiply with
+        // the scalar `emissive_factor` so a white texel acts as
+        // identity and a black texel zeroes the channel. Using `+`
+        // here would silently energise materials with `mat.emissive
+        // == Vec3::ZERO` (the default) — every textured surface
+        // would glow even when `emissive_factor` says otherwise —
+        // and would push hot pixels in white-texture areas above the
+        // intended factor, breaking the doc-comment contract above
+        // ("emissive maps are multiplied with the base scalar").
+        out.emissive = mat.emissive * Vec3::new(s.x, s.y, s.z);
     }
     out.texture_bindings = None;
     out
@@ -383,12 +392,24 @@ pub struct BsdfSample {
 
 /// Importance-sample the principled BSDF.
 ///
-/// `rng` returns three i.i.d. uniform numbers in `[0, 1)`.
+/// `rng` is four i.i.d. uniform numbers in `[0, 1)`. The fourth
+/// channel is consumed only by the transmission lobe (Fresnel
+/// Russian-roulette between microfacet reflection and refraction);
+/// the diffuse and specular lobes ignore it. A fourth sample is
+/// required — not a third one reused — because using the same
+/// scalar as both `u2` for the GGX half-vector azimuth and as the
+/// threshold for the Fresnel split produces a deterministic
+/// coupling between half-vector orientation and reflect-vs-refract
+/// outcome, visibly biasing roughened glass renders (energy
+/// stripes along one diagonal of the lobe). Allocate the fourth
+/// sample from the same RNG you draw the first three from — see
+/// `path_trace.rs`'s `[rng.f32(); 4]` call for the canonical
+/// pattern.
 pub fn sample_bsdf(
     mat: &PathTraceMaterial,
     n: Vec3,
     wo: Vec3,
-    rng: [f32; 3],
+    rng: [f32; 4],
 ) -> Option<BsdfSample> {
     let n_dot_v = n.dot(wo);
     if n_dot_v <= 0.0 {
@@ -422,7 +443,10 @@ pub fn sample_bsdf(
         let f_r_avg = ((f_r.x + f_r.y + f_r.z) / 3.0).clamp(0.0, 1.0);
         // Russian-roulette fresnel split: probability `f_r_avg` we
         // reflect off the microfacet, otherwise we refract.
-        if rng[2] < f_r_avg {
+        // Use the dedicated 4th sample for the Fresnel split so it
+        // is independent of `rng[2]` (already consumed by
+        // `sample_ggx_half_unconditional` as the polar-angle `u2`).
+        if rng[3] < f_r_avg {
             // Fresnel reflects → behave like a specular bounce.
             let wi = 2.0 * v_dot_h * h_world - wo;
             if n.dot(wi) <= 0.0 {
@@ -673,7 +697,12 @@ mod tests {
         let n_samples = 4096;
         let mut sum = Vec3::ZERO;
         for _ in 0..n_samples {
-            let r = [fastrand::f32(), fastrand::f32(), fastrand::f32()];
+            let r = [
+                fastrand::f32(),
+                fastrand::f32(),
+                fastrand::f32(),
+                fastrand::f32(),
+            ];
             if let Some(s) = sample_bsdf(&mat, n, wo, r) {
                 sum += s.weight;
             }
@@ -825,6 +854,7 @@ mod tests {
                 (i as f32 + 0.5) / trials as f32,
                 fastrand::f32(),
                 fastrand::f32(),
+                fastrand::f32(),
             ];
             if let Some(s) = sample_bsdf(&mat, n, wo, r) {
                 if s.is_transmission {
@@ -844,7 +874,12 @@ mod tests {
         let n = Vec3::Z;
         let wo = Vec3::Z;
         for i in 0..50 {
-            let r = [fastrand::f32(), (i as f32 + 0.5) / 50.0, fastrand::f32()];
+            let r = [
+                fastrand::f32(),
+                (i as f32 + 0.5) / 50.0,
+                fastrand::f32(),
+                fastrand::f32(),
+            ];
             if let Some(s) = sample_bsdf(&mat, n, wo, r) {
                 assert!(!s.is_transmission, "opaque material picked transmission");
             }

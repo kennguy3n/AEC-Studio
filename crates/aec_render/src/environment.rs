@@ -89,8 +89,31 @@ impl EnvironmentMap {
     /// Build an [`EnvironmentMap`] from raw linear-space RGB pixels.
     /// Useful for tests and for callers that have already loaded
     /// pixels via another path (e.g. an in-memory blob).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `pixels.len() != width * height`. The CDF builder
+    /// (`build_importance_cdf`) and the `sample_direction` /
+    /// `pdf_direction` paths all index `pixels` by
+    /// `y * width + x` and would silently wrap around / read the
+    /// wrong row on a mismatched `Vec`, which is far worse than a
+    /// loud panic at construction. The check used to be
+    /// `debug_assert_eq!`, but that compiles out in release builds
+    /// — leaving callers (in particular `from_dynamic_image` if the
+    /// underlying decoder ever surprises us, and any future
+    /// in-memory blob importer) with no protection in production
+    /// binaries. Matches the same `assert_eq!` pattern used by the
+    /// sibling `denoise::ImageRgb::from_pixels` constructor.
     pub fn from_pixels(width: u32, height: u32, pixels: Vec<[f32; 3]>, intensity: f32) -> Self {
-        debug_assert_eq!(pixels.len(), (width as usize) * (height as usize));
+        assert_eq!(
+            pixels.len(),
+            (width as usize) * (height as usize),
+            "EnvironmentMap::from_pixels: pixels.len() = {} does not match width*height = {}*{} = {}",
+            pixels.len(),
+            width,
+            height,
+            (width as usize) * (height as usize),
+        );
         let (marginal_cdf, conditional_cdf, row_integrals, total_integral) =
             build_importance_cdf(width, height, &pixels);
         Self {

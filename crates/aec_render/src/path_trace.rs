@@ -1578,7 +1578,15 @@ fn trace_path(
         }
 
         // Sample the BSDF for the next bounce.
-        let r = [rng.f32(), rng.f32(), rng.f32()];
+        //
+        // Four i.i.d. samples are required (not three) — `sample_bsdf`
+        // consumes `rng[3]` as the Fresnel reflect-vs-refract split in
+        // the transmission lobe, independent of `rng[2]` which the
+        // half-vector sampler uses as the polar-angle `u2`. Drawing
+        // the fourth sample from the same `rng` (rather than reusing
+        // `rng[2]`) is what eliminates the lobe-orientation /
+        // outcome coupling that biased Phase 17 glass renders.
+        let r = [rng.f32(), rng.f32(), rng.f32(), rng.f32()];
         let Some(sample) = sample_bsdf(&mat, n, wo, r) else {
             break;
         };
