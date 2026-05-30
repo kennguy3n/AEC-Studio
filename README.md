@@ -116,6 +116,20 @@ The Phase 7 baseline + Phase 12 production hardening landed before the architect
 
 ---
 
+## Extension system (Phase 8 → 16)
+
+AEC Studio is extensible via **Ed25519-signed third-party packages** installed under `{userData}/extensions/`. The same surface drives asset packs, project templates, custom schedules, export targets, AI tools, and importers — including the in-tree `.kcz` companion that powers the KChat integration above.
+
+- **Six contribution types** — `asset_pack` (catalogue entries with BLAKE3-pinned blobs), `template` (project templates composed with the on-disk `templates/` tree, with on-collision override), `schedule` (custom schedule sheets), `export_target` (Deliver-mode formats), `ai_tool` (planner-dispatchable tools that piggy-back on a host `grammar_key` with cap-clamped scopes), and `importer` (vendor file formats; runtime dispatch lands in v1.1).
+- **Typed permission model** — every manifest declares an explicit `permissions` list drawn from `filesystem_read`, `filesystem_write`, `geometry_read`, `geometry_write`, `ai_tools`, `audit_log`, `network`. `PermissionEnforcer::check_permission` rejects any privileged operation that wasn't declared up-front. Asset packs in particular cannot request `geometry_write` — they only contribute catalogue rows.
+- **Ed25519 signature verification** — production builds verify each manifest's embedded `signature` field against a trust store of allowed public keys (`verify_signature_against` + per-OS `trusted_keys.json`); manifests signed by an untrusted key are rejected. Unsigned manifests are rejected by `LoadOptions::default()`; `LoadOptions::allow_unsigned()` allows them as a dev mode (and surfaces them as `signed: false` in Settings). BLAKE3 hashes on every asset-pack blob prevent post-signing tampering of large payloads.
+- **Fault-tolerant boot (Phase 16)** — broken extensions never block AEC Studio from starting. `aec_core::extensions::load_with_diagnostics` walks each extension directory in isolation and accumulates failures into an `ExtensionLoadDiagnostic` vector instead of aborting the whole load. Three boot stages contribute (loader, asset-pack install, AI-tool resolution pre-walk) across eight wire-stable stage strings: `manifest_read`, `manifest_parse`, `manifest_validation`, `unsafe_path`, `signature_verification`, `duplicate_id`, `asset_pack_install`, `ai_tool_resolution`.
+- **Diagnostics surface** — the buffered vector is exposed via the `extensions:listLoadDiagnostics` IPC (preload: `aec.extensions.listLoadDiagnostics()`). When non-empty, the Settings page renders a read-only "Extension load diagnostics" card with each entry's extension id (when known), path, stage, and human-readable message. When empty, the card is hidden — a clean boot is silent.
+
+The architecture detail is in [ARCHITECTURE.md §9.7](ARCHITECTURE.md#97-extension-system-phase-8--phase-16-diagnostics). The developer-facing manifest schema, signing flow, and per-stage diagnostics reference are in [EXTENSIONS.md](EXTENSIONS.md).
+
+---
+
 ## Open-source foundations
 
 AEC Studio learns from — and selectively interoperates with — battle-tested open-source projects:
