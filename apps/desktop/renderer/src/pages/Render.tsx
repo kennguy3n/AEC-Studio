@@ -369,21 +369,29 @@ export function Render() {
   useEffect(() => {
     if (!project?.path) return;
     if (!hasInFlight) return;
+    // Capture the active project at effect creation. Subsequent
+    // poll resolutions re-check `getActiveProjectPath() !==
+    // startPath` (the synchronous ref-backed getter on
+    // `useActiveProject`) so a `listJobs()` issued under project A
+    // that resolves after the user has navigated to project B is
+    // skipped at commit time. This matches the stale-project guard
+    // pattern used by `enqueueAll` (lines 539, 565) and every
+    // other async handler in the file. The earlier draft of this
+    // poll wrote `if (project?.path)` at the same site, but
+    // `project?.path` is a closure-captured value identical to the
+    // truthiness check at effect entry — the comparison was dead
+    // code and didn't actually re-check the live state. Devin
+    // Review (commit fd44516) flagged the stale-closure pattern;
+    // this is the proper fix.
+    const startPath = project.path;
     let alive = true;
     const id = window.setInterval(() => {
       void aec.render
         .listJobs()
         .then((rows) => {
           if (!alive) return;
-          // Re-check the active project at commit time. The poll
-          // races project switches the same way the one-shot fetch
-          // does: a `listJobs()` issued under project A can resolve
-          // after the user navigates to project B. Without this
-          // guard, A's job list would land in B's `jobs` state and
-          // every per-row action (`onCancel`, RenderDoctor's
-          // `diagnose`) would address project A's render store
-          // from a UI keyed off project B.
-          if (project?.path) setJobs(rows as RenderJob[]);
+          if (getActiveProjectPath() !== startPath) return;
+          setJobs(rows as RenderJob[]);
         })
         .catch(() => {
           // Bridge failure (transient project-switch race, corrupt
@@ -399,7 +407,7 @@ export function Render() {
       alive = false;
       window.clearInterval(id);
     };
-  }, [project?.path, hasInFlight]);
+  }, [project?.path, hasInFlight, getActiveProjectPath]);
 
   const changePreset = useCallback((next: RenderPresetKey) => {
     setPreset(next);
