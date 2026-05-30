@@ -21,7 +21,9 @@ pub mod worker;
 pub use db::AssetDatabase;
 pub use decimate::{decimate as decimate_mesh, DecimateError, DecimateOptions, Quadric};
 pub use error::{AssetError, AssetResult};
-pub use extension_host::{install_asset_packs, AssetExtensionError, InstallSummary};
+pub use extension_host::{
+    install_asset_packs, install_asset_packs_collect_errors, AssetExtensionError, InstallSummary,
+};
 pub use ingest::{
     detect_format, ingest_bytes, ingest_path, IngestError, IngestFormat, IngestedMesh,
 };

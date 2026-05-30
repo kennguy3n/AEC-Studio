@@ -514,6 +514,14 @@ export function rendererInProcessBackend(): AecApi {
       cancelJob: async () => ({ cancelled: true }),
       runtimeStatus: async () => ({ state: "idle", lastError: null }),
     },
+    extensions: {
+      // Vitest fallback: there are no extensions loaded in the
+      // renderer in-process backend, so by construction there
+      // cannot be any load failures to surface. The empty-array
+      // contract is the same signal the Settings page uses on the
+      // real backend to hide the diagnostics card entirely.
+      listLoadDiagnostics: async () => [],
+    },
     export: {
       // Vitest fallback for the export IPC namespace. Mirrors the
       // shape AND the strictness of the in-process backend in

@@ -548,6 +548,20 @@ export function registerIpcHandlers(): void {
   });
   ipcMain.handle("ai:runtimeStatus", async () => getBridge().aiRuntimeStatus());
 
+  // ----- Extensions (Phase 16) -----
+  //
+  // Per-extension boot diagnostics. The bridge intentionally
+  // degrades on per-extension load errors (a broken manifest must
+  // not block the whole renderer from booting) but those silent
+  // failures used to be invisible. This IPC exposes the Rust-side
+  // buffered diagnostics so the Settings page can render a
+  // read-only diagnostics card. Read-only and idempotent;
+  // returns an empty array when nothing is broken (the renderer
+  // treats that as the signal to hide the card entirely).
+  ipcMain.handle("extensions:listLoadDiagnostics", async () =>
+    getBridge().extensionsListLoadDiagnostics(),
+  );
+
   // ----- Export -----
   ipcMain.handle("export:exportPdf", async (_e, p) => {
     assertObject(p, "params");

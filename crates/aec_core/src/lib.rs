@@ -44,10 +44,10 @@ pub use extension_permissions::{
 };
 pub use extensions::{
     canonical_payload_bytes, AiToolBody, AssetEntry, AssetEntryKind, AssetPackBody, ExportFormat,
-    ExportTargetBody, ExtensionId, ExtensionLoader, ExtensionManifest, ExtensionRegistry,
-    ExtensionSignature, ExtensionType, ImporterBody, LoadError, LoadOptions, LoadedExtension,
-    Permission, ScheduleBody, ScheduleColumnDef, ScheduleFormulaDef, ScheduleValueType,
-    TemplateBody,
+    ExportTargetBody, ExtensionId, ExtensionLoadDiagnostic, ExtensionLoadStage, ExtensionLoader,
+    ExtensionManifest, ExtensionRegistry, ExtensionSignature, ExtensionType, ImporterBody,
+    LoadError, LoadOptions, LoadedExtension, Permission, ScheduleBody, ScheduleColumnDef,
+    ScheduleFormulaDef, ScheduleValueType, TemplateBody,
 };
 #[cfg(feature = "kchat")]
 pub use kchat::DEFAULT_THREAD_ID;
