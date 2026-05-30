@@ -469,7 +469,10 @@ export interface BridgeBackend {
   }): Promise<RenderCompareResult>;
   /**
    * Set the HDRI environment map used by future renders. Pass `null`
-   * (or omit) to fall back to the procedural Hosek-Wilkie sky.
+   * for `path` to fall back to the procedural Hosek-Wilkie sky. The
+   * `path` field is required (not optional) — callers must explicitly
+   * communicate "no environment" via `null` so the IPC boundary at
+   * `ipc.ts:515` can distinguish "clear" from "leave unchanged".
    */
   renderSetEnvironmentMap(params: {
     path: string | null;
