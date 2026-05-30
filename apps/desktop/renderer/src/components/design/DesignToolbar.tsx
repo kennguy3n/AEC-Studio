@@ -1,3 +1,5 @@
+import { Icon, type IconName } from "../../icons/Icon";
+
 export type DesignTool =
   | "select"
   | "wall"
@@ -10,17 +12,17 @@ export type DesignTool =
   | "lighting"
   | "camera";
 
-const TOOLS: { id: DesignTool; label: string; icon: string }[] = [
-  { id: "select", label: "Select", icon: "↑" },
-  { id: "wall", label: "Wall", icon: "║" },
-  { id: "floor", label: "Floor", icon: "▤" },
-  { id: "ceiling", label: "Ceiling", icon: "▥" },
-  { id: "door", label: "Door", icon: "◰" },
-  { id: "window", label: "Window", icon: "▦" },
-  { id: "furniture", label: "Furniture", icon: "▢" },
-  { id: "material", label: "Material", icon: "◔" },
-  { id: "lighting", label: "Lighting", icon: "☀" },
-  { id: "camera", label: "Camera", icon: "◉" },
+const TOOLS: { id: DesignTool; label: string; icon: IconName }[] = [
+  { id: "select", label: "Select", icon: "select" },
+  { id: "wall", label: "Wall", icon: "wall" },
+  { id: "floor", label: "Floor", icon: "floor" },
+  { id: "ceiling", label: "Ceiling", icon: "ceiling" },
+  { id: "door", label: "Door", icon: "door" },
+  { id: "window", label: "Window", icon: "window" },
+  { id: "furniture", label: "Furniture", icon: "furniture" },
+  { id: "material", label: "Material", icon: "material" },
+  { id: "lighting", label: "Lighting", icon: "lighting" },
+  { id: "camera", label: "Camera", icon: "camera" },
 ];
 
 interface Props {
@@ -42,7 +44,7 @@ export function DesignToolbar({ activeTool, onSelect }: Props) {
           className={`design-toolbar__btn${activeTool === t.id ? " is-active" : ""}`}
           onClick={() => onSelect(t.id)}
         >
-          {t.icon}
+          <Icon name={t.icon} size={20} />
         </button>
       ))}
     </aside>

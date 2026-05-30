@@ -1,3 +1,5 @@
+import { Icon, type IconName } from "../../icons/Icon";
+
 export type DraftDrawTool =
   | "line"
   | "polyline"
@@ -21,27 +23,27 @@ export type DraftEditTool =
 
 export type DraftTool = DraftDrawTool | DraftEditTool | "select";
 
-export const DRAW_TOOLS: { id: DraftDrawTool; label: string }[] = [
-  { id: "line", label: "Line" },
-  { id: "polyline", label: "Polyline" },
-  { id: "arc", label: "Arc" },
-  { id: "circle", label: "Circle" },
-  { id: "text", label: "Text" },
-  { id: "dim", label: "Dim" },
-  { id: "hatch", label: "Hatch" },
+export const DRAW_TOOLS: { id: DraftDrawTool; label: string; icon: IconName }[] = [
+  { id: "line", label: "Line", icon: "line" },
+  { id: "polyline", label: "Polyline", icon: "polyline" },
+  { id: "arc", label: "Arc", icon: "arc" },
+  { id: "circle", label: "Circle", icon: "circle" },
+  { id: "text", label: "Text", icon: "text" },
+  { id: "dim", label: "Dim", icon: "dim" },
+  { id: "hatch", label: "Hatch", icon: "hatch" },
 ];
 
-export const EDIT_TOOLS: { id: DraftEditTool; label: string }[] = [
-  { id: "move", label: "Move" },
-  { id: "copy", label: "Copy" },
-  { id: "rotate", label: "Rotate" },
-  { id: "trim", label: "Trim" },
-  { id: "extend", label: "Extend" },
-  { id: "offset", label: "Offset" },
-  { id: "fillet", label: "Fillet" },
-  { id: "chamfer", label: "Chamfer" },
-  { id: "mirror", label: "Mirror" },
-  { id: "scale", label: "Scale" },
+export const EDIT_TOOLS: { id: DraftEditTool; label: string; icon: IconName }[] = [
+  { id: "move", label: "Move", icon: "move" },
+  { id: "copy", label: "Copy", icon: "copy" },
+  { id: "rotate", label: "Rotate", icon: "rotate" },
+  { id: "trim", label: "Trim", icon: "trim" },
+  { id: "extend", label: "Extend", icon: "extend" },
+  { id: "offset", label: "Offset", icon: "offset" },
+  { id: "fillet", label: "Fillet", icon: "fillet" },
+  { id: "chamfer", label: "Chamfer", icon: "chamfer" },
+  { id: "mirror", label: "Mirror", icon: "mirror" },
+  { id: "scale", label: "Scale", icon: "scale" },
 ];
 
 interface Props {
@@ -59,8 +61,10 @@ export function DraftToolbar({ activeTool, onSelect, onImport, onExport }: Props
         className={`draft-toolbar__btn${activeTool === "select" ? " draft-toolbar__btn--active" : ""}`}
         onClick={() => onSelect("select")}
         data-testid="draft-tool-select"
+        title="Select"
       >
-        Select
+        <Icon name="select" size={18} />
+        <span className="draft-toolbar__label">Select</span>
       </button>
       <div className="draft-toolbar__group" data-testid="draft-toolbar-draw">
         {DRAW_TOOLS.map((t) => (
@@ -70,8 +74,10 @@ export function DraftToolbar({ activeTool, onSelect, onImport, onExport }: Props
             className={`draft-toolbar__btn${activeTool === t.id ? " draft-toolbar__btn--active" : ""}`}
             onClick={() => onSelect(t.id)}
             data-testid={`draft-tool-${t.id}`}
+            title={t.label}
           >
-            {t.label}
+            <Icon name={t.icon} size={18} />
+            <span className="draft-toolbar__label">{t.label}</span>
           </button>
         ))}
       </div>
@@ -83,8 +89,10 @@ export function DraftToolbar({ activeTool, onSelect, onImport, onExport }: Props
             className={`draft-toolbar__btn${activeTool === t.id ? " draft-toolbar__btn--active" : ""}`}
             onClick={() => onSelect(t.id)}
             data-testid={`draft-tool-${t.id}`}
+            title={t.label}
           >
-            {t.label}
+            <Icon name={t.icon} size={18} />
+            <span className="draft-toolbar__label">{t.label}</span>
           </button>
         ))}
       </div>

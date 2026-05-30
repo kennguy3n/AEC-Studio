@@ -7,6 +7,7 @@
  * the page owns. Buttons are disabled when the underlying action
  * isn't valid (e.g. compare needs two distinct revisions).
  */
+import { Icon } from "../../icons/Icon";
 
 export interface DeliverToolbarProps {
   onExportPack: () => void;
@@ -35,7 +36,10 @@ export function DeliverToolbar({
         disabled={exporting || !canExport}
         data-testid="toolbar-export"
       >
-        {exporting ? "Exporting…" : "Export pack"}
+        <Icon name="exportPack" size={16} />
+        <span className="deliver-toolbar__label">
+          {exporting ? "Exporting…" : "Export pack"}
+        </span>
       </button>
       <button
         type="button"
@@ -43,7 +47,8 @@ export function DeliverToolbar({
         disabled={!canTag}
         data-testid="toolbar-tag"
       >
-        Tag revision
+        <Icon name="tagRevision" size={16} />
+        <span className="deliver-toolbar__label">Tag revision</span>
       </button>
       <button
         type="button"
@@ -51,7 +56,8 @@ export function DeliverToolbar({
         disabled={!canCompare}
         data-testid="toolbar-compare"
       >
-        Compare revisions
+        <Icon name="compareRevisions" size={16} />
+        <span className="deliver-toolbar__label">Compare revisions</span>
       </button>
     </div>
   );

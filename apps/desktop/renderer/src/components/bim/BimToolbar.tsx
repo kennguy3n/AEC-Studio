@@ -1,3 +1,5 @@
+import { Icon, type IconName } from "../../icons/Icon";
+
 export type BimAction =
   | "importIfc"
   | "attachIfc"
@@ -8,17 +10,17 @@ export type BimAction =
   | "diff"
   | "boq";
 
-const ACTIONS: { id: BimAction; label: string }[] = [
-  { id: "importIfc", label: "Import IFC" },
+const ACTIONS: { id: BimAction; label: string; icon: IconName }[] = [
+  { id: "importIfc", label: "Import IFC", icon: "importIfc" },
   // PR-P: `Attach` runs `bim_attach_ifc` after a preview parse,
   // folding the snapshot into the active project's SQLCipher DB.
-  { id: "attachIfc", label: "Attach IFC" },
-  { id: "exportIfc", label: "Export IFC" },
-  { id: "validate", label: "Validate" },
-  { id: "classify", label: "Classify" },
-  { id: "generateSchedule", label: "Schedule" },
-  { id: "diff", label: "Diff" },
-  { id: "boq", label: "BOQ" },
+  { id: "attachIfc", label: "Attach IFC", icon: "attachIfc" },
+  { id: "exportIfc", label: "Export IFC", icon: "exportIfc" },
+  { id: "validate", label: "Validate", icon: "validate" },
+  { id: "classify", label: "Classify", icon: "classify" },
+  { id: "generateSchedule", label: "Schedule", icon: "schedule" },
+  { id: "diff", label: "Diff", icon: "diff" },
+  { id: "boq", label: "BOQ", icon: "boq" },
 ];
 
 interface Props {
@@ -44,8 +46,12 @@ export function BimToolbar({ busyAction, onInvoke }: Props) {
             data-testid={`bim-action-${a.id}`}
             disabled={busyAction !== null && busyAction !== a.id}
             onClick={() => onInvoke(a.id)}
+            title={a.label}
           >
-            {isBusy ? "…" : a.label}
+            <Icon name={a.icon} size={16} />
+            <span className="bim-toolbar__label">
+              {isBusy ? "…" : a.label}
+            </span>
           </button>
         );
       })}

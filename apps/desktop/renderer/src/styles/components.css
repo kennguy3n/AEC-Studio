@@ -38,6 +38,15 @@
   font-size: 11px;
   font-weight: 500;
   text-decoration: none;
+  position: relative;
+  /* Phase 17 Task 9: smooth indicator/slide. Keep under 200ms
+     and respect prefers-reduced-motion (block at the bottom of
+     the file). */
+  transition:
+    background-color 160ms ease,
+    color 160ms ease,
+    border-color 160ms ease,
+    transform 120ms ease;
 }
 
 .mode-rail__item:hover {
@@ -45,10 +54,19 @@
   color: var(--aec-color-text-primary);
 }
 
+.mode-rail__item:active {
+  transform: scale(0.96);
+}
+
 .mode-rail__item.is-active {
   background: var(--aec-color-accent-soft);
   color: var(--aec-color-accent-strong);
   border-color: var(--aec-color-accent-soft);
+}
+
+.mode-rail__item:focus-visible {
+  outline: 2px solid var(--aec-color-accent);
+  outline-offset: 2px;
 }
 
 .mode-rail__icon {
@@ -110,6 +128,16 @@
   border: 1px solid var(--aec-color-border);
   box-shadow: var(--aec-shadow-sm);
   padding: var(--aec-space-4);
+  /* Phase 17 Task 9: subtle elevation + lift on hover. */
+  transition:
+    box-shadow 150ms ease,
+    transform 150ms ease,
+    border-color 150ms ease;
+}
+
+.card:hover {
+  box-shadow: var(--aec-shadow-md);
+  transform: translateY(-2px);
 }
 
 .button {
@@ -124,11 +152,24 @@
   color: var(--aec-color-accent-on);
   font-size: 13px;
   font-weight: 600;
-  transition: background 80ms ease;
+  transition:
+    background 120ms ease,
+    transform 120ms ease,
+    box-shadow 120ms ease;
 }
 
 .button:hover {
   background: var(--aec-color-accent-strong);
+  box-shadow: var(--aec-shadow-sm);
+}
+
+.button:active {
+  transform: scale(0.96);
+}
+
+.button:focus-visible {
+  outline: 2px solid var(--aec-color-accent-strong);
+  outline-offset: 2px;
 }
 
 .button--secondary {
@@ -239,18 +280,46 @@
   display: flex;
   flex-direction: column;
   gap: var(--aec-space-3);
+  overflow: hidden;
+}
+
+/* Phase 17 Task 13: hero slot that holds either a preview <img> or
+   the SVG icon fallback. Aspect ratio is 16/10 (matches the 512x320
+   ratio of the shipped previews) so the gallery rows align even
+   when some templates have images and others fall back to icons. */
+.template-card__hero {
+  width: 100%;
+  aspect-ratio: 16 / 10;
+  border-radius: var(--aec-radius-sm);
+  background: var(--aec-color-surface-muted);
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  position: relative;
+}
+
+.template-card__preview {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  /* Phase 17 Task 13: hover-zoom on the preview only (not the
+     fallback icon, which would look weird scaling up). */
+  transition: transform 200ms ease;
+}
+
+.template-card:hover .template-card__preview {
+  transform: scale(1.02);
 }
 
 .template-card__icon {
-  width: 36px;
-  height: 36px;
+  width: 56px;
+  height: 56px;
   border-radius: var(--aec-radius-sm);
   background: var(--aec-color-accent-soft);
   color: var(--aec-color-accent-strong);
   display: grid;
   place-items: center;
-  font-size: 20px;
-  font-weight: 700;
 }
 
 .template-card__name {
@@ -314,11 +383,28 @@
   background: transparent;
   font-size: 18px;
   color: var(--aec-color-text-secondary);
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  transition:
+    background 120ms ease,
+    color 120ms ease,
+    border-color 120ms ease,
+    transform 120ms ease;
 }
 
 .design-toolbar__btn:hover {
   background: var(--aec-color-surface-muted);
   color: var(--aec-color-text-primary);
+}
+
+.design-toolbar__btn:active {
+  transform: scale(0.96);
+}
+
+.design-toolbar__btn:focus-visible {
+  outline: 2px solid var(--aec-color-accent);
+  outline-offset: 2px;
 }
 
 .design-toolbar__btn.is-active {
@@ -484,4 +570,218 @@
   gap: var(--aec-space-3);
   margin-bottom: var(--aec-space-2);
   font-size: 12px;
+}
+
+/* ----- Phase 17 Task 7 — toolbars with SVG icons ----- */
+
+/* DraftToolbar uses icon-over-label layout for a richer toolbar. */
+.draft-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 4px;
+  background: var(--aec-color-bg-elevated);
+  border: 1px solid var(--aec-color-border);
+  border-radius: var(--aec-radius-md);
+  align-items: stretch;
+}
+
+.draft-toolbar__group {
+  display: flex;
+  gap: 4px;
+  padding: 0 4px;
+  border-right: 1px solid var(--aec-color-border);
+}
+
+.draft-toolbar__group:last-child {
+  border-right: none;
+}
+
+.draft-toolbar__btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  min-width: 56px;
+  padding: 4px 6px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--aec-color-text-secondary);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--aec-radius-sm);
+  cursor: pointer;
+  transition:
+    background 120ms ease,
+    color 120ms ease,
+    border-color 120ms ease,
+    transform 120ms ease;
+}
+
+.draft-toolbar__btn:hover {
+  background: var(--aec-color-surface-muted);
+  color: var(--aec-color-text-primary);
+}
+
+.draft-toolbar__btn:active {
+  transform: scale(0.96);
+}
+
+.draft-toolbar__btn:focus-visible {
+  outline: 2px solid var(--aec-color-accent);
+  outline-offset: 2px;
+}
+
+.draft-toolbar__btn--active {
+  background: var(--aec-color-accent-soft);
+  color: var(--aec-color-accent-strong);
+  border-color: var(--aec-color-accent-soft);
+}
+
+.draft-toolbar__label {
+  font-size: 11px;
+  line-height: 1.1;
+}
+
+/* BimToolbar: icon-aligned-with-label horizontal pills. */
+.bim-toolbar {
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  flex-wrap: wrap;
+}
+
+.bim-toolbar__btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--aec-color-text-secondary);
+  background: var(--aec-color-surface);
+  border: 1px solid var(--aec-color-border);
+  border-radius: var(--aec-radius-sm);
+  cursor: pointer;
+  transition:
+    background 120ms ease,
+    color 120ms ease,
+    border-color 120ms ease,
+    transform 120ms ease;
+}
+
+.bim-toolbar__btn:hover:not(:disabled) {
+  background: var(--aec-color-surface-muted);
+  color: var(--aec-color-text-primary);
+  border-color: var(--aec-color-accent-soft);
+}
+
+.bim-toolbar__btn:active:not(:disabled) {
+  transform: scale(0.96);
+}
+
+.bim-toolbar__btn:focus-visible {
+  outline: 2px solid var(--aec-color-accent);
+  outline-offset: 2px;
+}
+
+.bim-toolbar__btn--busy {
+  background: var(--aec-color-accent-soft);
+  color: var(--aec-color-accent-strong);
+  border-color: var(--aec-color-accent-soft);
+}
+
+.bim-toolbar__btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.bim-toolbar__label {
+  font-size: 12px;
+}
+
+/* DeliverToolbar — same horizontal pill style as BIM. */
+.deliver-toolbar__label {
+  font-size: 12px;
+}
+
+/* ----- Phase 17 Task 9 — micro-animations ----- */
+
+@keyframes aec-shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+.is-skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--aec-color-surface-muted) 0%,
+    var(--aec-color-border) 50%,
+    var(--aec-color-surface-muted) 100%
+  );
+  background-size: 200% 100%;
+  animation: aec-shimmer 1400ms linear infinite;
+  border-radius: var(--aec-radius-sm);
+  color: transparent;
+}
+
+@keyframes aec-toast-in {
+  from {
+    transform: translateX(20px);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+@keyframes aec-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes aec-pop-in {
+  from {
+    transform: scale(0.95);
+    opacity: 0;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+@keyframes aec-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(124, 58, 237, 0.4); }
+  50% { box-shadow: 0 0 0 6px rgba(124, 58, 237, 0); }
+}
+
+.status-bar__chip.is-active {
+  animation: aec-pulse 1600ms ease-in-out infinite;
+}
+
+/* Reduced-motion: disable all non-essential animations and
+   transitions. Keep opacity transitions short so screen readers
+   don't see flicker, but kill transforms and infinite loops. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .card:hover,
+  .button:active,
+  .design-toolbar__btn:active,
+  .draft-toolbar__btn:active,
+  .bim-toolbar__btn:active:not(:disabled),
+  .mode-rail__item:active,
+  .template-card:hover .template-card__preview {
+    transform: none !important;
+  }
 }
