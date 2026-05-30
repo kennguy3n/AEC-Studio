@@ -183,24 +183,44 @@ impl EnvironmentMap {
     /// Solid-angle pdf for a given world direction, used by MIS when
     /// the BSDF strategy samples the environment via a miss.
     ///
-    /// The pdf in (u, v) space is `L(u, v) * sin(theta) / I_total`;
-    /// converting to solid angle multiplies by `width * height / (2π²
-    /// sin(theta))`, leaving `L(u, v) * width * height / (2π² I_total)`.
+    /// The discrete probability mass of pixel `(x, y)` is
+    /// `L(x,y) * sin(theta_y) / I_total` because
+    /// [`build_importance_cdf`] folds the equirectangular cell area
+    /// (`sin(theta)`) into the per-pixel weight. Treating the pixel as
+    /// covering area `1/(W·H)` in `(u, v)` space gives the (u, v) pdf
+    ///
+    /// ```text
+    ///   p_uv(u, v) = L(u, v) * W * H * sin(theta) / I_total
+    /// ```
+    ///
+    /// and converting to solid angle via
+    /// `dω = 2π² · sin(theta) · du · dv` divides by
+    /// `2π² · sin(theta)`. The `sin(theta)` cancels and the final
+    /// solid-angle pdf is
+    ///
+    /// ```text
+    ///   p_ω = L(u, v) * W * H / (2π² · I_total).
+    /// ```
+    ///
+    /// Earlier code carried an additional `1/sin(theta)` factor which
+    /// is incorrect: the CDF construction *already* includes the
+    /// Jacobian's `sin(theta)` weight, so the only `sin(theta)` in the
+    /// chain is the one that cancels. Keeping the spurious divisor
+    /// made `pdf_direction` diverge at the poles and broke MIS weights
+    /// for environment NEE on bright top/bottom HDRIs.
     pub fn pdf_direction(&self, dir: Vec3) -> f32 {
         if self.total_integral <= 0.0 || self.pixels.is_empty() {
             return 0.0;
         }
         let n = dir.normalize_or_zero();
         let theta = n.y.clamp(-1.0, 1.0).acos();
-        let sin_theta = theta.sin().max(1e-6);
         let phi = n.z.atan2(n.x);
         let u = (phi + PI) / (2.0 * PI);
         let v = theta / PI;
         let xi = ((u * self.width as f32) as i32).clamp(0, self.width as i32 - 1) as u32;
         let yi = ((v * self.height as f32) as i32).clamp(0, self.height as i32 - 1) as u32;
         let l = luminance(self.pixel(xi, yi));
-        l * (self.width as f32) * (self.height as f32)
-            / (2.0 * PI * PI * sin_theta * self.total_integral)
+        l * (self.width as f32) * (self.height as f32) / (2.0 * PI * PI * self.total_integral)
     }
 
     /// Importance-sample a direction from the environment. Returns

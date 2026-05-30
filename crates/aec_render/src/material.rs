@@ -277,13 +277,23 @@ pub fn eval_bsdf(
         // inside-out case (ray inside the medium hitting the back
         // face) the path tracer flips the geometric normal *before*
         // calling `eval_bsdf`, so this branch is unreachable with
-        // `n_dot_v < 0` and we can use `1.0 / ior` unconditionally.
-        let eta = 1.0 / mat.ior;
+        // `n_dot_v < 0`.
+        //
         // Rough BTDF: Cook-Torrance microfacet with half vector for
-        // refractive interface. For near-smooth glass this collapses
-        // toward a delta function, but the Monte Carlo weights remain
-        // correct.
-        let ht = -(eta * wi + wo).normalize();
+        // refractive interface (Walter et al. 2007, eq. 16):
+        //
+        // ```text
+        //   h_t = -(η_o · ω_o + η_i · ω_i)
+        // ```
+        //
+        // where `ω_o` (this code's `wo`) is on the outside (η_o = 1)
+        // and `ω_i` (this code's `wi`) is on the inside
+        // (η_i = mat.ior). The IOR therefore weights the **inside**
+        // direction (`wi`), not the outside; earlier code had the
+        // weighting inverted (`eta * wi + wo` with `eta = 1/ior`),
+        // which produced a half-vector that was not a pure microfacet
+        // normal and broke MIS weights for rough glass.
+        let ht = -(wo + mat.ior * wi).normalize();
         let n_dot_h = n.dot(ht).abs();
         let v_dot_h = wo.dot(ht).abs();
         let l_dot_h = wi.dot(ht).abs();
@@ -292,7 +302,10 @@ pub fn eval_bsdf(
         let t_frac = Vec3::ONE - f_r; // transmitted fraction
         let d = ggx_d(n_dot_h, alpha.max(0.001));
         let g = ggx_g_smith(n_dot_v.abs(), n_dot_l.abs(), alpha.max(0.001));
-        let denom = (eta * l_dot_h + v_dot_h).powi(2);
+        // Walter et al. 2007, eq. 21 denominator: `(η_o · |ω_o·h| +
+        // η_i · |ω_i·h|)²`. With η_o = 1, η_i = mat.ior this becomes
+        // `(v_dot_h + mat.ior · l_dot_h)²`.
+        let denom = (v_dot_h + mat.ior * l_dot_h).powi(2);
         if denom < 1e-20 {
             return Vec3::ZERO;
         }
@@ -349,14 +362,18 @@ pub fn pdf_bsdf(mat: &PathTraceMaterial, n: Vec3, wi: Vec3, wo: Vec3) -> f32 {
     if p_trans > 0.0 && n_dot_l < 0.0 && n_dot_v > 0.0 {
         // For near-smooth glass the transmission pdf is concentrated
         // around the refracted direction. We approximate via the BTDF
-        // microfacet half-vector GGX density.
+        // microfacet half-vector GGX density. Half-vector follows
+        // Walter et al. 2007 eq. 16 with η_o = 1 (outside, `wo`) and
+        // η_i = mat.ior (inside, `wi`). See the matching comment in
+        // `eval_bsdf` above for the derivation; the inverted weighting
+        // earlier in this file made the recovered half-vector veer
+        // away from the true microfacet normal at high IOR.
         let alpha = (mat.roughness * mat.roughness).max(0.001);
-        let eta = 1.0 / mat.ior;
-        let ht = -(eta * wi + wo).normalize();
+        let ht = -(wo + mat.ior * wi).normalize();
         let n_dot_h = n.dot(ht).abs();
         let v_dot_h = wo.dot(ht).abs().max(1e-6);
         let l_dot_h = wi.dot(ht).abs().max(1e-6);
-        let denom = (eta * l_dot_h + v_dot_h).powi(2);
+        let denom = (v_dot_h + mat.ior * l_dot_h).powi(2);
         if denom < 1e-20 {
             return 0.0;
         }
@@ -1048,5 +1065,66 @@ mod tests {
             avg.x.is_finite() && avg.x < 5.0,
             "average glass throughput unreasonably high (firefly leak): {avg:?}"
         );
+    }
+
+    /// Regression: the BTDF half-vector formula (Walter et al. 2007,
+    /// eq. 16) must satisfy `h_t = -(η_o · ω_o + η_i · ω_i)` with
+    /// η_o = 1 (outside) and η_i = mat.ior (inside). When `wi` is the
+    /// Snell-refracted direction of `wo`, the recovered `h_t` should
+    /// be (anti-)parallel to the shading normal `n` because the
+    /// macro-surface acts as a smooth interface. Pre-fix the IOR
+    /// weighting was inverted (`eta * wi + wo` with `eta = 1/ior`),
+    /// so the recovered half-vector was a mix of `wo` and `n` and the
+    /// BTDF / PDF evaluated at the wrong microfacet, producing wrong
+    /// MIS weights for rough glass.
+    #[test]
+    fn btdf_half_vector_recovers_shading_normal_for_smooth_refraction() {
+        let n = Vec3::Z;
+        // Oblique view direction so the test is not trivial at normal
+        // incidence.
+        let wo = Vec3::new(0.3, 0.0, 0.9).normalize();
+        let ior = 1.5_f32;
+        let eta = 1.0 / ior;
+        let wi = refract_snell(wo, n, eta).expect("should refract at this angle");
+        // Apply the corrected Walter formula directly.
+        let ht = -(wo + ior * wi).normalize();
+        // For a Snell-refracted pair the microfacet that produced the
+        // refraction is the macro-surface, so `ht` must be parallel
+        // (or anti-parallel) to `n`. We accept either sign because
+        // `normalize` discards the leading factor's sign.
+        let parallel = ht.dot(n).abs();
+        assert!(
+            parallel > 0.999,
+            "BTDF half-vector not aligned with shading normal: ht={ht:?}, n={n:?}, |ht·n|={parallel}"
+        );
+    }
+
+    /// Sanity check that `eval_bsdf` returns a finite, non-negative
+    /// BTDF lobe for a rough glass surface (transmission = 1, IOR =
+    /// 1.5) when `wi` is the Snell-refracted direction of `wo`. With
+    /// the inverted half-vector formula the denominator
+    /// `(eta * l_dot_h + v_dot_h)²` could land arbitrarily close to
+    /// zero at high IOR; the corrected formula keeps it stable.
+    #[test]
+    fn btdf_eval_finite_for_rough_glass() {
+        let mat = PathTraceMaterial {
+            base_color: Vec3::splat(0.95),
+            metallic: 0.0,
+            roughness: 0.25,
+            ior: 1.5,
+            emissive: Vec3::ZERO,
+            transmission: 1.0,
+            ao: 1.0,
+            texture_bindings: None,
+        };
+        let n = Vec3::Z;
+        let wo = Vec3::new(0.2, 0.0, 0.98).normalize();
+        let wi = refract_snell(wo, n, 1.0 / mat.ior).expect("should refract");
+        let f = eval_bsdf(&mat, n, wi, wo);
+        assert!(
+            f.x.is_finite() && f.y.is_finite() && f.z.is_finite(),
+            "{f:?}"
+        );
+        assert!(f.x >= 0.0 && f.y >= 0.0 && f.z >= 0.0, "{f:?}");
     }
 }
