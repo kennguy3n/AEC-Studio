@@ -245,6 +245,57 @@ This document tracks AEC Studio's phased delivery from open-source foundation to
 
 ---
 
+## Phase 7 — Optional KChat integration
+
+**Status:** `DONE` *(baseline Phase 7 below; the Phase 12 socket transport was replatformed onto loopback HTTP + `.kcz` companion extension + `aecstudio://` deeplinks in Phase 15 — see the Phase 15 section further down for the replatform topology).*
+
+**Goal:** Teams using KChat can publish AEC Studio artifacts and route review comments back to the audit trail without giving up local-first.
+
+### Build
+
+| Item | Status |
+|---|---|
+| KChat artifact card publishing (render, sheet, revision pack, BOQ snapshot) | `DONE` |
+| Review / approval cards (inline comments → audit-trail entries) | `DONE` |
+| Revision comments sync (one-way: KChat → audit trail) | `DONE` |
+| Team asset packs (publish + subscribe via the user's existing transport) | `DONE` |
+| Local-first sync (no centralized store; uses the user's own transport) | `DONE` |
+
+### Exit criteria
+
+- [x] Users can publish a render or sheet pack to a KChat thread in one click. *(`KChatPublisher` trait + `PublishCardModal`; covered by `crates/aec_core/src/kchat.rs` tests.)*
+- [x] KChat comments appear as audit-trail entries with thread context. *(`ingest_review` → `ActorKind::KChat` audit entries; `crates/aec_core/src/kchat_sync.rs` dedups re-imports.)*
+- [x] AEC Studio remains fully usable with KChat integration disabled. *(`KChatConfig::disabled` rejects publish/sync; UI gates on `runtimeStatus.kchatEnabled`.)*
+
+---
+
+## Phase 8 — Extension system
+
+**Status:** `DONE`
+
+**Goal:** Asset packs, templates, schedules, export targets, AI tools, and importers ship as Ed25519-signed third-party extensions with a typed permission model.
+
+### Build
+
+| Item | Status |
+|---|---|
+| Manifest schema (six type-specific bodies: `AssetPackBody`, `TemplateBody`, `ScheduleBody`, `ExportTargetBody`, `AiToolBody`, `ImporterBody`) | `DONE` |
+| `ExtensionLoader` (scans `extensions/<id>/manifest.json`) + `ExtensionRegistry` indexed by id and kind with `find_template` / `find_schedule` / `find_export_target` / `find_ai_tool` accessors + `canonical_payload_bytes` for byte-stable signing | `DONE` |
+| `PermissionEnforcer` (`Operation`, `PermissionCheck`, `TrustStore`) + `validate_manifest` (required fields, permission set, body shape, AI tool grammar/scope, duplicate detection) | `DONE` |
+| Ed25519 signature verification: `verify_signature_against` (production — requires key in `TrustStore`) and `verify_signature_self_consistent` (dev-only) | `DONE` |
+| Per-type hosts: `aec_assets::install_asset_packs` (BLAKE3-verified, idempotent), `TemplateLoader::{load_with_extensions, discover_with_extensions}`, `aec_bim::schedules::extension_host`, `aec_export::extension_targets`, `aec_ai::extension_tools` | `DONE` |
+| Phase 16 follow-up — fault-tolerant `load_with_diagnostics` loader returning `Vec<ExtensionLoadDiagnostic>` so broken manifests never block boot | `DONE` |
+
+### Exit criteria
+
+- [x] Every per-type host runs through `PermissionEnforcer::check_permission` before privileged work. *(`crates/aec_assets/src/extension_host.rs`, `crates/aec_core/src/template_loader.rs`, `crates/aec_bim/src/schedules/extension_host.rs`, `crates/aec_export/src/extension_targets.rs`, `crates/aec_ai/src/extension_tools.rs`.)*
+- [x] Production builds reject manifests signed by untrusted keys. *(`verify_signature_against` returns `Err(ManifestError::UntrustedKey)` for keys not in the trust store; `LoadOptions::default()` rejects unsigned manifests — `LoadOptions::allow_unsigned()` opts into the dev path.)*
+- [x] AI tool extensions enforce grammar_key + scope intersection + max-entities cap. *(`canonical_builtin_for_grammar_key` rejects synthetic keys; `ai_list_tools` and `resolve_ai_tool_alias` clamp `max_entities_modified` to the host schema cap and intersect declared scopes with the host's allowed set; verified by tests in `crates/aec_bridge/tests/ai_endpoints.rs`.)*
+- [x] Phase 8 user-journey e2e test exercises signed Ed25519 asset-pack + template + AI-tool extensions through `BridgeConfig::extensions_dir`. *(Validated by `crates/aec_bridge/tests/phase8_journey.rs`.)*
+- [x] [EXTENSIONS.md](EXTENSIONS.md) documents the manifest schema, permission model, Ed25519 signing flow, security model, and Phase 16 load diagnostics surface.
+
+---
+
 ## Phase 9 — Native render & BIM engine
 
 **Status:** `DONE` (PR1–PR4 + PR5 + PR-A through PR-P merged; #9 #10 #11 #12 #13 #14–#38 #PR-P)
@@ -479,6 +530,59 @@ This document tracks AEC Studio's phased delivery from open-source foundation to
 
 ---
 
+## Phase 13 — Renderer UX wiring, placeholder elimination, file-picker integration, active project state, UI polish
+
+**Status:** `DONE`
+
+**Goal:** Take the Phase 12 production-depth surfaces and finish the renderer-side experience: every mode page (BIM / Design / Draft / Deliver / Render / Home) is wired to the live active-project state via the new `useActiveProject` React context + `<RequireProject>` route guards; `demo://` placeholder paths are removed from production code; Electron file-picker IPC (`dialog.openFile` / `dialog.openDirectory` / `dialog.saveFile`) replaces hard-coded paths in import/export flows; a global toast system, status-bar wiring (dirty/saving/saved + undo/redo + render-queue chip), keyboard-shortcut help overlay, per-mode error boundaries, and a debounced ResizeObserver on the viewport polish the shell. Group B (backend `placeholder_*` elimination + real `DeliverPackContext` from project state) and Group F (acceptance-criteria benchmarks + Phase 6 deliver / Phase 8 extension e2e journeys) ship as Phase 14.
+
+### Group A — Wire renderer pages to real project data (Tasks 1–6)
+
+| Item | Status |
+|---|---|
+| `Bim.tsx` reads active project via `useActiveProject()`, threads `project.path` through every `aec.bim.*` call | `DONE` |
+| `bim:readScheduleRows` IPC handler round-trips the generated XLSX so `ScheduleView` displays real schedule rows | `DONE` |
+| `Design.tsx` consumes `useActiveProject()`; design commands resolve project path on the main-process side via `withResolvedProjectPath` in `ipc.ts` | `DONE` |
+| `Draft.tsx` ships real DXF / DWG import/export wired through new file-picker IPC + `aec.draft.importDxf` / `aec.draft.exportDxf` | `DONE` |
+| `Deliver.tsx` builds packs through a save dialog, threads `projectName`, surfaces success / error toasts | `DONE` |
+| `Render.tsx` loads cameras from `aec.command.listGraph(projectPath, "camera")`, falls back to demo cameras only when empty, enqueues real render jobs with best-effort cancellation | `DONE` |
+
+### Group C — File-picker and dialog integration (Tasks 13–17)
+
+| Item | Status |
+|---|---|
+| New `apps/desktop/electron/dialog-ipc.ts` ships `dialog:openFile`, `dialog:openDirectory`, `dialog:saveFile` IPC handlers wrapping Electron `dialog.show*Dialog` with full parameter validation + a `__setDialogModule` test hook | `DONE` |
+| Wired into BIM (IFC import, attach, export), Draft (DXF / DWG import/export), Deliver (ZIP pack save dialog), Home (project open / recents list with stale-entry cleanup) | `DONE` |
+
+### Group D — Active project state management (Tasks 18–22)
+
+| Item | Status |
+|---|---|
+| `apps/desktop/renderer/src/hooks/useActiveProject.tsx` holds the open `ProjectSummary`, exposes `openProject(path)` / `createProject(template, name)` / `closeProject()` / `saveProject()`, dirty / saving / undo / redo flags + a debounced 5 s auto-save after the last `markDirty()` | `DONE` |
+| `App.tsx` wraps the tree in `<ToastProvider><ActiveProjectProvider>` and route-guards every mode page with `<RequireProject>` (redirects to `/` if no project is open); project name displayed in the app header | `DONE` |
+| Keyboard shortcuts Ctrl/Cmd+Z (undo), Ctrl/Cmd+Shift+Z (redo), Ctrl/Cmd+S (save), Ctrl/Cmd+W (close project), all scoped by the current route via `useLocation` → `CommandScope` | `DONE` |
+| `active-project.ts` extended from path-only tracking to full `ActiveProjectSummary` (path + cached summary) with `setActiveProject(summary)` / `peekActiveProjectSummary()` / `onActiveProjectChange(listener)` subscriber API | `DONE` |
+
+### Group E — UI polish (Tasks 23–27)
+
+| Item | Status |
+|---|---|
+| `useToast.tsx` toast provider (success / info auto-dismiss 5 s, error persists) | `DONE` |
+| `StatusBar.tsx`: project name + dirty/saving/saved indicator + undo/redo stack depths + active render job count (polled 5 s) alongside the existing GPU / RAM / tier chips | `DONE` |
+| `ShortcutHelp.tsx` overlay listing every registered shortcut grouped by group (Shift+? or Ctrl/Cmd+/) — reads live from `shortcutRegistry` | `DONE` |
+| `ErrorBoundary.tsx` wraps each mode page so a runtime exception in one mode doesn't crash the shell — surfaces the error message + a retry button | `DONE` |
+| `ViewportContainer.tsx` ResizeObserver coalesces resize bursts with a 120 ms trailing edge so the bridge surface is re-allocated once per drag (instead of 30 ×/s); resolution indicator in the bottom-right updates optimistically during drags | `DONE` |
+
+### Exit criteria
+
+- [x] Every mode page is route-guarded by `<RequireProject>` and threads project path through every `aec.*` IPC call. *(`apps/desktop/renderer/src/App.tsx` + `apps/desktop/renderer/src/hooks/useActiveProject.tsx`.)*
+- [x] No `demo://` references remain in production renderer code. *(Validated in Phase 14 Group C, PR #74; `grep -rn "demo://" --include="*.{ts,tsx,rs,md}"` returns only PROGRESS.md changelog entries.)*
+- [x] New `dialog:openFile` / `dialog:openDirectory` / `dialog:saveFile` IPC handlers replace hard-coded paths in import/export flows. *(`apps/desktop/electron/dialog-ipc.ts`; wired across BIM, Draft, Deliver, Home.)*
+- [x] Renderer vitest suite passes (281 tests across 52 files). *(All page tests updated to wrap in `<ToastProvider><ActiveProjectProvider>` and use real-shaped paths.)*
+- [x] Group B (real `DeliverPackContext`) + Group F (Phase 6 deliver / Phase 8 extension e2e + acceptance-criteria benchmarks) deferred to Phase 14 — landed in PR #72 and PR #73 respectively.
+
+---
+
 ## Phase 14 — Deferred Phase 13 follow-ups, `demo://` cleanup, journey validation, benchmarks, protocol verification
 
 **Status:** `DONE`
@@ -633,30 +737,6 @@ This document tracks AEC Studio's phased delivery from open-source foundation to
 - [x] Electron `extensions:listLoadDiagnostics` IPC returns the same diagnostics to the renderer via `aec.extensions.listLoadDiagnostics()`.
 - [x] Settings page renders the diagnostics card when at least one diagnostic is present and stays hidden when the list is empty.
 - [x] `cargo test` (aec_core + aec_bridge + aec_assets), `cargo clippy -D warnings`, `cargo fmt --check`, `npm test --workspaces`, `npm run lint`, and `tsc` against both `tsconfig.json` and `tsconfig.electron.json` all pass.
-
----
-
-## Phase 7 — Optional KChat integration
-
-**Status:** `DONE`
-
-**Goal:** Teams using KChat can publish AEC Studio artifacts and route review comments back to the audit trail without giving up local-first.
-
-### Build
-
-| Item | Status |
-|---|---|
-| KChat artifact card publishing (render, sheet, revision pack, BOQ snapshot) | `DONE` |
-| Review / approval cards (inline comments → audit-trail entries) | `DONE` |
-| Revision comments sync (one-way: KChat → audit trail) | `DONE` |
-| Team asset packs (publish + subscribe via the user's existing transport) | `DONE` |
-| Local-first sync (no centralized store; uses the user's own transport) | `DONE` |
-
-### Exit criteria
-
-- [x] Users can publish a render or sheet pack to a KChat thread in one click. *(`KChatPublisher` trait + `PublishCardModal`; covered by `crates/aec_core/src/kchat.rs` tests.)*
-- [x] KChat comments appear as audit-trail entries with thread context. *(`ingest_review` → `ActorKind::KChat` audit entries; `crates/aec_core/src/kchat_sync.rs` dedups re-imports.)*
-- [x] AEC Studio remains fully usable with KChat integration disabled. *(`KChatConfig::disabled` rejects publish/sync; UI gates on `runtimeStatus.kchatEnabled`.)*
 
 ---
 
