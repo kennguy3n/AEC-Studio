@@ -11,6 +11,7 @@ pub mod error;
 pub mod extension_host;
 pub mod ingest;
 pub mod lod;
+pub mod lod_select;
 pub mod metadata;
 pub mod pipeline;
 pub mod query;
@@ -28,6 +29,7 @@ pub use ingest::{
     detect_format, ingest_bytes, ingest_path, IngestError, IngestFormat, IngestedMesh,
 };
 pub use lod::{LodChain, LodLevel};
+pub use lod_select::{LodSelector, ScreenContext};
 pub use metadata::{AssetMetadata, License, MeshBlob, ThumbnailKind, Vendor};
 pub use pipeline::{
     AssetImportPipeline, ImportRequest, ImportSummary, PathImportMetadata, RealMeshImportRequest,
