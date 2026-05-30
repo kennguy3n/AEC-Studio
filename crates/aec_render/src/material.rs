@@ -309,11 +309,26 @@ pub fn eval_bsdf(
         if denom < 1e-20 {
             return Vec3::ZERO;
         }
+        // Walter et al. 2007, eq. 21 numerator:
+        //
+        // ```text
+        //   f_t = (1 - F) · D · G · |ω_o·h| · |ω_i·h|
+        //         ─────────────────────────────────
+        //               |ω_o·n| · |ω_i·n| · denom
+        // ```
+        //
+        // The `|ω_i·n|` factor in the denominator (this code's
+        // `n_dot_l.abs()`) is required: without it the recovered
+        // weight `f · cos(θ_i) / pdf` is too large by a factor of
+        // `|ω_i·n|`, which combined with the missing η_i² in the
+        // refraction Jacobian (see the pdf_bsdf comment) produced a
+        // ~η² · |ω_i·n| over-bright rough-glass refraction (caught by
+        // the energy-conservation regression below).
         let btdf = t_frac
             * mat.base_color
             * d
             * g
-            * (v_dot_h * l_dot_h / (n_dot_v.abs() * denom).max(1e-20));
+            * (v_dot_h * l_dot_h / (n_dot_v.abs() * n_dot_l.abs() * denom).max(1e-20));
         return btdf;
     }
 
@@ -377,7 +392,25 @@ pub fn pdf_bsdf(mat: &PathTraceMaterial, n: Vec3, wi: Vec3, wo: Vec3) -> f32 {
         if denom < 1e-20 {
             return 0.0;
         }
-        let trans_pdf = ggx_d(n_dot_h, alpha) * n_dot_h * l_dot_h / denom;
+        // Walter et al. 2007, eq. 17 — Jacobian |∂ω_h / ∂ω_i| for the
+        // refraction half-vector mapping:
+        //
+        // ```text
+        //   |∂ω_h/∂ω_i| = η_i² · |ω_i · h_t|
+        //                 ───────────────────────────────────
+        //                 (η_i (ω_i·h_t) + η_o (ω_o·h_t))²
+        // ```
+        //
+        // where η_i (this code's `mat.ior`) is the IOR of the medium
+        // ω_i is *inside*. The half-vector PDF `D(h) · |n·h|`
+        // transforms to the incident-direction PDF by multiplying by
+        // this Jacobian. Earlier code dropped the leading η_i²
+        // factor, which made the rough-glass refraction PDF too
+        // small by a factor of `mat.ior²` (~2.25 at IOR 1.5). The
+        // missing factor canceled with the BTDF denominator bug for
+        // the smooth limit but exploded `f·cos/pdf` for rough glass.
+        let eta_i = mat.ior;
+        let trans_pdf = ggx_d(n_dot_h, alpha) * n_dot_h * eta_i * eta_i * l_dot_h / denom;
         // Only the `(1 - f_r_avg)` fraction of transmission-lobe
         // samples reach the refraction branch in `sample_bsdf` — the
         // remaining `f_r_avg` fraction is captured by the Fresnel
@@ -1126,5 +1159,71 @@ mod tests {
             "{f:?}"
         );
         assert!(f.x >= 0.0 && f.y >= 0.0 && f.z >= 0.0, "{f:?}");
+    }
+
+    /// Energy-conservation regression for the **rough**-glass path
+    /// (`roughness >= 0.05` — bypasses the closed-form smooth-glass
+    /// shortcut in [`sample_bsdf`] and therefore drives the full
+    /// `eval_bsdf` BTDF + `pdf_bsdf` refraction-Jacobian formulas).
+    ///
+    /// A passive BSDF integrated over the sphere must transport at
+    /// most unit energy:
+    ///
+    /// ```text
+    ///   ∫ f(ωi, ωo) · |n·ωi| dωi  ≤  1
+    /// ```
+    ///
+    /// Drawing `wi ~ sample_bsdf(wo)` and averaging the returned
+    /// `f · cos / pdf` weight estimates this integral. With either
+    /// of the two Walter-2007 formula bugs the recovered weight is
+    /// inflated by `η_i² · |n·ωi|`, so for IOR 1.5 white glass at
+    /// near-normal incidence the average lands around `2.25 · |n·ωi|`
+    /// — well outside the energy bound. This regression keeps both
+    /// fixes alive simultaneously: the eval-side `|n·ωi|` factor and
+    /// the pdf-side `η_i²` factor.
+    #[test]
+    fn rough_glass_btdf_energy_conserving() {
+        let mat = PathTraceMaterial {
+            base_color: Vec3::ONE,
+            metallic: 0.0,
+            roughness: 0.3,
+            ior: 1.5,
+            emissive: Vec3::ZERO,
+            transmission: 1.0,
+            ao: 1.0,
+            texture_bindings: None,
+        };
+        let n = Vec3::Z;
+        // Slightly off-normal so the refracted `wi` has `|n·wi| < 1`
+        // and the bug-induced `|n·wi|` factor in the weight is
+        // distinguishable from the η² factor.
+        let wo = Vec3::new(0.3, 0.0, 0.95).normalize();
+        let trials = 16_384_u32;
+        let mut sum = Vec3::ZERO;
+        for _ in 0..trials {
+            let r = [
+                fastrand::f32(),
+                fastrand::f32(),
+                fastrand::f32(),
+                fastrand::f32(),
+            ];
+            if let Some(s) = sample_bsdf(&mat, n, wo, r) {
+                assert!(
+                    s.weight.x.is_finite() && s.weight.y.is_finite() && s.weight.z.is_finite(),
+                    "non-finite weight: {:?}",
+                    s.weight
+                );
+                sum += s.weight;
+            }
+        }
+        let avg = sum / trials as f32;
+        // Energy conservation: average sampled throughput must not
+        // exceed unity (plus a small Monte Carlo margin). Pre-fix
+        // this averaged ≈ 2.0+ on this geometry; with both fixes it
+        // sits at ≈ 0.95 (transmission-dominated, white glass).
+        assert!(
+            avg.x < 1.1 && avg.y < 1.1 && avg.z < 1.1,
+            "rough-glass throughput violates energy conservation: avg={avg:?}"
+        );
     }
 }
