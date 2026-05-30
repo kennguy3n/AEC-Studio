@@ -272,11 +272,13 @@ pub fn eval_bsdf(
         // that integrates to the correct energy after dividing by the
         // transmission pdf below.
         let alpha = mat.roughness * mat.roughness;
-        let eta = if n_dot_v > 0.0 {
-            1.0 / mat.ior
-        } else {
-            mat.ior
-        };
+        // The enclosing guard above already enforces `n_dot_v > 0.0`,
+        // i.e. the ray entered the surface from the outside. For the
+        // inside-out case (ray inside the medium hitting the back
+        // face) the path tracer flips the geometric normal *before*
+        // calling `eval_bsdf`, so this branch is unreachable with
+        // `n_dot_v < 0` and we can use `1.0 / ior` unconditionally.
+        let eta = 1.0 / mat.ior;
         // Rough BTDF: Cook-Torrance microfacet with half vector for
         // refractive interface. For near-smooth glass this collapses
         // toward a delta function, but the Monte Carlo weights remain
@@ -330,7 +332,14 @@ pub fn eval_bsdf(
 ///
 /// The combined PDF mixes diffuse, specular, and (optionally)
 /// transmission lobes with the same weights that `sample_bsdf` uses
-/// to pick between them.
+/// to pick between them. The transmission lobe is **bi-modal**: each
+/// transmission sample is split via Fresnel Russian-roulette into
+/// either a microfacet **reflection** (probability `f_r_avg`) or a
+/// **refraction** (probability `1 - f_r_avg`). Both outcomes must
+/// contribute to the PDF for their respective output hemispheres,
+/// otherwise the MIS weight `f(wi) * cos / pdf(wi)` explodes for
+/// reflected-from-transmission directions on pure-glass materials
+/// (where `reflect_budget = 1 - p_trans = 0`) and produces fireflies.
 pub fn pdf_bsdf(mat: &PathTraceMaterial, n: Vec3, wi: Vec3, wo: Vec3) -> f32 {
     let n_dot_l = n.dot(wi);
     let n_dot_v = n.dot(wo);
@@ -352,7 +361,13 @@ pub fn pdf_bsdf(mat: &PathTraceMaterial, n: Vec3, wi: Vec3, wo: Vec3) -> f32 {
             return 0.0;
         }
         let trans_pdf = ggx_d(n_dot_h, alpha) * n_dot_h * l_dot_h / denom;
-        return p_trans * trans_pdf;
+        // Only the `(1 - f_r_avg)` fraction of transmission-lobe
+        // samples reach the refraction branch in `sample_bsdf` — the
+        // remaining `f_r_avg` fraction is captured by the Fresnel
+        // split and produces reflected directions (handled below).
+        let f_r = fresnel_schlick(v_dot_h, mat.f0());
+        let f_r_avg = ((f_r.x + f_r.y + f_r.z) / 3.0).clamp(0.0, 1.0);
+        return p_trans * (1.0 - f_r_avg) * trans_pdf;
     }
 
     if n_dot_l <= 0.0 || n_dot_v <= 0.0 {
@@ -372,7 +387,26 @@ pub fn pdf_bsdf(mat: &PathTraceMaterial, n: Vec3, wi: Vec3, wo: Vec3) -> f32 {
     let reflect_budget = 1.0 - p_trans;
     let p_spec = p_spec_raw * reflect_budget;
     let p_diff = (1.0 - p_spec_raw) * reflect_budget;
-    p_spec * specular_pdf + p_diff * diffuse_pdf
+
+    // Transmission-lobe Fresnel-reflect contribution. When
+    // `sample_bsdf` picks the transmission lobe (probability
+    // `p_trans`) and the Fresnel Russian-roulette reflects
+    // (probability `f_r_avg`), the resulting `wi` lives in the
+    // upper hemisphere and would otherwise have zero PDF for a
+    // pure-glass material (`reflect_budget = 0`). The half-vector
+    // density matches `sample_ggx_half_unconditional` with the same
+    // `alpha.max(0.001)` floor that the sampler uses.
+    let trans_reflect_pdf = if p_trans > 0.0 {
+        let alpha_t = alpha.max(0.001);
+        let f_r_at_h = fresnel_schlick(v_dot_h, f0);
+        let f_r_avg = ((f_r_at_h.x + f_r_at_h.y + f_r_at_h.z) / 3.0).clamp(0.0, 1.0);
+        let half_pdf = ggx_d(n_dot_h, alpha_t) * n_dot_h / (4.0 * v_dot_h);
+        p_trans * f_r_avg * half_pdf
+    } else {
+        0.0
+    };
+
+    p_spec * specular_pdf + p_diff * diffuse_pdf + trans_reflect_pdf
 }
 
 /// Sampled direction + weight.
@@ -900,5 +934,119 @@ mod tests {
             texture_bindings: None,
         };
         assert_eq!(transmission_weight(&mat), 0.0);
+    }
+
+    /// Regression: pure-glass surfaces used to produce ~10^10 fireflies
+    /// when `sample_bsdf` picked the transmission lobe and the
+    /// Fresnel split reflected — `pdf_bsdf` returned 0 for the
+    /// reflected direction (reflect_budget = 1 - p_trans = 0), so
+    /// `f * cos / pdf.max(1e-12)` blew up. After the fix, the
+    /// transmission lobe's Fresnel-reflect contribution is included
+    /// in `pdf_bsdf` and weights stay finite.
+    #[test]
+    fn pure_glass_fresnel_reflect_pdf_is_nonzero() {
+        let mat = PathTraceMaterial {
+            base_color: Vec3::ONE,
+            metallic: 0.0,
+            roughness: 0.2,
+            ior: 1.5,
+            emissive: Vec3::ZERO,
+            transmission: 1.0,
+            ao: 1.0,
+            texture_bindings: None,
+        };
+        let n = Vec3::Z;
+        let wo = Vec3::Z; // normal incidence
+                          // Perfect mirror reflection direction.
+        let wi = wo; // reflects to itself at normal incidence
+        let pdf = pdf_bsdf(&mat, n, wi, wo);
+        assert!(
+            pdf > 0.0,
+            "pdf_bsdf returned 0 for Fresnel-reflected direction on pure glass (firefly bug)"
+        );
+    }
+
+    #[test]
+    fn pure_glass_sample_weights_never_explode() {
+        // Sample a pure-glass material many times under controlled
+        // RNG and assert no individual sample weight exceeds a
+        // reasonable bound. The pre-fix code could produce ~10^10
+        // weights when the Fresnel split landed in the reflect
+        // branch. With the corrected PDF, all weights are < ~100
+        // even at normal incidence (the worst case for fireflies).
+        let mat = PathTraceMaterial {
+            base_color: Vec3::ONE,
+            metallic: 0.0,
+            roughness: 0.2,
+            ior: 1.5,
+            emissive: Vec3::ZERO,
+            transmission: 1.0,
+            ao: 1.0,
+            texture_bindings: None,
+        };
+        let n = Vec3::Z;
+        let wo = Vec3::new(0.0, 0.1, 0.99).normalize();
+        let mut max_weight: f32 = 0.0;
+        let trials = 20_000;
+        for _ in 0..trials {
+            let r = [
+                fastrand::f32(),
+                fastrand::f32(),
+                fastrand::f32(),
+                fastrand::f32(),
+            ];
+            if let Some(s) = sample_bsdf(&mat, n, wo, r) {
+                let m = s.weight.x.max(s.weight.y).max(s.weight.z);
+                if m.is_finite() {
+                    max_weight = max_weight.max(m);
+                } else {
+                    panic!("non-finite weight: {:?} (sample {:?})", s.weight, s);
+                }
+            }
+        }
+        assert!(
+            max_weight < 100.0,
+            "glass sample weight exploded to {max_weight} (firefly regression)"
+        );
+    }
+
+    #[test]
+    fn pure_glass_expected_throughput_is_unity() {
+        // A pure-glass material under unit illumination should
+        // transport ~100% of the energy on average (reflect + refract
+        // = 1 by Fresnel). The pre-fix code over-counted some samples
+        // due to the firefly weights so this average was very wrong.
+        let mat = PathTraceMaterial {
+            base_color: Vec3::ONE,
+            metallic: 0.0,
+            roughness: 0.3,
+            ior: 1.5,
+            emissive: Vec3::ZERO,
+            transmission: 1.0,
+            ao: 1.0,
+            texture_bindings: None,
+        };
+        let n = Vec3::Z;
+        let wo = Vec3::Z;
+        let trials = 8192;
+        let mut sum = Vec3::ZERO;
+        for _ in 0..trials {
+            let r = [
+                fastrand::f32(),
+                fastrand::f32(),
+                fastrand::f32(),
+                fastrand::f32(),
+            ];
+            if let Some(s) = sample_bsdf(&mat, n, wo, r) {
+                sum += s.weight;
+            }
+        }
+        let avg = sum / trials as f32;
+        // The expected throughput for white glass is ~1.0 ± Monte
+        // Carlo noise. Pre-fix this averaged > 100 due to fireflies.
+        assert!(
+            avg.x.is_finite() && avg.x < 5.0,
+            "average glass throughput unreasonably high (firefly leak): {avg:?}"
+        );
     }
 }

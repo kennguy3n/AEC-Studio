@@ -63,8 +63,17 @@ pub enum EnvironmentError {
 impl EnvironmentMap {
     /// Load a Radiance `.hdr` or OpenEXR `.exr` file from disk and
     /// build the importance-sampling CDF.
+    ///
+    /// Distinguishes between a missing file (`EnvironmentError::NotFound`)
+    /// and a corrupt / unsupported file (`EnvironmentError::Decode`).
+    /// The `image::open` call would otherwise surface a generic IO
+    /// error for both cases, which makes the UI message ("decode
+    /// failed") misleading when the user mistyped a path.
     pub fn load_hdr(path: impl AsRef<Path>) -> Result<Self, EnvironmentError> {
         let p = path.as_ref();
+        if !p.exists() {
+            return Err(EnvironmentError::NotFound(p.to_path_buf()));
+        }
         let img = image::open(p).map_err(|e| EnvironmentError::Decode {
             path: p.to_path_buf(),
             source: e,
@@ -406,5 +415,21 @@ mod tests {
             s.length_squared() > 0.0,
             "exr sample should be non-zero, got {s:?}"
         );
+    }
+
+    /// Loading a non-existent path returns `EnvironmentError::NotFound`
+    /// rather than the misleading `Decode` variant the `image::open`
+    /// IO error used to surface. The bridge service relies on this
+    /// distinction to render a "file not found" toast vs. "corrupt
+    /// HDRI" toast.
+    #[test]
+    fn load_hdr_missing_path_returns_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bogus = tmp.path().join("does-not-exist.hdr");
+        let err = EnvironmentMap::load_hdr(&bogus).expect_err("expected error");
+        match err {
+            EnvironmentError::NotFound(p) => assert_eq!(p, bogus),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
     }
 }
