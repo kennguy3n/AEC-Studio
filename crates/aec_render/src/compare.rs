@@ -11,8 +11,12 @@
 //!
 //! Pixels are expected as linear-space RGBA (the same format used by
 //! [`crate::scheduler::AccumulationBuffer::average_rgb`]). Alpha is
-//! ignored. The image dimensions must match; this function returns
-//! [`CompareError::DimensionMismatch`] otherwise.
+//! ignored. The buffer sizes and image dimensions must match; the
+//! flat-byte-slice entry point returns [`CompareError::BufferSize`]
+//! when the input lengths are inconsistent with `width × height × 4`,
+//! while the file-decoding entry point returns
+//! [`CompareError::DimensionMismatch`] when the two decoded images
+//! disagree on dimensions.
 
 use std::path::Path;
 
@@ -22,6 +26,26 @@ use thiserror::Error;
 /// Errors from [`compare_images`] / [`ssim_from_files`].
 #[derive(Debug, Error)]
 pub enum CompareError {
+    /// One of the flat byte slices passed to [`ssim_rgba_u8`] does not
+    /// match the declared `width × height × 4`. Reported separately
+    /// from [`Self::DimensionMismatch`] because at this point the
+    /// caller has only handed us a flat buffer — we don't know the
+    /// 2D dimensions of the offending side, only that its length is
+    /// wrong.
+    #[error(
+        "buffer size mismatch: expected {expected_bytes} bytes for {width}x{height}x4, \
+         got a={a_bytes} bytes, b={b_bytes} bytes"
+    )]
+    BufferSize {
+        width: u32,
+        height: u32,
+        expected_bytes: usize,
+        a_bytes: usize,
+        b_bytes: usize,
+    },
+    /// The two images compared by [`ssim_from_files`] /
+    /// [`compare_images`] decoded successfully but disagree on
+    /// dimensions.
     #[error("dimension mismatch: a={a_width}x{a_height}, b={b_width}x{b_height}")]
     DimensionMismatch {
         a_width: u32,
@@ -46,12 +70,20 @@ pub enum CompareError {
 /// implementation when called with `data_range=255` and `gaussian_weights=False`
 /// (we use a uniform `11×11` window).
 pub fn ssim_rgba_u8(a: &[u8], b: &[u8], width: u32, height: u32) -> Result<f32, CompareError> {
-    if (width * height * 4) as usize != a.len() || a.len() != b.len() {
-        return Err(CompareError::DimensionMismatch {
-            a_width: width,
-            a_height: height,
-            b_width: (b.len() / 4) as u32,
-            b_height: 1,
+    // Both inputs are flat byte slices: we don't know their true 2D
+    // dimensions if their length is wrong, so report the actual byte
+    // counts rather than inventing a fictitious `b_width × 1`
+    // dimension (which the previous error variant produced).
+    let expected_bytes = (width as usize)
+        .saturating_mul(height as usize)
+        .saturating_mul(4);
+    if a.len() != expected_bytes || b.len() != expected_bytes {
+        return Err(CompareError::BufferSize {
+            width,
+            height,
+            expected_bytes,
+            a_bytes: a.len(),
+            b_bytes: b.len(),
         });
     }
     // Convert to luminance (BT.709) for a single-channel SSIM. For
@@ -261,10 +293,43 @@ mod tests {
     }
 
     #[test]
-    fn mismatched_dimensions_return_error() {
+    fn mismatched_buffer_size_returns_buffer_size_error() {
+        // `b` has 16*8*4 = 512 bytes but the caller declared an 8x8
+        // image (256 bytes). The error must report both actual byte
+        // counts — not fabricate a phantom `b_width × 1` dimension.
         let a = solid_image(8, 8, [0, 0, 0, 255]);
         let b = solid_image(16, 8, [0, 0, 0, 255]);
         let err = ssim_rgba_u8(&a, &b, 8, 8).unwrap_err();
-        assert!(matches!(err, CompareError::DimensionMismatch { .. }));
+        match err {
+            CompareError::BufferSize {
+                width,
+                height,
+                expected_bytes,
+                a_bytes,
+                b_bytes,
+            } => {
+                assert_eq!(width, 8);
+                assert_eq!(height, 8);
+                assert_eq!(expected_bytes, 8 * 8 * 4);
+                assert_eq!(a_bytes, 8 * 8 * 4);
+                assert_eq!(b_bytes, 16 * 8 * 4);
+            }
+            other => panic!("expected BufferSize, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn buffer_size_error_message_contains_actual_byte_counts() {
+        let a = solid_image(2, 2, [0, 0, 0, 255]);
+        let b = solid_image(4, 4, [0, 0, 0, 255]);
+        let err = ssim_rgba_u8(&a, &b, 2, 2).unwrap_err();
+        let msg = err.to_string();
+        // Display impl must spell out the actual byte counts so a
+        // dev reading the error knows which side was wrong-sized
+        // — the previous variant invented a `b_width × 1` shape
+        // that was always misleading.
+        assert!(msg.contains("16 bytes"), "expected expected_bytes: {msg}");
+        assert!(msg.contains("a=16 bytes"), "expected a_bytes: {msg}");
+        assert!(msg.contains("b=64 bytes"), "expected b_bytes: {msg}");
     }
 }

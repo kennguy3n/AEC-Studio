@@ -59,7 +59,16 @@ pub struct PathTraceScene {
     /// Optional HDRI environment map. When present, the path tracer
     /// returns the environment radiance for rays that escape the BVH
     /// instead of the procedural Hosek-Wilkie sky baked into `sky`.
-    pub environment: Option<crate::environment::EnvironmentMap>,
+    ///
+    /// Stored behind [`std::sync::Arc`] so callers (notably
+    /// [`crate::final_render::FinalRenderPipeline`] and the bridge
+    /// `RenderState` env-map cache) can hand the same decoded HDRI
+    /// to many concurrent path-trace builds without paying the deep
+    /// pixel-data clone that the previous `Option<EnvironmentMap>`
+    /// shape forced on every render. `Arc::clone` is an atomic
+    /// refcount bump (~10 ns) versus tens of MB of memcpy + CDF
+    /// duplication for a 4K HDRI.
+    pub environment: Option<std::sync::Arc<crate::environment::EnvironmentMap>>,
 }
 
 /// Per-triangle data needed for shading (smooth normals + per-vertex
@@ -105,7 +114,7 @@ impl PathTraceScene {
         material_lookup: impl Fn(&str) -> Option<usize>,
         sky: SkyParams,
         textures: crate::texture::TextureAtlas,
-        environment: Option<crate::environment::EnvironmentMap>,
+        environment: Option<std::sync::Arc<crate::environment::EnvironmentMap>>,
     ) -> Self {
         let mut triangles: Vec<ShadingTriangle> = Vec::new();
         let mut shading: Vec<TriangleShading> = Vec::new();

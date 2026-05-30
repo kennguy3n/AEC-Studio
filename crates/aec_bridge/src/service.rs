@@ -7600,12 +7600,20 @@ END-ISO-10303-21;\n";
         assert_eq!(env.conditional_cdf.len(), (env.width * env.height) as usize);
     }
 
-    /// Intensity changes alone (path=None) must not clobber a
-    /// previously-cached map; this lets the renderer keep the same
-    /// HDRI while the user tweaks strength. (The path=None branch
-    /// is the explicit "clear" code path — verify that it does
-    /// clear the cached map even though it preserves the new
-    /// intensity for the next load.)
+    /// `render_set_environment_map(None, Some(i))` is the explicit
+    /// "fall back to the procedural Hosek-Wilkie sky" code path. The
+    /// public API contract (see the docstring on
+    /// [`BridgeService::render_set_environment_map`]) is:
+    /// - `path = None` clears the cached map (procedural sky from
+    ///   here on);
+    /// - `intensity = Some(i)` is preserved on `RenderState` so the
+    ///   next `path = Some(...)` call bakes it into the new map
+    ///   without forcing the caller to re-specify the strength.
+    ///
+    /// This test exercises both halves of that contract: after a
+    /// cached map is established, an intensity-only call must (1)
+    /// clear `state.environment`, and (2) leave the new intensity
+    /// remembered on `state.environment_intensity`.
     #[test]
     fn render_set_environment_map_intensity_only_call_clears_cached_map() {
         use image::{Rgb, Rgb32FImage};

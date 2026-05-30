@@ -14,10 +14,40 @@
 //! back to CPU rendering whenever the scene uses textures (the wgpu
 //! bindless-texture-array path is documented in `gpu_trace.rs`).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use glam::{Vec3, Vec4};
 use image::{DynamicImage, GenericImageView};
+
+/// Whether an on-disk 8-bit texture is sRGB-encoded (the standard for
+/// **colour** textures — albedo, emissive) or already linear (the
+/// standard for **data** textures — normal maps, metallic/roughness,
+/// AO, displacement, height fields).
+///
+/// The path tracer's BSDF assumes linear-space inputs (textures and
+/// flat fields alike); applying the sRGB → linear transfer to a data
+/// texture would systematically tilt the decoded values — a mid-grey
+/// `128/255 = 0.502` normal-map texel would decode to `0.214` and
+/// then map to a tangent-space normal of `-0.572` instead of the
+/// flat `±0.0` the artist authored. Likewise a `0.5` roughness
+/// channel in a glTF MR texture would be reported as `0.214`.
+///
+/// Float (HDR) textures (`.hdr`, `.exr`, `Rgb32F`, `Rgba32F`) are
+/// **always** treated as already-linear regardless of this setting:
+/// the Radiance / OpenEXR formats encode linear-light data by
+/// definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ColorSpace {
+    /// 8-bit values are sRGB-encoded; apply the standard sRGB → linear
+    /// transfer at decode time. This is the default and the correct
+    /// setting for albedo / base-colour and emissive maps.
+    #[default]
+    Srgb,
+    /// 8-bit values are already linear (data textures). Each channel
+    /// is decoded as `byte / 255.0` with no gamma applied.
+    Linear,
+}
 
 /// Opaque handle into a [`TextureAtlas`]. Returned by
 /// [`TextureAtlas::register_image`] / [`TextureAtlas::load_path`] and
@@ -95,6 +125,13 @@ impl AtlasEntry {
 #[derive(Debug, Default, Clone)]
 pub struct TextureAtlas {
     entries: Vec<AtlasEntry>,
+    /// Dedup cache: maps a `(canonicalised path, color space)` pair to
+    /// the previously-registered [`TextureId`] so a second
+    /// [`Self::load_path_with_color_space`] for the same on-disk file
+    /// reuses the existing decode + MIP chain instead of decoding
+    /// twice. Critical for projects where many materials reference
+    /// the same shared albedo / normal map.
+    path_dedup: HashMap<(PathBuf, ColorSpace), TextureId>,
 }
 
 impl TextureAtlas {
@@ -115,24 +152,69 @@ impl TextureAtlas {
     }
 
     /// Decode a PNG / JPEG file from disk and register it with the
-    /// atlas. The decoded image is converted to linear-space RGBA `f32`
-    /// (sRGB → linear gamma 2.2 for 8-bit inputs, identity for HDR
-    /// inputs). The MIP chain is generated eagerly via box-filter
-    /// downsample down to a 1×1 base.
+    /// atlas, assuming the file is sRGB-encoded (the convention for
+    /// **colour** textures: albedo, emissive). For **data** textures
+    /// — normal maps, metallic/roughness, AO, displacement — use
+    /// [`Self::load_path_with_color_space`] with [`ColorSpace::Linear`].
+    ///
+    /// If the same path was already loaded with the same color space,
+    /// the existing [`TextureId`] is returned and no second decode
+    /// runs (dedup cache).
     pub fn load_path(&mut self, path: impl AsRef<Path>) -> Result<TextureId, TextureError> {
+        self.load_path_with_color_space(path, ColorSpace::Srgb)
+    }
+
+    /// Decode a PNG / JPEG file from disk and register it with the
+    /// atlas, treating its 8-bit values as either sRGB (colour textures:
+    /// albedo, emissive) or linear (data textures: normal map,
+    /// metallic-roughness, AO, displacement). The MIP chain is
+    /// generated eagerly via box-filter downsample down to a 1×1 base.
+    ///
+    /// HDR float inputs (`.hdr`, `.exr`) are always treated as
+    /// linear-light regardless of `color_space`.
+    ///
+    /// Repeat calls for the same `(path, color_space)` pair reuse the
+    /// previously-registered [`TextureId`] (dedup cache). Calling with
+    /// a different color space for the same path produces a fresh
+    /// entry — the two decode paths are not interchangeable.
+    pub fn load_path_with_color_space(
+        &mut self,
+        path: impl AsRef<Path>,
+        color_space: ColorSpace,
+    ) -> Result<TextureId, TextureError> {
         let path_ref = path.as_ref();
+        let canonical = path_ref.to_path_buf();
+        if let Some(id) = self.path_dedup.get(&(canonical.clone(), color_space)) {
+            return Ok(*id);
+        }
         let img = image::open(path_ref).map_err(|e| TextureError::Decode {
             path: path_ref.to_path_buf(),
             source: e,
         })?;
-        Ok(self.register_image_with_source(img, Some(path_ref.to_path_buf())))
+        let id = self.register_image_with_source(img, Some(canonical.clone()), color_space);
+        self.path_dedup.insert((canonical, color_space), id);
+        Ok(id)
     }
 
-    /// Register a [`DynamicImage`] already loaded by the caller. The
-    /// pipeline can use this when textures live in `project.sqlite`
-    /// blobs rather than on the host filesystem.
+    /// Register a [`DynamicImage`] already loaded by the caller,
+    /// assuming an sRGB color space. The pipeline can use this when
+    /// textures live in `project.sqlite` blobs rather than on the host
+    /// filesystem. For data textures, use
+    /// [`Self::register_image_with_color_space`].
     pub fn register_image(&mut self, img: DynamicImage) -> TextureId {
-        self.register_image_with_source(img, None)
+        self.register_image_with_source(img, None, ColorSpace::Srgb)
+    }
+
+    /// Register a [`DynamicImage`] already loaded by the caller, with
+    /// an explicit color space. Use [`ColorSpace::Linear`] for data
+    /// textures (normal map, metallic-roughness, AO, displacement)
+    /// and [`ColorSpace::Srgb`] for colour textures (albedo, emissive).
+    pub fn register_image_with_color_space(
+        &mut self,
+        img: DynamicImage,
+        color_space: ColorSpace,
+    ) -> TextureId {
+        self.register_image_with_source(img, None, color_space)
     }
 
     /// Register a raw linear `f32 × 4` buffer (e.g. an HDR sample, a
@@ -164,13 +246,14 @@ impl TextureAtlas {
         &mut self,
         img: DynamicImage,
         source: Option<PathBuf>,
+        color_space: ColorSpace,
     ) -> TextureId {
         let (w, h) = img.dimensions();
         let is_hdr = matches!(
             img,
             DynamicImage::ImageRgb32F(_) | DynamicImage::ImageRgba32F(_)
         );
-        let base_pixels = decode_to_linear_rgba(&img, is_hdr);
+        let base_pixels = decode_to_linear_rgba(&img, is_hdr, color_space);
         let base = MipLevel {
             width: w,
             height: h,
@@ -200,21 +283,42 @@ impl TextureAtlas {
         mut blob_resolver: impl FnMut(&str) -> Option<PathBuf>,
     ) -> (Self, Vec<MaterialTextureBindings>) {
         let mut atlas = TextureAtlas::new();
+        // Per-slot color space follows the glTF spec:
+        //   - albedo / base-colour  -> sRGB    (colour data)
+        //   - normal map            -> Linear  (encoded XYZ data; sRGB
+        //                                       would tilt the
+        //                                       decoded normal)
+        //   - metallic-roughness    -> Linear  (encoded scalar data;
+        //                                       sRGB would shift
+        //                                       roughness/metallic
+        //                                       values toward black)
+        //   - emissive              -> sRGB    (colour data)
+        // The atlas's path_dedup cache handles the case where the
+        // same on-disk file is referenced by multiple materials —
+        // a second material with the same blob_hash points at the
+        // already-registered TextureId rather than triggering a
+        // re-decode.
         let mut bindings = Vec::with_capacity(materials.len());
         for mat in materials {
             let mut b = MaterialTextureBindings::default();
-            for (slot, dst) in [
-                (mat.albedo_map.as_ref(), &mut b.albedo),
-                (mat.normal_map.as_ref(), &mut b.normal),
+            let slots: [(
+                Option<&aec_materials::TextureRef>,
+                &mut Option<TextureId>,
+                ColorSpace,
+            ); 4] = [
+                (mat.albedo_map.as_ref(), &mut b.albedo, ColorSpace::Srgb),
+                (mat.normal_map.as_ref(), &mut b.normal, ColorSpace::Linear),
                 (
                     mat.metallic_roughness_map.as_ref(),
                     &mut b.metallic_roughness,
+                    ColorSpace::Linear,
                 ),
-                (mat.emissive_map.as_ref(), &mut b.emissive),
-            ] {
+                (mat.emissive_map.as_ref(), &mut b.emissive, ColorSpace::Srgb),
+            ];
+            for (slot, dst, color_space) in slots {
                 if let Some(tex_ref) = slot {
                     if let Some(p) = blob_resolver(&tex_ref.blob_hash) {
-                        match atlas.load_path(&p) {
+                        match atlas.load_path_with_color_space(&p, color_space) {
                             Ok(id) => *dst = Some(id),
                             Err(err) => {
                                 tracing::warn!(
@@ -309,14 +413,22 @@ pub fn sample_rgb(atlas: &TextureAtlas, id: TextureId, uv: [f32; 2]) -> Vec3 {
 
 /// Convert an arbitrary [`DynamicImage`] to linear-space RGBA `f32`.
 ///
-/// * 8-bit / 16-bit inputs are assumed to be sRGB-encoded (the
-///   convention for albedo / emissive textures shipped with the
-///   asset library and the glTF spec). Each channel is converted via
-///   the standard sRGB transfer function except for the alpha channel,
-///   which is always treated as a linear coverage value.
-/// * 32-bit float inputs (Radiance HDR / OpenEXR) are treated as
-///   already-linear data; no transfer is applied.
-fn decode_to_linear_rgba(img: &DynamicImage, hdr_is_linear: bool) -> Vec<[f32; 4]> {
+/// * 8-bit / 16-bit inputs are decoded according to `color_space`:
+///   [`ColorSpace::Srgb`] applies the standard sRGB → linear transfer
+///   (the convention for **colour** textures — albedo, emissive),
+///   while [`ColorSpace::Linear`] divides by 255 with no gamma (the
+///   convention for **data** textures — normal map,
+///   metallic-roughness, AO, displacement, per the glTF spec). The
+///   alpha channel is always treated as linear coverage regardless
+///   of `color_space`.
+/// * 32-bit float inputs (Radiance HDR / OpenEXR) are always treated
+///   as already-linear regardless of `color_space`; no transfer is
+///   applied. `.hdr`/`.exr` are by definition linear-light formats.
+fn decode_to_linear_rgba(
+    img: &DynamicImage,
+    hdr_is_linear: bool,
+    color_space: ColorSpace,
+) -> Vec<[f32; 4]> {
     if hdr_is_linear {
         let rgba32 = img.to_rgba32f();
         return rgba32
@@ -325,16 +437,29 @@ fn decode_to_linear_rgba(img: &DynamicImage, hdr_is_linear: bool) -> Vec<[f32; 4
             .collect();
     }
     let rgba8 = img.to_rgba8();
-    rgba8
-        .pixels()
-        .map(|p| {
-            let r = srgb_to_linear(p.0[0] as f32 / 255.0);
-            let g = srgb_to_linear(p.0[1] as f32 / 255.0);
-            let b = srgb_to_linear(p.0[2] as f32 / 255.0);
-            let a = p.0[3] as f32 / 255.0;
-            [r, g, b, a]
-        })
-        .collect()
+    match color_space {
+        ColorSpace::Srgb => rgba8
+            .pixels()
+            .map(|p| {
+                let r = srgb_to_linear(p.0[0] as f32 / 255.0);
+                let g = srgb_to_linear(p.0[1] as f32 / 255.0);
+                let b = srgb_to_linear(p.0[2] as f32 / 255.0);
+                let a = p.0[3] as f32 / 255.0;
+                [r, g, b, a]
+            })
+            .collect(),
+        ColorSpace::Linear => rgba8
+            .pixels()
+            .map(|p| {
+                [
+                    p.0[0] as f32 / 255.0,
+                    p.0[1] as f32 / 255.0,
+                    p.0[2] as f32 / 255.0,
+                    p.0[3] as f32 / 255.0,
+                ]
+            })
+            .collect(),
+    }
 }
 
 /// Standard sRGB → linear transfer function. Matches the formula used
@@ -534,5 +659,190 @@ mod tests {
             TextureAtlas::from_material_library(std::slice::from_ref(&mat), |_| None);
         assert!(atlas.is_empty());
         assert!(bindings[0].albedo.is_none());
+    }
+
+    /// Devin Review Phase 17 Group A pass 4: 8-bit data textures
+    /// (normal / metallic-roughness / AO) must NOT have the sRGB
+    /// transfer applied at decode time. A mid-grey 128/255 normal-map
+    /// texel must decode to ~0.502 linear (which a downstream
+    /// `2x - 1` map sends to a flat ~0.0 tangent-space normal), not
+    /// to ~0.214 (which the sRGB path produces and which a downstream
+    /// mapper would send to -0.572 — a strongly bent fake normal).
+    #[test]
+    fn linear_color_space_skips_srgb_transfer_for_data_textures() {
+        let mut img: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::new(1, 1);
+        *img.get_pixel_mut(0, 0) = Rgba([128, 128, 255, 255]);
+        let dyn_img = DynamicImage::ImageRgba8(img);
+
+        let mut atlas = TextureAtlas::new();
+        let lin_id = atlas.register_image_with_color_space(dyn_img.clone(), ColorSpace::Linear);
+        let srgb_id = atlas.register_image_with_color_space(dyn_img, ColorSpace::Srgb);
+
+        let s_lin = bilinear_sample(&atlas, lin_id, [0.5, 0.5], 0.0);
+        let s_srgb = bilinear_sample(&atlas, srgb_id, [0.5, 0.5], 0.0);
+
+        // Linear path: 128/255 = 0.50196, no transfer.
+        assert!(
+            (s_lin.x - 128.0 / 255.0).abs() < 1e-4,
+            "ColorSpace::Linear must decode 128/255 verbatim, got {}",
+            s_lin.x
+        );
+        // sRGB path: 128/255 = 0.502 sRGB → ~0.2158 linear.
+        assert!(
+            (s_srgb.x - 0.215_86).abs() < 1e-3,
+            "ColorSpace::Srgb must apply the sRGB transfer (~0.2158 for 128/255), got {}",
+            s_srgb.x
+        );
+        // The two decoders must produce materially different results
+        // — a regression where both paths went through sRGB would
+        // collapse this difference.
+        assert!(
+            (s_lin.x - s_srgb.x).abs() > 0.25,
+            "Linear vs sRGB decode must differ by >0.25 for 128/255; got delta {}",
+            (s_lin.x - s_srgb.x).abs()
+        );
+    }
+
+    /// `from_material_library` must use ColorSpace::Linear for the
+    /// normal-map and metallic-roughness slots per the glTF spec.
+    /// This test threads a single grey PNG through both slots and
+    /// verifies the *Linear* decode result.
+    #[test]
+    fn material_library_normal_and_mr_decode_as_linear() {
+        use aec_materials::material::{PbrMaterial, TextureRef};
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("grey.png");
+        let mut img: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::new(1, 1);
+        *img.get_pixel_mut(0, 0) = Rgba([128, 128, 128, 255]);
+        DynamicImage::ImageRgba8(img).save(&path).unwrap();
+
+        let mat = PbrMaterial {
+            normal_map: Some(TextureRef {
+                blob_hash: "grey-n".into(),
+                channel: "normal".into(),
+                width: 1,
+                height: 1,
+            }),
+            metallic_roughness_map: Some(TextureRef {
+                blob_hash: "grey-mr".into(),
+                channel: "metallic_roughness".into(),
+                width: 1,
+                height: 1,
+            }),
+            ..PbrMaterial::new("mat:grey", "Grey")
+        };
+        let path_clone = path.clone();
+        let (atlas, bindings) =
+            TextureAtlas::from_material_library(std::slice::from_ref(&mat), |hash| match hash {
+                "grey-n" | "grey-mr" => Some(path_clone.clone()),
+                _ => None,
+            });
+
+        let n_id = bindings[0].normal.expect("normal bound");
+        let mr_id = bindings[0]
+            .metallic_roughness
+            .expect("metallic-roughness bound");
+        let s_n = bilinear_sample(&atlas, n_id, [0.5, 0.5], 0.0);
+        let s_mr = bilinear_sample(&atlas, mr_id, [0.5, 0.5], 0.0);
+
+        let expected = 128.0_f32 / 255.0;
+        assert!(
+            (s_n.x - expected).abs() < 1e-3,
+            "normal-map slot must decode as linear (~{expected}), got {}",
+            s_n.x
+        );
+        assert!(
+            (s_mr.y - expected).abs() < 1e-3,
+            "MR roughness channel must decode as linear (~{expected}), got {}",
+            s_mr.y
+        );
+    }
+
+    /// Devin Review Phase 17 Group A pass 4: when many materials
+    /// reference the same blob_hash, the atlas must decode the on-disk
+    /// file exactly once. Without the dedup cache a 100-material
+    /// project sharing a single 2K albedo would decode it 100 times
+    /// at scene-build, which on a real workload is hundreds of MB of
+    /// redundant pixel data and several seconds of decode wall-time.
+    #[test]
+    fn material_library_dedups_identical_blob_hashes() {
+        use aec_materials::material::{PbrMaterial, TextureRef};
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shared.png");
+        let mut img: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::new(2, 2);
+        for (_, _, p) in img.enumerate_pixels_mut() {
+            *p = Rgba([200, 100, 50, 255]);
+        }
+        DynamicImage::ImageRgba8(img).save(&path).unwrap();
+
+        let shared_ref = TextureRef {
+            blob_hash: "shared".into(),
+            channel: "albedo".into(),
+            width: 2,
+            height: 2,
+        };
+        let mut mats = Vec::new();
+        for i in 0..5 {
+            mats.push(PbrMaterial {
+                albedo_map: Some(shared_ref.clone()),
+                ..PbrMaterial::new(format!("mat:{i}"), format!("Material {i}"))
+            });
+        }
+
+        let mut decode_calls = 0_u32;
+        let path_clone = path.clone();
+        let (atlas, bindings) = TextureAtlas::from_material_library(&mats, |hash| {
+            if hash == "shared" {
+                decode_calls += 1;
+                Some(path_clone.clone())
+            } else {
+                None
+            }
+        });
+
+        // The resolver is called once per slot per material (the
+        // dedup happens inside `load_path_with_color_space`), but the
+        // atlas must hold exactly ONE entry — proving the underlying
+        // decode + MIP-chain construction ran exactly once.
+        assert_eq!(
+            atlas.len(),
+            1,
+            "expected 1 atlas entry, got {}",
+            atlas.len()
+        );
+        // Every material's albedo binding must point at the same
+        // TextureId.
+        let first_id = bindings[0].albedo.expect("albedo bound");
+        for b in &bindings[1..] {
+            assert_eq!(b.albedo, Some(first_id), "all materials share the texture");
+        }
+    }
+
+    /// Different color spaces against the same path must NOT collide
+    /// in the dedup cache — the two decodes produce different pixel
+    /// values, so they must be stored as distinct atlas entries.
+    #[test]
+    fn dedup_cache_keys_on_color_space_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("data.png");
+        let mut img: ImageBuffer<Rgba<u8>, Vec<u8>> = ImageBuffer::new(1, 1);
+        *img.get_pixel_mut(0, 0) = Rgba([128, 128, 128, 255]);
+        DynamicImage::ImageRgba8(img).save(&path).unwrap();
+
+        let mut atlas = TextureAtlas::new();
+        let lin_id = atlas
+            .load_path_with_color_space(&path, ColorSpace::Linear)
+            .expect("decode");
+        let srgb_id = atlas
+            .load_path_with_color_space(&path, ColorSpace::Srgb)
+            .expect("decode");
+        let lin_id_2 = atlas
+            .load_path_with_color_space(&path, ColorSpace::Linear)
+            .expect("decode");
+
+        assert_eq!(atlas.len(), 2, "Linear and Srgb must be separate entries");
+        assert_ne!(lin_id, srgb_id);
+        // Second Linear call must reuse the existing decode.
+        assert_eq!(lin_id, lin_id_2);
     }
 }
