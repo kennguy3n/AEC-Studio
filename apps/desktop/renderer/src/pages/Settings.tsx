@@ -23,6 +23,13 @@ import {
   parseLoopbackInstance,
   type KChatLoopbackInstance,
 } from "../components/kchat/loopbackInstance";
+import {
+  applyThemeMode,
+  readStoredThemeMode,
+  resolveEffectiveTheme,
+  type ThemeMode,
+  writeStoredThemeMode,
+} from "../lib/theme";
 
 type AiModelTier = "tiny" | "small" | "medium" | "large";
 type RenderPresetKey = "quick" | "standard" | "high" | "studio";
@@ -252,6 +259,51 @@ export function Settings() {
     setSavedAt(new Date().toISOString());
   }, []);
 
+  // Phase 17 Task 8 — Theme. The boot script in `main.tsx` already
+  // applied the stored mode to `<html>` synchronously, so the
+  // initial state read is consistent with what the user sees.
+  const [themeMode, setThemeMode] = useState<ThemeMode>(() =>
+    readStoredThemeMode(),
+  );
+  // Re-resolve "system" when the OS toggles dark/light. We keep a
+  // counter rather than the resolved value directly so the
+  // displayed label updates *after* the new value is in effect
+  // (paint-after-commit, not commit-during-render).
+  const [, setOsHintTick] = useState(0);
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.matchMedia) return;
+    const mql = window.matchMedia("(prefers-color-scheme: dark)");
+    const handler = () => {
+      if (themeMode === "system") setOsHintTick((t) => t + 1);
+    };
+    // `addEventListener` is the modern path; older Safari needs
+    // `addListener`. Try the modern one and fall back so this works
+    // in all environments AEC Studio supports.
+    if (typeof mql.addEventListener === "function") {
+      mql.addEventListener("change", handler);
+      return () => mql.removeEventListener("change", handler);
+    }
+    if (typeof mql.addListener === "function") {
+      mql.addListener(handler);
+      return () => mql.removeListener(handler);
+    }
+    return undefined;
+  }, [themeMode]);
+  const setTheme = useCallback((mode: ThemeMode) => {
+    applyThemeMode(mode);
+    writeStoredThemeMode(mode);
+    setThemeMode(mode);
+    // Theme toggles are immediate — the Save button is for the
+    // other settings on this page. Don't reset savedAt.
+  }, []);
+  // Computed on every render. `resolveEffectiveTheme` is a string
+  // compare plus a `matchMedia` read in System mode — microseconds —
+  // so the memo overhead is a net loss. Memoising on `[themeMode]`
+  // alone would also be wrong: when the OS flips under System mode
+  // the dep array is unchanged, so the memo would hand back the
+  // cached resolution against the previous OS preference.
+  const effectiveTheme = resolveEffectiveTheme(themeMode);
+
   const tierLabel = useMemo(() => {
     if (!status) return "Detecting…";
     return `${status.tier} (${status.cpu.physicalCores}c / ${status.cpu.logicalCores}t, ${(
@@ -348,6 +400,53 @@ export function Settings() {
             <option value="studio">Studio</option>
           </select>
         </label>
+      </section>
+
+      <section
+        className="settings-section"
+        data-testid="settings-section-appearance"
+        aria-label="Appearance"
+      >
+        <h2>Appearance</h2>
+        <fieldset>
+          <legend>Theme</legend>
+          <label>
+            <input
+              type="radio"
+              name="theme"
+              value="system"
+              data-testid="settings-theme-system"
+              checked={themeMode === "system"}
+              onChange={() => setTheme("system")}
+            />
+            System ({effectiveTheme === "dark" ? "dark" : "light"} right now)
+          </label>
+          <label>
+            <input
+              type="radio"
+              name="theme"
+              value="light"
+              data-testid="settings-theme-light"
+              checked={themeMode === "light"}
+              onChange={() => setTheme("light")}
+            />
+            Light
+          </label>
+          <label>
+            <input
+              type="radio"
+              name="theme"
+              value="dark"
+              data-testid="settings-theme-dark"
+              checked={themeMode === "dark"}
+              onChange={() => setTheme("dark")}
+            />
+            Dark
+          </label>
+        </fieldset>
+        <p className="settings-page__subtitle">
+          Changes apply immediately and persist across sessions.
+        </p>
       </section>
 
       <section

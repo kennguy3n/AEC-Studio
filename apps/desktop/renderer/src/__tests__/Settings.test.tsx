@@ -180,4 +180,51 @@ describe("Settings page", () => {
     expect(imperial.checked).toBe(true);
     expect(metric.checked).toBe(false);
   });
+
+  it("theme toggle applies the data-theme attribute and persists to localStorage", () => {
+    // Each Settings test runs in jsdom with a fresh DOM, so the
+    // localStorage and <html data-theme> start clean.
+    localStorage.clear();
+    document.documentElement.removeAttribute("data-theme");
+    render(
+      <MemoryRouter>
+        <Settings />
+      </MemoryRouter>,
+    );
+    const systemRadio = screen.getByTestId(
+      "settings-theme-system",
+    ) as HTMLInputElement;
+    const darkRadio = screen.getByTestId(
+      "settings-theme-dark",
+    ) as HTMLInputElement;
+    const lightRadio = screen.getByTestId(
+      "settings-theme-light",
+    ) as HTMLInputElement;
+    // Default is "system" (no localStorage entry).
+    expect(systemRadio.checked).toBe(true);
+    expect(document.documentElement.hasAttribute("data-theme")).toBe(
+      false,
+    );
+    // Switching to dark sets the attribute and persists.
+    fireEvent.click(darkRadio);
+    expect(darkRadio.checked).toBe(true);
+    expect(document.documentElement.getAttribute("data-theme")).toBe(
+      "dark",
+    );
+    expect(localStorage.getItem("aec.theme.mode")).toBe("dark");
+    // Switching to light overrides.
+    fireEvent.click(lightRadio);
+    expect(lightRadio.checked).toBe(true);
+    expect(document.documentElement.getAttribute("data-theme")).toBe(
+      "light",
+    );
+    expect(localStorage.getItem("aec.theme.mode")).toBe("light");
+    // Back to system removes the attribute.
+    fireEvent.click(systemRadio);
+    expect(systemRadio.checked).toBe(true);
+    expect(document.documentElement.hasAttribute("data-theme")).toBe(
+      false,
+    );
+    expect(localStorage.getItem("aec.theme.mode")).toBe("system");
+  });
 });

@@ -71,3 +71,83 @@
   --aec-mode-rail-width: 80px;
   --aec-status-bar-height: 32px;
 }
+
+/**
+ * Phase 17 Task 8 — Dark mode.
+ *
+ * Two paths to dark:
+ *   1. The user has set `data-theme="dark"` on `<html>` (via the
+ *      Settings theme toggle, persisted in localStorage). This wins.
+ *   2. The user has not chosen a theme and the OS reports
+ *      `prefers-color-scheme: dark`. This is the fallback.
+ *
+ * Setting `data-theme="light"` explicitly keeps the light palette
+ * even when the OS is dark, so the toggle can override the OS in
+ * either direction.
+ *
+ * Both blocks set the same custom-property names — every component
+ * already reads via `var(--aec-color-*)` so no per-component changes
+ * are required.
+ *
+ * The accent (`#7c3aed`) stays — purple has high contrast against
+ * both light and dark surfaces (AA 5.4:1 on `#1a1a2e`). The accent
+ * `on` color (text drawn on top of the accent fill) stays white in
+ * both themes for the same reason.
+ */
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    /* Surfaces — Tessera / Blender-inspired charcoal palette. */
+    --aec-color-bg: #1a1a2e;
+    --aec-color-bg-elevated: #16213e;
+    --aec-color-surface: #1a1a2e;
+    --aec-color-surface-muted: #232347;
+    --aec-color-surface-rail: #14142b;
+
+    /* Text */
+    --aec-color-text-primary: #e8e8ef;
+    --aec-color-text-secondary: #a8a4bc;
+    --aec-color-text-muted: #6f6a85;
+    --aec-color-text-inverse: #1a1a2e;
+
+    /* Borders */
+    --aec-color-border: #2a2a4a;
+    --aec-color-border-strong: #3d3d63;
+
+    /* Brand accent — keep purple, soften the wash for dark. */
+    --aec-color-accent-soft: rgba(167, 139, 250, 0.18);
+
+    /* Shadows are nearly invisible in dark, but a soft elevation
+       still helps depth perception. Use higher black opacity. */
+    --aec-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.45);
+    --aec-shadow-md: 0 4px 10px rgba(0, 0, 0, 0.55);
+    --aec-shadow-lg: 0 12px 24px rgba(0, 0, 0, 0.65);
+  }
+}
+
+:root[data-theme="dark"] {
+  /* Surfaces */
+  --aec-color-bg: #1a1a2e;
+  --aec-color-bg-elevated: #16213e;
+  --aec-color-surface: #1a1a2e;
+  --aec-color-surface-muted: #232347;
+  --aec-color-surface-rail: #14142b;
+
+  /* Text */
+  --aec-color-text-primary: #e8e8ef;
+  --aec-color-text-secondary: #a8a4bc;
+  --aec-color-text-muted: #6f6a85;
+  --aec-color-text-inverse: #1a1a2e;
+
+  /* Borders */
+  --aec-color-border: #2a2a4a;
+  --aec-color-border-strong: #3d3d63;
+
+  /* Brand accent */
+  --aec-color-accent-soft: rgba(167, 139, 250, 0.18);
+
+  /* Shadows */
+  --aec-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.45);
+  --aec-shadow-md: 0 4px 10px rgba(0, 0, 0, 0.55);
+  --aec-shadow-lg: 0 12px 24px rgba(0, 0, 0, 0.65);
+}

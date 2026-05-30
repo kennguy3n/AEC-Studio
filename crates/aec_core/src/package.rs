@@ -462,7 +462,8 @@ mod tests {
             // "legacy DB" half of the simulation realistic across the
             // full migration chain rather than just v2.
             conn.execute_batch(
-                "DROP TABLE IF EXISTS audit_chain; \
+                "DROP TABLE IF EXISTS project_thumbnail; \
+                 DROP TABLE IF EXISTS audit_chain; \
                  DROP INDEX IF EXISTS idx_undo_journal_scope; \
                  DROP INDEX IF EXISTS idx_components_entity_kind; \
                  ALTER TABLE undo_journal DROP COLUMN scope; \

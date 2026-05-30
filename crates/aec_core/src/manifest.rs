@@ -13,7 +13,7 @@ use crate::types::ProjectId;
 /// [`crate::migrations::Migration::all`]. New projects are created
 /// at this version; older projects are upgraded by
 /// [`crate::migrations::run_pending`] when opened.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// The `manifest.json` at the root of a `.aecstudio` directory package.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

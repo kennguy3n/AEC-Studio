@@ -230,6 +230,26 @@ export function registerIpcHandlers(): void {
     setActiveProjectIfMatchesActive(summary);
     return summary;
   });
+  // Phase 17 Group B Task 12. Persist a rendered PNG thumbnail
+  // into the project's SQLCipher DB. We validate at the IPC boundary
+  // *in addition to* the service-side magic-byte / dimension checks
+  // so a renderer-side bug (forgot to encode, passed a string, etc.)
+  // surfaces as a clean `IpcValidationError` instead of a NAPI type-
+  // coercion failure that Sentry would log without the field name.
+  ipcMain.handle(
+    "project:setThumbnail",
+    async (_e, { projectPath, png, width, height }) => {
+      assertString(projectPath, "projectPath");
+      assertUint8Array(png, "png");
+      assertPositiveInteger(width, "width", 1, 4096);
+      assertPositiveInteger(height, "height", 1, 4096);
+      return getBridge().projectSetThumbnail(projectPath, png, width, height);
+    },
+  );
+  ipcMain.handle("project:getThumbnail", async (_e, { projectPath }) => {
+    assertString(projectPath, "projectPath");
+    return getBridge().projectGetThumbnail(projectPath);
+  });
   // `project:current` is a synchronous-style channel that the
   // renderer's `useActiveProject` hook polls (or subscribes via
   // an IPC push channel) to surface the currently-open project to
@@ -291,6 +311,42 @@ export function registerIpcHandlers(): void {
   ipcMain.handle("design:listAssets", async (_e, query) => {
     assertObject(query, "query");
     return getBridge().designListAssets(query);
+  });
+  // Phase 17 Group B Task 11. Both handlers run `assertObject`
+  // against their parameter to enforce the bridge's object-shape
+  // contract — a renderer-side bug that sends `undefined` /
+  // `null` / a primitive on either argument surfaces as a typed
+  // IPC error here rather than reaching the napi layer and
+  // throwing a less-actionable napi-side type error.
+  ipcMain.handle("design:listMaterials", async (_e, query) => {
+    assertObject(query, "query");
+    return getBridge().designListMaterials(
+      query as Parameters<
+        ReturnType<typeof getBridge>["designListMaterials"]
+      >[0],
+    );
+  });
+  // Object-arg shape (`{ materialId, update }`) matches every other
+  // `design:*` handler above. The preload wraps the renderer's
+  // positional (materialId, update) call into the object form so the
+  // public `aec.design.updateMaterial(materialId, patch)` surface
+  // stays unchanged.
+  ipcMain.handle("design:updateMaterial", async (_e, params) => {
+    assertObject(params, "params");
+    const { materialId, update } = params as {
+      materialId?: unknown;
+      update?: unknown;
+    };
+    if (typeof materialId !== "string" || materialId.length === 0) {
+      throw new Error("design:updateMaterial: materialId must be a string");
+    }
+    assertObject(update, "update");
+    return getBridge().designUpdateMaterial(
+      materialId,
+      update as Parameters<
+        ReturnType<typeof getBridge>["designUpdateMaterial"]
+      >[1],
+    );
   });
 
   // ----- Draft -----
@@ -1113,6 +1169,51 @@ function assertObject(
 ): asserts value is Record<string, unknown> {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     throw new IpcValidationError(`${field} must be an object`);
+  }
+}
+
+/**
+ * Phase 17 Group B Task 12. The renderer hands the IPC layer a
+ * `Uint8Array` of PNG bytes for `project:setThumbnail`. Electron
+ * marshals typed arrays through structured clone, so we just need
+ * to assert the right runtime shape on the main side. Node's
+ * `Buffer` extends `Uint8Array`, so checking for the base class
+ * accepts both.
+ */
+function assertUint8Array(
+  value: unknown,
+  field: string,
+): asserts value is Uint8Array {
+  if (!(value instanceof Uint8Array)) {
+    throw new IpcValidationError(`${field} must be a Uint8Array`);
+  }
+  if (value.length === 0) {
+    throw new IpcValidationError(`${field} must not be empty`);
+  }
+}
+
+/**
+ * Validate that `value` is a positive 32-bit integer within `[min,
+ * max]` (inclusive). Used for thumbnail dimensions in Phase 17
+ * Group B Task 12 to enforce sane viewport sizes before they hit
+ * the SQL layer.
+ */
+function assertPositiveInteger(
+  value: unknown,
+  field: string,
+  min: number,
+  max: number,
+): asserts value is number {
+  if (
+    typeof value !== "number" ||
+    !Number.isFinite(value) ||
+    !Number.isInteger(value) ||
+    value < min ||
+    value > max
+  ) {
+    throw new IpcValidationError(
+      `${field} must be an integer in [${min}, ${max}] (got: ${String(value)})`,
+    );
   }
 }
 

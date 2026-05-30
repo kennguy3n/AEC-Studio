@@ -1,6 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { aec } from "../api/aec";
 import { DraftToolbar, DraftTool } from "../components/draft/DraftToolbar";
+import {
+  PanelResizeHandle,
+  usePersistentPanelSize,
+} from "../components/PanelResizeHandle";
 import {
   LayerPanel,
   DEFAULT_LAYERS,
@@ -40,6 +44,13 @@ export function Draft() {
     primaryType: null,
     layer: null,
   });
+  // Phase 17 Group B Task 14 — persisted right-panel width.
+  const [panelWidth, setPanelWidth, commitPanelWidth] = usePersistentPanelSize(
+    "panel.draft.right",
+    320,
+    { min: 200, max: 600 },
+  );
+  const dragStartWidth = useRef<number>(panelWidth);
 
   // Reset per-project state on project transitions. Today this fires
   // only on initial mount because `RequireProject` unmounts the Draft
@@ -174,7 +185,16 @@ export function Draft() {
   };
 
   return (
-    <div className="draft-layout" data-testid="draft-mode">
+    <div
+      className="draft-layout"
+      data-testid="draft-mode"
+      style={{
+        display: "grid",
+        gridTemplateColumns: `auto 1fr auto ${panelWidth}px`,
+        gap: "var(--aec-space-3)",
+        height: "calc(100vh - var(--aec-status-bar-height))",
+      }}
+    >
       <DraftToolbar
         activeTool={activeTool}
         onSelect={setActiveTool}
@@ -193,6 +213,20 @@ export function Draft() {
         <DraftCanvas activeTool={activeTool} />
         <CommandLine log={log} onLog={setLog} />
       </div>
+      <PanelResizeHandle
+        orientation="vertical"
+        label="Resize draft side panel"
+        data-testid="draft-panel-resize"
+        onResizeStart={() => {
+          dragStartWidth.current = panelWidth;
+        }}
+        onResize={(delta) => {
+          setPanelWidth(dragStartWidth.current - delta);
+        }}
+        // Persist once per gesture rather than on every pointermove
+        // — see `usePersistentPanelSize` docstring.
+        onResizeEnd={commitPanelWidth}
+      />
       <div className="draft-panels">
         <LayerPanel layers={layers} onChange={setLayers} />
         <DraftInspector selection={selection} activeTool={activeTool} />

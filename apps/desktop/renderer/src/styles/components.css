@@ -38,6 +38,15 @@
   font-size: 11px;
   font-weight: 500;
   text-decoration: none;
+  position: relative;
+  /* Phase 17 Task 9: smooth indicator/slide. Keep under 200ms
+     and respect prefers-reduced-motion (block at the bottom of
+     the file). */
+  transition:
+    background-color 160ms ease,
+    color 160ms ease,
+    border-color 160ms ease,
+    transform 120ms ease;
 }
 
 .mode-rail__item:hover {
@@ -45,10 +54,19 @@
   color: var(--aec-color-text-primary);
 }
 
+.mode-rail__item:active {
+  transform: scale(0.96);
+}
+
 .mode-rail__item.is-active {
   background: var(--aec-color-accent-soft);
   color: var(--aec-color-accent-strong);
   border-color: var(--aec-color-accent-soft);
+}
+
+.mode-rail__item:focus-visible {
+  outline: 2px solid var(--aec-color-accent);
+  outline-offset: 2px;
 }
 
 .mode-rail__icon {
@@ -110,6 +128,16 @@
   border: 1px solid var(--aec-color-border);
   box-shadow: var(--aec-shadow-sm);
   padding: var(--aec-space-4);
+  /* Phase 17 Task 9: subtle elevation + lift on hover. */
+  transition:
+    box-shadow 150ms ease,
+    transform 150ms ease,
+    border-color 150ms ease;
+}
+
+.card:hover {
+  box-shadow: var(--aec-shadow-md);
+  transform: translateY(-2px);
 }
 
 .button {
@@ -124,11 +152,24 @@
   color: var(--aec-color-accent-on);
   font-size: 13px;
   font-weight: 600;
-  transition: background 80ms ease;
+  transition:
+    background 120ms ease,
+    transform 120ms ease,
+    box-shadow 120ms ease;
 }
 
 .button:hover {
   background: var(--aec-color-accent-strong);
+  box-shadow: var(--aec-shadow-sm);
+}
+
+.button:active {
+  transform: scale(0.96);
+}
+
+.button:focus-visible {
+  outline: 2px solid var(--aec-color-accent-strong);
+  outline-offset: 2px;
 }
 
 .button--secondary {
@@ -223,6 +264,23 @@
   aspect-ratio: 16 / 10;
   background: linear-gradient(135deg, #efeaff, #d5c5f5);
   border-radius: var(--aec-radius-sm);
+  overflow: hidden;
+  position: relative;
+}
+
+/* Phase 17 Group B Task 12: real thumbnail image overlays the
+   gradient placeholder. `object-fit: cover` lets us reuse the same
+   16:10 slot for the 256×192 (4:3) captures the renderer produces,
+   cropping the top/bottom rather than letterboxing. The `display:
+   block` removes the inline-baseline gap that would otherwise show
+   a 4px sliver of the gradient at the bottom. */
+.project-card__thumb-img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
 }
 
 .project-card__name {
@@ -239,18 +297,46 @@
   display: flex;
   flex-direction: column;
   gap: var(--aec-space-3);
+  overflow: hidden;
+}
+
+/* Phase 17 Task 13: hero slot that holds either a preview <img> or
+   the SVG icon fallback. Aspect ratio is 16/10 (matches the 512x320
+   ratio of the shipped previews) so the gallery rows align even
+   when some templates have images and others fall back to icons. */
+.template-card__hero {
+  width: 100%;
+  aspect-ratio: 16 / 10;
+  border-radius: var(--aec-radius-sm);
+  background: var(--aec-color-surface-muted);
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  position: relative;
+}
+
+.template-card__preview {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  /* Phase 17 Task 13: hover-zoom on the preview only (not the
+     fallback icon, which would look weird scaling up). */
+  transition: transform 200ms ease;
+}
+
+.template-card:hover .template-card__preview {
+  transform: scale(1.02);
 }
 
 .template-card__icon {
-  width: 36px;
-  height: 36px;
+  width: 56px;
+  height: 56px;
   border-radius: var(--aec-radius-sm);
   background: var(--aec-color-accent-soft);
   color: var(--aec-color-accent-strong);
   display: grid;
   place-items: center;
-  font-size: 20px;
-  font-weight: 700;
 }
 
 .template-card__name {
@@ -314,11 +400,28 @@
   background: transparent;
   font-size: 18px;
   color: var(--aec-color-text-secondary);
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  transition:
+    background 120ms ease,
+    color 120ms ease,
+    border-color 120ms ease,
+    transform 120ms ease;
 }
 
 .design-toolbar__btn:hover {
   background: var(--aec-color-surface-muted);
   color: var(--aec-color-text-primary);
+}
+
+.design-toolbar__btn:active {
+  transform: scale(0.96);
+}
+
+.design-toolbar__btn:focus-visible {
+  outline: 2px solid var(--aec-color-accent);
+  outline-offset: 2px;
 }
 
 .design-toolbar__btn.is-active {
@@ -457,7 +560,48 @@
   border-radius: var(--aec-radius-sm);
 }
 
-/* ----- material panel ----- */
+/* ----- material panel (Phase 17 Group B Task 11) ----- */
+
+.material-tabs {
+  display: flex;
+  gap: var(--aec-space-1);
+  margin-bottom: var(--aec-space-2);
+  flex-wrap: wrap;
+}
+
+.material-tabs__tab {
+  font-size: 11px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--aec-color-border);
+  background: var(--aec-color-bg-elevated);
+  color: var(--aec-color-text-muted);
+  cursor: pointer;
+  transition:
+    background 150ms ease,
+    color 150ms ease,
+    border-color 150ms ease;
+}
+
+.material-tabs__tab:hover {
+  border-color: var(--aec-color-accent);
+}
+
+.material-tabs__tab--active {
+  background: var(--aec-color-accent);
+  color: var(--aec-color-on-accent, #fff);
+  border-color: var(--aec-color-accent);
+}
+
+.material-panel__error {
+  font-size: 11px;
+  color: var(--aec-color-danger, #c2410c);
+  background: var(--aec-color-bg-elevated);
+  border: 1px solid var(--aec-color-border);
+  border-radius: var(--aec-radius-sm);
+  padding: 6px 8px;
+  margin-bottom: var(--aec-space-2);
+}
 
 .material-grid {
   display: grid;
@@ -470,6 +614,25 @@
   flex-direction: column;
   gap: 4px;
   font-size: 11px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--aec-radius-sm);
+  padding: 4px;
+  cursor: pointer;
+  transition:
+    border-color 150ms ease,
+    box-shadow 150ms ease,
+    transform 150ms ease;
+}
+
+.material-grid__item:hover {
+  border-color: var(--aec-color-border);
+  transform: translateY(-2px);
+}
+
+.material-grid__item[aria-pressed="true"] {
+  border-color: var(--aec-color-accent);
+  box-shadow: 0 0 0 1px var(--aec-color-accent) inset;
 }
 
 .material-grid__swatch {
@@ -478,10 +641,420 @@
   border: 1px solid var(--aec-color-border);
 }
 
+.material-grid__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.material-inspector {
+  margin-top: var(--aec-space-3);
+  padding-top: var(--aec-space-2);
+  border-top: 1px solid var(--aec-color-border);
+}
+
+.material-inspector h3 {
+  font-size: 13px;
+  margin: 0 0 var(--aec-space-2) 0;
+}
+
 .material-inspector__row {
   display: grid;
   grid-template-columns: 96px 1fr;
   gap: var(--aec-space-3);
   margin-bottom: var(--aec-space-2);
   font-size: 12px;
+  align-items: center;
+}
+
+.material-inspector__slider {
+  display: flex;
+  align-items: center;
+  gap: var(--aec-space-2);
+}
+
+.material-inspector__slider input[type="range"] {
+  flex: 1;
+}
+
+.material-inspector__value {
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  color: var(--aec-color-text-muted);
+  min-width: 48px;
+}
+
+.material-inspector__color {
+  display: flex;
+  align-items: center;
+  gap: var(--aec-space-2);
+}
+
+.material-inspector__color input[type="color"] {
+  width: 32px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid var(--aec-color-border);
+  border-radius: var(--aec-radius-sm);
+  background: transparent;
+  cursor: pointer;
+}
+
+/* ----- Phase 17 Task 7 — toolbars with SVG icons ----- */
+
+/* DraftToolbar uses icon-over-label layout for a richer toolbar. */
+.draft-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 4px;
+  background: var(--aec-color-bg-elevated);
+  border: 1px solid var(--aec-color-border);
+  border-radius: var(--aec-radius-md);
+  align-items: stretch;
+}
+
+.draft-toolbar__group {
+  display: flex;
+  gap: 4px;
+  padding: 0 4px;
+  border-right: 1px solid var(--aec-color-border);
+}
+
+.draft-toolbar__group:last-child {
+  border-right: none;
+}
+
+.draft-toolbar__btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  min-width: 56px;
+  padding: 4px 6px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--aec-color-text-secondary);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--aec-radius-sm);
+  cursor: pointer;
+  transition:
+    background 120ms ease,
+    color 120ms ease,
+    border-color 120ms ease,
+    transform 120ms ease;
+}
+
+.draft-toolbar__btn:hover {
+  background: var(--aec-color-surface-muted);
+  color: var(--aec-color-text-primary);
+}
+
+.draft-toolbar__btn:active {
+  transform: scale(0.96);
+}
+
+.draft-toolbar__btn:focus-visible {
+  outline: 2px solid var(--aec-color-accent);
+  outline-offset: 2px;
+}
+
+.draft-toolbar__btn--active {
+  background: var(--aec-color-accent-soft);
+  color: var(--aec-color-accent-strong);
+  border-color: var(--aec-color-accent-soft);
+}
+
+.draft-toolbar__label {
+  font-size: 11px;
+  line-height: 1.1;
+}
+
+/* BimToolbar: icon-aligned-with-label horizontal pills. */
+.bim-toolbar {
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  flex-wrap: wrap;
+}
+
+.bim-toolbar__btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--aec-color-text-secondary);
+  background: var(--aec-color-surface);
+  border: 1px solid var(--aec-color-border);
+  border-radius: var(--aec-radius-sm);
+  cursor: pointer;
+  transition:
+    background 120ms ease,
+    color 120ms ease,
+    border-color 120ms ease,
+    transform 120ms ease;
+}
+
+.bim-toolbar__btn:hover:not(:disabled) {
+  background: var(--aec-color-surface-muted);
+  color: var(--aec-color-text-primary);
+  border-color: var(--aec-color-accent-soft);
+}
+
+.bim-toolbar__btn:active:not(:disabled) {
+  transform: scale(0.96);
+}
+
+.bim-toolbar__btn:focus-visible {
+  outline: 2px solid var(--aec-color-accent);
+  outline-offset: 2px;
+}
+
+.bim-toolbar__btn--busy {
+  background: var(--aec-color-accent-soft);
+  color: var(--aec-color-accent-strong);
+  border-color: var(--aec-color-accent-soft);
+}
+
+.bim-toolbar__btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.bim-toolbar__label {
+  font-size: 12px;
+}
+
+/* DeliverToolbar — same horizontal pill style as BIM. */
+.deliver-toolbar__label {
+  font-size: 12px;
+}
+
+/* ----- Phase 17 Task 9 — micro-animations ----- */
+
+@keyframes aec-shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+.is-skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--aec-color-surface-muted) 0%,
+    var(--aec-color-border) 50%,
+    var(--aec-color-surface-muted) 100%
+  );
+  background-size: 200% 100%;
+  animation: aec-shimmer 1400ms linear infinite;
+  border-radius: var(--aec-radius-sm);
+  color: transparent;
+}
+
+@keyframes aec-toast-in {
+  from {
+    transform: translateX(20px);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+@keyframes aec-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes aec-pop-in {
+  from {
+    transform: scale(0.95);
+    opacity: 0;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+@keyframes aec-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(124, 58, 237, 0.4); }
+  50% { box-shadow: 0 0 0 6px rgba(124, 58, 237, 0); }
+}
+
+.status-bar__chip.is-active {
+  animation: aec-pulse 1600ms ease-in-out infinite;
+}
+
+/* Reduced-motion: disable all non-essential animations and
+   transitions. Keep opacity transitions short so screen readers
+   don't see flicker, but kill transforms and infinite loops. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .card:hover,
+  .button:active,
+  .design-toolbar__btn:active,
+  .draft-toolbar__btn:active,
+  .bim-toolbar__btn:active:not(:disabled),
+  .mode-rail__item:active,
+  .template-card:hover .template-card__preview {
+    transform: none !important;
+  }
+}
+
+/* ----- Phase 17 Task 10 — Context menus ----- */
+
+/**
+ * The menu is portal-rendered into <body> so it escapes any
+ * overflow-cropped ancestors. Position is fixed in viewport
+ * coordinates; the React component clamps it inside the visible
+ * region after measuring the natural width.
+ */
+.context-menu {
+  background: var(--aec-color-bg-elevated);
+  border: 1px solid var(--aec-color-border);
+  border-radius: var(--aec-radius-md);
+  box-shadow: var(--aec-shadow-lg);
+  padding: 4px;
+  min-width: 180px;
+  max-width: 320px;
+  z-index: 9000;
+  /* Pop-in animation; respects prefers-reduced-motion via the
+     global override block above. */
+  animation: aec-pop-in 120ms ease;
+  font-family: var(--aec-font-sans);
+  font-size: 13px;
+  color: var(--aec-color-text-primary);
+}
+
+.context-menu__item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 10px;
+  background: transparent;
+  border: 0;
+  border-radius: var(--aec-radius-sm);
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  transition: background 120ms ease;
+}
+
+.context-menu__item:hover:not(:disabled),
+.context-menu__item:focus-visible:not(:disabled) {
+  background: var(--aec-color-accent-soft);
+  outline: none;
+}
+
+.context-menu__item:disabled {
+  color: var(--aec-color-text-muted);
+  cursor: not-allowed;
+}
+
+.context-menu__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  color: var(--aec-color-text-secondary);
+}
+
+.context-menu__label {
+  flex: 1;
+}
+
+.context-menu__shortcut {
+  color: var(--aec-color-text-muted);
+  font-size: 11px;
+  font-family: var(--aec-font-mono);
+  letter-spacing: 0.02em;
+}
+
+.context-menu__separator {
+  height: 1px;
+  background: var(--aec-color-border);
+  margin: 4px 2px;
+}
+
+/* ----- Phase 17 Task 14 — Panel resize handles ----- */
+
+/**
+ * Resize handles live between two flex children. The 6-px wide hit
+ * region is wider than the visible bar (which is 1 px) so the
+ * cursor target is comfortable while the visual is minimal — same
+ * pattern as Figma / VS Code.
+ */
+.panel-resize-handle {
+  position: relative;
+  flex: 0 0 6px;
+  cursor: col-resize;
+  user-select: none;
+  background: transparent;
+  transition: background 120ms ease;
+}
+
+.panel-resize-handle--row {
+  flex: 0 0 6px;
+  cursor: row-resize;
+}
+
+.panel-resize-handle::before {
+  /* The visible 1-px bar centred in the hit region. */
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: calc(50% - 0.5px);
+  width: 1px;
+  background: var(--aec-color-border);
+  transition: background 120ms ease;
+}
+
+.panel-resize-handle--row::before {
+  top: calc(50% - 0.5px);
+  bottom: auto;
+  left: 0;
+  right: 0;
+  width: auto;
+  height: 1px;
+}
+
+.panel-resize-handle:hover::before,
+.panel-resize-handle.is-dragging::before {
+  background: var(--aec-color-accent);
+}
+
+.panel-resize-handle__grip {
+  /* The 3-dot grip glyph (Icon name="grip") sits centred on the
+     handle, fades in on hover. Pointer-events:none so the icon
+     doesn't intercept the drag. */
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  opacity: 0;
+  pointer-events: none;
+  color: var(--aec-color-text-muted);
+  transition: opacity 120ms ease;
+}
+
+.panel-resize-handle:hover .panel-resize-handle__grip,
+.panel-resize-handle.is-dragging .panel-resize-handle__grip {
+  opacity: 1;
 }

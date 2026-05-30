@@ -239,6 +239,35 @@ export interface BridgeBackend {
    * mirrors that shape so backends are interchangeable at runtime.
    */
   projectSave(projectPath: string): Promise<ProjectSummary>;
+  /**
+   * Phase 17 Group B Task 12. Persist a PNG-encoded thumbnail for a
+   * project so the Home page's recent-project grid can show real
+   * viewport state instead of a CSS gradient placeholder. The renderer
+   * captures the current viewport canvas as PNG bytes (see the
+   * `captureThumbnailPng` helper) and the bridge validates magic
+   * header + dimensions + size before writing the singleton row.
+   *
+   * Resolves with `{ ok: true }` on success. Validation failures
+   * surface as `BridgeServiceError::Invalid` and reject the promise.
+   */
+  projectSetThumbnail(
+    projectPath: string,
+    png: Uint8Array,
+    width: number,
+    height: number,
+  ): Promise<{ ok: true }>;
+  /**
+   * Phase 17 Group B Task 12. Read the persisted thumbnail blob for a
+   * project, or `null` when no thumbnail has been written yet.
+   *
+   * The native bridge returns a Node `Buffer` so the renderer can
+   * build a `Blob` URL without an intermediate base64 hop. The
+   * in-process fallback returns a `Uint8Array` of the same byte
+   * sequence — `ProjectCard` accepts either via `ArrayBuffer.isView`.
+   */
+  projectGetThumbnail(
+    projectPath: string,
+  ): Promise<ProjectThumbnail | null>;
   projectListRecents(): Promise<ProjectSummary[]>;
   /**
    * Pack the entire project package directory at `projectPath` into
@@ -263,6 +292,37 @@ export interface BridgeBackend {
     params: Record<string, unknown>,
   ): Promise<{ cameraId: string }>;
   designListAssets(query: Record<string, unknown>): Promise<AssetSummary[]>;
+  /**
+   * Phase 17 Group B Task 11. List materials from the process-wide
+   * PBR `MaterialLibrary` matching `query`. The library is seeded
+   * once at process boot from `MaterialLibrary::with_default_pack()`
+   * (8 starter materials covering Scandinavian / Industrial /
+   * Japandi style tags). The design-mode `MaterialPanel` calls this
+   * on mount and on every style-tag tab change.
+   *
+   * Read-only on the bridge side — routes through
+   * `with_service_ref_fallible` so it runs concurrently with
+   * status polls and asset reads without taking the service-wide
+   * write lock.
+   */
+  designListMaterials(query: MaterialListQuery): Promise<MaterialSummary[]>;
+  /**
+   * Phase 17 Group B Task 11. Apply a slider patch to a single
+   * material and return the updated summary so the inspector can
+   * re-render without a follow-up `designListMaterials` round-trip.
+   *
+   * Validation runs atomically on the service side — a single
+   * out-of-range slider rejects the whole patch so a mid-drag
+   * slider can't half-apply across multiple fields. The renderer
+   * surfaces validation failures through the bridge's
+   * `Error.message` ("invalid: metallic must be in [0.0, 1.0]")
+   * which the `MaterialPanel` toasts without invalidating its
+   * optimistic UI state.
+   */
+  designUpdateMaterial(
+    materialId: string,
+    update: MaterialUpdate,
+  ): Promise<MaterialSummary>;
 
   draftDrawPrimitive(
     params: Record<string, unknown>,
@@ -1046,6 +1106,22 @@ export interface ProjectSummary {
   modifiedAt: string;
 }
 
+/**
+ * On-disk thumbnail blob for a project. Phase 17 Group B Task 12.
+ *
+ * The `png` field is whatever the native bridge handed back — a Node
+ * `Buffer` on the N-API path, a `Uint8Array` on the in-process
+ * fallback. Both are `Uint8Array`-compatible (a Node `Buffer` is a
+ * `Uint8Array` subclass) so the renderer can build a `Blob` directly
+ * without sniffing the runtime.
+ */
+export interface ProjectThumbnail {
+  png: Uint8Array;
+  width: number;
+  height: number;
+  updatedAt: string;
+}
+
 export interface AssetSummary {
   assetId: string;
   name: string;
@@ -1053,6 +1129,56 @@ export interface AssetSummary {
   styleTags: string[];
   vendor: string | null;
   thumbnailDataUri: string | null;
+}
+
+/**
+ * Renderer-side projection of the bridge's `MaterialSummary` shape.
+ * Field-for-field mirror of `MaterialSummaryJs` in
+ * `crates/aec_bridge/src/napi_api.rs`. `albedo` / `emissive` are
+ * linear-space RGB triples (each channel in `[0.0, 1.0]`) so the
+ * `MaterialPanel`'s PBR-style swatch sphere can shade directly from
+ * the floats without parsing a CSS string.
+ */
+export interface MaterialSummary {
+  materialId: string;
+  name: string;
+  albedo: [number, number, number];
+  metallic: number;
+  roughness: number;
+  ior: number;
+  transmission: number;
+  emissive: [number, number, number];
+  styleTags: string[];
+  tags: string[];
+}
+
+/**
+ * Renderer-side query parameters for `designListMaterials`. All
+ * fields optional — `{}` returns the full library.
+ */
+export interface MaterialListQuery {
+  search?: string;
+  tags?: string[];
+  styleTags?: string[];
+  limit?: number;
+}
+
+/**
+ * Renderer-side patch payload for `designUpdateMaterial`. Every
+ * field is optional; unset fields keep their current value. Values
+ * outside the bridge's per-field ranges (metallic / roughness /
+ * transmission in `[0, 1]`, ior in `[1, 5]`, albedo / emissive
+ * components in `[0, 1]`) reject atomically — the inspector toasts
+ * the error and the local UI state stays intact so the user can
+ * re-drag the slider without re-opening the panel.
+ */
+export interface MaterialUpdate {
+  albedo?: [number, number, number];
+  metallic?: number;
+  roughness?: number;
+  ior?: number;
+  transmission?: number;
+  emissive?: [number, number, number];
 }
 
 export interface RenderJob {
@@ -1647,6 +1773,15 @@ interface NativeApi {
   ): unknown;
   project_open(project_path: string): unknown;
   project_save(project_path: string): unknown;
+  /** Phase 17 Group B Task 12. */
+  project_set_thumbnail(
+    project_path: string,
+    png: Uint8Array,
+    width: number,
+    height: number,
+  ): unknown;
+  /** Phase 17 Group B Task 12. */
+  project_get_thumbnail(project_path: string): unknown;
   project_list_recents(): unknown;
   runtime_status(): unknown;
   project_engine_status(project_path: string): unknown;
@@ -1745,6 +1880,34 @@ interface NativeApi {
     styleTags?: string[];
     limit?: number;
   }): unknown;
+  // Phase 17 Group B Task 11. The napi side reads from the
+  // process-wide `MaterialLibrary` (seeded at boot with 8 starter
+  // materials) and clamps `limit` to 10_000 to guard against a
+  // renderer bug passing a negative JS number that wraps through
+  // napi's `ToUint32()` coercion.
+  design_list_materials(query: {
+    search?: string;
+    tags?: string[];
+    styleTags?: string[];
+    limit?: number;
+  }): unknown;
+  // Phase 17 Group B Task 11. The patch is applied atomically —
+  // any out-of-range slider rejects the whole patch so a mid-drag
+  // slider can't half-apply across multiple fields. `albedo` /
+  // `emissive` are 3-element float arrays; napi-rs doesn't expose
+  // fixed-size arrays at the boundary so the renderer ships
+  // `number[]` and the bridge validates the length.
+  design_update_material(
+    material_id: string,
+    update: {
+      albedo?: number[];
+      metallic?: number;
+      roughness?: number;
+      ior?: number;
+      transmission?: number;
+      emissive?: number[];
+    },
+  ): unknown;
   // PR-W (Phase 1) — full project package ZIP archive. Sync on the
   // Rust side (synchronous `std::fs::read` + `zip` walk; per the
   // PR-W doc the largest realistic package is a few hundred MB, so
@@ -1891,6 +2054,8 @@ export const NATIVE_WIRED_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   "projectCreateFromTemplate",
   "projectOpen",
   "projectSave",
+  "projectSetThumbnail",
+  "projectGetThumbnail",
   "projectListRecents",
   "runtimeStatus",
   "projectEngineStatus",
@@ -1960,6 +2125,13 @@ export const NATIVE_WIRED_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   // in-process fallback used to ship, so dev/prod browsing renders
   // identical cards. See `crates/aec_bridge/src/asset_state.rs`.
   "designListAssets",
+  // Phase 17 Group B Task 11. Materials live in the process-wide
+  // `MaterialLibrary` (seeded at boot with 8 starter materials);
+  // these endpoints expose list / update so the design-mode
+  // `MaterialPanel` can drive both the swatch grid and the slider
+  // inspector without a separate IPC for each affordance.
+  "designListMaterials",
+  "designUpdateMaterial",
   // PR-W (Phase 10) — design / BIM / export.
   // `projectExportPackage` writes a real ZIP archive of the
   // project package directory. The four design.* convenience
@@ -2122,6 +2294,31 @@ function adaptNative(n: NativeApi): BridgeBackend {
       n.project_create_from_template(k, p) as ProjectSummary,
     projectOpen: async (p) => n.project_open(p) as ProjectSummary,
     projectSave: async (p) => n.project_save(p) as ProjectSummary,
+    projectSetThumbnail: async (p, png, w, h) => {
+      // The N-API binding marshals `Buffer` zero-copy from the V8
+      // heap; the BridgeBackend interface takes `Uint8Array` for
+      // testability so the in-process fallback can pass a plain
+      // typed array. Both call sites flow through here — Node's
+      // `Buffer` IS a `Uint8Array`, so the cast is a structural
+      // pass-through with no copy.
+      n.project_set_thumbnail(p, png, w, h);
+      return { ok: true };
+    },
+    projectGetThumbnail: async (p) => {
+      // The native side returns `{ png: Buffer, width, height,
+      // updatedAt }` on hit and `null` on miss. We surface both
+      // shapes unchanged to the renderer — `ProjectCard` discriminates
+      // on `result === null` and Node's `Buffer` already passes the
+      // `Uint8Array` check downstream (it's a subclass).
+      type NativeThumb = {
+        png: Uint8Array;
+        width: number;
+        height: number;
+        updatedAt: string;
+      };
+      const raw = n.project_get_thumbnail(p) as NativeThumb | null;
+      return raw === null ? null : raw;
+    },
     projectListRecents: async () =>
       n.project_list_recents() as ProjectSummary[],
     runtimeStatus: async () => n.runtime_status() as RuntimeStatus,
@@ -2360,6 +2557,34 @@ function adaptNative(n: NativeApi): BridgeBackend {
         limit:
           typeof query.limit === "number" ? (query.limit as number) : undefined,
       }) as AssetSummary[],
+    // Phase 17 Group B Task 11. Materials live in the process-wide
+    // PBR `MaterialLibrary`, separate from the SQLite asset DB —
+    // asset packs install geometry + bindings against material ids,
+    // while the material library owns the actual shading
+    // parameters. Both flow through the same renderer surface so
+    // the `MaterialPanel` can show them side-by-side.
+    designListMaterials: async (query) =>
+      n.design_list_materials({
+        search: query.search,
+        tags: query.tags,
+        styleTags: query.styleTags,
+        limit: query.limit,
+      }) as MaterialSummary[],
+    // Phase 17 Group B Task 11. The bridge applies the patch
+    // atomically — any out-of-range slider rejects the whole patch
+    // so a mid-drag slider can't half-apply across multiple
+    // fields. The returned `MaterialSummary` mirrors the same
+    // shape the list endpoint produces, so the inspector can swap
+    // it into local state without an extra normalisation step.
+    designUpdateMaterial: async (materialId, update) =>
+      n.design_update_material(materialId, {
+        albedo: update.albedo ? [...update.albedo] : undefined,
+        metallic: update.metallic,
+        roughness: update.roughness,
+        ior: update.ior,
+        transmission: update.transmission,
+        emissive: update.emissive ? [...update.emissive] : undefined,
+      }) as MaterialSummary,
     // ----- PR-W (Phase 1): project package archive -----
     projectExportPackage: async (projectPath, outPath) =>
       n.project_export_package(
@@ -3022,6 +3247,14 @@ export function inProcessBackend(): BridgeBackend {
   };
 
   const assets: AssetSummary[] = seedAssets();
+  // Phase 17 Group B Task 11. Mirror of the bridge's
+  // `MaterialLibrary::with_default_pack()` seed — 8 starter
+  // materials across Scandinavian / Industrial / Japandi style
+  // tabs. Mutated in-place by `designUpdateMaterial` so the
+  // in-process fallback can drive `MaterialPanel` end-to-end
+  // tests (drag a slider, confirm the next list-call shows the
+  // moved value) without spinning up the napi backend.
+  const materials: MaterialSummary[] = seedMaterials();
   const jobs: RenderJob[] = [];
   // Revisions are scoped per backend instance, matching `recents`, `jobs`
   // and `assets` above. Tests that instantiate fresh backends (or hit
@@ -3032,6 +3265,28 @@ export function inProcessBackend(): BridgeBackend {
   // by `projectPath` so a vitest that opens two projects gets two
   // independent graphs / undo stacks.
   const graphs = new Map<string, InProcessGraph>();
+
+  /**
+   * In-process thumbnail blobs keyed by project path. Phase 17 Group B
+   * Task 12. The native SQLite-backed path persists across restarts;
+   * this Map exists only so vitest can round-trip the bridge contract
+   * without spinning up the Rust crate. Mirrors the native validation
+   * (PNG magic header, dimensions, 1 MiB ceiling) so the fallback
+   * cannot silently accept inputs the real bridge would reject.
+   */
+  const thumbnails = new Map<string, ProjectThumbnail>();
+
+  const PNG_MAGIC = new Uint8Array([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+  ]);
+  const MAX_THUMB_BYTES = 1024 * 1024;
+  const isValidPngHeader = (b: Uint8Array): boolean => {
+    if (b.length < PNG_MAGIC.length) return false;
+    for (let i = 0; i < PNG_MAGIC.length; i += 1) {
+      if (b[i] !== PNG_MAGIC[i]) return false;
+    }
+    return true;
+  };
 
   return {
     async projectCreateFromTemplate(templateKey, projectName) {
@@ -3071,6 +3326,55 @@ export function inProcessBackend(): BridgeBackend {
         modifiedAt: now,
       };
     },
+    async projectSetThumbnail(projectPath, png, width, height) {
+      // Mirror the native validator (`project_set_thumbnail` in
+      // `crates/aec_bridge/src/service.rs`). Same ordering, same
+      // error messages, so the in-process fallback fails identically
+      // on bad input — otherwise renderer code paths that lean on a
+      // specific error string would diverge between dev (in-process)
+      // and prod (native).
+      if (!png || png.length === 0) {
+        throw new Error("project_set_thumbnail: PNG buffer is empty");
+      }
+      if (!isValidPngHeader(png)) {
+        throw new Error(
+          "project_set_thumbnail: buffer does not start with PNG magic header",
+        );
+      }
+      if (width === 0 || height === 0 || width > 4096 || height > 4096) {
+        throw new Error(
+          `project_set_thumbnail: dimensions out of range (1..=4096); got ${width}\u00D7${height}`,
+        );
+      }
+      if (png.length > MAX_THUMB_BYTES) {
+        throw new Error(
+          `project_set_thumbnail: PNG buffer is ${png.length} bytes; max is ${MAX_THUMB_BYTES} bytes`,
+        );
+      }
+      // Defensive copy — caller may reuse the buffer for the next
+      // capture and we want the persisted blob to be immutable from
+      // their perspective.
+      thumbnails.set(projectPath, {
+        png: new Uint8Array(png),
+        width,
+        height,
+        updatedAt: new Date().toISOString(),
+      });
+      return { ok: true };
+    },
+    async projectGetThumbnail(projectPath) {
+      const stored = thumbnails.get(projectPath);
+      if (!stored) return null;
+      // Return a fresh `Uint8Array` view so the renderer can build a
+      // `Blob` without aliasing the cache (preventing accidental
+      // mutation through the returned reference).
+      return {
+        png: new Uint8Array(stored.png),
+        width: stored.width,
+        height: stored.height,
+        updatedAt: stored.updatedAt,
+      };
+    },
     async projectListRecents() {
       return [...recents];
     },
@@ -3096,6 +3400,28 @@ export function inProcessBackend(): BridgeBackend {
     },
     async designListAssets(query) {
       return filterAssets(assets, query);
+    },
+    async designListMaterials(query) {
+      return filterMaterials(materials, query);
+    },
+    async designUpdateMaterial(materialId, update) {
+      const idx = materials.findIndex((m) => m.materialId === materialId);
+      if (idx < 0) {
+        throw new Error(`invalid: material \`${materialId}\` not found`);
+      }
+      validateMaterialUpdate(update);
+      const cur = materials[idx];
+      const next: MaterialSummary = {
+        ...cur,
+        albedo: update.albedo ?? cur.albedo,
+        metallic: update.metallic ?? cur.metallic,
+        roughness: update.roughness ?? cur.roughness,
+        ior: update.ior ?? cur.ior,
+        transmission: update.transmission ?? cur.transmission,
+        emissive: update.emissive ?? cur.emissive,
+      };
+      materials[idx] = next;
+      return next;
     },
 
     async draftDrawPrimitive(_p) {
@@ -4772,6 +5098,142 @@ function filterAssets(
     .filter((a) => styleTags.every((t) => a.styleTags.includes(t)))
     .filter((a) => (search ? a.name.toLowerCase().includes(search) : true))
     .slice(0, limit);
+}
+
+/**
+ * Phase 17 Group B Task 11. In-process fallback mirror of the
+ * bridge's `MaterialLibrary::with_default_pack()` — 8 starter
+ * materials. Defaults (metallic 0, roughness 0.6, ior 1.45,
+ * emissive [0,0,0], transmission 0) match the
+ * `PbrMaterial::new` constructor in
+ * `crates/aec_materials/src/material.rs`; per-material overrides
+ * mirror the Rust `with_default_pack()` adjustments (concrete /
+ * marble roughness 0.45, brass metallic 0.9 roughness 0.3, linen
+ * roughness 0.85).
+ *
+ * Albedos / style-tag tuples are copied verbatim from the Rust
+ * default pack so end-to-end tests against the in-process backend
+ * exercise the same id space the napi backend serves in
+ * production.
+ */
+function seedMaterials(): MaterialSummary[] {
+  const base = (
+    id: string,
+    name: string,
+    albedo: [number, number, number],
+    styleTags: string[],
+    overrides: Partial<MaterialSummary> = {},
+  ): MaterialSummary => ({
+    materialId: id,
+    name,
+    albedo,
+    metallic: 0,
+    roughness: 0.6,
+    ior: 1.45,
+    transmission: 0,
+    emissive: [0, 0, 0],
+    styleTags,
+    tags: [],
+    ...overrides,
+  });
+  return [
+    base("mat:oak_light", "Light Oak", [0.78, 0.66, 0.5], [
+      "scandinavian",
+      "warm",
+    ]),
+    base("mat:walnut", "Walnut", [0.34, 0.21, 0.14], ["industrial", "warm"]),
+    base(
+      "mat:concrete_polished",
+      "Polished Concrete",
+      [0.55, 0.55, 0.56],
+      ["industrial", "minimal"],
+      { roughness: 0.45 },
+    ),
+    base("mat:linen_oat", "Oat Linen", [0.85, 0.78, 0.66], [
+      "japandi",
+      "warm",
+    ], { roughness: 0.85 }),
+    base(
+      "mat:matte_white",
+      "Matte White Paint",
+      [0.92, 0.92, 0.91],
+      ["minimal"],
+    ),
+    base("mat:terracotta", "Terracotta Tile", [0.78, 0.42, 0.32], [
+      "mediterranean",
+      "warm",
+    ]),
+    base(
+      "mat:brushed_brass",
+      "Brushed Brass",
+      [0.78, 0.68, 0.42],
+      ["art_deco", "warm"],
+      { metallic: 0.9, roughness: 0.3 },
+    ),
+    base(
+      "mat:marble_carrara",
+      "Carrara Marble",
+      [0.92, 0.92, 0.93],
+      ["classical", "minimal"],
+      { roughness: 0.45 },
+    ),
+  ];
+}
+
+/**
+ * Phase 17 Group B Task 11. AND-match the renderer's query against
+ * the seeded material list. `search` is a case-insensitive name
+ * substring (matches the Rust `MaterialQuery.name_contains`
+ * lowercasing pattern). `limit` defaults to `materials.length` —
+ * unlike `filterAssets` we don't cap to 24 because the inspector's
+ * style-tag tabs benefit from seeing the full library at once.
+ */
+function filterMaterials(
+  materials: MaterialSummary[],
+  query: MaterialListQuery,
+): MaterialSummary[] {
+  const tags = query.tags ?? [];
+  const styleTags = query.styleTags ?? [];
+  const search = query.search ? query.search.toLowerCase() : "";
+  const limit = query.limit ?? materials.length;
+  return materials
+    .filter((m) => tags.every((t) => m.tags.includes(t)))
+    .filter((m) => styleTags.every((t) => m.styleTags.includes(t)))
+    .filter((m) => (search ? m.name.toLowerCase().includes(search) : true))
+    .slice(0, limit);
+}
+
+/**
+ * Phase 17 Group B Task 11. Mirror of the bridge's
+ * `validate_material_update` (crates/aec_bridge/src/service.rs) —
+ * runs the same per-field range checks so the in-process fallback
+ * surfaces the same `invalid: …` errors the napi backend would.
+ * Validation runs *before* the in-place mutation in the caller so
+ * a single out-of-range slider can't half-apply a multi-field
+ * patch.
+ */
+function validateMaterialUpdate(update: MaterialUpdate): void {
+  const unit = (label: string, v: number | undefined) => {
+    if (v !== undefined && !(v >= 0 && v <= 1)) {
+      throw new Error(`invalid: ${label} must be in [0.0, 1.0]`);
+    }
+  };
+  const rgb = (label: string, v: [number, number, number] | undefined) => {
+    if (!v) return;
+    for (let i = 0; i < 3; i++) {
+      if (!(v[i] >= 0 && v[i] <= 1)) {
+        throw new Error(`invalid: ${label}[${i}] must be in [0.0, 1.0]`);
+      }
+    }
+  };
+  unit("metallic", update.metallic);
+  unit("roughness", update.roughness);
+  unit("transmission", update.transmission);
+  if (update.ior !== undefined && !(update.ior >= 1 && update.ior <= 5)) {
+    throw new Error("invalid: ior must be in [1.0, 5.0]");
+  }
+  rgb("albedo", update.albedo);
+  rgb("emissive", update.emissive);
 }
 
 // `AI_TOOLS` and `AiTool` are sourced from `./ai-tools` and re-exported

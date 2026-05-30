@@ -28,6 +28,7 @@ import {
 } from "react";
 import type { ReactNode } from "react";
 import { aec, ProjectSummary } from "../api/aec";
+import { captureProjectMetadataThumbnail } from "../lib/thumbnail";
 
 export interface ActiveProjectState {
   project: ProjectSummary | null;
@@ -693,6 +694,37 @@ export function ActiveProjectProvider({
           // debounce instead of racing a stale armed timer against
           // the just-completed save.
           cancelPendingAutoSave();
+          // Phase 17 Group B Task 12. Capture a per-project
+          // thumbnail and persist it next to the project payload so
+          // the Home page's recent-grid shows something
+          // recognisable instead of the generic gradient. Best-
+          // effort: a failure here (canvas unavailable, bridge
+          // rejected the blob, etc.) MUST NOT bubble out of
+          // `saveProject` — the save's primary contract is the
+          // project bytes hitting disk, which has already happened
+          // by the time we reach this branch. The catch swallows
+          // and logs through `console.warn` so a regression is
+          // visible in devtools without breaking the user's save.
+          void captureProjectMetadataThumbnail({
+            projectName: summary.name,
+            templateKey: summary.templateKey,
+            modifiedAt: summary.modifiedAt,
+          })
+            .then((thumb) =>
+              aec.project.setThumbnail(
+                savePath,
+                thumb.png,
+                thumb.width,
+                thumb.height,
+              ),
+            )
+            .catch((err) => {
+              // eslint-disable-next-line no-console
+              console.warn(
+                "useActiveProject.saveProject: thumbnail capture failed",
+                err,
+              );
+            });
         }
       } finally {
         // `dirty` stays true on failure so the next mutation (or a

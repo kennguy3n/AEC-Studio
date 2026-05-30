@@ -17,6 +17,30 @@ const api = {
       ipcRenderer.invoke("project:open", { projectPath }),
     save: (projectPath: string) =>
       ipcRenderer.invoke("project:save", { projectPath }),
+    // Phase 17 Group B Task 12. The renderer passes a `Uint8Array`
+    // of PNG bytes captured from the viewport; Electron's structured
+    // clone transports typed arrays without an intermediate copy
+    // (V8 ArrayBuffer transfer semantics), so the main process sees
+    // the same byte buffer.
+    setThumbnail: (
+      projectPath: string,
+      png: Uint8Array,
+      width: number,
+      height: number,
+    ) =>
+      ipcRenderer.invoke("project:setThumbnail", {
+        projectPath,
+        png,
+        width,
+        height,
+      }) as Promise<{ ok: true }>,
+    getThumbnail: (projectPath: string) =>
+      ipcRenderer.invoke("project:getThumbnail", { projectPath }) as Promise<{
+        png: Uint8Array;
+        width: number;
+        height: number;
+        updatedAt: string;
+      } | null>,
     listRecents: () => ipcRenderer.invoke("project:listRecents"),
     exportPackage: (projectPath: string, outPath: string) =>
       ipcRenderer.invoke("project:exportPackage", { projectPath, outPath }),
@@ -136,6 +160,37 @@ const api = {
       ipcRenderer.invoke("design:saveCamera", params),
     listAssets: (query: Record<string, unknown>) =>
       ipcRenderer.invoke("design:listAssets", query),
+    // Phase 17 Group B Task 11. Both surfaces forward directly to
+    // the bridge — the `MaterialListQuery` / `MaterialUpdate`
+    // shapes are validated on the IPC handler (object-ness),
+    // again at the bridge (in-process backend's
+    // `validateMaterialUpdate`), and at the napi layer (range
+    // checks + 3-element-array enforcement) before reaching the
+    // service-side `validate_material_update`. This is the same
+    // belt-and-suspenders pattern the asset surface uses — the
+    // renderer can never get its slider patch silently dropped
+    // by an upstream type-coercion bug.
+    listMaterials: (query: {
+      search?: string;
+      tags?: string[];
+      styleTags?: string[];
+      limit?: number;
+    }) => ipcRenderer.invoke("design:listMaterials", query),
+    updateMaterial: (
+      materialId: string,
+      update: {
+        albedo?: [number, number, number];
+        metallic?: number;
+        roughness?: number;
+        ior?: number;
+        transmission?: number;
+        emissive?: [number, number, number];
+      },
+    ) =>
+      // The IPC handler accepts a single `{ materialId, update }`
+      // object (matches every other `design:*` handler). The renderer
+      // keeps the more ergonomic positional form via this wrapper.
+      ipcRenderer.invoke("design:updateMaterial", { materialId, update }),
   },
 
   // ----- Draft -----
