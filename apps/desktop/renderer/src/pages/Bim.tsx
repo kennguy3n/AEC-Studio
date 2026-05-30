@@ -1,5 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { aec } from "../api/aec";
+import {
+  PanelResizeHandle,
+  usePersistentPanelSize,
+} from "../components/PanelResizeHandle";
 import { importIfcWithSizeGuard } from "../api/bim-import";
 import { attachIfcToProject } from "../api/bim-attach";
 import {
@@ -103,6 +107,24 @@ export function Bim() {
   // subsequent BIM ops (export, validate, schedule, diff) operate
   // on this path. Null when no IFC has been imported yet.
   const [ifcSourcePath, setIfcSourcePath] = useState<string | null>(null);
+
+  // Phase 17 Group B Task 14 — persisted left / right panel widths
+  // for the BIM mode's three-column layout (spatial tree | viewport
+  // | property editor). Min/max chosen so neither side panel can
+  // collapse beneath usability nor crush the viewport on common
+  // 1366×768 laptop screens.
+  const [treeWidth, setTreeWidth] = usePersistentPanelSize(
+    "panel.bim.tree",
+    280,
+    { min: 200, max: 480 },
+  );
+  const [pseditorWidth, setPseditorWidth] = usePersistentPanelSize(
+    "panel.bim.pseditor",
+    320,
+    { min: 240, max: 520 },
+  );
+  const dragStartTreeWidth = useRef<number>(treeWidth);
+  const dragStartPseditorWidth = useRef<number>(pseditorWidth);
 
   const projectPath = project?.path ?? null;
 
@@ -605,11 +627,32 @@ export function Bim() {
   return (
     <div className="bim-layout" data-testid="bim-mode">
       <BimToolbar busyAction={busyAction} onInvoke={onInvoke} />
-      <div className="bim-center">
+      <div
+        className="bim-center"
+        style={{
+          display: "grid",
+          gridTemplateColumns: `${treeWidth}px auto 1fr auto ${pseditorWidth}px`,
+          gap: "var(--aec-space-3)",
+          flex: 1,
+          minHeight: 0,
+        }}
+      >
         <SpatialTree
           root={root}
           selectedId={selectedId}
           onSelect={setSelectedId}
+        />
+        <PanelResizeHandle
+          orientation="vertical"
+          label="Resize spatial tree panel"
+          data-testid="bim-tree-resize"
+          onResizeStart={() => {
+            dragStartTreeWidth.current = treeWidth;
+          }}
+          onResize={(delta) => {
+            // Tree is on the LEFT — dragging right grows it.
+            setTreeWidth(dragStartTreeWidth.current + delta);
+          }}
         />
         <div
           className="bim-viewport"
@@ -622,6 +665,19 @@ export function Bim() {
             <p>Select an element from the spatial tree.</p>
           )}
         </div>
+        <PanelResizeHandle
+          orientation="vertical"
+          label="Resize property editor panel"
+          data-testid="bim-pseditor-resize"
+          onResizeStart={() => {
+            dragStartPseditorWidth.current = pseditorWidth;
+          }}
+          onResize={(delta) => {
+            // Property editor is on the RIGHT — dragging right
+            // shrinks it. Mirror the sign.
+            setPseditorWidth(dragStartPseditorWidth.current - delta);
+          }}
+        />
         <PropertyEditor
           entityId={selectedId}
           classification={classification}

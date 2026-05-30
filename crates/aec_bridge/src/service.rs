@@ -223,6 +223,24 @@ pub struct TemplateChoice {
     pub description: String,
 }
 
+/// On-disk thumbnail blob for a project, returned by
+/// [`BridgeService::project_get_thumbnail`].
+///
+/// Phase 17 Group B Task 12. The PNG bytes are the same as what the
+/// renderer captured via `captureThumbnailPng` — already encoded by
+/// the time they hit the bridge. The `width` / `height` fields
+/// mirror the captured dimensions so the renderer can hint its
+/// `<img>` element with `width` / `height` attributes and avoid
+/// layout shift before the image decodes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectThumbnail {
+    pub png: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+    /// ISO-8601 timestamp from when the thumbnail was written.
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectSummary {
     pub project_id: ProjectId,
@@ -2104,6 +2122,107 @@ impl BridgeService {
         Ok(pkg.summary().into())
     }
 
+    /// Persist a PNG-encoded thumbnail for a project, written as the
+    /// singleton row in the SQLCipher `project_thumbnail` table.
+    ///
+    /// Phase 17 Group B Task 12 — every save updates this so the Home
+    /// page's recent-project grid shows the actual viewport state for
+    /// each project rather than a placeholder gradient. The bridge
+    /// stays format-agnostic: the renderer captures the viewport's
+    /// current canvas as PNG bytes (the simplest reproducible
+    /// snapshot — see the renderer's `captureThumbnailPng` helper)
+    /// and hands us the encoded buffer plus its dimensions. We
+    /// validate (non-empty, PNG magic bytes, dimensions in range)
+    /// and `INSERT OR REPLACE` so the row gets overwritten in place.
+    ///
+    /// The `CHECK (singleton = 1)` constraint in the v5 migration
+    /// keeps the table to at most one row per project, which lets us
+    /// avoid a "delete-then-insert" race window where a reader could
+    /// observe a missing thumbnail mid-update.
+    pub fn project_set_thumbnail(
+        &mut self,
+        path: &str,
+        png_bytes: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<(), BridgeServiceError> {
+        if png_bytes.is_empty() {
+            return Err(BridgeServiceError::Invalid(
+                "project_set_thumbnail: PNG buffer is empty".into(),
+            ));
+        }
+        // PNG magic header — `89 50 4E 47 0D 0A 1A 0A`. Reject early
+        // so the renderer sees a typed error rather than a cryptic
+        // SQL constraint failure on read.
+        const PNG_MAGIC: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+        if png_bytes.len() < PNG_MAGIC.len() || &png_bytes[..PNG_MAGIC.len()] != PNG_MAGIC {
+            return Err(BridgeServiceError::Invalid(
+                "project_set_thumbnail: buffer does not start with PNG magic header".into(),
+            ));
+        }
+        if width == 0 || height == 0 || width > 4096 || height > 4096 {
+            return Err(BridgeServiceError::Invalid(format!(
+                "project_set_thumbnail: dimensions out of range (1..=4096); \
+                 got {width}×{height}",
+            )));
+        }
+        // Cap the stored blob at 1 MiB to keep the project file size
+        // sane — a 256×192 PNG of a typical interior is ~30–80 KiB,
+        // so 1 MiB is ~20× the expected size and only an unusually
+        // verbose source would brush against it.
+        const MAX_THUMBNAIL_BYTES: usize = 1024 * 1024;
+        if png_bytes.len() > MAX_THUMBNAIL_BYTES {
+            return Err(BridgeServiceError::Invalid(format!(
+                "project_set_thumbnail: PNG buffer is {} bytes; max is {} bytes",
+                png_bytes.len(),
+                MAX_THUMBNAIL_BYTES,
+            )));
+        }
+        let (_pkg, conn) =
+            ProjectPackage::open_with_master_key_and_database(path, &self.master_key)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT OR REPLACE INTO project_thumbnail \
+             (singleton, png, width, height, updated_at) \
+             VALUES (1, ?1, ?2, ?3, ?4)",
+            rusqlite::params![png_bytes, width as i64, height as i64, now],
+        )?;
+        Ok(())
+    }
+
+    /// Read the persisted thumbnail PNG bytes for a project, or `None`
+    /// when no thumbnail has been written yet.
+    ///
+    /// `&self` — read-only at the manifest level, but the SQLCipher
+    /// open routes through [`ProjectPackage::open_database`] which
+    /// runs the migration registry. A legacy v4 project that has
+    /// never had a thumbnail saved will return `None` after the
+    /// migration creates the (empty) `project_thumbnail` table.
+    pub fn project_get_thumbnail(
+        &self,
+        path: &str,
+    ) -> Result<Option<ProjectThumbnail>, BridgeServiceError> {
+        let pkg = ProjectPackage::open(path)?;
+        let conn = pkg.open_database(&self.master_key)?;
+        let result: rusqlite::Result<(Vec<u8>, i64, i64, String)> = conn.query_row(
+            "SELECT png, width, height, updated_at \
+             FROM project_thumbnail \
+             WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        );
+        match result {
+            Ok((png, width, height, updated_at)) => Ok(Some(ProjectThumbnail {
+                png,
+                width: width as u32,
+                height: height as u32,
+                updated_at,
+            })),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(BridgeServiceError::Core(e.to_string())),
+        }
+    }
+
     /// Apply a typed command to the project graph and persist the
     /// resulting deltas + journal entry to the SQLCipher database.
     ///
@@ -2570,9 +2689,10 @@ impl BridgeService {
         &self,
         query: &MaterialListQuery,
     ) -> Result<Vec<MaterialSummary>, BridgeServiceError> {
-        let lib = self.material_library.lock().map_err(|_| {
-            BridgeServiceError::Core("material_library mutex poisoned".to_string())
-        })?;
+        let lib = self
+            .material_library
+            .lock()
+            .map_err(|_| BridgeServiceError::Core("material_library mutex poisoned".to_string()))?;
         let q = aec_materials::library::MaterialQuery {
             tags: query.tags.clone(),
             style_tags: query.style_tags.clone(),
@@ -2616,9 +2736,10 @@ impl BridgeService {
         update: &MaterialUpdate,
     ) -> Result<MaterialSummary, BridgeServiceError> {
         validate_material_update(update)?;
-        let mut lib = self.material_library.lock().map_err(|_| {
-            BridgeServiceError::Core("material_library mutex poisoned".to_string())
-        })?;
+        let mut lib = self
+            .material_library
+            .lock()
+            .map_err(|_| BridgeServiceError::Core("material_library mutex poisoned".to_string()))?;
         let current = lib.get(material_id).cloned().ok_or_else(|| {
             BridgeServiceError::Invalid(format!("material `{material_id}` not found"))
         })?;
@@ -5981,6 +6102,118 @@ mod tests {
         assert_eq!(r1, r2);
     }
 
+    /// Round-trip the thumbnail blob through the
+    /// `project_set_thumbnail` / `project_get_thumbnail` pair and
+    /// verify the exact bytes come back unchanged. Phase 17 Group B
+    /// Task 12: the Home page's recent-project grid depends on these
+    /// two methods being a faithful mirror.
+    #[test]
+    fn project_thumbnail_set_get_roundtrip() {
+        let (mut s, _g) = service();
+        let summary = s
+            .project_create_from_template("interior.apartment", "ThumbProj")
+            .unwrap();
+
+        // Fresh project: no thumbnail yet.
+        let empty = s.project_get_thumbnail(&summary.path).unwrap();
+        assert!(empty.is_none(), "fresh project should have no thumbnail");
+
+        // Minimal valid PNG: 1×1 transparent pixel. Captured here so
+        // the test exercises the real magic-byte validator end-to-end
+        // (not a stub).
+        let png: [u8; 67] = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // signature
+            0x00, 0x00, 0x00, 0x0D, // IHDR length
+            0x49, 0x48, 0x44, 0x52, // IHDR
+            0x00, 0x00, 0x00, 0x01, // width = 1
+            0x00, 0x00, 0x00, 0x01, // height = 1
+            0x08, 0x06, 0x00, 0x00, 0x00, // bit depth / color type / etc.
+            0x1F, 0x15, 0xC4, 0x89, // CRC
+            0x00, 0x00, 0x00, 0x0D, // IDAT length
+            0x49, 0x44, 0x41, 0x54, // IDAT
+            0x78, 0x9C, 0x62, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D,
+            0xB4, // IDAT data
+            0x00, 0x00, 0x00, 0x00, // IEND length
+            0x49, 0x45, 0x4E, 0x44, // IEND
+            0xAE, 0x42, 0x60, 0x82, // CRC
+        ];
+        s.project_set_thumbnail(&summary.path, &png, 256, 192)
+            .unwrap();
+
+        let got = s.project_get_thumbnail(&summary.path).unwrap().unwrap();
+        assert_eq!(got.png, png.to_vec(), "PNG bytes must round-trip exactly");
+        assert_eq!(got.width, 256);
+        assert_eq!(got.height, 192);
+        assert!(
+            !got.updated_at.is_empty(),
+            "updated_at must be a non-empty ISO-8601 timestamp"
+        );
+
+        // Second write replaces the row in place (singleton constraint).
+        let png2: Vec<u8> = {
+            let mut v = png.to_vec();
+            v[20] = 0x02; // tweak one byte so we can tell them apart
+            v
+        };
+        s.project_set_thumbnail(&summary.path, &png2, 512, 384)
+            .unwrap();
+        let got2 = s.project_get_thumbnail(&summary.path).unwrap().unwrap();
+        assert_eq!(got2.png, png2, "second write must replace the blob");
+        assert_eq!(got2.width, 512);
+        assert_eq!(got2.height, 384);
+    }
+
+    /// Every invalid input path on `project_set_thumbnail` must
+    /// return a typed `Invalid` error before any SQL is written, so
+    /// the renderer can show a clean toast instead of a constraint-
+    /// violation stack trace.
+    #[test]
+    fn project_set_thumbnail_rejects_invalid_input() {
+        let (mut s, _g) = service();
+        let summary = s
+            .project_create_from_template("interior.apartment", "ValidateThumb")
+            .unwrap();
+
+        // Empty buffer.
+        let err = s
+            .project_set_thumbnail(&summary.path, &[], 256, 192)
+            .unwrap_err();
+        assert!(matches!(err, BridgeServiceError::Invalid(_)));
+
+        // Wrong magic header.
+        let err = s
+            .project_set_thumbnail(&summary.path, b"NOTPNG\x00\x00rest", 256, 192)
+            .unwrap_err();
+        assert!(matches!(err, BridgeServiceError::Invalid(_)));
+
+        // Zero dimension.
+        let err = s
+            .project_set_thumbnail(&summary.path, b"\x89PNG\r\n\x1a\nXX", 0, 192)
+            .unwrap_err();
+        assert!(matches!(err, BridgeServiceError::Invalid(_)));
+
+        // Over-large dimension.
+        let err = s
+            .project_set_thumbnail(&summary.path, b"\x89PNG\r\n\x1a\nXX", 256, 5000)
+            .unwrap_err();
+        assert!(matches!(err, BridgeServiceError::Invalid(_)));
+
+        // Over-large buffer (1 MiB + 1).
+        let mut big = vec![0u8; 1024 * 1024 + 1];
+        big[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        let err = s
+            .project_set_thumbnail(&summary.path, &big, 256, 192)
+            .unwrap_err();
+        assert!(matches!(err, BridgeServiceError::Invalid(_)));
+
+        // None of those should have left a row behind.
+        let got = s.project_get_thumbnail(&summary.path).unwrap();
+        assert!(
+            got.is_none(),
+            "rejected writes must leave the thumbnail row untouched"
+        );
+    }
+
     #[test]
     fn project_save_invalidates_engine_status_cache() {
         // Save mutates the manifest on disk (`updated_at` and possibly
@@ -7903,11 +8136,7 @@ END-ISO-10303-21;\n";
                 ..MaterialListQuery::default()
             })
             .expect("empty-string substring query");
-        assert_eq!(
-            empty.len(),
-            8,
-            "empty `search` must behave like no filter"
-        );
+        assert_eq!(empty.len(), 8, "empty `search` must behave like no filter");
     }
 
     #[test]

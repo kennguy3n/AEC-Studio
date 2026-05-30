@@ -80,6 +80,32 @@ export function rendererInProcessBackend(): AecApi {
   // matching production's main-process semantics exactly.
   const recents: Recent[] = [];
   let current: Recent | null = null;
+
+  // Phase 17 Group B Task 12. In-memory thumbnail blobs keyed by
+  // project path. The native bridge persists these into the project's
+  // SQLCipher DB; this fallback only needs to round-trip through the
+  // same renderer code path so a vitest spec exercising `ProjectCard`
+  // sees a non-null `<img>` after `setThumbnail` resolves. Validation
+  // mirrors `crates/aec_bridge/src/service.rs::project_set_thumbnail`
+  // verbatim so error contracts cannot drift.
+  type ThumbnailRow = {
+    png: Uint8Array;
+    width: number;
+    height: number;
+    updatedAt: string;
+  };
+  const thumbnails = new Map<string, ThumbnailRow>();
+  const THUMBNAIL_MAX_BYTES = 1024 * 1024;
+  const THUMBNAIL_PNG_MAGIC = new Uint8Array([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+  ]);
+  const isValidPngHeader = (b: Uint8Array): boolean => {
+    if (b.length < THUMBNAIL_PNG_MAGIC.length) return false;
+    for (let i = 0; i < THUMBNAIL_PNG_MAGIC.length; i += 1) {
+      if (b[i] !== THUMBNAIL_PNG_MAGIC[i]) return false;
+    }
+    return true;
+  };
   // Listeners subscribed via `project.onActiveProjectChange`. The
   // in-process backend mirrors the main-process `active-project.ts`
   // notification contract: every transition (open / create / save of
@@ -363,6 +389,50 @@ export function rendererInProcessBackend(): AecApi {
           path: projectPath,
           templateKey: null,
           modifiedAt: now,
+        };
+      },
+      setThumbnail: async (projectPath, png, width, height) => {
+        // Phase 17 Group B Task 12. The in-process renderer fallback
+        // mirrors the bridge's validation pipeline so vitest specs
+        // see the same error surface as production. We keep the
+        // accepted blob in `thumbnails` so a subsequent `getThumbnail`
+        // returns it (otherwise a UI test that exercises the full
+        // capture→display loop would silently regress to the gradient
+        // placeholder).
+        if (!png || png.length === 0) {
+          throw new Error("project_set_thumbnail: PNG buffer is empty");
+        }
+        if (!isValidPngHeader(png)) {
+          throw new Error(
+            "project_set_thumbnail: buffer does not start with PNG magic header",
+          );
+        }
+        if (width === 0 || height === 0 || width > 4096 || height > 4096) {
+          throw new Error(
+            `project_set_thumbnail: dimensions out of range (1..=4096); got ${width}\u00D7${height}`,
+          );
+        }
+        if (png.length > THUMBNAIL_MAX_BYTES) {
+          throw new Error(
+            `project_set_thumbnail: PNG buffer is ${png.length} bytes; max is ${THUMBNAIL_MAX_BYTES} bytes`,
+          );
+        }
+        thumbnails.set(projectPath, {
+          png: new Uint8Array(png),
+          width,
+          height,
+          updatedAt: new Date().toISOString(),
+        });
+        return { ok: true as const };
+      },
+      getThumbnail: async (projectPath) => {
+        const t = thumbnails.get(projectPath);
+        if (!t) return null;
+        return {
+          png: new Uint8Array(t.png),
+          width: t.width,
+          height: t.height,
+          updatedAt: t.updatedAt,
         };
       },
       listRecents: async () => [...recents],

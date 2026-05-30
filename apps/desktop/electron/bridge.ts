@@ -239,6 +239,35 @@ export interface BridgeBackend {
    * mirrors that shape so backends are interchangeable at runtime.
    */
   projectSave(projectPath: string): Promise<ProjectSummary>;
+  /**
+   * Phase 17 Group B Task 12. Persist a PNG-encoded thumbnail for a
+   * project so the Home page's recent-project grid can show real
+   * viewport state instead of a CSS gradient placeholder. The renderer
+   * captures the current viewport canvas as PNG bytes (see the
+   * `captureThumbnailPng` helper) and the bridge validates magic
+   * header + dimensions + size before writing the singleton row.
+   *
+   * Resolves with `{ ok: true }` on success. Validation failures
+   * surface as `BridgeServiceError::Invalid` and reject the promise.
+   */
+  projectSetThumbnail(
+    projectPath: string,
+    png: Uint8Array,
+    width: number,
+    height: number,
+  ): Promise<{ ok: true }>;
+  /**
+   * Phase 17 Group B Task 12. Read the persisted thumbnail blob for a
+   * project, or `null` when no thumbnail has been written yet.
+   *
+   * The native bridge returns a Node `Buffer` so the renderer can
+   * build a `Blob` URL without an intermediate base64 hop. The
+   * in-process fallback returns a `Uint8Array` of the same byte
+   * sequence — `ProjectCard` accepts either via `ArrayBuffer.isView`.
+   */
+  projectGetThumbnail(
+    projectPath: string,
+  ): Promise<ProjectThumbnail | null>;
   projectListRecents(): Promise<ProjectSummary[]>;
   /**
    * Pack the entire project package directory at `projectPath` into
@@ -1059,6 +1088,22 @@ export interface ProjectSummary {
   modifiedAt: string;
 }
 
+/**
+ * On-disk thumbnail blob for a project. Phase 17 Group B Task 12.
+ *
+ * The `png` field is whatever the native bridge handed back — a Node
+ * `Buffer` on the N-API path, a `Uint8Array` on the in-process
+ * fallback. Both are `Uint8Array`-compatible (a Node `Buffer` is a
+ * `Uint8Array` subclass) so the renderer can build a `Blob` directly
+ * without sniffing the runtime.
+ */
+export interface ProjectThumbnail {
+  png: Uint8Array;
+  width: number;
+  height: number;
+  updatedAt: string;
+}
+
 export interface AssetSummary {
   assetId: string;
   name: string;
@@ -1684,6 +1729,15 @@ interface NativeApi {
   ): unknown;
   project_open(project_path: string): unknown;
   project_save(project_path: string): unknown;
+  /** Phase 17 Group B Task 12. */
+  project_set_thumbnail(
+    project_path: string,
+    png: Uint8Array,
+    width: number,
+    height: number,
+  ): unknown;
+  /** Phase 17 Group B Task 12. */
+  project_get_thumbnail(project_path: string): unknown;
   project_list_recents(): unknown;
   runtime_status(): unknown;
   project_engine_status(project_path: string): unknown;
@@ -1935,6 +1989,8 @@ export const NATIVE_WIRED_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   "projectCreateFromTemplate",
   "projectOpen",
   "projectSave",
+  "projectSetThumbnail",
+  "projectGetThumbnail",
   "projectListRecents",
   "runtimeStatus",
   "projectEngineStatus",
@@ -2166,6 +2222,31 @@ function adaptNative(n: NativeApi): BridgeBackend {
       n.project_create_from_template(k, p) as ProjectSummary,
     projectOpen: async (p) => n.project_open(p) as ProjectSummary,
     projectSave: async (p) => n.project_save(p) as ProjectSummary,
+    projectSetThumbnail: async (p, png, w, h) => {
+      // The N-API binding marshals `Buffer` zero-copy from the V8
+      // heap; the BridgeBackend interface takes `Uint8Array` for
+      // testability so the in-process fallback can pass a plain
+      // typed array. Both call sites flow through here — Node's
+      // `Buffer` IS a `Uint8Array`, so the cast is a structural
+      // pass-through with no copy.
+      n.project_set_thumbnail(p, png, w, h);
+      return { ok: true };
+    },
+    projectGetThumbnail: async (p) => {
+      // The native side returns `{ png: Buffer, width, height,
+      // updatedAt }` on hit and `null` on miss. We surface both
+      // shapes unchanged to the renderer — `ProjectCard` discriminates
+      // on `result === null` and Node's `Buffer` already passes the
+      // `Uint8Array` check downstream (it's a subclass).
+      type NativeThumb = {
+        png: Uint8Array;
+        width: number;
+        height: number;
+        updatedAt: string;
+      };
+      const raw = n.project_get_thumbnail(p) as NativeThumb | null;
+      return raw === null ? null : raw;
+    },
     projectListRecents: async () =>
       n.project_list_recents() as ProjectSummary[],
     runtimeStatus: async () => n.runtime_status() as RuntimeStatus,
@@ -3061,6 +3142,28 @@ export function inProcessBackend(): BridgeBackend {
   // independent graphs / undo stacks.
   const graphs = new Map<string, InProcessGraph>();
 
+  /**
+   * In-process thumbnail blobs keyed by project path. Phase 17 Group B
+   * Task 12. The native SQLite-backed path persists across restarts;
+   * this Map exists only so vitest can round-trip the bridge contract
+   * without spinning up the Rust crate. Mirrors the native validation
+   * (PNG magic header, dimensions, 1 MiB ceiling) so the fallback
+   * cannot silently accept inputs the real bridge would reject.
+   */
+  const thumbnails = new Map<string, ProjectThumbnail>();
+
+  const PNG_MAGIC = new Uint8Array([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+  ]);
+  const MAX_THUMB_BYTES = 1024 * 1024;
+  const isValidPngHeader = (b: Uint8Array): boolean => {
+    if (b.length < PNG_MAGIC.length) return false;
+    for (let i = 0; i < PNG_MAGIC.length; i += 1) {
+      if (b[i] !== PNG_MAGIC[i]) return false;
+    }
+    return true;
+  };
+
   return {
     async projectCreateFromTemplate(templateKey, projectName) {
       const summary: ProjectSummary = {
@@ -3097,6 +3200,55 @@ export function inProcessBackend(): BridgeBackend {
         path: projectPath,
         templateKey: null,
         modifiedAt: now,
+      };
+    },
+    async projectSetThumbnail(projectPath, png, width, height) {
+      // Mirror the native validator (`project_set_thumbnail` in
+      // `crates/aec_bridge/src/service.rs`). Same ordering, same
+      // error messages, so the in-process fallback fails identically
+      // on bad input — otherwise renderer code paths that lean on a
+      // specific error string would diverge between dev (in-process)
+      // and prod (native).
+      if (!png || png.length === 0) {
+        throw new Error("project_set_thumbnail: PNG buffer is empty");
+      }
+      if (!isValidPngHeader(png)) {
+        throw new Error(
+          "project_set_thumbnail: buffer does not start with PNG magic header",
+        );
+      }
+      if (width === 0 || height === 0 || width > 4096 || height > 4096) {
+        throw new Error(
+          `project_set_thumbnail: dimensions out of range (1..=4096); got ${width}\u00D7${height}`,
+        );
+      }
+      if (png.length > MAX_THUMB_BYTES) {
+        throw new Error(
+          `project_set_thumbnail: PNG buffer is ${png.length} bytes; max is ${MAX_THUMB_BYTES} bytes`,
+        );
+      }
+      // Defensive copy — caller may reuse the buffer for the next
+      // capture and we want the persisted blob to be immutable from
+      // their perspective.
+      thumbnails.set(projectPath, {
+        png: new Uint8Array(png),
+        width,
+        height,
+        updatedAt: new Date().toISOString(),
+      });
+      return { ok: true };
+    },
+    async projectGetThumbnail(projectPath) {
+      const stored = thumbnails.get(projectPath);
+      if (!stored) return null;
+      // Return a fresh `Uint8Array` view so the renderer can build a
+      // `Blob` without aliasing the cache (preventing accidental
+      // mutation through the returned reference).
+      return {
+        png: new Uint8Array(stored.png),
+        width: stored.width,
+        height: stored.height,
+        updatedAt: stored.updatedAt,
       };
     },
     async projectListRecents() {

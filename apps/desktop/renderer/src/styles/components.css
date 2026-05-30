@@ -264,6 +264,23 @@
   aspect-ratio: 16 / 10;
   background: linear-gradient(135deg, #efeaff, #d5c5f5);
   border-radius: var(--aec-radius-sm);
+  overflow: hidden;
+  position: relative;
+}
+
+/* Phase 17 Group B Task 12: real thumbnail image overlays the
+   gradient placeholder. `object-fit: cover` lets us reuse the same
+   16:10 slot for the 256×192 (4:3) captures the renderer produces,
+   cropping the top/bottom rather than letterboxing. The `display:
+   block` removes the inline-baseline gap that would otherwise show
+   a 4px sliver of the gradient at the bottom. */
+.project-card__thumb-img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: cover;
 }
 
 .project-card__name {

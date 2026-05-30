@@ -434,7 +434,8 @@ mod tests {
             // simulation in `package.rs::legacy_v1_project_is_upgraded_end_to_end`
             // does.
             conn.execute_batch(
-                "DROP TABLE IF EXISTS audit_chain; \
+                "DROP TABLE IF EXISTS project_thumbnail; \
+                 DROP TABLE IF EXISTS audit_chain; \
                  DROP INDEX IF EXISTS idx_undo_journal_scope; \
                  DROP INDEX IF EXISTS idx_components_entity_kind; \
                  ALTER TABLE undo_journal DROP COLUMN scope; \

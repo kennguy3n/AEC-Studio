@@ -33,6 +33,22 @@ export type ProjectSummary = {
   modifiedAt: string;
 };
 
+/**
+ * Phase 17 Group B Task 12. Renderer-side projection of a saved
+ * project thumbnail blob. The `png` field is a `Uint8Array` (the
+ * native bridge returns a Node `Buffer`, which subclasses
+ * `Uint8Array`; the in-process fallback uses a plain typed array)
+ * so the consumer can build a `Blob` URL via
+ * `URL.createObjectURL(new Blob([png], { type: "image/png" }))`
+ * without an intermediate base64 hop.
+ */
+export type ProjectThumbnail = {
+  png: Uint8Array;
+  width: number;
+  height: number;
+  updatedAt: string;
+};
+
 export type AssetSummary = {
   assetId: string;
   name: string;

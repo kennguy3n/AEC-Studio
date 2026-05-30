@@ -250,6 +250,48 @@ pub fn project_save(path: String) -> Result<ProjectSummaryJs> {
     with_service(|svc| svc.project_save(&path)).map(Into::into)
 }
 
+/// JS-facing project thumbnail row. Mirrors
+/// `crate::service::ProjectThumbnail`. The `png` field is a Node
+/// `Buffer` (zero-copy byte view in V8) so the renderer can build
+/// a `Uint8Array` / `Blob` without an intermediate base64 round-trip.
+///
+/// Phase 17 Group B Task 12.
+#[napi(object)]
+pub struct ProjectThumbnailJs {
+    pub png: Buffer,
+    pub width: u32,
+    pub height: u32,
+    pub updated_at: String,
+}
+
+impl From<crate::service::ProjectThumbnail> for ProjectThumbnailJs {
+    fn from(t: crate::service::ProjectThumbnail) -> Self {
+        Self {
+            png: t.png.into(),
+            width: t.width,
+            height: t.height,
+            updated_at: t.updated_at,
+        }
+    }
+}
+
+#[napi]
+pub fn project_set_thumbnail(path: String, png: Buffer, width: u32, height: u32) -> Result<()> {
+    // The `Buffer` arg is a zero-copy view onto the V8 backing
+    // store. We deref it to `&[u8]` once at the boundary and the
+    // bridge layer validates magic header + size before persisting.
+    with_service(|svc| svc.project_set_thumbnail(&path, &png, width, height))
+}
+
+#[napi]
+pub fn project_get_thumbnail(path: String) -> Result<Option<ProjectThumbnailJs>> {
+    // Read-only on the service layer (`&self`). Use the read side
+    // of the bridge `RwLock` so concurrent Home-page reads for
+    // multiple recent projects run in parallel instead of
+    // serialising against each other.
+    with_service_ref_fallible(|svc| svc.project_get_thumbnail(&path)).map(|opt| opt.map(Into::into))
+}
+
 #[napi]
 pub fn project_list_recents() -> Result<Vec<ProjectSummaryJs>> {
     // `project_list_recents` is `&self` on `BridgeService` (it just
@@ -945,9 +987,7 @@ impl From<crate::service::MaterialSummary> for MaterialSummaryJs {
 /// near-`u32::MAX` value through napi's `ToUint32()` coercion
 /// can't allocate an unbounded result vector.
 #[napi]
-pub fn design_list_materials(
-    query: DesignListMaterialsQueryJs,
-) -> Result<Vec<MaterialSummaryJs>> {
+pub fn design_list_materials(query: DesignListMaterialsQueryJs) -> Result<Vec<MaterialSummaryJs>> {
     let q = crate::service::MaterialListQuery {
         search: query.search,
         tags: query.tags.unwrap_or_default(),

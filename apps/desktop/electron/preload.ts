@@ -17,6 +17,30 @@ const api = {
       ipcRenderer.invoke("project:open", { projectPath }),
     save: (projectPath: string) =>
       ipcRenderer.invoke("project:save", { projectPath }),
+    // Phase 17 Group B Task 12. The renderer passes a `Uint8Array`
+    // of PNG bytes captured from the viewport; Electron's structured
+    // clone transports typed arrays without an intermediate copy
+    // (V8 ArrayBuffer transfer semantics), so the main process sees
+    // the same byte buffer.
+    setThumbnail: (
+      projectPath: string,
+      png: Uint8Array,
+      width: number,
+      height: number,
+    ) =>
+      ipcRenderer.invoke("project:setThumbnail", {
+        projectPath,
+        png,
+        width,
+        height,
+      }) as Promise<{ ok: true }>,
+    getThumbnail: (projectPath: string) =>
+      ipcRenderer.invoke("project:getThumbnail", { projectPath }) as Promise<{
+        png: Uint8Array;
+        width: number;
+        height: number;
+        updatedAt: string;
+      } | null>,
     listRecents: () => ipcRenderer.invoke("project:listRecents"),
     exportPackage: (projectPath: string, outPath: string) =>
       ipcRenderer.invoke("project:exportPackage", { projectPath, outPath }),
