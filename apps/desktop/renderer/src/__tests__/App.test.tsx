@@ -35,6 +35,16 @@ describe("App", () => {
     window.localStorage.setItem("aec.onboarding.dismissed", "1");
   });
 
+  afterEach(() => {
+    // Drop the dismissed flag so other test files in the same Vitest
+    // worker that exercise the onboarding flow start from a clean
+    // localStorage. Without this, App.test.tsx leaks a persisted "1"
+    // into any subsequent suite that does not itself remove the key
+    // in its own beforeEach (OnboardingModal.test.tsx already does;
+    // future suites might not).
+    window.localStorage.removeItem("aec.onboarding.dismissed");
+  });
+
   it("renders the mode rail with all seven modes", () => {
     renderAt("/");
     expect(screen.getAllByRole("link")).toHaveLength(7);
