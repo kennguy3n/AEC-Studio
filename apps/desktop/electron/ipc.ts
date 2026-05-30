@@ -292,6 +292,32 @@ export function registerIpcHandlers(): void {
     assertObject(query, "query");
     return getBridge().designListAssets(query);
   });
+  // Phase 17 Group B Task 11. Both handlers run `assertObject`
+  // against their parameter to enforce the bridge's object-shape
+  // contract — a renderer-side bug that sends `undefined` /
+  // `null` / a primitive on either argument surfaces as a typed
+  // IPC error here rather than reaching the napi layer and
+  // throwing a less-actionable napi-side type error.
+  ipcMain.handle("design:listMaterials", async (_e, query) => {
+    assertObject(query, "query");
+    return getBridge().designListMaterials(
+      query as Parameters<
+        ReturnType<typeof getBridge>["designListMaterials"]
+      >[0],
+    );
+  });
+  ipcMain.handle("design:updateMaterial", async (_e, materialId, update) => {
+    if (typeof materialId !== "string" || materialId.length === 0) {
+      throw new Error("design:updateMaterial: materialId must be a string");
+    }
+    assertObject(update, "update");
+    return getBridge().designUpdateMaterial(
+      materialId,
+      update as Parameters<
+        ReturnType<typeof getBridge>["designUpdateMaterial"]
+      >[1],
+    );
+  });
 
   // ----- Draft -----
   // Same object-shape validation as the Design handlers above. We don't

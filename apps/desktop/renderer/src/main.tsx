@@ -5,6 +5,13 @@ import App from "./App";
 import "./styles/tokens.css";
 import "./styles/global.css";
 import "./styles/components.css";
+import { applyThemeMode, readStoredThemeMode } from "./lib/theme";
+
+// Phase 17 Task 8 — apply the persisted theme before React renders.
+// This runs synchronously inside the import graph, so the very first
+// paint already has the right `data-theme` attribute on <html>; there
+// is no light→dark flash on a dark-preferring user's reload.
+applyThemeMode(readStoredThemeMode());
 
 // HashRouter (not BrowserRouter) is the correct router for an Electron
 // renderer that loads its HTML via `file://`. `BrowserRouter` reads

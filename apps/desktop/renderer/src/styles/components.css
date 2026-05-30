@@ -543,7 +543,48 @@
   border-radius: var(--aec-radius-sm);
 }
 
-/* ----- material panel ----- */
+/* ----- material panel (Phase 17 Group B Task 11) ----- */
+
+.material-tabs {
+  display: flex;
+  gap: var(--aec-space-1);
+  margin-bottom: var(--aec-space-2);
+  flex-wrap: wrap;
+}
+
+.material-tabs__tab {
+  font-size: 11px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--aec-color-border);
+  background: var(--aec-color-bg-elevated);
+  color: var(--aec-color-text-muted);
+  cursor: pointer;
+  transition:
+    background 150ms ease,
+    color 150ms ease,
+    border-color 150ms ease;
+}
+
+.material-tabs__tab:hover {
+  border-color: var(--aec-color-accent);
+}
+
+.material-tabs__tab--active {
+  background: var(--aec-color-accent);
+  color: var(--aec-color-on-accent, #fff);
+  border-color: var(--aec-color-accent);
+}
+
+.material-panel__error {
+  font-size: 11px;
+  color: var(--aec-color-danger, #c2410c);
+  background: var(--aec-color-bg-elevated);
+  border: 1px solid var(--aec-color-border);
+  border-radius: var(--aec-radius-sm);
+  padding: 6px 8px;
+  margin-bottom: var(--aec-space-2);
+}
 
 .material-grid {
   display: grid;
@@ -556,6 +597,25 @@
   flex-direction: column;
   gap: 4px;
   font-size: 11px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--aec-radius-sm);
+  padding: 4px;
+  cursor: pointer;
+  transition:
+    border-color 150ms ease,
+    box-shadow 150ms ease,
+    transform 150ms ease;
+}
+
+.material-grid__item:hover {
+  border-color: var(--aec-color-border);
+  transform: translateY(-2px);
+}
+
+.material-grid__item[aria-pressed="true"] {
+  border-color: var(--aec-color-accent);
+  box-shadow: 0 0 0 1px var(--aec-color-accent) inset;
 }
 
 .material-grid__swatch {
@@ -564,12 +624,63 @@
   border: 1px solid var(--aec-color-border);
 }
 
+.material-grid__name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.material-inspector {
+  margin-top: var(--aec-space-3);
+  padding-top: var(--aec-space-2);
+  border-top: 1px solid var(--aec-color-border);
+}
+
+.material-inspector h3 {
+  font-size: 13px;
+  margin: 0 0 var(--aec-space-2) 0;
+}
+
 .material-inspector__row {
   display: grid;
   grid-template-columns: 96px 1fr;
   gap: var(--aec-space-3);
   margin-bottom: var(--aec-space-2);
   font-size: 12px;
+  align-items: center;
+}
+
+.material-inspector__slider {
+  display: flex;
+  align-items: center;
+  gap: var(--aec-space-2);
+}
+
+.material-inspector__slider input[type="range"] {
+  flex: 1;
+}
+
+.material-inspector__value {
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  color: var(--aec-color-text-muted);
+  min-width: 48px;
+}
+
+.material-inspector__color {
+  display: flex;
+  align-items: center;
+  gap: var(--aec-space-2);
+}
+
+.material-inspector__color input[type="color"] {
+  width: 32px;
+  height: 24px;
+  padding: 0;
+  border: 1px solid var(--aec-color-border);
+  border-radius: var(--aec-radius-sm);
+  background: transparent;
+  cursor: pointer;
 }
 
 /* ----- Phase 17 Task 7 — toolbars with SVG icons ----- */
@@ -784,4 +895,149 @@
   .template-card:hover .template-card__preview {
     transform: none !important;
   }
+}
+
+/* ----- Phase 17 Task 10 — Context menus ----- */
+
+/**
+ * The menu is portal-rendered into <body> so it escapes any
+ * overflow-cropped ancestors. Position is fixed in viewport
+ * coordinates; the React component clamps it inside the visible
+ * region after measuring the natural width.
+ */
+.context-menu {
+  background: var(--aec-color-bg-elevated);
+  border: 1px solid var(--aec-color-border);
+  border-radius: var(--aec-radius-md);
+  box-shadow: var(--aec-shadow-lg);
+  padding: 4px;
+  min-width: 180px;
+  max-width: 320px;
+  z-index: 9000;
+  /* Pop-in animation; respects prefers-reduced-motion via the
+     global override block above. */
+  animation: aec-pop-in 120ms ease;
+  font-family: var(--aec-font-sans);
+  font-size: 13px;
+  color: var(--aec-color-text-primary);
+}
+
+.context-menu__item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 10px;
+  background: transparent;
+  border: 0;
+  border-radius: var(--aec-radius-sm);
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  transition: background 120ms ease;
+}
+
+.context-menu__item:hover:not(:disabled),
+.context-menu__item:focus-visible:not(:disabled) {
+  background: var(--aec-color-accent-soft);
+  outline: none;
+}
+
+.context-menu__item:disabled {
+  color: var(--aec-color-text-muted);
+  cursor: not-allowed;
+}
+
+.context-menu__icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  color: var(--aec-color-text-secondary);
+}
+
+.context-menu__label {
+  flex: 1;
+}
+
+.context-menu__shortcut {
+  color: var(--aec-color-text-muted);
+  font-size: 11px;
+  font-family: var(--aec-font-mono);
+  letter-spacing: 0.02em;
+}
+
+.context-menu__separator {
+  height: 1px;
+  background: var(--aec-color-border);
+  margin: 4px 2px;
+}
+
+/* ----- Phase 17 Task 14 — Panel resize handles ----- */
+
+/**
+ * Resize handles live between two flex children. The 6-px wide hit
+ * region is wider than the visible bar (which is 1 px) so the
+ * cursor target is comfortable while the visual is minimal — same
+ * pattern as Figma / VS Code.
+ */
+.panel-resize-handle {
+  position: relative;
+  flex: 0 0 6px;
+  cursor: col-resize;
+  user-select: none;
+  background: transparent;
+  transition: background 120ms ease;
+}
+
+.panel-resize-handle--row {
+  flex: 0 0 6px;
+  cursor: row-resize;
+}
+
+.panel-resize-handle::before {
+  /* The visible 1-px bar centred in the hit region. */
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: calc(50% - 0.5px);
+  width: 1px;
+  background: var(--aec-color-border);
+  transition: background 120ms ease;
+}
+
+.panel-resize-handle--row::before {
+  top: calc(50% - 0.5px);
+  bottom: auto;
+  left: 0;
+  right: 0;
+  width: auto;
+  height: 1px;
+}
+
+.panel-resize-handle:hover::before,
+.panel-resize-handle.is-dragging::before {
+  background: var(--aec-color-accent);
+}
+
+.panel-resize-handle__grip {
+  /* The 3-dot grip glyph (Icon name="grip") sits centred on the
+     handle, fades in on hover. Pointer-events:none so the icon
+     doesn't intercept the drag. */
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  opacity: 0;
+  pointer-events: none;
+  color: var(--aec-color-text-muted);
+  transition: opacity 120ms ease;
+}
+
+.panel-resize-handle:hover .panel-resize-handle__grip,
+.panel-resize-handle.is-dragging .panel-resize-handle__grip {
+  opacity: 1;
 }

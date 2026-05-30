@@ -188,6 +188,127 @@ export function rendererInProcessBackend(): AecApi {
     },
   ];
 
+  // Phase 17 Group B Task 11. Mirror of the bridge's
+  // `MaterialLibrary::with_default_pack()` seed — 8 starter
+  // materials whose albedos / style tags / per-id roughness +
+  // metallic overrides match the Rust default pack exactly
+  // (`crates/aec_materials/src/library.rs`). Defaults
+  // (metallic 0, roughness 0.6, ior 1.45, emissive [0,0,0],
+  // transmission 0) come from the Rust `PbrMaterial::new`
+  // constructor — keep these aligned with the napi backend's
+  // values so renderer tests against the in-process backend
+  // exercise the same id space the napi backend serves in
+  // production.
+  const materials: {
+    materialId: string;
+    name: string;
+    albedo: [number, number, number];
+    metallic: number;
+    roughness: number;
+    ior: number;
+    transmission: number;
+    emissive: [number, number, number];
+    styleTags: string[];
+    tags: string[];
+  }[] = [
+    {
+      materialId: "mat:oak_light",
+      name: "Light Oak",
+      albedo: [0.78, 0.66, 0.5],
+      metallic: 0,
+      roughness: 0.6,
+      ior: 1.45,
+      transmission: 0,
+      emissive: [0, 0, 0],
+      styleTags: ["scandinavian", "warm"],
+      tags: [],
+    },
+    {
+      materialId: "mat:walnut",
+      name: "Walnut",
+      albedo: [0.34, 0.21, 0.14],
+      metallic: 0,
+      roughness: 0.6,
+      ior: 1.45,
+      transmission: 0,
+      emissive: [0, 0, 0],
+      styleTags: ["industrial", "warm"],
+      tags: [],
+    },
+    {
+      materialId: "mat:concrete_polished",
+      name: "Polished Concrete",
+      albedo: [0.55, 0.55, 0.56],
+      metallic: 0,
+      roughness: 0.45,
+      ior: 1.45,
+      transmission: 0,
+      emissive: [0, 0, 0],
+      styleTags: ["industrial", "minimal"],
+      tags: [],
+    },
+    {
+      materialId: "mat:linen_oat",
+      name: "Oat Linen",
+      albedo: [0.85, 0.78, 0.66],
+      metallic: 0,
+      roughness: 0.85,
+      ior: 1.45,
+      transmission: 0,
+      emissive: [0, 0, 0],
+      styleTags: ["japandi", "warm"],
+      tags: [],
+    },
+    {
+      materialId: "mat:matte_white",
+      name: "Matte White Paint",
+      albedo: [0.92, 0.92, 0.91],
+      metallic: 0,
+      roughness: 0.6,
+      ior: 1.45,
+      transmission: 0,
+      emissive: [0, 0, 0],
+      styleTags: ["minimal"],
+      tags: [],
+    },
+    {
+      materialId: "mat:terracotta",
+      name: "Terracotta Tile",
+      albedo: [0.78, 0.42, 0.32],
+      metallic: 0,
+      roughness: 0.6,
+      ior: 1.45,
+      transmission: 0,
+      emissive: [0, 0, 0],
+      styleTags: ["mediterranean", "warm"],
+      tags: [],
+    },
+    {
+      materialId: "mat:brushed_brass",
+      name: "Brushed Brass",
+      albedo: [0.78, 0.68, 0.42],
+      metallic: 0.9,
+      roughness: 0.3,
+      ior: 1.45,
+      transmission: 0,
+      emissive: [0, 0, 0],
+      styleTags: ["art_deco", "warm"],
+      tags: [],
+    },
+    {
+      materialId: "mat:marble_carrara",
+      name: "Carrara Marble",
+      albedo: [0.92, 0.92, 0.93],
+      metallic: 0,
+      roughness: 0.45,
+      ior: 1.45,
+      transmission: 0,
+      emissive: [0, 0, 0],
+      styleTags: ["classical", "minimal"],
+      tags: [],
+    },
+  ];
+
   return {
     project: {
       createFromTemplate: async (templateKey, projectName) => {
@@ -309,6 +430,84 @@ export function rendererInProcessBackend(): AecApi {
               : true,
           )
           .slice(0, q.limit ?? 24);
+      },
+      // Phase 17 Group B Task 11. Renderer-side in-process
+      // fallback mirror of the main-process `seedMaterials()` —
+      // 8 starter materials whose ids / albedos / style tags
+      // match the bridge's `MaterialLibrary::with_default_pack()`
+      // exactly. The fallback exists so the `MaterialPanel`
+      // renders deterministically in unit tests without a
+      // running napi backend, and so the renderer can be
+      // exercised under `vite preview` (no Electron host) for
+      // visual regression work.
+      listMaterials: async (query) => {
+        const q = query as {
+          tags?: string[];
+          styleTags?: string[];
+          search?: string;
+          limit?: number;
+        };
+        return materials
+          .filter((m) => (q.tags ?? []).every((t) => m.tags.includes(t)))
+          .filter((m) =>
+            (q.styleTags ?? []).every((t) => m.styleTags.includes(t)),
+          )
+          .filter((m) =>
+            q.search
+              ? m.name.toLowerCase().includes(q.search.toLowerCase())
+              : true,
+          )
+          .slice(0, q.limit ?? materials.length);
+      },
+      // Range-validation mirrors `validateMaterialUpdate` in
+      // `apps/desktop/electron/bridge.ts` so the renderer
+      // surface sees the same `invalid: …` error string the
+      // napi backend would emit.
+      updateMaterial: async (materialId, update) => {
+        const idx = materials.findIndex((m) => m.materialId === materialId);
+        if (idx < 0) {
+          throw new Error(`invalid: material \`${materialId}\` not found`);
+        }
+        const inUnit = (v: number | undefined, label: string) => {
+          if (v !== undefined && !(v >= 0 && v <= 1)) {
+            throw new Error(`invalid: ${label} must be in [0.0, 1.0]`);
+          }
+        };
+        inUnit(update.metallic, "metallic");
+        inUnit(update.roughness, "roughness");
+        inUnit(update.transmission, "transmission");
+        if (
+          update.ior !== undefined &&
+          !(update.ior >= 1 && update.ior <= 5)
+        ) {
+          throw new Error("invalid: ior must be in [1.0, 5.0]");
+        }
+        for (const [label, v] of [
+          ["albedo", update.albedo],
+          ["emissive", update.emissive],
+        ] as const) {
+          if (v) {
+            for (let i = 0; i < 3; i++) {
+              if (!(v[i] >= 0 && v[i] <= 1)) {
+                throw new Error(
+                  `invalid: ${label}[${i}] must be in [0.0, 1.0]`,
+                );
+              }
+            }
+          }
+        }
+        const cur = materials[idx];
+        const next = {
+          ...cur,
+          albedo: update.albedo ?? cur.albedo,
+          metallic: update.metallic ?? cur.metallic,
+          roughness: update.roughness ?? cur.roughness,
+          ior: update.ior ?? cur.ior,
+          transmission: update.transmission ?? cur.transmission,
+          emissive: update.emissive ?? cur.emissive,
+        };
+        materials[idx] = next;
+        return next;
       },
     },
     draft: {

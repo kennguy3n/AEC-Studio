@@ -136,6 +136,33 @@ const api = {
       ipcRenderer.invoke("design:saveCamera", params),
     listAssets: (query: Record<string, unknown>) =>
       ipcRenderer.invoke("design:listAssets", query),
+    // Phase 17 Group B Task 11. Both surfaces forward directly to
+    // the bridge — the `MaterialListQuery` / `MaterialUpdate`
+    // shapes are validated on the IPC handler (object-ness),
+    // again at the bridge (in-process backend's
+    // `validateMaterialUpdate`), and at the napi layer (range
+    // checks + 3-element-array enforcement) before reaching the
+    // service-side `validate_material_update`. This is the same
+    // belt-and-suspenders pattern the asset surface uses — the
+    // renderer can never get its slider patch silently dropped
+    // by an upstream type-coercion bug.
+    listMaterials: (query: {
+      search?: string;
+      tags?: string[];
+      styleTags?: string[];
+      limit?: number;
+    }) => ipcRenderer.invoke("design:listMaterials", query),
+    updateMaterial: (
+      materialId: string,
+      update: {
+        albedo?: [number, number, number];
+        metallic?: number;
+        roughness?: number;
+        ior?: number;
+        transmission?: number;
+        emissive?: [number, number, number];
+      },
+    ) => ipcRenderer.invoke("design:updateMaterial", materialId, update),
   },
 
   // ----- Draft -----

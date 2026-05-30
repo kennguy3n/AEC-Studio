@@ -865,6 +865,170 @@ pub fn design_list_assets(query: DesignListAssetsQueryJs) -> Result<Vec<AssetSum
         .map(|rows| rows.into_iter().map(Into::into).collect())
 }
 
+/// JS-facing renderer-side query parameters for
+/// [`design_list_materials`]. Mirrors the `MaterialListQuery` shape
+/// the renderer passes through `designListMaterials(query)` in
+/// `apps/desktop/electron/bridge.ts`.
+///
+/// All fields are optional so the renderer can call this with an
+/// empty object (`{}`) and get the full material library back. The
+/// `style_tags` filter is the primary affordance the design-mode
+/// `MaterialPanel` uses for the Scandinavian / Industrial / Japandi
+/// tabs.
+///
+/// * `search` → renderer's case-insensitive name substring.
+/// * `tags` → AND-matched against `PbrMaterial::tags`.
+/// * `style_tags` → AND-matched against `PbrMaterial::style_tags`.
+/// * `limit` → cap on result-set size. `None` returns everything.
+#[napi(object)]
+pub struct DesignListMaterialsQueryJs {
+    pub search: Option<String>,
+    pub tags: Option<Vec<String>>,
+    pub style_tags: Option<Vec<String>>,
+    pub limit: Option<u32>,
+}
+
+/// JS-facing PBR material summary. Field names align with the
+/// TypeScript `MaterialSummary` interface in
+/// `apps/desktop/electron/bridge.ts`.
+///
+/// `albedo` / `emissive` stay as linear-space `[r, g, b]` triples
+/// (each component in `[0.0, 1.0]`) rather than CSS hex strings so
+/// the renderer's PBR-style swatch sphere can shade directly from
+/// the channel values — pre-stringifying here would force the
+/// renderer to parse the CSS form back into floats for shading
+/// math.
+#[napi(object)]
+pub struct MaterialSummaryJs {
+    pub material_id: String,
+    pub name: String,
+    pub albedo: Vec<f32>,
+    pub metallic: f64,
+    pub roughness: f64,
+    pub ior: f64,
+    pub transmission: f64,
+    pub emissive: Vec<f32>,
+    pub style_tags: Vec<String>,
+    pub tags: Vec<String>,
+}
+
+impl From<crate::service::MaterialSummary> for MaterialSummaryJs {
+    fn from(s: crate::service::MaterialSummary) -> Self {
+        Self {
+            material_id: s.material_id,
+            name: s.name,
+            albedo: s.albedo.to_vec(),
+            metallic: s.metallic as f64,
+            roughness: s.roughness as f64,
+            ior: s.ior as f64,
+            transmission: s.transmission as f64,
+            emissive: s.emissive.to_vec(),
+            style_tags: s.style_tags,
+            tags: s.tags,
+        }
+    }
+}
+
+/// List materials from the process-wide PBR library matching
+/// `query`. Read-only; routes through [`with_service_ref_fallible`]
+/// so it runs concurrently with status polls, asset-list reads, and
+/// other read-side endpoints without taking the service-wide write
+/// lock.
+///
+/// The library is seeded once at boot from
+/// `MaterialLibrary::with_default_pack()` (8 starter materials) —
+/// the design-mode `MaterialPanel` calls this endpoint on mount to
+/// populate the swatch grid and on every style-tag tab change to
+/// re-filter. The bridge clamps `query.limit` to
+/// [`crate::service::DESIGN_LIST_MATERIALS_MAX_LIMIT`] (10_000) so
+/// a renderer bug sending a negative JS number that wraps to a
+/// near-`u32::MAX` value through napi's `ToUint32()` coercion
+/// can't allocate an unbounded result vector.
+#[napi]
+pub fn design_list_materials(
+    query: DesignListMaterialsQueryJs,
+) -> Result<Vec<MaterialSummaryJs>> {
+    let q = crate::service::MaterialListQuery {
+        search: query.search,
+        tags: query.tags.unwrap_or_default(),
+        style_tags: query.style_tags.unwrap_or_default(),
+        limit: query.limit,
+    };
+    with_service_ref_fallible(|svc| svc.design_list_materials(&q))
+        .map(|rows| rows.into_iter().map(Into::into).collect())
+}
+
+/// JS-facing patch payload for [`design_update_material`]. Every
+/// field is `Option` so the inspector can `PATCH`-style send only
+/// the slider that moved; unset fields keep their current value.
+///
+/// `albedo` / `emissive` arrive as JS arrays of three floats — the
+/// `Vec<f32>` shape is forced by napi-rs's lack of fixed-size
+/// array support at the napi-rs 2.x boundary, so the bridge
+/// validates `len() == 3` before forwarding to the service-layer
+/// `[f32; 3]`. Out-of-range values are rejected by the service
+/// layer's `validate_material_update`, surfacing through napi as an
+/// `Error::from_reason("invalid: …")` the renderer can show on the
+/// inspector toast.
+#[napi(object)]
+pub struct MaterialUpdateJs {
+    pub albedo: Option<Vec<f32>>,
+    pub metallic: Option<f64>,
+    pub roughness: Option<f64>,
+    pub ior: Option<f64>,
+    pub transmission: Option<f64>,
+    pub emissive: Option<Vec<f32>>,
+}
+
+fn rgb_from_vec(field: &str, v: &[f32]) -> Result<[f32; 3]> {
+    if v.len() != 3 {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!("{field} must have exactly 3 components, got {}", v.len()),
+        ));
+    }
+    Ok([v[0], v[1], v[2]])
+}
+
+/// Apply an inspector slider patch to a single material and return
+/// the updated summary so the renderer can refresh its inspector
+/// without a follow-up `design_list_materials` round-trip.
+///
+/// Validation runs *atomically* on the service side — a single
+/// out-of-range slider can't half-apply a multi-field patch. The
+/// service-layer guarantees:
+///
+/// * `metallic` / `roughness` / `transmission` in `[0.0, 1.0]`
+/// * `ior` in `[1.0, 5.0]`
+/// * `albedo` / `emissive` components in `[0.0, 1.0]`
+///
+/// All slider violations surface through napi as
+/// `Error::from_reason("invalid: …")` — the renderer's
+/// MaterialPanel inspector catches these and shows a toast without
+/// invalidating the local UI state, so the user can re-drag the
+/// slider into range without re-opening the inspector.
+#[napi]
+pub fn design_update_material(
+    material_id: String,
+    update: MaterialUpdateJs,
+) -> Result<MaterialSummaryJs> {
+    let albedo = update.albedo.as_deref().map(|v| rgb_from_vec("albedo", v));
+    let emissive = update
+        .emissive
+        .as_deref()
+        .map(|v| rgb_from_vec("emissive", v));
+    let patch = crate::service::MaterialUpdate {
+        albedo: albedo.transpose()?,
+        metallic: update.metallic.map(|v| v as f32),
+        roughness: update.roughness.map(|v| v as f32),
+        ior: update.ior.map(|v| v as f32),
+        transmission: update.transmission.map(|v| v as f32),
+        emissive: emissive.transpose()?,
+    };
+    with_service_ref_fallible(|svc| svc.design_update_material(&material_id, &patch))
+        .map(Into::into)
+}
+
 fn parse_scope(s: &str) -> Result<aec_core::types::Scope> {
     match s {
         "design" => Ok(aec_core::types::Scope::Design),

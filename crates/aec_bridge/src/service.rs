@@ -1023,6 +1023,150 @@ pub(crate) const DESIGN_LIST_ASSETS_DEFAULT_LIMIT: u32 = 24;
 /// allocation stays bounded.
 pub(crate) const DESIGN_LIST_ASSETS_MAX_LIMIT: u32 = 10_000;
 
+/// Hard upper bound on a single `design_list_materials` page size.
+/// 10_000 is well above any plausible material library (the bundled
+/// starter pack ships 8; even a fully populated industry library —
+/// IKEA + Muuto + Vitra combined — runs in the hundreds). Mirroring
+/// [`DESIGN_LIST_ASSETS_MAX_LIMIT`]'s saturating-clamp pattern so an
+/// upstream renderer bug sending a JS negative number can't force
+/// the in-process library to materialise an unbounded result set.
+pub(crate) const DESIGN_LIST_MATERIALS_MAX_LIMIT: u32 = 10_000;
+
+/// Validate every populated field in a [`MaterialUpdate`] before the
+/// in-place mutation runs in [`BridgeService::design_update_material`].
+///
+/// Returns [`BridgeServiceError::Invalid`] with a human-readable
+/// message naming the offending field on the first violation —
+/// callers re-call after the user corrects the slider, so we don't
+/// need to aggregate errors. See the per-field range rationale in
+/// the [`BridgeService::design_update_material`] doc comment.
+fn validate_material_update(update: &MaterialUpdate) -> Result<(), BridgeServiceError> {
+    fn check_unit(name: &str, v: f32) -> Result<(), BridgeServiceError> {
+        if !(0.0..=1.0).contains(&v) || !v.is_finite() {
+            return Err(BridgeServiceError::Invalid(format!(
+                "{name} must be in [0.0, 1.0]; got {v}"
+            )));
+        }
+        Ok(())
+    }
+    fn check_rgb(name: &str, v: [f32; 3]) -> Result<(), BridgeServiceError> {
+        for (i, c) in v.iter().enumerate() {
+            if !(0.0..=1.0).contains(c) || !c.is_finite() {
+                return Err(BridgeServiceError::Invalid(format!(
+                    "{name}[{i}] must be in [0.0, 1.0]; got {c}"
+                )));
+            }
+        }
+        Ok(())
+    }
+    if let Some(v) = update.metallic {
+        check_unit("metallic", v)?;
+    }
+    if let Some(v) = update.roughness {
+        check_unit("roughness", v)?;
+    }
+    if let Some(v) = update.transmission {
+        check_unit("transmission", v)?;
+    }
+    if let Some(v) = update.ior {
+        if !(1.0..=5.0).contains(&v) || !v.is_finite() {
+            return Err(BridgeServiceError::Invalid(format!(
+                "ior must be in [1.0, 5.0]; got {v}"
+            )));
+        }
+    }
+    if let Some(v) = update.albedo {
+        check_rgb("albedo", v)?;
+    }
+    if let Some(v) = update.emissive {
+        check_rgb("emissive", v)?;
+    }
+    Ok(())
+}
+
+/// Renderer-facing projection of [`aec_materials::material::PbrMaterial`].
+/// Shape pinned by the TypeScript `MaterialSummary` interface in
+/// `apps/desktop/electron/bridge.ts` so the napi layer can hand the
+/// value to the design-mode `MaterialPanel` without a transform step.
+///
+/// `albedo` / `emissive` are kept as `[f32; 3]` (linear RGB, each
+/// component in `[0.0, 1.0]`) rather than a flattened CSS string so
+/// the renderer can compute the PBR-style sphere thumbnail directly
+/// from the channel values — pre-stringifying here would force the
+/// renderer to parse the CSS form back into floats for the swatch
+/// shading math.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MaterialSummary {
+    pub material_id: String,
+    pub name: String,
+    /// Linear-space RGB albedo, each component in `[0.0, 1.0]`.
+    pub albedo: [f32; 3],
+    pub metallic: f32,
+    pub roughness: f32,
+    pub ior: f32,
+    pub transmission: f32,
+    /// Linear-space emissive RGB (additive radiance). `[0, 0, 0]` for
+    /// non-emissive materials — the most common case.
+    pub emissive: [f32; 3],
+    pub style_tags: Vec<String>,
+    pub tags: Vec<String>,
+}
+
+fn pbr_to_summary(m: &aec_materials::material::PbrMaterial) -> MaterialSummary {
+    MaterialSummary {
+        material_id: m.id.clone(),
+        name: m.name.clone(),
+        albedo: m.albedo,
+        metallic: m.metallic,
+        roughness: m.roughness,
+        ior: m.ior,
+        transmission: m.transmission,
+        emissive: m.emissive,
+        style_tags: m.style_tags.clone(),
+        tags: m.tags.clone(),
+    }
+}
+
+/// Query parameters for [`BridgeService::design_list_materials`]. All
+/// fields are optional; an empty query returns the full library
+/// sorted by display name.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MaterialListQuery {
+    /// Case-insensitive substring match against `name`. Empty /
+    /// `None` falls through to "no filter".
+    pub search: Option<String>,
+    /// AND-matched against `PbrMaterial::style_tags`. Empty falls
+    /// through to "no filter".
+    pub style_tags: Vec<String>,
+    /// AND-matched against `PbrMaterial::tags`.
+    pub tags: Vec<String>,
+    /// Cap on result-set size. `None` returns everything.
+    pub limit: Option<u32>,
+}
+
+/// Patch payload for [`BridgeService::design_update_material`]. Only
+/// the fields the design-mode inspector exposes are editable —
+/// texture maps, AO, vendor metadata, and the id itself are
+/// read-only at this layer because they're set when the library is
+/// authored (asset-pack import / JSON load) rather than mutated
+/// through the live UI.
+///
+/// Every field is `Option` so the inspector can `PATCH`-style send
+/// only the slider that moved; unset fields keep their current
+/// value. The bridge validates each field individually
+/// (`metallic` / `roughness` / `transmission` must lie in
+/// `[0.0, 1.0]`; `ior` must be `>= 1.0` because all real-world
+/// transmissive materials sit on or above vacuum's `n = 1`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct MaterialUpdate {
+    pub albedo: Option<[f32; 3]>,
+    pub metallic: Option<f32>,
+    pub roughness: Option<f32>,
+    pub ior: Option<f32>,
+    pub transmission: Option<f32>,
+    pub emissive: Option<[f32; 3]>,
+}
+
 /// Renderer-facing projection of [`aec_assets::AssetMetadata`]. Only
 /// the fields the asset-browser card consumes — drop the full LOD
 /// chain, materials list, license, version, and creation timestamp
@@ -1416,6 +1560,29 @@ pub struct BridgeService {
     /// order). Empty when there are no failures — the renderer hides
     /// the diagnostics card entirely in that case.
     extension_load_diagnostics: Vec<aec_core::ExtensionLoadDiagnostic>,
+    /// Process-wide PBR material library backing the design-mode
+    /// `MaterialPanel`. Phase 17 Group B Task 11 surfaced the library
+    /// through `design_list_materials` / `design_update_material`
+    /// so the renderer can present a live swatch grid with PBR
+    /// preview thumbnails and editable sliders instead of the
+    /// hardcoded 8-swatch placeholder it shipped with.
+    ///
+    /// The library is seeded from
+    /// [`aec_materials::library::MaterialLibrary::with_default_pack`]
+    /// at boot — the same starter pack the asset pipeline uses for
+    /// new projects — and any subsequent
+    /// [`Self::design_update_material`] call mutates the in-process
+    /// copy. The library is intentionally a *bridge-wide* singleton
+    /// rather than per-project state: in the present revision, the
+    /// renderer owns one material panel that follows the active
+    /// project, and a future per-project material override needs a
+    /// dedicated schema (project-scoped overrides + library-scoped
+    /// defaults) that we don't want to half-build here. When that
+    /// lands, the field type becomes
+    /// `HashMap<PathBuf, Mutex<MaterialLibrary>>` and the existing
+    /// `design_list_materials` / `design_update_material` callers
+    /// route through it — the napi surface stays the same.
+    material_library: Mutex<aec_materials::library::MaterialLibrary>,
 }
 
 /// Process-wide render state held by [`BridgeService::render_state`].
@@ -1658,6 +1825,9 @@ impl BridgeService {
             extension_registry,
             permission_enforcer,
             extension_load_diagnostics,
+            material_library: Mutex::new(
+                aec_materials::library::MaterialLibrary::with_default_pack(),
+            ),
         })
     }
 
@@ -2376,6 +2546,104 @@ impl BridgeService {
         };
         let rows = self.asset_state.with_db(|db| db.query(&aq))?;
         Ok(rows.into_iter().map(asset_metadata_to_summary).collect())
+    }
+
+    /// List PBR materials from the in-process
+    /// [`aec_materials::library::MaterialLibrary`] for the design-mode
+    /// `MaterialPanel`. Read-only; takes the library mutex just long
+    /// enough to filter + clone the matching summaries, then drops
+    /// it before returning.
+    ///
+    /// Filter semantics mirror [`aec_materials::library::MaterialQuery`]:
+    ///
+    /// * `query.search` → ASCII case-insensitive substring on
+    ///   `name`. Empty / missing falls through to "no filter".
+    /// * `query.style_tags` → AND-matched against
+    ///   `PbrMaterial::style_tags`. Empty falls through to "no filter".
+    /// * `query.tags` → AND-matched against `PbrMaterial::tags`.
+    /// * `query.limit` → saturating-clamped to
+    ///   [`DESIGN_LIST_MATERIALS_MAX_LIMIT`] (10_000) — well above any
+    ///   plausible material library — to defend against an upstream
+    ///   renderer bug sending a JS negative number that wraps to a
+    ///   near-`u32::MAX` value through napi's `ToUint32()` coercion.
+    pub fn design_list_materials(
+        &self,
+        query: &MaterialListQuery,
+    ) -> Result<Vec<MaterialSummary>, BridgeServiceError> {
+        let lib = self.material_library.lock().map_err(|_| {
+            BridgeServiceError::Core("material_library mutex poisoned".to_string())
+        })?;
+        let q = aec_materials::library::MaterialQuery {
+            tags: query.tags.clone(),
+            style_tags: query.style_tags.clone(),
+            vendor_id: None,
+            name_contains: query.search.as_ref().filter(|s| !s.is_empty()).cloned(),
+            limit: query
+                .limit
+                .map(|n| (n.min(DESIGN_LIST_MATERIALS_MAX_LIMIT)) as usize),
+        };
+        Ok(lib.query(&q).into_iter().map(pbr_to_summary).collect())
+    }
+
+    /// Apply a slider patch to a single material and return the
+    /// updated summary so the renderer can refresh the inspector
+    /// without a follow-up `design_list_materials` round-trip.
+    ///
+    /// Validation runs *before* the in-place mutation so a single
+    /// out-of-range slider can't half-apply a multi-field patch:
+    ///
+    /// * `metallic` / `roughness` / `transmission` must lie in
+    ///   `[0.0, 1.0]` (PBR convention; outside this range the BSDF
+    ///   becomes ill-defined and the rasteriser's tone-mapper either
+    ///   clips or NaN-propagates).
+    /// * `ior` must satisfy `1.0 <= ior <= 5.0`. The lower bound
+    ///   forbids vacuum-or-below indices that would make Snell's
+    ///   law trivially fail; the upper bound is well above any
+    ///   architectural material (diamond is 2.42, sapphire 1.77).
+    /// * `albedo` / `emissive` components must lie in `[0.0, 1.0]` —
+    ///   the renderer treats values above 1 as HDR emissive and
+    ///   below 0 as a coding bug, so the slider surface clamps to
+    ///   the same range the inspector advertises.
+    ///
+    /// Returns [`BridgeServiceError::Invalid`] on any range violation
+    /// and [`BridgeServiceError::Core`] on poisoned mutex / unknown
+    /// material id. The `unknown id` case is folded into `Invalid`
+    /// rather than `Core` because the renderer recovers from it by
+    /// re-listing the library, not by reporting a runtime fault.
+    pub fn design_update_material(
+        &self,
+        material_id: &str,
+        update: &MaterialUpdate,
+    ) -> Result<MaterialSummary, BridgeServiceError> {
+        validate_material_update(update)?;
+        let mut lib = self.material_library.lock().map_err(|_| {
+            BridgeServiceError::Core("material_library mutex poisoned".to_string())
+        })?;
+        let current = lib.get(material_id).cloned().ok_or_else(|| {
+            BridgeServiceError::Invalid(format!("material `{material_id}` not found"))
+        })?;
+        let mut next = current;
+        if let Some(albedo) = update.albedo {
+            next.albedo = albedo;
+        }
+        if let Some(metallic) = update.metallic {
+            next.metallic = metallic;
+        }
+        if let Some(roughness) = update.roughness {
+            next.roughness = roughness;
+        }
+        if let Some(ior) = update.ior {
+            next.ior = ior;
+        }
+        if let Some(transmission) = update.transmission {
+            next.transmission = transmission;
+        }
+        if let Some(emissive) = update.emissive {
+            next.emissive = emissive;
+        }
+        let summary = pbr_to_summary(&next);
+        lib.upsert(next);
+        Ok(summary)
     }
 
     /// Read an `.ifc` file from disk and return a structured import
@@ -7564,6 +7832,242 @@ END-ISO-10303-21;\n";
             })
             .expect("no-match query is not an error");
         assert!(assets.is_empty());
+    }
+
+    // ============================================================
+    // Phase 17 Group B Task 11: design_list_materials / design_update_material
+    // ============================================================
+
+    #[test]
+    fn design_list_materials_returns_default_pack_on_fresh_state() {
+        // Fresh service → library seeded with
+        // `MaterialLibrary::with_default_pack` (8 starter materials).
+        // Pins the contract that the design-mode panel sees real
+        // PBR data on the first open, not an empty list that the
+        // renderer would have to fall back to hardcoded swatches for.
+        let (s, _g) = service();
+        let mats = s
+            .design_list_materials(&MaterialListQuery::default())
+            .expect("design_list_materials succeeds on fresh state");
+        assert_eq!(mats.len(), 8, "starter pack has 8 materials");
+        // Names are stable across runs (defined in `with_default_pack`)
+        // and the renderer relies on them for the swatch label.
+        let names: Vec<&str> = mats.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"Light Oak"));
+        assert!(names.contains(&"Walnut"));
+        assert!(names.contains(&"Carrara Marble"));
+        assert!(names.contains(&"Brushed Brass"));
+    }
+
+    #[test]
+    fn design_list_materials_filters_by_style_tag() {
+        // `style_tags = ["industrial"]` → walnut + polished concrete
+        // (both tagged `industrial` in the starter pack). Marble
+        // (`classical` / `minimal`) and matte white (`minimal`)
+        // drop out. Pins AND-tag semantics.
+        let (s, _g) = service();
+        let q = MaterialListQuery {
+            style_tags: vec!["industrial".to_string()],
+            ..MaterialListQuery::default()
+        };
+        let mats = s
+            .design_list_materials(&q)
+            .expect("style-tag-filtered query");
+        assert!(!mats.is_empty());
+        for m in &mats {
+            assert!(
+                m.style_tags.iter().any(|t| t == "industrial"),
+                "every result must carry the requested style_tag; got {:?}",
+                m.style_tags
+            );
+        }
+    }
+
+    #[test]
+    fn design_list_materials_filters_by_search_substring() {
+        // `search = "Oak"` matches "Light Oak" only; `search = ""`
+        // falls through to "no filter" (matches all 8). Pins the
+        // empty-string-as-no-filter behaviour the renderer relies on.
+        let (s, _g) = service();
+        let oak = s
+            .design_list_materials(&MaterialListQuery {
+                search: Some("Oak".to_string()),
+                ..MaterialListQuery::default()
+            })
+            .expect("substring query");
+        assert_eq!(oak.len(), 1);
+        assert_eq!(oak[0].name, "Light Oak");
+        let empty = s
+            .design_list_materials(&MaterialListQuery {
+                search: Some(String::new()),
+                ..MaterialListQuery::default()
+            })
+            .expect("empty-string substring query");
+        assert_eq!(
+            empty.len(),
+            8,
+            "empty `search` must behave like no filter"
+        );
+    }
+
+    #[test]
+    fn design_list_materials_saturating_clamps_to_max_limit() {
+        // Regression on the saturating-clamp promise: `limit =
+        // u32::MAX` must not propagate into an unbounded
+        // materialisation. Mirrors the asset-list test of the same
+        // shape.
+        let (s, _g) = service();
+        let res = s
+            .design_list_materials(&MaterialListQuery {
+                limit: Some(u32::MAX),
+                ..MaterialListQuery::default()
+            })
+            .expect("u32::MAX limit must succeed (clamped, not unbounded)");
+        assert_eq!(res.len(), 8, "clamped query returns the full starter pack");
+    }
+
+    #[test]
+    fn design_update_material_applies_patch_and_returns_summary() {
+        // A patch on `metallic` + `roughness` + `albedo` must be
+        // visible on the returned summary AND on the next list call.
+        // Pins the in-process state mutation contract.
+        let (s, _g) = service();
+        let before = s
+            .design_list_materials(&MaterialListQuery::default())
+            .unwrap();
+        let oak = before
+            .iter()
+            .find(|m| m.material_id == "mat:oak_light")
+            .cloned()
+            .expect("oak is in starter pack");
+        let updated = s
+            .design_update_material(
+                "mat:oak_light",
+                &MaterialUpdate {
+                    metallic: Some(0.4),
+                    roughness: Some(0.2),
+                    albedo: Some([0.5, 0.3, 0.1]),
+                    ..MaterialUpdate::default()
+                },
+            )
+            .expect("patch applies");
+        assert!((updated.metallic - 0.4).abs() < 1e-6);
+        assert!((updated.roughness - 0.2).abs() < 1e-6);
+        assert_eq!(updated.albedo, [0.5, 0.3, 0.1]);
+        // Untouched fields preserve the previous value.
+        assert!((updated.ior - oak.ior).abs() < 1e-6);
+        assert_eq!(updated.material_id, "mat:oak_light");
+        let after = s
+            .design_list_materials(&MaterialListQuery::default())
+            .unwrap();
+        let next_oak = after
+            .iter()
+            .find(|m| m.material_id == "mat:oak_light")
+            .expect("oak still present after update");
+        assert!((next_oak.metallic - 0.4).abs() < 1e-6);
+        assert_eq!(next_oak.albedo, [0.5, 0.3, 0.1]);
+    }
+
+    #[test]
+    fn design_update_material_rejects_out_of_range_values() {
+        // Out-of-range sliders must surface as `Invalid`, not
+        // silently clamp. The renderer relies on the error to bring
+        // the slider back inside the legal range (and shows a toast
+        // explaining why). Mutates nothing on rejection.
+        let (s, _g) = service();
+        let cases: Vec<(&str, MaterialUpdate)> = vec![
+            (
+                "metallic > 1.0",
+                MaterialUpdate {
+                    metallic: Some(1.5),
+                    ..MaterialUpdate::default()
+                },
+            ),
+            (
+                "roughness < 0.0",
+                MaterialUpdate {
+                    roughness: Some(-0.1),
+                    ..MaterialUpdate::default()
+                },
+            ),
+            (
+                "transmission NaN",
+                MaterialUpdate {
+                    transmission: Some(f32::NAN),
+                    ..MaterialUpdate::default()
+                },
+            ),
+            (
+                "ior below vacuum",
+                MaterialUpdate {
+                    ior: Some(0.5),
+                    ..MaterialUpdate::default()
+                },
+            ),
+            (
+                "ior above diamond+",
+                MaterialUpdate {
+                    ior: Some(10.0),
+                    ..MaterialUpdate::default()
+                },
+            ),
+            (
+                "albedo component > 1.0",
+                MaterialUpdate {
+                    albedo: Some([1.2, 0.0, 0.0]),
+                    ..MaterialUpdate::default()
+                },
+            ),
+        ];
+        let before = s
+            .design_list_materials(&MaterialListQuery::default())
+            .unwrap();
+        let oak_before = before
+            .iter()
+            .find(|m| m.material_id == "mat:oak_light")
+            .cloned()
+            .expect("oak present");
+        for (case, update) in cases {
+            let err = s
+                .design_update_material("mat:oak_light", &update)
+                .expect_err(case);
+            assert!(
+                matches!(err, BridgeServiceError::Invalid(_)),
+                "case `{case}` should surface as Invalid; got {err:?}"
+            );
+        }
+        let after = s
+            .design_list_materials(&MaterialListQuery::default())
+            .unwrap();
+        let oak_after = after
+            .iter()
+            .find(|m| m.material_id == "mat:oak_light")
+            .cloned()
+            .expect("oak still present");
+        assert_eq!(
+            oak_before, oak_after,
+            "rejected updates must not mutate the library"
+        );
+    }
+
+    #[test]
+    fn design_update_material_unknown_id_surfaces_invalid() {
+        // A renderer that snapshots the library, then issues an
+        // update against an id that was meanwhile removed from the
+        // library, must see an `Invalid` error so it can re-list and
+        // surface a friendly "material no longer available" toast —
+        // not a generic `Core` runtime error.
+        let (s, _g) = service();
+        let err = s
+            .design_update_material(
+                "mat:does_not_exist",
+                &MaterialUpdate {
+                    metallic: Some(0.5),
+                    ..MaterialUpdate::default()
+                },
+            )
+            .expect_err("unknown id rejected");
+        assert!(matches!(err, BridgeServiceError::Invalid(_)));
     }
 
     // ============================================================
