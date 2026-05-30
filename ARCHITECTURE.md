@@ -775,10 +775,16 @@ extension directory and restart the app.
 - `ExtensionLoadStage` wire strings are stable; adding new variants is additive.
 - The diagnostics vector is captured once at boot and never mutated thereafter; reloading
   extensions at runtime is out of scope for Phase 16.
-- `load_single_extension` deliberately duplicates the per-directory body of
-  `ExtensionLoader::load` so the strict + tolerant loaders can diverge on failure semantics
-  without obscuring either contract. The duplication is documented in-line as a maintenance
-  hazard to revisit if a third loader variant appears.
+- The strict (`ExtensionLoader::load`) and tolerant (`ExtensionLoader::load_with_diagnostics`)
+  entrypoints share a single per-extension pipeline via the internal
+  `try_load_single_extension(ext_dir, opts) -> SingleLoadOutcome` helper. The helper covers
+  manifest read → JSON parse → unsafe-path check → schema validation → signature verification
+  and tags each failure with the appropriate `ExtensionLoadStage`. The strict entrypoint
+  discards the stage tag and bubbles the typed `LoadError` for a `Failed` outcome; the
+  tolerant entrypoint maps `Failed` straight into an `ExtensionLoadDiagnostic`. Directory
+  enumeration is likewise shared via `enumerate_extension_dirs(root) -> Vec<PathBuf>` (sorted
+  lexicographically — the deterministic order is part of the contract). Any future change to
+  manifest validation, signature verification, or stage tagging lands in exactly one place.
 
 ---
 
