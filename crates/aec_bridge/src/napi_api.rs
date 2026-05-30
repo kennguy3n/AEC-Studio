@@ -1905,6 +1905,15 @@ pub struct RenderJobJs {
     pub progress: f64,
     pub camera_id: Option<String>,
     pub batch_id: Option<String>,
+    /// RFC3339 timestamp the render started (or `None` if it is
+    /// still queued). Renderer constructs a JS `Date` to compute
+    /// elapsed time / ETA in `RenderQueue.tsx`.
+    pub started_at: Option<String>,
+    /// RFC3339 timestamp the render completed.
+    pub completed_at: Option<String>,
+    /// Absolute path to the output image on disk (`None` while the
+    /// job is queued or running).
+    pub output_path: Option<String>,
 }
 
 impl From<crate::service::RenderJobSummary> for RenderJobJs {
@@ -1916,6 +1925,9 @@ impl From<crate::service::RenderJobSummary> for RenderJobJs {
             progress: s.progress as f64,
             camera_id: s.camera_id,
             batch_id: s.batch_id,
+            started_at: s.started_at,
+            completed_at: s.completed_at,
+            output_path: s.output_path,
         }
     }
 }
@@ -2112,6 +2124,69 @@ pub fn render_diagnose(job_id: String) -> Result<RenderDiagnoseJs> {
 #[napi]
 pub fn render_check_materials() -> Result<RenderCheckMaterialsJs> {
     with_service_ref_fallible(super::service::BridgeService::render_check_materials).map(Into::into)
+}
+
+/// Read the output image bytes for a completed render job. Bound to
+/// the renderer as `aec.render.getOutputImage({ jobId })`. The
+/// returned `Buffer` is base64-encoded by the renderer and used as
+/// the `src` of an `<img>` for `RenderPreview` /
+/// `BeforeAfterCompare`.
+#[napi]
+pub fn render_get_output_image(job_id: String) -> Result<RenderOutputImageJs> {
+    with_service_ref_fallible(|svc| svc.render_get_output_image(&job_id)).map(Into::into)
+}
+
+/// Compute the SSIM between two completed render jobs. Bound to the
+/// renderer as `aec.render.compareSsim({ aJobId, bJobId })`.
+#[napi]
+pub fn render_compare_ssim(a_job_id: String, b_job_id: String) -> Result<RenderCompareResultJs> {
+    with_service_ref_fallible(|svc| svc.render_compare_ssim(&a_job_id, &b_job_id)).map(Into::into)
+}
+
+/// Set the HDRI environment map for future render jobs. Pass `null`
+/// to fall back to the procedural Hosek-Wilkie sky. Bound as
+/// `aec.render.setEnvironmentMap({ path, intensity })`.
+#[napi]
+pub fn render_set_environment_map(path: Option<String>, intensity: Option<f64>) -> Result<()> {
+    with_service_ref_fallible(|svc| {
+        svc.render_set_environment_map(path.as_deref(), intensity.map(|v| v as f32))
+    })
+}
+
+/// JS-facing render output image returned by [`render_get_output_image`].
+#[napi(object)]
+pub struct RenderOutputImageJs {
+    pub job_id: String,
+    pub path: String,
+    pub bytes: napi::bindgen_prelude::Buffer,
+}
+
+impl From<crate::service::RenderOutputImage> for RenderOutputImageJs {
+    fn from(o: crate::service::RenderOutputImage) -> Self {
+        Self {
+            job_id: o.job_id,
+            path: o.path,
+            bytes: o.bytes.into(),
+        }
+    }
+}
+
+/// JS-facing render compare result returned by [`render_compare_ssim`].
+#[napi(object)]
+pub struct RenderCompareResultJs {
+    pub a_job_id: String,
+    pub b_job_id: String,
+    pub ssim: f64,
+}
+
+impl From<crate::service::RenderCompareResult> for RenderCompareResultJs {
+    fn from(o: crate::service::RenderCompareResult) -> Self {
+        Self {
+            a_job_id: o.a_job_id,
+            b_job_id: o.b_job_id,
+            ssim: o.ssim,
+        }
+    }
 }
 
 // ---------------------------------------------------------------

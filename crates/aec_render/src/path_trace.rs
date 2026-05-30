@@ -51,14 +51,28 @@ pub struct PathTraceScene {
     pub material_ids: Vec<i32>,
     pub lights: Vec<NativeLight>,
     pub sky: SkyParams,
+    /// CPU-side texture atlas (albedo / normal / metallic-roughness /
+    /// emissive). Empty when the scene has no textured materials. The
+    /// path tracer samples this in its inner loop via
+    /// [`crate::material::sample_textured_material`].
+    pub textures: crate::texture::TextureAtlas,
+    /// Optional HDRI environment map. When present, the path tracer
+    /// returns the environment radiance for rays that escape the BVH
+    /// instead of the procedural Hosek-Wilkie sky baked into `sky`.
+    pub environment: Option<crate::environment::EnvironmentMap>,
 }
 
-/// Per-triangle data needed for shading (smooth normals, UVs).
+/// Per-triangle data needed for shading (smooth normals + per-vertex
+/// texture coordinates). The path tracer interpolates these via
+/// barycentric coordinates at each hit point.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TriangleShading {
     pub n0: Vec3,
     pub n1: Vec3,
     pub n2: Vec3,
+    pub uv0: glam::Vec2,
+    pub uv1: glam::Vec2,
+    pub uv2: glam::Vec2,
 }
 
 impl PathTraceScene {
@@ -69,6 +83,29 @@ impl PathTraceScene {
         materials: Vec<PathTraceMaterial>,
         material_lookup: impl Fn(&str) -> Option<usize>,
         sky: SkyParams,
+    ) -> Self {
+        Self::from_render_scene_with_textures(
+            scene,
+            materials,
+            material_lookup,
+            sky,
+            crate::texture::TextureAtlas::new(),
+            None,
+        )
+    }
+
+    /// Same as [`Self::from_render_scene`] but allows the caller to
+    /// supply an already-built [`TextureAtlas`] and an optional
+    /// [`EnvironmentMap`]. `FinalRenderPipeline` uses this entry point
+    /// so the texture atlas can be reused across CPU + GPU paths and
+    /// across multiple tiles of the same render.
+    pub fn from_render_scene_with_textures(
+        scene: &RenderScene,
+        materials: Vec<PathTraceMaterial>,
+        material_lookup: impl Fn(&str) -> Option<usize>,
+        sky: SkyParams,
+        textures: crate::texture::TextureAtlas,
+        environment: Option<crate::environment::EnvironmentMap>,
     ) -> Self {
         let mut triangles: Vec<ShadingTriangle> = Vec::new();
         let mut shading: Vec<TriangleShading> = Vec::new();
@@ -132,7 +169,26 @@ impl PathTraceScene {
                     let g2 = *normals.get(i2).unwrap_or(&Vec3::Z);
                     (g0, g1, g2)
                 };
-                shading.push(TriangleShading { n0, n1, n2 });
+                let (uv0, uv1, uv2) = if mesh.uvs.is_empty() {
+                    (glam::Vec2::ZERO, glam::Vec2::ZERO, glam::Vec2::ZERO)
+                } else {
+                    let g0 = mesh.uvs.get(i0).copied().unwrap_or([0.0, 0.0]);
+                    let g1 = mesh.uvs.get(i1).copied().unwrap_or([0.0, 0.0]);
+                    let g2 = mesh.uvs.get(i2).copied().unwrap_or([0.0, 0.0]);
+                    (
+                        glam::Vec2::from_array(g0),
+                        glam::Vec2::from_array(g1),
+                        glam::Vec2::from_array(g2),
+                    )
+                };
+                shading.push(TriangleShading {
+                    n0,
+                    n1,
+                    n2,
+                    uv0,
+                    uv1,
+                    uv2,
+                });
                 material_ids.push(mat_id);
             }
         }
@@ -152,6 +208,8 @@ impl PathTraceScene {
             materials,
             lights,
             sky,
+            textures,
+            environment,
         }
     }
 
@@ -1303,7 +1361,13 @@ fn trace_path(
     for bounce in 0..config.max_bounces {
         let hit = closest_hit(&scene.bvh, &scene.triangles, &ray);
         let Some(hit) = hit else {
-            let env = environment_radiance(&scene.sky, ray.dir);
+            // Prefer the HDRI environment if present; fall back to
+            // the procedural Hosek-Wilkie sky for legacy projects.
+            let env = if let Some(envmap) = scene.environment.as_ref() {
+                envmap.sample_direction(ray.dir)
+            } else {
+                environment_radiance(&scene.sky, ray.dir)
+            };
             // The environment background itself is not currently
             // sampled by NEE (there is no sky-light sampler), so its
             // contribution always has MIS weight 1.0 regardless of
@@ -1366,7 +1430,7 @@ fn trace_path(
         };
         let tri = &scene.triangles[hit.prim_id as usize];
         let shading = &scene.shading_data[hit.prim_id as usize];
-        let mat = scene.material_for(hit.prim_id);
+        let flat_mat = scene.material_for(hit.prim_id);
 
         // Smooth-normal interpolation; fall back to geometric if degenerate.
         let w = 1.0 - hit.u - hit.v;
@@ -1376,11 +1440,33 @@ fn trace_path(
         } else {
             smooth.normalize()
         };
-        let n = if n_shade.dot(-ray.dir) > 0.0 {
+        let mut n = if n_shade.dot(-ray.dir) > 0.0 {
             n_shade
         } else {
             -n_shade
         };
+
+        // Barycentric UV interpolation for texture sampling.
+        let uv = shading.uv0 * w + shading.uv1 * hit.u + shading.uv2 * hit.v;
+        // Resolve textured material slots (albedo / metallic-roughness /
+        // emissive) by sampling the atlas at the interpolated UV. The
+        // returned material has `texture_bindings = None`, so the BSDF
+        // sample/eval/pdf loop below operates on flat per-pixel values.
+        let mat = crate::material::sample_textured_material(&flat_mat, &scene.textures, uv);
+        // Apply the normal map (if any) before the BSDF dispatch — every
+        // downstream consumer of `n` (tangent basis, NEE, BSDF) reads it
+        // post-perturbation.
+        if let Some(bindings) = flat_mat.texture_bindings {
+            let (t_axis, b_axis) = crate::material::tangent_basis(n);
+            n = crate::material::sample_normal_map(
+                Some(&bindings),
+                &scene.textures,
+                uv,
+                n,
+                t_axis,
+                b_axis,
+            );
+        }
 
         let hit_pos = ray.at(hit.t);
         let wo = -ray.dir;
@@ -1509,12 +1595,22 @@ fn trace_path(
             throughput /= p_continue;
         }
 
-        ray = Ray::new(hit_pos, sample.direction);
+        // For transmission samples, the next ray originates on the
+        // *opposite* side of the surface. The shading normal `n` here
+        // faces the incoming view direction, so a transmitted ray
+        // continues through the surface (offset by `-n * eps` not
+        // `+n * eps`).
+        let next_origin = if sample.is_transmission {
+            hit_pos - n * 1e-3
+        } else {
+            hit_pos + n * 1e-3
+        };
+        ray = Ray::new(next_origin, sample.direction);
         // Remember where this BSDF sample was taken from, so the next
         // iteration can compute the owning light's NEE pdf from the
         // same shading point when MIS-combining a BSDF-found emitter
         // contribution.
-        prev_hit_pos = hit_pos;
+        prev_hit_pos = next_origin;
     }
 
     // If max_bounces == 0 (a degenerate but valid config), neither the

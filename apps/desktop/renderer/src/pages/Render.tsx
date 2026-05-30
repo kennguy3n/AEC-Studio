@@ -27,6 +27,28 @@ function recommendedFor(tier: RuntimeStatus["tier"]): RenderPresetKey {
   return recommendedPresetFor(tier);
 }
 
+/**
+ * Convert a `Uint8Array` (image bytes coming back over the bridge)
+ * into a base64 string for use in `data:image/png;base64,…` URIs.
+ * Encodes in 8 KB chunks so we don't blow the `String.fromCharCode`
+ * argument-list limit on large renders.
+ */
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = "";
+  const chunkSize = 0x2000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(
+      null,
+      // `apply` requires `number[]`, not a typed array, in older
+      // type defs — we slice into a plain array first.
+      Array.from(bytes.subarray(i, i + chunkSize)),
+    );
+  }
+  return typeof btoa === "function"
+    ? btoa(binary)
+    : Buffer.from(binary, "binary").toString("base64");
+}
+
 // Empty list is the *only* legal starting state for the camera
 // selector. A previous incarnation seeded `FALLBACK_CAMERAS` with two
 // fake demo entries (`cam_living`, `cam_kitchen`) so the UI looked
@@ -60,6 +82,19 @@ export function Render() {
     DoctorSuggestion[]
   >([]);
   const [busy, setBusy] = useState(false);
+
+  // Latest completed-render preview + before/after compare state.
+  // `previewDataUri` mirrors the most recently completed job's
+  // output PNG (loaded via `aec.render.getOutputImage`). Compare
+  // tracks two job ids picked from the queue and computes SSIM via
+  // `aec.render.compareSsim` whenever the pair changes.
+  const [previewDataUri, setPreviewDataUri] = useState<string | null>(null);
+  const [previewJobId, setPreviewJobId] = useState<string | null>(null);
+  const [compareAId, setCompareAId] = useState<string | null>(null);
+  const [compareBId, setCompareBId] = useState<string | null>(null);
+  const [compareABytes, setCompareABytes] = useState<string | null>(null);
+  const [compareBBytes, setCompareBBytes] = useState<string | null>(null);
+  const [compareSsim, setCompareSsim] = useState<number | null>(null);
 
   // Defense-in-depth for `enqueueAll` so it can detect whether
   // the user transitioned to a different project (or closed the
@@ -246,6 +281,77 @@ export function Render() {
     void aec.render.applyPreset({ preset: next });
   }, []);
 
+  // Latest completed render → fetch its output image bytes and
+  // turn them into a `data:image/png;base64,…` URI for the
+  // RenderPreview `<img>`. We pick the most recent completed job
+  // by `completedAt` (or fall back to the first completed entry
+  // in the queue list when `completedAt` is absent).
+  useEffect(() => {
+    const completed = jobs
+      .filter((j) => j.status === "completed" && j.outputPath)
+      .sort((a, b) => {
+        const ta = a.completedAt ? Date.parse(a.completedAt) : 0;
+        const tb = b.completedAt ? Date.parse(b.completedAt) : 0;
+        return tb - ta;
+      });
+    const latest = completed[0] ?? null;
+    if (!latest || latest.jobId === previewJobId) {
+      return;
+    }
+    let alive = true;
+    (async () => {
+      try {
+        const out = await aec.render.getOutputImage({ jobId: latest.jobId });
+        if (!alive) return;
+        const b64 = bytesToBase64(out.bytes);
+        setPreviewDataUri(`data:image/png;base64,${b64}`);
+        setPreviewJobId(latest.jobId);
+      } catch {
+        // Bridge / IO failure (output file gone, permission
+        // denied) — keep the previous preview rather than
+        // clearing to null so the user doesn't see a flicker on
+        // every poll cycle. Surfaced at the bridge layer.
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [jobs, previewJobId]);
+
+  // Compare two completed renders: load both output images, compute
+  // SSIM, and surface all three to the BeforeAfterCompare widget.
+  // We refetch whenever either selected job id changes.
+  useEffect(() => {
+    if (!compareAId || !compareBId) {
+      setCompareABytes(null);
+      setCompareBBytes(null);
+      setCompareSsim(null);
+      return;
+    }
+    let alive = true;
+    (async () => {
+      try {
+        const [a, b, score] = await Promise.all([
+          aec.render.getOutputImage({ jobId: compareAId }),
+          aec.render.getOutputImage({ jobId: compareBId }),
+          aec.render.compareSsim({ aJobId: compareAId, bJobId: compareBId }),
+        ]);
+        if (!alive) return;
+        setCompareABytes(`data:image/png;base64,${bytesToBase64(a.bytes)}`);
+        setCompareBBytes(`data:image/png;base64,${bytesToBase64(b.bytes)}`);
+        setCompareSsim(score.ssim);
+      } catch {
+        if (!alive) return;
+        setCompareABytes(null);
+        setCompareBBytes(null);
+        setCompareSsim(null);
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [compareAId, compareBId]);
+
   const toggleCamera = (id: string) => {
     setSelectedCameras((prev) => {
       const next = new Set(prev);
@@ -400,8 +506,26 @@ export function Render() {
           />
         </aside>
         <main className="render-main">
-          <RenderPreview imageDataUri={null} caption="Latest preview" />
-          <BeforeAfterCompare before={null} after={null} />
+          <RenderPreview
+            imageDataUri={previewDataUri}
+            caption={
+              previewJobId
+                ? `Latest preview · job ${previewJobId}`
+                : "Latest preview"
+            }
+          />
+          <CompareJobPicker
+            jobs={jobs}
+            aJobId={compareAId}
+            bJobId={compareBId}
+            onAChange={setCompareAId}
+            onBChange={setCompareBId}
+          />
+          <BeforeAfterCompare
+            before={compareABytes}
+            after={compareBBytes}
+            ssim={compareSsim}
+          />
         </main>
         <aside className="render-side-r">
           <RenderQueue jobs={jobs} onCancel={onCancel} />
@@ -428,6 +552,76 @@ export function Render() {
           </div>
         </aside>
       </div>
+    </div>
+  );
+}
+
+interface CompareJobPickerProps {
+  jobs: RenderJob[];
+  aJobId: string | null;
+  bJobId: string | null;
+  onAChange: (jobId: string | null) => void;
+  onBChange: (jobId: string | null) => void;
+}
+
+/**
+ * Twin `<select>`s for picking the two completed render jobs that
+ * the `BeforeAfterCompare` slider should diff. Only `completed`
+ * jobs with an `outputPath` are listed — anything else has no
+ * image to read back via `aec.render.getOutputImage`.
+ */
+function CompareJobPicker({
+  jobs,
+  aJobId,
+  bJobId,
+  onAChange,
+  onBChange,
+}: CompareJobPickerProps) {
+  const eligible = jobs.filter(
+    (j) => j.status === "completed" && j.outputPath,
+  );
+  if (eligible.length < 2) {
+    return (
+      <p
+        className="render-compare__picker-empty"
+        data-testid="render-compare-picker-empty"
+      >
+        Complete at least two renders to compare them.
+      </p>
+    );
+  }
+  return (
+    <div className="render-compare__picker" data-testid="render-compare-picker">
+      <label>
+        Before:
+        <select
+          value={aJobId ?? ""}
+          onChange={(e) => onAChange(e.target.value || null)}
+          data-testid="render-compare-a-picker"
+        >
+          <option value="">(pick a render)</option>
+          {eligible.map((j) => (
+            <option key={j.jobId} value={j.jobId}>
+              {j.jobId}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label>
+        After:
+        <select
+          value={bJobId ?? ""}
+          onChange={(e) => onBChange(e.target.value || null)}
+          data-testid="render-compare-b-picker"
+        >
+          <option value="">(pick a render)</option>
+          {eligible.map((j) => (
+            <option key={j.jobId} value={j.jobId}>
+              {j.jobId}
+            </option>
+          ))}
+        </select>
+      </label>
     </div>
   );
 }

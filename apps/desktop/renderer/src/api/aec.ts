@@ -65,6 +65,21 @@ export type RenderJob = {
   progress: number;
   cameraId?: string | null;
   batchId?: string | null;
+  startedAt?: string | null;
+  completedAt?: string | null;
+  outputPath?: string | null;
+};
+
+export type RenderOutputImage = {
+  jobId: string;
+  path: string;
+  bytes: Uint8Array;
+};
+
+export type RenderCompareResult = {
+  aJobId: string;
+  bJobId: string;
+  ssim: number;
 };
 
 export type BatchProgress = {

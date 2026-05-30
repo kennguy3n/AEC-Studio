@@ -485,6 +485,22 @@ export function rendererInProcessBackend(): AecApi {
         averageProgress: 0,
       }),
       checkMaterials: async () => ({ findings: [] }),
+      // Phase 17 — output read-back + SSIM compare. The renderer
+      // fallback has no rendered output to surface, so each call
+      // throws a clear error. Tests that exercise the compare /
+      // preview flow are expected to vi.spyOn(aec.render, ...) and
+      // return a fixture.
+      getOutputImage: async (params: { jobId: string }) => {
+        throw new Error(
+          `renderGetOutputImage: in-process backend has no output for '${params.jobId}'; mock the bridge call in tests`,
+        );
+      },
+      compareSsim: async (params: { aJobId: string; bJobId: string }) => {
+        throw new Error(
+          `renderCompareSsim: in-process backend cannot compare ('${params.aJobId}', '${params.bJobId}'); mock the bridge call in tests`,
+        );
+      },
+      setEnvironmentMap: async () => ({ ok: true as const }),
     },
     ai: {
       // Return a defensive copy so callers (and Vitest harnesses) can't

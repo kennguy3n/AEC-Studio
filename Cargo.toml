@@ -50,7 +50,7 @@ ed25519-dalek = { version = "2", default-features = false, features = ["std", "r
 rand_core = { version = "0.6", default-features = false, features = ["std"] }
 rayon = "1"
 fastrand = "2"
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "hdr", "exr"] }
 gltf = { version = "1.4", default-features = false, features = ["import", "names", "utils"] }
 tobj = { version = "4", default-features = false }
 bincode = "1.3"

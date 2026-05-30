@@ -61,6 +61,11 @@ aec_cad = { path = "../aec_cad" }
 tempfile = { workspace = true }
 zip = { workspace = true }
 criterion = { workspace = true }
+# Phase 17 Group A Task 6 (`render_output_and_ssim_roundtrip_*`
+# tests): build a deterministic 4×4 PNG fixture on disk to drive
+# `render_get_output_image` + `render_compare_ssim` end-to-end
+# without invoking the actual path tracer.
+image = { workspace = true }
 # Phase 14 Group B Task 9 (`tests/phase8_journey.rs`) plants signed
 # extension manifests on disk to drive the bridge's
 # `BridgeConfig::extensions_dir` boot path end-to-end. The journey

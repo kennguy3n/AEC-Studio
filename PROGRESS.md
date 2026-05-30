@@ -740,6 +740,42 @@ This document tracks AEC Studio's phased delivery from open-source foundation to
 
 ---
 
+## Phase 17 — Top-level product quality
+
+**Status:** `IN PROGRESS`
+
+**Goal:** Lift AEC Studio out of "engineering-complete prototype" into "product the user actually wants to ship with." Six task groups: (A) path-tracer rendering quality, (B) design system + micro-UX, (C) user-journey completeness, (D) performance + architecture, (E) deliver + workflow polish, (F) accessibility + documentation. This entry tracks Group A (Tasks 1–6) — the highest-impact rendering changes (textures, glass transmission, HDRI environment maps, SSIM compare). Groups B–F land in follow-up PRs.
+
+### Group A — Path-tracer rendering quality (Tasks 1–6)
+
+| Item | Status |
+|---|---|
+| **Task 1** — `aec_render::texture::TextureAtlas` (CPU RGBA store, `image`-crate PNG/JPEG load, bilinear `sample_bilinear`, box-filter MIP chain, `from_material_library` factory + tests for 4×4 checkerboard + MIP level select) | `DONE` |
+| **Task 2** — `PathTraceMaterial` extended with `albedo_tex / normal_tex / metallic_roughness_tex / emissive_tex`; `PathTraceMaterial::from_pbr` resolves `PbrMaterial.{albedo,normal,metallic_roughness,emissive}_map` to `TextureId`s via the atlas; barycentric UV interpolation in `trace_ray`'s hit shader; tangent-space normal-map perturbation; glTF-packed MR sampling; tests for textured-quad render + normal-mapped sphere hemisphere shading | `DONE` |
+| **Task 3** — Glass/transmission BSDF lobe in `aec_render::material`: 3-lobe sampler (diffuse + specular + transmission), `mat.transmission * (1 - mat.metallic)` probability, Snell's-law refraction via `mat.ior`, TIR fallback to specular reflection, colored throughput `base_color * transmission`; `eval_bsdf`/`pdf_bsdf` updated for MIS; bounce loop offsets on the opposite side when a transmission sample is chosen; tests for refraction bending, transparency, TIR at grazing angle | `DONE` |
+| **Task 4** — `aec_render::environment::EnvironmentMap` loads `.hdr` (Radiance RGBE) + `.exr` (OpenEXR) into equirectangular `Vec<[f32; 3]>`; precomputed marginal + conditional CDFs for importance-sampled NEE; `sample_direction(dir)` replaces the procedural Hosek-Wilkie sky on ray escape; `light_sampling::sample_environment` for MIS; bridge `render:setEnvironmentMap` IPC + `aec.render.setEnvironmentMap({ path })` surface; tests for mirrored-sphere reflection detail + lower-variance importance sampling | `DONE` |
+| **Task 5** — `FinalRenderPipeline` builds a `TextureAtlas` from `MaterialLibrary` via `TextureAtlas::from_material_library`; `PathTraceScene::from_render_scene` propagates texture IDs + UVs from the geometry cache; PBR preview pipeline samples albedo textures for rasterized preview; CPU-only fallback with a clear log message when textures are present and GPU bindless arrays are unavailable; tests for end-to-end textured-project render producing non-uniform surface colors | `DONE` |
+| **Task 6** — `aec_render::compare::ssim_rgba_u8` + `ssim_from_files` (Wang et al. 2004) for quantitative compare; bridge `render:getOutputImage` + `render:compareSsim` IPCs with `RenderOutputImage { jobId, path, bytes }` + `RenderCompareResult { aJobId, bJobId, ssim }` wire shapes; `Render.tsx` auto-loads the latest completed render's PNG → `data:image/png;base64,…` URI; `BeforeAfterCompare` picks two jobs from the queue, fetches both outputs, computes SSIM, and displays the score as a percent above the slider; tests for identical-image SSIM = 1.0, noisy-vs-denoised SSIM ∈ (0.8, 1.0), bridge `render_output_and_ssim_roundtrip_against_real_png` + 5 error-path unit tests | `DONE` |
+
+### Exit criteria (Group A)
+
+- [x] Path tracer samples albedo, normal, and metallic-roughness textures with bilinear filtering + glTF-packed channel layout (green = roughness, blue = metallic).
+- [x] Glass / transmission lobe routes through `sample_bsdf` with MIS-correct `eval_bsdf` + `pdf_bsdf`, including TIR fallback at grazing angles.
+- [x] `.hdr` + `.exr` environment maps load and importance-sample for next-event estimation; `render:setEnvironmentMap` swaps the active env without re-creating the scene.
+- [x] `FinalRenderPipeline` end-to-end wires textures + transmission + environment through the build → render → output PNG path.
+- [x] `BeforeAfterCompare` shows two real render outputs (selected from the queue), with the SSIM score rendered above the slider.
+- [x] `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all --check`, `npm test --workspaces` all pass.
+
+### Open items (Groups B–F)
+
+- Group B (Tasks 7–14): SVG icon set, dark mode, micro-animations, context menus, real PBR material panel, project thumbnails, template previews, panel resize handles.
+- Group C (Tasks 15–20): BIM viewport integration, real spatial tree, real render output display + ETA, onboarding, draft viewport.
+- Group D (Tasks 21–24): shared-memory viewport frames, async bridge, constrained-Delaunay tessellator, LOD mesh decimation.
+- Group E (Tasks 25–28): unsaved-changes dialog, undo history panel, keyboard drafting polish, deliver pack preview.
+- Group F (Tasks 29–30): accessibility audit, documentation update (PROGRESS / PHASES / README / ARCHITECTURE).
+
+---
+
 ## MVP feature set summary
 
 | Category | Details |

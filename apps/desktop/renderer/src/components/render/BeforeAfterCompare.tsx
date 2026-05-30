@@ -3,9 +3,17 @@ import { useState } from "react";
 interface Props {
   before: string | null;
   after: string | null;
+  /**
+   * Structural Similarity Index between `before` and `after`, in
+   * `[-1, 1]`. `null` means the score has not been computed yet
+   * (e.g. the bridge call is in flight or only one image is loaded).
+   * Displayed as a percent above the slider so the user gets a
+   * quantitative signal in addition to the visual diff.
+   */
+  ssim?: number | null;
 }
 
-export function BeforeAfterCompare({ before, after }: Props) {
+export function BeforeAfterCompare({ before, after, ssim }: Props) {
   const [position, setPosition] = useState(50);
 
   if (!before || !after) {
@@ -43,6 +51,15 @@ export function BeforeAfterCompare({ before, after }: Props) {
           style={{ left: `${position}%` }}
         />
       </div>
+      {typeof ssim === "number" && Number.isFinite(ssim) ? (
+        <div
+          className="render-compare__ssim"
+          data-testid="render-compare-ssim"
+          title="Structural Similarity Index (Wang et al. 2004)"
+        >
+          SSIM: {(ssim * 100).toFixed(1)}%
+        </div>
+      ) : null}
       <input
         type="range"
         min={0}

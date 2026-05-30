@@ -492,6 +492,40 @@ export function registerIpcHandlers(): void {
     getBridge().renderCheckMaterials(),
   );
 
+  // ----- Phase 17 — output image read-back + SSIM compare -----
+  ipcMain.handle("render:getOutputImage", async (_e, p) => {
+    assertObject(p, "params");
+    const jobId = (p as { jobId?: unknown }).jobId;
+    assertString(jobId, "jobId");
+    return getBridge().renderGetOutputImage({ jobId: jobId as string });
+  });
+  ipcMain.handle("render:compareSsim", async (_e, p) => {
+    assertObject(p, "params");
+    const aJobId = (p as { aJobId?: unknown }).aJobId;
+    const bJobId = (p as { bJobId?: unknown }).bJobId;
+    assertString(aJobId, "aJobId");
+    assertString(bJobId, "bJobId");
+    return getBridge().renderCompareSsim({
+      aJobId: aJobId as string,
+      bJobId: bJobId as string,
+    });
+  });
+  ipcMain.handle("render:setEnvironmentMap", async (_e, p) => {
+    assertObject(p, "params");
+    const path = (p as { path?: unknown }).path;
+    if (path !== null && typeof path !== "string") {
+      throw new Error("renderSetEnvironmentMap: path must be string or null");
+    }
+    const intensity = (p as { intensity?: unknown }).intensity;
+    if (intensity !== undefined && typeof intensity !== "number") {
+      throw new Error("renderSetEnvironmentMap: intensity must be number");
+    }
+    return getBridge().renderSetEnvironmentMap({
+      path: path as string | null,
+      intensity: intensity as number | undefined,
+    });
+  });
+
   // ----- AI -----
   ipcMain.handle("ai:listTools", async () => getBridge().aiListTools());
   // `ai:plan` is routed through `withResolvedProjectPath` for the same

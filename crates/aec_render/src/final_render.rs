@@ -87,6 +87,14 @@ pub struct FinalRenderOutput {
 /// to produce a PNG on disk.
 pub struct FinalRenderPipeline {
     materials: MaterialLibrary,
+    environment: Option<crate::environment::EnvironmentMap>,
+    /// Resolver from `albedo_map.blob_hash` (or normal/MR/emissive)
+    /// to an absolute filesystem path. The default resolver returns
+    /// `None` for every input (so texture bindings end up `None` and
+    /// the renderer falls back to the flat colour). Production
+    /// callers should plug in a closure backed by their asset blob
+    /// store so on-disk texture files are picked up automatically.
+    blob_resolver: std::sync::Arc<dyn Fn(&str) -> Option<std::path::PathBuf> + Send + Sync>,
 }
 
 impl Default for FinalRenderPipeline {
@@ -101,6 +109,8 @@ impl FinalRenderPipeline {
     pub fn new() -> Self {
         Self {
             materials: MaterialLibrary::new(),
+            environment: None,
+            blob_resolver: std::sync::Arc::new(|_| None),
         }
     }
 
@@ -108,7 +118,29 @@ impl FinalRenderPipeline {
     /// `material_id` matches an entry in the library inherit that
     /// material's PBR properties.
     pub fn with_materials(materials: MaterialLibrary) -> Self {
-        Self { materials }
+        Self {
+            materials,
+            environment: None,
+            blob_resolver: std::sync::Arc::new(|_| None),
+        }
+    }
+
+    /// Replace the HDRI environment map. Pass `None` to fall back to
+    /// the procedural Hosek-Wilkie sky. Builder-style so callers can
+    /// chain: `FinalRenderPipeline::with_materials(mats).with_environment(env)`.
+    pub fn with_environment(mut self, env: Option<crate::environment::EnvironmentMap>) -> Self {
+        self.environment = env;
+        self
+    }
+
+    /// Replace the texture-blob resolver used to wire albedo / normal
+    /// / metallic-roughness / emissive maps into the path tracer.
+    pub fn with_blob_resolver(
+        mut self,
+        resolver: std::sync::Arc<dyn Fn(&str) -> Option<std::path::PathBuf> + Send + Sync>,
+    ) -> Self {
+        self.blob_resolver = resolver;
+        self
     }
 
     /// Render using `scene.cameras[0]`. Errors with
@@ -160,7 +192,12 @@ impl FinalRenderPipeline {
         }
 
         let sky = scene_sky(scene);
-        let pt_scene = build_path_trace_scene(scene, &self.materials, sky);
+        let env = self.environment.clone();
+        let resolver = std::sync::Arc::clone(&self.blob_resolver);
+        let pt_scene =
+            build_path_trace_scene_with_env(scene, &self.materials, sky, env, move |id| {
+                resolver(id)
+            });
         let config = path_trace_config_from_preset(&preset.config, CameraProjection::Perspective);
 
         let start = Instant::now();
@@ -217,22 +254,52 @@ impl FinalRenderPipeline {
 /// Build a [`PathTraceScene`] from a [`RenderScene`] + material library.
 ///
 /// Exposed `pub(crate)` so the walkthrough / panorama pipelines can
-/// reuse the conversion without rebuilding it per-frame.
+/// reuse the conversion without rebuilding it per-frame. Internally
+/// builds a [`crate::texture::TextureAtlas`] by resolving any
+/// `albedo_map` / `normal_map` / `metallic_roughness_map` /
+/// `emissive_map` referenced by the materials, and threads the
+/// optional HDRI environment map through to the path tracer.
 pub(crate) fn build_path_trace_scene(
     scene: &RenderScene,
     materials: &MaterialLibrary,
     sky: SkyParams,
 ) -> PathTraceScene {
+    build_path_trace_scene_with_env(scene, materials, sky, None, |_id| None)
+}
+
+/// Same as [`build_path_trace_scene`] but with explicit environment
+/// map + texture-blob resolver (e.g. an asset-blob lookup that maps
+/// short ids → on-disk paths). The resolver receives the raw
+/// `albedo_map` / `normal_map` / etc. strings from the PBR material
+/// and should return an absolute filesystem path when it can.
+pub(crate) fn build_path_trace_scene_with_env(
+    scene: &RenderScene,
+    materials: &MaterialLibrary,
+    sky: SkyParams,
+    environment: Option<crate::environment::EnvironmentMap>,
+    blob_resolver: impl Fn(&str) -> Option<std::path::PathBuf>,
+) -> PathTraceScene {
+    let mats: Vec<aec_materials::PbrMaterial> = materials.iter().cloned().collect();
+    let (atlas, bindings) =
+        crate::texture::TextureAtlas::from_material_library(&mats, &blob_resolver);
     let entries: Vec<(String, PathTraceMaterial)> = materials
         .iter()
-        .map(|m| (m.id.clone(), PathTraceMaterial::from_pbr(m)))
+        .zip(bindings.iter())
+        .map(|(m, b)| {
+            (
+                m.id.clone(),
+                PathTraceMaterial::from_pbr_with_textures(m, *b),
+            )
+        })
         .collect();
     let path_trace_materials: Vec<PathTraceMaterial> = entries.iter().map(|(_, m)| *m).collect();
-    PathTraceScene::from_render_scene(
+    PathTraceScene::from_render_scene_with_textures(
         scene,
         path_trace_materials,
         |id| entries.iter().position(|(eid, _)| eid == id),
         sky,
+        atlas,
+        environment,
     )
 }
 

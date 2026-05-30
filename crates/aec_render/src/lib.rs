@@ -12,8 +12,10 @@
 
 pub mod bvh;
 pub mod cameras;
+pub mod compare;
 pub mod denoise;
 pub mod doctor;
+pub mod environment;
 pub mod final_render;
 pub mod gpu_trace;
 pub mod history;
@@ -31,6 +33,7 @@ pub mod queue;
 pub mod sampling;
 pub mod scene;
 pub mod scheduler;
+pub mod texture;
 pub mod walkthrough;
 
 pub use bvh::{Aabb, BuilderTriangle, Bvh, BvhNode};
@@ -38,11 +41,13 @@ pub use cameras::{
     render_thumbnail_rgba8, CameraJournal, CameraJournalEntry, CameraPresetKind, CameraSnapshot,
     CameraStore, CameraValidationError,
 };
+pub use compare::{ssim_from_files, ssim_luminance, ssim_rgba_u8, CompareError};
 pub use denoise::{bilateral_denoise, nlm_denoise, BilateralParams, Denoiser, ImageRgb, NlmParams};
 pub use doctor::{
     check_materials, CheckMaterialsOptions, MaterialCheckResult, MaterialFinding,
     DEFAULT_MAX_TEXTURE_EDGE_PX,
 };
+pub use environment::{EnvironmentError, EnvironmentMap};
 pub use final_render::{FinalRenderError, FinalRenderOutput, FinalRenderPipeline};
 pub use gpu_trace::{
     render_or_fallback as gpu_render_or_fallback, validate_shader as gpu_validate_shader,
@@ -85,6 +90,10 @@ pub use scene::{RenderCamera, RenderLight, RenderScene, SerializedMesh};
 pub use scheduler::{
     config_from_preset as scheduler_config_from_preset, make_progress_observer, schedule,
     SchedulerConfig, SchedulerOutcome, SchedulerProgress, SchedulerProgressFn, SchedulerStats,
+};
+pub use texture::{
+    bilinear_sample, build_mip_chain, sample_rgb, AtlasEntry, MaterialTextureBindings, MipLevel,
+    TextureAtlas, TextureError, TextureId,
 };
 pub use walkthrough::{
     WalkthroughError, WalkthroughOutput, WalkthroughPipeline, WalkthroughProgress,

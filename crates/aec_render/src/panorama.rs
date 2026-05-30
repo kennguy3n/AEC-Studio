@@ -296,6 +296,8 @@ mod tests {
             material_ids: Vec::new(),
             lights: Vec::new(),
             sky: crate::lighting::SkyParams::default(),
+            textures: crate::texture::TextureAtlas::new(),
+            environment: None,
         };
         // A wide sun (15° half-angle ≈ 0.26 rad) so it occupies several
         // pixels of a low-resolution panorama; small enough that not
@@ -527,6 +529,8 @@ mod tests {
             material_ids: Vec::new(),
             lights: Vec::new(),
             sky: crate::lighting::SkyParams::default(),
+            textures: crate::texture::TextureAtlas::new(),
+            environment: None,
         };
         // Large sun (~17° angular radius) so even a 2-sample pixel at
         // the equator reliably hits it; tiny suns are too brittle.

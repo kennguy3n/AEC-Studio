@@ -429,6 +429,20 @@ pub struct RenderJobSummary {
     pub progress: f32,
     pub camera_id: Option<String>,
     pub batch_id: Option<String>,
+    /// Render started timestamp (RFC3339). `None` if still queued.
+    /// Used by the queue UI to compute "running for N seconds" and
+    /// by the ETA calculation. Always serialised as ISO-8601 so the
+    /// renderer can construct a `Date` object directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    /// Render completed timestamp (RFC3339). `None` while running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+    /// Output image path on disk. Populated when status is
+    /// `completed`. The renderer reads this via
+    /// [`BridgeService::render_get_output_image`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_path: Option<String>,
 }
 
 impl From<&CoreRenderJob> for RenderJobSummary {
@@ -440,8 +454,37 @@ impl From<&CoreRenderJob> for RenderJobSummary {
             progress: j.progress,
             camera_id: j.camera_id.clone(),
             batch_id: j.batch_id.clone(),
+            started_at: j.started_at.map(|t| t.to_rfc3339()),
+            completed_at: j.completed_at.map(|t| t.to_rfc3339()),
+            output_path: j
+                .output_path
+                .as_ref()
+                .map(|p| p.to_string_lossy().to_string()),
         }
     }
+}
+
+/// Raw bytes returned by [`BridgeService::render_get_output_image`].
+/// The renderer base64-encodes `bytes` and constructs a
+/// `data:image/png;base64,…` URL to feed into an `<img>` tag.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RenderOutputImage {
+    pub job_id: String,
+    pub path: String,
+    /// Raw image bytes (PNG, JPEG, or whatever the writer used).
+    /// Transparently materialised as a Node `Buffer` over the napi
+    /// boundary; no base64 round-trip occurs in the bridge itself.
+    pub bytes: Vec<u8>,
+}
+
+/// Result of [`BridgeService::render_compare_ssim`]. SSIM in
+/// `[-1.0, 1.0]`, with `1.0` meaning pixel-identical and `~0.95+`
+/// meaning visually indistinguishable.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RenderCompareResult {
+    pub a_job_id: String,
+    pub b_job_id: String,
+    pub ssim: f64,
 }
 
 fn render_job_status_to_str(s: RenderJobStatus) -> &'static str {
@@ -1427,6 +1470,14 @@ pub struct BridgeService {
 pub(crate) struct RenderState {
     pub(crate) queue: RenderQueue,
     pub(crate) preset_store: RenderPresetStore,
+    /// Optional HDRI environment map path + strength for the path
+    /// tracer. When `path` is `Some`, the renderer loads the file at
+    /// `path` and passes the resulting `EnvironmentMap` to
+    /// `build_path_trace_scene_with_env` instead of using the
+    /// procedural Hosek-Wilkie sky. Set via
+    /// [`BridgeService::render_set_environment_map`].
+    pub(crate) environment_path: Option<std::path::PathBuf>,
+    pub(crate) environment_intensity: f32,
 }
 
 impl RenderState {
@@ -1434,6 +1485,8 @@ impl RenderState {
         Self {
             queue: RenderQueue::new(),
             preset_store: RenderPresetStore::default(),
+            environment_path: None,
+            environment_intensity: 1.0,
         }
     }
 }
@@ -3766,6 +3819,106 @@ impl BridgeService {
             }
         }
         Ok(RenderCheckMaterialsReport { findings })
+    }
+
+    /// Set the HDRI environment map used by future render jobs.
+    /// Pass `None` to fall back to the procedural Hosek-Wilkie sky.
+    ///
+    /// The path is validated by attempting to load it once via
+    /// [`aec_render::environment::EnvironmentMap::load_hdr`] — if the
+    /// file does not exist or cannot be decoded as `.hdr` / `.exr`,
+    /// returns [`BridgeServiceError::Core`] and leaves the existing
+    /// environment unchanged.
+    pub fn render_set_environment_map(
+        &self,
+        path: Option<&str>,
+        intensity: Option<f32>,
+    ) -> Result<(), BridgeServiceError> {
+        let mut state = self.lock_render_state()?;
+        if let Some(p) = path {
+            let buf = std::path::PathBuf::from(p);
+            // Validate that the file loads — produces a clear
+            // error early instead of a confusing failure inside
+            // the render loop.
+            aec_render::environment::EnvironmentMap::load_hdr(&buf)
+                .map_err(|e| BridgeServiceError::Core(format!("load env map: {e}")))?;
+            state.environment_path = Some(buf);
+        } else {
+            state.environment_path = None;
+        }
+        if let Some(i) = intensity {
+            state.environment_intensity = i.max(0.0);
+        }
+        Ok(())
+    }
+
+    /// Read the on-disk output image for a completed render job and
+    /// return its raw PNG/JPEG bytes. The renderer uses this to populate
+    /// the `RenderPreview` and `BeforeAfterCompare` components via the
+    /// `render:getOutputImage` IPC.
+    ///
+    /// Returns [`BridgeServiceError::Core`] when the job is unknown or
+    /// has no recorded `output_path`, and [`BridgeServiceError::Core`]
+    /// (wrapping the underlying io error) when the path exists in the
+    /// job record but the file cannot be read.
+    pub fn render_get_output_image(
+        &self,
+        job_id: &str,
+    ) -> Result<RenderOutputImage, BridgeServiceError> {
+        let state = self.lock_render_state()?;
+        let job = state
+            .queue
+            .list_jobs()
+            .into_iter()
+            .find(|j| j.id == job_id)
+            .ok_or_else(|| BridgeServiceError::Core(format!("render job '{job_id}' not found")))?;
+        let path = job.output_path.clone().ok_or_else(|| {
+            BridgeServiceError::Core(format!("render job '{job_id}' has no output yet"))
+        })?;
+        let bytes = std::fs::read(&path)
+            .map_err(|e| BridgeServiceError::Core(format!("read {}: {e}", path.display())))?;
+        Ok(RenderOutputImage {
+            job_id: job.id.clone(),
+            path: path.to_string_lossy().to_string(),
+            bytes,
+        })
+    }
+
+    /// Compute the SSIM (Wang et al. 2004) between two completed
+    /// render jobs' output images. Powers the slider widget in
+    /// `Render.tsx`'s `BeforeAfterCompare` — the displayed score
+    /// quantifies how visually similar the two renders are.
+    ///
+    /// SSIM ranges over `[-1.0, 1.0]`; values near `1.0` mean the
+    /// renders are visually indistinguishable. Mismatched image
+    /// dimensions and missing output paths surface as
+    /// [`BridgeServiceError::Core`].
+    pub fn render_compare_ssim(
+        &self,
+        a_job_id: &str,
+        b_job_id: &str,
+    ) -> Result<RenderCompareResult, BridgeServiceError> {
+        let state = self.lock_render_state()?;
+        let lookup = |id: &str| -> Result<std::path::PathBuf, BridgeServiceError> {
+            let job = state
+                .queue
+                .list_jobs()
+                .into_iter()
+                .find(|j| j.id == id)
+                .ok_or_else(|| BridgeServiceError::Core(format!("render job '{id}' not found")))?;
+            job.output_path.clone().ok_or_else(|| {
+                BridgeServiceError::Core(format!("render job '{id}' has no output yet"))
+            })
+        };
+        let a_path = lookup(a_job_id)?;
+        let b_path = lookup(b_job_id)?;
+        let ssim = aec_render::compare::ssim_from_files(&a_path, &b_path)
+            .map_err(|e| BridgeServiceError::Core(format!("ssim: {e}")))?;
+        Ok(RenderCompareResult {
+            a_job_id: a_job_id.to_string(),
+            b_job_id: b_job_id.to_string(),
+            ssim: ssim as f64,
+        })
     }
 
     fn lock_render_state(
@@ -7257,6 +7410,104 @@ END-ISO-10303-21;\n";
         let (s, _g) = service();
         let r = s.render_check_materials().unwrap();
         assert!(r.findings.is_empty());
+    }
+
+    #[test]
+    fn render_get_output_image_unknown_job_is_error() {
+        let (s, _g) = service();
+        let err = s.render_get_output_image("not-a-real-job").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not found"),
+            "expected 'not found' in error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn render_get_output_image_pending_job_is_error() {
+        let (s, _g) = service();
+        let r = s.render_enqueue("cam-1", "quick", 0, None).unwrap();
+        // Job is queued but has not yet run — no output_path.
+        let err = s.render_get_output_image(&r.job_id).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no output"),
+            "expected 'no output' in error for pending job, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn render_compare_ssim_unknown_jobs_are_errors() {
+        let (s, _g) = service();
+        let err = s.render_compare_ssim("missing-a", "missing-b").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not found"),
+            "expected 'not found' in error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn render_set_environment_map_clears_when_path_is_none() {
+        // The clear path doesn't touch the filesystem, so it
+        // succeeds even with a fresh service.
+        let (s, _g) = service();
+        s.render_set_environment_map(None, Some(1.5)).unwrap();
+    }
+
+    #[test]
+    fn render_set_environment_map_rejects_missing_file() {
+        let (s, _g) = service();
+        let err = s
+            .render_set_environment_map(Some("/this/path/does/not/exist.hdr"), None)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("load env map"),
+            "expected 'load env map' in error, got: {msg}"
+        );
+    }
+
+    /// Happy path for the Phase 17 IPC surface: enqueue → admit →
+    /// complete with a real PNG on disk → read it back via
+    /// `render_get_output_image` and compare to itself via
+    /// `render_compare_ssim`. Covers the bridge's bytes-on-the-wire
+    /// contract end-to-end (file IO + service plumbing) without
+    /// invoking the actual path tracer.
+    #[test]
+    fn render_output_and_ssim_roundtrip_against_real_png() {
+        let (s, _g) = service();
+        // Enqueue + admit so the job is in the running set.
+        let enq = s.render_enqueue("cam-1", "quick", 0, None).unwrap();
+        // Write a small 4×4 deterministic PNG so we can read it back.
+        let tmp = tempfile::tempdir().unwrap();
+        let out_path = tmp.path().join("frame.png");
+        let pixels: Vec<u8> = (0..(4 * 4 * 4)).map(|i| ((i * 17) % 256) as u8).collect();
+        let img = image::RgbaImage::from_raw(4, 4, pixels).expect("RgbaImage::from_raw 4x4 RGBA");
+        img.save(&out_path).expect("write fixture PNG");
+        // Drive the queue forward: admit → complete (the
+        // `RenderQueue` is `pub(crate)` so we can poke it directly
+        // from this module's tests).
+        {
+            let mut state = s.lock_render_state().unwrap();
+            let admitted = state.queue.admit().expect("admit");
+            assert_eq!(admitted.id, enq.job_id);
+            state.queue.complete(&enq.job_id, out_path.clone()).unwrap();
+        }
+        let out = s.render_get_output_image(&enq.job_id).unwrap();
+        assert_eq!(out.job_id, enq.job_id);
+        assert_eq!(out.path, out_path.to_string_lossy().to_string());
+        assert!(!out.bytes.is_empty(), "PNG bytes must not be empty");
+        // Compare the job's output against itself — SSIM is exactly
+        // 1.0 for two pixel-identical images.
+        let cmp = s.render_compare_ssim(&enq.job_id, &enq.job_id).unwrap();
+        assert_eq!(cmp.a_job_id, enq.job_id);
+        assert_eq!(cmp.b_job_id, enq.job_id);
+        assert!(
+            (cmp.ssim - 1.0).abs() < 1e-6,
+            "self-compare SSIM must be ≈ 1.0, got {}",
+            cmp.ssim
+        );
     }
 
     #[test]
