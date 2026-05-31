@@ -117,17 +117,36 @@ fn host_is_allowed(host: &str) -> bool {
 
 /// Validate that a redirect target is to an allowed host. Returns the
 /// new URL on success; an error otherwise.
+///
+/// The check parses the *authority* of the URL (RFC 3986 § 3.2) and
+/// strips the optional `userinfo @` prefix before passing the bare host
+/// to [`host_is_allowed`]. Without this step a crafted redirect such as
+/// `https://attacker@cdn-lfs.huggingface.co/...` would surface
+/// `"attacker@cdn-lfs.huggingface.co"` to the allow-list — which would
+/// then pass `.ends_with(".huggingface.co")` despite the *real* host
+/// being controlled by the attacker.
 fn validate_redirect(url: &str) -> Result<(), DownloadError> {
-    // Cheap host extraction without pulling in `url`: split off "scheme://"
-    // then take everything before the next "/", ":", or end.
+    // Cheap authority extraction without pulling in `url`: split off
+    // "scheme://" then take everything up to the next "/", "?", or "#".
+    // Note that `:` is *not* an authority terminator — it appears both
+    // inside `userinfo` (`user:pass`) and before the port (`host:443`),
+    // so we must not stop on it here.
     let after_scheme = url
         .split_once("://")
         .map(|(_, rest)| rest)
         .ok_or_else(|| DownloadError::DisallowedRedirect(url.to_string()))?;
-    let host_end = after_scheme
-        .find(['/', ':', '?', '#'])
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
         .unwrap_or(after_scheme.len());
-    let host = &after_scheme[..host_end];
+    let authority = &after_scheme[..authority_end];
+    // Strip optional `userinfo@` per RFC 3986 § 3.2.1 so that
+    // `evil@cdn-lfs.huggingface.co` is allow-listed as
+    // `cdn-lfs.huggingface.co`, not as the full `evil@…` string that
+    // merely *ends with* `.huggingface.co`. RFC 3986 mandates that the
+    // *last* `@` separates userinfo from host, so we use `rsplit_once`.
+    let hostport = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    // Drop the optional port suffix (`:NNNN`); the allow-list is host-only.
+    let host = hostport.split_once(':').map_or(hostport, |(h, _)| h);
     if host_is_allowed(host) {
         Ok(())
     } else {
@@ -437,6 +456,54 @@ mod tests {
         assert!(validate_redirect("https://huggingface.co/x").is_ok());
         assert!(validate_redirect("https://cdn-lfs.huggingface.co/x").is_ok());
         assert!(validate_redirect("https://evil.example.com/x").is_err());
+    }
+
+    #[test]
+    fn validate_redirect_strips_userinfo_before_allowlisting() {
+        // RFC 3986 § 3.2.1: a URL's authority may carry an optional
+        // `userinfo @` prefix. The real DNS host is whatever follows
+        // the *last* `@`. Without userinfo stripping, the substring
+        // before `host_is_allowed` would be `"attacker@…huggingface.co"`,
+        // which spuriously passes `.ends_with(".huggingface.co")` even
+        // though the host segment is attacker-controlled.
+        //
+        // Bare userinfo (no host suffix) should also be rejected, not
+        // silently accepted.
+        assert!(
+            validate_redirect("https://attacker@evil.example.com/x").is_err(),
+            "userinfo must not be treated as the host"
+        );
+        // A `userinfo @ allowed-host` form must still parse the host
+        // correctly and admit the redirect — userinfo by itself is
+        // not grounds for rejection.
+        assert!(
+            validate_redirect("https://user:pass@cdn-lfs.huggingface.co/x").is_ok(),
+            "userinfo with allowed host must be accepted post-strip"
+        );
+        // Multiple `@` characters: the last one separates userinfo from
+        // host (rsplit picks the last segment).
+        assert!(
+            validate_redirect("https://a@b@huggingface.co/x").is_ok(),
+            "multi-@ authority must split on the last @"
+        );
+        assert!(
+            validate_redirect("https://a@b@evil.example.com/x").is_err(),
+            "multi-@ authority must still reject when the post-@ host is not allowed"
+        );
+        // Port-suffix handling: the allow-list checks the bare host, so
+        // `:443` (or any other port) must not perturb the decision.
+        assert!(
+            validate_redirect("https://cdn-lfs.huggingface.co:443/x").is_ok(),
+            "explicit port on an allowed host must still be accepted"
+        );
+        assert!(
+            validate_redirect("https://evil.example.com:443/x").is_err(),
+            "explicit port must not rescue a disallowed host"
+        );
+        assert!(
+            validate_redirect("https://user:pass@cdn-lfs.huggingface.co:443/x").is_ok(),
+            "userinfo + port on an allowed host must be accepted"
+        );
     }
 
     #[test]

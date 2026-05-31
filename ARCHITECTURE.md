@@ -1201,8 +1201,6 @@ aec-studio/
 │   │                             boq.rs, interior_pack.rs, contractor_pack.rs, bim_pack.rs,
 │   │                             before_after.rs, xlsx.rs; determinism + contractor_perf + phase6_e2e tests
 │   └── aec_audit/              # Audit trail, project history (ActorKind::KChat for review comments)
-├── workers/                    # Sidecar processes
-│   └── ai/                     # llama-server sidecar config (the only remaining external sidecar)
 ├── templates/                  # Project, room, drawing, render, BIM templates
 │   ├── interior/
 │   ├── architecture/

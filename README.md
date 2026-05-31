@@ -242,8 +242,6 @@ aec-studio/
 │   ├── aec_governor/           # Resource governor, hardware profiler, scheduling
 │   ├── aec_export/             # PDF, DXF, IFC, glTF, proposal pack export
 │   └── aec_audit/              # Audit trail, project history
-├── workers/                    # Sidecar processes
-│   └── ai/                     # llama-server sidecar config
 ├── templates/                  # Project, room, drawing, render, BIM templates
 │   ├── interior/
 │   ├── architecture/
