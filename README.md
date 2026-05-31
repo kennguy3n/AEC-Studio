@@ -11,7 +11,7 @@
 - **BIM Lite / IFC** — import, view, classify, and lightly edit IFC building models; produce room and door/window schedules; do quantity takeoff for small projects.
 - **Asset Library** — bundled and importable furniture, materials, and presets organized by project type (apartment, café, office, villa, retail, kitchen, bathroom, renovation).
 - **Local Render** — PBR-class previews and photorealistic final renders driven by a native Rust path tracer (CPU + wgpu compute), with batch queues, presets, and walkthrough/panorama support. No external runtime needed.
-- **Local AI** — on-device AI assistants for plan detection, style suggestions, render-doctor diagnostics, CAD cleanup, and BIM classification — all running through a local llama.cpp / PrismML sidecar with explicit, previewable actions.
+- **Local AI** — on-device AI assistants for plan detection, style suggestions, render-doctor diagnostics, CAD cleanup, and BIM classification — all running through a local `llama-server` sidecar (PrismML llama.cpp fork) loading **Ternary-Bonsai 1.58-bit GGUF** models with explicit, previewable actions. No Python shipped; Metal / CUDA / Vulkan acceleration per platform.
 - **Deliver** — proposal packs, contractor handoff bundles, BOQ-lite quantity exports, IFC packs, and PDF/DXF exports tailored to the project type.
 - **One project, many outputs** — a single `.aecstudio` package emits client decks, drawings, BIM exports, and contractor packages without duplicating data.
 
@@ -51,12 +51,14 @@ Desktop only. Supports **CPU-only** and **CPU+GPU** configurations.
 
 | Target | Acceleration |
 |---|---|
-| Apple Silicon (macOS) | **MLX** for inference, Metal for viewport and the native wgpu path tracer |
+| Apple Silicon (macOS) | **llama.cpp Metal backend** (PrismML fork) for inference on GGUF models, Metal for viewport and the native wgpu path tracer |
 | Windows CPU | **llama.cpp** (PrismML fork) with **AVX2 / AVX-VNNI / AVX-512 VNNI** |
-| Windows GPU | **Vulkan / CUDA** for inference, DX12 / Vulkan for the native wgpu path tracer |
+| Windows GPU | **CUDA** (NVIDIA) or **Vulkan** (AMD/Intel) for inference, DX12 / Vulkan for the native wgpu path tracer |
 | Linux CPU | **llama.cpp** (PrismML fork) with **AVX2 / AVX-VNNI / AVX-512 VNNI** |
 | Linux GPU | **Vulkan** for inference and the native wgpu path tracer (CUDA optional on NVIDIA for inference only) |
 | Viewport / CAD canvas (all platforms) | **wgpu** with Vulkan, Metal, D3D12, or OpenGL backend |
+
+All inference runs through **pre-compiled native C/C++ binaries** (the `llama-server` sidecar from the PrismML llama.cpp fork). **No Python is shipped with the app** — the MLX-2bit checkpoints published by PrismML are reference / conversion sources, never loaded at runtime.
 
 ---
 
@@ -69,8 +71,8 @@ Desktop only. Supports **CPU-only** and **CPU+GPU** configurations.
 | Core engine | Rust |
 | Native viewport | wgpu (Vulkan / Metal / D3D12 / OpenGL) |
 | Local storage | SQLite / SQLCipher |
-| Model runtime | llama.cpp / PrismML sidecar |
-| Apple Silicon acceleration | MLX |
+| Model runtime | `llama-server` (PrismML llama.cpp fork) — Ternary-Bonsai 1.58-bit GGUF |
+| Apple Silicon acceleration | llama.cpp Metal backend (`-ngl 999`) — no Python / MLX in the shipped runtime |
 | BIM / IFC | Native Rust STEP parser + writer + tessellator (`aec_bim::ifc`) — IFC4 with IFC2x3 / IFC4x3 input compatibility |
 | Render engine | Native Rust path tracer + PBR rasterizer (wgpu compute, CPU fallback) |
 | Electron ↔ Rust bridge | N-API (napi-rs) |
@@ -301,6 +303,7 @@ AGPL-3.0 — see [LICENSE](LICENSE).
 - [PROGRESS.md](PROGRESS.md) — phased delivery tracker
 - [PHASES.md](PHASES.md) — top-line phase status
 - [EXTENSIONS.md](EXTENSIONS.md) — extension system: manifest schema, permissions, signatures
+- [docs/AI_RUNTIME.md](docs/AI_RUNTIME.md) — AI runtime architecture (Ternary-Bonsai 1.58-bit GGUF, `llama-server` sidecar, no Python)
 - [CONTRIBUTING.md](CONTRIBUTING.md) — contribution guide
 - [SECURITY.md](SECURITY.md) — security policy
 - [docs/LICENSE_ARCHITECTURE.md](docs/LICENSE_ARCHITECTURE.md) — AGPL boundary analysis (llama.cpp; rendering and BIM are now in-process Rust)

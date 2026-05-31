@@ -56,7 +56,7 @@ flowchart TB
     end
 
     subgraph "Local AI Worker"
-        LlamaSidecar["llama.cpp / PrismML / MLX"]
+        LlamaSidecar["llama-server (PrismML llama.cpp fork)"]
         VisionModel["Plan-detection vision model"]
         Embeddings["Embeddings"]
         ToolPlanner["Tool planner (grammar-constrained)"]
@@ -121,8 +121,8 @@ flowchart TB
 | Native viewport | wgpu | Cross-platform GPU (Vulkan / Metal / D3D12 / OpenGL) for 3D + 2D CAD |
 | Local database | SQLite / SQLCipher | Local-first, encrypted, single-file project storage |
 | Search / hybrid retrieval | SQLite FTS5 + embeddings | Asset search, BIM property search without external services |
-| Model runtime | llama.cpp / PrismML sidecar | Local GGUF inference with broad acceleration coverage |
-| Apple Silicon | MLX | macOS ARM inference acceleration |
+| Model runtime | `llama-server` (PrismML llama.cpp fork) — Ternary-Bonsai 1.58-bit GGUF | Native C/C++ inference; no Python in the runtime |
+| Apple Silicon | llama.cpp Metal backend (`--gpu-layers 999`) | Full-layer Metal offload — no MLX / Python dependency |
 | Render engine | Native Rust path tracer (wgpu compute) + PBR rasterizer | Photoreal final + fast preview, in-process with no external runtime |
 | BIM / IFC | Native Rust STEP parser + writer + tessellator (`aec_bim::ifc`) | In-process IFC4 (and IFC2x3 / IFC4x3 on input) with verbatim Pset round-trip; no external dependency |
 | Electron bridge | N-API (napi-rs) | Low-overhead Rust ↔ Node.js calls |
@@ -989,19 +989,36 @@ Asset import (glTF / FBX / OBJ)
 
 ## Local model runtime
 
+> See [docs/AI_RUNTIME.md](docs/AI_RUNTIME.md) for the full AI runtime
+> architecture: model list with BLAKE3 hashes, sidecar spawn args per
+> platform, download privacy guarantees, and the no-Python enforcement
+> proof chain. This section is the architectural summary.
+
 ### PrismML llama.cpp fork
 
 AEC Studio uses the **PrismML** fork of llama.cpp ([kennguy3n/llama.cpp@prism](https://github.com/kennguy3n/llama.cpp)) for local model inference. The PrismML fork adds:
 
-- Q1_0_g128 ternary repack format for memory-efficient small models.
+- Q2_0 1.58-bit packing for Ternary-Bonsai models (the production format
+  AEC Studio ships) — the closely-related Q1_0_g128 ternary repack also
+  ships as a reference path.
 - Acceleration across CUDA, Metal, Vulkan, AVX-512 VNNI, AVX-VNNI, AVX2, and ARM NEON.
 - Tooling and packaging hooks AEC Studio uses to produce per-platform sidecars.
 
 ### Adapter bootstrap priority
 
 ```
-MLXAdapter (macOS Apple Silicon) → LlamaCppAdapter (Windows / Linux / fallback) → Disabled (no AI mode)
+LlamaCppAdapter (all platforms — Metal on macOS, CUDA / Vulkan on Windows / Linux) → Disabled (no AI mode)
 ```
+
+There is no `MLXAdapter` shipped in AEC Studio. The PrismML team publishes
+MLX-2bit checkpoints (`prism-ml/Ternary-Bonsai-*-mlx-2bit`) as a *conversion
+source format* for the GGUF-Q2_0 files we actually load; nothing in the AEC
+Studio runtime opens an MLX file, because MLX requires the Python `mlx` /
+`mlx-lm` packages and AEC Studio ships **no Python**. On Apple Silicon, the
+production inference path is `llama-server` with `--gpu-layers 999`, which
+offloads every transformer layer to Metal — measurably faster than MLX on
+Q2_0 weights for the Bonsai family and removes an entire runtime
+dependency.
 
 ### Inference tasks for AEC
 
@@ -1092,9 +1109,9 @@ Encryption uses SQLCipher with **AES-256 page-level** and per-project keys. Cont
 |---|---|
 | Shell | Electron + React |
 | Native addon | Universal N-API addon (Intel + Apple Silicon) |
-| Preferred AI runtime | MLX (MLXAdapter) |
+| AI runtime | `llama-server` (PrismML llama.cpp fork) — Metal backend via `--gpu-layers 999` on Apple Silicon; CPU AVX2 / AVX-VNNI fallback on Intel; CPU NEON fallback on Apple Silicon |
 | Render GPU | wgpu Metal backend (native path tracer + PBR rasterizer) |
-| Fallback AI runtime | LlamaCppAdapter (CPU AVX2/AVX-VNNI on Intel; CPU NEON on Apple Silicon) |
+| Python in runtime | **None** — MLX-2bit checkpoints are conversion sources only, never loaded |
 | Packaging | electron-builder, `.dmg` and `.zip` |
 | Code signing / notarization | Apple Developer ID + notarytool |
 

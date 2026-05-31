@@ -473,20 +473,20 @@ aec_ai (Rust)
 ├── planner/                    # Schema-bound planner (grammar-constrained decoding)
 ├── safety_validator/           # Enforces scope, bounded changes, tool whitelist
 ├── diff_engine/                # Builds previewable diffs against the command engine
-├── runtime/                    # Sidecar lifecycle (llama.cpp / PrismML / MLX)
+├── runtime/                    # Sidecar lifecycle (llama-server, PrismML llama.cpp fork)
 ├── grammars/                   # GBNF grammars for tool calls and structured outputs
 └── audit/                      # Logs accepted/rejected actions to the audit trail
 ```
 
 ### AI model tiers
 
-| Tier | Model | RAM target | Use case |
-|---|---|---|---|
-| **Lightweight** | Bonsai 1.7B (Q4_K_M or Q1_0_g128 ternary) | 2–4 GB | Tool calls, schedule fill, classification suggestions |
-| **Balanced** | Bonsai 4B | 6–8 GB | Style assistant, longer planning, BIM property fill |
-| **Higher quality** | Bonsai 8B | 10+ GB | Multi-step layout suggestions, render doctor with rich rationale |
+| Tier | Model | Format | RAM target | Use case |
+|---|---|---|---|---|
+| **Small** | [Ternary-Bonsai 1.7B](https://huggingface.co/prism-ml/Ternary-Bonsai-1.7B-gguf) | 1.58-bit GGUF (Q2_0) | 2–4 GB | Tool calls, schedule fill, classification suggestions |
+| **Medium** | [Ternary-Bonsai 4B](https://huggingface.co/prism-ml/Ternary-Bonsai-4B-gguf) | 1.58-bit GGUF (Q2_0) | 6–8 GB | Style assistant, longer planning, BIM property fill |
+| **Large** | [Ternary-Bonsai 8B](https://huggingface.co/prism-ml/Ternary-Bonsai-8B-gguf) | 1.58-bit GGUF (Q2_0) | 10+ GB | Multi-step layout suggestions, render doctor with rich rationale |
 
-On Apple Silicon, models run via **MLX** (2-bit or 4-bit). On Windows, they run via **llama.cpp / PrismML** (CPU AVX2/AVX-VNNI/AVX-512 VNNI, GPU Vulkan/CUDA).
+All three tiers ship as 1.58-bit ternary GGUF files (\~463 MB / 1.07 GB / 2.18 GB on disk) and load through the `llama-server` sidecar from the [PrismML llama.cpp fork](https://github.com/kennguy3n/llama.cpp). The runtime is the same on every platform — Apple Silicon Macs offload all layers to **Metal** via `--gpu-layers 999`, Windows / Linux machines use **CUDA** (NVIDIA), **Vulkan** (AMD / Intel), or fall back to CPU AVX2 / AVX-VNNI / AVX-512-VNNI. PrismML also publishes MLX-2bit checkpoints (`prism-ml/Ternary-Bonsai-*-mlx-2bit`); those are **conversion sources only** and never loaded at runtime, because the shipped app contains no Python.
 
 ---
 

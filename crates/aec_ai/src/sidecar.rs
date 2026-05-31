@@ -106,6 +106,92 @@ pub fn sidecar_bin() -> PathBuf {
     PathBuf::from(DEFAULT_SIDECAR_BIN)
 }
 
+/// Compile-time host-OS family. Captured into a value so the spawn arg
+/// builder can be unit-tested for every target without recompiling: tests
+/// pass a synthetic [`HostPlatform`] in instead of using `cfg!()`
+/// directly. Production code reads `HostPlatform::current()`, which
+/// resolves at compile time to whatever target the binary was built for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostPlatform {
+    /// macOS (any arch). Metal GPU offload via `--n-gpu-layers 999`.
+    MacOs,
+    /// Windows. CUDA / Vulkan offload + `--no-mmap` (Windows mmap of
+    /// multi-GB GGUF files is unreliable on FAT-backed or network drives,
+    /// and `llama-server` recommends disabling it on Windows).
+    Windows,
+    /// Linux (and other Unix). CUDA / Vulkan offload.
+    Linux,
+}
+
+impl HostPlatform {
+    /// Resolve the platform the current binary was built for.
+    pub const fn current() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::MacOs
+        } else if cfg!(target_os = "windows") {
+            Self::Windows
+        } else {
+            // Treat every other Unix the same as Linux for spawn-arg
+            // purposes — the GPU-offload + flash-attn + mmap behaviour
+            // is identical on FreeBSD / OpenBSD / illumos.
+            Self::Linux
+        }
+    }
+}
+
+/// Build the `llama-server` argv tail for `config` on `platform`. Returns
+/// the full ordered arg list (including the always-on `--host` /
+/// `--port` / `--model` flags) so the test suite can pin the exact
+/// command-line shape per target.
+///
+/// Args added on top of the baseline (host / port / ctx-size / parallel /
+/// model):
+///
+/// * `--n-gpu-layers 999` — request all-layer GPU offload. The PrismML
+///   fork falls back to CPU for any layer that doesn't fit, so this is
+///   safe to pass unconditionally; a CPU-only host simply ignores it
+///   after the auto-detect. On macOS this routes through Metal; on
+///   Windows / Linux through CUDA (NVIDIA), Vulkan (AMD / Intel), or HIP
+///   (consumer AMD), whichever was compiled into the binary.
+/// * `--flash-attn` — flash-attention kernels. Ternary-Bonsai Q2_0
+///   supports it on every backend the PrismML fork ships, and it cuts
+///   prefill latency \~30 % on Apple Silicon. There is no model where
+///   we'd want to *disable* this once the kernel exists, so it is
+///   unconditional.
+/// * `--no-mmap` — Windows-only. Disables `MapViewOfFile`-based loading
+///   for the model file; the fallback `read()` loop avoids the
+///   intermittent EOF errors `llama.cpp` reports on Windows when the
+///   GGUF lives on a network share or a non-NTFS drive. macOS / Linux
+///   keep mmap on for the cold-load fault-in win.
+///
+/// The argv is built deterministically so `spawn_args_for_*` tests can
+/// assert exact ordering and presence.
+pub fn build_spawn_args(config: &RuntimeConfig, platform: HostPlatform) -> Vec<String> {
+    let mut args = vec![
+        "--host".into(),
+        "127.0.0.1".into(),
+        "--port".into(),
+        config.port.to_string(),
+        "--ctx-size".into(),
+        config.max_context_tokens.to_string(),
+        "--parallel".into(),
+        config.parallel.to_string(),
+        "--model".into(),
+        config.model_path.display().to_string(),
+        // GPU offload + flash-attn are platform-independent in their
+        // *request* — the binary itself decides whether to honour them
+        // based on the backend it was compiled with and the hardware
+        // available at spawn time.
+        "--n-gpu-layers".into(),
+        "999".into(),
+        "--flash-attn".into(),
+    ];
+    if platform == HostPlatform::Windows {
+        args.push("--no-mmap".into());
+    }
+    args
+}
+
 /// Spawn the sidecar and wait until its `/health` endpoint reports `ok`.
 ///
 /// `health_poll_timeout` is the overall budget — typically 30 s for cold-cache
@@ -114,6 +200,10 @@ pub fn sidecar_bin() -> PathBuf {
 /// The returned `SidecarHandle` *owns* the child process; dropping it kills
 /// the sidecar. The transport inside the handle is pre-configured with the
 /// runtime's request timeout.
+///
+/// Spawn args are built by [`build_spawn_args`] for [`HostPlatform::current`]
+/// — see that function's doc for the per-target GPU-offload / mmap /
+/// flash-attn matrix.
 pub fn spawn(
     config: &RuntimeConfig,
     health_poll_timeout: Duration,
@@ -121,16 +211,9 @@ pub fn spawn(
     let bin = sidecar_bin();
     let bin_display = bin.display().to_string();
     let mut cmd = Command::new(&bin);
-    cmd.arg("--host")
-        .arg("127.0.0.1")
-        .arg("--port")
-        .arg(config.port.to_string())
-        .arg("--ctx-size")
-        .arg(config.max_context_tokens.to_string())
-        .arg("--parallel")
-        .arg(config.parallel.to_string())
-        .arg("--model")
-        .arg(&config.model_path);
+    for arg in build_spawn_args(config, HostPlatform::current()) {
+        cmd.arg(arg);
+    }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -380,6 +463,98 @@ mod tests {
         policy.reset();
         assert_eq!(policy.consecutive_failures(), 0);
         assert_eq!(policy.next_delay(), Duration::from_millis(500));
+    }
+
+    /// The argv builder must include `--n-gpu-layers 999` and
+    /// `--flash-attn` on every platform — PrismML auto-detects whether
+    /// the backend can honour the offload request, so passing it on a
+    /// CPU-only host is a no-op rather than a failure. Pinning this is
+    /// what stops a future "let's drop GPU flags on Linux" regression
+    /// from silently halving inference speed on every GPU machine.
+    #[test]
+    fn spawn_args_request_gpu_offload_and_flash_attn_on_every_platform() {
+        let cfg = RuntimeConfig::default();
+        for platform in [
+            HostPlatform::MacOs,
+            HostPlatform::Linux,
+            HostPlatform::Windows,
+        ] {
+            let args = build_spawn_args(&cfg, platform);
+            // `--n-gpu-layers 999` must appear as a pair.
+            let ngl_idx = args
+                .iter()
+                .position(|a| a == "--n-gpu-layers")
+                .unwrap_or_else(|| panic!("missing --n-gpu-layers on {platform:?}: {args:?}"));
+            assert_eq!(
+                args.get(ngl_idx + 1).map(String::as_str),
+                Some("999"),
+                "--n-gpu-layers must be followed by 999 on {platform:?}",
+            );
+            assert!(
+                args.iter().any(|a| a == "--flash-attn"),
+                "missing --flash-attn on {platform:?}: {args:?}",
+            );
+        }
+    }
+
+    /// `--no-mmap` is Windows-specific. The mmap fallback path inside
+    /// `llama.cpp` reports intermittent EOF errors on Windows network
+    /// drives and non-NTFS volumes; macOS / Linux mmap is reliable for
+    /// multi-GB GGUF loads so we keep it on for the page-fault-in win.
+    #[test]
+    fn no_mmap_only_on_windows() {
+        let cfg = RuntimeConfig::default();
+        assert!(
+            !build_spawn_args(&cfg, HostPlatform::MacOs).contains(&"--no-mmap".to_string()),
+            "macOS must not pass --no-mmap (mmap is the fast path)",
+        );
+        assert!(
+            !build_spawn_args(&cfg, HostPlatform::Linux).contains(&"--no-mmap".to_string()),
+            "Linux must not pass --no-mmap (mmap is the fast path)",
+        );
+        assert!(
+            build_spawn_args(&cfg, HostPlatform::Windows).contains(&"--no-mmap".to_string()),
+            "Windows must pass --no-mmap (mmap is unreliable for large GGUF on Windows)",
+        );
+    }
+
+    /// The baseline args (host, port, ctx-size, parallel, model) must
+    /// appear before the platform-specific GPU / mmap / flash-attn tail.
+    /// Their values must reflect the supplied [`RuntimeConfig`] so the
+    /// `ai_set_active_tier` → `reload_with_config` chain (which mutates
+    /// `model_path` and `max_context_tokens`) actually reaches the
+    /// sidecar process on next spawn.
+    #[test]
+    fn spawn_args_reflect_runtime_config_values() {
+        let cfg = RuntimeConfig {
+            port: 17_823,
+            max_context_tokens: 4096,
+            parallel: 3,
+            model_path: std::path::PathBuf::from("/fake/Ternary-Bonsai-8B-Q2_0.gguf"),
+            ..RuntimeConfig::default()
+        };
+        let args = build_spawn_args(&cfg, HostPlatform::Linux);
+        let pos = |needle: &str| {
+            args.iter()
+                .position(|a| a == needle)
+                .unwrap_or_else(|| panic!("missing {needle}: {args:?}"))
+        };
+        assert_eq!(
+            args.get(pos("--port") + 1).map(String::as_str),
+            Some("17823")
+        );
+        assert_eq!(
+            args.get(pos("--ctx-size") + 1).map(String::as_str),
+            Some("4096"),
+        );
+        assert_eq!(
+            args.get(pos("--parallel") + 1).map(String::as_str),
+            Some("3"),
+        );
+        assert_eq!(
+            args.get(pos("--model") + 1).map(String::as_str),
+            Some("/fake/Ternary-Bonsai-8B-Q2_0.gguf"),
+        );
     }
 
     #[test]
