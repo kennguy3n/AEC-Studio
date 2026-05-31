@@ -3080,6 +3080,296 @@ pub async fn ai_set_active_tier(tier: String) -> Result<()> {
 }
 
 // ============================================================
+// image-gen.* (Phase 18 Group C — text-to-image sidecar)
+// ============================================================
+//
+// Mirrors the `ai_*` family for the image-gen sidecar. Each handler
+// hops through `spawn_blocking_napi` so the libuv main thread is
+// never blocked, regardless of whether the underlying call is cheap
+// (status poll) or expensive (multi-minute model download, 30-60 s
+// sidecar cold spawn, multi-second txt2img sampling).
+
+/// JS-facing image-gen sidecar status. Mirrors [`AiRuntimeStatusJs`].
+#[napi(object)]
+pub struct ImageGenRuntimeStatusJs {
+    pub state: String,
+    pub last_error: Option<String>,
+}
+
+#[napi]
+pub async fn image_gen_runtime_status() -> Result<ImageGenRuntimeStatusJs> {
+    spawn_blocking_napi(move || {
+        with_service_ref_fallible(super::service::BridgeService::image_gen_runtime_status).map(
+            |r| ImageGenRuntimeStatusJs {
+                state: r.state,
+                last_error: r.last_error,
+            },
+        )
+    })
+    .await
+}
+
+#[napi(object)]
+pub struct ImageGenModelAvailabilityJs {
+    pub filename: String,
+    pub size_bytes: BigInt,
+    pub available: bool,
+    pub size_on_disk: BigInt,
+    pub download_url: Option<String>,
+    pub blake3_hex: String,
+    pub models_dir: String,
+}
+
+#[napi]
+pub async fn image_gen_model_availability() -> Result<ImageGenModelAvailabilityJs> {
+    spawn_blocking_napi(move || {
+        with_service_ref_fallible(super::service::BridgeService::image_gen_model_availability).map(
+            |r| ImageGenModelAvailabilityJs {
+                filename: r.filename,
+                size_bytes: BigInt::from(r.size_bytes),
+                available: r.available,
+                size_on_disk: BigInt::from(r.size_on_disk),
+                download_url: r.download_url,
+                blake3_hex: r.blake3_hex,
+                models_dir: r.models_dir,
+            },
+        )
+    })
+    .await
+}
+
+/// Caller-supplied image-gen descriptor. Mirrors the Rust
+/// [`aec_ai::image_gen::ImageGenModelDescriptor`] but flattens
+/// `size_bytes` from `u64` to `BigInt` for the napi boundary.
+#[napi(object)]
+pub struct ImageGenModelDescriptorJs {
+    pub filename: String,
+    pub size_bytes: BigInt,
+    pub blake3_hex: String,
+    pub download_url: Option<String>,
+    pub vae_filename: Option<String>,
+}
+
+#[napi]
+pub async fn image_gen_set_descriptor(descriptor: ImageGenModelDescriptorJs) -> Result<()> {
+    spawn_blocking_napi(move || {
+        // `get_u64` returns `(signed, value, lossless)`. We reject
+        // descriptors that overflowed the JS BigInt -> u64 conversion
+        // rather than silently truncating — a 4 EiB image-gen model
+        // is not a thing, so this is purely a defensive check
+        // against pathological caller inputs.
+        let (signed, size, lossless) = descriptor.size_bytes.get_u64();
+        if signed || !lossless {
+            return Err(Error::from_reason(
+                "image_gen_set_descriptor: size_bytes did not fit in u64".to_string(),
+            ));
+        }
+        let inner = aec_ai::image_gen::ImageGenModelDescriptor {
+            filename: descriptor.filename,
+            size_bytes: size,
+            blake3_hex: descriptor.blake3_hex,
+            download_url: descriptor.download_url,
+            vae_filename: descriptor.vae_filename,
+        };
+        with_service_ref_fallible(|svc| svc.image_gen_set_descriptor(inner))
+    })
+    .await
+}
+
+#[napi(object)]
+pub struct ImageGenDownloadProgressJs {
+    pub filename: String,
+    pub downloaded: BigInt,
+    pub total: BigInt,
+    pub state: String,
+    pub message: Option<String>,
+}
+
+#[napi(object)]
+pub struct ImageGenDownloadResultJs {
+    pub filename: String,
+    pub path: String,
+    pub size_bytes: BigInt,
+}
+
+/// Download the configured image-gen model GGUF, verify BLAKE3, and
+/// atomically rename into `models_dir`. Same lock-discipline split
+/// as [`ai_download_model`] — the SERVICE `RwLock` reader guard is
+/// dropped before the HTTP transfer.
+#[napi]
+pub async fn image_gen_download_model() -> Result<ImageGenDownloadResultJs> {
+    spawn_blocking_napi(move || {
+        let ctx = with_service_ref_fallible(|svc| svc.image_gen_prepare_download())?;
+        let r = BridgeService::run_image_gen_download(ctx)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(ImageGenDownloadResultJs {
+            filename: r.filename,
+            path: r.path,
+            size_bytes: BigInt::from(r.size_bytes),
+        })
+    })
+    .await
+}
+
+#[napi]
+pub fn image_gen_download_progress() -> Result<Option<ImageGenDownloadProgressJs>> {
+    with_service_ref_fallible(super::service::BridgeService::image_gen_download_progress).map(
+        |opt| {
+            opt.map(|p| ImageGenDownloadProgressJs {
+                filename: p.filename,
+                downloaded: BigInt::from(p.downloaded),
+                total: BigInt::from(p.total),
+                state: p.state,
+                message: p.message,
+            })
+        },
+    )
+}
+
+/// JS-facing txt2img request. Caller-supplied dimensions / steps /
+/// cfg_scale; sampler + seed are optional.
+#[napi(object)]
+pub struct ImageGenGenerateRequestJs {
+    pub prompt: String,
+    pub negative_prompt: Option<String>,
+    pub width: u32,
+    pub height: u32,
+    pub steps: u32,
+    pub cfg_scale: f64,
+    pub seed: Option<i64>,
+    pub sampler: Option<String>,
+}
+
+#[napi(object)]
+pub struct ImageGenGenerateResultJs {
+    pub png_base64: String,
+    pub seed: Option<i64>,
+    pub width: u32,
+    pub height: u32,
+    pub steps: u32,
+    pub info: Option<String>,
+}
+
+#[napi]
+pub async fn image_gen_generate(
+    request: ImageGenGenerateRequestJs,
+) -> Result<ImageGenGenerateResultJs> {
+    spawn_blocking_napi(move || {
+        let inner = super::service::ImageGenGenerateRequest {
+            prompt: request.prompt,
+            negative_prompt: request.negative_prompt,
+            width: request.width,
+            height: request.height,
+            steps: request.steps,
+            cfg_scale: request.cfg_scale as f32,
+            seed: request.seed,
+            sampler: request.sampler,
+        };
+        with_service_ref_fallible(|svc| svc.image_gen_generate(inner)).map(|r| {
+            ImageGenGenerateResultJs {
+                png_base64: r.png_base64,
+                seed: r.seed,
+                width: r.width,
+                height: r.height,
+                steps: r.steps,
+                info: r.info,
+            }
+        })
+    })
+    .await
+}
+
+// ============================================================
+// Phase 18 Group C Task 17 — image-gen governor policy surface
+// ============================================================
+
+/// JS-facing image-gen governor policy. Mirrors the Rust
+/// [`aec_governor::policy::ImageGenPolicy`] one-for-one.
+#[napi(object)]
+pub struct ImageGenPolicyJs {
+    pub idle_timeout_secs: u32,
+    pub load_budget_secs: u32,
+    pub max_parallel_requests: u32,
+    pub allow_during_pathtraced_render: bool,
+}
+
+impl From<aec_governor::policy::ImageGenPolicy> for ImageGenPolicyJs {
+    fn from(p: aec_governor::policy::ImageGenPolicy) -> Self {
+        Self {
+            idle_timeout_secs: p.idle_timeout_secs,
+            load_budget_secs: p.load_budget_secs,
+            max_parallel_requests: p.max_parallel_requests,
+            allow_during_pathtraced_render: p.allow_during_pathtraced_render,
+        }
+    }
+}
+
+impl From<ImageGenPolicyJs> for aec_governor::policy::ImageGenPolicy {
+    fn from(p: ImageGenPolicyJs) -> Self {
+        Self {
+            idle_timeout_secs: p.idle_timeout_secs,
+            load_budget_secs: p.load_budget_secs,
+            max_parallel_requests: p.max_parallel_requests,
+            allow_during_pathtraced_render: p.allow_during_pathtraced_render,
+        }
+    }
+}
+
+#[napi]
+pub async fn image_gen_active_policy() -> Result<ImageGenPolicyJs> {
+    spawn_blocking_napi(move || {
+        with_service_ref_fallible(super::service::BridgeService::image_gen_active_policy)
+            .map(ImageGenPolicyJs::from)
+    })
+    .await
+}
+
+#[napi]
+pub async fn image_gen_apply_policy(policy: ImageGenPolicyJs) -> Result<()> {
+    spawn_blocking_napi(move || {
+        let inner = aec_governor::policy::ImageGenPolicy::from(policy);
+        with_service_ref_fallible(|svc| svc.image_gen_apply_policy(inner))
+    })
+    .await
+}
+
+/// Apply both the AI and image-gen policies bundled into one
+/// `GovernorPolicy` for the supplied hardware tier slug. Mirrors
+/// `ai_set_active_tier` on the text side.
+///
+/// `tier` is one of: `"low"`, `"medium"`, `"high"`, `"pro"`.
+#[napi]
+pub async fn governor_apply_hardware_tier(tier: String) -> Result<()> {
+    spawn_blocking_napi(move || {
+        let parsed = match tier.as_str() {
+            "low" => aec_governor::tier::HardwareTier::Low,
+            "medium" => aec_governor::tier::HardwareTier::Medium,
+            "high" => aec_governor::tier::HardwareTier::High,
+            "pro" => aec_governor::tier::HardwareTier::Pro,
+            other => {
+                return Err(napi::Error::from_reason(format!(
+                    "governor_apply_hardware_tier: unknown tier slug {other:?}; expected low/medium/high/pro"
+                )));
+            }
+        };
+        with_service_ref_fallible(|svc| svc.governor_apply_hardware_tier(parsed))
+    })
+    .await
+}
+
+/// `true` iff at least one path-traced render is currently
+/// `Running` in the queue. The renderer's image panel surfaces a
+/// "paused while rendering" banner when this returns `true` AND
+/// the active image-gen policy disallows concurrent execution.
+#[napi]
+pub async fn pathtraced_render_in_progress() -> Result<bool> {
+    spawn_blocking_napi(move || {
+        with_service_ref_fallible(super::service::BridgeService::pathtraced_render_in_progress)
+    })
+    .await
+}
+
+// ============================================================
 // draft.* / deliver.* (Group A, Phase 10)
 // ============================================================
 

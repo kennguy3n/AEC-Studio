@@ -100,6 +100,7 @@ dependencies = [
  "aec_materials",
  "aec_render",
  "aec_viewport",
+ "base64 0.22.1",
  "blake3",
  "chrono",
  "criterion",

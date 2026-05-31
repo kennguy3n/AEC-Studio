@@ -37,6 +37,7 @@ uuid = { workspace = true }
 aec_governor = { path = "../aec_governor" }
 aec_export = { path = "../aec_export" }
 aec_ai = { path = "../aec_ai" }
+base64 = { workspace = true }
 blake3 = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }

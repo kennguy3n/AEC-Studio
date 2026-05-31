@@ -20,6 +20,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { aec, RuntimeStatus } from "../api/aec";
 import { AiModelsSection } from "../components/AiModelsSection";
+import { ImageGenPanel } from "../components/ImageGenPanel";
 import {
   parseLoopbackInstance,
   type KChatLoopbackInstance,
@@ -377,6 +378,8 @@ export function Settings() {
       </section>
 
       <AiModelsSection />
+
+      <ImageGenPanel />
 
       <section
         className="settings-section"

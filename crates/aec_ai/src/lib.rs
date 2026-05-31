@@ -14,6 +14,7 @@ pub mod diff_engine;
 pub mod extension_tools;
 pub mod grammars;
 pub mod http;
+pub mod image_gen;
 pub mod layout_suggestion;
 pub mod lighting_balance;
 pub mod model_download;

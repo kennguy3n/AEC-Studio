@@ -251,6 +251,166 @@ export interface AiDownloadResult {
   sizeBytes: number;
 }
 
+/**
+ * Phase 18 Group C — image-gen sidecar status snapshot. Mirrors the
+ * Rust `aec_ai::image_gen::ImageGenRuntimeState` lifecycle, lowercased
+ * for renderer consumption: `idle` (sidecar not spawned), `loading`
+ * (cold-spawning the sd-server child), `ready` (sidecar bound to a
+ * txt2img-capable port), `failed` (last spawn/load attempt errored —
+ * the error message is in {@link ImageGenRuntimeStatus.lastError}).
+ *
+ * Unlike the text sidecar, image-gen is single-model — there is no
+ * tier concept — but the surface mirrors {@link aiRuntimeStatus} so
+ * the Settings page can share polling/UX patterns.
+ */
+export interface ImageGenRuntimeStatus {
+  state: "idle" | "loading" | "ready" | "failed";
+  /** Populated on `"failed"`; cleared on subsequent `loading` / `ready`. */
+  lastError: string | null;
+}
+
+/**
+ * Phase 18 Group C — image-gen model availability. Returned by
+ * {@link BridgeBackend.imageGenModelAvailability}.
+ *
+ * Unlike the text side ({@link AiModelAvailability}) which carries a
+ * three-tier array, image-gen has a single configured descriptor at a
+ * time. When the descriptor has not been pinned (no first-run wizard
+ * has been run yet) `filename` is the empty string, `sizeBytes` is 0,
+ * and `downloadUrl` is `null` — the renderer surfaces a "Configure
+ * model" wizard instead of a "Download" button.
+ */
+export interface ImageGenModelAvailability {
+  /** On-disk filename inside `modelsDir`. Empty when no descriptor configured. */
+  filename: string;
+  /** Expected file size in bytes (from the pinned descriptor). 0 when unset. */
+  sizeBytes: number;
+  /** `true` iff the file is present on disk and its length matches `sizeBytes`. */
+  available: boolean;
+  /** Actual on-disk byte length. 0 when the file is missing. */
+  sizeOnDisk: number;
+  /** Currently-pinned download URL, or `null` when no descriptor configured. */
+  downloadUrl: string | null;
+  /** Expected BLAKE3 hex (compile-time-pinned by the renderer's wizard). */
+  blake3Hex: string;
+  /** Absolute path to the directory image-gen model files live in. */
+  modelsDir: string;
+}
+
+/**
+ * Phase 18 Group C — caller-supplied image-gen model descriptor. The
+ * renderer's first-run wizard pins these fields against a verified
+ * stable-diffusion.cpp-compatible GGUF (URL + BLAKE3 + size). The
+ * bridge round-trips the values into the in-process
+ * `ImageGenModelManager`; subsequent downloads use this descriptor.
+ *
+ * `vaeFilename` is optional — stable-diffusion.cpp embeds the VAE in
+ * the same GGUF for most variants, but some larger SDXL models ship
+ * the VAE as a sibling file.
+ */
+export interface ImageGenModelDescriptor {
+  filename: string;
+  sizeBytes: number;
+  blake3Hex: string;
+  downloadUrl: string | null;
+  vaeFilename: string | null;
+}
+
+/**
+ * Phase 18 Group C — live progress snapshot of an in-flight image-gen
+ * model download. Mirrors {@link AiDownloadProgress} but identifies
+ * the model by filename rather than tier slug.
+ */
+export interface ImageGenDownloadProgress {
+  filename: string;
+  downloaded: number;
+  total: number;
+  /** One of `"downloading" | "verifying" | "completed" | "failed"`. */
+  state: "downloading" | "verifying" | "completed" | "failed";
+  /** Populated on `"failed"`; cleared on every other state. */
+  message: string | null;
+}
+
+/** Successful return of {@link BridgeBackend.imageGenDownloadModel}. */
+export interface ImageGenDownloadResult {
+  filename: string;
+  /** Absolute on-disk path of the verified GGUF. */
+  path: string;
+  sizeBytes: number;
+}
+
+/**
+ * Phase 18 Group C — txt2img request payload. Pinned shape rather
+ * than `Record<string, unknown>` so renderer typos surface at compile
+ * time. `seed: null` means "let the sidecar pick"; the sidecar
+ * surfaces the chosen seed in {@link ImageGenGenerateResult.seed}
+ * so the user can reproduce results.
+ */
+export interface ImageGenGenerateRequest {
+  prompt: string;
+  negativePrompt?: string | null;
+  width: number;
+  height: number;
+  steps: number;
+  cfgScale: number;
+  seed?: number | null;
+  /**
+   * Sampler name (e.g. `"euler_a"`, `"dpmpp_2m"`). `null` lets the
+   * sidecar choose the default.
+   */
+  sampler?: string | null;
+}
+
+/**
+ * Phase 18 Group C — successful txt2img result. The PNG is returned
+ * base64-encoded so the renderer can drop it straight into an
+ * `<img src="data:image/png;base64,...">`. We do not return raw
+ * `Uint8Array` because napi-rs `Buffer` marshalling is slower than a
+ * base64 round-trip for the ~256–1024 KiB payloads the image panel
+ * deals with.
+ */
+export interface ImageGenGenerateResult {
+  pngBase64: string;
+  seed: number | null;
+  width: number;
+  height: number;
+  steps: number;
+  /** Free-form info string from the sidecar (e.g. parameters echo). */
+  info: string | null;
+}
+
+/**
+ * Phase 18 Group C Task 17 — image-gen governor policy DTO mirroring
+ * Rust `aec_governor::policy::ImageGenPolicy`. Surfaces the four
+ * per-tier knobs the bridge actually honours:
+ *
+ *   * `idleTimeoutSecs` — how long the runtime keeps the sidecar
+ *     resident after the last txt2img request before unloading.
+ *   * `loadBudgetSecs` — cold-spawn deadline. The runtime aborts
+ *     and reports `failed` if model load doesn't complete in this
+ *     many seconds.
+ *   * `maxParallelRequests` — concurrent txt2img cap. The bridge
+ *     does not currently expose multi-request batching but the
+ *     governor still pins the future cap per tier.
+ *   * `allowDuringPathtracedRender` — when `false`, the bridge
+ *     rejects {@link imageGenGenerate} while any non-realtime
+ *     render job is `Running`. Low / Medium tiers default to
+ *     `false`; High / Pro to `true`.
+ */
+export interface ImageGenPolicy {
+  idleTimeoutSecs: number;
+  loadBudgetSecs: number;
+  maxParallelRequests: number;
+  allowDuringPathtracedRender: boolean;
+}
+
+/**
+ * Hardware tier slug accepted by
+ * {@link BridgeBackend.governorApplyHardwareTier}. The native side
+ * returns a clear error for any other string.
+ */
+export type GovernorHardwareTier = "low" | "medium" | "high" | "pro";
+
 /** Parsed payloads for individual AI tools, tagged by `tool`. */
 export type AiPlanParsed =
   | LayoutSuggestionParsed
@@ -639,6 +799,94 @@ export interface BridgeBackend {
    * the new tier's GGUF via `ModelManager::active_config`.
    */
   aiSetActiveTier(tier: AiModelTierSlug): Promise<void>;
+
+  /**
+   * Phase 18 Group C — live image-gen sidecar status. Same polling
+   * contract as {@link aiRuntimeStatus}: cheap, called on a 500 ms
+   * timer by the Settings page's image-gen panel.
+   */
+  imageGenRuntimeStatus(): Promise<ImageGenRuntimeStatus>;
+
+  /**
+   * Phase 18 Group C — snapshot of the image-gen model on disk and
+   * the currently-pinned descriptor. Cheap; Settings calls this on
+   * mount and after every download / set-descriptor.
+   */
+  imageGenModelAvailability(): Promise<ImageGenModelAvailability>;
+
+  /**
+   * Phase 18 Group C — pin the descriptor (URL + BLAKE3 + size) the
+   * subsequent {@link imageGenDownloadModel} will use. Verified by
+   * the in-process model manager (rejects empty filenames, non-
+   * http(s) URLs). Kills any in-flight image-gen sidecar so the next
+   * {@link imageGenGenerate} cold-spawns against the new file. Does
+   * NOT trigger a download.
+   */
+  imageGenSetDescriptor(descriptor: ImageGenModelDescriptor): Promise<void>;
+
+  /**
+   * Phase 18 Group C — download the configured image-gen model file to
+   * `modelsDir`, BLAKE3-verify, atomically rename into place. Long-
+   * running (tens of seconds to minutes depending on the SD model
+   * size + connection). The Rust side updates the progress slot on
+   * every chunk; poll {@link imageGenDownloadProgress}.
+   */
+  imageGenDownloadModel(): Promise<ImageGenDownloadResult>;
+
+  /**
+   * Phase 18 Group C — read the in-process image-gen download
+   * progress slot. Returns `null` when no download has run this
+   * session. Cheap; ~500 ms polling cadence while the panel is open.
+   */
+  imageGenDownloadProgress(): Promise<ImageGenDownloadProgress | null>;
+
+  /**
+   * Phase 18 Group C — run a single txt2img request against the
+   * image-gen sidecar. Cold-spawns the sidecar on first call (~10–
+   * 30 s), reuses it for subsequent calls until the 120 s idle
+   * timer or governor budget unloads the model.
+   */
+  imageGenGenerate(
+    request: ImageGenGenerateRequest,
+  ): Promise<ImageGenGenerateResult>;
+
+  /**
+   * Phase 18 Group C Task 17 — read the active image-gen governor
+   * policy. The Settings page reads this on mount and after every
+   * {@link governorApplyHardwareTier} call so the image-gen panel
+   * can render an accurate "paused while rendering" hint instead of
+   * guessing based on the user's selected tier.
+   */
+  imageGenActivePolicy(): Promise<ImageGenPolicy>;
+
+  /**
+   * Phase 18 Group C Task 17 — push a custom image-gen policy. Used
+   * by integration tests and advanced users; the normal flow on
+   * tier change goes through {@link governorApplyHardwareTier}.
+   * Triggers an in-process runtime reload — any live image-gen
+   * sidecar is killed and the next {@link imageGenGenerate} cold-
+   * spawns with the new idle / load budgets.
+   */
+  imageGenApplyPolicy(policy: ImageGenPolicy): Promise<void>;
+
+  /**
+   * Phase 18 Group C Task 17 — apply the
+   * {@link aec_governor::policy::GovernorPolicy} for the supplied
+   * hardware tier. Today only propagates the image-gen half; the
+   * text-side tier slug is still set via {@link aiSetActiveTier}
+   * until Group D's first-run wizard merges the two surfaces.
+   */
+  governorApplyHardwareTier(tier: GovernorHardwareTier): Promise<void>;
+
+  /**
+   * Phase 18 Group C Task 17 — `true` iff at least one
+   * non-realtime render is currently `Running`. The Settings
+   * page's image-gen panel polls this every ~1 s so it can render
+   * a "paused while rendering" banner on Low / Medium tiers — the
+   * banner is suppressed when the user is on High / Pro because
+   * those tiers permit concurrent execution.
+   */
+  pathtracedRenderInProgress(): Promise<boolean>;
 
   /**
    * List per-extension boot failures captured by the Rust bridge
@@ -2123,6 +2371,55 @@ interface NativeApi {
   ai_download_model(tier: string): Promise<unknown>;
   ai_download_progress(): unknown;
   ai_set_active_tier(tier: string): Promise<unknown>;
+  // ----- Phase 18 group C: image-gen sidecar surface -----
+  //
+  // All six are `#[napi]` exports in
+  // `crates/aec_bridge/src/napi_api.rs` mirroring the `ai_*` family:
+  // five `#[napi] async fn` routed through `spawn_blocking_napi` so the
+  // libuv main thread stays free during the up-to-60 s cold-spawn /
+  // multi-second sampling, plus one sync `image_gen_download_progress`
+  // for the ~500 ms progress poll. The descriptor object passes
+  // `size_bytes` as a JS `BigInt` (napi-rs unconditionally marshals
+  // `u64` as `BigInt`); the adaptor narrows to `number` once on the
+  // boundary because the largest SD GGUF (~6 GiB SDXL Q5_1) is still
+  // safely below `Number.MAX_SAFE_INTEGER`.
+  image_gen_runtime_status(): Promise<unknown>;
+  image_gen_model_availability(): Promise<unknown>;
+  image_gen_set_descriptor(descriptor: {
+    filename: string;
+    sizeBytes: bigint;
+    blake3Hex: string;
+    downloadUrl: string | null;
+    vaeFilename: string | null;
+  }): Promise<unknown>;
+  image_gen_download_model(): Promise<unknown>;
+  image_gen_download_progress(): unknown;
+  image_gen_generate(request: {
+    prompt: string;
+    negativePrompt: string | null;
+    width: number;
+    height: number;
+    steps: number;
+    cfgScale: number;
+    seed: number | null;
+    sampler: string | null;
+  }): Promise<unknown>;
+  // Phase 18 Group C Task 17 — governor policy surface. Async on
+  // the native side because `governor_apply_hardware_tier` calls
+  // through to `image_gen_apply_policy` which performs a runtime
+  // reload (briefly takes the image-gen handle slot to kill the
+  // child); the others are sub-millisecond but routed through
+  // `spawn_blocking_napi` for consistency with the rest of this
+  // family.
+  image_gen_active_policy(): Promise<unknown>;
+  image_gen_apply_policy(policy: {
+    idleTimeoutSecs: number;
+    loadBudgetSecs: number;
+    maxParallelRequests: number;
+    allowDuringPathtracedRender: boolean;
+  }): Promise<unknown>;
+  governor_apply_hardware_tier(tier: string): Promise<unknown>;
+  pathtraced_render_in_progress(): Promise<unknown>;
   // Extension load diagnostics — see `BridgeBackend.extensionsListLoadDiagnostics`.
   // Sync N-API export (the captured slice lives in process memory
   // and is empty in the common no-broken-extensions case), so the
@@ -2344,6 +2641,31 @@ export const NATIVE_WIRED_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   "aiDownloadModel",
   "aiDownloadProgress",
   "aiSetActiveTier",
+  // Phase 18 Group C — image-gen sidecar surface. Same N-API
+  // dispatch + lock-discipline as the `ai*` block above; the
+  // bridge holds an `ImageGenState` (parallel to `AiState`) with
+  // its own runtime + model manager + download slot. Six methods:
+  // status / availability / setDescriptor / download / progress /
+  // generate. The download surface uses the same prepare-then-run
+  // split (`image_gen_prepare_download` under the brief lock,
+  // `run_image_gen_download` static + lock-free for the HTTP
+  // transfer) so a multi-minute download cannot wedge the bridge.
+  "imageGenRuntimeStatus",
+  "imageGenModelAvailability",
+  "imageGenSetDescriptor",
+  "imageGenDownloadModel",
+  "imageGenDownloadProgress",
+  "imageGenGenerate",
+  // Phase 18 Group C Task 17 — governor policy surface for the
+  // image-gen sidecar. `imageGenActivePolicy` is cheap (single
+  // RwLock::read); `governorApplyHardwareTier` triggers a runtime
+  // reload (kills any live sidecar so the next generate cold-spawns
+  // with the new budgets); `pathtracedRenderInProgress` is the
+  // hot-path gate read by the renderer's image panel banner.
+  "imageGenActivePolicy",
+  "imageGenApplyPolicy",
+  "governorApplyHardwareTier",
+  "pathtracedRenderInProgress",
   "extensionsListLoadDiagnostics",
   // Group A (Phase 10) — draft.* / deliver.* parity with
   // design.* / bim.*. Each routes through a `#[napi]` export
@@ -3180,6 +3502,163 @@ function adaptNative(n: NativeApi): BridgeBackend {
     aiSetActiveTier: async (tier) => {
       await n.ai_set_active_tier(tier);
     },
+    // ----- Phase 18 Group C: image-gen sidecar -----
+    //
+    // Same BigInt-narrowing convention as the ai_* adaptors:
+    // napi-rs unconditionally marshals Rust `u64` as JS `BigInt`,
+    // so we narrow once at the boundary. The image-gen models go
+    // up to ~6 GiB (SDXL Q5_1) but are still safely below
+    // `Number.MAX_SAFE_INTEGER` (~9 PiB), so the narrowing is
+    // lossless for every model the wizard will pin.
+    imageGenRuntimeStatus: async () => {
+      const r = (await n.image_gen_runtime_status()) as {
+        state: string;
+        lastError: string | null;
+      };
+      // The renderer's `ImageGenRuntimeStatus.state` is a closed
+      // four-variant union; the Rust side guarantees the lowercase
+      // string via `image_gen_state_string`, but we cast here
+      // rather than narrowing so a future Rust-side variant doesn't
+      // silently produce `undefined` on the TS side. A bad value
+      // would show as a literal string in the panel, which is the
+      // right "loud" failure mode.
+      return {
+        state: r.state as ImageGenRuntimeStatus["state"],
+        lastError: r.lastError,
+      };
+    },
+    imageGenModelAvailability: async () => {
+      const r = (await n.image_gen_model_availability()) as {
+        filename: string;
+        sizeBytes: bigint;
+        available: boolean;
+        sizeOnDisk: bigint;
+        downloadUrl: string | null;
+        blake3Hex: string;
+        modelsDir: string;
+      };
+      return {
+        filename: r.filename,
+        sizeBytes: Number(r.sizeBytes),
+        available: r.available,
+        sizeOnDisk: Number(r.sizeOnDisk),
+        downloadUrl: r.downloadUrl,
+        blake3Hex: r.blake3Hex,
+        modelsDir: r.modelsDir,
+      };
+    },
+    imageGenSetDescriptor: async (descriptor) => {
+      // Widen `number` → `bigint` once at the boundary so napi-rs's
+      // `BigInt` decoder gets the expected JS type. The renderer
+      // never sees `bigint` — it goes through `ImageGenModelDescriptor`
+      // which uses `number`.
+      await n.image_gen_set_descriptor({
+        filename: descriptor.filename,
+        sizeBytes: BigInt(descriptor.sizeBytes),
+        blake3Hex: descriptor.blake3Hex,
+        downloadUrl: descriptor.downloadUrl,
+        vaeFilename: descriptor.vaeFilename,
+      });
+    },
+    imageGenDownloadModel: async () => {
+      // `n.image_gen_download_model` is async and routed through
+      // `spawn_blocking_napi`, so the libuv main thread is free for
+      // `imageGenDownloadProgress` polls during the multi-minute
+      // download. Don't add a JS-side timeout — the Rust side has
+      // its own per-read budget.
+      const r = (await n.image_gen_download_model()) as {
+        filename: string;
+        path: string;
+        sizeBytes: bigint;
+      };
+      return {
+        filename: r.filename,
+        path: r.path,
+        sizeBytes: Number(r.sizeBytes),
+      };
+    },
+    imageGenDownloadProgress: async () => {
+      // Sync N-API export (the slot is `Mutex<Option<...>>`).
+      // `Promise.resolve` to satisfy the async backend contract.
+      const r = n.image_gen_download_progress() as
+        | {
+            filename: string;
+            downloaded: bigint;
+            total: bigint;
+            state: "downloading" | "verifying" | "completed" | "failed";
+            message: string | null;
+          }
+        | null
+        | undefined;
+      if (!r) {
+        return null;
+      }
+      return {
+        filename: r.filename,
+        downloaded: Number(r.downloaded),
+        total: Number(r.total),
+        state: r.state,
+        message: r.message,
+      };
+    },
+    imageGenGenerate: async (request) => {
+      const r = (await n.image_gen_generate({
+        prompt: request.prompt,
+        negativePrompt: request.negativePrompt ?? null,
+        width: request.width,
+        height: request.height,
+        steps: request.steps,
+        cfgScale: request.cfgScale,
+        seed: request.seed ?? null,
+        sampler: request.sampler ?? null,
+      })) as {
+        pngBase64: string;
+        seed: number | null;
+        width: number;
+        height: number;
+        steps: number;
+        info: string | null;
+      };
+      return {
+        pngBase64: r.pngBase64,
+        seed: r.seed,
+        width: r.width,
+        height: r.height,
+        steps: r.steps,
+        info: r.info,
+      };
+    },
+    // Phase 18 Group C Task 17 — governor policy adapters. The
+    // policy DTO is plain `number`s (the Rust side stores
+    // everything as `u32`), so no BigInt narrowing is needed
+    // here; we still mirror the field names one-to-one.
+    imageGenActivePolicy: async () => {
+      const r = (await n.image_gen_active_policy()) as {
+        idleTimeoutSecs: number;
+        loadBudgetSecs: number;
+        maxParallelRequests: number;
+        allowDuringPathtracedRender: boolean;
+      };
+      return {
+        idleTimeoutSecs: r.idleTimeoutSecs,
+        loadBudgetSecs: r.loadBudgetSecs,
+        maxParallelRequests: r.maxParallelRequests,
+        allowDuringPathtracedRender: r.allowDuringPathtracedRender,
+      };
+    },
+    imageGenApplyPolicy: async (policy) => {
+      await n.image_gen_apply_policy({
+        idleTimeoutSecs: policy.idleTimeoutSecs,
+        loadBudgetSecs: policy.loadBudgetSecs,
+        maxParallelRequests: policy.maxParallelRequests,
+        allowDuringPathtracedRender: policy.allowDuringPathtracedRender,
+      });
+    },
+    governorApplyHardwareTier: async (tier) => {
+      await n.governor_apply_hardware_tier(tier);
+    },
+    pathtracedRenderInProgress: async () =>
+      Boolean(await n.pathtraced_render_in_progress()),
     // Phase 16 — per-extension boot diagnostics. Sync N-API export
     // (the captured slice lives in process memory and is empty in
     // the common no-broken-extensions case) so we just call and
@@ -4298,6 +4777,68 @@ export function inProcessBackend(): BridgeBackend {
       return null;
     },
     async aiSetActiveTier(_tier) {},
+
+    // Phase 18 Group C — image-gen sidecar fallback. Vitest / SSR
+    // run with no native bridge loaded; we return shapes that match
+    // the native `ImageGen*` surface so the renderer's panel can
+    // exercise every branch (no descriptor → wizard, descriptor +
+    // unavailable → download button, etc.) without HTTP, without a
+    // child process, and without GPU. `imageGenGenerate` throws
+    // because there is no in-process diffusion path — the renderer
+    // already handles that branch.
+    async imageGenRuntimeStatus() {
+      return { state: "idle" as const, lastError: null };
+    },
+    async imageGenModelAvailability() {
+      return {
+        filename: "",
+        sizeBytes: 0,
+        available: false,
+        sizeOnDisk: 0,
+        downloadUrl: null,
+        blake3Hex: "",
+        modelsDir: "",
+      };
+    },
+    async imageGenSetDescriptor(_descriptor) {},
+    async imageGenDownloadModel() {
+      return { filename: "", path: "", sizeBytes: 0 };
+    },
+    async imageGenDownloadProgress() {
+      return null;
+    },
+    async imageGenGenerate(_request) {
+      // In-process fallback cannot run a real diffusion model.
+      // Surface a clearly-named error rather than returning empty
+      // bytes — the renderer's panel renders the message verbatim.
+      throw new Error(
+        "imageGenGenerate: in-process backend cannot generate images. " +
+          "Image generation requires the native bridge with the image-gen " +
+          "sidecar configured.",
+      );
+    },
+
+    // Phase 18 Group C Task 17 — in-process fallback for the
+    // governor policy surface. The Medium-tier defaults match the
+    // native bridge's constructor; tests that need a different
+    // tier can spy on these via the renderer-backend mock.
+    async imageGenActivePolicy() {
+      // Mirrors `GovernorPolicy::for_tier(HardwareTier::Medium).image_gen`
+      // — keep in sync with `crates/aec_governor/src/policy.rs`.
+      return {
+        idleTimeoutSecs: 120,
+        loadBudgetSecs: 60,
+        maxParallelRequests: 1,
+        allowDuringPathtracedRender: false,
+      };
+    },
+    async imageGenApplyPolicy(_policy) {},
+    async governorApplyHardwareTier(_tier) {},
+    async pathtracedRenderInProgress() {
+      // No render queue in the SSR / vitest fallback — the panel
+      // assumes no path-traced render is running.
+      return false;
+    },
 
     async extensionsListLoadDiagnostics() {
       // Vitest / SSR fallback: the in-process backend does not boot
