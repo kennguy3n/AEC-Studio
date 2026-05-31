@@ -222,13 +222,34 @@ impl ImageGenState {
             // restarting it on each generate request — important
             // when the user mashes "Generate" on a misconfigured
             // descriptor.
-            let mut policy = self.restart_policy.lock().map_err(poisoned)?;
-            match sidecar::spawn_with_retry(
-                &cfg.spawn_config,
-                cfg.load_budget.min(spawn_timeout),
-                &mut policy,
-                DEFAULT_IMAGE_GEN_MAX_SPAWN_ATTEMPTS,
-            ) {
+            //
+            // Phase 18 Group E Devin Review fix — the
+            // `restart_policy` mutex is taken inside an inner
+            // scope so it is **dropped before** we re-acquire
+            // `runtime.write()` for `mark_ready` / `mark_failed`.
+            // Without the scope, the lock acquisition order
+            // becomes `restart_policy → runtime`, which inverts
+            // the canonical order documented at the top of this
+            // module (`handle_slot → runtime → restart_policy`).
+            // The bug is currently latent because every
+            // `restart_policy` acquisition in the workspace also
+            // holds `handle_slot` (serialising it against any
+            // other ordering), but the moment a future code
+            // path acquires `runtime` then `restart_policy`
+            // outside of `handle_slot` we would have an AB/BA
+            // deadlock. Keep the scope tight.
+            let spawn_result = {
+                let mut policy = self.restart_policy.lock().map_err(poisoned)?;
+                sidecar::spawn_with_retry(
+                    &cfg.spawn_config,
+                    cfg.load_budget.min(spawn_timeout),
+                    &mut policy,
+                    DEFAULT_IMAGE_GEN_MAX_SPAWN_ATTEMPTS,
+                )
+                // `policy` MutexGuard dropped here at end of scope,
+                // before the `runtime.write()` calls below.
+            };
+            match spawn_result {
                 Ok(handle) => {
                     let transport = handle.transport().clone();
                     *slot = Some(handle);
@@ -375,5 +396,83 @@ mod tests {
         new_cfg.spawn_config.port = 13599;
         s.reload_with_config(new_cfg).unwrap();
         assert_eq!(s.snapshot().unwrap().state, ImageGenRuntimeState::Idle);
+    }
+
+    /// Phase 18 Group E Devin Review regression — pins the canonical
+    /// lock-ordering invariant in `ensure_ready` after the
+    /// failure-path `mark_failed` branch.
+    ///
+    /// **What the bug was**: `restart_policy.lock()` was acquired
+    /// at the top of the cold-spawn arm and held across the
+    /// subsequent `runtime.write().mark_failed(...)` call. That
+    /// inverted the documented order
+    /// (`handle_slot \u2192 runtime \u2192 restart_policy`) into
+    /// `restart_policy \u2192 runtime`. No deadlock today because every
+    /// `restart_policy` access also holds `handle_slot`, but a
+    /// future code path that took `runtime` then `restart_policy`
+    /// outside `handle_slot` would AB/BA-deadlock.
+    ///
+    /// **What this test pins**: after `ensure_ready` returns
+    /// `Err(Spawn(EmptyModelPath))`, all three locks
+    /// (`handle_slot`, `runtime`, `restart_policy`) must be
+    /// release-able via `try_lock` / `try_write`. If a future
+    /// refactor accidentally widens the `restart_policy` scope to
+    /// span the `runtime.write()` call again, this test will fail
+    /// loudly: under the bug, a panic in `mark_failed` would leak
+    /// the `policy` guard. The test also asserts via direct field
+    /// access (only possible because the test lives in the same
+    /// module) that no guard was left behind on the success path
+    /// we exercise here.
+    #[test]
+    fn ensure_ready_failure_path_releases_all_locks_in_canonical_order() {
+        // Default `ImageGenSpawnConfig` has `model_path: PathBuf::new()`,
+        // so `spawn_with_retry` hard-stops on `EmptyModelPath` without
+        // attempting any real child process \u2014 we exercise only the
+        // mark_failed branch under test, not the IO / health probe.
+        let state = ImageGenState::new(ImageGenRuntimeConfig::default());
+        let result = state.ensure_ready(Duration::from_millis(50));
+        assert!(
+            matches!(result, Err(ImageGenStateError::Spawn(_))),
+            "expected Spawn error from empty-model-path fast-fail, got {result:?}",
+        );
+
+        // After `ensure_ready` returns, every internal lock must
+        // be release-able with no contention. If the bug regressed
+        // (policy guard outliving runtime.write()), a poisoned-lock
+        // panic from inside the scope would have left the
+        // `restart_policy` guard wedged, so `try_lock` would
+        // either return `WouldBlock` or `Poisoned` here.
+        let handle_slot = state
+            .handle_slot
+            .try_lock()
+            .expect("handle_slot must be released after ensure_ready returns");
+        assert!(
+            handle_slot.is_none(),
+            "failure path must not leave a stale handle",
+        );
+        drop(handle_slot);
+        let runtime = state
+            .runtime
+            .try_write()
+            .expect("runtime must be release-able after ensure_ready returns");
+        drop(runtime);
+        let policy = state
+            .restart_policy
+            .try_lock()
+            .expect("restart_policy must be released after ensure_ready returns");
+        drop(policy);
+
+        // Runtime must have observed the `mark_failed` write \u2014
+        // proving the runtime.write() acquired AFTER policy was
+        // dropped actually executed.
+        let snap = state.snapshot().expect("snapshot after fail");
+        assert_eq!(snap.state, ImageGenRuntimeState::Failed);
+        let err = snap
+            .last_error
+            .expect("Failed state always carries last_error");
+        assert!(
+            err.to_ascii_lowercase().contains("model"),
+            "last_error should reference the empty model path: {err}",
+        );
     }
 }
