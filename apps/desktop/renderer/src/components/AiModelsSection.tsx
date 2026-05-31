@@ -78,9 +78,8 @@ export function AiModelsSection(): JSX.Element {
     let cancelled = false;
     const tick = async () => {
       try {
-        const p = (await aec.ai.downloadProgress()) as
-          | AiDownloadProgress
-          | null;
+        const p =
+          (await aec.ai.downloadProgress()) as AiDownloadProgress | null;
         if (cancelled) return;
         if (p) {
           if (p.state === "failed" && dismissedFailedRef.current) {
@@ -121,7 +120,28 @@ export function AiModelsSection(): JSX.Element {
         // "completed" snapshot.
         setPendingTier(null);
       } catch (e) {
-        setError(e instanceof Error ? e.message : String(e));
+        // The Rust side publishes `DownloadState::Failed` to the
+        // progress slot *before* returning the error here, so the
+        // per-tier failure banner (rendered from `progress` lower
+        // down) and the top-level `error` banner would otherwise
+        // both show for the same failure. Pull the slot eagerly and
+        // route the rendering through exactly one of them: the
+        // contextual per-tier banner when Failed is published, the
+        // top-level banner as a defense-in-depth fallback when the
+        // error escapes before the Rust side could publish.
+        const msg = e instanceof Error ? e.message : String(e);
+        let routedToPerTier = false;
+        try {
+          const p =
+            (await aec.ai.downloadProgress()) as AiDownloadProgress | null;
+          if (p && p.state === "failed" && p.tier === tier) {
+            setProgress(p);
+            routedToPerTier = true;
+          }
+        } catch {
+          // Ignore — fall through to the top-level banner.
+        }
+        if (!routedToPerTier) setError(msg);
         setPendingTier(null);
       } finally {
         await refreshAvailability();
@@ -164,13 +184,10 @@ export function AiModelsSection(): JSX.Element {
     >
       <h2>AI text models</h2>
       <p>
-        Ternary-Bonsai 1.58-bit GGUF models. Downloads come from
-        HuggingFace over HTTPS and are BLAKE3-verified.
+        Ternary-Bonsai 1.58-bit GGUF models. Downloads come from HuggingFace
+        over HTTPS and are BLAKE3-verified.
       </p>
-      <p
-        className="settings-models-dir"
-        data-testid="settings-ai-models-dir"
-      >
+      <p className="settings-models-dir" data-testid="settings-ai-models-dir">
         Models directory: <code>{availability.modelsDir || "(not set)"}</code>
       </p>
       {error && (
@@ -182,7 +199,10 @@ export function AiModelsSection(): JSX.Element {
           {error}
         </div>
       )}
-      <ul className="settings-models-list" data-testid="settings-ai-models-list">
+      <ul
+        className="settings-models-list"
+        data-testid="settings-ai-models-list"
+      >
         {availability.tiers.map((t) => {
           const isActive = availability.activeTier === t.tier;
           const isDownloading =

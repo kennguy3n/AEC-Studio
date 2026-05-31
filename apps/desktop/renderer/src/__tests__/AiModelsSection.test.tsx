@@ -40,15 +40,11 @@ describe("AiModelsSection", () => {
   it("renders all three Ternary-Bonsai tiers", async () => {
     render(<AiModelsSection />);
     await waitFor(() => {
-      expect(
-        screen.getByTestId("settings-ai-model-small"),
-      ).toBeInTheDocument();
+      expect(screen.getByTestId("settings-ai-model-small")).toBeInTheDocument();
       expect(
         screen.getByTestId("settings-ai-model-medium"),
       ).toBeInTheDocument();
-      expect(
-        screen.getByTestId("settings-ai-model-large"),
-      ).toBeInTheDocument();
+      expect(screen.getByTestId("settings-ai-model-large")).toBeInTheDocument();
     });
   });
 
@@ -96,7 +92,8 @@ describe("AiModelsSection", () => {
     ];
     let progressIdx = 0;
     vi.spyOn(aec.ai, "downloadProgress").mockImplementation(async () => {
-      const p = progressStates[Math.min(progressIdx, progressStates.length - 1)];
+      const p =
+        progressStates[Math.min(progressIdx, progressStates.length - 1)];
       progressIdx++;
       return p;
     });
@@ -143,6 +140,83 @@ describe("AiModelsSection", () => {
         screen.getByTestId("settings-ai-model-small-available"),
       ).toBeInTheDocument();
     });
+  });
+
+  it("routes a download failure to the per-tier banner only, not the top-level error", async () => {
+    // Mirrors the production invariant: `BridgeService::ai_download_model`
+    // publishes `DownloadState::Failed` to the progress slot *before*
+    // rejecting the napi promise. The component should surface the
+    // contextual per-tier banner and skip the top-level error so the
+    // user does not see two banners for the same failure.
+    vi.spyOn(aec.ai, "downloadModel").mockRejectedValue(
+      new Error("HTTP 503 from huggingface.co"),
+    );
+    vi.spyOn(aec.ai, "downloadProgress").mockResolvedValue({
+      tier: "small",
+      downloaded: 12_345,
+      total: 463_290_464,
+      state: "failed",
+      message: "HTTP 503 from huggingface.co",
+    });
+    vi.spyOn(aec.ai, "modelAvailability").mockResolvedValue({
+      tiers: [
+        tierInfo("small", false, 463_290_464),
+        tierInfo("medium", false, 1_074_969_344),
+        tierInfo("large", false, 2_182_184_672),
+      ],
+      activeTier: "small",
+      modelsDir: "/var/models",
+    });
+
+    render(<AiModelsSection />);
+    const downloadBtn = await screen.findByTestId(
+      "settings-ai-model-small-download",
+    );
+    fireEvent.click(downloadBtn);
+
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("settings-ai-model-small-failed"),
+      ).toHaveTextContent("HTTP 503 from huggingface.co");
+    });
+    expect(
+      screen.queryByTestId("settings-ai-models-error"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("falls back to the top-level error banner when the progress slot has no Failed entry", async () => {
+    // Defense in depth: if the napi reject races ahead of the Rust
+    // side publishing Failed (or if the progress fetch itself
+    // rejects), the user must still see the error — surface it
+    // through the top-level banner.
+    vi.spyOn(aec.ai, "downloadModel").mockRejectedValue(
+      new Error("IPC channel closed"),
+    );
+    vi.spyOn(aec.ai, "downloadProgress").mockResolvedValue(null);
+    vi.spyOn(aec.ai, "modelAvailability").mockResolvedValue({
+      tiers: [
+        tierInfo("small", false, 463_290_464),
+        tierInfo("medium", false, 1_074_969_344),
+        tierInfo("large", false, 2_182_184_672),
+      ],
+      activeTier: "small",
+      modelsDir: "/var/models",
+    });
+
+    render(<AiModelsSection />);
+    const downloadBtn = await screen.findByTestId(
+      "settings-ai-model-small-download",
+    );
+    fireEvent.click(downloadBtn);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("settings-ai-models-error")).toHaveTextContent(
+        "IPC channel closed",
+      );
+    });
+    expect(
+      screen.queryByTestId("settings-ai-model-small-failed"),
+    ).not.toBeInTheDocument();
   });
 
   it("calls setActiveTier when 'Set active' clicked on a downloaded non-active tier", async () => {
