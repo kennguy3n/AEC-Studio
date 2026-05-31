@@ -6127,22 +6127,31 @@ impl BridgeService {
             }
         }
         // Step 1: update the manager. Brief critical section — no
-        // network I/O, no spawn.
-        let new_path = {
+        // network I/O, no spawn. Read BOTH `model_path` and
+        // `vae_path` while the lock is held: the new descriptor may
+        // declare a different `vae_filename` (e.g. an SDXL model
+        // shipping a separate VAE), and any subsequent cold spawn
+        // must pass the matching `--vae` flag through
+        // [`build_image_gen_spawn_args`]. Returning a `None`
+        // `vae_path` is also load-bearing: it lets a descriptor swap
+        // that *drops* a VAE clear the previous descriptor's path
+        // out of the spawn config.
+        let (new_model_path, new_vae_path) = {
             let mut mgr = self
                 .image_gen_model_manager
                 .lock()
                 .map_err(|_| BridgeServiceError::ImageGen("model_manager mutex poisoned".into()))?;
             mgr.set_descriptor(descriptor);
-            mgr.model_path()
+            (mgr.model_path(), mgr.vae_path())
         };
         // Step 2: kill any running sidecar so the next `ensure_ready`
         // cold-spawns with the new model path. We snapshot the
-        // *current* runtime config and mutate only `model_path` —
-        // every other field (port, threads, request_timeout,
-        // vae_path on the spawn side; idle_timeout, load_budget at
-        // the lifecycle side) is governor-owned and must survive a
-        // descriptor swap. Same pattern as
+        // *current* runtime config and mutate only the
+        // descriptor-derived fields (`spawn_config.model_path` and
+        // `spawn_config.vae_path`). Every other field — port,
+        // threads, request_timeout on the spawn side; idle_timeout,
+        // load_budget at the lifecycle side — is governor-owned and
+        // must survive a descriptor swap. Same pattern as
         // [`Self::image_gen_apply_policy`]; reverting to
         // [`ImageGenRuntimeConfig::default`] here would silently
         // overwrite a Pro-tier 300 s idle window with the 120 s boot
@@ -6152,7 +6161,8 @@ impl BridgeService {
                 BridgeServiceError::ImageGen(format!("snapshot image-gen runtime config: {e}"))
             })?;
             let mut next = current;
-            next.spawn_config.model_path = new_path;
+            next.spawn_config.model_path = new_model_path;
+            next.spawn_config.vae_path = new_vae_path;
             next
         };
         self.image_gen_state
@@ -10706,6 +10716,108 @@ END-ISO-10303-21;\n";
                 .ends_with("swapped-model.gguf"),
             "new descriptor model_path did not land in spawn_config: {:?}",
             after.spawn_config.model_path,
+        );
+    }
+
+    #[test]
+    fn image_gen_set_descriptor_propagates_vae_path_to_spawn_config() {
+        // Regression for Devin Review BUG (round 3): when a
+        // descriptor declares a non-`None` `vae_filename` (e.g. an
+        // SDXL checkpoint shipping a separate VAE), the resolved
+        // path MUST land in `spawn_config.vae_path` so the next
+        // sidecar cold spawn passes `--vae`. The previous
+        // implementation only updated `spawn_config.model_path`, so
+        // the sidecar launched without the VAE and produced garbled
+        // output for any model that needs one. Mirrors the
+        // `…_preserves_governor_applied_lifecycle_budgets` test —
+        // same call site, different field under test.
+        let (s, _g) = service();
+        let descriptor = ImageGenModelDescriptor {
+            filename: "sdxl-base-1.0.gguf".into(),
+            blake3_hex: String::new(),
+            size_bytes: 0,
+            download_url: Some("https://huggingface.co/example/sdxl-base.gguf".into()),
+            vae_filename: Some("sdxl-vae-fp16-fix.safetensors".into()),
+        };
+        s.image_gen_set_descriptor(descriptor).unwrap();
+
+        let after = s.image_gen_state.snapshot_config().unwrap();
+        assert!(
+            after
+                .spawn_config
+                .model_path
+                .to_string_lossy()
+                .ends_with("sdxl-base-1.0.gguf"),
+            "model_path did not land in spawn_config: {:?}",
+            after.spawn_config.model_path,
+        );
+        let vae = after
+            .spawn_config
+            .vae_path
+            .as_ref()
+            .expect("vae_path must be populated when descriptor declares vae_filename");
+        assert!(
+            vae.to_string_lossy()
+                .ends_with("sdxl-vae-fp16-fix.safetensors"),
+            "vae_path did not land in spawn_config: {:?}",
+            vae,
+        );
+    }
+
+    #[test]
+    fn image_gen_set_descriptor_clears_vae_path_when_new_descriptor_omits_it() {
+        // Companion to the propagation test above: if the user
+        // first pins a descriptor *with* a VAE and then pins one
+        // *without*, the spawn config's `vae_path` MUST be cleared
+        // (set to `None`). Otherwise the next cold spawn would pass
+        // `--vae /path/to/old.safetensors` from the previous
+        // descriptor — at best a confusing log line, at worst the
+        // sidecar refuses to start because the old file isn't on
+        // disk.
+        let (s, _g) = service();
+
+        // Step 1: pin a descriptor that declares a VAE.
+        let with_vae = ImageGenModelDescriptor {
+            filename: "sdxl-base-1.0.gguf".into(),
+            blake3_hex: String::new(),
+            size_bytes: 0,
+            download_url: Some("https://huggingface.co/example/sdxl-base.gguf".into()),
+            vae_filename: Some("sdxl-vae-fp16-fix.safetensors".into()),
+        };
+        s.image_gen_set_descriptor(with_vae).unwrap();
+        // Sanity: the VAE landed.
+        assert!(
+            s.image_gen_state
+                .snapshot_config()
+                .unwrap()
+                .spawn_config
+                .vae_path
+                .is_some(),
+        );
+
+        // Step 2: swap to a descriptor without a VAE. The VAE path
+        // must clear.
+        let without_vae = ImageGenModelDescriptor {
+            filename: "sd15-pruned.gguf".into(),
+            blake3_hex: String::new(),
+            size_bytes: 0,
+            download_url: Some("https://huggingface.co/example/sd15-pruned.gguf".into()),
+            vae_filename: None,
+        };
+        s.image_gen_set_descriptor(without_vae).unwrap();
+
+        let after = s.image_gen_state.snapshot_config().unwrap();
+        assert!(
+            after.spawn_config.vae_path.is_none(),
+            "vae_path leaked across descriptor swap: {:?}",
+            after.spawn_config.vae_path,
+        );
+        assert!(
+            after
+                .spawn_config
+                .model_path
+                .to_string_lossy()
+                .ends_with("sd15-pruned.gguf"),
         );
     }
 
