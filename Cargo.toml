@@ -15,6 +15,7 @@ members = [
     "crates/aec_governor",
     "crates/aec_export",
     "crates/aec_audit",
+    "crates/aec_integrity",
 ]
 
 [workspace.package]

@@ -98,6 +98,7 @@ dependencies = [
  "aec_export",
  "aec_geometry",
  "aec_governor",
+ "aec_integrity",
  "aec_materials",
  "aec_render",
  "aec_viewport",
@@ -117,6 +118,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
+ "tracing",
  "uuid",
  "zip",
 ]
@@ -217,6 +219,21 @@ dependencies = [
  "sysinfo",
  "tempfile",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "aec_integrity"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "ed25519-dalek",
+ "getrandom 0.2.17",
+ "hex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tracing",
 ]
 
 [[package]]

@@ -6225,6 +6225,159 @@ impl BridgeService {
             .collect()
     }
 
+    /// Phase 18 Group E Task 26 — verify every model file currently
+    /// known to the registry against its compile-time-pinned BLAKE3
+    /// hash + size. Returns a per-file
+    /// [`aec_integrity::VerificationReport`] the renderer can surface
+    /// in the Settings → Models pane and the bridge logs at every
+    /// boot.
+    ///
+    /// The verification is **graceful by design**:
+    ///
+    /// - A missing file is reported as `Missing`, **not** an error —
+    ///   it just means the user hasn't downloaded that tier yet. The
+    ///   Models pane already exposes that as a "download" button.
+    /// - A file whose size or BLAKE3 hash differs from the pin is
+    ///   reported as `SizeMismatch` / `Mismatch`. These are the
+    ///   tamper / corruption signals — the renderer should warn the
+    ///   user and offer a re-download. The bridge does **not**
+    ///   silently delete the file (that's the user's policy
+    ///   decision); it just refuses to spawn against it.
+    /// - An I/O error reading the file (permission denied, broken
+    ///   disk) is surfaced as `ReadError` so the user can
+    ///   distinguish "tamper" from "broken hardware".
+    ///
+    /// The function is `&self` so the renderer can call it
+    /// repeatedly without acquiring any writer lock, and it
+    /// touches each model file at most once (streaming BLAKE3
+    /// in 64 KiB chunks, no whole-file load into RAM).
+    pub fn model_integrity_report(
+        &self,
+    ) -> Result<aec_integrity::VerificationReport, BridgeServiceError> {
+        // Resolve the text + image-gen model directories. Both are
+        // owned by `BridgeService` so the locks are micro-scoped and
+        // dropped before any file I/O runs.
+        let text_dir: PathBuf = {
+            let mgr = self
+                .model_manager
+                .lock()
+                .map_err(|_| BridgeServiceError::Ai("model_manager mutex poisoned".into()))?;
+            mgr.models_dir().to_path_buf()
+        };
+        let image_dir: PathBuf = {
+            let mgr = self
+                .image_gen_model_manager
+                .lock()
+                .map_err(|_| BridgeServiceError::ImageGen("model_manager mutex poisoned".into()))?;
+            mgr.models_dir().to_path_buf()
+        };
+
+        let registry = aec_ai::registry::ModelRegistry::embedded();
+
+        // Build the FilePin list. Each pin's `id` is namespaced
+        // (`text.{tier}` / `image-gen.{preset-id}`) so the renderer
+        // can route mismatches to the correct UI surface.
+        let mut pins: Vec<aec_integrity::FilePin> = Vec::new();
+        for t in &registry.text.tiers {
+            // `Blake3Digest::from_hex` cannot fail here unless the
+            // registry's BLAKE3 hex is malformed — which is itself a
+            // boot-time invariant (`ModelRegistry::validate_at_boot`
+            // doesn't currently check hex length, so do it here and
+            // surface a clear error).
+            let expected = aec_integrity::Blake3Digest::from_hex(&t.blake3_hex).map_err(|e| {
+                BridgeServiceError::Ai(format!(
+                    "model_integrity_report: text.{:?} blake3_hex is malformed in ai_models.json: {e}",
+                    t.tier
+                ))
+            })?;
+            pins.push(aec_integrity::FilePin {
+                id: format!("text.{:?}", t.tier).to_ascii_lowercase(),
+                path: text_dir.join(&t.filename),
+                expected_blake3: expected,
+                expected_size_bytes: t.size_bytes,
+            });
+        }
+        for p in &registry.image_gen.presets {
+            let expected = aec_integrity::Blake3Digest::from_hex(&p.blake3_hex).map_err(|e| {
+                BridgeServiceError::ImageGen(format!(
+                    "model_integrity_report: image-gen preset '{}' blake3_hex is malformed: {e}",
+                    p.id
+                ))
+            })?;
+            pins.push(aec_integrity::FilePin {
+                id: format!("image-gen.{}", p.id),
+                path: image_dir.join(&p.filename),
+                expected_blake3: expected,
+                expected_size_bytes: p.size_bytes,
+            });
+        }
+
+        // Also pin the user-supplied image-gen descriptor (the wizard
+        // may have pinned a custom SD GGUF that isn't in the
+        // registry's preset list). Skip when the descriptor is empty
+        // — that's the boot default before the user has chosen a
+        // model.
+        let custom_descriptor = {
+            let mgr = self
+                .image_gen_model_manager
+                .lock()
+                .map_err(|_| BridgeServiceError::ImageGen("model_manager mutex poisoned".into()))?;
+            mgr.descriptor().clone()
+        };
+        if !custom_descriptor.filename.is_empty() && !custom_descriptor.blake3_hex.is_empty() {
+            // The pin id is namespaced under `image-gen.custom` so the
+            // renderer can differentiate "registry preset" from
+            // "user-supplied" in the diagnostics surface.
+            let expected = aec_integrity::Blake3Digest::from_hex(&custom_descriptor.blake3_hex)
+                .map_err(|e| {
+                    BridgeServiceError::ImageGen(format!(
+                        "model_integrity_report: user-supplied image-gen blake3_hex is malformed: {e}"
+                    ))
+                })?;
+            // Avoid producing a duplicate `id` if the user pinned a
+            // descriptor whose filename matches a registry preset.
+            // `verify_files_against_pins` rejects duplicate ids, and
+            // a duplicate would be a confusing diagnostic anyway.
+            let already_pinned = pins
+                .iter()
+                .any(|fp| fp.path == image_dir.join(&custom_descriptor.filename));
+            if !already_pinned {
+                pins.push(aec_integrity::FilePin {
+                    id: "image-gen.custom".to_string(),
+                    path: image_dir.join(&custom_descriptor.filename),
+                    expected_blake3: expected,
+                    expected_size_bytes: custom_descriptor.size_bytes,
+                });
+            }
+        }
+
+        let outcomes = aec_integrity::verify_files_against_pins(&pins)
+            .map_err(|e| BridgeServiceError::Ai(format!("model_integrity_report: {e}")))?;
+
+        // Log non-`Verified` outcomes at boot so server-side logs
+        // capture every tamper / corruption signal alongside the
+        // existing extension-load diagnostics. The `aec_integrity`
+        // layer already issued a `warn!` per non-verified pin; we
+        // emit a structured summary line so logs surface the boot-
+        // wide all-verified bit without grepping per-pin warnings.
+        let any_failed = outcomes
+            .iter()
+            .any(|o| !matches!(o.status, aec_integrity::ModelVerificationStatus::Verified));
+        if any_failed {
+            tracing::warn!(
+                pin_count = pins.len(),
+                "model_integrity_report: one or more model files did not verify against their compile-time-pinned BLAKE3/size"
+            );
+        } else {
+            tracing::info!(
+                pin_count = pins.len(),
+                "model_integrity_report: all known model files verified against compile-time pins"
+            );
+        }
+
+        Ok(aec_integrity::VerificationReport::from_outcomes(&outcomes))
+    }
+
     /// Replace the currently-configured image-gen descriptor and kill
     /// any in-flight sidecar so the next `image_gen_generate` cold-
     /// spawns with the new model. Used by the renderer's first-run
@@ -11250,6 +11403,171 @@ END-ISO-10303-21;\n";
         // may already be gone (e.g. another test parallel-ran);
         // we don't fail the test on cleanup-side errors.
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn model_integrity_report_pins_every_text_tier_and_every_image_gen_preset() {
+        // Phase 18 Group E Task 24/26 — confirm the integrity
+        // report enumerates one outcome per registry-known model
+        // (3 text tiers + N image-gen presets) with stable id
+        // namespacing. The values of `id` matter because the
+        // renderer routes mismatches to UI surfaces by id prefix
+        // — text.* lives in the Models pane, image-gen.* lives
+        // in the Image-gen panel.
+        let (s, _g) = service();
+        let report = s
+            .model_integrity_report()
+            .expect("registry pins are well-formed; report must build cleanly");
+        let registry = aec_ai::registry::ModelRegistry::embedded();
+        let expected_text_count = registry.text.tiers.len();
+        let expected_preset_count = registry.image_gen.presets.len();
+        let expected_total = expected_text_count + expected_preset_count;
+
+        // The report may include an additional `image-gen.custom`
+        // entry if a user-supplied descriptor is non-empty; the
+        // boot default leaves that descriptor blank so the
+        // current test shape expects exactly the registry-pin
+        // count. Anchored at >= so the test does not fail if a
+        // future PR populates the custom descriptor at boot.
+        assert!(
+            report.entries.len() >= expected_total,
+            "report must enumerate every registry-known model: got {} entries, registry pins {}",
+            report.entries.len(),
+            expected_total
+        );
+
+        let ids: std::collections::HashSet<&str> =
+            report.entries.iter().map(|e| e.id.as_str()).collect();
+        for t in &registry.text.tiers {
+            let expected_id = format!("text.{:?}", t.tier).to_ascii_lowercase();
+            assert!(
+                ids.contains(expected_id.as_str()),
+                "report missing pin for text tier {:?}: ids={:?}",
+                t.tier,
+                ids
+            );
+        }
+        for p in &registry.image_gen.presets {
+            let expected_id = format!("image-gen.{}", p.id);
+            assert!(
+                ids.contains(expected_id.as_str()),
+                "report missing pin for image-gen preset {:?}: ids={:?}",
+                p.id,
+                ids
+            );
+        }
+    }
+
+    #[test]
+    fn model_integrity_report_reports_missing_for_files_not_on_disk() {
+        // The default-tier files are not downloaded in a fresh
+        // bridge boot, so every entry must be `missing` (never
+        // `mismatch`, which would indicate the test environment
+        // had stale tampered files lying around). This pins the
+        // Task 23 contract that "missing != tampered" and gives
+        // us a regression net against the bridge silently
+        // upgrading a missing file to a hash-mismatch.
+        let (s, _g) = service();
+        // Make sure no leftover file from prior runs poisons the
+        // boot-pristine assumption. The default text models live
+        // in `aec_ai::default_models_dir()` which is the user's
+        // platform-specific data directory — we don't blow that
+        // away. Instead we assert that **every reported entry
+        // for a registry-known tier is either `verified` or
+        // `missing`**; `mismatch` here would mean the user had a
+        // tampered file at the canonical path, which is itself a
+        // real bug we want to surface.
+        let report = s.model_integrity_report().unwrap();
+        for entry in &report.entries {
+            assert!(
+                entry.status == "verified" || entry.status == "missing",
+                "every registry pin must report verified or missing on a pristine test \
+                 environment (got status={} for id={}; detail={})",
+                entry.status,
+                entry.id,
+                entry.detail
+            );
+        }
+    }
+
+    #[test]
+    fn model_integrity_report_detects_tampered_model_file_via_blake3_mismatch() {
+        // Plant a wrong-bytes file at the canonical path for the
+        // `text.small` tier and confirm the report surfaces a
+        // `mismatch` (NOT `verified`, NOT `missing`). This is
+        // the load-bearing tamper-detection path Task 26
+        // exists to provide.
+        let (s, _g) = service();
+        let registry = aec_ai::registry::ModelRegistry::embedded();
+        let small = registry
+            .text
+            .tiers
+            .iter()
+            .find(|t| matches!(t.tier, aec_ai::registry::TextTierTag::Small))
+            .expect("Small tier present in registry");
+
+        let models_dir = {
+            let mgr = s.model_manager.lock().unwrap();
+            mgr.models_dir().to_path_buf()
+        };
+        let model_path = models_dir.join(&small.filename);
+        if let Some(parent) = model_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        // Write bytes whose size DIFFERS from the pinned size_bytes
+        // so the size-mismatch fast-path fires. (Writing
+        // `size_bytes` worth of zeros would land on `mismatch`
+        // via BLAKE3, but a SizeMismatch is the cheaper-to-detect
+        // shape and is what the bridge will fire first on a
+        // real corruption — pinning that path keeps the test
+        // fast.)
+        let evil_bytes = vec![0u8; 17];
+        std::fs::write(&model_path, &evil_bytes).unwrap();
+        // Sanity: registry-pinned size MUST differ from 17.
+        assert_ne!(small.size_bytes, 17);
+
+        let report = s.model_integrity_report().unwrap();
+        let id = format!("text.{:?}", small.tier).to_ascii_lowercase();
+        let entry = report
+            .entries
+            .iter()
+            .find(|e| e.id == id)
+            .expect("tampered text.small entry must be present in report");
+        assert_eq!(
+            entry.status, "size-mismatch",
+            "tampered file must be reported as size-mismatch (was: {})",
+            entry.status
+        );
+        assert!(!report.all_verified);
+
+        // Clean up the planted file so the next test run starts
+        // from a pristine state.
+        let _ = std::fs::remove_file(&model_path);
+    }
+
+    #[test]
+    fn model_integrity_report_includes_user_supplied_image_gen_descriptor() {
+        // The user's wizard can pin a custom SD GGUF that isn't
+        // in the registry's preset list. The integrity report
+        // must include it under `image-gen.custom` so the
+        // Settings UI can verify it on the same surface as the
+        // shipped models. This keeps users-of-not-yet-curated
+        // SD models from missing out on tamper detection.
+        let (s, _g) = service();
+        s.image_gen_set_descriptor(ImageGenModelDescriptor {
+            filename: "user-supplied-test.gguf".into(),
+            blake3_hex: "d74981efa70a0c880b8d8c1985d075dbcbf679b99a5f9914e5aaf96b831a9e24".into(),
+            size_bytes: 11,
+            download_url: Some("https://example.invalid/x.gguf".into()),
+            vae_filename: None,
+        })
+        .expect("descriptor must accept");
+        let report = s.model_integrity_report().unwrap();
+        let has_custom = report.entries.iter().any(|e| e.id == "image-gen.custom");
+        assert!(
+            has_custom,
+            "user-supplied descriptor must appear under id='image-gen.custom'"
+        );
     }
 
     #[test]

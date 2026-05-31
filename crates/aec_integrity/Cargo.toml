@@ -1,0 +1,24 @@
+[package]
+name = "aec_integrity"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Binary + model integrity verification (BLAKE3 file hash + Ed25519 signed manifests) for AEC Studio."
+
+[dependencies]
+blake3 = { workspace = true }
+ed25519-dalek = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+getrandom = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
