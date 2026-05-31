@@ -168,7 +168,20 @@ impl ImageGenState {
         // crash), drop the dead handle and fall through to cold
         // spawn.
         if let Some(handle) = slot.as_mut() {
-            if handle.try_exit_code().is_some() {
+            if let Some(code) = handle.try_exit_code() {
+                // Phase 18 Group E Task 25 — sidecar lifecycle
+                // telemetry. A non-`None` exit code observed during
+                // `ensure_ready`'s pre-flight check means the child
+                // died between requests (OOM, segfault, GPU driver
+                // crash, user-initiated SIGTERM). This is a tamper
+                // / corruption / health signal the operator needs to
+                // see in logs immediately, not after the next
+                // generate call retries the spawn.
+                tracing::warn!(
+                    sidecar = "image-gen",
+                    exit_code = ?code,
+                    "image-gen sidecar exited between requests; resetting runtime + re-spawning on next ensure_ready"
+                );
                 *slot = None;
                 let cfg = {
                     let r = self.runtime.read().map_err(poisoned)?;
@@ -238,6 +251,18 @@ impl ImageGenState {
             // path acquires `runtime` then `restart_policy`
             // outside of `handle_slot` we would have an AB/BA
             // deadlock. Keep the scope tight.
+            // Phase 18 Group E Task 25 — emit a `cold_spawn_start`
+            // event before the (possibly multi-second) cold spawn
+            // so operators can correlate a slow generate with the
+            // sidecar phase that owned the latency.
+            tracing::info!(
+                sidecar = "image-gen",
+                load_budget_secs = cfg.load_budget.as_secs(),
+                spawn_timeout_secs = spawn_timeout.as_secs(),
+                max_attempts = DEFAULT_IMAGE_GEN_MAX_SPAWN_ATTEMPTS,
+                "image-gen sidecar cold-spawn starting"
+            );
+            let spawn_started_at = std::time::Instant::now();
             let spawn_result = {
                 let mut policy = self.restart_policy.lock().map_err(poisoned)?;
                 sidecar::spawn_with_retry(
@@ -262,15 +287,35 @@ impl ImageGenState {
                 // `if slot.is_none()` block above) will fail that
                 // test before merge. Do not collapse this scope.
             };
+            let elapsed = spawn_started_at.elapsed();
             match spawn_result {
                 Ok(handle) => {
                     let transport = handle.transport().clone();
                     *slot = Some(handle);
                     self.runtime.write().map_err(poisoned)?.mark_ready();
+                    // Phase 18 Group E Task 25 — successful cold
+                    // spawn telemetry. `elapsed` lets ops correlate
+                    // health-probe stalls vs. true spawn cost.
+                    tracing::info!(
+                        sidecar = "image-gen",
+                        elapsed_ms = elapsed.as_millis() as u64,
+                        "image-gen sidecar cold-spawn ready"
+                    );
                     Ok(transport)
                 }
                 Err(e) => {
                     let msg = e.to_string();
+                    // Phase 18 Group E Task 25 — failed cold spawn
+                    // telemetry. Emit at `warn!` (not `error!`)
+                    // because retry policy may resurrect on the next
+                    // generate. Operators tailing logs see the
+                    // exhausted retry budget as the final signal.
+                    tracing::warn!(
+                        sidecar = "image-gen",
+                        elapsed_ms = elapsed.as_millis() as u64,
+                        error = %msg,
+                        "image-gen sidecar cold-spawn failed (retry budget exhausted)"
+                    );
                     self.runtime.write().map_err(poisoned)?.mark_failed(msg);
                     Err(e.into())
                 }
@@ -298,9 +343,26 @@ impl ImageGenState {
         new_config: ImageGenRuntimeConfig,
     ) -> Result<(), ImageGenStateError> {
         let mut slot = self.handle_slot.lock().map_err(poisoned)?;
+        let had_running_child = slot.is_some();
         *slot = None;
         let mut runtime = self.runtime.write().map_err(poisoned)?;
         runtime.reload_with_config(new_config);
+        // Phase 18 Group E Task 25 — config-reload telemetry.
+        // Distinguishes "kill running child to re-spawn against new
+        // model" (loud signal) from "swap config while idle" (quiet
+        // signal). Both are user-driven Settings actions but the
+        // former interrupts an in-flight session.
+        if had_running_child {
+            tracing::info!(
+                sidecar = "image-gen",
+                "image-gen sidecar killed by reload_with_config; next ensure_ready will cold-spawn against new config"
+            );
+        } else {
+            tracing::debug!(
+                sidecar = "image-gen",
+                "image-gen runtime config reloaded while sidecar idle"
+            );
+        }
         Ok(())
     }
 
@@ -331,6 +393,16 @@ impl ImageGenState {
         let was_running = slot.is_some();
         *slot = None;
         runtime.reset();
+        // Phase 18 Group E Task 25 — idle-eviction telemetry.
+        // Only emit when we actually shut down a running child so
+        // we don't spam logs every governor tick on an empty
+        // service.
+        if was_running {
+            tracing::info!(
+                sidecar = "image-gen",
+                "image-gen sidecar idle-evicted by governor maybe_unload tick"
+            );
+        }
         Ok(was_running)
     }
 

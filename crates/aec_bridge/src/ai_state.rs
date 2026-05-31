@@ -269,7 +269,19 @@ impl AiState {
         // refused error. `try_exit_code` is non-blocking
         // (`Child::try_wait`).
         if let Some(handle) = slot.as_mut() {
-            if handle.try_exit_code().is_some() {
+            if let Some(code) = handle.try_exit_code() {
+                // Phase 18 Group E Task 25 — sidecar lifecycle
+                // telemetry. A non-`None` exit code observed during
+                // `ensure_ready`'s pre-flight check means the child
+                // died between requests (OOM, segfault, host
+                // `pkill`). This is a health signal the operator
+                // needs to see in logs immediately, not after the
+                // next `ai_plan` retries the spawn.
+                tracing::warn!(
+                    sidecar = "ai",
+                    exit_code = ?code,
+                    "text sidecar exited between requests; resetting runtime + re-spawning on next ensure_ready"
+                );
                 *slot = None;
                 // Reset runtime so the upcoming `begin_load` doesn't
                 // surface a stale `Failed` from a previous crash.
@@ -301,15 +313,38 @@ impl AiState {
                 runtime.begin_load();
                 runtime.config().clone()
             };
-            match sidecar::spawn(&cfg, spawn_timeout) {
+            // Phase 18 Group E Task 25 — cold-spawn-start telemetry.
+            // Mirrors the image-gen side so operators see one
+            // sidecar-tagged event pair per spawn cycle regardless
+            // of which sidecar took the latency.
+            tracing::info!(
+                sidecar = "ai",
+                spawn_timeout_secs = spawn_timeout.as_secs(),
+                "text sidecar cold-spawn starting"
+            );
+            let spawn_started_at = std::time::Instant::now();
+            let spawn_result = sidecar::spawn(&cfg, spawn_timeout);
+            let elapsed = spawn_started_at.elapsed();
+            match spawn_result {
                 Ok(handle) => {
                     let transport = handle.transport().clone();
                     *slot = Some(handle);
                     self.runtime.write().map_err(poisoned)?.mark_ready();
+                    tracing::info!(
+                        sidecar = "ai",
+                        elapsed_ms = elapsed.as_millis() as u64,
+                        "text sidecar cold-spawn ready"
+                    );
                     Ok(transport)
                 }
                 Err(e) => {
                     let msg = e.to_string();
+                    tracing::warn!(
+                        sidecar = "ai",
+                        elapsed_ms = elapsed.as_millis() as u64,
+                        error = %msg,
+                        "text sidecar cold-spawn failed"
+                    );
                     self.runtime.write().map_err(poisoned)?.mark_failed(msg);
                     Err(e.into())
                 }
@@ -354,6 +389,7 @@ impl AiState {
     /// was already `None`; nothing to drop.
     pub fn reload_with_config(&self, new_config: RuntimeConfig) -> Result<(), AiStateError> {
         let mut slot = self.handle_slot.lock().map_err(poisoned)?;
+        let had_running_child = slot.is_some();
         // Dropping the previous handle (if any) kills the running
         // `llama-server` child via `Drop for SidecarHandle`. Setting
         // to `None` first means the brief `runtime` write below
@@ -364,6 +400,18 @@ impl AiState {
         *slot = None;
         let mut runtime = self.runtime.write().map_err(poisoned)?;
         *runtime = SidecarRuntime::new(new_config);
+        // Phase 18 Group E Task 25 — config-reload telemetry.
+        if had_running_child {
+            tracing::info!(
+                sidecar = "ai",
+                "text sidecar killed by reload_with_config; next ensure_ready will cold-spawn against new config"
+            );
+        } else {
+            tracing::debug!(
+                sidecar = "ai",
+                "text runtime config reloaded while sidecar idle"
+            );
+        }
         Ok(())
     }
 
