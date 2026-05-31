@@ -6566,15 +6566,35 @@ impl BridgeService {
                     .into(),
             ));
         }
-        // The cold-spawn budget is the smaller of the per-tier
-        // policy load_budget (e.g. Pro = 90 s) and the hard ceiling
-        // (`DEFAULT_IMAGE_GEN_SPAWN_TIMEOUT` = 60 s, defending
-        // against a misconfigured snapshot that pushes the budget
-        // beyond what a healthy sidecar should ever need). Matching
-        // `ImageGenState::ensure_ready`'s own `min` shape so the
-        // run phase does not double-clamp.
-        let spawn_timeout = std::time::Duration::from_secs(policy.load_budget_secs as u64)
-            .min(DEFAULT_IMAGE_GEN_SPAWN_TIMEOUT);
+        // Phase 18 Group E Devin Review fix — the cold-spawn budget
+        // is the **per-tier policy `load_budget`** (Low = 45 s,
+        // Medium = 60 s, High = 75 s, Pro = 90 s — see
+        // `crates/aec_governor/src/policy.rs::GovernorPolicy::for_tier`).
+        // Earlier this branch did
+        // `Duration::from_secs(policy.load_budget_secs).min(DEFAULT_IMAGE_GEN_SPAWN_TIMEOUT)`
+        // — with `DEFAULT_IMAGE_GEN_SPAWN_TIMEOUT == 60 s`, that
+        // `.min()` silently clamped High (75 s) and Pro (90 s) back
+        // down to 60 s, defeating the entire per-tier
+        // differentiation. The clamp also produced a hard-to-
+        // diagnose `HealthTimeout` on Pro workstations loading a
+        // large SDXL GGUF, where 60 s is genuinely insufficient
+        // for the mmap + CUDA / Metal context init the governor's
+        // 90 s budget accounts for.
+        //
+        // The fix trusts the policy verbatim: the governor already
+        // bounds `load_budget_secs` at construction time (it's a
+        // hard-coded per-tier table) so no extra ceiling is needed
+        // at this layer. `DEFAULT_IMAGE_GEN_SPAWN_TIMEOUT` is kept
+        // strictly as a fallback floor for the defensive
+        // `policy.load_budget_secs == 0` branch — which would
+        // otherwise hand `spawn_with_retry` a zero-second deadline
+        // and trip an immediate `HealthTimeout`.
+        let policy_budget = std::time::Duration::from_secs(policy.load_budget_secs as u64);
+        let spawn_timeout = if policy_budget.is_zero() {
+            DEFAULT_IMAGE_GEN_SPAWN_TIMEOUT
+        } else {
+            policy_budget
+        };
         Ok(ImageGenGenerateContext {
             request,
             image_gen_state: Arc::clone(&self.image_gen_state),
@@ -11355,23 +11375,121 @@ END-ISO-10303-21;\n";
             Arc::ptr_eq(&ctx.image_gen_state, &s.image_gen_state),
             "prepare must clone the SAME Arc<ImageGenState> the service owns",
         );
-        // Spawn timeout must be > 0 and bounded by the per-tier
-        // load_budget AND the hard ceiling. The Medium-tier default
-        // load_budget is 60 s, which equals
-        // DEFAULT_IMAGE_GEN_SPAWN_TIMEOUT — so the min collapses to
-        // 60 s in the default-boot config.
-        assert!(
-            ctx.spawn_timeout.as_secs() > 0,
-            "spawn_timeout must be positive",
+        // Phase 18 Group E Devin Review fix — `spawn_timeout`
+        // tracks the **per-tier policy `load_budget`** verbatim
+        // (Low = 45 s, Medium = 60 s, High = 75 s, Pro = 90 s).
+        // Earlier this branch clamped to
+        // `DEFAULT_IMAGE_GEN_SPAWN_TIMEOUT == 60 s`, which silently
+        // regressed High (75 s) and Pro (90 s) tier budgets. The
+        // default-boot config is Medium = 60 s, so the assertion
+        // here pins the post-fix invariant: spawn_timeout EQUALS
+        // the Medium-tier load_budget (not a ceiling on it).
+        let medium_budget = std::time::Duration::from_secs(
+            GovernorPolicy::for_tier(HardwareTier::Medium)
+                .image_gen
+                .load_budget_secs as u64,
         );
-        assert!(
-            ctx.spawn_timeout <= DEFAULT_IMAGE_GEN_SPAWN_TIMEOUT,
-            "spawn_timeout must not exceed the hard ceiling",
+        assert_eq!(
+            ctx.spawn_timeout, medium_budget,
+            "spawn_timeout at boot must equal the Medium-tier policy load_budget (not a hard ceiling on it)",
         );
         // Request must round-trip byte-identically through the
         // context so the run phase observes the user's submitted
         // parameters and not the validated-but-modified copy.
         assert_eq!(ctx.request, req);
+    }
+
+    #[test]
+    fn image_gen_prepare_generate_propagates_pro_tier_load_budget_unclamped() {
+        // Phase 18 Group E Devin Review fix — the YELLOW bug that
+        // triggered this regression test was:
+        // `let spawn_timeout = policy_budget.min(DEFAULT_IMAGE_GEN_SPAWN_TIMEOUT)`
+        // — silently clamping Pro (90 s) and High (75 s) load
+        // budgets down to 60 s, the hard-coded default.  The fix
+        // trusts the policy verbatim.  This test pins the property
+        // by applying Pro tier, calling prepare_generate, and
+        // asserting `spawn_timeout == 90 s` (NOT 60 s).
+        let (s, _g) = service();
+        // Apply Pro tier — propagates the per-tier image_gen policy
+        // into both the bridge's hot-path snapshot and the runtime
+        // config that ensure_ready will observe.
+        s.governor_apply_hardware_tier(HardwareTier::Pro).unwrap();
+        let pro_budget = std::time::Duration::from_secs(
+            GovernorPolicy::for_tier(HardwareTier::Pro)
+                .image_gen
+                .load_budget_secs as u64,
+        );
+        assert_eq!(
+            pro_budget.as_secs(),
+            90,
+            "Pro tier load_budget must be 90 s per the governor policy table",
+        );
+        let req = ImageGenGenerateRequest {
+            prompt: "Pro tier render".into(),
+            negative_prompt: None,
+            width: 1024,
+            height: 1024,
+            steps: 25,
+            cfg_scale: 7.0,
+            seed: None,
+            sampler: None,
+        };
+        let ctx = s.image_gen_prepare_generate(req).unwrap();
+        assert_eq!(
+            ctx.spawn_timeout, pro_budget,
+            "Pro-tier spawn_timeout must propagate the 90 s policy budget verbatim — was clamped to {} s by the YELLOW bug, now must be exactly {} s",
+            ctx.spawn_timeout.as_secs(),
+            pro_budget.as_secs(),
+        );
+        // Belt-and-suspenders: the spawn_timeout must STRICTLY
+        // EXCEED the old hard-ceiling — proves the regression
+        // can't reappear via a `.min(DEFAULT)` slipping back in.
+        assert!(
+            ctx.spawn_timeout > DEFAULT_IMAGE_GEN_SPAWN_TIMEOUT,
+            "Pro-tier spawn_timeout ({:?}) must exceed the legacy hard ceiling ({:?})",
+            ctx.spawn_timeout,
+            DEFAULT_IMAGE_GEN_SPAWN_TIMEOUT,
+        );
+    }
+
+    #[test]
+    fn image_gen_prepare_generate_propagates_high_tier_load_budget_unclamped() {
+        // Phase 18 Group E Devin Review fix — sibling of the
+        // Pro-tier regression test. High tier's 75 s budget was
+        // also silently clamped to 60 s by the pre-fix code.
+        let (s, _g) = service();
+        s.governor_apply_hardware_tier(HardwareTier::High).unwrap();
+        let high_budget = std::time::Duration::from_secs(
+            GovernorPolicy::for_tier(HardwareTier::High)
+                .image_gen
+                .load_budget_secs as u64,
+        );
+        assert_eq!(
+            high_budget.as_secs(),
+            75,
+            "High tier load_budget must be 75 s per the governor policy table",
+        );
+        let req = ImageGenGenerateRequest {
+            prompt: "High tier render".into(),
+            negative_prompt: None,
+            width: 768,
+            height: 768,
+            steps: 20,
+            cfg_scale: 7.0,
+            seed: None,
+            sampler: None,
+        };
+        let ctx = s.image_gen_prepare_generate(req).unwrap();
+        assert_eq!(
+            ctx.spawn_timeout, high_budget,
+            "High-tier spawn_timeout must propagate the 75 s policy budget verbatim",
+        );
+        assert!(
+            ctx.spawn_timeout > DEFAULT_IMAGE_GEN_SPAWN_TIMEOUT,
+            "High-tier spawn_timeout ({:?}) must exceed the legacy hard ceiling ({:?})",
+            ctx.spawn_timeout,
+            DEFAULT_IMAGE_GEN_SPAWN_TIMEOUT,
+        );
     }
 
     #[test]

@@ -246,8 +246,21 @@ impl ImageGenState {
                     &mut policy,
                     DEFAULT_IMAGE_GEN_MAX_SPAWN_ATTEMPTS,
                 )
-                // `policy` MutexGuard dropped here at end of scope,
-                // before the `runtime.write()` calls below.
+                // INVARIANT (Phase 18 Group E Devin Review): the
+                // `policy` MutexGuard is dropped exactly at this
+                // closing brace, **before** the `runtime.write()`
+                // calls in the `match spawn_result` arms below.
+                // Without this scope boundary, the lock acquisition
+                // order becomes `restart_policy → runtime`, inverting
+                // the canonical `handle_slot → runtime → restart_policy`
+                // documented at the top of this module. The
+                // regression test
+                // `ensure_ready_failure_path_releases_all_locks_in_canonical_order`
+                // pins this property — any future refactor that
+                // pulls `policy` out of this inner scope (e.g. by
+                // hoisting the `let mut policy = …` to the
+                // `if slot.is_none()` block above) will fail that
+                // test before merge. Do not collapse this scope.
             };
             match spawn_result {
                 Ok(handle) => {
