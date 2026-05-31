@@ -13,6 +13,8 @@
 
 use std::time::Duration;
 
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -65,6 +67,27 @@ pub enum ImageGenTransportError {
     InvalidBase64(String),
     #[error("request cancelled by caller")]
     Cancelled,
+}
+
+/// Decode a base64 string emitted by the image-gen sidecar.
+///
+/// Uses the workspace `base64` crate's `STANDARD` engine (the same engine
+/// the encode side in `aec_bridge::service` uses for the renderer
+/// round-trip), so encode/decode are guaranteed symmetric. We strip ASCII
+/// whitespace before decoding because some HTTP proxies / sidecar builds
+/// emit PEM-style wrapped base64 (`xxxx\nxxxx\n=`), which the strict
+/// `STANDARD` engine would otherwise reject.
+fn decode_image_base64(s: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    if s.as_bytes().iter().any(u8::is_ascii_whitespace) {
+        let stripped: String = s
+            .bytes()
+            .filter(|b| !b.is_ascii_whitespace())
+            .map(char::from)
+            .collect();
+        STANDARD.decode(stripped)
+    } else {
+        STANDARD.decode(s)
+    }
 }
 
 /// Subset of the AUTOMATIC1111 `txt2img` request envelope that
@@ -244,7 +267,7 @@ impl ImageGenTransport {
             .images
             .first()
             .ok_or(ImageGenTransportError::EmptyImage)?;
-        let png_bytes = base64_decode(first)
+        let png_bytes = decode_image_base64(first)
             .map_err(|e| ImageGenTransportError::InvalidBase64(e.to_string()))?;
         let seed = raw
             .parameters
@@ -259,66 +282,6 @@ impl ImageGenTransport {
             info: raw.info,
         })
     }
-}
-
-/// Tiny zero-dep base64 decoder for the subset of payloads
-/// stable-diffusion.cpp emits: standard alphabet (`A-Za-z0-9+/`),
-/// optional `=` padding, no whitespace, no URL-safe variant. We pull
-/// this in inline to avoid a runtime dep on the `base64` crate just
-/// for one decode path; the encoder is unnecessary because we only
-/// ever decode from the sidecar.
-fn base64_decode(s: &str) -> Result<Vec<u8>, Base64Error> {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
-    let mut buf = [0u8; 4];
-    let mut buf_len = 0usize;
-    for (idx, &c) in bytes.iter().enumerate() {
-        let v = match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            b'=' => {
-                // Padding only valid in the last 1-2 positions.
-                if idx < bytes.len() - 2 {
-                    return Err(Base64Error::UnexpectedPadding);
-                }
-                continue;
-            }
-            other => return Err(Base64Error::InvalidByte(other)),
-        };
-        buf[buf_len] = v;
-        buf_len += 1;
-        if buf_len == 4 {
-            out.push((buf[0] << 2) | (buf[1] >> 4));
-            out.push((buf[1] << 4) | (buf[2] >> 2));
-            out.push((buf[2] << 6) | buf[3]);
-            buf_len = 0;
-        }
-    }
-    match buf_len {
-        0 => {}
-        2 => {
-            out.push((buf[0] << 2) | (buf[1] >> 4));
-        }
-        3 => {
-            out.push((buf[0] << 2) | (buf[1] >> 4));
-            out.push((buf[1] << 4) | (buf[2] >> 2));
-        }
-        _ => return Err(Base64Error::IncompleteQuartet),
-    }
-    Ok(out)
-}
-
-#[derive(Debug, Error)]
-enum Base64Error {
-    #[error("invalid base64 byte: 0x{0:02x}")]
-    InvalidByte(u8),
-    #[error("padding `=` before end of input")]
-    UnexpectedPadding,
-    #[error("input length not a multiple of 4 base64 chars (after padding)")]
-    IncompleteQuartet,
 }
 
 fn is_health_ok(body: &str) -> bool {
@@ -373,10 +336,10 @@ mod tests {
     }
 
     #[test]
-    fn base64_decode_round_trips_a_known_png_signature() {
+    fn decode_image_base64_round_trips_a_known_png_signature() {
         // The first 8 bytes of every PNG are 0x89 50 4E 47 0D 0A 1A 0A
         // (`%PNG\r\n\x1a\n`). Their base64 encoding is `iVBORw0KGgo=`.
-        let decoded = base64_decode("iVBORw0KGgo=").unwrap();
+        let decoded = decode_image_base64("iVBORw0KGgo=").unwrap();
         assert_eq!(
             decoded,
             vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
@@ -384,16 +347,35 @@ mod tests {
     }
 
     #[test]
-    fn base64_decode_accepts_unpadded_input() {
-        // "Man" → "TWFu" (no padding). Multi-byte plain.
-        let decoded = base64_decode("TWFu").unwrap();
-        assert_eq!(decoded, b"Man");
+    fn decode_image_base64_rejects_invalid_byte() {
+        // The `!` is outside the base64 alphabet; the `base64` crate's
+        // `STANDARD` engine surfaces this as an `InvalidByte`.
+        let err = decode_image_base64("AA!A").unwrap_err();
+        assert!(matches!(err, base64::DecodeError::InvalidByte(..)));
     }
 
     #[test]
-    fn base64_decode_rejects_invalid_byte() {
-        let err = base64_decode("AA!A").unwrap_err();
-        assert!(matches!(err, Base64Error::InvalidByte(b'!')));
+    fn decode_image_base64_does_not_panic_on_short_inputs_containing_padding() {
+        // Devin Review BUG-0001 regression: the previous hand-rolled
+        // decoder underflowed `bytes.len() - 2` on inputs like `"="` /
+        // `""`, which panicked in debug builds. The `base64` crate
+        // surfaces these as ordinary `DecodeError`s.
+        assert!(decode_image_base64("=").is_err());
+        assert!(decode_image_base64("").is_ok()); // empty decodes to empty
+        assert!(decode_image_base64("==").is_err());
+    }
+
+    #[test]
+    fn decode_image_base64_handles_pem_style_whitespace() {
+        // Some proxies / sidecar builds emit PEM-style wrapped base64
+        // with embedded newlines. The strict `STANDARD` engine rejects
+        // those, so `decode_image_base64` pre-strips ASCII whitespace.
+        let wrapped = "iVBO\nRw0K\nGgo=\n";
+        let decoded = decode_image_base64(wrapped).unwrap();
+        assert_eq!(
+            decoded,
+            vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+        );
     }
 
     #[test]
