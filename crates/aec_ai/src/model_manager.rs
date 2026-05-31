@@ -114,22 +114,26 @@ impl ModelTier {
     }
 
     /// Canonical GGUF Q2_0 filename used by the prism-ml HF repos.
+    ///
+    /// Reads from the compile-time-embedded
+    /// [`crate::registry::ModelRegistry`] (single source of truth
+    /// as of Phase 18 Group D Task 18). The registry boot-time
+    /// validation guarantees every tier is present, so the
+    /// `expect` here is unreachable in practice.
     pub fn filename(&self) -> &'static str {
-        match self {
-            Self::Small => "Ternary-Bonsai-1.7B-Q2_0.gguf",
-            Self::Medium => "Ternary-Bonsai-4B-Q2_0.gguf",
-            Self::Large => "Ternary-Bonsai-8B-Q2_0.gguf",
-        }
+        crate::registry::ModelRegistry::embedded()
+            .text_tier(*self)
+            .filename
+            .as_str()
     }
 
     /// Human-readable name for the model, used in Settings UI and download
     /// dialogs. Includes the family, parameter count, and quantization.
     pub fn display_name(&self) -> &'static str {
-        match self {
-            Self::Small => "Ternary-Bonsai 1.7B (1.58-bit GGUF Q2_0)",
-            Self::Medium => "Ternary-Bonsai 4B (1.58-bit GGUF Q2_0)",
-            Self::Large => "Ternary-Bonsai 8B (1.58-bit GGUF Q2_0)",
-        }
+        crate::registry::ModelRegistry::embedded()
+            .text_tier(*self)
+            .display_name
+            .as_str()
     }
 
     /// Sidecar context window size for this tier. Ternary-Bonsai models
@@ -138,22 +142,18 @@ impl ModelTier {
     /// allocate more KV cache, so this is the hardware-tier cap, not the
     /// model's intrinsic maximum.
     pub fn context_tokens(&self) -> u32 {
-        match self {
-            Self::Small => 2048,
-            Self::Medium => 4096,
-            Self::Large => 4096,
-        }
+        crate::registry::ModelRegistry::embedded()
+            .text_tier(*self)
+            .context_tokens
     }
 
     /// On-disk Q2_0 GGUF size in bytes (matches the HuggingFace LFS
     /// pointer). Used by the download progress UI to render the total
     /// before the response Content-Length is known.
     pub fn download_size_bytes(&self) -> u64 {
-        match self {
-            Self::Small => 463_290_464,
-            Self::Medium => 1_074_969_344,
-            Self::Large => 2_182_184_672,
-        }
+        crate::registry::ModelRegistry::embedded()
+            .text_tier(*self)
+            .size_bytes
     }
 
     /// Canonical BLAKE3 checksum of the Q2_0 GGUF as published by
@@ -161,21 +161,19 @@ impl ModelTier {
     /// `https://huggingface.co/prism-ml/Ternary-Bonsai-*-gguf/resolve/main/*.gguf`
     /// and hashing with BLAKE3.
     pub fn canonical_blake3_hex(&self) -> &'static str {
-        match self {
-            Self::Small => "6634a3ae6c4a5b3e6bec28fd7abe701579c2739db3695df1eb8ced9c28e4fc9a",
-            Self::Medium => "89a7662c39f5c704e2ede224590e3840ab7d44213109f08164177a7b2d14a7f5",
-            Self::Large => "3c2a48b2e9da29274ec96770cbd27ed0dd2e14b57ba1ce20b1a1d68344738ddd",
-        }
+        crate::registry::ModelRegistry::embedded()
+            .text_tier(*self)
+            .blake3_hex
+            .as_str()
     }
 
     /// HuggingFace repo slug for this tier (used to build the `resolve/main`
     /// download URL).
     pub fn huggingface_repo(&self) -> &'static str {
-        match self {
-            Self::Small => "prism-ml/Ternary-Bonsai-1.7B-gguf",
-            Self::Medium => "prism-ml/Ternary-Bonsai-4B-gguf",
-            Self::Large => "prism-ml/Ternary-Bonsai-8B-gguf",
-        }
+        crate::registry::ModelRegistry::embedded()
+            .text_tier(*self)
+            .huggingface_repo
+            .as_str()
     }
 
     /// Direct-download URL on the HuggingFace CDN for this tier's GGUF.

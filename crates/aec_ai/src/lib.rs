@@ -23,6 +23,7 @@ pub mod plan_detection;
 pub mod plan_to_wall;
 pub mod planner;
 pub mod property_fill;
+pub mod registry;
 pub mod render_doctor;
 pub mod runtime;
 pub mod safety_validator;
