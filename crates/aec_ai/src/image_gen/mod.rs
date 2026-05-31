@@ -35,7 +35,9 @@ pub use model_manager::{
     default_image_gen_descriptor, ImageGenModelDescriptor, ImageGenModelManager,
     ImageGenModelManagerError,
 };
-pub use runtime::{ImageGenRuntime, ImageGenRuntimeError, ImageGenRuntimeState};
+pub use runtime::{
+    ImageGenRuntime, ImageGenRuntimeConfig, ImageGenRuntimeError, ImageGenRuntimeState,
+};
 pub use sidecar::{
     build_image_gen_spawn_args, image_gen_bin, spawn_with_retry as image_gen_spawn_with_retry,
     ImageGenConfig, ImageGenHandle, ImageGenRestartPolicy, ImageGenSpawnError,

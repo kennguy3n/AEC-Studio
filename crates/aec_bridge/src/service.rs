@@ -4917,6 +4917,23 @@ impl BridgeService {
         self.ai_state = state;
     }
 
+    /// Test-only: install a pre-built [`ImageGenState`] (typically
+    /// one constructed via [`ImageGenState::__test_with_transport`]
+    /// against a mock loopback HTTP server) so an integration test
+    /// can exercise [`Self::image_gen_prepare_generate`] +
+    /// [`Self::run_image_gen_generate`] + [`Self::image_gen_runtime_status`]
+    /// + [`Self::image_gen_maybe_unload`] without spawning a real
+    /// `sd-server` / `stable-diffusion.cpp` binary.
+    ///
+    /// Mirrors [`Self::__test_install_ai_state`] for the text side
+    /// and is used by `tests/group_f_e2e_lifecycle.rs` to drive the
+    /// full descriptor-pin → spawn → generate → idle-unload →
+    /// re-spawn lifecycle deterministically in CI.
+    #[doc(hidden)]
+    pub fn __test_install_image_gen_state(&mut self, state: crate::image_gen_state::ImageGenState) {
+        self.image_gen_state = Arc::new(state);
+    }
+
     // ---------------------------------------------------------------
     // AI endpoints
     // ---------------------------------------------------------------
