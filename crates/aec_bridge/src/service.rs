@@ -5698,19 +5698,51 @@ impl BridgeService {
         Ok(g.clone())
     }
 
-    /// Overwrite the active tier on the in-process [`ModelManager`].
-    /// Does NOT respawn the sidecar — the next `ai_plan` cold-spawn
-    /// picks up the new tier's GGUF file via
-    /// [`aec_ai::ModelManager::active_config`]. The Settings page
-    /// drives this when the user changes the model tier override.
+    /// Switch the in-process active model tier. Two effects, applied
+    /// atomically from the caller's POV:
+    ///
+    /// 1. **`ModelManager::set_tier`** — the per-tier descriptor lookup
+    ///    [`ai_model_availability`](Self::ai_model_availability) returns
+    ///    now reports the new tier as `active_tier`.
+    /// 2. **`AiState::reload_with_config`** — the
+    ///    [`SidecarRuntime`](aec_ai::SidecarRuntime) inside the bridge's
+    ///    [`AiState`](crate::ai_state::AiState) has its `RuntimeConfig`
+    ///    swapped to the new tier's
+    ///    [`active_config()`](aec_ai::ModelManager::active_config), and
+    ///    any running `llama-server` child is killed by dropping its
+    ///    [`SidecarHandle`](aec_ai::sidecar::SidecarHandle). The next
+    ///    `ai_plan` cold-spawns the **new** tier's GGUF.
+    ///
+    /// Without step 2 the renderer would silently keep talking to the
+    /// previous tier's model until the bridge restarted.
+    ///
+    /// The Settings page calls this when the user picks a different
+    /// tier from the radio group; the renderer doesn't need to do
+    /// anything else (no explicit "restart sidecar" step).
     pub fn ai_set_active_tier(&self, tier_str: &str) -> Result<(), BridgeServiceError> {
         let tier = aec_ai::ModelTier::from_slug(tier_str)
             .ok_or_else(|| BridgeServiceError::Ai(format!("unknown tier {tier_str:?}")))?;
-        let mut mgr = self
-            .model_manager
-            .lock()
-            .map_err(|_| BridgeServiceError::Ai("model_manager mutex poisoned".into()))?;
-        mgr.set_tier(tier);
+        // Step 1: mutate the manager and clone out the new config in
+        // a single short critical section, so the manager mutex isn't
+        // held across the `AiState::reload_with_config` call (which
+        // briefly takes both the `handle_slot` and `runtime` locks).
+        let new_config = {
+            let mut mgr = self
+                .model_manager
+                .lock()
+                .map_err(|_| BridgeServiceError::Ai("model_manager mutex poisoned".into()))?;
+            mgr.set_tier(tier);
+            mgr.active_config()
+        };
+        // Step 2: propagate to the sidecar runtime. If this fails
+        // (lock poison only — the method does no I/O), the manager
+        // state is now inconsistent with the runtime; we still
+        // surface the error so the renderer can retry. A successful
+        // retry will re-derive `new_config` from the already-updated
+        // manager state.
+        self.ai_state
+            .reload_with_config(new_config)
+            .map_err(|e| BridgeServiceError::Ai(format!("reload ai runtime: {e}")))?;
         Ok(())
     }
 

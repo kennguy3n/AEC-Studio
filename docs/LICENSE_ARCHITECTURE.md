@@ -121,8 +121,8 @@ and cross-platform packaging (no Python runtime dependency).
 The PrismML fork inherits MIT (see [kennguy3n/llama.cpp](https://github.com/kennguy3n/llama.cpp)).
 
 MIT is fully permissive and AGPL-compatible. AEC Studio invokes the
-`llama-server` binary as a **subprocess** (`workers/ai/`) and talks to it via
-**loopback HTTP** on `127.0.0.1`. We do not link `libllama` directly.
+`llama-server` binary as a **subprocess** (managed by `crates/aec_ai/src/sidecar.rs`)
+and talks to it via **loopback HTTP** on `127.0.0.1`. We do not link `libllama` directly.
 
 **Why subprocess, not library.** Even though MIT permits linking:
 

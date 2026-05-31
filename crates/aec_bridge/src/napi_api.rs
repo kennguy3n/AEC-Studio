@@ -3068,9 +3068,11 @@ pub fn ai_download_progress() -> Result<Option<AiDownloadProgressJs>> {
     })
 }
 
-/// Overwrite the active tier on the in-process model manager. Does
-/// NOT respawn the sidecar — the next `ai_plan` cold-spawn picks up
-/// the new tier's GGUF via `ModelManager::active_config`.
+/// Switch the active model tier. Updates the in-process
+/// `ModelManager` AND swaps the sidecar runtime's `RuntimeConfig` so
+/// the next `ai_plan` cold-spawns the new tier's GGUF. Any running
+/// `llama-server` child is killed in the process — see
+/// [`BridgeService::ai_set_active_tier`] for the full contract.
 #[napi]
 pub async fn ai_set_active_tier(tier: String) -> Result<()> {
     spawn_blocking_napi(move || with_service_ref_fallible(|svc| svc.ai_set_active_tier(&tier)))

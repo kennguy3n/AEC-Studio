@@ -18,7 +18,10 @@
 //!   * Slug-parser errors come back as
 //!     [`BridgeServiceError::Ai`], not panics.
 
-use aec_bridge::{BridgeConfig, BridgeService};
+use std::time::Duration;
+
+use aec_ai::{RuntimeConfig, SidecarTransport};
+use aec_bridge::{ai_state::AiState, BridgeConfig, BridgeService};
 use tempfile::TempDir;
 
 fn make_service() -> (BridgeService, TempDir) {
@@ -117,4 +120,59 @@ fn ai_model_availability_flips_to_available_when_correctly_sized_file_is_present
         !a.tiers[0].filename.is_empty(),
         "filename should be populated",
     );
+}
+
+/// PR #92 Devin Review BUG_..._0006 regression pin: switching the
+/// active tier from Settings must propagate the new model path into
+/// the in-process `AiState`, not just update the `ModelManager`. If
+/// `BridgeService::ai_set_active_tier` skipped the
+/// `AiState::reload_with_config` step, the runtime would remain
+/// "ready" with the *previous* tier's GGUF loaded, and the next
+/// `ai_plan` would silently dispatch against the wrong model.
+///
+/// We install a fake `Ready` runtime (via the test-only
+/// `__test_with_transport` helper, which is what `ai_endpoints.rs`
+/// uses), confirm the bridge reports `ready`, then flip the tier and
+/// confirm the runtime has been reset to `idle` — which is the
+/// observable side-effect of `reload_with_config`: it drops the
+/// in-memory `SidecarHandle` (killing any real `llama-server` child
+/// on a non-test build) and replaces the `SidecarRuntime` with a
+/// fresh `Idle` one carrying the new tier's `RuntimeConfig`. A
+/// subsequent `ai_plan` therefore cold-spawns against the new model.
+#[test]
+fn ai_set_active_tier_resets_runtime_so_next_plan_uses_new_model() {
+    let (mut s, _tmp) = make_service();
+    // Wire in a fake transport so the runtime starts in `Ready`. We
+    // never actually call through the transport — the assertions
+    // observe the lifecycle state transition, which is what proves
+    // the propagation happened.
+    let transport = SidecarTransport::new(13_579, Duration::from_secs(5));
+    let state = AiState::__test_with_transport(RuntimeConfig::default(), transport);
+    s.__test_install_ai_state(state);
+
+    // Precondition: bridge sees the runtime as Ready.
+    assert_eq!(
+        s.ai_runtime_status().expect("status").state,
+        "ready",
+        "test setup: runtime should be Ready before tier switch",
+    );
+
+    // Switch tiers — should kill the (fake) handle and reset the
+    // runtime config to Medium.
+    s.ai_set_active_tier("medium").expect("set active");
+
+    // Observable consequence: runtime is no longer `Ready`. Without
+    // the `reload_with_config` step this would still say "ready" and
+    // the next plan would talk to the stale model.
+    assert_eq!(
+        s.ai_runtime_status().expect("status after switch").state,
+        "idle",
+        "runtime should reset to Idle after tier switch so the next \
+         ai_plan cold-spawns the new tier's GGUF",
+    );
+
+    // Manager state also reflects the switch (kept from the
+    // pre-existing round-trip test).
+    let a = s.ai_model_availability().expect("availability");
+    assert_eq!(a.active_tier, "medium");
 }

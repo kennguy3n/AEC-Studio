@@ -260,8 +260,6 @@ aec-studio/
 │   ├── aec_governor/           # Resource governor, hardware profiler, scheduling
 │   ├── aec_export/             # PDF, DXF, IFC, glTF, proposal pack export
 │   └── aec_audit/              # Audit trail, project history
-├── workers/                    # Sidecar processes
-│   └── ai/                     # llama-server sidecar config (only remaining external sidecar)
 ├── templates/                  # Project, room, drawing, render, BIM templates
 ├── assets/                     # Bundled asset packs (furniture, materials, presets)
 ├── packaging/                  # electron-builder configs (macos, windows)
