@@ -1023,6 +1023,11 @@ function viewportMock() {
         cameraJson: cameraJson(),
       };
     },
+    // Phase 17 Task 21 — the renderer-fallback backend has no GPU
+    // and no Rust viewport service, so it returns null (= "no
+    // frame buffer available"). Vitest tests that need a synthetic
+    // frame buffer mock the AecApi directly instead.
+    readFrameBuffer: async () => null,
   } satisfies AecApi["viewport"];
 }
 

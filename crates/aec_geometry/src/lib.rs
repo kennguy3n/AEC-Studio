@@ -15,6 +15,7 @@ pub mod opening;
 pub mod room;
 pub mod snap;
 pub mod spatial_index;
+pub mod triangulate;
 pub mod wall;
 pub mod window;
 
@@ -29,5 +30,6 @@ pub use opening::Opening;
 pub use room::Room;
 pub use snap::{snap_to, SnapResult, SnapTarget};
 pub use spatial_index::{Bvh, BvhAabb};
+pub use triangulate::{triangulate_cdt, triangulate_cdt_with_options, CdtOptions};
 pub use wall::Wall;
 pub use window::{Window, WindowKind};

@@ -828,6 +828,13 @@ export interface BridgeBackend {
    *  pixel bytes live in the bridge's surface manager and are
    *  picked up by the desktop shell out-of-band. */
   viewportRequestFrame(): Promise<ViewportFrameReport>;
+  /** Phase 17 Task 21 — read the current viewport's RGBA8 pixel
+   *  buffer. Returns `null` until the viewport has been resized.
+   *  The `bytes` field is a zero-copy view into a Rust Vec<u8>
+   *  (napi external Buffer); the renderer's rAF canvas-paint loop
+   *  reads it directly. `frameIndex` is monotonic and coalesces
+   *  on idle so the paint loop can skip duplicate writes. */
+  viewportReadFrameBuffer(): Promise<ViewportFrameBuffer | null>;
 }
 
 /**
@@ -913,6 +920,29 @@ export interface ViewportCameraReport {
   target: [number, number, number];
   up: [number, number, number];
   fov_y_radians: number;
+}
+
+/** Result of `viewportReadFrameBuffer` (Phase 17 Task 21).
+ *
+ *  The `bytes` field is a `Uint8Array` view into a zero-copy
+ *  napi-external buffer. The renderer should treat it as
+ *  *read-only* — mutating it from JS is technically allowed but
+ *  pointless (the next frame allocates a fresh buffer).
+ *
+ *  `width` and `height` are the viewport dimensions at the moment
+ *  the bridge produced the frame; the renderer should always pass
+ *  them to `ctx.putImageData` rather than its own cached size in
+ *  case a resize raced the readback.
+ *
+ *  `frameIndex` is monotonic and coalesces on idle — the renderer
+ *  compares it against its last-painted index and skips the canvas
+ *  write when they match.
+ */
+export interface ViewportFrameBuffer {
+  bytes: Uint8Array;
+  width: number;
+  height: number;
+  frameIndex: number;
 }
 
 /** Result of `viewportRequestFrame`. */
@@ -1780,8 +1810,14 @@ interface NativeApi {
     template_key: string,
     project_name: string,
   ): unknown;
-  project_open(project_path: string): unknown;
-  project_save(project_path: string): unknown;
+  // Phase 17 Task 22: native ASYNC — the SQLCipher open + key
+  // unwrap and the SQLite commit + fsync are routed through
+  // `spawn_blocking_napi` so the Electron main process's JS event
+  // loop stays responsive while project I/O is in flight. Typed as
+  // `Promise<unknown>` (not the looser `unknown`) so a forgotten
+  // `await` is caught by TS at compile time.
+  project_open(project_path: string): Promise<unknown>;
+  project_save(project_path: string): Promise<unknown>;
   /** Phase 17 Group B Task 12. */
   project_set_thumbnail(
     project_path: string,
@@ -1794,8 +1830,11 @@ interface NativeApi {
   project_list_recents(): unknown;
   runtime_status(): unknown;
   project_engine_status(project_path: string): unknown;
-  project_audit_sync(project_path: string): unknown;
-  project_audit_verify(project_path: string): unknown;
+  // Phase 17 Task 22: native ASYNC — audit chain backfill /
+  // verification walk every recorded entry and recompute BLAKE3,
+  // dispatched to the blocking pool.
+  project_audit_sync(project_path: string): Promise<unknown>;
+  project_audit_verify(project_path: string): Promise<unknown>;
   // ASYNC: returns Promise<unknown> because the underlying napi
   // function is `#[napi] async fn` (parses the IFC on a tokio
   // blocking-pool worker so it doesn't freeze the JS event loop).
@@ -1804,14 +1843,26 @@ interface NativeApi {
   // pending-promise object showing up at runtime.
   bim_import_ifc(path: string): Promise<unknown>;
   bim_check_file_size(path: string): unknown;
-  bim_attach_ifc(project_path: string, ifc_path: string): unknown;
-  command_apply(project_path: string, command_json: string): unknown;
-  command_undo(project_path: string, active_scope: string): unknown;
-  command_redo(project_path: string, active_scope: string): unknown;
+  // Phase 17 Task 22: native ASYNC — IFC attach parses the
+  // entire STEP, computes the dedup hash, and writes the snapshot
+  // (multi-second on real MEP federations), so it runs on the
+  // blocking pool.
+  bim_attach_ifc(project_path: string, ifc_path: string): Promise<unknown>;
+  // Phase 17 Task 22: native ASYNC — command_apply takes the
+  // service write lock, runs apply (may walk hundreds of
+  // entities + several SQL writes), and appends to the audit
+  // chain. Undo / redo route through the same engine.
+  command_apply(project_path: string, command_json: string): Promise<unknown>;
+  command_undo(project_path: string, active_scope: string): Promise<unknown>;
+  command_redo(project_path: string, active_scope: string): Promise<unknown>;
+  // Phase 17 Task 22: native ASYNC — graph listings on MEP
+  // federations return tens of thousands of rows; the SQL fetch
+  // + `Vec<EntityRecord>` materialisation runs on the blocking
+  // pool.
   project_graph_list(
     project_path: string,
     kind_filter: string | null | undefined,
-  ): unknown;
+  ): Promise<unknown>;
   // Render endpoints wired in PR-R. The `priority` and `scene_json`
   // parameters on `render_enqueue` (and `scene_json` on
   // `render_enqueue_batch`) are optional from napi-rs's POV;
@@ -1860,46 +1911,63 @@ interface NativeApi {
   // (`#[napi(object)]` struct in `napi_api.rs`) so the renderer can
   // pass the same `Record<string, unknown>` shape it already uses
   // for the in-process fallback.
-  export_pdf(params: Record<string, unknown>): unknown;
-  export_dxf(params: Record<string, unknown>): unknown;
-  export_ifc(params: Record<string, unknown>): unknown;
-  export_gltf(params: Record<string, unknown>): unknown;
-  export_build_proposal_pack(params: Record<string, unknown>): unknown;
-  deliver_build_pack(params: Record<string, unknown>): unknown;
+  // Phase 17 Task 22: every export endpoint is native ASYNC — PDF
+  // / DXF / IFC / glTF / proposal-pack / build-pack all walk the
+  // project graph and write multi-MB files, dispatched through
+  // `spawn_blocking_napi` so the renderer stays interactive while
+  // the export is in flight.
+  export_pdf(params: Record<string, unknown>): Promise<unknown>;
+  export_dxf(params: Record<string, unknown>): Promise<unknown>;
+  export_ifc(params: Record<string, unknown>): Promise<unknown>;
+  export_gltf(params: Record<string, unknown>): Promise<unknown>;
+  export_build_proposal_pack(
+    params: Record<string, unknown>,
+  ): Promise<unknown>;
+  deliver_build_pack(params: Record<string, unknown>): Promise<unknown>;
   // Read-only BIM operations wired in PR-T. All four operate on
   // standalone IFC files, route through the snapshot cache
   // populated by `bimImportIfc` / `bimAttachIfc`, and return
   // structured summaries the renderer's BIM panels can render
   // directly (no opaque `{ scheduleId: string }` placeholder).
-  bim_export_ifc(ifc_path: string, out_path: string): unknown;
-  bim_validate(ifc_path: string): unknown;
-  bim_diff(before_path: string, after_path: string): unknown;
+  // Phase 17 Task 22: native ASYNC — each touches the parsed IFC
+  // snapshot (CPU-bound walk over thousands of elements) and
+  // either re-serialises STEP, runs validation rules, computes a
+  // structured diff, or writes XLSX rows. None of these fit in
+  // the napi worker's event-loop budget.
+  bim_export_ifc(ifc_path: string, out_path: string): Promise<unknown>;
+  bim_validate(ifc_path: string): Promise<unknown>;
+  bim_diff(before_path: string, after_path: string): Promise<unknown>;
   bim_generate_schedule(
     ifc_path: string,
     kind: string,
     out_path: string,
-  ): unknown;
-  bim_read_schedule_rows(xlsx_path: string): unknown;
+  ): Promise<unknown>;
+  bim_read_schedule_rows(xlsx_path: string): Promise<unknown>;
   // Asset library wired in PR-U. The napi side narrows the loosely-
   // typed `Record<string, unknown>` query to the four documented
   // fields; unknown extra keys are silently dropped by napi-rs.
+  // Phase 17 Task 22: native ASYNC — the SQLite asset DB scan
+  // (with optional style-tag filter + limit clamp) is dispatched
+  // through `spawn_blocking_napi`.
   design_list_assets(query: {
     search?: string;
     tags?: string[];
     styleTags?: string[];
     limit?: number;
-  }): unknown;
+  }): Promise<unknown>;
   // Phase 17 Group B Task 11. The napi side reads from the
   // process-wide `MaterialLibrary` (seeded at boot with 8 starter
   // materials) and clamps `limit` to 10_000 to guard against a
   // renderer bug passing a negative JS number that wraps through
   // napi's `ToUint32()` coercion.
+  // Phase 17 Task 22: native ASYNC — the material library scan
+  // mirrors `design_list_assets` and runs on the blocking pool.
   design_list_materials(query: {
     search?: string;
     tags?: string[];
     styleTags?: string[];
     limit?: number;
-  }): unknown;
+  }): Promise<unknown>;
   // Phase 17 Group B Task 11. The patch is applied atomically —
   // any out-of-range slider rejects the whole patch so a mid-drag
   // slider can't half-apply across multiple fields. `albedo` /
@@ -1917,11 +1985,13 @@ interface NativeApi {
       emissive?: number[];
     },
   ): unknown;
-  // PR-W (Phase 1) — full project package ZIP archive. Sync on the
-  // Rust side (synchronous `std::fs::read` + `zip` walk; per the
-  // PR-W doc the largest realistic package is a few hundred MB, so
-  // it stays on the calling thread for now).
-  project_export_package(project_path: string, out_path: string): unknown;
+  // Phase 17 Task 22: native ASYNC — the ZIP archive walk can be
+  // multi-hundred-MB on real projects (encrypted SQLite +
+  // sub-directories), so the build now runs on the blocking pool.
+  project_export_package(
+    project_path: string,
+    out_path: string,
+  ): Promise<unknown>;
   // PR-W (Phase 1+2) — design.* command façades. `params_json` is
   // the JSON-stringified renderer-side `params` object; the napi
   // side deserialises it into the corresponding `aec_command`
@@ -1931,11 +2001,11 @@ interface NativeApi {
   design_set_lighting(project_path: string, params_json: string): unknown;
   design_save_camera(project_path: string, params_json: string): unknown;
   design_place_furniture(project_path: string, params_json: string): unknown;
-  // PR-W (Phase 3+4) — BIM classification + property mutation.
-  // Sync on the Rust side; concurrent status polls are kept
-  // responsive by SQLite's PRAGMA busy_timeout rather than by
-  // making these methods async.
-  bim_classify(project_path: string, scheme: string): unknown;
+  // Phase 17 Task 22: native ASYNC — classification walks the
+  // entire spatial tree and runs the rule pipeline, dispatched to
+  // the blocking pool. `bim_set_property` stays synchronous (the
+  // mutation is a single bounded SQL update).
+  bim_classify(project_path: string, scheme: string): Promise<unknown>;
   bim_set_property(
     project_path: string,
     entity_id: string,
@@ -2047,6 +2117,14 @@ interface NativeApi {
     delta?: number;
   }): unknown;
   viewport_request_frame(): unknown;
+  // Phase 17 Task 21 — RGBA8 pixels for the current viewport
+  // (read back from the off-screen surface). The native side
+  // returns `Option<{ bytes, width, height, frame_index }>` as a
+  // zero-copy `Buffer::from_data` so V8 owns a view into the Rust
+  // allocation; the renderer's rAF canvas paint loop reads it
+  // directly. Typed `unknown` like the other viewport calls so the
+  // adaptor below is the single place that pins the runtime shape.
+  viewport_read_frame_buffer(): unknown;
 }
 
 /**
@@ -2219,6 +2297,11 @@ export const NATIVE_WIRED_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   "viewportResize",
   "viewportInput",
   "viewportRequestFrame",
+  // Phase 17 Task 21 — pixel readback for the renderer's canvas
+  // paint loop. Lives on the same `ViewportService` as the four
+  // calls above so the read returns the same camera state the
+  // bridge just observed.
+  "viewportReadFrameBuffer",
 ];
 
 /**
@@ -2301,8 +2384,13 @@ function adaptNative(n: NativeApi): BridgeBackend {
     ...(wrapped as unknown as BridgeBackend),
     projectCreateFromTemplate: async (k, p) =>
       n.project_create_from_template(k, p) as ProjectSummary,
-    projectOpen: async (p) => n.project_open(p) as ProjectSummary,
-    projectSave: async (p) => n.project_save(p) as ProjectSummary,
+    // `n.project_open` / `n.project_save` are native ASYNC napi
+    // functions (Phase 17 Task 22): they dispatch the SQLCipher
+    // open / commit + fsync to the tokio blocking pool so the
+    // Electron main process JS event loop stays responsive while
+    // the project I/O is in flight. Must be awaited.
+    projectOpen: async (p) => (await n.project_open(p)) as ProjectSummary,
+    projectSave: async (p) => (await n.project_save(p)) as ProjectSummary,
     projectSetThumbnail: async (p, png, w, h) => {
       // The N-API binding marshals `Buffer` zero-copy from the V8
       // heap; the BridgeBackend interface takes `Uint8Array` for
@@ -2333,38 +2421,53 @@ function adaptNative(n: NativeApi): BridgeBackend {
     runtimeStatus: async () => n.runtime_status() as RuntimeStatus,
     projectEngineStatus: async (p) =>
       n.project_engine_status(p) as EngineStatus,
-    projectAuditSync: async (p) => n.project_audit_sync(p) as number,
+    // Phase 17 Task 22: native async — audit chain backfill and
+    // verification both walk every recorded entry and recompute
+    // BLAKE3, so they run on the blocking pool.
+    projectAuditSync: async (p) => (await n.project_audit_sync(p)) as number,
     projectAuditVerify: async (p) =>
-      n.project_audit_verify(p) as AuditChainVerification,
+      (await n.project_audit_verify(p)) as AuditChainVerification,
     // `n.bim_import_ifc` is a native ASYNC napi function (returns
     // a Promise) so that the multi-second IFC parse runs on the
     // tokio blocking pool and does NOT freeze the Electron main
     // process's JS event loop. Must be awaited.
     bimImportIfc: async (p) => (await n.bim_import_ifc(p)) as BimImportSummary,
     bimCheckFileSize: async (p) => n.bim_check_file_size(p) as BimFileSizeCheck,
+    // Phase 17 Task 22: native async — `bim_attach_ifc` parses the
+    // entire IFC, computes the dedup hash, and persists the
+    // snapshot. Multi-second on real-world MEP federations.
     bimAttachIfc: async (projectPath, ifcPath) =>
-      n.bim_attach_ifc(projectPath, ifcPath) as BimAttachSummary,
+      (await n.bim_attach_ifc(projectPath, ifcPath)) as BimAttachSummary,
+    // Phase 17 Task 22: command_apply / undo / redo are native
+    // async. The command engine takes the write lock on SERVICE,
+    // runs the command's apply (which may walk hundreds of
+    // entities and perform multiple SQLite writes), then appends to
+    // the audit chain — all blocking I/O + CPU, must be awaited.
     commandApply: async (projectPath, command) =>
       decodeCommandApplyJs(
-        n.command_apply(
+        (await n.command_apply(
           projectPath,
           JSON.stringify(command),
-        ) as CommandApplyResultJs,
+        )) as CommandApplyResultJs,
       ),
     commandUndo: async (projectPath, activeScope) =>
       decodeCommandApplyJs(
-        n.command_undo(projectPath, activeScope) as CommandApplyResultJs,
+        (await n.command_undo(projectPath, activeScope)) as CommandApplyResultJs,
       ),
     commandRedo: async (projectPath, activeScope) =>
       decodeCommandApplyJs(
-        n.command_redo(projectPath, activeScope) as CommandApplyResultJs,
+        (await n.command_redo(projectPath, activeScope)) as CommandApplyResultJs,
       ),
+    // Phase 17 Task 22: `project_graph_list` is native async
+    // because MEP federations return tens of thousands of rows —
+    // the SQL fetch plus `Vec<EntityRecord>` materialisation must
+    // not stall the napi worker.
     projectGraphList: async (projectPath, kindFilter) =>
       (
-        n.project_graph_list(
+        (await n.project_graph_list(
           projectPath,
           kindFilter ?? null,
-        ) as EntityRecordJs[]
+        )) as EntityRecordJs[]
       ).map(decodeEntityRecordJs),
     // ----- Render endpoints (PR-R) -----
     //
@@ -2544,33 +2647,46 @@ function adaptNative(n: NativeApi): BridgeBackend {
     // `Record<string, unknown>` verbatim. The N-API layer applies
     // strict field validation (missing `out_path` / wrong types
     // surface as `napi::Error` with `Status::InvalidArg`).
+    // Phase 17 Task 22: every export endpoint is native async.
+    // PDF / DXF / IFC / glTF / proposal-pack / build-pack all walk
+    // the project graph and write multi-MB files — they must run on
+    // the blocking pool so the renderer stays interactive while the
+    // export is in flight.
     exportPdf: async (params) =>
-      n.export_pdf(params) as { outPath: string; pages: number },
-    exportDxf: async (params) => n.export_dxf(params) as { outPath: string },
-    exportIfc: async (params) => n.export_ifc(params) as { outPath: string },
-    exportGltf: async (params) => n.export_gltf(params) as { outPath: string },
+      (await n.export_pdf(params)) as { outPath: string; pages: number },
+    exportDxf: async (params) =>
+      (await n.export_dxf(params)) as { outPath: string },
+    exportIfc: async (params) =>
+      (await n.export_ifc(params)) as { outPath: string },
+    exportGltf: async (params) =>
+      (await n.export_gltf(params)) as { outPath: string },
     exportBuildProposalPack: async (params) =>
-      n.export_build_proposal_pack(params) as { outPath: string },
+      (await n.export_build_proposal_pack(params)) as { outPath: string },
     deliverBuildPack: async (params) =>
-      n.deliver_build_pack(params) as DeliverPackResult,
+      (await n.deliver_build_pack(params)) as DeliverPackResult,
     // ----- BIM read-only endpoints (PR-T) -----
+    // Phase 17 Task 22: all native async — each touches the parsed
+    // IFC snapshot (CPU-bound walk over thousands of elements) and
+    // either re-serialises STEP, runs validation rules, computes a
+    // structured diff, or writes XLSX rows. None of these fit in
+    // the napi worker's event-loop budget.
     bimExportIfc: async (params) =>
-      n.bim_export_ifc(
+      (await n.bim_export_ifc(
         params.sourcePath,
         params.outPath,
-      ) as BimExportIfcSummary,
+      )) as BimExportIfcSummary,
     bimValidate: async (params) =>
-      n.bim_validate(params.sourcePath) as BimValidateReport,
+      (await n.bim_validate(params.sourcePath)) as BimValidateReport,
     bimDiff: async (params) =>
-      n.bim_diff(params.beforePath, params.afterPath) as BimDiffSummary,
+      (await n.bim_diff(params.beforePath, params.afterPath)) as BimDiffSummary,
     bimGenerateSchedule: async (params) =>
-      n.bim_generate_schedule(
+      (await n.bim_generate_schedule(
         params.sourcePath,
         params.kind,
         params.outPath,
-      ) as BimScheduleSummary,
+      )) as BimScheduleSummary,
     bimReadScheduleRows: async (params) =>
-      n.bim_read_schedule_rows(params.xlsxPath) as BimScheduleRows,
+      (await n.bim_read_schedule_rows(params.xlsxPath)) as BimScheduleRows,
     // PR-U: asset library backed by `aec_assets::AssetDatabase`.
     // `query` is `Record<string, unknown>` on the BridgeBackend
     // interface so the renderer can pass arbitrary extra filter
@@ -2579,8 +2695,12 @@ function adaptNative(n: NativeApi): BridgeBackend {
     // rest through opaquely (the napi struct silently ignores
     // unknown fields). Anything else stays in the renderer-side
     // filter path for forward-compat.
+    // Phase 17 Task 22: native async — the SQLite asset DB scan
+    // (with optional style-tag filter + limit clamp) is dispatched
+    // to the blocking pool so the asset-browser grid hydration
+    // doesn't stall the napi worker.
     designListAssets: async (query) =>
-      n.design_list_assets({
+      (await n.design_list_assets({
         search:
           typeof query.search === "string"
             ? (query.search as string)
@@ -2591,20 +2711,23 @@ function adaptNative(n: NativeApi): BridgeBackend {
           : undefined,
         limit:
           typeof query.limit === "number" ? (query.limit as number) : undefined,
-      }) as AssetSummary[],
+      })) as AssetSummary[],
     // Phase 17 Group B Task 11. Materials live in the process-wide
     // PBR `MaterialLibrary`, separate from the SQLite asset DB —
     // asset packs install geometry + bindings against material ids,
     // while the material library owns the actual shading
     // parameters. Both flow through the same renderer surface so
     // the `MaterialPanel` can show them side-by-side.
+    // Phase 17 Task 22: native async — the material library scan
+    // also goes through the blocking pool, mirroring
+    // `designListAssets`.
     designListMaterials: async (query) =>
-      n.design_list_materials({
+      (await n.design_list_materials({
         search: query.search,
         tags: query.tags,
         styleTags: query.styleTags,
         limit: query.limit,
-      }) as MaterialSummary[],
+      })) as MaterialSummary[],
     // Phase 17 Group B Task 11. The bridge applies the patch
     // atomically — any out-of-range slider rejects the whole patch
     // so a mid-drag slider can't half-apply across multiple
@@ -2621,11 +2744,15 @@ function adaptNative(n: NativeApi): BridgeBackend {
         emissive: update.emissive ? [...update.emissive] : undefined,
       }) as MaterialSummary,
     // ----- PR-W (Phase 1): project package archive -----
+    // Phase 17 Task 22: native async — the archive walk can be
+    // multi-hundred-MB on real projects (encrypted SQLite +
+    // sub-directories), so the ZIP build must not stall the napi
+    // worker.
     projectExportPackage: async (projectPath, outPath) =>
-      n.project_export_package(
+      (await n.project_export_package(
         projectPath,
         outPath,
-      ) as ProjectExportPackageResult,
+      )) as ProjectExportPackageResult,
     // ----- PR-W (Phase 1+2): design.* command façades -----
     //
     // The renderer's `BridgeBackend.design{PaintMaterial,
@@ -2677,7 +2804,10 @@ function adaptNative(n: NativeApi): BridgeBackend {
     bimClassify: async (params) => {
       const projectPath = requireProjectPath(params, "bimClassify");
       const scheme = requireStringField(params, "bimClassify", "scheme");
-      return n.bim_classify(projectPath, scheme) as BimClassifyResult;
+      // Phase 17 Task 22: native async — classification walks the
+      // entire spatial tree and runs the rule pipeline; dispatched
+      // to the blocking pool.
+      return (await n.bim_classify(projectPath, scheme)) as BimClassifyResult;
     },
     bimSetProperty: async (params) => {
       const projectPath = requireProjectPath(params, "bimSetProperty");
@@ -3177,6 +3307,30 @@ function adaptNative(n: NativeApi): BridgeBackend {
         height: raw.height,
         state: raw.state as ViewportFrameReport["state"],
         cameraJson: raw.cameraJson,
+      };
+    },
+    // Phase 17 Task 21 — RGBA8 pixel readback. The native side
+    // returns `Option<{ bytes: Buffer, width, height, frame_index }>`.
+    // `bytes` is a Node `Buffer` (which is a subclass of `Uint8Array`)
+    // wrapping the Rust `Vec<u8>` zero-copy, so we hand it through
+    // unchanged. `null` propagates as `null` (= "viewport not sized
+    // yet" — the renderer shows the unavailable overlay).
+    viewportReadFrameBuffer: async () => {
+      const raw = n.viewport_read_frame_buffer() as
+        | {
+            bytes: Buffer;
+            width: number;
+            height: number;
+            frameIndex: number;
+          }
+        | null
+        | undefined;
+      if (!raw) return null;
+      return {
+        bytes: raw.bytes,
+        width: raw.width,
+        height: raw.height,
+        frameIndex: raw.frameIndex,
       };
     },
   };
@@ -4301,6 +4455,11 @@ export function inProcessBackend(): BridgeBackend {
         fov_y_radians: Math.PI / 3,
       }),
     }),
+    // Phase 17 Task 21 — no GPU + no readback in the in-process
+    // fallback. Returning `null` is the explicit "viewport not
+    // available" signal; the renderer renders the unavailable
+    // overlay rather than a fabricated frame.
+    viewportReadFrameBuffer: async () => null,
   };
 }
 

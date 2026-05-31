@@ -96,6 +96,15 @@ export function Viewport3DHost({
     x: number;
     y: number;
   }>({ kind: null, x: 0, y: 0 });
+  // Canvas element + last painted frame index for the Task 21
+  // RGBA8 paint loop. `lastPaintedRef` lives across renders so the
+  // rAF tick can compare the bridge's `frameIndex` against the
+  // last value it actually wrote to the canvas and skip
+  // `putImageData` on no-op ticks (the bridge already coalesces on
+  // idle but tests + cold starts can still hand back a duplicate
+  // index, so the guard is defence-in-depth).
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const lastPaintedRef = useRef<number>(-1);
 
   // 1. Initial status probe.
   useEffect(() => {
@@ -288,11 +297,29 @@ export function Viewport3DHost({
     }
   }, []);
 
-  // 4. rAF frame request loop. Only runs when state == "ready".
+  // 4. rAF frame request + paint loop. Only runs when state == "ready".
+  //
+  // Two bridge calls per tick:
+  //   - `requestFrame()` advances the bridge's internal
+  //     surface-manager frame counter (used by the GPU device when
+  //     present) and reports `state: "presented" | "coalesced"`.
+  //   - `readFrameBuffer()` returns the current RGBA8 pixels for
+  //     the canvas painter. The bridge coalesces idle reads (same
+  //     camera + same size → same `frameIndex`) so this is cheap
+  //     when the user isn't interacting.
+  //
+  // The painter compares the returned `frameIndex` against
+  // `lastPaintedRef` and skips `putImageData` when they match,
+  // saving a per-tick canvas write while the camera is idle.
   useEffect(() => {
     if (status.state !== "ready") return;
     let running = true;
     let raf = 0;
+    // Reset on (re)entry into "ready" so a transition from
+    // "unavailable" → "ready" (e.g. device recovered after suspend)
+    // forces a fresh paint even if `frameIndex` happens to match a
+    // pre-suspend value.
+    lastPaintedRef.current = -1;
     const tick = async () => {
       if (!running) return;
       try {
@@ -312,6 +339,20 @@ export function Viewport3DHost({
         );
       } catch {
         // swallow
+      }
+      if (!running) return;
+      // Paint pass — Phase 17 Task 21. Catches its own errors so a
+      // transient `readFrameBuffer` reject (e.g. bridge restart) does
+      // not abort the rAF loop; the next tick will retry.
+      try {
+        const fb = await aec.viewport.readFrameBuffer();
+        if (!running) return;
+        if (fb && fb.frameIndex !== lastPaintedRef.current) {
+          paintFrameBuffer(canvasRef.current, fb);
+          lastPaintedRef.current = fb.frameIndex;
+        }
+      } catch {
+        // swallow — same rationale as requestFrame above.
       }
       if (!running) return;
       raf = requestAnimationFrame(() => {
@@ -370,6 +411,27 @@ export function Viewport3DHost({
       onWheel={onWheel}
       style={{ touchAction: "none", position: "relative" }}
     >
+      {/* Phase 17 Task 21 — RGBA8 paint surface. Sits underneath the
+          HUD overlay so the text remains readable on top of the
+          procedural sky/ground gradient. `pointer-events: none`
+          keeps pointer drags on the host section, not the canvas.
+          The intrinsic `width`/`height` are set by `paintFrameBuffer`
+          per frame; the CSS `width: 100% / height: 100%` stretches
+          those pixels to fill the host. */}
+      <canvas
+        ref={canvasRef}
+        data-testid={
+          mode === "bim" ? "bim-viewport-canvas" : "design-viewport-canvas"
+        }
+        style={{
+          position: "absolute",
+          inset: 0,
+          width: "100%",
+          height: "100%",
+          pointerEvents: "none",
+          display: "block",
+        }}
+      />
       <div style={{ position: "absolute", top: 8, left: 8, fontSize: 12 }}>
         <div style={{ fontWeight: 600, fontSize: 13 }}>{hudTitle}</div>
         <div style={{ color: "var(--aec-color-text-muted)" }}>
@@ -440,6 +502,58 @@ const loadingStyle: React.CSSProperties = {
   fontSize: 13,
   pointerEvents: "none",
 };
+
+/**
+ * Phase 17 Task 21 — paint a single RGBA8 frame buffer to the
+ * canvas painter overlay. Exported only via internal use inside the
+ * rAF loop; not re-exported from the module's public surface.
+ *
+ * The function:
+ *   1. Resizes the canvas backing store to match the frame buffer's
+ *      pixel dimensions (with a guard against zero-size resizes that
+ *      would clobber the canvas's image cache for no benefit).
+ *   2. Builds an `ImageData` over the bridge's `Uint8Array` view by
+ *      wrapping it in a `Uint8ClampedArray` of the same backing
+ *      memory. This is safe because the bridge returns a fresh
+ *      `Vec<u8>`-backed napi Buffer per call — JS does not mutate
+ *      the bytes and Rust does not retain a reference past the
+ *      tick.
+ *   3. Calls `putImageData` to commit the pixels.
+ *
+ * The function is a no-op (silently) when the canvas ref is null,
+ * the frame buffer dimensions don't match `bytes.length`, or the
+ * 2D context isn't available — all three are recoverable
+ * conditions (component unmounted between schedule + paint, browser
+ * lost the canvas backing store, jsdom test environment).
+ */
+function paintFrameBuffer(
+  canvas: HTMLCanvasElement | null,
+  fb: { bytes: Uint8Array; width: number; height: number },
+): void {
+  if (!canvas) return;
+  if (fb.width <= 0 || fb.height <= 0) return;
+  const expected = fb.width * fb.height * 4;
+  // Defensive: the bridge contract says `bytes.length === width *
+  // height * 4`, but a bridge restart mid-tick could conceivably
+  // hand back a mismatched payload. Drop the frame rather than
+  // painting partial garbage.
+  if (fb.bytes.length < expected) return;
+  if (canvas.width !== fb.width) canvas.width = fb.width;
+  if (canvas.height !== fb.height) canvas.height = fb.height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  // Use `ctx.createImageData(w, h)` + `data.set(bytes)` rather than
+  // `new ImageData(clamped, w, h)`. The createImageData path is
+  // canonical canvas API (works in every browser engine and in
+  // jsdom/test environments that lack the global `ImageData`
+  // constructor), and `data.set` is a single memcpy that the JIT
+  // typically lowers to a SIMD copy of the underlying ArrayBuffer.
+  // The copy cost (RGBA at 1080p ≈ 8MB/frame) is well under a
+  // millisecond on modern CPUs — well within the rAF budget.
+  const image = ctx.createImageData(fb.width, fb.height);
+  image.data.set(fb.bytes.subarray(0, expected));
+  ctx.putImageData(image, 0, 0);
+}
 
 function parseCamera(json: string): {
   position: [number, number, number];

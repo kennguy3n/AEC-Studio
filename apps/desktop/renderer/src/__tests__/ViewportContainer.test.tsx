@@ -333,4 +333,142 @@ describe("ViewportContainer", () => {
       }
     }
   });
+
+  // Phase 17 Task 21 — the rAF tick reads the bridge's RGBA8 frame
+  // buffer and paints it into the canvas overlay via `putImageData`.
+  // Vitest's jsdom doesn't actually rasterise the canvas, but we
+  // can still verify (a) the bridge call is wired, (b) the canvas
+  // element is mounted into the DOM, and (c) idle reads (same
+  // frame_index) are coalesced — i.e. `putImageData` is NOT invoked
+  // on every tick when the bridge reports the same `frameIndex`.
+  it("paints the bridge's frame buffer into the canvas overlay on each new frameIndex", async () => {
+    vi.spyOn(aec.viewport, "status").mockResolvedValue({
+      state: "ready",
+      width: 4,
+      height: 2,
+      frameIndex: 0,
+      gpuDescriptorJson: null,
+    });
+    vi.spyOn(aec.viewport, "requestFrame").mockResolvedValue({
+      frameIndex: 1,
+      width: 4,
+      height: 2,
+      state: "presented",
+      cameraJson: JSON.stringify({
+        position: [5000, 3000, 5000],
+        target: [0, 0, 0],
+        up: [0, 1, 0],
+        fov_y_radians: Math.PI / 3,
+      }),
+    });
+    // The bridge returns three different frame buffers in sequence,
+    // each with a different `frameIndex`. The paint loop must
+    // invoke `putImageData` once per distinct index.
+    const readFB = vi
+      .spyOn(aec.viewport, "readFrameBuffer")
+      .mockResolvedValueOnce({
+        bytes: new Uint8Array(4 * 2 * 4).fill(7),
+        width: 4,
+        height: 2,
+        frameIndex: 10,
+      })
+      .mockResolvedValueOnce({
+        bytes: new Uint8Array(4 * 2 * 4).fill(7),
+        width: 4,
+        height: 2,
+        frameIndex: 10, // duplicate — must coalesce
+      })
+      .mockResolvedValueOnce({
+        bytes: new Uint8Array(4 * 2 * 4).fill(9),
+        width: 4,
+        height: 2,
+        frameIndex: 11,
+      })
+      .mockResolvedValue(null);
+    // jsdom's HTMLCanvasElement.getContext returns null by default;
+    // patch it with a minimal 2d-context stub that records
+    // putImageData calls so we can assert the painter ran.
+    // `createImageData` returns a stub with a `data` array we can
+    // inspect to verify the bridge bytes are forwarded into the
+    // canvas image buffer.
+    const putImageData = vi.fn();
+    const createImageData = vi
+      .fn()
+      .mockImplementation((w: number, h: number) => ({
+        width: w,
+        height: h,
+        data: new Uint8ClampedArray(w * h * 4),
+      }));
+    const getContext = vi
+      .spyOn(HTMLCanvasElement.prototype, "getContext")
+      .mockImplementation(
+        () =>
+          ({
+            putImageData,
+            createImageData,
+          }) as unknown as CanvasRenderingContext2D,
+      );
+
+    try {
+      render(<ViewportContainer activeTool="select" />);
+      await waitFor(() =>
+        expect(screen.getByTestId("viewport-state-label").textContent).toBe(
+          "ready",
+        ),
+      );
+      // The rAF loop ticks asynchronously; spin until we see at
+      // least two distinct paints (frameIndex 10 + 11) or time out.
+      await waitFor(() => expect(putImageData).toHaveBeenCalledTimes(2), {
+        timeout: 2000,
+      });
+
+      const canvas = screen.getByTestId(
+        "design-viewport-canvas",
+      ) as HTMLCanvasElement;
+      // The canvas was sized to the frame buffer's intrinsic
+      // dimensions — `paintFrameBuffer` syncs the backing-store
+      // size before `putImageData`.
+      expect(canvas.width).toBe(4);
+      expect(canvas.height).toBe(2);
+
+      // The rAF loop keeps ticking past the 3 mocked frames (later
+      // ticks resolve to `null` via `mockResolvedValue(null)` and
+      // hit the early-return in the painter), so `readFB` will see
+      // more than 3 calls in practice. The invariant we care about
+      // is that the FIRST three calls drove EXACTLY two paints — the
+      // duplicate frameIndex coalesces. We assert the coalescing
+      // contract via `putImageData` and only verify the bridge was
+      // called *at least* as many times as we mocked.
+      expect(readFB.mock.calls.length).toBeGreaterThanOrEqual(3);
+      expect(putImageData).toHaveBeenCalledTimes(2);
+    } finally {
+      getContext.mockRestore();
+    }
+  });
+
+  // Phase 17 Task 21 — when the bridge reports `state:
+  // "unavailable"`, the rAF loop must not run, which means
+  // `readFrameBuffer` must NEVER be called. The unavailable banner
+  // is the user-facing signal; calling the bridge's paint endpoint
+  // would be wasted IPC.
+  it("does not call readFrameBuffer when the viewport is unavailable", async () => {
+    vi.spyOn(aec.viewport, "status").mockResolvedValue({
+      state: "unavailable",
+      width: 0,
+      height: 0,
+      frameIndex: 0,
+      gpuDescriptorJson: null,
+    });
+    const readFB = vi.spyOn(aec.viewport, "readFrameBuffer");
+    render(<ViewportContainer activeTool="select" />);
+    await waitFor(() =>
+      expect(screen.getByTestId("viewport-state-label").textContent).toBe(
+        "unavailable",
+      ),
+    );
+    // Give the rAF loop a chance to run anyway — if the guard
+    // breaks in the future this assertion will catch it.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(readFB).not.toHaveBeenCalled();
+  });
 });

@@ -240,14 +240,24 @@ pub fn project_create_from_template(
         .map(Into::into)
 }
 
+/// Phase 17 Task 22: routed through [`spawn_blocking_napi`] so the
+/// SQLCipher open (re-deriving the project key + WAL replay) never
+/// blocks the napi worker thread / Electron main process JS event
+/// loop on a cold project open. Concurrent status polls remain
+/// responsive while the open is in flight.
 #[napi]
-pub fn project_open(path: String) -> Result<ProjectSummaryJs> {
-    with_service(|svc| svc.project_open(&path)).map(Into::into)
+pub async fn project_open(path: String) -> Result<ProjectSummaryJs> {
+    spawn_blocking_napi(move || with_service(|svc| svc.project_open(&path)).map(Into::into)).await
 }
 
+/// Phase 17 Task 22: routed through [`spawn_blocking_napi`] for the
+/// same reason as [`project_open`] — a project save can take tens of
+/// milliseconds when the project graph is large (SQLCipher COMMIT +
+/// fsync), and the Electron main process JS event loop must remain
+/// responsive throughout.
 #[napi]
-pub fn project_save(path: String) -> Result<ProjectSummaryJs> {
-    with_service(|svc| svc.project_save(&path)).map(Into::into)
+pub async fn project_save(path: String) -> Result<ProjectSummaryJs> {
+    spawn_blocking_napi(move || with_service(|svc| svc.project_save(&path)).map(Into::into)).await
 }
 
 /// JS-facing project thumbnail row. Mirrors
@@ -362,9 +372,16 @@ pub fn project_engine_status(path: String) -> Result<EngineStatusJs> {
     with_service_ref_fallible(|svc| svc.project_engine_status(&path)).map(Into::into)
 }
 
+/// Phase 17 Task 22: routed through [`spawn_blocking_napi`] because
+/// the audit chain backfill walks every entity touched by every
+/// historical command. On a project graph with thousands of entities
+/// this is several hundred milliseconds of pure CPU work.
 #[napi]
-pub fn project_audit_sync(path: String) -> Result<u32> {
-    with_service(|svc| svc.project_audit_sync(&path)).map(|n| n.min(u32::MAX as u64) as u32)
+pub async fn project_audit_sync(path: String) -> Result<u32> {
+    spawn_blocking_napi(move || {
+        with_service(|svc| svc.project_audit_sync(&path)).map(|n| n.min(u32::MAX as u64) as u32)
+    })
+    .await
 }
 
 /// JS-facing audit chain verification report. Mirrors
@@ -497,9 +514,16 @@ impl From<aec_audit::ChainVerification> for ChainVerificationJs {
 /// project with 10,000 audit entries (~5 MiB) verifies in under
 /// 2 ms. We therefore run on the read side of the service lock
 /// rather than `spawn_blocking_napi`-ing it.
+/// Phase 17 Task 22: routed through [`spawn_blocking_napi`] because
+/// the chain verification recomputes BLAKE3 over every recorded
+/// entry and re-verifies the Merkle linkage. CPU-bound and grows
+/// O(log_entries).
 #[napi]
-pub fn project_audit_verify(path: String) -> Result<ChainVerificationJs> {
-    with_service_ref_fallible(|svc| svc.project_audit_verify(&path)).map(Into::into)
+pub async fn project_audit_verify(path: String) -> Result<ChainVerificationJs> {
+    spawn_blocking_napi(move || {
+        with_service_ref_fallible(|svc| svc.project_audit_verify(&path)).map(Into::into)
+    })
+    .await
 }
 
 /// JS-facing parse-only IFC import summary. Mirrors the renderer's
@@ -686,9 +710,17 @@ impl From<crate::service::BimAttachSummary> for BimAttachSummaryJs {
 /// for the loading-indicator UX (cache hit is sub-millisecond;
 /// miss is the multi-second STEP parse path that `bim_import_ifc`
 /// would otherwise re-run).
+/// Phase 17 Task 22: routed through [`spawn_blocking_napi`] because
+/// `bim_attach_ifc` parses the entire `.ifc` file, computes the
+/// dedup hash and writes the snapshot into the project. Multi-second
+/// on real-world MEP federations.
 #[napi]
-pub fn bim_attach_ifc(project_path: String, ifc_path: String) -> Result<BimAttachSummaryJs> {
-    with_service_ref_fallible(|svc| svc.bim_attach_ifc(&project_path, &ifc_path)).map(Into::into)
+pub async fn bim_attach_ifc(project_path: String, ifc_path: String) -> Result<BimAttachSummaryJs> {
+    spawn_blocking_napi(move || {
+        with_service_ref_fallible(|svc| svc.bim_attach_ifc(&project_path, &ifc_path))
+            .map(Into::into)
+    })
+    .await
 }
 
 /// JS-facing command-apply result. Mirrors
@@ -784,15 +816,27 @@ impl From<aec_command::commands::EntityRecord> for EntityRecordJs {
 /// writes through `Mutex<rusqlite::Connection>`, so the outer lock is
 /// not protecting on-disk state, only the in-memory caches that hang
 /// off [`crate::service::BridgeService`].
+/// Phase 17 Task 22: routed through [`spawn_blocking_napi`]. The
+/// command engine path takes the writer-side lock on `SERVICE`, runs
+/// the command's `apply` function (which may walk hundreds of
+/// entities and perform several SQLite writes), and appends to the
+/// audit chain. The whole pipeline is blocking I/O + CPU and must
+/// not stall the napi worker.
 #[napi]
-pub fn command_apply(project_path: String, command_json: String) -> Result<CommandApplyResultJs> {
+pub async fn command_apply(
+    project_path: String,
+    command_json: String,
+) -> Result<CommandApplyResultJs> {
     let cmd: aec_command::commands::Command = serde_json::from_str(&command_json).map_err(|e| {
         Error::new(
             Status::InvalidArg,
             format!("command_apply: invalid command JSON: {e}"),
         )
     })?;
-    with_service(|svc| svc.command_apply(&project_path, cmd)).map(Into::into)
+    spawn_blocking_napi(move || {
+        with_service(|svc| svc.command_apply(&project_path, cmd)).map(Into::into)
+    })
+    .await
 }
 
 /// Undo the most recently applied command on `project_path`.
@@ -802,31 +846,61 @@ pub fn command_apply(project_path: String, command_json: String) -> Result<Comma
 /// resulting audit envelope and to validate that the inverse
 /// deltas don't cross a scope boundary (e.g. you can't undo a
 /// design command while in the bim workflow).
+///
+/// Phase 17 Task 22: routed through [`spawn_blocking_napi`] for the
+/// same reason as [`command_apply`].
 #[napi]
-pub fn command_undo(project_path: String, active_scope: String) -> Result<CommandApplyResultJs> {
+pub async fn command_undo(
+    project_path: String,
+    active_scope: String,
+) -> Result<CommandApplyResultJs> {
     let scope = parse_scope(&active_scope)?;
-    with_service(|svc| svc.command_undo(&project_path, scope)).map(Into::into)
+    spawn_blocking_napi(move || {
+        with_service(|svc| svc.command_undo(&project_path, scope)).map(Into::into)
+    })
+    .await
 }
 
 /// Redo the most recently undone command. Symmetric counterpart
 /// to [`command_undo`].
+///
+/// Phase 17 Task 22: routed through [`spawn_blocking_napi`].
 #[napi]
-pub fn command_redo(project_path: String, active_scope: String) -> Result<CommandApplyResultJs> {
+pub async fn command_redo(
+    project_path: String,
+    active_scope: String,
+) -> Result<CommandApplyResultJs> {
     let scope = parse_scope(&active_scope)?;
-    with_service(|svc| svc.command_redo(&project_path, scope)).map(Into::into)
+    spawn_blocking_napi(move || {
+        with_service(|svc| svc.command_redo(&project_path, scope)).map(Into::into)
+    })
+    .await
 }
 
 /// List the project graph. Pass `kind_filter = None` for the full
 /// graph; pass `Some(kind)` to narrow (e.g. `"wall"`, `"room"`,
 /// `"camera"`). Read-only; safe to call concurrently with status
 /// polls — routed through `with_service_ref_fallible`.
+///
+/// Phase 17 Task 22: dispatched to the napi blocking pool via
+/// [`spawn_blocking_napi`]. On MEP federation projects the graph
+/// list returns tens of thousands of rows; the SQL fetch plus
+/// `Vec<EntityRecord>` materialisation and conversion to
+/// `EntityRecordJs` would otherwise stall the napi worker thread
+/// (and transitively the Electron main process JS event loop) for
+/// hundreds of milliseconds.
 #[napi]
-pub fn project_graph_list(
+pub async fn project_graph_list(
     project_path: String,
     kind_filter: Option<String>,
 ) -> Result<Vec<EntityRecordJs>> {
-    with_service_ref_fallible(|svc| svc.project_graph_list(&project_path, kind_filter.as_deref()))
+    spawn_blocking_napi(move || {
+        with_service_ref_fallible(|svc| {
+            svc.project_graph_list(&project_path, kind_filter.as_deref())
+        })
         .map(|rs| rs.into_iter().map(Into::into).collect())
+    })
+    .await
 }
 
 /// JS-facing renderer-side query parameters for
@@ -896,15 +970,18 @@ impl From<crate::service::AssetSummary> for AssetSummaryJs {
 /// touches the asset browser pays zero SQLite open + schema-bootstrap
 /// + seed cost.
 #[napi]
-pub fn design_list_assets(query: DesignListAssetsQueryJs) -> Result<Vec<AssetSummaryJs>> {
+pub async fn design_list_assets(query: DesignListAssetsQueryJs) -> Result<Vec<AssetSummaryJs>> {
     let q = crate::service::AssetListQuery {
         search: query.search,
         tags: query.tags.unwrap_or_default(),
         style_tags: query.style_tags.unwrap_or_default(),
         limit: query.limit,
     };
-    with_service_ref_fallible(|svc| svc.design_list_assets(&q))
-        .map(|rows| rows.into_iter().map(Into::into).collect())
+    spawn_blocking_napi(move || {
+        with_service_ref_fallible(|svc| svc.design_list_assets(&q))
+            .map(|rows| rows.into_iter().map(Into::into).collect())
+    })
+    .await
 }
 
 /// JS-facing renderer-side query parameters for
@@ -940,16 +1017,24 @@ pub struct DesignListMaterialsQueryJs {
 /// the channel values — pre-stringifying here would force the
 /// renderer to parse the CSS form back into floats for shading
 /// math.
+// napi-rs 2.x does NOT implement `FromNapiValue` for `f32` (JS numbers
+// are IEEE-754 doubles, so only `f64` round-trips losslessly), which
+// means `Vec<f32>` is also unsupported at the napi boundary. The
+// `#[napi(object)]` derive macro generates BOTH `FromNapiValue` and
+// `ToNapiValue` impls for object structs unconditionally, so any
+// `Vec<f32>` field would fail to compile under `--all-features`.
+// We use `Vec<f64>` here and cast to/from the service-layer `f32`
+// linear-RGB representation at the conversion boundary.
 #[napi(object)]
 pub struct MaterialSummaryJs {
     pub material_id: String,
     pub name: String,
-    pub albedo: Vec<f32>,
+    pub albedo: Vec<f64>,
     pub metallic: f64,
     pub roughness: f64,
     pub ior: f64,
     pub transmission: f64,
-    pub emissive: Vec<f32>,
+    pub emissive: Vec<f64>,
     pub style_tags: Vec<String>,
     pub tags: Vec<String>,
 }
@@ -959,12 +1044,12 @@ impl From<crate::service::MaterialSummary> for MaterialSummaryJs {
         Self {
             material_id: s.material_id,
             name: s.name,
-            albedo: s.albedo.to_vec(),
+            albedo: s.albedo.iter().map(|v| *v as f64).collect(),
             metallic: s.metallic as f64,
             roughness: s.roughness as f64,
             ior: s.ior as f64,
             transmission: s.transmission as f64,
-            emissive: s.emissive.to_vec(),
+            emissive: s.emissive.iter().map(|v| *v as f64).collect(),
             style_tags: s.style_tags,
             tags: s.tags,
         }
@@ -987,47 +1072,54 @@ impl From<crate::service::MaterialSummary> for MaterialSummaryJs {
 /// near-`u32::MAX` value through napi's `ToUint32()` coercion
 /// can't allocate an unbounded result vector.
 #[napi]
-pub fn design_list_materials(query: DesignListMaterialsQueryJs) -> Result<Vec<MaterialSummaryJs>> {
+pub async fn design_list_materials(
+    query: DesignListMaterialsQueryJs,
+) -> Result<Vec<MaterialSummaryJs>> {
     let q = crate::service::MaterialListQuery {
         search: query.search,
         tags: query.tags.unwrap_or_default(),
         style_tags: query.style_tags.unwrap_or_default(),
         limit: query.limit,
     };
-    with_service_ref_fallible(|svc| svc.design_list_materials(&q))
-        .map(|rows| rows.into_iter().map(Into::into).collect())
+    spawn_blocking_napi(move || {
+        with_service_ref_fallible(|svc| svc.design_list_materials(&q))
+            .map(|rows| rows.into_iter().map(Into::into).collect())
+    })
+    .await
 }
 
 /// JS-facing patch payload for [`design_update_material`]. Every
 /// field is `Option` so the inspector can `PATCH`-style send only
 /// the slider that moved; unset fields keep their current value.
 ///
-/// `albedo` / `emissive` arrive as JS arrays of three floats — the
-/// `Vec<f32>` shape is forced by napi-rs's lack of fixed-size
-/// array support at the napi-rs 2.x boundary, so the bridge
-/// validates `len() == 3` before forwarding to the service-layer
-/// `[f32; 3]`. Out-of-range values are rejected by the service
-/// layer's `validate_material_update`, surfacing through napi as an
-/// `Error::from_reason("invalid: …")` the renderer can show on the
-/// inspector toast.
+/// `albedo` / `emissive` arrive as JS arrays of three numbers — the
+/// `Vec<f64>` shape is forced by napi-rs's lack of fixed-size
+/// array support at the napi-rs 2.x boundary AND by napi-rs's lack
+/// of a `FromNapiValue` impl for `f32` (JS numbers are IEEE-754
+/// doubles, so only `f64` round-trips through napi natively). The
+/// bridge validates `len() == 3` before forwarding to the service-
+/// layer `[f32; 3]` via `as f32` casts. Out-of-range values are
+/// rejected by the service layer's `validate_material_update`,
+/// surfacing through napi as an `Error::from_reason("invalid: …")`
+/// the renderer can show on the inspector toast.
 #[napi(object)]
 pub struct MaterialUpdateJs {
-    pub albedo: Option<Vec<f32>>,
+    pub albedo: Option<Vec<f64>>,
     pub metallic: Option<f64>,
     pub roughness: Option<f64>,
     pub ior: Option<f64>,
     pub transmission: Option<f64>,
-    pub emissive: Option<Vec<f32>>,
+    pub emissive: Option<Vec<f64>>,
 }
 
-fn rgb_from_vec(field: &str, v: &[f32]) -> Result<[f32; 3]> {
+fn rgb_from_vec(field: &str, v: &[f64]) -> Result<[f32; 3]> {
     if v.len() != 3 {
         return Err(Error::new(
             Status::InvalidArg,
             format!("{field} must have exactly 3 components, got {}", v.len()),
         ));
     }
-    Ok([v[0], v[1], v[2]])
+    Ok([v[0] as f32, v[1] as f32, v[2] as f32])
 }
 
 /// Apply an inspector slider patch to a single material and return
@@ -1121,10 +1213,15 @@ impl From<crate::service::ExportPdfResult> for ExportPdfResultJs {
 /// per-export caches today — concurrent status polls must not be
 /// blocked by a multi-second PDF assembly.
 #[napi]
-pub fn export_pdf(params: ExportPdfParamsJs) -> Result<ExportPdfResultJs> {
+pub async fn export_pdf(params: ExportPdfParamsJs) -> Result<ExportPdfResultJs> {
     let body = params.body_lines.unwrap_or_default();
-    with_service_ref_fallible(|svc| svc.export_pdf(&params.out_path, &params.project_name, &body))
+    spawn_blocking_napi(move || {
+        with_service_ref_fallible(|svc| {
+            svc.export_pdf(&params.out_path, &params.project_name, &body)
+        })
         .map(Into::into)
+    })
+    .await
 }
 
 /// Typed params for [`export_dxf`]. `walls_mm` is `Vec<[f64; 4]>`
@@ -1159,7 +1256,7 @@ impl From<crate::service::ExportDxfResult> for ExportDxfResultJs {
 /// renderer-supplied wall arrays at the napi boundary so the
 /// service layer can rely on a typed `(f64, f64, f64, f64)` tuple.
 #[napi]
-pub fn export_dxf(params: ExportDxfParamsJs) -> Result<ExportDxfResultJs> {
+pub async fn export_dxf(params: ExportDxfParamsJs) -> Result<ExportDxfResultJs> {
     let walls_raw = params.walls_mm.unwrap_or_default();
     let mut walls: Vec<(f64, f64, f64, f64)> = Vec::with_capacity(walls_raw.len());
     for (i, seg) in walls_raw.iter().enumerate() {
@@ -1174,8 +1271,13 @@ pub fn export_dxf(params: ExportDxfParamsJs) -> Result<ExportDxfResultJs> {
         }
         walls.push((seg[0], seg[1], seg[2], seg[3]));
     }
-    with_service_ref_fallible(|svc| svc.export_dxf(&params.out_path, &params.project_name, &walls))
+    spawn_blocking_napi(move || {
+        with_service_ref_fallible(|svc| {
+            svc.export_dxf(&params.out_path, &params.project_name, &walls)
+        })
         .map(Into::into)
+    })
+    .await
 }
 
 /// Typed params for [`export_ifc`]. When `storey_names` is `None`
@@ -1207,12 +1309,15 @@ impl From<crate::service::ExportIfcResult> for ExportIfcResultJs {
 /// trips through, so the output is byte-compatible with the
 /// dedup hashing pipeline.
 #[napi]
-pub fn export_ifc(params: ExportIfcParamsJs) -> Result<ExportIfcResultJs> {
+pub async fn export_ifc(params: ExportIfcParamsJs) -> Result<ExportIfcResultJs> {
     let storeys = params.storey_names.unwrap_or_default();
-    with_service_ref_fallible(|svc| {
-        svc.export_ifc(&params.out_path, &params.project_name, &storeys)
+    spawn_blocking_napi(move || {
+        with_service_ref_fallible(|svc| {
+            svc.export_ifc(&params.out_path, &params.project_name, &storeys)
+        })
+        .map(Into::into)
     })
-    .map(Into::into)
+    .await
 }
 
 /// Typed params for [`export_gltf`].
@@ -1240,9 +1345,12 @@ impl From<crate::service::ExportGltfResult> for ExportGltfResultJs {
 /// Three.js' `GLTFLoader` and Khronos's glTF-Validator both accept
 /// the output.
 #[napi]
-pub fn export_gltf(params: ExportGltfParamsJs) -> Result<ExportGltfResultJs> {
-    with_service_ref_fallible(|svc| svc.export_gltf(&params.out_path, &params.project_name))
-        .map(Into::into)
+pub async fn export_gltf(params: ExportGltfParamsJs) -> Result<ExportGltfResultJs> {
+    spawn_blocking_napi(move || {
+        with_service_ref_fallible(|svc| svc.export_gltf(&params.out_path, &params.project_name))
+            .map(Into::into)
+    })
+    .await
 }
 
 /// Typed params for [`export_build_proposal_pack`].
@@ -1280,19 +1388,22 @@ impl From<crate::service::ExportProposalPackResult> for ExportProposalPackResult
 /// Export a real client-facing proposal PDF for the project. The
 /// renderer's `BridgeBackend.exportBuildProposalPack` calls this.
 #[napi]
-pub fn export_build_proposal_pack(
+pub async fn export_build_proposal_pack(
     params: ExportProposalPackParamsJs,
 ) -> Result<ExportProposalPackResultJs> {
-    let client = params.client_name.as_deref().unwrap_or("(client)");
-    with_service_ref_fallible(|svc| {
-        svc.export_proposal_pack(
-            &params.out_path,
-            &params.project_name,
-            client,
-            params.project_path.as_deref(),
-        )
+    spawn_blocking_napi(move || {
+        let client = params.client_name.as_deref().unwrap_or("(client)");
+        with_service_ref_fallible(|svc| {
+            svc.export_proposal_pack(
+                &params.out_path,
+                &params.project_name,
+                client,
+                params.project_path.as_deref(),
+            )
+        })
+        .map(Into::into)
     })
-    .map(Into::into)
+    .await
 }
 
 /// Typed params for [`deliver_build_pack`]. `kind` is one of
@@ -1353,7 +1464,9 @@ impl From<crate::service::DeliverPackResult> for DeliverBuildPackResultJs {
 /// crate is stateless and the renderer's preview pane polls in
 /// parallel with the archive assembly.
 #[napi]
-pub fn deliver_build_pack(params: DeliverBuildPackParamsJs) -> Result<DeliverBuildPackResultJs> {
+pub async fn deliver_build_pack(
+    params: DeliverBuildPackParamsJs,
+) -> Result<DeliverBuildPackResultJs> {
     let project_name = params.project_name.unwrap_or_else(|| "Project".to_string());
     let svc_params = crate::service::DeliverBuildPackParams {
         out_path: params.out_path,
@@ -1378,7 +1491,10 @@ pub fn deliver_build_pack(params: DeliverBuildPackParamsJs) -> Result<DeliverBui
     // ~600 LoC above) so the closure can consume `svc_params` directly
     // via `move` — no `.clone()` needed. Saves a `DeliverBuildPackParams`
     // copy per call. Flagged in PR-S round 2 ANALYSIS_0003.
-    with_service_ref_fallible(move |svc| svc.deliver_build_pack(svc_params)).map(Into::into)
+    spawn_blocking_napi(move || {
+        with_service_ref_fallible(move |svc| svc.deliver_build_pack(svc_params)).map(Into::into)
+    })
+    .await
 }
 
 /// JS-facing result of [`project_export_package`]. Mirrors the
@@ -1415,12 +1531,15 @@ impl From<crate::service::ProjectExportPackageResult> for ProjectExportPackageRe
 /// under the singleton read lock — long archive walks don't block
 /// status polls.
 #[napi]
-pub fn project_export_package(
+pub async fn project_export_package(
     project_path: String,
     out_path: String,
 ) -> Result<ProjectExportPackageResultJs> {
-    with_service_ref_fallible(move |svc| svc.project_export_package(&project_path, &out_path))
-        .map(Into::into)
+    spawn_blocking_napi(move || {
+        with_service_ref_fallible(move |svc| svc.project_export_package(&project_path, &out_path))
+            .map(Into::into)
+    })
+    .await
 }
 
 // ============================================================
@@ -1609,8 +1728,12 @@ impl From<crate::service::BimClassifyResult> for BimClassifyResultJs {
 /// polls (`runtimeStatus`, `renderListJobs`, etc.) during a
 /// potentially long classification walk.
 #[napi]
-pub fn bim_classify(project_path: String, scheme: String) -> Result<BimClassifyResultJs> {
-    with_service_ref_fallible(move |svc| svc.bim_classify(&project_path, &scheme)).map(Into::into)
+pub async fn bim_classify(project_path: String, scheme: String) -> Result<BimClassifyResultJs> {
+    spawn_blocking_napi(move || {
+        with_service_ref_fallible(move |svc| svc.bim_classify(&project_path, &scheme))
+            .map(Into::into)
+    })
+    .await
 }
 
 /// JS-facing result of [`bim_set_property`]. Mirrors the
@@ -1721,8 +1844,11 @@ impl From<crate::service::BimExportIfcSummary> for BimExportIfcSummaryJs {
 /// lock. See `with_service_ref_fallible` in `napi_api.rs:32`
 /// for the broader rationale.
 #[napi]
-pub fn bim_export_ifc(ifc_path: String, out_path: String) -> Result<BimExportIfcSummaryJs> {
-    with_service_ref_fallible(|svc| svc.bim_export_ifc(&ifc_path, &out_path)).map(Into::into)
+pub async fn bim_export_ifc(ifc_path: String, out_path: String) -> Result<BimExportIfcSummaryJs> {
+    spawn_blocking_napi(move || {
+        with_service_ref_fallible(|svc| svc.bim_export_ifc(&ifc_path, &out_path)).map(Into::into)
+    })
+    .await
 }
 
 /// JS-facing validation finding. Mirrors the renderer's
@@ -1789,8 +1915,11 @@ impl From<crate::service::BimValidateReport> for BimValidateReportJs {
 ///
 /// Routes through `with_service_ref_fallible` (read-only).
 #[napi]
-pub fn bim_validate(ifc_path: String) -> Result<BimValidateReportJs> {
-    with_service_ref_fallible(|svc| svc.bim_validate(&ifc_path)).map(Into::into)
+pub async fn bim_validate(ifc_path: String) -> Result<BimValidateReportJs> {
+    spawn_blocking_napi(move || {
+        with_service_ref_fallible(|svc| svc.bim_validate(&ifc_path)).map(Into::into)
+    })
+    .await
 }
 
 /// JS-facing property-level change. `before` / `after` are JSON-
@@ -1903,8 +2032,11 @@ impl From<crate::service::BimDiffSummary> for BimDiffSummaryJs {
 ///
 /// Routes through `with_service_ref_fallible` (read-only).
 #[napi]
-pub fn bim_diff(before_path: String, after_path: String) -> Result<BimDiffSummaryJs> {
-    with_service_ref_fallible(|svc| svc.bim_diff(&before_path, &after_path)).map(Into::into)
+pub async fn bim_diff(before_path: String, after_path: String) -> Result<BimDiffSummaryJs> {
+    spawn_blocking_napi(move || {
+        with_service_ref_fallible(|svc| svc.bim_diff(&before_path, &after_path)).map(Into::into)
+    })
+    .await
 }
 
 /// JS-facing summary of
@@ -1960,13 +2092,16 @@ impl From<crate::service::BimScheduleSummary> for BimScheduleSummaryJs {
 /// on the filesystem itself, not on any in-memory state guarded
 /// by the lock. Same caveat as `bim_export_ifc` above.
 #[napi]
-pub fn bim_generate_schedule(
+pub async fn bim_generate_schedule(
     ifc_path: String,
     kind: String,
     out_path: String,
 ) -> Result<BimScheduleSummaryJs> {
-    with_service_ref_fallible(|svc| svc.bim_generate_schedule(&ifc_path, &kind, &out_path))
-        .map(Into::into)
+    spawn_blocking_napi(move || {
+        with_service_ref_fallible(|svc| svc.bim_generate_schedule(&ifc_path, &kind, &out_path))
+            .map(Into::into)
+    })
+    .await
 }
 
 /// JS-facing shape returned by [`bim_read_schedule_rows`]. Mirrors
@@ -2008,8 +2143,11 @@ impl From<crate::service::BimScheduleRows> for BimScheduleRowsJs {
 /// flattened to `napi::Error` via the same `to_napi_error` mapping
 /// used by every other bridge surface.
 #[napi]
-pub fn bim_read_schedule_rows(xlsx_path: String) -> Result<BimScheduleRowsJs> {
-    with_service_ref_fallible(|svc| svc.bim_read_schedule_rows(&xlsx_path)).map(Into::into)
+pub async fn bim_read_schedule_rows(xlsx_path: String) -> Result<BimScheduleRowsJs> {
+    spawn_blocking_napi(move || {
+        with_service_ref_fallible(|svc| svc.bim_read_schedule_rows(&xlsx_path)).map(Into::into)
+    })
+    .await
 }
 
 /// JS-facing CPU descriptor. Mirrors `RuntimeStatus["cpu"]` in
@@ -3360,6 +3498,41 @@ pub fn viewport_request_frame() -> Result<ViewportFrameJs> {
 pub fn viewport_status() -> Result<ViewportStatusJs> {
     let rep = with_service_ref(super::service::BridgeService::viewport_status)?;
     Ok(viewport_status_to_js(rep))
+}
+
+/// JS-facing viewport frame buffer payload. Phase 17 Group D Task 21.
+///
+/// The `bytes` field wraps the Rust `Vec<u8>` via `Buffer::from_data`
+/// so V8 owns a zero-copy view into the allocation — no per-frame
+/// memcpy of the RGBA pixels across the JS boundary. The buffer is
+/// freed when V8 garbage-collects the wrapper, so the renderer can
+/// keep the bytes around for as long as its canvas-paint loop needs
+/// without an explicit handle to drop.
+///
+/// `frame_index` is monotonic across calls for a given viewport size
+/// and increments only when the camera state changes (frame
+/// coalescing). The renderer's rAF loop compares the value to its
+/// last painted index and skips the `putImageData` when they match.
+#[napi(object)]
+pub struct ViewportFrameBufferJs {
+    pub bytes: napi::bindgen_prelude::Buffer,
+    pub width: u32,
+    pub height: u32,
+    pub frame_index: f64,
+}
+
+/// Read the current viewport's CPU-side RGBA8 frame buffer. Returns
+/// `None` when the viewport has not been resized yet (the bridge
+/// treats the "no surface" case as "show the unavailable overlay").
+#[napi]
+pub fn viewport_read_frame_buffer() -> Result<Option<ViewportFrameBufferJs>> {
+    let opt = with_service_ref(super::service::BridgeService::viewport_read_frame_buffer)?;
+    Ok(opt.map(|fb| ViewportFrameBufferJs {
+        width: fb.width,
+        height: fb.height,
+        frame_index: fb.frame_index as f64,
+        bytes: fb.pixels.into(),
+    }))
 }
 
 fn hex_decode(s: &str) -> Option<Vec<u8>> {

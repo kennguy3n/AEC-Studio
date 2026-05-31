@@ -17,4 +17,7 @@ pub enum GeometryError {
 
     #[error("polygon is not closed or has fewer than 3 vertices")]
     InvalidPolygon,
+
+    #[error("tessellation failed: {0}")]
+    Tessellation(String),
 }

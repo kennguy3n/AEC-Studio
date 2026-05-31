@@ -5754,6 +5754,19 @@ impl BridgeService {
     pub fn viewport_status(&self) -> crate::viewport_service::ViewportStatusReport {
         self.viewport_service.status()
     }
+
+    /// Read a CPU-side RGBA8 frame buffer ready for the renderer's
+    /// canvas paint loop. Phase 17 Group D Task 21 — the
+    /// `FrameBuffer.pixels` vector is moved into a napi
+    /// `Buffer::from_data` at the N-API boundary so V8 sees a
+    /// zero-copy view into the Rust allocation.
+    ///
+    /// Returns `None` when the viewport hasn't been resized yet —
+    /// the renderer treats this as "show the GPU-unavailable
+    /// overlay, no canvas paint required."
+    pub fn viewport_read_frame_buffer(&self) -> Option<aec_viewport::frame_buffer::FrameBuffer> {
+        self.viewport_service.read_frame_buffer()
+    }
 }
 
 /// Bridge-shaped review-ingest report. Renderer-facing alias for the

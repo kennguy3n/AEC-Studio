@@ -16,6 +16,7 @@
 use std::sync::{Arc, RwLock};
 
 use aec_viewport::camera::Camera;
+use aec_viewport::frame_buffer::{render_horizon_frame, FrameBuffer};
 use aec_viewport::render_pipeline::{CameraUniform, PipelineConfig, RenderPipeline};
 use aec_viewport::renderer::{RendererBackend, ViewportRenderer};
 use aec_viewport::surface::{FrameKey, SurfaceManager};
@@ -101,6 +102,16 @@ struct Inner {
     /// since they include floating-point comparisons; instead each
     /// successful camera update bumps this counter.
     camera_hash: u64,
+    /// Monotonic frame counter used by [`ViewportService::read_frame_buffer`]
+    /// when no [`SurfaceManager`] exists (no GPU adapter). Mirrors
+    /// [`SurfaceManager::frame_index`] so the renderer sees the same
+    /// monotonic invariant regardless of whether a real device is
+    /// behind the bridge.
+    fallback_frame_index: u64,
+    /// Last frame key seen by `read_frame_buffer` in fallback mode.
+    /// Mirrors [`SurfaceManager::last_key`] so the no-adapter path
+    /// applies the same coalescing rule as the GPU path.
+    fallback_last_key: Option<FrameKey>,
 }
 
 /// Bridge-layer viewport state.
@@ -129,6 +140,8 @@ impl ViewportService {
                 height: 0,
                 config,
                 camera_hash: 0,
+                fallback_frame_index: 0,
+                fallback_last_key: None,
             })),
         }
     }
@@ -263,6 +276,63 @@ impl ViewportService {
             camera: camera_report,
             state: "presented".into(),
         })
+    }
+
+    /// Read a CPU-side RGBA8 frame buffer for the current camera
+    /// state. Returns `None` when the viewport has not been sized
+    /// yet (no resize call has succeeded). The bytes are produced
+    /// by [`render_horizon_frame`] — a deterministic procedural
+    /// sky + ground gradient driven by the camera's pitch and yaw —
+    /// so the renderer's canvas paint loop has visible content the
+    /// moment the user drags the camera, even on machines without a
+    /// GPU adapter.
+    ///
+    /// Phase 17 Group D Task 21. Implementation note: the
+    /// `FrameBuffer::pixels` field is moved out at the napi
+    /// boundary via `Buffer::from_data`, so V8 owns a zero-copy
+    /// view into the Rust allocation. The renderer reads back the
+    /// bytes through `aec.viewport.readFrameBuffer()`; the
+    /// frame_index lets the canvas component drop stale frames if
+    /// the rAF callback runs slower than the bridge.
+    pub fn read_frame_buffer(&self) -> Option<FrameBuffer> {
+        let mut inner = self.inner.write().expect("viewport service poisoned");
+        if inner.width == 0 || inner.height == 0 {
+            return None;
+        }
+        // Build the frame key. The key is identical to the one
+        // `request_frame` uses so the renderer can mix
+        // request_frame and readFrameBuffer calls without seeing
+        // out-of-order frame indices.
+        let key = FrameKey {
+            camera_hash: inner.camera_hash,
+            selection_hash: 0,
+            geometry_hash: 0,
+            viewport_w: inner.width,
+            viewport_h: inner.height,
+        };
+        // Bump the frame index ONLY when the inputs changed. The
+        // renderer compares the returned `frame_index` against its
+        // last painted value and skips the canvas write when they
+        // match. This keeps the rAF loop quiet (no putImageData
+        // every tick) when the camera is idle.
+        let frame_index = if let Some(s) = inner.surface.as_mut() {
+            if s.should_render(key) {
+                s.record_frame(key);
+            }
+            s.frame_index()
+        } else {
+            // Fallback mode mirrors the surface manager's
+            // "record only when key changed" semantics so the
+            // renderer behaves identically regardless of whether
+            // a GPU adapter is present.
+            if inner.fallback_last_key != Some(key) {
+                inner.fallback_frame_index = inner.fallback_frame_index.wrapping_add(1);
+                inner.fallback_last_key = Some(key);
+            }
+            inner.fallback_frame_index
+        };
+        let fb = render_horizon_frame(&inner.camera, inner.width, inner.height, frame_index);
+        Some(fb)
     }
 
     /// Status report for the diagnostics panel.
@@ -485,6 +555,68 @@ mod tests {
         }
         let m = Mat4::from_cols_array_2d(&u.view_proj);
         assert!(m.determinant().abs() > 1e-6);
+    }
+
+    #[test]
+    fn read_frame_buffer_before_resize_returns_none() {
+        let s = ViewportService::new();
+        assert!(s.read_frame_buffer().is_none());
+    }
+
+    #[test]
+    fn read_frame_buffer_after_resize_returns_bytes() {
+        let s = ViewportService::new();
+        s.resize(64, 32).expect("resize ok");
+        let fb = s.read_frame_buffer().expect("frame buffer present");
+        assert_eq!(fb.width, 64);
+        assert_eq!(fb.height, 32);
+        assert_eq!(fb.byte_len(), 64 * 32 * 4);
+        assert_eq!(fb.pixels.len(), fb.byte_len());
+        // Every pixel must be opaque so the renderer's putImageData
+        // call paints solid colours, not see-through gradients.
+        for chunk in fb.pixels.chunks(4) {
+            assert_eq!(chunk[3], 255);
+        }
+    }
+
+    #[test]
+    fn read_frame_buffer_coalesces_idle_calls_and_bumps_on_input() {
+        let s = ViewportService::new();
+        s.resize(8, 8).expect("resize ok");
+        let a = s.read_frame_buffer().expect("a").frame_index;
+        let b = s.read_frame_buffer().expect("b").frame_index;
+        assert_eq!(
+            a, b,
+            "idle reads should coalesce to the same frame_index ({a} == {b})"
+        );
+        s.apply_input(ViewportInput::Orbit { dx: 10.0, dy: 0.0 });
+        let c = s.read_frame_buffer().expect("c").frame_index;
+        assert!(
+            c > b,
+            "frame_index should bump after a camera input ({b} -> {c})"
+        );
+    }
+
+    #[test]
+    fn read_frame_buffer_responds_to_camera_input() {
+        // Two reads at the same size + same camera should produce
+        // bit-identical pixel arrays (deterministic procedural
+        // output). A camera input between them should produce
+        // *different* pixel arrays.
+        let s = ViewportService::new();
+        s.resize(64, 32).expect("resize ok");
+        let a = s.read_frame_buffer().expect("a");
+        let b = s.read_frame_buffer().expect("b");
+        assert_eq!(a.pixels, b.pixels, "no input means deterministic frame");
+        s.apply_input(ViewportInput::Orbit {
+            dx: 100.0,
+            dy: 50.0,
+        });
+        let c = s.read_frame_buffer().expect("c");
+        assert_ne!(
+            a.pixels, c.pixels,
+            "orbit input should change the rendered frame"
+        );
     }
 
     #[test]
