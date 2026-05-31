@@ -247,6 +247,22 @@ fn download_to_file_impl(
     let status = response.status();
     let resuming = status == 206;
     if status != 200 && status != 206 {
+        // HTTP 416 (Range Not Satisfiable) with resume_from > 0 means
+        // the partial file is at least as large as the server's view of
+        // the resource — typically because a prior attempt finished the
+        // transfer but crashed before its caller renamed the partial
+        // into place (see [`ModelManager::download_model`]). If we
+        // leave the partial on disk, every subsequent retry will
+        // request the same `Range: bytes=<total>-` and get the same 416
+        // — a permanent stuck state. Delete the partial so the next
+        // attempt either hits the model-manager's BLAKE3 fast path (if
+        // the file was actually complete and correct) or starts the
+        // transfer from byte 0 (if it was corrupt of exactly the wrong
+        // length). Best-effort: failure to delete is not propagated;
+        // the underlying 416 is the actionable error.
+        if status == 416 && resume_from > 0 {
+            let _ = std::fs::remove_file(dest);
+        }
         return Err(DownloadError::Status(status));
     }
 
@@ -652,5 +668,83 @@ mod tests {
         assert!(!USER_AGENT.to_ascii_lowercase().contains("linux"));
         assert!(!USER_AGENT.to_ascii_lowercase().contains("darwin"));
         assert!(!USER_AGENT.to_ascii_lowercase().contains("windows"));
+    }
+
+    /// Mock server that always answers `416 Range Not Satisfiable` with
+    /// a `Content-Range: bytes */<total>` header. Used to verify that
+    /// `download_to_file_impl` deletes the partial file on 416 so the
+    /// next attempt is not permanently stuck (see the layer-2 fix at
+    /// the top of this file's status check).
+    fn spawn_416(listener: TcpListener, total: u64) -> thread::JoinHandle<()> {
+        thread::spawn(move || loop {
+            let Ok((mut s, _)) = listener.accept() else {
+                return;
+            };
+            let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
+            let mut req = vec![0u8; 8192];
+            let _ = s.read(&mut req);
+            let resp = format!(
+                "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total}\r\nContent-Length: 0\r\n\r\n",
+            );
+            let _ = s.write_all(resp.as_bytes());
+            let _ = s.flush();
+        })
+    }
+
+    /// Defence-in-depth: if `download_to_file_impl` issues a resume
+    /// request and the server returns HTTP 416 (Range Not Satisfiable),
+    /// the partial file is left in a state where every subsequent
+    /// resume attempt will hit the same 416 — a permanent stuck state.
+    /// The fix deletes the partial on 416-with-resume-from > 0 so the
+    /// next attempt can either take the model-manager's BLAKE3 fast
+    /// path (if the file was actually complete and correct) or start
+    /// the transfer fresh from byte 0.
+    #[test]
+    fn deletes_partial_file_on_http_416_when_resuming() {
+        let listener = bind_loopback();
+        let port = listener.local_addr().unwrap().port();
+        let total: u64 = 4096;
+        let _join = spawn_416(listener, total);
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.bin");
+        // Pre-seed the partial to the full expected size — this is
+        // exactly the state created by the "crashed between BLAKE3
+        // verify and atomic rename" bug.
+        std::fs::write(&dest, vec![0u8; total as usize]).unwrap();
+        let err =
+            download_to_file_impl(&format!("http://127.0.0.1:{port}/file"), &dest, total, None)
+                .unwrap_err();
+        match err {
+            DownloadError::Status(416) => {}
+            other => panic!("expected Status(416), got {other:?}"),
+        }
+        assert!(
+            !dest.exists(),
+            "partial file MUST be deleted on 416 with resume_from > 0, \
+             so the next retry does not get permanently stuck"
+        );
+    }
+
+    /// Companion to the test above: if `resume_from == 0` (no partial
+    /// on disk) and the server somehow returns 416, we must NOT delete
+    /// anything — there's nothing to delete, and the error should
+    /// surface unchanged. Also confirms the 416 cleanup is gated on
+    /// `resume_from > 0`.
+    #[test]
+    fn does_not_attempt_delete_on_416_without_resume() {
+        let listener = bind_loopback();
+        let port = listener.local_addr().unwrap().port();
+        let _join = spawn_416(listener, 4096);
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.bin");
+        // No pre-seeded partial — resume_from will be 0.
+        let err =
+            download_to_file_impl(&format!("http://127.0.0.1:{port}/file"), &dest, 4096, None)
+                .unwrap_err();
+        match err {
+            DownloadError::Status(416) => {}
+            other => panic!("expected Status(416), got {other:?}"),
+        }
+        assert!(!dest.exists(), "no file should exist (we never wrote one)");
     }
 }

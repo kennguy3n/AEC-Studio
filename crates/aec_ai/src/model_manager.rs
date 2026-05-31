@@ -457,6 +457,16 @@ impl ModelManager {
     /// already exists from a previous attempt, a `Range: bytes=N-` header
     /// is sent and the new bytes are appended.
     ///
+    /// **Recovery fast path**: if `<filename>.partial` already hashes
+    /// to the expected BLAKE3 (i.e. a previous attempt finished the
+    /// transfer but crashed before the atomic rename), the HTTPS
+    /// transfer is skipped entirely and the partial is renamed into
+    /// place. Without this, a resume request on a complete file would
+    /// send `Range: bytes=<total>-` and receive HTTP 416, leaving the
+    /// caller permanently stuck (see the layer-2 416 deletion in
+    /// [`model_download::download_to_file`] for the defence-in-depth
+    /// companion fix).
+    ///
     /// `callbacks.on_progress` is called periodically during the
     /// download with `(downloaded_bytes, total_bytes)`. `callbacks.on_state`
     /// is called on each lifecycle transition
@@ -491,6 +501,32 @@ impl ModelManager {
         let partial_path = self
             .models_dir
             .join(format!("{}.partial", descriptor.filename));
+        // Fast path: a previous attempt may have completed the download
+        // (correct BLAKE3) but crashed between the verify step below and
+        // the atomic rename. Without this check, the next call would
+        // resume from the end of the file, send `Range: bytes=<total>-`,
+        // get HTTP 416 and treat that as a fatal error — leaving the
+        // partial file in place so every subsequent retry hits the same
+        // 416 (permanent failure). Hash the partial first; if it
+        // matches, skip the HTTP transfer entirely and proceed to
+        // rename. The BLAKE3 hash is the authoritative completeness
+        // check, not the file size.
+        if partial_path.is_file() {
+            if let Ok(actual) = blake3_file(&partial_path) {
+                if actual == descriptor.blake3_hex {
+                    callbacks.fire_state(DownloadState::Verifying);
+                    if let Err(e) = std::fs::rename(&partial_path, &final_path) {
+                        callbacks.fire_state(DownloadState::Failed {
+                            stage: "rename",
+                            msg: e.to_string(),
+                        });
+                        return Err(e.into());
+                    }
+                    callbacks.fire_state(DownloadState::Completed);
+                    return Ok(final_path);
+                }
+            }
+        }
         callbacks.fire_state(DownloadState::Downloading);
         if let Err(e) = model_download::download_to_file(
             &url,
@@ -647,6 +683,7 @@ fn blake3_file(path: &Path) -> Result<String, ModelManagerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     #[test]
     fn select_tier_large_with_high_vram() {
@@ -849,5 +886,112 @@ mod tests {
         let mgr = ModelManager::new(dir.path().to_path_buf(), vec![], 16384, 8192).unwrap();
         // No descriptor registered → skip verification.
         assert!(mgr.verify_active_checksum().unwrap());
+    }
+
+    /// Reproduces the 416-permanent-failure bug: a previous attempt
+    /// fully downloaded the model into `<filename>.partial`, BLAKE3
+    /// matched, but the process died between BLAKE3 verification and
+    /// the atomic rename. Calling `download_model` again must NOT issue
+    /// any HTTP request (the partial is already correct); it must
+    /// detect the complete partial by hash and rename it into place.
+    ///
+    /// We force "must not issue HTTP" by giving the descriptor a
+    /// non-allowlisted `download_url` — if the fast path were missing,
+    /// `model_download::download_to_file` would reject the URL with
+    /// `HostNotAllowed` and the test would fail.
+    #[test]
+    fn download_model_skips_http_when_partial_already_matches_blake3() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"complete-but-not-yet-renamed payload bytes";
+        let filename = ModelTier::Small.filename().to_string();
+        let partial_path = dir.path().join(format!("{filename}.partial"));
+        std::fs::write(&partial_path, payload).unwrap();
+        let expected_hash = hex::encode(blake3::hash(payload).as_bytes());
+
+        let descriptor = ModelDescriptor {
+            tier: ModelTier::Small,
+            filename: filename.clone(),
+            blake3_hex: expected_hash.clone(),
+            // Intentionally NOT on the HuggingFace allow-list — if the
+            // fast path is missing, download_to_file rejects this with
+            // HostNotAllowed and the test fails.
+            download_url: Some("https://example.invalid/should-not-be-called".to_string()),
+            size_bytes: payload.len() as u64,
+        };
+        let mgr =
+            ModelManager::new(dir.path().to_path_buf(), vec![descriptor], 16384, 8192).unwrap();
+
+        let states: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let states_for_cb = states.clone();
+        let callbacks = DownloadCallbacks {
+            on_progress: None,
+            on_state: Some(Arc::new(move |s| {
+                let label = match s {
+                    DownloadState::Downloading => "downloading",
+                    DownloadState::Verifying => "verifying",
+                    DownloadState::Completed => "completed",
+                    DownloadState::Failed { .. } => "failed",
+                };
+                states_for_cb.lock().unwrap().push(label);
+            })),
+        };
+
+        let final_path = mgr.download_model(ModelTier::Small, callbacks).unwrap();
+
+        assert_eq!(final_path, dir.path().join(&filename));
+        assert!(final_path.is_file(), "final file must exist after rename");
+        assert!(
+            !partial_path.exists(),
+            "partial file must be renamed away, not left in place"
+        );
+        let observed = states.lock().unwrap().clone();
+        assert!(
+            !observed.contains(&"downloading"),
+            "fast path must not emit Downloading (no HTTP should occur); observed: {observed:?}"
+        );
+        assert!(
+            observed.contains(&"completed"),
+            "fast path must terminate in Completed; observed: {observed:?}"
+        );
+    }
+
+    /// If a `.partial` file exists but has the wrong BLAKE3 (e.g.
+    /// corrupted mid-download by the previous attempt), the fast path
+    /// must NOT take it. We don't test the full download flow here (no
+    /// network in unit tests); we just confirm the fast path is hash-
+    /// gated. With a wrong hash and a non-allowlisted URL,
+    /// `download_to_file` is reached and rejects with `HostNotAllowed`,
+    /// which propagates as an error — proving the fast path was
+    /// bypassed.
+    #[test]
+    fn download_model_does_not_skip_http_when_partial_blake3_is_wrong() {
+        let dir = tempfile::tempdir().unwrap();
+        let filename = ModelTier::Small.filename().to_string();
+        let partial_path = dir.path().join(format!("{filename}.partial"));
+        std::fs::write(&partial_path, b"corrupt-bytes").unwrap();
+        // descriptor's expected hash is for *different* content.
+        let expected_hash = hex::encode(blake3::hash(b"different content").as_bytes());
+
+        let descriptor = ModelDescriptor {
+            tier: ModelTier::Small,
+            filename: filename.clone(),
+            blake3_hex: expected_hash,
+            download_url: Some("https://example.invalid/should-be-called".to_string()),
+            size_bytes: 16,
+        };
+        let mgr =
+            ModelManager::new(dir.path().to_path_buf(), vec![descriptor], 16384, 8192).unwrap();
+
+        let err = mgr
+            .download_model(ModelTier::Small, DownloadCallbacks::default())
+            .expect_err("must NOT use fast path when partial hash is wrong");
+        // It must have reached download_to_file and been rejected by the
+        // host allow-list — proving the fast path was bypassed.
+        assert!(
+            err.to_string().to_lowercase().contains("host"),
+            "expected host-not-allowed error from download_to_file; got: {err}"
+        );
+        // Final path must NOT exist (we did NOT rename a wrong-hash file).
+        assert!(!dir.path().join(&filename).is_file());
     }
 }
