@@ -1531,6 +1531,54 @@ pub struct AiDownloadResult {
     pub size_bytes: u64,
 }
 
+/// Owned, fully self-contained handle on an in-flight model
+/// download. Built by [`BridgeService::ai_prepare_download`] under a
+/// **brief** model_manager lock, then handed to
+/// [`BridgeService::run_ai_download`] which performs the HTTPS
+/// transfer + BLAKE3 verify + atomic rename **without** any
+/// `BridgeService` lock held.
+///
+/// This is the split that keeps a multi-minute download from
+/// blocking writers (`project_save`, `command_apply`, …) on the
+/// outer N-API `RwLock<Option<BridgeService>>`: the napi handler
+/// only holds the read lock long enough to clone these owned values,
+/// then drops it before invoking `run_ai_download`.
+#[derive(Debug, Clone)]
+pub struct AiDownloadContext {
+    /// Lowercase tier slug (`"small" | "medium" | "large"`).
+    pub tier_slug: String,
+    /// Cloned out of [`aec_ai::ModelManager`] under the lock — owns
+    /// the canonical filename, BLAKE3, download URL, and expected
+    /// size hint.
+    pub descriptor: aec_ai::ModelDescriptor,
+    /// Directory the download lands in (created if missing).
+    pub models_dir: PathBuf,
+    /// Absolute target path the verified file is renamed to on
+    /// success.
+    pub final_path: PathBuf,
+    /// `<final_path>.partial` — bytes accumulate here so a partial
+    /// download isn't mistaken for a verified model.
+    pub partial_path: PathBuf,
+    /// Shared progress slot the bridge service publishes into, cloned
+    /// out of [`BridgeService::download_progress`]. Held as an
+    /// `Arc<Mutex<…>>` rather than a borrow so the download body
+    /// runs with **no** `BridgeService`-level lock held — the
+    /// `Mutex` is acquired only for the microseconds it takes to
+    /// swap in each progress snapshot.
+    pub progress: Arc<Mutex<Option<AiDownloadProgress>>>,
+}
+
+/// Swap a fresh [`AiDownloadProgress`] snapshot into the shared slot.
+/// Free function (not a method) so [`BridgeService::run_ai_download`]
+/// can publish progress without holding `&self` — letting the napi
+/// handler drop its outer `RwLock` reader guard before kicking off
+/// the HTTP transfer.
+fn publish_progress_to(slot: &Mutex<Option<AiDownloadProgress>>, p: AiDownloadProgress) {
+    if let Ok(mut g) = slot.lock() {
+        *g = Some(p);
+    }
+}
+
 /// Configuration for [`BridgeService`].
 #[derive(Debug, Clone)]
 pub struct BridgeConfig {
@@ -5465,29 +5513,21 @@ impl BridgeService {
         })
     }
 
-    /// Download the GGUF file for `tier` (one of `"small" | "medium"
-    /// | "large"`) to the configured `models_dir`, verifying its
-    /// BLAKE3 against the manifest before atomically renaming into
-    /// place. Returns the on-disk path on success.
-    ///
-    /// During the download (which can take minutes on a slow link)
-    /// the [`Self::ai_download_progress`] slot is updated on every
-    /// `download_to_file` chunk callback so the renderer's Settings
-    /// progress bar can poll progress without ever blocking.
-    ///
-    /// The lock on [`Self::model_manager`] is held only briefly (to
-    /// clone the descriptor + path) — concurrent
-    /// `ai_model_availability` / `ai_download_progress` polls return
-    /// in microseconds even while the download is in flight.
-    pub fn ai_download_model(
+    /// Build an [`AiDownloadContext`] for `tier_str` while holding
+    /// the model_manager lock just long enough to clone the
+    /// descriptor + paths + the shared progress slot. The returned
+    /// context is fully owned — the napi handler drops the outer
+    /// `RwLock<Option<BridgeService>>` reader guard and then calls
+    /// [`Self::run_ai_download`] without holding **any**
+    /// `BridgeService` lock, so concurrent `with_service` writers
+    /// (`project_save`, `command_apply`, …) run in parallel with
+    /// the multi-minute HTTP download.
+    pub fn ai_prepare_download(
         &self,
         tier_str: &str,
-    ) -> Result<AiDownloadResult, BridgeServiceError> {
+    ) -> Result<AiDownloadContext, BridgeServiceError> {
         let tier = aec_ai::ModelTier::from_slug(tier_str)
             .ok_or_else(|| BridgeServiceError::Ai(format!("unknown tier {tier_str:?}")))?;
-        // Clone every value we need from the manager under the lock, then
-        // drop the lock before doing any I/O so concurrent polls keep
-        // running.
         let (descriptor, models_dir, final_path) = {
             let mgr = self
                 .model_manager
@@ -5505,11 +5545,39 @@ impl BridgeService {
                 mgr.model_path_for(tier),
             )
         };
+        let partial_path = models_dir.join(format!("{}.partial", descriptor.filename));
+        Ok(AiDownloadContext {
+            tier_slug: tier_str.into(),
+            descriptor,
+            models_dir,
+            final_path,
+            partial_path,
+            progress: Arc::clone(&self.download_progress),
+        })
+    }
+
+    /// Drive a model download to completion using the owned `ctx`.
+    /// Performs HTTPS download → BLAKE3 verify → atomic rename and
+    /// updates `ctx.progress` from inside the download callback.
+    /// **Does not hold any `BridgeService` lock** — the progress
+    /// `Arc<Mutex<…>>` is the only shared state, and the `Mutex` is
+    /// acquired only for the microseconds it takes to swap each
+    /// snapshot. Safe to invoke from a `spawn_blocking` task while
+    /// concurrent writers run in parallel.
+    pub fn run_ai_download(ctx: AiDownloadContext) -> Result<AiDownloadResult, BridgeServiceError> {
+        let AiDownloadContext {
+            tier_slug,
+            descriptor,
+            models_dir,
+            final_path,
+            partial_path,
+            progress,
+        } = ctx;
         let url = descriptor
             .download_url
             .as_ref()
             .ok_or_else(|| {
-                BridgeServiceError::Ai(format!("no download URL configured for tier {tier_str}"))
+                BridgeServiceError::Ai(format!("no download URL configured for tier {tier_slug}"))
             })?
             .clone();
         std::fs::create_dir_all(&models_dir).map_err(|e| {
@@ -5520,15 +5588,18 @@ impl BridgeService {
             if let Ok(true) = aec_ai::ModelManager::verify_file(&final_path, &descriptor.blake3_hex)
             {
                 let size_bytes = std::fs::metadata(&final_path).map_or(0, |m| m.len());
-                self.publish_progress(AiDownloadProgress {
-                    tier: tier_str.into(),
-                    downloaded: size_bytes,
-                    total: size_bytes,
-                    state: "completed".into(),
-                    message: None,
-                });
+                publish_progress_to(
+                    &progress,
+                    AiDownloadProgress {
+                        tier: tier_slug.clone(),
+                        downloaded: size_bytes,
+                        total: size_bytes,
+                        state: "completed".into(),
+                        message: None,
+                    },
+                );
                 return Ok(AiDownloadResult {
-                    tier: tier_str.into(),
+                    tier: tier_slug,
                     path: final_path.display().to_string(),
                     size_bytes,
                 });
@@ -5539,15 +5610,18 @@ impl BridgeService {
         }
         // Publish a `downloading` snapshot before the first byte lands so
         // the renderer's poll immediately observes the in-flight state.
-        self.publish_progress(AiDownloadProgress {
-            tier: tier_str.into(),
-            downloaded: 0,
-            total: descriptor.size_bytes,
-            state: "downloading".into(),
-            message: None,
-        });
-        let progress_slot = Arc::clone(&self.download_progress);
-        let tier_slot_label: String = tier_str.into();
+        publish_progress_to(
+            &progress,
+            AiDownloadProgress {
+                tier: tier_slug.clone(),
+                downloaded: 0,
+                total: descriptor.size_bytes,
+                state: "downloading".into(),
+                message: None,
+            },
+        );
+        let progress_slot = Arc::clone(&progress);
+        let tier_slot_label = tier_slug.clone();
         let total_hint = descriptor.size_bytes;
         let cb: aec_ai::ProgressCallback = Arc::new(move |done, total| {
             if let Ok(mut g) = progress_slot.lock() {
@@ -5560,59 +5634,73 @@ impl BridgeService {
                 });
             }
         });
-        let partial_path = models_dir.join(format!("{}.partial", descriptor.filename));
         if let Err(e) = aec_ai::download_to_file(&url, &partial_path, total_hint, Some(cb)) {
-            self.publish_progress(AiDownloadProgress {
-                tier: tier_str.into(),
-                downloaded: 0,
-                total: total_hint,
-                state: "failed".into(),
-                message: Some(e.to_string()),
-            });
+            publish_progress_to(
+                &progress,
+                AiDownloadProgress {
+                    tier: tier_slug.clone(),
+                    downloaded: 0,
+                    total: total_hint,
+                    state: "failed".into(),
+                    message: Some(e.to_string()),
+                },
+            );
             return Err(BridgeServiceError::Ai(format!("download failed: {e}")));
         }
         // Verify the partial before promoting it to the final path.
-        self.publish_progress(AiDownloadProgress {
-            tier: tier_str.into(),
-            downloaded: total_hint,
-            total: total_hint,
-            state: "verifying".into(),
-            message: None,
-        });
+        publish_progress_to(
+            &progress,
+            AiDownloadProgress {
+                tier: tier_slug.clone(),
+                downloaded: total_hint,
+                total: total_hint,
+                state: "verifying".into(),
+                message: None,
+            },
+        );
         match aec_ai::ModelManager::verify_file(&partial_path, &descriptor.blake3_hex) {
             Ok(true) => {}
             Ok(false) => {
                 let _ = std::fs::remove_file(&partial_path);
-                self.publish_progress(AiDownloadProgress {
-                    tier: tier_str.into(),
-                    downloaded: 0,
-                    total: total_hint,
-                    state: "failed".into(),
-                    message: Some("BLAKE3 checksum mismatch".into()),
-                });
+                publish_progress_to(
+                    &progress,
+                    AiDownloadProgress {
+                        tier: tier_slug.clone(),
+                        downloaded: 0,
+                        total: total_hint,
+                        state: "failed".into(),
+                        message: Some("BLAKE3 checksum mismatch".into()),
+                    },
+                );
                 return Err(BridgeServiceError::Ai(
                     "downloaded file failed BLAKE3 verification".into(),
                 ));
             }
             Err(e) => {
-                self.publish_progress(AiDownloadProgress {
-                    tier: tier_str.into(),
-                    downloaded: 0,
-                    total: total_hint,
-                    state: "failed".into(),
-                    message: Some(e.to_string()),
-                });
+                publish_progress_to(
+                    &progress,
+                    AiDownloadProgress {
+                        tier: tier_slug.clone(),
+                        downloaded: 0,
+                        total: total_hint,
+                        state: "failed".into(),
+                        message: Some(e.to_string()),
+                    },
+                );
                 return Err(BridgeServiceError::Ai(format!("verify failed: {e}")));
             }
         }
         std::fs::rename(&partial_path, &final_path).map_err(|e| {
-            self.publish_progress(AiDownloadProgress {
-                tier: tier_str.into(),
-                downloaded: total_hint,
-                total: total_hint,
-                state: "failed".into(),
-                message: Some(format!("rename failed: {e}")),
-            });
+            publish_progress_to(
+                &progress,
+                AiDownloadProgress {
+                    tier: tier_slug.clone(),
+                    downloaded: total_hint,
+                    total: total_hint,
+                    state: "failed".into(),
+                    message: Some(format!("rename failed: {e}")),
+                },
+            );
             BridgeServiceError::Ai(format!(
                 "rename {} -> {}: {e}",
                 partial_path.display(),
@@ -5620,18 +5708,36 @@ impl BridgeService {
             ))
         })?;
         let size_bytes = std::fs::metadata(&final_path).map_or(0, |m| m.len());
-        self.publish_progress(AiDownloadProgress {
-            tier: tier_str.into(),
-            downloaded: size_bytes,
-            total: size_bytes,
-            state: "completed".into(),
-            message: None,
-        });
+        publish_progress_to(
+            &progress,
+            AiDownloadProgress {
+                tier: tier_slug.clone(),
+                downloaded: size_bytes,
+                total: size_bytes,
+                state: "completed".into(),
+                message: None,
+            },
+        );
         Ok(AiDownloadResult {
-            tier: tier_str.into(),
+            tier: tier_slug,
             path: final_path.display().to_string(),
             size_bytes,
         })
+    }
+
+    /// Convenience: prepare + run a model download in one call.
+    /// Internal callers (and the `ai_model_download_surface`
+    /// integration tests) that don't go through the napi `RwLock`
+    /// keep this shape; the napi handler instead calls
+    /// [`Self::ai_prepare_download`] under the read lock, drops the
+    /// lock, then calls [`Self::run_ai_download`] so a multi-minute
+    /// HTTP transfer doesn't block writers.
+    pub fn ai_download_model(
+        &self,
+        tier_str: &str,
+    ) -> Result<AiDownloadResult, BridgeServiceError> {
+        let ctx = self.ai_prepare_download(tier_str)?;
+        Self::run_ai_download(ctx)
     }
 
     /// Read the latest progress snapshot published by an in-flight
@@ -5661,12 +5767,6 @@ impl BridgeService {
             .map_err(|_| BridgeServiceError::Ai("model_manager mutex poisoned".into()))?;
         mgr.set_tier(tier);
         Ok(())
-    }
-
-    fn publish_progress(&self, p: AiDownloadProgress) {
-        if let Ok(mut g) = self.download_progress.lock() {
-            *g = Some(p);
-        }
     }
 
     // ----- Draft scope (DXF import/export + drawing + sheet/layer ----- //

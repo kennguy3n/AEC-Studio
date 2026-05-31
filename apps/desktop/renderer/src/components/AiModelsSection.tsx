@@ -114,6 +114,12 @@ export function AiModelsSection(): JSX.Element {
       setPendingTier(tier);
       try {
         await aec.ai.downloadModel(tier);
+        // Bridge resolved → file is BLAKE3-verified and on disk.
+        // Clear `pendingTier` immediately so the Download buttons
+        // re-enable on the next render rather than waiting up to
+        // 500 ms for the polling effect's next tick to observe the
+        // "completed" snapshot.
+        setPendingTier(null);
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
         setPendingTier(null);
