@@ -30,9 +30,16 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-/// Maximum response body size we accept from the sidecar. The Phase 1 budget
-/// is a single tool-call JSON envelope (typically < 8 KiB); 1 MiB is a wide
-/// safety margin that still bounds memory if the sidecar misbehaves.
+/// Default maximum response body size we accept from the sidecar. The
+/// text sidecar emits a single tool-call JSON envelope (typically
+/// < 8 KiB); 1 MiB is a wide safety margin that still bounds memory
+/// if the sidecar misbehaves.
+///
+/// The text [`request`] function uses this default. Callers with
+/// larger payloads (notably the Phase 18 Group C image-gen sidecar,
+/// which returns multi-MiB base64 PNGs from the AUTOMATIC1111
+/// `/sdapi/v1/txt2img` endpoint) call [`request_with_body_limit`] with an
+/// explicit budget instead of widening this default for everyone.
 pub const MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Error)]
@@ -63,17 +70,21 @@ pub struct HttpResponse {
     pub body: String,
 }
 
-/// Issue a single HTTP request to `127.0.0.1:port`. `path` must already include
-/// any leading `/`. `method` is `"GET"` or `"POST"`. `body` is the JSON envelope
-/// (or empty for GET).
+/// Issue a single HTTP request to `127.0.0.1:port` with the default
+/// 1 MiB response-body cap. See [`request_with_body_limit`] for the
+/// variant that accepts an explicit limit.
+///
+/// `path` must already include any leading `/`. `method` is
+/// `"GET"` or `"POST"`. `body` is the JSON envelope (or empty for
+/// GET).
 ///
 /// The request is hard-coded to:
 ///   * `Host: 127.0.0.1:<port>`
 ///   * `Connection: close`
 ///   * `Content-Type: application/json` (when `body` is non-empty)
 ///
-/// `connect_timeout` bounds the initial TCP handshake; `io_timeout` applies to
-/// every read/write on the stream once connected.
+/// `connect_timeout` bounds the initial TCP handshake; `io_timeout`
+/// applies to every read/write on the stream once connected.
 pub fn request(
     port: u16,
     method: &str,
@@ -81,6 +92,39 @@ pub fn request(
     body: &str,
     connect_timeout: Duration,
     io_timeout: Duration,
+) -> Result<HttpResponse, HttpError> {
+    request_with_body_limit(
+        port,
+        method,
+        path,
+        body,
+        connect_timeout,
+        io_timeout,
+        MAX_RESPONSE_BODY_BYTES,
+    )
+}
+
+/// Same as [`request`] but with a caller-supplied response-body
+/// `limit` (in bytes). Used by the Phase 18 image-gen transport,
+/// which expects multi-MiB base64 PNG payloads from the
+/// AUTOMATIC1111 `/sdapi/v1/txt2img` endpoint — widening the
+/// default 1 MiB cap globally would soften the memory bound on
+/// every other loopback caller (`/v1/chat/completions`,
+/// `/health`, …), so the limit is per-call here.
+///
+/// The limit is applied in three places: the `Content-Length`
+/// pre-check, the chunked-transfer accumulator, and the
+/// `Connection: close` EOF tail. Exceeding it returns
+/// [`HttpError::BodyTooLarge`] without consuming the whole stream
+/// — the bound is hard, not advisory.
+pub fn request_with_body_limit(
+    port: u16,
+    method: &str,
+    path: &str,
+    body: &str,
+    connect_timeout: Duration,
+    io_timeout: Duration,
+    limit: usize,
 ) -> Result<HttpResponse, HttpError> {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
     let mut stream = TcpStream::connect_timeout(&addr, connect_timeout)
@@ -124,10 +168,13 @@ pub fn request(
     stream.flush().map_err(HttpError::Write)?;
 
     let mut reader = BufReader::new(stream);
-    parse_response(&mut reader)
+    parse_response(&mut reader, limit)
 }
 
-fn parse_response<R: Read + BufRead>(reader: &mut R) -> Result<HttpResponse, HttpError> {
+fn parse_response<R: Read + BufRead>(
+    reader: &mut R,
+    limit: usize,
+) -> Result<HttpResponse, HttpError> {
     // Status line: e.g. "HTTP/1.1 200 OK\r\n"
     let mut status_line = String::new();
     reader
@@ -179,12 +226,10 @@ fn parse_response<R: Read + BufRead>(reader: &mut R) -> Result<HttpResponse, Htt
     // defense-in-depth in case this client is ever reused against a
     // different loopback server.
     let body = if transfer_encoding_chunked {
-        read_chunked(reader)?
+        read_chunked(reader, limit)?
     } else if let Some(len) = content_length {
-        if len > MAX_RESPONSE_BODY_BYTES {
-            return Err(HttpError::BodyTooLarge {
-                limit: MAX_RESPONSE_BODY_BYTES,
-            });
+        if len > limit {
+            return Err(HttpError::BodyTooLarge { limit });
         }
         let mut buf = vec![0u8; len];
         reader.read_exact(&mut buf).map_err(HttpError::Read)?;
@@ -192,12 +237,10 @@ fn parse_response<R: Read + BufRead>(reader: &mut R) -> Result<HttpResponse, Htt
     } else {
         // Connection: close → read until EOF, bounded by the cap.
         let mut buf = Vec::new();
-        let mut take = reader.take(MAX_RESPONSE_BODY_BYTES as u64 + 1);
+        let mut take = reader.take(limit as u64 + 1);
         take.read_to_end(&mut buf).map_err(HttpError::Read)?;
-        if buf.len() > MAX_RESPONSE_BODY_BYTES {
-            return Err(HttpError::BodyTooLarge {
-                limit: MAX_RESPONSE_BODY_BYTES,
-            });
+        if buf.len() > limit {
+            return Err(HttpError::BodyTooLarge { limit });
         }
         String::from_utf8(buf).map_err(|_| HttpError::MalformedHeaders)?
     };
@@ -208,7 +251,7 @@ fn parse_response<R: Read + BufRead>(reader: &mut R) -> Result<HttpResponse, Htt
     Ok(HttpResponse { status, body })
 }
 
-fn read_chunked<R: BufRead>(reader: &mut R) -> Result<String, HttpError> {
+fn read_chunked<R: BufRead>(reader: &mut R, limit: usize) -> Result<String, HttpError> {
     let mut out = Vec::new();
     loop {
         let mut size_line = String::new();
@@ -230,10 +273,8 @@ fn read_chunked<R: BufRead>(reader: &mut R) -> Result<String, HttpError> {
             }
             break;
         }
-        if out.len() + size > MAX_RESPONSE_BODY_BYTES {
-            return Err(HttpError::BodyTooLarge {
-                limit: MAX_RESPONSE_BODY_BYTES,
-            });
+        if out.len() + size > limit {
+            return Err(HttpError::BodyTooLarge { limit });
         }
         let mut buf = vec![0u8; size];
         reader.read_exact(&mut buf).map_err(HttpError::Read)?;
@@ -259,7 +300,7 @@ mod tests {
         let raw =
             b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\n\r\n{\"ok\":true}";
         let mut reader = BufReader::new(Cursor::new(raw));
-        let r = parse_response(&mut reader).unwrap();
+        let r = parse_response(&mut reader, MAX_RESPONSE_BODY_BYTES).unwrap();
         assert_eq!(r.status, 200);
         assert_eq!(r.body, "{\"ok\":true}");
     }
@@ -273,7 +314,7 @@ mod tests {
         let raw =
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n6\r\n{\"ok\":\r\n5\r\ntrue}\r\n0\r\n\r\n";
         let mut reader = BufReader::new(Cursor::new(raw));
-        let r = parse_response(&mut reader).unwrap();
+        let r = parse_response(&mut reader, MAX_RESPONSE_BODY_BYTES).unwrap();
         assert_eq!(r.status, 200);
         assert_eq!(r.body, "{\"ok\":true}");
     }
@@ -282,7 +323,7 @@ mod tests {
     fn rejects_5xx_with_body_propagated() {
         let raw = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 18\r\n\r\n{\"error\":\"warming\"}";
         let mut reader = BufReader::new(Cursor::new(raw));
-        let err = parse_response(&mut reader).unwrap_err();
+        let err = parse_response(&mut reader, MAX_RESPONSE_BODY_BYTES).unwrap_err();
         match err {
             HttpError::HttpStatus { status, body } => {
                 assert_eq!(status, 503);
@@ -299,7 +340,7 @@ mod tests {
             MAX_RESPONSE_BODY_BYTES + 1
         );
         let mut reader = BufReader::new(Cursor::new(raw.into_bytes()));
-        let err = parse_response(&mut reader).unwrap_err();
+        let err = parse_response(&mut reader, MAX_RESPONSE_BODY_BYTES).unwrap_err();
         assert!(matches!(err, HttpError::BodyTooLarge { .. }));
     }
 
@@ -307,7 +348,67 @@ mod tests {
     fn rejects_malformed_status_line() {
         let raw = b"NOT_HTTP\r\n";
         let mut reader = BufReader::new(Cursor::new(raw));
-        let err = parse_response(&mut reader).unwrap_err();
+        let err = parse_response(&mut reader, MAX_RESPONSE_BODY_BYTES).unwrap_err();
         assert!(matches!(err, HttpError::InvalidStatusLine(_)));
+    }
+
+    /// Pin the new `limit` parameter: a Content-Length that would
+    /// fit under the default 1 MiB cap but exceeds the caller's
+    /// per-request budget must still surface `BodyTooLarge`. The
+    /// Phase 18 image-gen transport calls
+    /// [`request_with_body_limit`] with a 16 MiB ceiling for base64
+    /// PNGs; this test pins that the limit threading actually
+    /// reaches the body-size check, not just the function
+    /// signature.
+    #[test]
+    fn caller_supplied_limit_overrides_default_cap() {
+        // 1024-byte body, but caller passes a 256-byte limit.
+        let mut raw = b"HTTP/1.1 200 OK\r\nContent-Length: 1024\r\n\r\n".to_vec();
+        raw.extend(std::iter::repeat_n(b'x', 1024));
+        let mut reader = BufReader::new(Cursor::new(raw));
+        let err = parse_response(&mut reader, 256).unwrap_err();
+        match err {
+            HttpError::BodyTooLarge { limit } => assert_eq!(limit, 256),
+            other => panic!("expected BodyTooLarge {{ limit: 256 }}, got {other:?}"),
+        }
+    }
+
+    /// And the dual: a body that fits the caller's wider limit
+    /// (e.g. 2 MiB > default 1 MiB) is accepted. We keep the test
+    /// modest (a 4 KiB body with an 8 KiB limit) so it runs in
+    /// microseconds.
+    #[test]
+    fn caller_supplied_limit_admits_bodies_above_default_when_widened() {
+        let payload = "x".repeat(4 * 1024);
+        let raw = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+            payload.len(),
+            payload
+        );
+        let mut reader = BufReader::new(Cursor::new(raw.into_bytes()));
+        let r = parse_response(&mut reader, 8 * 1024).unwrap();
+        assert_eq!(r.status, 200);
+        assert_eq!(r.body.len(), 4 * 1024);
+    }
+
+    /// Chunked-transfer accumulator must also honour the caller's
+    /// limit, not just the default cap. Without threading the
+    /// limit into `read_chunked`, a chunked response could bypass
+    /// the per-request budget.
+    #[test]
+    fn chunked_transfer_honours_caller_limit() {
+        // Single 1024-byte chunk; caller passes a 256-byte limit.
+        let chunk = "x".repeat(1024);
+        let raw = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+            chunk.len(),
+            chunk,
+        );
+        let mut reader = BufReader::new(Cursor::new(raw.into_bytes()));
+        let err = parse_response(&mut reader, 256).unwrap_err();
+        match err {
+            HttpError::BodyTooLarge { limit } => assert_eq!(limit, 256),
+            other => panic!("expected BodyTooLarge {{ limit: 256 }}, got {other:?}"),
+        }
     }
 }

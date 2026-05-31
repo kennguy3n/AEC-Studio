@@ -1,0 +1,44 @@
+{
+  "$schema_doc": "Phase 18 Group D Task 18 — single source of truth for every model the local AI runtime knows about. Compile-time pinned via include_str! in crates/aec_ai/src/registry.rs::ModelRegistry::embedded so adding / updating a model is a JSON edit, not a Rust code change. BLAKE3 / sizes / URLs must be verified end-to-end (download → blake3sum → file size → tally) before being added; never paste an unverified hash. Schema is versioned (`schema_version`) so future migrations can detect a pre-D registry written by an older binary.",
+  "schema_version": 1,
+  "text": {
+    "$doc": "Ternary-Bonsai 1.58-bit GGUF Q2_0 text models — one per hardware tier. Verified during Phase 18 Group A (PR #92) by downloading each file from prism-ml's HuggingFace LFS endpoint and hashing with BLAKE3. The hashes here MUST match the ones in `ModelTier::canonical_blake3_hex` exactly — `model_manager.rs::model_tier_filenames_match_huggingface_repos` + the new `registry::tests` pin that round-trip.",
+    "default_tier": "medium",
+    "tiers": [
+      {
+        "tier": "small",
+        "filename": "Ternary-Bonsai-1.7B-Q2_0.gguf",
+        "display_name": "Ternary-Bonsai 1.7B (1.58-bit GGUF Q2_0)",
+        "huggingface_repo": "prism-ml/Ternary-Bonsai-1.7B-gguf",
+        "size_bytes": 463290464,
+        "blake3_hex": "6634a3ae6c4a5b3e6bec28fd7abe701579c2739db3695df1eb8ced9c28e4fc9a",
+        "context_tokens": 2048,
+        "format": "gguf"
+      },
+      {
+        "tier": "medium",
+        "filename": "Ternary-Bonsai-4B-Q2_0.gguf",
+        "display_name": "Ternary-Bonsai 4B (1.58-bit GGUF Q2_0)",
+        "huggingface_repo": "prism-ml/Ternary-Bonsai-4B-gguf",
+        "size_bytes": 1074969344,
+        "blake3_hex": "89a7662c39f5c704e2ede224590e3840ab7d44213109f08164177a7b2d14a7f5",
+        "context_tokens": 4096,
+        "format": "gguf"
+      },
+      {
+        "tier": "large",
+        "filename": "Ternary-Bonsai-8B-Q2_0.gguf",
+        "display_name": "Ternary-Bonsai 8B (1.58-bit GGUF Q2_0)",
+        "huggingface_repo": "prism-ml/Ternary-Bonsai-8B-gguf",
+        "size_bytes": 2182184672,
+        "blake3_hex": "3c2a48b2e9da29274ec96770cbd27ed0dd2e14b57ba1ce20b1a1d68344738ddd",
+        "context_tokens": 4096,
+        "format": "gguf"
+      }
+    ]
+  },
+  "image_gen": {
+    "$doc": "Image-gen presets — curated list of small-SD-family GGUFs the first-run wizard offers as one-click downloads. Each entry must have been verified end-to-end (download → blake3sum → file size) before merge. The presets array is INTENTIONALLY EMPTY in the current ship: shipping fabricated hashes for SD models we haven't downloaded-and-hashed in this session would be the exact failure mode the registry exists to prevent. Operators who want to add a verified preset edit this array; the first-run wizard reads the same JSON. Users with a HF URL we don't curate paste it in the wizard's manual entry field (`apps/desktop/renderer/src/components/ImageGenWizardPanel.tsx`). Phase 18 Group E Task 23: every preset MUST include `\"format\": \"gguf\"` — the registry parser hard-rejects any other value (e.g. `mlx`, `gemlite`, `hqq`) at boot so a Python-only model cannot ship.",
+    "presets": []
+  }
+}

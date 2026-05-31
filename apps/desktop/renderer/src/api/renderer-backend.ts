@@ -770,6 +770,11 @@ export function rendererInProcessBackend(): AecApi {
         );
       },
       setEnvironmentMap: async () => ({ ok: true as const }),
+      // Phase 18 Group C Task 17 — vitest fallback for the render
+      // queue inspector. No real queue in-process, so always
+      // `false`; component tests can spy on this via the standard
+      // mock-renderer-backend pattern.
+      pathtracedInProgress: async () => false,
     },
     ai: {
       // Return a defensive copy so callers (and Vitest harnesses) can't
@@ -835,6 +840,93 @@ export function rendererInProcessBackend(): AecApi {
       }),
       downloadProgress: async () => null,
       setActiveTier: async (_tier: "small" | "medium" | "large") => {},
+    },
+    // Phase 18 Group C — image-gen sidecar fallback. The in-process
+    // renderer backend can't run a real diffusion model (no native
+    // bridge, no sd-server, no GPU); we return shapes the panel can
+    // exercise (idle status, no-descriptor availability) and `generate`
+    // throws a descriptive error so the panel's failure path is
+    // testable without ever needing real bytes.
+    imageGen: {
+      runtimeStatus: async () =>
+        ({ state: "idle", lastError: null }) as {
+          state: "idle" | "loading" | "ready" | "failed";
+          lastError: string | null;
+        },
+      modelAvailability: async () => ({
+        filename: "",
+        sizeBytes: 0,
+        available: false,
+        sizeOnDisk: 0,
+        downloadUrl: null,
+        blake3Hex: "",
+        modelsDir: "",
+      }),
+      // Phase 18 Group D Task 20 — vitest fallback for the
+      // first-run wizard's preset list. The Electron-side bridge
+      // reads the curated list from the embedded model registry;
+      // the in-process renderer backend has no such registry, so
+      // we surface an empty array — the wizard renders its
+      // manual-entry form off this branch.
+      listPresets: async () =>
+        [] as Array<{
+          id: string;
+          displayName: string;
+          filename: string;
+          sizeBytes: number;
+          blake3Hex: string;
+          downloadUrl: string | null;
+          vaeFilename: string | null;
+        }>,
+      setDescriptor: async (_d: {
+        filename: string;
+        sizeBytes: number;
+        blake3Hex: string;
+        downloadUrl: string | null;
+        vaeFilename: string | null;
+      }) => {},
+      downloadModel: async () => ({ filename: "", path: "", sizeBytes: 0 }),
+      downloadProgress: async () => null,
+      generate: async (_req: {
+        prompt: string;
+        negativePrompt?: string | null;
+        width: number;
+        height: number;
+        steps: number;
+        cfgScale: number;
+        seed?: number | null;
+        sampler?: string | null;
+      }) => {
+        throw new Error(
+          "imageGen.generate: in-process renderer backend cannot generate " +
+            "images. Image generation requires the Electron bridge with a " +
+            "configured image-gen sidecar.",
+        );
+      },
+      // Phase 18 Group C Task 17 — vitest fallback for the
+      // governor policy surface. Defaults mirror
+      // `GovernorPolicy::for_tier(HardwareTier::Medium).image_gen`
+      // — keep in sync with `crates/aec_governor/src/policy.rs`.
+      activePolicy: async () => ({
+        idleTimeoutSecs: 120,
+        loadBudgetSecs: 60,
+        maxParallelRequests: 1,
+        allowDuringPathtracedRender: false,
+      }),
+      applyPolicy: async (_p: {
+        idleTimeoutSecs: number;
+        loadBudgetSecs: number;
+        maxParallelRequests: number;
+        allowDuringPathtracedRender: boolean;
+      }) => {},
+    },
+    // Phase 18 Group C Task 17 — top-level governor surface; the
+    // in-process renderer backend has no real hardware probe, so
+    // applying a tier is a no-op. The render-queue inspector
+    // (`pathtracedInProgress`) lives on the existing `render`
+    // namespace above to keep that surface cohesive.
+    governor: {
+      applyHardwareTier: async (_t: "low" | "medium" | "high" | "pro") => {},
     },
     extensions: {
       // Vitest fallback: there are no extensions loaded in the

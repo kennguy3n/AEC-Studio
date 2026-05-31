@@ -5,13 +5,18 @@
 //! this layer trivially testable.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use aec_ai::image_gen::{
+    runtime::ImageGenRuntimeConfig,
+    transport::{ImageGenRequest, ImageGenTransport},
+    ImageGenModelDescriptor, ImageGenModelManager, ImageGenModelManagerError,
+};
 use aec_ai::{
     AiAuditLogger, DiffEngine, DiffStatus, GrammarRegistry as AiGrammarRegistry,
     PlanRequest as AiPlanRequest, ToolName as AiToolName, ToolPlanner, ToolSchema as AiToolSchema,
@@ -24,11 +29,12 @@ use aec_core::config::ProjectSettings;
 use aec_core::package::{ProjectPackage, ProjectSummary as CoreProjectSummary};
 use aec_core::templates::TemplateLoader;
 use aec_core::types::{CommandId, ProjectId, Scope};
+use aec_governor::policy::{GovernorPolicy, ImageGenPolicy};
 use aec_governor::profiler::{CpuProfile, GpuProfile, HardwareProfiler};
 use aec_governor::tier::HardwareTier;
 use aec_render::doctor::{check_materials, CheckMaterialsOptions, MaterialFinding};
 use aec_render::job::{RenderJob as CoreRenderJob, RenderJobStatus};
-use aec_render::preset::RenderPresetStore;
+use aec_render::preset::{RenderPresetStore, RenderQuality};
 use aec_render::queue::{BatchProgress as CoreBatchProgress, RenderQueue};
 use aec_render::scene::RenderScene;
 
@@ -36,6 +42,9 @@ use crate::ai_state::{AiState, AiStateError, PendingDiff, DEFAULT_SPAWN_TIMEOUT}
 use crate::asset_state::AssetState;
 use crate::bim_attach;
 use crate::engine_status_cache::EngineStatusCache;
+use crate::image_gen_state::{
+    ImageGenState, ImageGenStateError, ImageGenStatusSnapshot, DEFAULT_IMAGE_GEN_SPAWN_TIMEOUT,
+};
 use crate::recents::{RecentsStore, RecentsStoreError};
 use crate::snapshot_cache::{SnapshotCache, SnapshotKey};
 
@@ -156,6 +165,16 @@ pub enum BridgeServiceError {
     /// rejection from one another.
     #[error("ai: {0}")]
     Ai(String),
+    /// Image-gen sidecar / model / transport failure. Separate from
+    /// [`Self::Ai`] because the two subsystems own different
+    /// processes, different ports, and different model files — the
+    /// renderer's image panel surfaces these errors in its own banner
+    /// rather than the chat AI's status badge. See
+    /// [`crate::image_gen_state::ImageGenStateError`] and
+    /// [`aec_ai::image_gen::ImageGenModelManagerError`] for the
+    /// underlying error shapes.
+    #[error("image-gen: {0}")]
+    ImageGen(String),
 }
 
 impl From<aec_assets::AssetError> for BridgeServiceError {
@@ -167,6 +186,18 @@ impl From<aec_assets::AssetError> for BridgeServiceError {
 impl From<AiStateError> for BridgeServiceError {
     fn from(e: AiStateError) -> Self {
         Self::Ai(e.to_string())
+    }
+}
+
+impl From<ImageGenStateError> for BridgeServiceError {
+    fn from(e: ImageGenStateError) -> Self {
+        Self::ImageGen(e.to_string())
+    }
+}
+
+impl From<ImageGenModelManagerError> for BridgeServiceError {
+    fn from(e: ImageGenModelManagerError) -> Self {
+        Self::ImageGen(e.to_string())
     }
 }
 
@@ -1618,6 +1649,232 @@ fn publish_progress_to(slot: &Mutex<Option<AiDownloadProgress>>, p: AiDownloadPr
     }
 }
 
+// ===========================================================================
+// Image-gen bridge surface (Phase 18 Group C)
+//
+// Mirrors the text-side AI shapes (AiRuntimeStatusReport,
+// AiModelAvailability, AiDownloadProgress, AiDownloadContext, …) for the
+// image-gen sidecar. The pair is kept side-by-side rather than unified
+// because the two subsystems own different processes, different ports,
+// and have different lifecycle budgets — see
+// [`crate::image_gen_state`]'s module doc for the full rationale.
+// ===========================================================================
+
+/// Live image-gen sidecar status snapshot, returned by
+/// [`BridgeService::image_gen_runtime_status`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageGenRuntimeStatusReport {
+    /// Lowercase variant of [`aec_ai::image_gen::ImageGenRuntimeState`]:
+    /// one of `"idle" | "loading" | "ready" | "failed"`.
+    pub state: String,
+    /// Set only when `state == "failed"`. Cleared on `reload_with_config`
+    /// or the next successful `mark_ready`.
+    pub last_error: Option<String>,
+}
+
+/// Single-model availability snapshot for the image-gen panel. Unlike
+/// the text side (three tiers), image-gen ships with one descriptor at
+/// a time — either the user-configured local SD GGUF or a future
+/// PrismML native bonsai-image build. The renderer reads this to
+/// decide whether to show the "Download" button or the "Generate"
+/// panel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageGenModelAvailability {
+    /// On-disk filename inside `models_dir`. Empty string when no
+    /// descriptor is configured.
+    pub filename: String,
+    /// Expected file size in bytes. 0 when no descriptor is configured.
+    pub size_bytes: u64,
+    /// `true` iff the file is present on disk **and** its byte length
+    /// matches `size_bytes`. We deliberately do NOT run a BLAKE3 check
+    /// on every poll — verification is part of `download_model` —
+    /// but a length mismatch is enough to flip `available` to `false`.
+    pub available: bool,
+    /// Actual byte length of the on-disk file (0 when missing).
+    pub size_on_disk: u64,
+    /// Currently-configured download URL (if any). `None` means
+    /// "no URL configured" — the renderer surfaces a "configure
+    /// model" wizard rather than a "download" button.
+    pub download_url: Option<String>,
+    /// Expected BLAKE3 hex. Empty when no descriptor is configured.
+    pub blake3_hex: String,
+    /// Absolute path to the directory holding image-gen model files.
+    pub models_dir: String,
+}
+
+/// Live snapshot of an in-flight image-gen model download. Mirrors
+/// [`AiDownloadProgress`] but identifies the model by `filename`
+/// rather than by tier slug (image-gen has no tier concept).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageGenDownloadProgress {
+    pub filename: String,
+    pub downloaded: u64,
+    pub total: u64,
+    /// One of `"downloading" | "verifying" | "completed" | "failed"`.
+    pub state: String,
+    pub message: Option<String>,
+}
+
+/// Phase 18 Group D Task 20 — a single image-gen preset entry as
+/// surfaced to the renderer's first-run wizard.
+///
+/// The wizard maps each entry to a one-click "pin this preset"
+/// button: pressing it fires `imageGen.setDescriptor(descriptor)`
+/// with the embedded [`ImageGenModelDescriptor`]. The `id` lets the
+/// wizard de-duplicate clicks + correlate analytics-free internal
+/// state without depending on the human-readable display name.
+///
+/// Backed by [`aec_ai::registry::ImageGenPresetDescriptor`]; this is
+/// the JS-facing flattening (`download_url` reshaped to
+/// `Option<String>` matching [`ImageGenModelDescriptor::download_url`],
+/// preset metadata lifted out of the descriptor shape).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageGenPresetEntry {
+    /// Stable preset id from `ai_models.json` (hyphenated lowercase
+    /// by convention; e.g. `"sd-v1-5-q4-0"`). Empty preset arrays
+    /// at the registry layer return an empty `Vec` here.
+    pub id: String,
+    /// Human-readable label rendered as the wizard list-item title.
+    pub display_name: String,
+    /// Descriptor to feed into
+    /// [`BridgeService::image_gen_set_descriptor`] when the user
+    /// picks this preset. Pre-filled with the
+    /// registry's verified BLAKE3 / size / URL so the wizard does
+    /// not need to round-trip those into the bridge — only the
+    /// final "pin" call.
+    pub descriptor: ImageGenModelDescriptor,
+}
+
+/// Successful return of [`BridgeService::image_gen_download_model`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageGenDownloadResult {
+    pub filename: String,
+    pub path: String,
+    pub size_bytes: u64,
+}
+
+/// Owned handle on an in-flight image-gen model download. Built by
+/// [`BridgeService::image_gen_prepare_download`] under a brief
+/// model-manager lock; consumed by
+/// [`BridgeService::run_image_gen_download`] which performs the
+/// HTTPS-transfer + BLAKE3-verify + atomic-rename flow without
+/// holding any `BridgeService` lock.
+#[derive(Debug, Clone)]
+pub struct ImageGenDownloadContext {
+    pub descriptor: ImageGenModelDescriptor,
+    pub models_dir: PathBuf,
+    /// Shared progress slot the bridge publishes into.
+    pub progress: Arc<Mutex<Option<ImageGenDownloadProgress>>>,
+    /// Shared mutex serialising concurrent downloads — see
+    /// [`AiDownloadContext::download_guard`] for the rationale.
+    pub download_guard: Arc<Mutex<()>>,
+}
+
+/// Request payload for [`BridgeService::image_gen_generate`]. The
+/// renderer pins a stable shape here rather than threading a dozen
+/// `Option<>` parameters through the napi boundary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageGenGenerateRequest {
+    pub prompt: String,
+    #[serde(default)]
+    pub negative_prompt: Option<String>,
+    pub width: u32,
+    pub height: u32,
+    pub steps: u32,
+    pub cfg_scale: f32,
+    /// `None` → server picks a random seed and surfaces it in the
+    /// response.
+    #[serde(default)]
+    pub seed: Option<i64>,
+    /// Sampler name (e.g. `"euler_a"`, `"dpmpp_2m"`). `None` lets the
+    /// sidecar choose.
+    #[serde(default)]
+    pub sampler: Option<String>,
+}
+
+/// Phase 18 Group D Task 21 — owned, fully self-contained handle on
+/// an in-flight `txt2img` request. Built by
+/// [`BridgeService::image_gen_prepare_generate`] under a **brief**
+/// process-wide lock, then handed to
+/// [`BridgeService::run_image_gen_generate`] which performs the
+/// (potentially multi-minute) sidecar cold-spawn + sampling
+/// **without** holding any `BridgeService` lock.
+///
+/// Same shape as [`AiDownloadContext`] / [`ImageGenDownloadContext`]:
+/// the napi handler holds the `SERVICE` `RwLock` reader guard only
+/// long enough to clone these owned values, then drops it before
+/// invoking `run_image_gen_generate`. This is what keeps a slow
+/// generate (60 s cold spawn + up to 180 s sampling for high-step /
+/// large-dimension requests) from starving concurrent writers like
+/// `command_apply` / `project_save` on the outer N-API
+/// `RwLock<Option<BridgeService>>`.
+///
+/// `Debug` is hand-rolled: [`crate::image_gen_state::ImageGenState`]
+/// intentionally does not implement `Debug` because its handle slot
+/// owns a `Child` process. The hand-rolled impl prints the request
+/// and spawn budget so test failures and structured logs surface
+/// the generate parameters without exposing the inner state.
+#[derive(Clone)]
+pub struct ImageGenGenerateContext {
+    /// Cloned-out [`ImageGenGenerateRequest`] — all primitive owned
+    /// values, no borrow.
+    pub request: ImageGenGenerateRequest,
+    /// Process-wide image-gen sidecar state shared with
+    /// [`BridgeService::image_gen_state`]. Cloned `Arc` so the
+    /// `BridgeService` lock can be released for the duration of
+    /// `ensure_ready` + `transport.generate`. Note that
+    /// [`crate::image_gen_state::ImageGenState`]'s own locks
+    /// (`handle_slot` + `runtime`) are still respected on the
+    /// inside; this only releases the *outer* `SERVICE` `RwLock`
+    /// read guard.
+    pub image_gen_state: Arc<crate::image_gen_state::ImageGenState>,
+    /// Cold-spawn budget passed to [`crate::image_gen_state::ImageGenState::ensure_ready`].
+    /// Snapshotted from the runtime config + clamped to the
+    /// per-tier load budget under the prepare lock so the actual
+    /// `ensure_ready` call does not need to re-read the policy.
+    pub spawn_timeout: std::time::Duration,
+}
+
+impl std::fmt::Debug for ImageGenGenerateContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImageGenGenerateContext")
+            .field("request", &self.request)
+            .field("image_gen_state", &"<ImageGenState>")
+            .field("spawn_timeout", &self.spawn_timeout)
+            .finish()
+    }
+}
+
+/// Successful return of [`BridgeService::image_gen_generate`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageGenGenerateResult {
+    /// Base64-encoded PNG bytes — the renderer pipes this straight
+    /// into an `<img src="data:image/png;base64,…" />`. We do not
+    /// return raw bytes because napi-rs's `Buffer` marshalling is
+    /// slower than a base64 round-trip for ~512 KiB payloads.
+    pub png_base64: String,
+    /// Effective seed used by the sidecar. Pinned back into the
+    /// renderer's request UI so the user can reproduce a result.
+    pub seed: Option<i64>,
+    pub width: u32,
+    pub height: u32,
+    pub steps: u32,
+    /// Free-form info string (model name, sampler, timings). Surfaced
+    /// in the renderer's audit log for debugging.
+    pub info: Option<String>,
+}
+
+/// Swap a fresh [`ImageGenDownloadProgress`] snapshot into the shared
+/// slot. Parallels [`publish_progress_to`] for the text side.
+fn publish_image_gen_progress_to(
+    slot: &Mutex<Option<ImageGenDownloadProgress>>,
+    p: ImageGenDownloadProgress,
+) {
+    if let Ok(mut g) = slot.lock() {
+        *g = Some(p);
+    }
+}
+
 /// Configuration for [`BridgeService`].
 #[derive(Debug, Clone)]
 pub struct BridgeConfig {
@@ -1763,6 +2020,48 @@ pub struct BridgeService {
     /// See the doc on [`AiDownloadContext::download_guard`] for the
     /// threat model.
     download_guard: Arc<Mutex<()>>,
+    /// Process-wide image-gen sidecar state. See
+    /// [`crate::image_gen_state::ImageGenState`] for the lock
+    /// discipline; same shape as `ai_state` for the text sidecar.
+    /// Held directly (no `Mutex`) because `ImageGenState`'s methods
+    /// all take `&self` — its two internal primitives (`handle_slot`,
+    /// `runtime`) provide synchronisation directly. Stored as an
+    /// `Arc` so the napi handler can clone the handle, drop the
+    /// outer `BridgeService` reader guard, and call
+    /// `ensure_ready` / `transport.generate(...)` from a worker
+    /// thread without holding any bridge-wide lock.
+    image_gen_state: Arc<ImageGenState>,
+    /// Process-wide [`aec_ai::image_gen::ImageGenModelManager`]:
+    /// tracks the single configured image-gen descriptor. Held
+    /// behind a [`Mutex`] for interior mutability (`set_descriptor`,
+    /// `download_model`). Lock taken briefly per call — multi-minute
+    /// downloads use the same prepare-context-then-release pattern
+    /// as the text-side `ai_prepare_download`.
+    image_gen_model_manager: Mutex<ImageGenModelManager>,
+    /// In-process slot holding the latest
+    /// [`ImageGenDownloadProgress`] snapshot. Parallel to
+    /// [`Self::download_progress`] for the text side; the two slots
+    /// are kept independent so a concurrent text + image download
+    /// (rare but possible) doesn't stomp on each other.
+    image_gen_download_progress: Arc<Mutex<Option<ImageGenDownloadProgress>>>,
+    /// Process-wide guard serialising image-gen model downloads.
+    /// Parallel to [`Self::download_guard`] for the text side; the
+    /// two guards are independent so text + image downloads can
+    /// proceed concurrently if the user has bandwidth for both.
+    image_gen_download_guard: Arc<Mutex<()>>,
+    /// Phase 18 Group C Task 17 — active image-gen governor policy.
+    /// Initially populated from [`GovernorPolicy::for_tier`] at the
+    /// bridge's boot-time tier; the renderer updates it via
+    /// [`BridgeService::image_gen_apply_policy`] when the user (or
+    /// the boot probe) selects a different hardware tier.
+    ///
+    /// Held behind an [`RwLock`] because [`Self::image_gen_generate`]
+    /// reads `allow_during_pathtraced_render` on every request (hot
+    /// path) while writes happen only on tier switch (cold). The
+    /// idle-timeout / load-budget fields propagate to the runtime
+    /// via [`ImageGenState::reload_with_config`] inside the
+    /// [`Self::image_gen_apply_policy`] setter.
+    image_gen_policy: RwLock<ImageGenPolicy>,
     /// Process-wide KChat accounting state. In Phase 15 the
     /// in-process publisher is always an
     /// [`aec_core::InMemoryPublisher`] — the real publisher is the
@@ -2102,6 +2401,17 @@ impl BridgeService {
             model_manager: Mutex::new(default_model_manager()),
             download_progress: Arc::new(Mutex::new(None)),
             download_guard: Arc::new(Mutex::new(())),
+            image_gen_state: Arc::new(ImageGenState::new(default_image_gen_runtime_config())),
+            image_gen_model_manager: Mutex::new(default_image_gen_model_manager()),
+            image_gen_download_progress: Arc::new(Mutex::new(None)),
+            image_gen_download_guard: Arc::new(Mutex::new(())),
+            // Boot-time tier is Medium — a reasonable mid-range default
+            // for the very first invocation before the hardware probe
+            // runs. The renderer's first-run flow follows up with
+            // [`Self::image_gen_apply_policy`] (or
+            // [`Self::ai_set_active_tier`] for tier-coupled callers)
+            // to swap in the tier the user actually has.
+            image_gen_policy: RwLock::new(GovernorPolicy::for_tier(HardwareTier::Medium).image_gen),
             kchat_state: crate::kchat_state::KChatState::new(),
             viewport_service: crate::viewport_service::ViewportService::new(),
             extension_registry,
@@ -4607,6 +4917,23 @@ impl BridgeService {
         self.ai_state = state;
     }
 
+    /// Test-only: install a pre-built [`ImageGenState`] (typically
+    /// one constructed via [`ImageGenState::__test_with_transport`]
+    /// against a mock loopback HTTP server) so an integration test
+    /// can exercise [`Self::image_gen_prepare_generate`] +
+    /// [`Self::run_image_gen_generate`] + [`Self::image_gen_runtime_status`]
+    /// + [`Self::image_gen_maybe_unload`] without spawning a real
+    /// `sd-server` / `stable-diffusion.cpp` binary.
+    ///
+    /// Mirrors [`Self::__test_install_ai_state`] for the text side
+    /// and is used by `tests/group_f_e2e_lifecycle.rs` to drive the
+    /// full descriptor-pin → spawn → generate → idle-unload →
+    /// re-spawn lifecycle deterministically in CI.
+    #[doc(hidden)]
+    pub fn __test_install_image_gen_state(&mut self, state: crate::image_gen_state::ImageGenState) {
+        self.image_gen_state = Arc::new(state);
+    }
+
     // ---------------------------------------------------------------
     // AI endpoints
     // ---------------------------------------------------------------
@@ -5818,6 +6145,805 @@ impl BridgeService {
         Ok(())
     }
 
+    // ===================================================================
+    // Image-gen surface (Phase 18 Group C)
+    //
+    // The methods below mirror the text-side `ai_*` family for the
+    // image-gen sidecar. They are deliberately kept side-by-side rather
+    // than unified into a generic "model runtime" surface because the
+    // two subsystems own independent processes, ports, and lifecycle
+    // budgets, and because Settings / the renderer's image panel
+    // surface the two in separate UI panels.
+    // ===================================================================
+
+    /// Live snapshot of the image-gen sidecar. The renderer's image
+    /// panel polls this every ~500 ms while a generation is in
+    /// flight to drive the status badge. Cheap (one `RwLock::read`
+    /// + one `Mutex::lock`), so safe to poll at high frequency.
+    pub fn image_gen_runtime_status(
+        &self,
+    ) -> Result<ImageGenRuntimeStatusReport, BridgeServiceError> {
+        let snap: ImageGenStatusSnapshot = self.image_gen_state.snapshot()?;
+        Ok(ImageGenRuntimeStatusReport {
+            state: image_gen_state_string(snap.state),
+            last_error: snap.last_error,
+        })
+    }
+
+    /// Availability snapshot for the currently-configured image-gen
+    /// descriptor. Returns the empty/zero state when no descriptor
+    /// has been pinned via [`Self::image_gen_set_descriptor`] — the
+    /// renderer uses that to decide between "configure model" and
+    /// "download" / "ready" UI.
+    pub fn image_gen_model_availability(
+        &self,
+    ) -> Result<ImageGenModelAvailability, BridgeServiceError> {
+        let mgr = self
+            .image_gen_model_manager
+            .lock()
+            .map_err(|_| BridgeServiceError::ImageGen("model_manager mutex poisoned".into()))?;
+        let descriptor = mgr.descriptor().clone();
+        let path = mgr.model_path();
+        let size_on_disk = std::fs::metadata(&path).map_or(0, |m| m.len());
+        // Phase 18 Group E Devin Review fix — parity with
+        // [`ImageGenModelManager::is_available`], which short-
+        // circuits to `false` when `descriptor.size_bytes == 0`.
+        // Without that guard, a zero-byte file on disk paired with
+        // a zero-size descriptor would report `available = true`,
+        // while the manager (the source of truth for ensure_ready
+        // / generate paths) would report `false`. The two reports
+        // must agree so the renderer never surfaces a "Ready"
+        // badge for a model the generate path would refuse to use.
+        Ok(ImageGenModelAvailability {
+            filename: descriptor.filename.clone(),
+            size_bytes: descriptor.size_bytes,
+            available: !descriptor.filename.is_empty()
+                && descriptor.size_bytes != 0
+                && path.is_file()
+                && size_on_disk == descriptor.size_bytes,
+            size_on_disk,
+            download_url: descriptor.download_url.clone(),
+            blake3_hex: descriptor.blake3_hex.clone(),
+            models_dir: mgr.models_dir().display().to_string(),
+        })
+    }
+
+    /// Phase 18 Group D Task 20 — curated image-gen preset list
+    /// surfaced to the first-run wizard.
+    ///
+    /// Reads directly from the compile-time-embedded
+    /// [`aec_ai::registry::ModelRegistry`] so the wizard, the
+    /// `set_descriptor` validator, and the BLAKE3-pinning
+    /// integrity invariant all reference the same source of truth.
+    /// The returned [`ImageGenPresetEntry`]s are
+    /// [`ImageGenModelDescriptor`]-shaped + a small `id` /
+    /// `display_name` label pair so the wizard can render a one-
+    /// click "pin this preset" button per entry.
+    ///
+    /// The result MAY be empty — that's the intentional ship state
+    /// of `ai_models.json::image_gen.presets`. The wizard renders
+    /// its "no presets curated — paste a HuggingFace URL" manual-
+    /// entry affordance off the empty branch.
+    pub fn image_gen_list_presets(&self) -> Vec<ImageGenPresetEntry> {
+        let r = aec_ai::registry::ModelRegistry::embedded();
+        r.image_gen_presets()
+            .iter()
+            .map(|p| ImageGenPresetEntry {
+                id: p.id.clone(),
+                display_name: p.display_name.clone(),
+                descriptor: ImageGenModelDescriptor {
+                    filename: p.filename.clone(),
+                    blake3_hex: p.blake3_hex.clone(),
+                    size_bytes: p.size_bytes,
+                    download_url: Some(p.download_url.clone()),
+                    vae_filename: p.vae_filename.clone(),
+                },
+            })
+            .collect()
+    }
+
+    /// Phase 18 Group E Task 26 — verify every model file currently
+    /// known to the registry against its compile-time-pinned BLAKE3
+    /// hash + size. Returns a per-file
+    /// [`aec_integrity::VerificationReport`] the renderer can surface
+    /// in the Settings → Models pane and the bridge logs at every
+    /// boot.
+    ///
+    /// The verification is **graceful by design**:
+    ///
+    /// - A missing file is reported as `Missing`, **not** an error —
+    ///   it just means the user hasn't downloaded that tier yet. The
+    ///   Models pane already exposes that as a "download" button.
+    /// - A file whose size or BLAKE3 hash differs from the pin is
+    ///   reported as `SizeMismatch` / `Mismatch`. These are the
+    ///   tamper / corruption signals — the renderer should warn the
+    ///   user and offer a re-download. The bridge does **not**
+    ///   silently delete the file (that's the user's policy
+    ///   decision); it just refuses to spawn against it.
+    /// - An I/O error reading the file (permission denied, broken
+    ///   disk) is surfaced as `ReadError` so the user can
+    ///   distinguish "tamper" from "broken hardware".
+    ///
+    /// The function is `&self` so the renderer can call it
+    /// repeatedly without acquiring any writer lock, and it
+    /// touches each model file at most once (streaming BLAKE3
+    /// in 64 KiB chunks, no whole-file load into RAM).
+    pub fn model_integrity_report(
+        &self,
+    ) -> Result<aec_integrity::VerificationReport, BridgeServiceError> {
+        // Resolve the text + image-gen model directories. Both are
+        // owned by `BridgeService` so the locks are micro-scoped and
+        // dropped before any file I/O runs.
+        let text_dir: PathBuf = {
+            let mgr = self
+                .model_manager
+                .lock()
+                .map_err(|_| BridgeServiceError::Ai("model_manager mutex poisoned".into()))?;
+            mgr.models_dir().to_path_buf()
+        };
+        let image_dir: PathBuf = {
+            let mgr = self
+                .image_gen_model_manager
+                .lock()
+                .map_err(|_| BridgeServiceError::ImageGen("model_manager mutex poisoned".into()))?;
+            mgr.models_dir().to_path_buf()
+        };
+
+        let registry = aec_ai::registry::ModelRegistry::embedded();
+
+        // Build the FilePin list. Each pin's `id` is namespaced
+        // (`text.{tier}` / `image-gen.{preset-id}`) so the renderer
+        // can route mismatches to the correct UI surface.
+        let mut pins: Vec<aec_integrity::FilePin> = Vec::new();
+        for t in &registry.text.tiers {
+            // `Blake3Digest::from_hex` cannot fail here unless the
+            // registry's BLAKE3 hex is malformed — which is itself a
+            // boot-time invariant (`ModelRegistry::validate_at_boot`
+            // doesn't currently check hex length, so do it here and
+            // surface a clear error).
+            let expected = aec_integrity::Blake3Digest::from_hex(&t.blake3_hex).map_err(|e| {
+                BridgeServiceError::Ai(format!(
+                    "model_integrity_report: text.{:?} blake3_hex is malformed in ai_models.json: {e}",
+                    t.tier
+                ))
+            })?;
+            pins.push(aec_integrity::FilePin {
+                id: format!("text.{:?}", t.tier).to_ascii_lowercase(),
+                path: text_dir.join(&t.filename),
+                expected_blake3: expected,
+                expected_size_bytes: t.size_bytes,
+            });
+        }
+        for p in &registry.image_gen.presets {
+            let expected = aec_integrity::Blake3Digest::from_hex(&p.blake3_hex).map_err(|e| {
+                BridgeServiceError::ImageGen(format!(
+                    "model_integrity_report: image-gen preset '{}' blake3_hex is malformed: {e}",
+                    p.id
+                ))
+            })?;
+            pins.push(aec_integrity::FilePin {
+                id: format!("image-gen.{}", p.id),
+                path: image_dir.join(&p.filename),
+                expected_blake3: expected,
+                expected_size_bytes: p.size_bytes,
+            });
+        }
+
+        // Also pin the user-supplied image-gen descriptor (the wizard
+        // may have pinned a custom SD GGUF that isn't in the
+        // registry's preset list). Skip when the descriptor is empty
+        // — that's the boot default before the user has chosen a
+        // model.
+        let custom_descriptor = {
+            let mgr = self
+                .image_gen_model_manager
+                .lock()
+                .map_err(|_| BridgeServiceError::ImageGen("model_manager mutex poisoned".into()))?;
+            mgr.descriptor().clone()
+        };
+        if !custom_descriptor.filename.is_empty() && !custom_descriptor.blake3_hex.is_empty() {
+            // The pin id is namespaced under `image-gen.custom` so the
+            // renderer can differentiate "registry preset" from
+            // "user-supplied" in the diagnostics surface.
+            let expected = aec_integrity::Blake3Digest::from_hex(&custom_descriptor.blake3_hex)
+                .map_err(|e| {
+                    BridgeServiceError::ImageGen(format!(
+                        "model_integrity_report: user-supplied image-gen blake3_hex is malformed: {e}"
+                    ))
+                })?;
+            // Avoid producing a duplicate `id` if the user pinned a
+            // descriptor whose filename matches a registry preset.
+            // `verify_files_against_pins` rejects duplicate ids, and
+            // a duplicate would be a confusing diagnostic anyway.
+            let already_pinned = pins
+                .iter()
+                .any(|fp| fp.path == image_dir.join(&custom_descriptor.filename));
+            if !already_pinned {
+                pins.push(aec_integrity::FilePin {
+                    id: "image-gen.custom".to_string(),
+                    path: image_dir.join(&custom_descriptor.filename),
+                    expected_blake3: expected,
+                    expected_size_bytes: custom_descriptor.size_bytes,
+                });
+            }
+        }
+
+        let outcomes = aec_integrity::verify_files_against_pins(&pins)
+            .map_err(|e| BridgeServiceError::Ai(format!("model_integrity_report: {e}")))?;
+
+        // Log non-`Verified` outcomes at boot so server-side logs
+        // capture every tamper / corruption signal alongside the
+        // existing extension-load diagnostics. The `aec_integrity`
+        // layer already issued a `warn!` per non-verified pin; we
+        // emit a structured summary line so logs surface the boot-
+        // wide all-verified bit without grepping per-pin warnings.
+        let any_failed = outcomes
+            .iter()
+            .any(|o| !matches!(o.status, aec_integrity::ModelVerificationStatus::Verified));
+        if any_failed {
+            tracing::warn!(
+                pin_count = pins.len(),
+                "model_integrity_report: one or more model files did not verify against their compile-time-pinned BLAKE3/size"
+            );
+        } else {
+            tracing::info!(
+                pin_count = pins.len(),
+                "model_integrity_report: all known model files verified against compile-time pins"
+            );
+        }
+
+        Ok(aec_integrity::VerificationReport::from_outcomes(&outcomes))
+    }
+
+    /// Replace the currently-configured image-gen descriptor and kill
+    /// any in-flight sidecar so the next `image_gen_generate` cold-
+    /// spawns with the new model. Used by the renderer's first-run
+    /// wizard and Settings UI to pin a user-supplied SD GGUF model.
+    ///
+    /// **Validation**: rejects descriptors with an empty filename
+    /// (the bridge has nowhere to write the download) or with a
+    /// `download_url` that is non-empty but not an `https://` URL.
+    /// All other fields (size, blake3) are accepted as the caller
+    /// supplied them — the BLAKE3 verification at
+    /// `image_gen_download_model` time is the authoritative integrity
+    /// check.
+    ///
+    /// **Phase 18 Group E Devin Review fix** — descriptor URLs are
+    /// constrained to `https://` only. Earlier this branch also
+    /// permitted `http://`, which conflicts with the project's
+    /// TLS-only outbound posture (see
+    /// [`crate::ai_state`](crate::ai_state) and the `host_is_allowed`
+    /// allow-list in [`aec_ai::model_download`]). The downstream
+    /// download path only allow-lists HuggingFace domains, which are
+    /// HTTPS-only, so a plain-HTTP descriptor URL would fail at
+    /// download time anyway — but catching it here surfaces a clear
+    /// error at descriptor-setting time rather than at first download.
+    pub fn image_gen_set_descriptor(
+        &self,
+        descriptor: ImageGenModelDescriptor,
+    ) -> Result<(), BridgeServiceError> {
+        if descriptor.filename.trim().is_empty() {
+            return Err(BridgeServiceError::Invalid(
+                "image_gen_set_descriptor: filename must not be empty".into(),
+            ));
+        }
+        if let Some(url) = descriptor.download_url.as_deref() {
+            if !url.starts_with("https://") {
+                return Err(BridgeServiceError::Invalid(format!(
+                    "image_gen_set_descriptor: download_url {url:?} must use https:// scheme (TLS-only outbound posture; cleartext http:// is rejected by the descriptor validator and would be rejected again by the downstream host allow-list)"
+                )));
+            }
+        }
+        // Step 1: update the manager. Brief critical section — no
+        // network I/O, no spawn. Read BOTH `model_path` and
+        // `vae_path` while the lock is held: the new descriptor may
+        // declare a different `vae_filename` (e.g. an SDXL model
+        // shipping a separate VAE), and any subsequent cold spawn
+        // must pass the matching `--vae` flag through
+        // [`build_image_gen_spawn_args`]. Returning a `None`
+        // `vae_path` is also load-bearing: it lets a descriptor swap
+        // that *drops* a VAE clear the previous descriptor's path
+        // out of the spawn config.
+        let (new_model_path, new_vae_path) = {
+            let mut mgr = self
+                .image_gen_model_manager
+                .lock()
+                .map_err(|_| BridgeServiceError::ImageGen("model_manager mutex poisoned".into()))?;
+            mgr.set_descriptor(descriptor);
+            (mgr.model_path(), mgr.vae_path())
+        };
+        // Step 2: kill any running sidecar so the next `ensure_ready`
+        // cold-spawns with the new model path. We snapshot the
+        // *current* runtime config and mutate only the
+        // descriptor-derived fields (`spawn_config.model_path` and
+        // `spawn_config.vae_path`). Every other field — port,
+        // threads, request_timeout on the spawn side; idle_timeout,
+        // load_budget at the lifecycle side — is governor-owned and
+        // must survive a descriptor swap. Same pattern as
+        // [`Self::image_gen_apply_policy`]; reverting to
+        // [`ImageGenRuntimeConfig::default`] here would silently
+        // overwrite a Pro-tier 300 s idle window with the 120 s boot
+        // default the moment the user pinned a different model.
+        let new_config = {
+            let current = self.image_gen_state.snapshot_config().map_err(|e| {
+                BridgeServiceError::ImageGen(format!("snapshot image-gen runtime config: {e}"))
+            })?;
+            let mut next = current;
+            next.spawn_config.model_path = new_model_path;
+            next.spawn_config.vae_path = new_vae_path;
+            next
+        };
+        self.image_gen_state
+            .reload_with_config(new_config)
+            .map_err(|e| BridgeServiceError::ImageGen(format!("reload image-gen runtime: {e}")))?;
+        Ok(())
+    }
+
+    /// Build an [`ImageGenDownloadContext`] under a brief model-manager
+    /// lock. Same prepare/run split as
+    /// [`Self::ai_prepare_download`] — the napi handler drops every
+    /// `BridgeService` lock before invoking [`Self::run_image_gen_download`]
+    /// so a multi-minute transfer does not block concurrent writers.
+    pub fn image_gen_prepare_download(
+        &self,
+    ) -> Result<ImageGenDownloadContext, BridgeServiceError> {
+        let (descriptor, models_dir) = {
+            let mgr = self
+                .image_gen_model_manager
+                .lock()
+                .map_err(|_| BridgeServiceError::ImageGen("model_manager mutex poisoned".into()))?;
+            (mgr.descriptor().clone(), mgr.models_dir().to_path_buf())
+        };
+        if descriptor.filename.is_empty() {
+            return Err(BridgeServiceError::ImageGen(
+                "image-gen descriptor not configured; call image_gen_set_descriptor first".into(),
+            ));
+        }
+        if descriptor.download_url.is_none() {
+            return Err(BridgeServiceError::ImageGen(
+                "image-gen descriptor has no download_url".into(),
+            ));
+        }
+        Ok(ImageGenDownloadContext {
+            descriptor,
+            models_dir,
+            progress: Arc::clone(&self.image_gen_download_progress),
+            download_guard: Arc::clone(&self.image_gen_download_guard),
+        })
+    }
+
+    /// Drive an image-gen model download to completion. Performs
+    /// HTTPS → BLAKE3 verify → atomic rename and publishes per-chunk
+    /// progress into `ctx.progress`. **Holds no `BridgeService`
+    /// lock** — safe to invoke from a `spawn_blocking` task while
+    /// concurrent writers run in parallel.
+    pub fn run_image_gen_download(
+        ctx: ImageGenDownloadContext,
+    ) -> Result<ImageGenDownloadResult, BridgeServiceError> {
+        let ImageGenDownloadContext {
+            descriptor,
+            models_dir,
+            progress,
+            download_guard,
+        } = ctx;
+        // Same poison-recovery semantics as the text-side guard — the
+        // guarded data is `()`, so a previous panic carries no
+        // corruption forward.
+        let _serialise = download_guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let total_hint = descriptor.size_bytes;
+        let filename = descriptor.filename.clone();
+        // Build a lock-free temporary model manager that owns just
+        // this descriptor — the bridge's `image_gen_model_manager`
+        // mutex was already dropped by `image_gen_prepare_download`.
+        let mgr = ImageGenModelManager::new(models_dir, descriptor.clone());
+        let final_path = mgr.model_path();
+        // Per-chunk progress: publish a `downloading` snapshot on
+        // every byte-counter update.
+        let progress_for_bytes = Arc::clone(&progress);
+        let filename_for_bytes = filename.clone();
+        let on_progress: aec_ai::ProgressCallback = Arc::new(move |done, total| {
+            publish_image_gen_progress_to(
+                &progress_for_bytes,
+                ImageGenDownloadProgress {
+                    filename: filename_for_bytes.clone(),
+                    downloaded: done,
+                    total: if total > 0 { total } else { total_hint },
+                    state: "downloading".into(),
+                    message: None,
+                },
+            );
+        });
+        let progress_for_state = Arc::clone(&progress);
+        let filename_for_state = filename.clone();
+        let on_state: Arc<dyn Fn(aec_ai::DownloadState) + Send + Sync> =
+            Arc::new(move |state| match state {
+                aec_ai::DownloadState::Downloading => {
+                    publish_image_gen_progress_to(
+                        &progress_for_state,
+                        ImageGenDownloadProgress {
+                            filename: filename_for_state.clone(),
+                            downloaded: 0,
+                            total: total_hint,
+                            state: "downloading".into(),
+                            message: None,
+                        },
+                    );
+                }
+                aec_ai::DownloadState::Verifying => {
+                    publish_image_gen_progress_to(
+                        &progress_for_state,
+                        ImageGenDownloadProgress {
+                            filename: filename_for_state.clone(),
+                            downloaded: total_hint,
+                            total: total_hint,
+                            state: "verifying".into(),
+                            message: None,
+                        },
+                    );
+                }
+                aec_ai::DownloadState::Completed => {
+                    // Final snapshot published after rename below.
+                }
+                aec_ai::DownloadState::Failed { msg, .. } => {
+                    publish_image_gen_progress_to(
+                        &progress_for_state,
+                        ImageGenDownloadProgress {
+                            filename: filename_for_state.clone(),
+                            downloaded: 0,
+                            total: total_hint,
+                            state: "failed".into(),
+                            message: Some(msg),
+                        },
+                    );
+                }
+            });
+        let callbacks = aec_ai::DownloadCallbacks {
+            on_progress: Some(on_progress),
+            on_state: Some(on_state),
+        };
+        let path = mgr.download_model(callbacks)?;
+        let size_bytes = std::fs::metadata(&path).map_or(0, |m| m.len());
+        publish_image_gen_progress_to(
+            &progress,
+            ImageGenDownloadProgress {
+                filename: filename.clone(),
+                downloaded: size_bytes,
+                total: size_bytes,
+                state: "completed".into(),
+                message: None,
+            },
+        );
+        debug_assert_eq!(path, final_path, "model manager renamed into expected slot");
+        Ok(ImageGenDownloadResult {
+            filename,
+            path: path.display().to_string(),
+            size_bytes,
+        })
+    }
+
+    /// Convenience: prepare + run in one call. Internal callers and
+    /// integration tests use this; the napi handler uses
+    /// `image_gen_prepare_download` + `run_image_gen_download`
+    /// directly to release the outer `RwLock` before the HTTP
+    /// transfer.
+    pub fn image_gen_download_model(&self) -> Result<ImageGenDownloadResult, BridgeServiceError> {
+        let ctx = self.image_gen_prepare_download()?;
+        Self::run_image_gen_download(ctx)
+    }
+
+    /// Read the latest [`ImageGenDownloadProgress`] snapshot. Mirrors
+    /// [`Self::ai_download_progress`].
+    pub fn image_gen_download_progress(
+        &self,
+    ) -> Result<Option<ImageGenDownloadProgress>, BridgeServiceError> {
+        let g = self
+            .image_gen_download_progress
+            .lock()
+            .map_err(|_| BridgeServiceError::ImageGen("download_progress mutex poisoned".into()))?;
+        Ok(g.clone())
+    }
+
+    /// Submit a `txt2img` request to the image-gen sidecar. Lazy-
+    /// spawns the sidecar if it isn't already running (which can
+    /// take 30–60 s on first call as the SD/Flux weights mmap), then
+    /// drives one `/sdapi/v1/txt2img` round-trip.
+    ///
+    /// Validates the request shape locally before calling the
+    /// sidecar — dimensions must be multiples of 8 (the SD/Flux UNet
+    /// requires this; the sidecar would reject otherwise with a less
+    /// readable error), and steps must be in `[1, 150]` (the
+    /// stable-diffusion.cpp sampler hard-caps at 150).
+    ///
+    /// **Phase 18 Group D Task 21 — prepare/run split.** This
+    /// convenience entry point calls
+    /// [`Self::image_gen_prepare_generate`] then
+    /// [`Self::run_image_gen_generate`] in sequence and is intended
+    /// for in-process callers (e.g. integration tests). The napi
+    /// handler instead uses the prepare/run split **directly** so
+    /// the `SERVICE` `RwLock` reader guard is dropped before the
+    /// multi-minute spawn + sampling phase — see
+    /// [`crate::napi_api::image_gen_generate`] for the boundary call.
+    pub fn image_gen_generate(
+        &self,
+        request: ImageGenGenerateRequest,
+    ) -> Result<ImageGenGenerateResult, BridgeServiceError> {
+        let ctx = self.image_gen_prepare_generate(request)?;
+        Self::run_image_gen_generate(ctx)
+    }
+
+    /// Build an [`ImageGenGenerateContext`] under a brief lock.
+    /// Performs every check that needs in-process bridge state
+    /// (request validation, governor policy gate, model descriptor
+    /// snapshot) so that [`Self::run_image_gen_generate`] can drive
+    /// the (potentially multi-minute) cold-spawn + `/sdapi/v1/txt2img`
+    /// round-trip with **no** `BridgeService` lock held.
+    ///
+    /// Same lock-discipline split as
+    /// [`Self::ai_prepare_download`] / [`Self::image_gen_prepare_download`]:
+    /// the napi handler holds the `SERVICE` `RwLock` reader guard
+    /// only long enough to clone the owned values into the returned
+    /// context, then drops it before invoking the run phase. This
+    /// prevents image generation from starving concurrent writers
+    /// like `command_apply` / `project_save` on the outer N-API
+    /// `RwLock<Option<BridgeService>>`.
+    pub fn image_gen_prepare_generate(
+        &self,
+        request: ImageGenGenerateRequest,
+    ) -> Result<ImageGenGenerateContext, BridgeServiceError> {
+        // Local validation — rejects with a readable error before we
+        // pay the spawn cost. (Hot-path validation stays under the
+        // prepare lock so we never even build a context for a
+        // malformed request.)
+        if request.prompt.trim().is_empty() {
+            return Err(BridgeServiceError::Invalid(
+                "image_gen_generate: prompt must not be empty".into(),
+            ));
+        }
+        if request.width % 8 != 0 || request.height % 8 != 0 {
+            return Err(BridgeServiceError::Invalid(format!(
+                "image_gen_generate: width/height must be multiples of 8 (got {}x{})",
+                request.width, request.height
+            )));
+        }
+        if request.width < 64
+            || request.height < 64
+            || request.width > 2048
+            || request.height > 2048
+        {
+            return Err(BridgeServiceError::Invalid(format!(
+                "image_gen_generate: dimensions {}x{} out of supported range (64..=2048)",
+                request.width, request.height
+            )));
+        }
+        if request.steps == 0 || request.steps > 150 {
+            return Err(BridgeServiceError::Invalid(format!(
+                "image_gen_generate: steps {} out of supported range (1..=150)",
+                request.steps
+            )));
+        }
+        if !request.cfg_scale.is_finite() || request.cfg_scale < 0.0 || request.cfg_scale > 30.0 {
+            return Err(BridgeServiceError::Invalid(format!(
+                "image_gen_generate: cfg_scale {} out of supported range (0.0..=30.0)",
+                request.cfg_scale
+            )));
+        }
+        // Phase 18 Group C Task 17 — pause-during-render governor
+        // gate. On Low / Medium tiers we refuse to spawn / use the
+        // image-gen sidecar while a path-traced render is `Running`
+        // because the two compete for the same CPU/GPU pool and the
+        // sidecar can OOM at cold spawn. The renderer surfaces this
+        // error in the image panel banner; the user retries once
+        // the render queue drains.
+        //
+        // Realtime-preview renders are not gated — they share no
+        // contended path-tracer state, so concurrent image-gen is
+        // safe even on a low-end laptop.
+        //
+        // NB: the gate must run **under** the prepare lock so its
+        // policy / render-queue snapshot is consistent with the
+        // moment the bridge admitted the request — a later swap of
+        // tier (via `governor_apply_hardware_tier`) cannot retro-
+        // actively invalidate an already-admitted generate. The
+        // policy is snapshot-cloned so the run phase observes the
+        // same `load_budget_secs` that was in effect at admit time.
+        let policy = self.image_gen_active_policy()?;
+        if !policy.allow_during_pathtraced_render && self.pathtraced_render_in_progress()? {
+            return Err(BridgeServiceError::ImageGen(
+                "image generation is paused while a path-traced render is running; \
+                 cancel or wait for the render queue to finish, or upgrade your \
+                 hardware tier in Settings"
+                    .into(),
+            ));
+        }
+        // Phase 18 Group E Devin Review fix — the cold-spawn budget
+        // is the **per-tier policy `load_budget`** (Low = 45 s,
+        // Medium = 60 s, High = 75 s, Pro = 90 s — see
+        // `crates/aec_governor/src/policy.rs::GovernorPolicy::for_tier`).
+        // Earlier this branch did
+        // `Duration::from_secs(policy.load_budget_secs).min(DEFAULT_IMAGE_GEN_SPAWN_TIMEOUT)`
+        // — with `DEFAULT_IMAGE_GEN_SPAWN_TIMEOUT == 60 s`, that
+        // `.min()` silently clamped High (75 s) and Pro (90 s) back
+        // down to 60 s, defeating the entire per-tier
+        // differentiation. The clamp also produced a hard-to-
+        // diagnose `HealthTimeout` on Pro workstations loading a
+        // large SDXL GGUF, where 60 s is genuinely insufficient
+        // for the mmap + CUDA / Metal context init the governor's
+        // 90 s budget accounts for.
+        //
+        // The fix trusts the policy verbatim: the governor already
+        // bounds `load_budget_secs` at construction time (it's a
+        // hard-coded per-tier table) so no extra ceiling is needed
+        // at this layer. `DEFAULT_IMAGE_GEN_SPAWN_TIMEOUT` is kept
+        // strictly as a fallback floor for the defensive
+        // `policy.load_budget_secs == 0` branch — which would
+        // otherwise hand `spawn_with_retry` a zero-second deadline
+        // and trip an immediate `HealthTimeout`.
+        let policy_budget = std::time::Duration::from_secs(policy.load_budget_secs as u64);
+        let spawn_timeout = if policy_budget.is_zero() {
+            DEFAULT_IMAGE_GEN_SPAWN_TIMEOUT
+        } else {
+            policy_budget
+        };
+        Ok(ImageGenGenerateContext {
+            request,
+            image_gen_state: Arc::clone(&self.image_gen_state),
+            spawn_timeout,
+        })
+    }
+
+    /// Drive an image-gen generate to completion. Performs the
+    /// (potentially multi-minute) sidecar cold-spawn + `/sdapi/v1/txt2img`
+    /// round-trip + base64 encode. **Holds no `BridgeService`
+    /// lock** — safe to invoke from a `spawn_blocking` task while
+    /// concurrent writers run in parallel.
+    pub fn run_image_gen_generate(
+        ctx: ImageGenGenerateContext,
+    ) -> Result<ImageGenGenerateResult, BridgeServiceError> {
+        let ImageGenGenerateContext {
+            request,
+            image_gen_state,
+            spawn_timeout,
+        } = ctx;
+        // Ensure the runtime config points at the currently-configured
+        // model file — `set_descriptor` keeps these in sync, but cover
+        // the case where the bridge booted with a pre-populated
+        // descriptor (e.g. a future config-file path).
+        let transport: ImageGenTransport = image_gen_state.ensure_ready(spawn_timeout)?;
+        let mut sd_request =
+            ImageGenRequest::new(request.prompt, request.width, request.height, request.steps)
+                .with_cfg_scale(request.cfg_scale);
+        if let Some(neg) = request.negative_prompt {
+            sd_request = sd_request.with_negative_prompt(neg);
+        }
+        if let Some(seed) = request.seed {
+            sd_request = sd_request.with_seed(seed);
+        }
+        if let Some(sampler) = request.sampler {
+            sd_request = sd_request.with_sampler(sampler);
+        }
+        // No cancel token wired in yet — the renderer's image panel
+        // doesn't expose a Cancel button in this milestone. The
+        // request times out at the sidecar level via
+        // `request_timeout`, so a hung generation cannot wedge the
+        // bridge thread indefinitely. Wiring user-driven cancel is a
+        // future Group D enhancement.
+        let response = transport
+            .generate(&sd_request, None)
+            .map_err(|e| BridgeServiceError::ImageGen(format!("txt2img: {e}")))?;
+        use base64::Engine as _;
+        let png_base64 = base64::engine::general_purpose::STANDARD.encode(&response.png_bytes);
+        Ok(ImageGenGenerateResult {
+            png_base64,
+            seed: response.seed,
+            width: response.width,
+            height: response.height,
+            steps: response.steps,
+            info: response.info,
+        })
+    }
+
+    /// Idle-evict the image-gen sidecar if its idle window has
+    /// elapsed. Called by the governor on its 5 s tick. Returns
+    /// `true` if a child was actually shut down.
+    pub fn image_gen_maybe_unload(&self) -> Result<bool, BridgeServiceError> {
+        Ok(self.image_gen_state.maybe_unload()?)
+    }
+
+    /// Phase 18 Group C Task 17 — apply a new image-gen governor
+    /// policy. Updates both the stored hot-path policy (for the
+    /// path-traced render gate inside [`Self::image_gen_generate`])
+    /// and the underlying [`ImageGenRuntimeConfig`] (which carries
+    /// `idle_timeout` and `load_budget`).
+    ///
+    /// Triggers a cold-spawn on the next [`Self::image_gen_generate`]
+    /// call by killing any live sidecar — same shape as
+    /// [`Self::ai_set_active_tier`], because the new budgets are
+    /// only honoured by the sidecar at spawn time.
+    pub fn image_gen_apply_policy(&self, policy: ImageGenPolicy) -> Result<(), BridgeServiceError> {
+        // Step 1: publish the policy under a brief write lock so the
+        // pathtraced-render gate observes it on subsequent reads. We
+        // do this *before* the runtime reload so a concurrent
+        // generate request that beats us to the gate read sees the
+        // new policy.
+        {
+            let mut slot = self.image_gen_policy.write().map_err(|_| {
+                BridgeServiceError::ImageGen("image_gen_policy lock poisoned".into())
+            })?;
+            *slot = policy;
+        }
+
+        // Step 2: rebuild the runtime config with the new idle /
+        // load budgets and reload the runtime. We clone the current
+        // spawn_config so the descriptor (filename / weights /
+        // sampler) is preserved across the policy swap — only the
+        // lifecycle timings change.
+        let new_runtime_config = {
+            let current = self.image_gen_state.snapshot_config().map_err(|e| {
+                BridgeServiceError::ImageGen(format!("snapshot image-gen runtime config: {e}"))
+            })?;
+            ImageGenRuntimeConfig {
+                spawn_config: current.spawn_config,
+                idle_timeout: std::time::Duration::from_secs(policy.idle_timeout_secs as u64),
+                load_budget: std::time::Duration::from_secs(policy.load_budget_secs as u64),
+            }
+        };
+        self.image_gen_state
+            .reload_with_config(new_runtime_config)
+            .map_err(|e| BridgeServiceError::ImageGen(format!("reload image-gen runtime: {e}")))?;
+        Ok(())
+    }
+
+    /// Phase 18 Group C Task 17 — derive both AI and image-gen
+    /// policies from the supplied hardware tier and apply them.
+    /// Convenience over having every caller compute
+    /// [`GovernorPolicy::for_tier`] themselves.
+    ///
+    /// Currently only propagates the image-gen policy because the
+    /// text-side tier slug (`small` / `medium` / `large`) is set
+    /// separately via [`Self::ai_set_active_tier`] — the two
+    /// surfaces will be merged when Group D's first-run wizard
+    /// lands.
+    pub fn governor_apply_hardware_tier(
+        &self,
+        tier: HardwareTier,
+    ) -> Result<(), BridgeServiceError> {
+        let policy = GovernorPolicy::for_tier(tier);
+        self.image_gen_apply_policy(policy.image_gen)
+    }
+
+    /// Phase 18 Group C Task 17 — true iff at least one render job
+    /// is currently `Running` AND uses a path-traced (i.e.
+    /// non-realtime) preset. The realtime PBR-rasterizer preview is
+    /// excluded because it shares no contended CPU/GPU work with
+    /// the image-gen sidecar — only the path-tracer does. Public so
+    /// the renderer (and integration tests) can read it without
+    /// triggering a generate; the gate inside
+    /// [`Self::image_gen_generate`] also calls it.
+    pub fn pathtraced_render_in_progress(&self) -> Result<bool, BridgeServiceError> {
+        let state = self.lock_render_state()?;
+        for job in state.queue.list_jobs() {
+            if matches!(job.status, RenderJobStatus::Running)
+                && !matches!(job.preset.config.quality, RenderQuality::RealtimePreview)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Phase 18 Group C Task 17 — read-only snapshot of the active
+    /// image-gen policy. Used by the renderer to render the per-tier
+    /// status (e.g. "paused while rendering") and by tests to pin
+    /// the policy that's actually in effect.
+    pub fn image_gen_active_policy(&self) -> Result<ImageGenPolicy, BridgeServiceError> {
+        Ok(*self
+            .image_gen_policy
+            .read()
+            .map_err(|_| BridgeServiceError::ImageGen("image_gen_policy lock poisoned".into()))?)
+    }
+
     // ----- Draft scope (DXF import/export + drawing + sheet/layer ----- //
 
     /// Import a DXF file at `dxf_path` into the project graph. Each
@@ -6412,6 +7538,60 @@ fn default_model_manager() -> aec_ai::ModelManager {
         aec_ai::ModelManager::default_descriptors(),
         aec_ai::ModelTier::Small,
     )
+}
+
+/// Default runtime config for the image-gen sidecar at boot.
+///
+/// The defaults baked into [`ImageGenRuntimeConfig::default`] cover the
+/// universal case (port 13580, 120 s idle unload, 60 s load budget, no
+/// `model_path` yet). The bridge does not eagerly resolve the model
+/// path here — it's filled in later when the renderer's image panel
+/// triggers `ensure_ready`, which reads the path from the current
+/// [`ImageGenModelManager`] descriptor.
+fn default_image_gen_runtime_config() -> ImageGenRuntimeConfig {
+    ImageGenRuntimeConfig::default()
+}
+
+/// Default [`ImageGenModelManager`] for a fresh bridge boot. Uses a
+/// dedicated `image_gen/` subdirectory under [`aec_ai::default_models_dir`]
+/// so image-gen weights live alongside text-model GGUFs but are
+/// trivially distinguishable on disk / in the filesystem viewer.
+///
+/// The descriptor starts empty (no filename, no URL, no BLAKE3) —
+/// **by design**, not as a stub. The renderer's first-run wizard
+/// (Group D Task 19) is responsible for either pasting a verified SD
+/// GGUF URL+hash+size into [`BridgeService::image_gen_set_descriptor`]
+/// or selecting a future PrismML native build. Until that happens,
+/// [`BridgeService::image_gen_model_availability`] reports
+/// `available: false` and the renderer surfaces a "configure model"
+/// prompt instead of a "download" button.
+///
+/// Picking a default URL here would either ship a stale hash (the
+/// model maintainer changes weights) or require this PR to download
+/// a multi-GB file just to compute a verified hash — neither is
+/// acceptable. The empty default is the architecturally correct
+/// choice: the bridge surface supports any user-supplied SD GGUF
+/// today and will support PrismML's native bonsai-image binary the
+/// moment one ships, with no code changes on this layer.
+fn default_image_gen_model_manager() -> ImageGenModelManager {
+    let mut dir = aec_ai::default_models_dir();
+    dir.push("image_gen");
+    ImageGenModelManager::with_default_descriptor(dir)
+}
+
+/// Stringify an [`aec_ai::image_gen::ImageGenRuntimeState`] into the
+/// lowercase form the renderer consumes. Centralised so adding a new
+/// variant fails to compile at this single site, not silently sends
+/// the renderer an unmapped status.
+fn image_gen_state_string(state: aec_ai::image_gen::runtime::ImageGenRuntimeState) -> String {
+    use aec_ai::image_gen::runtime::ImageGenRuntimeState as S;
+    match state {
+        S::Idle => "idle",
+        S::Loading => "loading",
+        S::Ready => "ready",
+        S::Failed => "failed",
+    }
+    .into()
 }
 
 /// Parse a caller-supplied `scene_json` parameter into a
@@ -9806,6 +10986,1048 @@ END-ISO-10303-21;\n";
         assert_eq!(
             canonical_builtin_for_grammar_key("totally_made_up", &schemas),
             None,
+        );
+    }
+
+    // ===================================================================
+    // Phase 18 Group C Task 17 — image-gen governor policy + path-tracer
+    // pause gate.
+    // ===================================================================
+
+    #[test]
+    fn image_gen_active_policy_defaults_to_medium_tier_at_boot() {
+        // Pinned by the constructor: until the renderer probes the
+        // hardware tier and calls `governor_apply_hardware_tier`, the
+        // bridge advertises the Medium-tier policy as a safe middle
+        // ground. Changing this default requires updating the test
+        // so the change surfaces in review.
+        let (s, _g) = service();
+        let p = s.image_gen_active_policy().unwrap();
+        let expected = GovernorPolicy::for_tier(HardwareTier::Medium).image_gen;
+        assert_eq!(p, expected);
+    }
+
+    #[test]
+    fn governor_apply_hardware_tier_swaps_in_per_tier_image_gen_policy() {
+        // Every tier the governor knows about must round-trip through
+        // `governor_apply_hardware_tier` → `image_gen_active_policy`.
+        // This also pins that the setter does NOT silently fall back
+        // to a default if the tier-specific policy is somehow missing.
+        let (s, _g) = service();
+        for tier in [
+            HardwareTier::Low,
+            HardwareTier::Medium,
+            HardwareTier::High,
+            HardwareTier::Pro,
+        ] {
+            s.governor_apply_hardware_tier(tier).unwrap();
+            let active = s.image_gen_active_policy().unwrap();
+            let expected = GovernorPolicy::for_tier(tier).image_gen;
+            assert_eq!(active, expected, "tier {:?}", tier);
+        }
+    }
+
+    #[test]
+    fn image_gen_apply_policy_propagates_idle_and_load_budgets_to_runtime() {
+        // The hot-path `image_gen_policy` slot only carries the
+        // gating + concurrency knobs; the lifecycle budgets
+        // (`idle_timeout_secs`, `load_budget_secs`) must be pushed
+        // down into the sidecar's `ImageGenRuntimeConfig` so the
+        // next cold spawn honours them. Pinned here because a
+        // regression would silently leave the runtime on the boot
+        // defaults.
+        let (s, _g) = service();
+        s.governor_apply_hardware_tier(HardwareTier::Pro).unwrap();
+        let cfg = s
+            .image_gen_state
+            .snapshot_config()
+            .expect("snapshot_config");
+        assert_eq!(
+            cfg.idle_timeout,
+            std::time::Duration::from_secs(
+                GovernorPolicy::for_tier(HardwareTier::Pro)
+                    .image_gen
+                    .idle_timeout_secs as u64
+            ),
+        );
+        assert_eq!(
+            cfg.load_budget,
+            std::time::Duration::from_secs(
+                GovernorPolicy::for_tier(HardwareTier::Pro)
+                    .image_gen
+                    .load_budget_secs as u64
+            ),
+        );
+    }
+
+    #[test]
+    fn image_gen_set_descriptor_preserves_governor_applied_lifecycle_budgets() {
+        // Regression for Devin Review BUG (round 2): swapping the
+        // active image-gen descriptor must NOT reset the
+        // governor-applied `idle_timeout` / `load_budget` to the
+        // boot defaults. The previous implementation built the new
+        // runtime config from `ImageGenRuntimeConfig::default()` and
+        // overwrote only `model_path`, so a Pro-tier 300 s idle
+        // window collapsed to the 120 s default the moment the user
+        // pinned a new GGUF in Settings. The fix mirrors
+        // [`image_gen_apply_policy`] — snapshot the current config,
+        // mutate only `model_path`, preserve every other field.
+        let (s, _g) = service();
+        s.governor_apply_hardware_tier(HardwareTier::Pro).unwrap();
+        let pro = GovernorPolicy::for_tier(HardwareTier::Pro).image_gen;
+        let expected_idle = std::time::Duration::from_secs(pro.idle_timeout_secs as u64);
+        let expected_load = std::time::Duration::from_secs(pro.load_budget_secs as u64);
+
+        // Sanity: governor_apply_hardware_tier did push the Pro
+        // budgets down. Without this we couldn't distinguish "set
+        // never ran" from "set ran and then got reset".
+        let before = s.image_gen_state.snapshot_config().unwrap();
+        assert_eq!(before.idle_timeout, expected_idle);
+        assert_eq!(before.load_budget, expected_load);
+
+        // Now swap the descriptor. The new model path must end up
+        // in `spawn_config`, but the governor-applied budgets MUST
+        // be unchanged.
+        let descriptor = ImageGenModelDescriptor {
+            filename: "swapped-model.gguf".into(),
+            blake3_hex: String::new(),
+            size_bytes: 0,
+            download_url: Some("https://huggingface.co/example/swapped-model.gguf".into()),
+            vae_filename: None,
+        };
+        s.image_gen_set_descriptor(descriptor).unwrap();
+
+        let after = s.image_gen_state.snapshot_config().unwrap();
+        assert_eq!(
+            after.idle_timeout, expected_idle,
+            "idle_timeout regressed to default after descriptor swap",
+        );
+        assert_eq!(
+            after.load_budget, expected_load,
+            "load_budget regressed to default after descriptor swap",
+        );
+        assert!(
+            after
+                .spawn_config
+                .model_path
+                .to_string_lossy()
+                .ends_with("swapped-model.gguf"),
+            "new descriptor model_path did not land in spawn_config: {:?}",
+            after.spawn_config.model_path,
+        );
+    }
+
+    #[test]
+    fn image_gen_set_descriptor_propagates_vae_path_to_spawn_config() {
+        // Regression for Devin Review BUG (round 3): when a
+        // descriptor declares a non-`None` `vae_filename` (e.g. an
+        // SDXL checkpoint shipping a separate VAE), the resolved
+        // path MUST land in `spawn_config.vae_path` so the next
+        // sidecar cold spawn passes `--vae`. The previous
+        // implementation only updated `spawn_config.model_path`, so
+        // the sidecar launched without the VAE and produced garbled
+        // output for any model that needs one. Mirrors the
+        // `…_preserves_governor_applied_lifecycle_budgets` test —
+        // same call site, different field under test.
+        let (s, _g) = service();
+        let descriptor = ImageGenModelDescriptor {
+            filename: "sdxl-base-1.0.gguf".into(),
+            blake3_hex: String::new(),
+            size_bytes: 0,
+            download_url: Some("https://huggingface.co/example/sdxl-base.gguf".into()),
+            vae_filename: Some("sdxl-vae-fp16-fix.safetensors".into()),
+        };
+        s.image_gen_set_descriptor(descriptor).unwrap();
+
+        let after = s.image_gen_state.snapshot_config().unwrap();
+        assert!(
+            after
+                .spawn_config
+                .model_path
+                .to_string_lossy()
+                .ends_with("sdxl-base-1.0.gguf"),
+            "model_path did not land in spawn_config: {:?}",
+            after.spawn_config.model_path,
+        );
+        let vae = after
+            .spawn_config
+            .vae_path
+            .as_ref()
+            .expect("vae_path must be populated when descriptor declares vae_filename");
+        assert!(
+            vae.to_string_lossy()
+                .ends_with("sdxl-vae-fp16-fix.safetensors"),
+            "vae_path did not land in spawn_config: {:?}",
+            vae,
+        );
+    }
+
+    #[test]
+    fn image_gen_set_descriptor_clears_vae_path_when_new_descriptor_omits_it() {
+        // Companion to the propagation test above: if the user
+        // first pins a descriptor *with* a VAE and then pins one
+        // *without*, the spawn config's `vae_path` MUST be cleared
+        // (set to `None`). Otherwise the next cold spawn would pass
+        // `--vae /path/to/old.safetensors` from the previous
+        // descriptor — at best a confusing log line, at worst the
+        // sidecar refuses to start because the old file isn't on
+        // disk.
+        let (s, _g) = service();
+
+        // Step 1: pin a descriptor that declares a VAE.
+        let with_vae = ImageGenModelDescriptor {
+            filename: "sdxl-base-1.0.gguf".into(),
+            blake3_hex: String::new(),
+            size_bytes: 0,
+            download_url: Some("https://huggingface.co/example/sdxl-base.gguf".into()),
+            vae_filename: Some("sdxl-vae-fp16-fix.safetensors".into()),
+        };
+        s.image_gen_set_descriptor(with_vae).unwrap();
+        // Sanity: the VAE landed.
+        assert!(s
+            .image_gen_state
+            .snapshot_config()
+            .unwrap()
+            .spawn_config
+            .vae_path
+            .is_some(),);
+
+        // Step 2: swap to a descriptor without a VAE. The VAE path
+        // must clear.
+        let without_vae = ImageGenModelDescriptor {
+            filename: "sd15-pruned.gguf".into(),
+            blake3_hex: String::new(),
+            size_bytes: 0,
+            download_url: Some("https://huggingface.co/example/sd15-pruned.gguf".into()),
+            vae_filename: None,
+        };
+        s.image_gen_set_descriptor(without_vae).unwrap();
+
+        let after = s.image_gen_state.snapshot_config().unwrap();
+        assert!(
+            after.spawn_config.vae_path.is_none(),
+            "vae_path leaked across descriptor swap: {:?}",
+            after.spawn_config.vae_path,
+        );
+        assert!(after
+            .spawn_config
+            .model_path
+            .to_string_lossy()
+            .ends_with("sd15-pruned.gguf"),);
+    }
+
+    #[test]
+    fn image_gen_list_presets_matches_embedded_registry() {
+        // Phase 18 Group D Task 20 — the wizard endpoint must
+        // return entries that round-trip 1:1 with the embedded
+        // `ai_models.json::image_gen.presets`. We assert four
+        // properties simultaneously:
+        //
+        //   1. The length matches the registry.
+        //   2. The ordering matches the registry (the wizard
+        //      surfaces presets in declaration order).
+        //   3. Every preset entry's descriptor is a valid input to
+        //      [`BridgeService::image_gen_set_descriptor`] — i.e.
+        //      it has a non-empty filename and a valid http(s)
+        //      `download_url`. This is what makes the wizard's
+        //      "one-click pin" UX safe.
+        //   4. The BLAKE3 hex, size, and filename pass through
+        //      byte-identical so the integrity-pinning invariant of
+        //      the registry is never weakened by a layer 1
+        //      transformation.
+        let (s, _g) = service();
+        let presets = s.image_gen_list_presets();
+        let registry = aec_ai::registry::ModelRegistry::embedded();
+        let raw = registry.image_gen_presets();
+        assert_eq!(presets.len(), raw.len());
+        for (got, want) in presets.iter().zip(raw.iter()) {
+            assert_eq!(got.id, want.id);
+            assert_eq!(got.display_name, want.display_name);
+            assert_eq!(got.descriptor.filename, want.filename);
+            assert_eq!(got.descriptor.blake3_hex, want.blake3_hex);
+            assert_eq!(got.descriptor.size_bytes, want.size_bytes);
+            assert_eq!(
+                got.descriptor.download_url.as_deref(),
+                Some(want.download_url.as_str()),
+            );
+            assert_eq!(got.descriptor.vae_filename, want.vae_filename);
+            // (3): each descriptor must be a valid set_descriptor
+            // input. We do NOT actually call set_descriptor on it
+            // here because that would mutate the singleton state;
+            // a separate test below exercises the round-trip.
+            assert!(
+                !got.descriptor.filename.is_empty(),
+                "preset has empty filename"
+            );
+            let url = got.descriptor.download_url.as_deref().unwrap_or("");
+            // Phase 18 Group E Devin Review fix — every shipped
+            // preset must use `https://`. The TLS-only outbound
+            // posture is enforced at `image_gen_set_descriptor`
+            // time; this assertion catches a regression where a
+            // future contributor pins a plain-HTTP preset that
+            // would land in the registry but be rejected by the
+            // bridge at first-use.
+            assert!(
+                url.starts_with("https://"),
+                "preset {:?} has non-https download_url {:?} \
+                 — plain http:// is rejected by image_gen_set_descriptor",
+                got.id,
+                url,
+            );
+        }
+    }
+
+    #[test]
+    fn image_gen_set_descriptor_rejects_plain_http_url() {
+        // Phase 18 Group E Devin Review fix — the TLS-only outbound
+        // posture forbids `http://` for any non-empty `download_url`.
+        // Earlier this branch accepted both `http://` and `https://`
+        // (validation lived at `model_download::host_is_allowed`
+        // which only allow-lists HF domains — all HTTPS-only — so a
+        // plain-HTTP URL would have failed at download time anyway).
+        // Catching it here surfaces a clear, actionable error at
+        // descriptor-pin time instead.
+        //
+        // We also pin the error message contains `https://` so the
+        // renderer-side error parser can surface a targeted hint.
+        let (s, _g) = service();
+        let descriptor = ImageGenModelDescriptor {
+            filename: "plain-http.gguf".into(),
+            blake3_hex: String::new(),
+            size_bytes: 0,
+            download_url: Some("http://example.com/plain-http.gguf".into()),
+            vae_filename: None,
+        };
+        let err = s
+            .image_gen_set_descriptor(descriptor)
+            .expect_err("plain http:// must be rejected");
+        match err {
+            BridgeServiceError::Invalid(msg) => {
+                assert!(
+                    msg.contains("https://"),
+                    "error message must reference https:// requirement: {msg}"
+                );
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn image_gen_set_descriptor_accepts_https_url() {
+        // Companion to `…_rejects_plain_http_url`: the happy path
+        // for the TLS-only validator. Pins that a descriptor with
+        // a valid `https://` URL is accepted byte-identical — i.e.
+        // the validator does NOT silently rewrite the URL or strip
+        // any field.
+        let (s, _g) = service();
+        let descriptor = ImageGenModelDescriptor {
+            filename: "good.gguf".into(),
+            blake3_hex: String::new(),
+            size_bytes: 0,
+            download_url: Some("https://huggingface.co/example/good.gguf".into()),
+            vae_filename: None,
+        };
+        s.image_gen_set_descriptor(descriptor)
+            .expect("valid https:// descriptor must be accepted");
+    }
+
+    #[test]
+    fn image_gen_set_descriptor_accepts_empty_url() {
+        // The TLS-only validator only fires on a *non-empty*
+        // `download_url`. A `None` (manual-entry / local model)
+        // is still accepted — the bridge has no URL to validate.
+        // This matches the rest of the image-gen lifecycle: the
+        // download endpoint is the one that requires a URL.
+        let (s, _g) = service();
+        let descriptor = ImageGenModelDescriptor {
+            filename: "local-only.gguf".into(),
+            blake3_hex: String::new(),
+            size_bytes: 0,
+            download_url: None,
+            vae_filename: None,
+        };
+        s.image_gen_set_descriptor(descriptor)
+            .expect("None download_url must be accepted");
+    }
+
+    #[test]
+    fn image_gen_model_availability_matches_manager_is_available_on_zero_size() {
+        // Phase 18 Group E Devin Review fix — the service-side
+        // `image_gen_model_availability` and the manager-side
+        // `is_available` must agree on every input. The bug:
+        // before this fix, when a descriptor declared
+        // `size_bytes == 0` and a 0-byte file existed on disk at
+        // `model_path`, the service reported `available = true`
+        // (descriptor filename non-empty + path is_file + sizes
+        // match — both zero) while the manager reported `false`
+        // (it short-circuits on `size_bytes == 0` first).
+        //
+        // The two reports are consumed by different code paths:
+        // the service one drives the renderer's badge; the
+        // manager one drives `ensure_ready`'s decision to spawn
+        // or refuse. A disagreement could surface a "Ready"
+        // badge for a model the generate path would refuse to
+        // load. The fix adds the `size_bytes != 0` short-circuit
+        // to the service path too.
+        let (s, _g) = service();
+        // Build a descriptor with size_bytes == 0 + a real 0-byte
+        // file on disk at the matching path. The manager's
+        // `models_dir` is resolved via [`aec_ai::default_models_dir`],
+        // not the test's TempDir, so we ask the manager for the
+        // resolved `model_path()` and write the 0-byte file there.
+        // We delete it at the end of the test to avoid polluting
+        // the user's models directory.
+        let zero_filename = "zero-bytes-availability-parity-test.gguf";
+        let path = {
+            let mut mgr = s.image_gen_model_manager.lock().unwrap();
+            let mut desc = mgr.descriptor().clone();
+            desc.filename = zero_filename.into();
+            desc.size_bytes = 0;
+            mgr.set_descriptor(desc);
+            mgr.model_path()
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::File::create(&path).unwrap();
+        // Sanity: the on-disk file is exactly the size the
+        // descriptor declares (both zero).
+        let on_disk = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(on_disk, 0);
+
+        let svc_view = s.image_gen_model_availability().unwrap();
+        let mgr_view = {
+            let mgr = s.image_gen_model_manager.lock().unwrap();
+            mgr.is_available()
+        };
+        assert_eq!(
+            svc_view.available, mgr_view,
+            "service-side image_gen_model_availability disagrees with manager-side \
+             is_available on size_bytes == 0 + 0-byte file on disk: service={} manager={}",
+            svc_view.available, mgr_view,
+        );
+        // Both must be `false` — a 0-byte file is never a usable
+        // model. Pinning the *value* (not just "agreement") so a
+        // future refactor that flips both to `true` is also
+        // caught.
+        assert!(
+            !svc_view.available,
+            "0-byte zero-sized descriptor must NOT be considered available"
+        );
+
+        // Clean up the artifact we wrote into the default
+        // image-gen models directory. `_ = ...` because the file
+        // may already be gone (e.g. another test parallel-ran);
+        // we don't fail the test on cleanup-side errors.
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn model_integrity_report_pins_every_text_tier_and_every_image_gen_preset() {
+        // Phase 18 Group E Task 24/26 — confirm the integrity
+        // report enumerates one outcome per registry-known model
+        // (3 text tiers + N image-gen presets) with stable id
+        // namespacing. The values of `id` matter because the
+        // renderer routes mismatches to UI surfaces by id prefix
+        // — text.* lives in the Models pane, image-gen.* lives
+        // in the Image-gen panel.
+        let (s, _g) = service();
+        let report = s
+            .model_integrity_report()
+            .expect("registry pins are well-formed; report must build cleanly");
+        let registry = aec_ai::registry::ModelRegistry::embedded();
+        let expected_text_count = registry.text.tiers.len();
+        let expected_preset_count = registry.image_gen.presets.len();
+        let expected_total = expected_text_count + expected_preset_count;
+
+        // The report may include an additional `image-gen.custom`
+        // entry if a user-supplied descriptor is non-empty; the
+        // boot default leaves that descriptor blank so the
+        // current test shape expects exactly the registry-pin
+        // count. Anchored at >= so the test does not fail if a
+        // future PR populates the custom descriptor at boot.
+        assert!(
+            report.entries.len() >= expected_total,
+            "report must enumerate every registry-known model: got {} entries, registry pins {}",
+            report.entries.len(),
+            expected_total
+        );
+
+        let ids: std::collections::HashSet<&str> =
+            report.entries.iter().map(|e| e.id.as_str()).collect();
+        for t in &registry.text.tiers {
+            let expected_id = format!("text.{:?}", t.tier).to_ascii_lowercase();
+            assert!(
+                ids.contains(expected_id.as_str()),
+                "report missing pin for text tier {:?}: ids={:?}",
+                t.tier,
+                ids
+            );
+        }
+        for p in &registry.image_gen.presets {
+            let expected_id = format!("image-gen.{}", p.id);
+            assert!(
+                ids.contains(expected_id.as_str()),
+                "report missing pin for image-gen preset {:?}: ids={:?}",
+                p.id,
+                ids
+            );
+        }
+    }
+
+    #[test]
+    fn model_integrity_report_reports_missing_for_files_not_on_disk() {
+        // The default-tier files are not downloaded in a fresh
+        // bridge boot, so every entry must be `missing` (never
+        // `mismatch`, which would indicate the test environment
+        // had stale tampered files lying around). This pins the
+        // Task 23 contract that "missing != tampered" and gives
+        // us a regression net against the bridge silently
+        // upgrading a missing file to a hash-mismatch.
+        let (s, _g) = service();
+        // Make sure no leftover file from prior runs poisons the
+        // boot-pristine assumption. The default text models live
+        // in `aec_ai::default_models_dir()` which is the user's
+        // platform-specific data directory — we don't blow that
+        // away. Instead we assert that **every reported entry
+        // for a registry-known tier is either `verified` or
+        // `missing`**; `mismatch` here would mean the user had a
+        // tampered file at the canonical path, which is itself a
+        // real bug we want to surface.
+        let report = s.model_integrity_report().unwrap();
+        for entry in &report.entries {
+            assert!(
+                entry.status == "verified" || entry.status == "missing",
+                "every registry pin must report verified or missing on a pristine test \
+                 environment (got status={} for id={}; detail={})",
+                entry.status,
+                entry.id,
+                entry.detail
+            );
+        }
+    }
+
+    #[test]
+    fn model_integrity_report_detects_tampered_model_file_via_blake3_mismatch() {
+        // Plant a wrong-bytes file at the canonical path for the
+        // `text.small` tier and confirm the report surfaces a
+        // `mismatch` (NOT `verified`, NOT `missing`). This is
+        // the load-bearing tamper-detection path Task 26
+        // exists to provide.
+        let (s, _g) = service();
+        let registry = aec_ai::registry::ModelRegistry::embedded();
+        let small = registry
+            .text
+            .tiers
+            .iter()
+            .find(|t| matches!(t.tier, aec_ai::registry::TextTierTag::Small))
+            .expect("Small tier present in registry");
+
+        let models_dir = {
+            let mgr = s.model_manager.lock().unwrap();
+            mgr.models_dir().to_path_buf()
+        };
+        let model_path = models_dir.join(&small.filename);
+        if let Some(parent) = model_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        // Write bytes whose size DIFFERS from the pinned size_bytes
+        // so the size-mismatch fast-path fires. (Writing
+        // `size_bytes` worth of zeros would land on `mismatch`
+        // via BLAKE3, but a SizeMismatch is the cheaper-to-detect
+        // shape and is what the bridge will fire first on a
+        // real corruption — pinning that path keeps the test
+        // fast.)
+        let evil_bytes = vec![0u8; 17];
+        std::fs::write(&model_path, &evil_bytes).unwrap();
+        // Sanity: registry-pinned size MUST differ from 17.
+        assert_ne!(small.size_bytes, 17);
+
+        let report = s.model_integrity_report().unwrap();
+        let id = format!("text.{:?}", small.tier).to_ascii_lowercase();
+        let entry = report
+            .entries
+            .iter()
+            .find(|e| e.id == id)
+            .expect("tampered text.small entry must be present in report");
+        assert_eq!(
+            entry.status, "size-mismatch",
+            "tampered file must be reported as size-mismatch (was: {})",
+            entry.status
+        );
+        assert!(!report.all_verified);
+
+        // Clean up the planted file so the next test run starts
+        // from a pristine state.
+        let _ = std::fs::remove_file(&model_path);
+    }
+
+    #[test]
+    fn model_integrity_report_includes_user_supplied_image_gen_descriptor() {
+        // The user's wizard can pin a custom SD GGUF that isn't
+        // in the registry's preset list. The integrity report
+        // must include it under `image-gen.custom` so the
+        // Settings UI can verify it on the same surface as the
+        // shipped models. This keeps users-of-not-yet-curated
+        // SD models from missing out on tamper detection.
+        let (s, _g) = service();
+        s.image_gen_set_descriptor(ImageGenModelDescriptor {
+            filename: "user-supplied-test.gguf".into(),
+            blake3_hex: "d74981efa70a0c880b8d8c1985d075dbcbf679b99a5f9914e5aaf96b831a9e24".into(),
+            size_bytes: 11,
+            download_url: Some("https://example.invalid/x.gguf".into()),
+            vae_filename: None,
+        })
+        .expect("descriptor must accept");
+        let report = s.model_integrity_report().unwrap();
+        let has_custom = report.entries.iter().any(|e| e.id == "image-gen.custom");
+        assert!(
+            has_custom,
+            "user-supplied descriptor must appear under id='image-gen.custom'"
+        );
+    }
+
+    #[test]
+    fn image_gen_list_presets_is_empty_in_current_ship() {
+        // Defensive: the current ship intentionally curates zero
+        // image-gen presets (see `$doc` in
+        // `crates/aec_ai/data/ai_models.json`). If a future PR
+        // adds a preset without auditing the BLAKE3 / size / URL,
+        // this assertion fires and the contributor is forced to
+        // either (a) update this test with the new count + a doc
+        // comment pointing at the verification evidence, or (b)
+        // walk back the unverified addition. The test serves as a
+        // commit-time tripwire on the integrity invariant.
+        let (s, _g) = service();
+        assert_eq!(
+            s.image_gen_list_presets().len(),
+            0,
+            "image-gen preset added without updating the integrity-pin tripwire test",
+        );
+    }
+
+    #[test]
+    fn pathtraced_render_in_progress_is_false_on_empty_queue() {
+        let (s, _g) = service();
+        assert!(!s.pathtraced_render_in_progress().unwrap());
+    }
+
+    #[test]
+    fn pathtraced_render_in_progress_ignores_realtime_preview_jobs() {
+        // The realtime PBR preview shares no path-tracer work with
+        // the image-gen sidecar, so a Running realtime job must NOT
+        // trip the gate. This is the property that distinguishes the
+        // image-gen pause from the broader "any render running" rule.
+        let (s, _g) = service();
+        {
+            let mut state = s.lock_render_state().unwrap();
+            let preset = aec_render::preset::RenderPreset::realtime_preview();
+            let job =
+                aec_render::job::RenderJob::new(preset, aec_render::scene::RenderScene::new());
+            let id = state.queue.submit(job);
+            // Admit it to flip Queued → Running.
+            loop {
+                let admitted = state.queue.admit();
+                match admitted {
+                    Some(j) if j.id == id => break,
+                    Some(_) => continue,
+                    None => panic!("queue refused to admit the realtime job"),
+                }
+            }
+        }
+        assert!(!s.pathtraced_render_in_progress().unwrap());
+    }
+
+    #[test]
+    fn pathtraced_render_in_progress_is_true_for_running_pathtraced_job() {
+        let (s, _g) = service();
+        {
+            let mut state = s.lock_render_state().unwrap();
+            // `from_quality` builds a preset whose RenderQuality
+            // variant matches the requested quality — Standard is a
+            // path-traced quality (NOT RealtimePreview).
+            let preset = aec_render::preset::RenderPreset::from_quality(
+                aec_render::preset::RenderQuality::Standard,
+            );
+            let job =
+                aec_render::job::RenderJob::new(preset, aec_render::scene::RenderScene::new());
+            let id = state.queue.submit(job);
+            loop {
+                let admitted = state.queue.admit();
+                match admitted {
+                    Some(j) if j.id == id => break,
+                    Some(_) => continue,
+                    None => panic!("queue refused to admit the standard job"),
+                }
+            }
+        }
+        assert!(s.pathtraced_render_in_progress().unwrap());
+    }
+
+    #[test]
+    fn image_gen_generate_is_gated_on_low_tier_during_pathtraced_render() {
+        // End-to-end pin of the gate: Low-tier policy disallows
+        // image-gen concurrency with a path-tracer, so a generate
+        // request mid-render must return a clear ImageGen error and
+        // MUST NOT touch the sidecar (no spawn attempt, no
+        // model-availability check).
+        let (s, _g) = service();
+        s.governor_apply_hardware_tier(HardwareTier::Low).unwrap();
+        {
+            let mut state = s.lock_render_state().unwrap();
+            let preset = aec_render::preset::RenderPreset::from_quality(
+                aec_render::preset::RenderQuality::Studio,
+            );
+            let id = state.queue.submit(aec_render::job::RenderJob::new(
+                preset,
+                aec_render::scene::RenderScene::new(),
+            ));
+            loop {
+                let admitted = state.queue.admit();
+                match admitted {
+                    Some(j) if j.id == id => break,
+                    Some(_) => continue,
+                    None => panic!("queue refused to admit the studio job"),
+                }
+            }
+        }
+        let err = s
+            .image_gen_generate(ImageGenGenerateRequest {
+                prompt: "a teapot".into(),
+                negative_prompt: None,
+                width: 64,
+                height: 64,
+                steps: 1,
+                cfg_scale: 7.0,
+                seed: None,
+                sampler: None,
+            })
+            .expect_err("generate must reject while pathtraced render runs on Low tier");
+        match err {
+            BridgeServiceError::ImageGen(msg) => {
+                assert!(
+                    msg.contains("paused while a path-traced render"),
+                    "unexpected gate message: {msg}",
+                );
+            }
+            other => panic!("expected ImageGen gate error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn image_gen_generate_passes_gate_on_pro_tier_during_pathtraced_render() {
+        // Pro-tier policy allows concurrent image-gen + path-tracer.
+        // We can't actually spawn the sidecar in a unit test (no
+        // binary on PATH), but we can pin that the gate is bypassed
+        // — the error we get back must be the downstream sidecar /
+        // model error, NOT the "paused while rendering" gate message.
+        let (s, _g) = service();
+        s.governor_apply_hardware_tier(HardwareTier::Pro).unwrap();
+        {
+            let mut state = s.lock_render_state().unwrap();
+            let preset = aec_render::preset::RenderPreset::from_quality(
+                aec_render::preset::RenderQuality::Studio,
+            );
+            let id = state.queue.submit(aec_render::job::RenderJob::new(
+                preset,
+                aec_render::scene::RenderScene::new(),
+            ));
+            loop {
+                let admitted = state.queue.admit();
+                match admitted {
+                    Some(j) if j.id == id => break,
+                    Some(_) => continue,
+                    None => panic!("queue refused to admit the studio job"),
+                }
+            }
+        }
+        let err = s
+            .image_gen_generate(ImageGenGenerateRequest {
+                prompt: "a teapot".into(),
+                negative_prompt: None,
+                width: 64,
+                height: 64,
+                steps: 1,
+                cfg_scale: 7.0,
+                seed: None,
+                sampler: None,
+            })
+            .expect_err("generate cannot succeed without an actual sd-server binary");
+        let msg = format!("{err:?}");
+        assert!(
+            !msg.contains("paused while a path-traced render"),
+            "Pro tier must bypass the gate; got gate error: {msg}",
+        );
+    }
+
+    #[test]
+    fn image_gen_prepare_generate_validates_request_under_lock() {
+        // Phase 18 Group D Task 21 — request-shape validation must
+        // happen in the prepare phase (under the SERVICE lock) so a
+        // malformed request never reaches the lock-free run phase
+        // and never gets a chance to allocate / spawn / sample. Pin
+        // every validator that the run phase relies on:
+        //
+        //   * empty prompt
+        //   * non-multiple-of-8 dimension
+        //   * out-of-range dimension
+        //   * out-of-range steps
+        //   * non-finite / out-of-range cfg_scale
+        //
+        // Each case must return `BridgeServiceError::Invalid` (NOT
+        // `ImageGen`) so the renderer can render a per-field
+        // validation banner instead of the sidecar-failed banner.
+        let (s, _g) = service();
+        let good = ImageGenGenerateRequest {
+            prompt: "a teapot".into(),
+            negative_prompt: None,
+            width: 64,
+            height: 64,
+            steps: 1,
+            cfg_scale: 7.0,
+            seed: None,
+            sampler: None,
+        };
+        // Empty prompt.
+        let mut bad = good.clone();
+        bad.prompt = "   ".into();
+        assert!(matches!(
+            s.image_gen_prepare_generate(bad).unwrap_err(),
+            BridgeServiceError::Invalid(_)
+        ));
+        // Non-multiple-of-8 width.
+        let mut bad = good.clone();
+        bad.width = 65;
+        assert!(matches!(
+            s.image_gen_prepare_generate(bad).unwrap_err(),
+            BridgeServiceError::Invalid(_)
+        ));
+        // Below-range dimension.
+        let mut bad = good.clone();
+        bad.height = 32;
+        assert!(matches!(
+            s.image_gen_prepare_generate(bad).unwrap_err(),
+            BridgeServiceError::Invalid(_)
+        ));
+        // Above-range dimension.
+        let mut bad = good.clone();
+        bad.height = 4096;
+        assert!(matches!(
+            s.image_gen_prepare_generate(bad).unwrap_err(),
+            BridgeServiceError::Invalid(_)
+        ));
+        // Out-of-range steps.
+        let mut bad = good.clone();
+        bad.steps = 0;
+        assert!(matches!(
+            s.image_gen_prepare_generate(bad).unwrap_err(),
+            BridgeServiceError::Invalid(_)
+        ));
+        let mut bad = good.clone();
+        bad.steps = 200;
+        assert!(matches!(
+            s.image_gen_prepare_generate(bad).unwrap_err(),
+            BridgeServiceError::Invalid(_)
+        ));
+        // Non-finite cfg_scale.
+        let mut bad = good.clone();
+        bad.cfg_scale = f32::NAN;
+        assert!(matches!(
+            s.image_gen_prepare_generate(bad).unwrap_err(),
+            BridgeServiceError::Invalid(_)
+        ));
+        let mut bad = good.clone();
+        bad.cfg_scale = f32::INFINITY;
+        assert!(matches!(
+            s.image_gen_prepare_generate(bad).unwrap_err(),
+            BridgeServiceError::Invalid(_)
+        ));
+        // Out-of-range cfg_scale.
+        let mut bad = good.clone();
+        bad.cfg_scale = 100.0;
+        assert!(matches!(
+            s.image_gen_prepare_generate(bad).unwrap_err(),
+            BridgeServiceError::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn image_gen_prepare_generate_returns_context_with_cloned_state_arc() {
+        // Phase 18 Group D Task 21 — the prepare phase must return
+        // an owned `ImageGenGenerateContext` whose
+        // `image_gen_state` field points at the **same**
+        // `ImageGenState` that the BridgeService owns. This is the
+        // property the napi handler relies on: it drops the SERVICE
+        // RwLock reader guard, then drives the sidecar against the
+        // same long-lived `Arc<ImageGenState>` (so a concurrent
+        // `image_gen_apply_policy` / `image_gen_set_descriptor`
+        // running in parallel observes the same state).
+        //
+        // We pin the pointer equality directly via `Arc::ptr_eq`.
+        // This is the smoking-gun assertion that fails if anyone
+        // ever rebuilds a fresh `ImageGenState` inside the prepare
+        // phase (which would silently regress the lock-discipline
+        // fix).
+        let (s, _g) = service();
+        let req = ImageGenGenerateRequest {
+            prompt: "anything".into(),
+            negative_prompt: None,
+            width: 64,
+            height: 64,
+            steps: 1,
+            cfg_scale: 7.0,
+            seed: None,
+            sampler: None,
+        };
+        let ctx = s.image_gen_prepare_generate(req.clone()).unwrap();
+        assert!(
+            Arc::ptr_eq(&ctx.image_gen_state, &s.image_gen_state),
+            "prepare must clone the SAME Arc<ImageGenState> the service owns",
+        );
+        // Phase 18 Group E Devin Review fix — `spawn_timeout`
+        // tracks the **per-tier policy `load_budget`** verbatim
+        // (Low = 45 s, Medium = 60 s, High = 75 s, Pro = 90 s).
+        // Earlier this branch clamped to
+        // `DEFAULT_IMAGE_GEN_SPAWN_TIMEOUT == 60 s`, which silently
+        // regressed High (75 s) and Pro (90 s) tier budgets. The
+        // default-boot config is Medium = 60 s, so the assertion
+        // here pins the post-fix invariant: spawn_timeout EQUALS
+        // the Medium-tier load_budget (not a ceiling on it).
+        let medium_budget = std::time::Duration::from_secs(
+            GovernorPolicy::for_tier(HardwareTier::Medium)
+                .image_gen
+                .load_budget_secs as u64,
+        );
+        assert_eq!(
+            ctx.spawn_timeout, medium_budget,
+            "spawn_timeout at boot must equal the Medium-tier policy load_budget (not a hard ceiling on it)",
+        );
+        // Request must round-trip byte-identically through the
+        // context so the run phase observes the user's submitted
+        // parameters and not the validated-but-modified copy.
+        assert_eq!(ctx.request, req);
+    }
+
+    #[test]
+    fn image_gen_prepare_generate_propagates_pro_tier_load_budget_unclamped() {
+        // Phase 18 Group E Devin Review fix — the YELLOW bug that
+        // triggered this regression test was:
+        // `let spawn_timeout = policy_budget.min(DEFAULT_IMAGE_GEN_SPAWN_TIMEOUT)`
+        // — silently clamping Pro (90 s) and High (75 s) load
+        // budgets down to 60 s, the hard-coded default.  The fix
+        // trusts the policy verbatim.  This test pins the property
+        // by applying Pro tier, calling prepare_generate, and
+        // asserting `spawn_timeout == 90 s` (NOT 60 s).
+        let (s, _g) = service();
+        // Apply Pro tier — propagates the per-tier image_gen policy
+        // into both the bridge's hot-path snapshot and the runtime
+        // config that ensure_ready will observe.
+        s.governor_apply_hardware_tier(HardwareTier::Pro).unwrap();
+        let pro_budget = std::time::Duration::from_secs(
+            GovernorPolicy::for_tier(HardwareTier::Pro)
+                .image_gen
+                .load_budget_secs as u64,
+        );
+        assert_eq!(
+            pro_budget.as_secs(),
+            90,
+            "Pro tier load_budget must be 90 s per the governor policy table",
+        );
+        let req = ImageGenGenerateRequest {
+            prompt: "Pro tier render".into(),
+            negative_prompt: None,
+            width: 1024,
+            height: 1024,
+            steps: 25,
+            cfg_scale: 7.0,
+            seed: None,
+            sampler: None,
+        };
+        let ctx = s.image_gen_prepare_generate(req).unwrap();
+        assert_eq!(
+            ctx.spawn_timeout, pro_budget,
+            "Pro-tier spawn_timeout must propagate the 90 s policy budget verbatim — was clamped to {} s by the YELLOW bug, now must be exactly {} s",
+            ctx.spawn_timeout.as_secs(),
+            pro_budget.as_secs(),
+        );
+        // Belt-and-suspenders: the spawn_timeout must STRICTLY
+        // EXCEED the old hard-ceiling — proves the regression
+        // can't reappear via a `.min(DEFAULT)` slipping back in.
+        assert!(
+            ctx.spawn_timeout > DEFAULT_IMAGE_GEN_SPAWN_TIMEOUT,
+            "Pro-tier spawn_timeout ({:?}) must exceed the legacy hard ceiling ({:?})",
+            ctx.spawn_timeout,
+            DEFAULT_IMAGE_GEN_SPAWN_TIMEOUT,
+        );
+    }
+
+    #[test]
+    fn image_gen_prepare_generate_propagates_high_tier_load_budget_unclamped() {
+        // Phase 18 Group E Devin Review fix — sibling of the
+        // Pro-tier regression test. High tier's 75 s budget was
+        // also silently clamped to 60 s by the pre-fix code.
+        let (s, _g) = service();
+        s.governor_apply_hardware_tier(HardwareTier::High).unwrap();
+        let high_budget = std::time::Duration::from_secs(
+            GovernorPolicy::for_tier(HardwareTier::High)
+                .image_gen
+                .load_budget_secs as u64,
+        );
+        assert_eq!(
+            high_budget.as_secs(),
+            75,
+            "High tier load_budget must be 75 s per the governor policy table",
+        );
+        let req = ImageGenGenerateRequest {
+            prompt: "High tier render".into(),
+            negative_prompt: None,
+            width: 768,
+            height: 768,
+            steps: 20,
+            cfg_scale: 7.0,
+            seed: None,
+            sampler: None,
+        };
+        let ctx = s.image_gen_prepare_generate(req).unwrap();
+        assert_eq!(
+            ctx.spawn_timeout, high_budget,
+            "High-tier spawn_timeout must propagate the 75 s policy budget verbatim",
+        );
+        assert!(
+            ctx.spawn_timeout > DEFAULT_IMAGE_GEN_SPAWN_TIMEOUT,
+            "High-tier spawn_timeout ({:?}) must exceed the legacy hard ceiling ({:?})",
+            ctx.spawn_timeout,
+            DEFAULT_IMAGE_GEN_SPAWN_TIMEOUT,
+        );
+    }
+
+    #[test]
+    fn image_gen_prepare_generate_does_not_call_ensure_ready() {
+        // Phase 18 Group D Task 21 — the prepare phase MUST NOT
+        // attempt to spawn the sidecar; that is the run phase's
+        // job. We can't observe "did spawn happen" directly without
+        // a mock, but we can pin the necessary contract: prepare
+        // returns successfully even when there's no `sd-server` on
+        // PATH (the spawn would fail). If a future refactor
+        // accidentally moves `ensure_ready` into the prepare phase,
+        // this test fires with a sidecar-spawn error instead of an
+        // `Ok(_)` context.
+        let (s, _g) = service();
+        let req = ImageGenGenerateRequest {
+            prompt: "trip the wire".into(),
+            negative_prompt: None,
+            width: 64,
+            height: 64,
+            steps: 1,
+            cfg_scale: 7.0,
+            seed: None,
+            sampler: None,
+        };
+        let result = s.image_gen_prepare_generate(req);
+        assert!(
+            result.is_ok(),
+            "prepare must succeed without a real sidecar; got {:?}",
+            result.err(),
         );
     }
 }

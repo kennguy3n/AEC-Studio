@@ -1,27 +1,23 @@
 [package]
-name = "aec_ai"
+name = "aec_integrity"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Local AI sidecar runtime: PrismML/llama.cpp control, grammars, safety validator, audit."
+description = "Binary + model integrity verification (BLAKE3 file hash + Ed25519 signed manifests) for AEC Studio."
 
 [dependencies]
-aec_core = { path = "../aec_core" }
-aec_audit = { path = "../aec_audit" }
-aec_bim = { path = "../aec_bim" }
-base64 = { workspace = true }
 blake3 = { workspace = true }
-chrono = { workspace = true }
+ed25519-dalek = { workspace = true }
 hex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-ureq = { workspace = true }
-uuid = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
+getrandom = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

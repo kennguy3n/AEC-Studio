@@ -37,7 +37,10 @@ uuid = { workspace = true }
 aec_governor = { path = "../aec_governor" }
 aec_export = { path = "../aec_export" }
 aec_ai = { path = "../aec_ai" }
+aec_integrity = { path = "../aec_integrity" }
+base64 = { workspace = true }
 blake3 = { workspace = true }
+tracing = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -121,11 +121,88 @@ pub struct AiPolicy {
     pub max_context_tokens: u32,
 }
 
+/// Phase 18 Group C Task 17 — per-tier image-gen governor policy.
+///
+/// Image-gen is single-model (no tier slug); the per-tier knobs we
+/// vary are the lifecycle timings and concurrency limits. The
+/// sidecar's resident-memory footprint (5–10× a text GGUF), GPU /
+/// CPU contention with the path-tracer, and cold-spawn latency make
+/// these the governance knobs that actually matter.
+///
+/// The bridge reads these into [`crate::ai::image_gen::ImageGenRuntimeConfig`]
+/// at boot so a Low-tier laptop and a Pro-tier workstation get
+/// runtime configs that match their hardware budget.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ImageGenPolicy {
+    /// How long the runtime may sit in `Ready` with no requests
+    /// before the bridge unloads the sidecar. Low-tier hardware
+    /// evicts much more aggressively (memory pressure) than
+    /// Pro-tier (no pressure → keep ready for snappy successive
+    /// generates).
+    pub idle_timeout_secs: u32,
+    /// Cold-spawn / health-load budget. Larger SD models (SDXL, FLUX)
+    /// can take 30+ seconds to mmap, so we generously over-provision
+    /// on every tier; on Low we cap shorter because we'd rather fail
+    /// fast and tell the user "your laptop can't run this model".
+    pub load_budget_secs: u32,
+    /// Maximum concurrent in-flight `generate` requests. Each
+    /// request is sequential on the sidecar, but a queue depth >1
+    /// lets the renderer batch a small UI burst (e.g. quick
+    /// re-prompt). Low tier caps at 1; Pro at 3.
+    pub max_parallel_requests: u32,
+    /// Whether the bridge will spawn / reuse the image-gen sidecar
+    /// while at least one path-traced render job is `Running` in the
+    /// render queue. On Low / Medium the answer is `false` — a
+    /// concurrent path-tracer would thrash CPU/GPU and crash the
+    /// sidecar on cold spawn; on High / Pro the answer is `true`
+    /// (the workstation can absorb both). This mirrors
+    /// [`RenderPolicy::allow_background_ai_during_render`] for the
+    /// text sidecar.
+    pub allow_during_pathtraced_render: bool,
+}
+
+impl Default for ImageGenPolicy {
+    /// Returns the Medium-tier policy. We mirror Medium because
+    /// that's the same "safe middle ground" the bridge advertises
+    /// as the boot default (see [`crate::bridge::image_gen_active_policy`]
+    /// in `aec_bridge`). The intent of this impl is to back
+    /// `#[serde(default)]` on the [`GovernorPolicy::image_gen`]
+    /// field — if a future binary deserializes a [`GovernorPolicy`]
+    /// JSON written by an older version that pre-dates the
+    /// `image_gen` field, the field comes in as Medium-tier
+    /// defaults rather than failing the entire decode with a
+    /// missing-field error. Construction at runtime always goes
+    /// through [`GovernorPolicy::for_tier`] which picks the
+    /// tier-correct values explicitly, so this `Default` is only
+    /// ever observed on the deserialize-from-stale-data path.
+    fn default() -> Self {
+        Self {
+            idle_timeout_secs: 120,
+            load_budget_secs: 60,
+            max_parallel_requests: 1,
+            allow_during_pathtraced_render: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct GovernorPolicy {
     pub tier: HardwareTier,
     pub render: RenderPolicy,
     pub ai: AiPolicy,
+    /// Phase 18 Group C — image-gen sidecar policy. See
+    /// [`ImageGenPolicy`] for the per-tier semantics.
+    ///
+    /// `#[serde(default)]` so a [`GovernorPolicy`] JSON written by
+    /// a pre-Group-C binary (no `image_gen` field) still
+    /// deserializes — the field comes in as
+    /// [`ImageGenPolicy::default`] (Medium-tier) instead of failing
+    /// the whole decode. Defensive: no caller persists
+    /// [`GovernorPolicy`] today, but the type implements `Deserialize`
+    /// so future config-file persistence MUST round-trip across
+    /// schema additions without bricking older configs.
+    #[serde(default)]
+    pub image_gen: ImageGenPolicy,
     pub mesh_cache_budget_mb: u32,
 }
 
@@ -149,6 +226,12 @@ impl GovernorPolicy {
                     max_parallel_requests: 1,
                     max_context_tokens: 4096,
                 },
+                image_gen: ImageGenPolicy {
+                    idle_timeout_secs: 60,
+                    load_budget_secs: 45,
+                    max_parallel_requests: 1,
+                    allow_during_pathtraced_render: false,
+                },
                 mesh_cache_budget_mb: 512,
             },
             HardwareTier::Medium => Self {
@@ -167,6 +250,12 @@ impl GovernorPolicy {
                     model_tier: AiModelTier::Small,
                     max_parallel_requests: 2,
                     max_context_tokens: 6144,
+                },
+                image_gen: ImageGenPolicy {
+                    idle_timeout_secs: 120,
+                    load_budget_secs: 60,
+                    max_parallel_requests: 1,
+                    allow_during_pathtraced_render: false,
                 },
                 mesh_cache_budget_mb: 1024,
             },
@@ -187,6 +276,12 @@ impl GovernorPolicy {
                     max_parallel_requests: 2,
                     max_context_tokens: 8192,
                 },
+                image_gen: ImageGenPolicy {
+                    idle_timeout_secs: 180,
+                    load_budget_secs: 75,
+                    max_parallel_requests: 2,
+                    allow_during_pathtraced_render: true,
+                },
                 mesh_cache_budget_mb: 2048,
             },
             HardwareTier::Pro => Self {
@@ -205,6 +300,12 @@ impl GovernorPolicy {
                     model_tier: AiModelTier::Large,
                     max_parallel_requests: 3,
                     max_context_tokens: 16384,
+                },
+                image_gen: ImageGenPolicy {
+                    idle_timeout_secs: 300,
+                    load_budget_secs: 90,
+                    max_parallel_requests: 3,
+                    allow_during_pathtraced_render: true,
                 },
                 mesh_cache_budget_mb: 4096,
             },
@@ -229,6 +330,107 @@ mod tests {
     fn low_tier_disallows_background_ai() {
         let low = GovernorPolicy::for_tier(HardwareTier::Low);
         assert!(!low.render.allow_background_ai_during_render);
+    }
+
+    #[test]
+    fn image_gen_policy_scales_monotonically_with_tier() {
+        // Phase 18 Group C Task 17 — higher hardware tier ⇒ longer
+        // resident window, larger spawn budget, more in-flight
+        // requests. Pinning this prevents future tier reshuffles
+        // from accidentally regressing image-gen capacity.
+        let low = GovernorPolicy::for_tier(HardwareTier::Low).image_gen;
+        let medium = GovernorPolicy::for_tier(HardwareTier::Medium).image_gen;
+        let high = GovernorPolicy::for_tier(HardwareTier::High).image_gen;
+        let pro = GovernorPolicy::for_tier(HardwareTier::Pro).image_gen;
+        assert!(low.idle_timeout_secs < medium.idle_timeout_secs);
+        assert!(medium.idle_timeout_secs < high.idle_timeout_secs);
+        assert!(high.idle_timeout_secs < pro.idle_timeout_secs);
+        assert!(low.load_budget_secs < medium.load_budget_secs);
+        assert!(medium.load_budget_secs < high.load_budget_secs);
+        assert!(high.load_budget_secs < pro.load_budget_secs);
+        assert!(low.max_parallel_requests <= medium.max_parallel_requests);
+        assert!(medium.max_parallel_requests < high.max_parallel_requests);
+        assert!(high.max_parallel_requests < pro.max_parallel_requests);
+    }
+
+    #[test]
+    fn low_and_medium_tiers_pause_image_gen_during_pathtraced_render() {
+        // Phase 18 Group C Task 17 — concurrent diffusion + path-tracer
+        // on a Low / Medium machine thrashes shared CPU/GPU resources
+        // and can OOM the sidecar at spawn. The bridge enforces this
+        // by inspecting the render queue for `Running` non-realtime
+        // jobs before spawning the image-gen sidecar. Pinned here so
+        // changing the policy requires updating the test (and thus
+        // surfacing the change in review).
+        assert!(
+            !GovernorPolicy::for_tier(HardwareTier::Low)
+                .image_gen
+                .allow_during_pathtraced_render
+        );
+        assert!(
+            !GovernorPolicy::for_tier(HardwareTier::Medium)
+                .image_gen
+                .allow_during_pathtraced_render
+        );
+        assert!(
+            GovernorPolicy::for_tier(HardwareTier::High)
+                .image_gen
+                .allow_during_pathtraced_render
+        );
+        assert!(
+            GovernorPolicy::for_tier(HardwareTier::Pro)
+                .image_gen
+                .allow_during_pathtraced_render
+        );
+    }
+
+    #[test]
+    fn image_gen_policy_default_matches_medium_tier_for_serde_default_fallback() {
+        // `#[serde(default)]` on `GovernorPolicy::image_gen` relies on
+        // `ImageGenPolicy::default` returning the Medium-tier policy,
+        // because Medium is the "safe middle ground" the bridge
+        // advertises as the boot default. Pinning the equality here
+        // keeps the default impl from drifting away from the for_tier
+        // values without a corresponding test failure.
+        let default_policy = ImageGenPolicy::default();
+        let medium_policy = GovernorPolicy::for_tier(HardwareTier::Medium).image_gen;
+        assert_eq!(default_policy, medium_policy);
+    }
+
+    #[test]
+    fn governor_policy_deserializes_legacy_json_without_image_gen_field() {
+        // Forward-compat: a `GovernorPolicy` JSON written by a
+        // pre-Group-C binary will have no `image_gen` field. The
+        // `#[serde(default)]` attribute on `GovernorPolicy::image_gen`
+        // must cause that missing field to come in as
+        // `ImageGenPolicy::default` (Medium-tier) rather than fail
+        // the whole decode with a missing-field error. Without this
+        // attribute, any future config-file persistence path would
+        // brick the moment a Group-C-aware binary read a Group-A-era
+        // config.
+        // We construct the legacy JSON by serializing a full
+        // Medium-tier policy and then *removing* the `image_gen`
+        // field, rather than hand-writing the JSON. This keeps the
+        // test resilient to future rename / alias attributes on
+        // unrelated fields (e.g. `eevee_resolution_scale` on
+        // `RenderPolicy`) — only the `image_gen` removal is the
+        // property under test.
+        let medium_full = GovernorPolicy::for_tier(HardwareTier::Medium);
+        let mut as_value =
+            serde_json::to_value(medium_full).expect("Medium policy must round-trip to JSON value");
+        let obj = as_value
+            .as_object_mut()
+            .expect("GovernorPolicy must serialize as a JSON object");
+        assert!(
+            obj.remove("image_gen").is_some(),
+            "expected `image_gen` field on serialized policy to remove"
+        );
+        let legacy_json =
+            serde_json::to_string(&as_value).expect("legacy JSON must reserialize cleanly");
+        let decoded: GovernorPolicy = serde_json::from_str(&legacy_json)
+            .expect("legacy GovernorPolicy without image_gen must still decode");
+        assert_eq!(decoded.image_gen, ImageGenPolicy::default());
+        assert_eq!(decoded.tier, HardwareTier::Medium);
     }
 
     #[test]

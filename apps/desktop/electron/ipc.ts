@@ -680,6 +680,255 @@ export function registerIpcHandlers(): void {
     return getBridge().aiSetActiveTier(tier);
   });
 
+  // ----- Phase 18 Group C: image-gen sidecar -----
+  //
+  // Parallel to the `ai:*` channel set, single-model (no tier slug).
+  // `imageGen:runtimeStatus` / `:modelAvailability` /
+  // `:downloadProgress` are cheap polls; `:downloadModel` and
+  // `:generate` are long-running (tokio blocking thread pool on the
+  // Rust side keeps the libuv main free). `:setDescriptor` pins the
+  // URL+hash+size the renderer's first-run wizard agreed on; the
+  // bridge validates these strictly (rejects empty filenames, non-
+  // http(s) URLs) so a renderer typo surfaces as a clean error
+  // rather than a half-applied descriptor.
+  ipcMain.handle("imageGen:runtimeStatus", async () =>
+    getBridge().imageGenRuntimeStatus(),
+  );
+  ipcMain.handle("imageGen:modelAvailability", async () =>
+    getBridge().imageGenModelAvailability(),
+  );
+  // Phase 18 Group D Task 20 — list curated image-gen presets for
+  // the first-run wizard. No payload to validate; the response is a
+  // (potentially empty) array of preset entries. The bridge layer
+  // is responsible for narrowing `BigInt` to `number`.
+  ipcMain.handle("imageGen:listPresets", async () =>
+    getBridge().imageGenListPresets(),
+  );
+  ipcMain.handle("imageGen:setDescriptor", async (_e, payload) => {
+    assertObject(payload, "params");
+    const { descriptor } = payload as { descriptor?: unknown };
+    assertObject(descriptor, "descriptor");
+    const {
+      filename,
+      sizeBytes,
+      blake3Hex,
+      downloadUrl,
+      vaeFilename,
+    } = descriptor as {
+      filename?: unknown;
+      sizeBytes?: unknown;
+      blake3Hex?: unknown;
+      downloadUrl?: unknown;
+      vaeFilename?: unknown;
+    };
+    assertString(filename, "descriptor.filename");
+    if (typeof sizeBytes !== "number" || !Number.isFinite(sizeBytes)) {
+      throw new Error(
+        "imageGen:setDescriptor: 'sizeBytes' must be a finite number",
+      );
+    }
+    if (!Number.isInteger(sizeBytes) || sizeBytes < 0) {
+      throw new Error(
+        "imageGen:setDescriptor: 'sizeBytes' must be a non-negative integer",
+      );
+    }
+    assertString(blake3Hex, "descriptor.blake3Hex");
+    // `downloadUrl` and `vaeFilename` are nullable on the wire.
+    let urlValue: string | null = null;
+    if (downloadUrl !== null && downloadUrl !== undefined) {
+      if (typeof downloadUrl !== "string") {
+        throw new Error(
+          "imageGen:setDescriptor: 'downloadUrl' must be a string when present",
+        );
+      }
+      urlValue = downloadUrl;
+    }
+    let vaeValue: string | null = null;
+    if (vaeFilename !== null && vaeFilename !== undefined) {
+      if (typeof vaeFilename !== "string") {
+        throw new Error(
+          "imageGen:setDescriptor: 'vaeFilename' must be a string when present",
+        );
+      }
+      vaeValue = vaeFilename;
+    }
+    return getBridge().imageGenSetDescriptor({
+      filename,
+      sizeBytes,
+      blake3Hex,
+      downloadUrl: urlValue,
+      vaeFilename: vaeValue,
+    });
+  });
+  ipcMain.handle("imageGen:downloadModel", async () =>
+    getBridge().imageGenDownloadModel(),
+  );
+  ipcMain.handle("imageGen:downloadProgress", async () =>
+    getBridge().imageGenDownloadProgress(),
+  );
+  ipcMain.handle("imageGen:generate", async (_e, payload) => {
+    assertObject(payload, "params");
+    const { request } = payload as { request?: unknown };
+    assertObject(request, "request");
+    const {
+      prompt,
+      negativePrompt,
+      width,
+      height,
+      steps,
+      cfgScale,
+      seed,
+      sampler,
+    } = request as {
+      prompt?: unknown;
+      negativePrompt?: unknown;
+      width?: unknown;
+      height?: unknown;
+      steps?: unknown;
+      cfgScale?: unknown;
+      seed?: unknown;
+      sampler?: unknown;
+    };
+    assertString(prompt, "request.prompt");
+    const dim = (label: string, v: unknown): number => {
+      if (typeof v !== "number" || !Number.isFinite(v)) {
+        throw new Error(`imageGen:generate: '${label}' must be a finite number`);
+      }
+      if (!Number.isInteger(v) || v <= 0) {
+        throw new Error(
+          `imageGen:generate: '${label}' must be a positive integer`,
+        );
+      }
+      return v;
+    };
+    const widthN = dim("width", width);
+    const heightN = dim("height", height);
+    const stepsN = dim("steps", steps);
+    if (typeof cfgScale !== "number" || !Number.isFinite(cfgScale)) {
+      throw new Error(
+        "imageGen:generate: 'cfgScale' must be a finite number",
+      );
+    }
+    let negativeValue: string | null = null;
+    if (negativePrompt !== null && negativePrompt !== undefined) {
+      if (typeof negativePrompt !== "string") {
+        throw new Error(
+          "imageGen:generate: 'negativePrompt' must be a string when present",
+        );
+      }
+      negativeValue = negativePrompt;
+    }
+    let seedValue: number | null = null;
+    if (seed !== null && seed !== undefined) {
+      if (typeof seed !== "number" || !Number.isFinite(seed)) {
+        throw new Error(
+          "imageGen:generate: 'seed' must be a finite number when present",
+        );
+      }
+      if (!Number.isInteger(seed)) {
+        throw new Error(
+          "imageGen:generate: 'seed' must be an integer when present",
+        );
+      }
+      seedValue = seed;
+    }
+    let samplerValue: string | null = null;
+    if (sampler !== null && sampler !== undefined) {
+      if (typeof sampler !== "string") {
+        throw new Error(
+          "imageGen:generate: 'sampler' must be a string when present",
+        );
+      }
+      samplerValue = sampler;
+    }
+    return getBridge().imageGenGenerate({
+      prompt,
+      negativePrompt: negativeValue,
+      width: widthN,
+      height: heightN,
+      steps: stepsN,
+      cfgScale,
+      seed: seedValue,
+      sampler: samplerValue,
+    });
+  });
+
+  // ----- Phase 18 Group C Task 17 — governor policy IPC -----
+  //
+  // Symmetric to the `ai:*` family above: `imageGen:activePolicy`
+  // reads the active policy, `imageGen:applyPolicy` swaps in a
+  // caller-supplied policy (used by tests / advanced settings),
+  // `governor:applyHardwareTier` derives the policy from a tier
+  // slug (the normal flow), and `render:pathtracedInProgress`
+  // exposes the gating signal the image-gen panel uses to render
+  // the "paused while rendering" banner.
+
+  ipcMain.handle("imageGen:activePolicy", async () =>
+    getBridge().imageGenActivePolicy(),
+  );
+
+  ipcMain.handle("imageGen:applyPolicy", async (_e, payload) => {
+    assertObject(payload, "params");
+    const { policy } = payload as { policy?: unknown };
+    assertObject(policy, "policy");
+    const {
+      idleTimeoutSecs,
+      loadBudgetSecs,
+      maxParallelRequests,
+      allowDuringPathtracedRender,
+    } = policy as {
+      idleTimeoutSecs?: unknown;
+      loadBudgetSecs?: unknown;
+      maxParallelRequests?: unknown;
+      allowDuringPathtracedRender?: unknown;
+    };
+    const u32 = (label: string, v: unknown): number => {
+      if (typeof v !== "number" || !Number.isFinite(v)) {
+        throw new Error(
+          `imageGen:applyPolicy: '${label}' must be a finite number`,
+        );
+      }
+      if (!Number.isInteger(v) || v < 0 || v > 0xffffffff) {
+        throw new Error(
+          `imageGen:applyPolicy: '${label}' must be a non-negative 32-bit integer`,
+        );
+      }
+      return v;
+    };
+    if (typeof allowDuringPathtracedRender !== "boolean") {
+      throw new Error(
+        "imageGen:applyPolicy: 'allowDuringPathtracedRender' must be a boolean",
+      );
+    }
+    return getBridge().imageGenApplyPolicy({
+      idleTimeoutSecs: u32("idleTimeoutSecs", idleTimeoutSecs),
+      loadBudgetSecs: u32("loadBudgetSecs", loadBudgetSecs),
+      maxParallelRequests: u32("maxParallelRequests", maxParallelRequests),
+      allowDuringPathtracedRender,
+    });
+  });
+
+  ipcMain.handle("governor:applyHardwareTier", async (_e, payload) => {
+    assertObject(payload, "params");
+    const { tier } = payload as { tier?: unknown };
+    assertString(tier, "tier");
+    if (
+      tier !== "low" &&
+      tier !== "medium" &&
+      tier !== "high" &&
+      tier !== "pro"
+    ) {
+      throw new Error(
+        `governor:applyHardwareTier: 'tier' must be one of low/medium/high/pro (got ${tier})`,
+      );
+    }
+    return getBridge().governorApplyHardwareTier(tier);
+  });
+
+  ipcMain.handle("render:pathtracedInProgress", async () =>
+    getBridge().pathtracedRenderInProgress(),
+  );
+
   // ----- Extensions (Phase 16) -----
   //
   // Per-extension boot diagnostics. The bridge intentionally

@@ -435,6 +435,12 @@ const api = {
       path: string | null;
       intensity?: number;
     }) => ipcRenderer.invoke("render:setEnvironmentMap", params),
+    // Phase 18 Group C Task 17 — `true` iff at least one
+    // non-realtime render is currently `Running`. Polled by the
+    // image-gen panel to gate the generate button + render the
+    // "paused while rendering" banner on Low / Medium tiers.
+    pathtracedInProgress: (): Promise<boolean> =>
+      ipcRenderer.invoke("render:pathtracedInProgress"),
   },
 
   // ----- AI -----
@@ -455,6 +461,107 @@ const api = {
     downloadProgress: () => ipcRenderer.invoke("ai:downloadProgress"),
     setActiveTier: (tier: "small" | "medium" | "large") =>
       ipcRenderer.invoke("ai:setActiveTier", { tier }),
+  },
+
+  // ----- Image generation (Phase 18 Group C) -----
+  //
+  // Parallel to the text `ai` surface but single-model (no tier).
+  // The renderer's `ImageGenPanel` calls these five methods plus a
+  // ~500 ms `downloadProgress` poll while a download is in flight,
+  // identical to the text panel's pattern. Each call is forwarded
+  // to the main process's bridge over IPC; the main process
+  // dispatches to the native N-API library or the in-process
+  // fallback. See `bridge.ts` for the wire shapes.
+  imageGen: {
+    runtimeStatus: (): Promise<{
+      state: "idle" | "loading" | "ready" | "failed";
+      lastError: string | null;
+    }> => ipcRenderer.invoke("imageGen:runtimeStatus"),
+    modelAvailability: (): Promise<{
+      filename: string;
+      sizeBytes: number;
+      available: boolean;
+      sizeOnDisk: number;
+      downloadUrl: string | null;
+      blake3Hex: string;
+      modelsDir: string;
+    }> => ipcRenderer.invoke("imageGen:modelAvailability"),
+    // Phase 18 Group D Task 20 — surface the curated image-gen
+    // preset registry to the first-run wizard. Cheap (registry is
+    // baked into the binary); panel calls this once on mount.
+    listPresets: (): Promise<
+      Array<{
+        id: string;
+        displayName: string;
+        filename: string;
+        sizeBytes: number;
+        blake3Hex: string;
+        downloadUrl: string | null;
+        vaeFilename: string | null;
+      }>
+    > => ipcRenderer.invoke("imageGen:listPresets"),
+    setDescriptor: (descriptor: {
+      filename: string;
+      sizeBytes: number;
+      blake3Hex: string;
+      downloadUrl: string | null;
+      vaeFilename: string | null;
+    }): Promise<void> =>
+      ipcRenderer.invoke("imageGen:setDescriptor", { descriptor }),
+    downloadModel: (): Promise<{
+      filename: string;
+      path: string;
+      sizeBytes: number;
+    }> => ipcRenderer.invoke("imageGen:downloadModel"),
+    downloadProgress: (): Promise<{
+      filename: string;
+      downloaded: number;
+      total: number;
+      state: "downloading" | "verifying" | "completed" | "failed";
+      message: string | null;
+    } | null> => ipcRenderer.invoke("imageGen:downloadProgress"),
+    generate: (request: {
+      prompt: string;
+      negativePrompt?: string | null;
+      width: number;
+      height: number;
+      steps: number;
+      cfgScale: number;
+      seed?: number | null;
+      sampler?: string | null;
+    }): Promise<{
+      pngBase64: string;
+      seed: number | null;
+      width: number;
+      height: number;
+      steps: number;
+      info: string | null;
+    }> => ipcRenderer.invoke("imageGen:generate", { request }),
+    // Phase 18 Group C Task 17 — governor policy surface.
+    activePolicy: (): Promise<{
+      idleTimeoutSecs: number;
+      loadBudgetSecs: number;
+      maxParallelRequests: number;
+      allowDuringPathtracedRender: boolean;
+    }> => ipcRenderer.invoke("imageGen:activePolicy"),
+    applyPolicy: (policy: {
+      idleTimeoutSecs: number;
+      loadBudgetSecs: number;
+      maxParallelRequests: number;
+      allowDuringPathtracedRender: boolean;
+    }): Promise<void> =>
+      ipcRenderer.invoke("imageGen:applyPolicy", { policy }),
+  },
+
+  // Phase 18 Group C Task 17 — top-level governor surface. The
+  // image-gen panel calls `governor.applyHardwareTier` when the
+  // user changes the hardware tier so the new policy + runtime
+  // config take effect immediately. The render-queue inspection
+  // method (`pathtracedInProgress`) lives on the existing `render`
+  // namespace above to keep that surface cohesive.
+  governor: {
+    applyHardwareTier: (tier: "low" | "medium" | "high" | "pro"): Promise<void> =>
+      ipcRenderer.invoke("governor:applyHardwareTier", { tier }),
   },
 
   // ----- Extensions (Phase 16) -----
