@@ -16,6 +16,7 @@ pub mod grammars;
 pub mod http;
 pub mod layout_suggestion;
 pub mod lighting_balance;
+pub mod model_download;
 pub mod model_manager;
 pub mod plan_detection;
 pub mod plan_to_wall;
@@ -52,6 +53,7 @@ pub use layout_suggestion::{LayoutProposal, LayoutSuggestionResult, LayoutValida
 pub use lighting_balance::{
     AccentLight, AccentLightKind, LightingBalanceError, LightingBalanceResult, MAX_ACCENT_LIGHTS,
 };
+pub use model_download::{download_to_file, DownloadError, ProgressCallback};
 pub use model_manager::{
     select_tier as select_model_tier, ModelDescriptor, ModelManager, ModelManagerError, ModelTier,
 };
@@ -66,7 +68,7 @@ pub use property_fill::{
     PropertyProposal, StandardRule,
 };
 pub use render_doctor::{RenderDoctorFinding, RenderDoctorResult, RenderIssue};
-pub use runtime::{RuntimeConfig, RuntimeError, RuntimeState, SidecarRuntime};
+pub use runtime::{default_models_dir, RuntimeConfig, RuntimeError, RuntimeState, SidecarRuntime};
 pub use safety_validator::{SafetyError, SafetyValidator, SafetyViolation};
 pub use schedule_fill::{
     FilledRow, ScheduleFillError, ScheduleFillResult, REVIEW_CONFIDENCE_THRESHOLD,

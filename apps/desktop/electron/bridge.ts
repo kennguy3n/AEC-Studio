@@ -206,6 +206,51 @@ export interface AiRejectOutcome {
   auditChainHead: string;
 }
 
+/** Lowercase tier slug for the Ternary-Bonsai text models. */
+export type AiModelTierSlug = "small" | "medium" | "large";
+
+/** One row in {@link AiModelAvailability}. */
+export interface AiModelTierInfo {
+  tier: AiModelTierSlug;
+  /** Human-readable name, e.g. `"Ternary-Bonsai 1.7B (1.58-bit GGUF Q2_0)"`. */
+  name: string;
+  /** Filename inside `modelsDir`. */
+  filename: string;
+  /** Expected file size (from the HuggingFace LFS pointer). */
+  sizeBytes: number;
+  /** `true` iff the file exists and its length matches `sizeBytes`. */
+  available: boolean;
+  /** Actual on-disk byte length. 0 when the file is missing. */
+  sizeOnDisk: number;
+}
+
+/** Snapshot of all three text-model tiers + the active tier. */
+export interface AiModelAvailability {
+  tiers: AiModelTierInfo[];
+  activeTier: AiModelTierSlug;
+  /** Absolute path to the directory the bridge stores GGUFs in. */
+  modelsDir: string;
+}
+
+/** Live progress snapshot of an in-flight model download. */
+export interface AiDownloadProgress {
+  tier: AiModelTierSlug;
+  downloaded: number;
+  total: number;
+  /** One of `"downloading" | "verifying" | "completed" | "failed"`. */
+  state: "downloading" | "verifying" | "completed" | "failed";
+  /** Populated on `"failed"`; cleared on every other state. */
+  message: string | null;
+}
+
+/** Successful return of {@link BridgeBackend.aiDownloadModel}. */
+export interface AiDownloadResult {
+  tier: AiModelTierSlug;
+  /** Absolute on-disk path of the verified GGUF. */
+  path: string;
+  sizeBytes: number;
+}
+
 /** Parsed payloads for individual AI tools, tagged by `tool`. */
 export type AiPlanParsed =
   | LayoutSuggestionParsed
@@ -566,6 +611,34 @@ export interface BridgeBackend {
   ): Promise<AiRejectOutcome>;
   aiCancelJob(jobId: string): Promise<{ cancelled: true }>;
   aiRuntimeStatus(): Promise<{ state: string; lastError: string | null }>;
+
+  /**
+   * Snapshot of which Ternary-Bonsai tiers are present on disk and
+   * which one is active. Cheap; Settings calls this on mount and
+   * after every download / delete to redraw its per-tier badges.
+   */
+  aiModelAvailability(): Promise<AiModelAvailability>;
+  /**
+   * Download the GGUF for `tier` (`"small" | "medium" | "large"`) to
+   * the configured `models_dir`, verifying its BLAKE3 before
+   * atomically renaming into place. Long-running (tens of seconds to
+   * minutes depending on tier + connection). The Rust side updates
+   * the progress slot on every chunk; poll via
+   * {@link aiDownloadProgress} for the UI's progress bar.
+   */
+  aiDownloadModel(tier: AiModelTierSlug): Promise<AiDownloadResult>;
+  /**
+   * Read the in-process download progress slot. Returns `null` when
+   * no download has run this session. Cheap; the Settings page polls
+   * this every ~500 ms while a download is in flight.
+   */
+  aiDownloadProgress(): Promise<AiDownloadProgress | null>;
+  /**
+   * Overwrite the active tier on the in-process model manager. Does
+   * NOT respawn the sidecar — the next `aiPlan` cold-spawn picks up
+   * the new tier's GGUF via `ModelManager::active_config`.
+   */
+  aiSetActiveTier(tier: AiModelTierSlug): Promise<void>;
 
   /**
    * List per-extension boot failures captured by the Rust bridge
@@ -2040,6 +2113,16 @@ interface NativeApi {
   ai_reject_diff(diff_id: string, reason?: string | null): Promise<unknown>;
   ai_cancel_job(job_id: string): Promise<unknown>;
   ai_runtime_status(): Promise<unknown>;
+  // ----- Phase 18 group A: model download surface -----
+  // `tier` is `"small" | "medium" | "large"`. `ai_download_model`
+  // resolves when the GGUF has been downloaded **and** BLAKE3-verified.
+  // `ai_download_progress` is a sync read of the in-process progress
+  // slot — the renderer polls it ~every 500 ms while the Settings
+  // page is open.
+  ai_model_availability(): Promise<unknown>;
+  ai_download_model(tier: string): Promise<unknown>;
+  ai_download_progress(): unknown;
+  ai_set_active_tier(tier: string): Promise<unknown>;
   // Extension load diagnostics — see `BridgeBackend.extensionsListLoadDiagnostics`.
   // Sync N-API export (the captured slice lives in process memory
   // and is empty in the common no-broken-extensions case), so the
@@ -2257,6 +2340,10 @@ export const NATIVE_WIRED_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   "aiRejectDiff",
   "aiCancelJob",
   "aiRuntimeStatus",
+  "aiModelAvailability",
+  "aiDownloadModel",
+  "aiDownloadProgress",
+  "aiSetActiveTier",
   "extensionsListLoadDiagnostics",
   // Group A (Phase 10) — draft.* / deliver.* parity with
   // design.* / bim.*. Each routes through a `#[napi]` export
@@ -3017,6 +3104,81 @@ function adaptNative(n: NativeApi): BridgeBackend {
       // reads it; if/when the AI sidebar wants to render a
       // "3 pending diffs" badge, widen the interface in a follow-up.
       return { state: r.state, lastError: r.lastError };
+    },
+    aiModelAvailability: async () => {
+      const r = (await n.ai_model_availability()) as {
+        tiers: Array<{
+          tier: string;
+          name: string;
+          filename: string;
+          // `BigInt` over the napi boundary because the largest GGUF
+          // (8B Q2_0) is ~2.18 GiB — safe in a JS `number` but the
+          // napi-rs surface unconditionally marshals `u64` as
+          // `BigInt`, so we narrow to `number` here once.
+          sizeBytes: bigint;
+          available: boolean;
+          sizeOnDisk: bigint;
+        }>;
+        activeTier: string;
+        modelsDir: string;
+      };
+      return {
+        tiers: r.tiers.map((t) => ({
+          tier: t.tier as AiModelTierSlug,
+          name: t.name,
+          filename: t.filename,
+          sizeBytes: Number(t.sizeBytes),
+          available: t.available,
+          sizeOnDisk: Number(t.sizeOnDisk),
+        })),
+        activeTier: r.activeTier as AiModelTierSlug,
+        modelsDir: r.modelsDir,
+      };
+    },
+    aiDownloadModel: async (tier) => {
+      // `n.ai_download_model` is async and routed through
+      // `spawn_blocking_napi` on the Rust side, so the libuv main
+      // thread stays free for `aiDownloadProgress` polls during the
+      // tens-of-seconds-to-minutes download. Don't add a JS-side
+      // timeout — the Rust side already has its own.
+      const r = (await n.ai_download_model(tier)) as {
+        tier: string;
+        path: string;
+        sizeBytes: bigint;
+      };
+      return {
+        tier: r.tier as AiModelTierSlug,
+        path: r.path,
+        sizeBytes: Number(r.sizeBytes),
+      };
+    },
+    aiDownloadProgress: async () => {
+      // Sync N-API export; the slot is `Mutex<Option<...>>` and the
+      // read is O(microseconds). `Promise.resolve` to satisfy the
+      // async backend contract.
+      const r = n.ai_download_progress() as
+        | {
+            tier: string;
+            downloaded: bigint;
+            total: bigint;
+            state: "downloading" | "verifying" | "completed" | "failed";
+            message: string | null;
+          }
+        | null
+        | undefined;
+      if (!r) {
+        return null;
+      }
+      return {
+        tier: r.tier as AiModelTierSlug,
+        downloaded: Number(r.downloaded),
+        total: Number(r.total),
+        state: r.state,
+        message: r.message,
+      };
+    },
+    aiSetActiveTier: async (tier) => {
+      await n.ai_set_active_tier(tier);
     },
     // Phase 16 — per-extension boot diagnostics. Sync N-API export
     // (the captured slice lives in process memory and is empty in
@@ -4090,6 +4252,52 @@ export function inProcessBackend(): BridgeBackend {
     async aiRuntimeStatus() {
       return { state: "idle", lastError: null };
     },
+    async aiModelAvailability() {
+      // Vitest / SSR fallback: report the canonical Ternary-Bonsai
+      // tier list with all three tiers marked unavailable. This lets
+      // the Settings page render its "Download" buttons in unit tests
+      // without spinning up the napi backend.
+      return {
+        tiers: [
+          {
+            tier: "small",
+            name: "Ternary-Bonsai 1.7B (1.58-bit GGUF Q2_0)",
+            filename: "Ternary-Bonsai-1.7B-Q2_0.gguf",
+            sizeBytes: 463_290_464,
+            available: false,
+            sizeOnDisk: 0,
+          },
+          {
+            tier: "medium",
+            name: "Ternary-Bonsai 4B (1.58-bit GGUF Q2_0)",
+            filename: "Ternary-Bonsai-4B-Q2_0.gguf",
+            sizeBytes: 1_074_969_344,
+            available: false,
+            sizeOnDisk: 0,
+          },
+          {
+            tier: "large",
+            name: "Ternary-Bonsai 8B (1.58-bit GGUF Q2_0)",
+            filename: "Ternary-Bonsai-8B-Q2_0.gguf",
+            sizeBytes: 2_182_184_672,
+            available: false,
+            sizeOnDisk: 0,
+          },
+        ],
+        activeTier: "small",
+        modelsDir: "",
+      };
+    },
+    async aiDownloadModel(tier) {
+      // Vitest / SSR fallback: no real download path; pretend the
+      // file landed at a deterministic stub path so component tests
+      // can exercise the success branch without HTTP.
+      return { tier, path: "", sizeBytes: 0 };
+    },
+    async aiDownloadProgress() {
+      return null;
+    },
+    async aiSetActiveTier(_tier) {},
 
     async extensionsListLoadDiagnostics() {
       // Vitest / SSR fallback: the in-process backend does not boot

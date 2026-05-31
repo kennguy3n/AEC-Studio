@@ -2948,6 +2948,117 @@ pub async fn ai_runtime_status() -> Result<AiRuntimeStatusJs> {
     .await
 }
 
+#[napi(object)]
+pub struct AiModelTierInfoJs {
+    pub tier: String,
+    pub name: String,
+    pub filename: String,
+    pub size_bytes: BigInt,
+    pub available: bool,
+    pub size_on_disk: BigInt,
+}
+
+#[napi(object)]
+pub struct AiModelAvailabilityJs {
+    pub tiers: Vec<AiModelTierInfoJs>,
+    pub active_tier: String,
+    pub models_dir: String,
+}
+
+#[napi(object)]
+pub struct AiDownloadProgressJs {
+    pub tier: String,
+    pub downloaded: BigInt,
+    pub total: BigInt,
+    /// One of `"downloading" | "verifying" | "completed" | "failed"`.
+    pub state: String,
+    pub message: Option<String>,
+}
+
+#[napi(object)]
+pub struct AiDownloadResultJs {
+    pub tier: String,
+    pub path: String,
+    pub size_bytes: BigInt,
+}
+
+/// Snapshot of which Ternary-Bonsai tiers are available on disk and
+/// which one is currently the active tier. The Settings page calls
+/// this on mount and after every download / delete to redraw its
+/// per-tier badges.
+#[napi]
+pub async fn ai_model_availability() -> Result<AiModelAvailabilityJs> {
+    spawn_blocking_napi(move || {
+        with_service_ref_fallible(super::service::BridgeService::ai_model_availability).map(|r| {
+            AiModelAvailabilityJs {
+                tiers: r
+                    .tiers
+                    .into_iter()
+                    .map(|t| AiModelTierInfoJs {
+                        tier: t.tier,
+                        name: t.name,
+                        filename: t.filename,
+                        size_bytes: BigInt::from(t.size_bytes),
+                        available: t.available,
+                        size_on_disk: BigInt::from(t.size_on_disk),
+                    })
+                    .collect(),
+                active_tier: r.active_tier,
+                models_dir: r.models_dir,
+            }
+        })
+    })
+    .await
+}
+
+/// Download the GGUF for `tier` to the configured `models_dir` and
+/// verify its BLAKE3. Blocks for the duration of the download
+/// (typically tens of seconds for the 1.7B model on a fast link, up
+/// to a few minutes for 8B). Routed through `spawn_blocking_napi` so
+/// the libuv main thread stays free for `ai_download_progress` polls
+/// (which run every ~500 ms to drive the Settings progress bar) and
+/// every other IPC call.
+#[napi]
+pub async fn ai_download_model(tier: String) -> Result<AiDownloadResultJs> {
+    spawn_blocking_napi(move || {
+        with_service_ref_fallible(|svc| svc.ai_download_model(&tier)).map(|r| AiDownloadResultJs {
+            tier: r.tier,
+            path: r.path,
+            size_bytes: BigInt::from(r.size_bytes),
+        })
+    })
+    .await
+}
+
+/// Return the most recent download progress snapshot, or `null` when
+/// no download has run this session. The Settings download panel
+/// polls this every ~500 ms while a download is in flight; otherwise
+/// the renderer can just call it once on mount.
+///
+/// Sync read because the slot is a single `Mutex<Option<...>>` and
+/// every read is O(microseconds).
+#[napi]
+pub fn ai_download_progress() -> Result<Option<AiDownloadProgressJs>> {
+    with_service_ref_fallible(super::service::BridgeService::ai_download_progress).map(|opt| {
+        opt.map(|p| AiDownloadProgressJs {
+            tier: p.tier,
+            downloaded: BigInt::from(p.downloaded),
+            total: BigInt::from(p.total),
+            state: p.state,
+            message: p.message,
+        })
+    })
+}
+
+/// Overwrite the active tier on the in-process model manager. Does
+/// NOT respawn the sidecar — the next `ai_plan` cold-spawn picks up
+/// the new tier's GGUF via `ModelManager::active_config`.
+#[napi]
+pub async fn ai_set_active_tier(tier: String) -> Result<()> {
+    spawn_blocking_napi(move || with_service_ref_fallible(|svc| svc.ai_set_active_tier(&tier)))
+        .await
+}
+
 // ============================================================
 // draft.* / deliver.* (Group A, Phase 10)
 // ============================================================

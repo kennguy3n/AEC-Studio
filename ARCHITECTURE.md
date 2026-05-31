@@ -809,7 +809,7 @@ crates/aec_governor/
 
 - Render preset and sample count.
 - Number of concurrent path-tracer tiles.
-- AI model tier (Bonsai 1.7B / 4B / 8B).
+- AI model tier (Ternary-Bonsai 1.7B / 4B / 8B, all 1.58-bit GGUF Q2_0).
 - Whether the PBR preview runs at full or half resolution.
 - Whether the 3D viewport runs at native or downscaled framebuffer under heavy load.
 - Eviction policy for the geometry mesh cache.
@@ -822,10 +822,10 @@ crates/aec_governor/
 
 | Profile | CPU | RAM | GPU | Default model tier | Default render preset |
 |---|---|---|---|---|---|
-| **Low** | Dual-core / 4-thread x86 or older M1 | 4–6 GB | None / integrated | Bonsai 1.7B Q4_K_M | PBR preview only, path tracer "Quick" (CPU fallback) |
-| **Medium** | Modern 6-core x86 or M2 | 8–12 GB | Integrated or low-end discrete | Bonsai 1.7B / 4B | Path tracer "Standard" |
-| **High** | 8+ cores or M2 Pro / M3 | 16–32 GB | RTX 3060 / Apple GPU 10-core+ | Bonsai 4B | Path tracer "High" |
-| **Pro** | 12+ cores / Threadripper / M3 Max | 32+ GB | RTX 4070+ or Apple GPU 30-core+ | Bonsai 8B | Path tracer "Studio" |
+| **Low** | Dual-core / 4-thread x86 or older M1 | 4–6 GB | None / integrated | Ternary-Bonsai 1.7B (1.58-bit GGUF Q2_0, ~442 MiB on disk, ~1.5 GiB resident) | PBR preview only, path tracer "Quick" (CPU fallback) |
+| **Medium** | Modern 6-core x86 or M2 | 8–12 GB | Integrated or low-end discrete | Ternary-Bonsai 1.7B / 4B (1.58-bit, ~1.0 GiB on disk for 4B) | Path tracer "Standard" |
+| **High** | 8+ cores or M2 Pro / M3 | 16–32 GB | RTX 3060 / Apple GPU 10-core+ | Ternary-Bonsai 4B (1.58-bit, ~2.5 GiB resident) | Path tracer "High" |
+| **Pro** | 12+ cores / Threadripper / M3 Max | 32+ GB | RTX 4070+ or Apple GPU 30-core+ | Ternary-Bonsai 8B (1.58-bit GGUF Q2_0, ~2.0 GiB on disk, ~4.5 GiB resident) | Path tracer "Studio" |
 
 The profile is detected at first run and re-evaluated when the user changes the runtime configuration. Users can override the recommended tier but the governor logs and surfaces the override.
 
@@ -980,7 +980,7 @@ Asset import (glTF / FBX / OBJ)
 | Memory | Model tier matched to the hardware profile |
 | Throughput | `--parallel 2` shared sidecar, per-request cancellation |
 | Latency | Grammar-constrained decoding emits only valid tool-call tokens |
-| Quality | Bonsai 1.7B for simple tools; auto-upgrade to 4B/8B for planning |
+| Quality | Ternary-Bonsai 1.7B (1.58-bit) for simple tools; auto-upgrade to 4B/8B for planning |
 | Power | Mac thermal back-off; Windows GPU split between viewport and inference |
 | Determinism | Fixed seeds and deterministic samplers when reproducibility is required |
 | Safety | All outputs pass through the safety validator before any commit |
@@ -1036,10 +1036,10 @@ All tool-call outputs are constrained with **GBNF** grammars in `crates/aec_ai/g
 
 | Tier | Available RAM | Capability |
 |---|---|---|
-| **Low** | 4–6 GB | Bonsai 1.7B Q4_K_M only, no concurrent AI + render |
-| **Medium** | 8–12 GB | Bonsai 1.7B / 4B, AI + PBR preview concurrently |
-| **High** | 16–32 GB | Bonsai 4B always-on, AI + path tracer concurrent (with governor) |
-| **Pro** | 32+ GB | Bonsai 8B always-on, multi-job AI + render |
+| **Low** | 4–6 GB | Ternary-Bonsai 1.7B (1.58-bit GGUF Q2_0) only, no concurrent AI + render |
+| **Medium** | 8–12 GB | Ternary-Bonsai 1.7B / 4B (1.58-bit), AI + PBR preview concurrently |
+| **High** | 16–32 GB | Ternary-Bonsai 4B (1.58-bit) always-on, AI + path tracer concurrent (with governor) |
+| **Pro** | 32+ GB | Ternary-Bonsai 8B (1.58-bit) always-on, multi-job AI + render |
 
 ---
 
@@ -1129,10 +1129,10 @@ Encryption uses SQLCipher with **AES-256 page-level** and per-project keys. Cont
 
 | Tier | Available RAM | Capability |
 |---|---|---|
-| **Low** | 4–6 GB | Bonsai 1.7B Q4_K_M only, PBR preview, single render job |
-| **Medium** | 8–12 GB | Bonsai 1.7B / 4B, path tracer "Standard" |
-| **High** | 16–32 GB | Bonsai 4B always-on, path tracer "High" with GPU denoise |
-| **Pro** | 32+ GB | Bonsai 8B always-on, path tracer "Studio", multi-job render queue |
+| **Low** | 4–6 GB | Ternary-Bonsai 1.7B (1.58-bit GGUF Q2_0) only, PBR preview, single render job |
+| **Medium** | 8–12 GB | Ternary-Bonsai 1.7B / 4B (1.58-bit), path tracer "Standard" |
+| **High** | 16–32 GB | Ternary-Bonsai 4B (1.58-bit) always-on, path tracer "High" with GPU denoise |
+| **Pro** | 32+ GB | Ternary-Bonsai 8B (1.58-bit) always-on, path tracer "Studio", multi-job render queue |
 
 ---
 

@@ -637,6 +637,48 @@ export function registerIpcHandlers(): void {
     return getBridge().aiCancelJob(jobId);
   });
   ipcMain.handle("ai:runtimeStatus", async () => getBridge().aiRuntimeStatus());
+  // ----- Phase 18 Group A: text-model download -----
+  //
+  // `ai:modelAvailability` is cheap (three syscalls); the Settings
+  // page calls it on mount and after every download / delete.
+  // `ai:downloadModel` is long-running (tens of seconds to minutes
+  // depending on tier + connection) — the Rust side runs it on the
+  // tokio blocking thread pool so the libuv main thread stays free
+  // for `ai:downloadProgress` polls (~500 ms) and every other IPC.
+  // `ai:downloadProgress` is a single `Mutex<Option<...>>` read,
+  // returns `null` when no download has ever run this session.
+  // `ai:setActiveTier` overwrites the active tier in the in-process
+  // model manager — the next `ai:plan` cold-spawn picks up the
+  // new GGUF via `ModelManager::active_config`. None of these
+  // touch project state, so no `withResolvedProjectPath` wrapping.
+  ipcMain.handle("ai:modelAvailability", async () =>
+    getBridge().aiModelAvailability(),
+  );
+  ipcMain.handle("ai:downloadModel", async (_e, payload) => {
+    assertObject(payload, "params");
+    const { tier } = payload as { tier?: unknown };
+    assertString(tier, "tier");
+    if (tier !== "small" && tier !== "medium" && tier !== "large") {
+      throw new Error(
+        "ai:downloadModel: 'tier' must be one of 'small' | 'medium' | 'large'",
+      );
+    }
+    return getBridge().aiDownloadModel(tier);
+  });
+  ipcMain.handle("ai:downloadProgress", async () =>
+    getBridge().aiDownloadProgress(),
+  );
+  ipcMain.handle("ai:setActiveTier", async (_e, payload) => {
+    assertObject(payload, "params");
+    const { tier } = payload as { tier?: unknown };
+    assertString(tier, "tier");
+    if (tier !== "small" && tier !== "medium" && tier !== "large") {
+      throw new Error(
+        "ai:setActiveTier: 'tier' must be one of 'small' | 'medium' | 'large'",
+      );
+    }
+    return getBridge().aiSetActiveTier(tier);
+  });
 
   // ----- Extensions (Phase 16) -----
   //

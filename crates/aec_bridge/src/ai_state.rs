@@ -188,10 +188,10 @@ fn poisoned<T>(err: std::sync::PoisonError<T>) -> AiStateError {
 }
 
 impl AiState {
-    /// Initialise with the sidecar config baked from
-    /// `workers/ai/config.json`. Does NOT spawn the sidecar yet —
-    /// spawning is deferred until the first `ai_plan` call so the
-    /// renderer can boot without paying the model-load cost.
+    /// Initialise with the supplied sidecar config (see
+    /// [`aec_ai::RuntimeConfig::default`]). Does NOT spawn the sidecar
+    /// yet — spawning is deferred until the first `ai_plan` call so
+    /// the renderer can boot without paying the model-load cost.
     pub fn new(config: RuntimeConfig) -> Self {
         Self {
             runtime: RwLock::new(SidecarRuntime::new(config)),
