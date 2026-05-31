@@ -195,8 +195,11 @@ export function AiModelsSection(): JSX.Element {
             progress.tier === t.tier;
           const failed =
             progress?.state === "failed" && progress.tier === t.tier;
-          const buttonDisabled =
-            t.available || pendingTier !== null;
+          // The Download button is only rendered inside the
+          // `{!t.available && (...)}` branch below, so `t.available`
+          // would be dead in the disabled-flag computation; we just
+          // disable while another tier is downloading.
+          const buttonDisabled = pendingTier !== null;
           return (
             <li
               key={t.tier}

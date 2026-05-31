@@ -1545,20 +1545,21 @@ pub struct AiDownloadResult {
 /// then drops it before invoking `run_ai_download`.
 #[derive(Debug, Clone)]
 pub struct AiDownloadContext {
-    /// Lowercase tier slug (`"small" | "medium" | "large"`).
+    /// Lowercase tier slug (`"small" | "medium" | "large"`). Echoed
+    /// back into the progress snapshots so the renderer can match
+    /// snapshots against the tier it requested.
     pub tier_slug: String,
+    /// The tier as a typed [`aec_ai::ModelTier`]. Used to build the
+    /// temporary [`aec_ai::ModelManager`] inside
+    /// [`BridgeService::run_ai_download`] without re-parsing the
+    /// slug.
+    pub tier: aec_ai::ModelTier,
     /// Cloned out of [`aec_ai::ModelManager`] under the lock — owns
     /// the canonical filename, BLAKE3, download URL, and expected
     /// size hint.
     pub descriptor: aec_ai::ModelDescriptor,
     /// Directory the download lands in (created if missing).
     pub models_dir: PathBuf,
-    /// Absolute target path the verified file is renamed to on
-    /// success.
-    pub final_path: PathBuf,
-    /// `<final_path>.partial` — bytes accumulate here so a partial
-    /// download isn't mistaken for a verified model.
-    pub partial_path: PathBuf,
     /// Shared progress slot the bridge service publishes into, cloned
     /// out of [`BridgeService::download_progress`]. Held as an
     /// `Arc<Mutex<…>>` rather than a borrow so the download body
@@ -5528,7 +5529,7 @@ impl BridgeService {
     ) -> Result<AiDownloadContext, BridgeServiceError> {
         let tier = aec_ai::ModelTier::from_slug(tier_str)
             .ok_or_else(|| BridgeServiceError::Ai(format!("unknown tier {tier_str:?}")))?;
-        let (descriptor, models_dir, final_path) = {
+        let (descriptor, models_dir) = {
             let mgr = self
                 .model_manager
                 .lock()
@@ -5539,19 +5540,13 @@ impl BridgeService {
                     BridgeServiceError::Ai(format!("missing descriptor for tier {tier_str}"))
                 })?
                 .clone();
-            (
-                descriptor,
-                mgr.models_dir().to_path_buf(),
-                mgr.model_path_for(tier),
-            )
+            (descriptor, mgr.models_dir().to_path_buf())
         };
-        let partial_path = models_dir.join(format!("{}.partial", descriptor.filename));
         Ok(AiDownloadContext {
             tier_slug: tier_str.into(),
+            tier,
             descriptor,
             models_dir,
-            final_path,
-            partial_path,
             progress: Arc::clone(&self.download_progress),
         })
     }
@@ -5567,147 +5562,96 @@ impl BridgeService {
     pub fn run_ai_download(ctx: AiDownloadContext) -> Result<AiDownloadResult, BridgeServiceError> {
         let AiDownloadContext {
             tier_slug,
+            tier,
             descriptor,
             models_dir,
-            final_path,
-            partial_path,
             progress,
         } = ctx;
-        let url = descriptor
-            .download_url
-            .as_ref()
-            .ok_or_else(|| {
-                BridgeServiceError::Ai(format!("no download URL configured for tier {tier_slug}"))
-            })?
-            .clone();
-        std::fs::create_dir_all(&models_dir).map_err(|e| {
-            BridgeServiceError::Ai(format!("create models_dir {}: {e}", models_dir.display()))
-        })?;
-        // Fast path: file already on disk with the right BLAKE3.
-        if final_path.is_file() {
-            if let Ok(true) = aec_ai::ModelManager::verify_file(&final_path, &descriptor.blake3_hex)
-            {
-                let size_bytes = std::fs::metadata(&final_path).map_or(0, |m| m.len());
-                publish_progress_to(
-                    &progress,
-                    AiDownloadProgress {
-                        tier: tier_slug.clone(),
-                        downloaded: size_bytes,
-                        total: size_bytes,
-                        state: "completed".into(),
-                        message: None,
-                    },
-                );
-                return Ok(AiDownloadResult {
-                    tier: tier_slug,
-                    path: final_path.display().to_string(),
-                    size_bytes,
-                });
-            }
-            // Bad checksum: drop the file so the next download starts
-            // clean rather than appending bytes to a corrupt file.
-            let _ = std::fs::remove_file(&final_path);
-        }
-        // Publish a `downloading` snapshot before the first byte lands so
-        // the renderer's poll immediately observes the in-flight state.
-        publish_progress_to(
-            &progress,
-            AiDownloadProgress {
-                tier: tier_slug.clone(),
-                downloaded: 0,
-                total: descriptor.size_bytes,
-                state: "downloading".into(),
-                message: None,
-            },
-        );
-        let progress_slot = Arc::clone(&progress);
-        let tier_slot_label = tier_slug.clone();
         let total_hint = descriptor.size_bytes;
-        let cb: aec_ai::ProgressCallback = Arc::new(move |done, total| {
-            if let Ok(mut g) = progress_slot.lock() {
-                *g = Some(AiDownloadProgress {
-                    tier: tier_slot_label.clone(),
+        // Build a temporary, lock-free ModelManager that owns just this
+        // tier's descriptor. The real `BridgeService::model_manager`
+        // mutex was already dropped by `ai_prepare_download`, so the
+        // download here uses zero `BridgeService` locks of any kind.
+        // Delegating to `ModelManager::download_model` keeps the
+        // download / verify / rename sequence in exactly one place;
+        // this method is now only responsible for translating
+        // `DownloadState` transitions and per-chunk progress into the
+        // bridge's `AiDownloadProgress` snapshots.
+        let mgr = aec_ai::ModelManager::with_tier(models_dir, vec![descriptor.clone()], tier);
+        let final_path = mgr.model_path_for(tier);
+        // Per-chunk progress: publish a `downloading` snapshot on
+        // every byte-counter update.
+        let progress_for_bytes = Arc::clone(&progress);
+        let tier_for_bytes = tier_slug.clone();
+        let on_progress: aec_ai::ProgressCallback = Arc::new(move |done, total| {
+            publish_progress_to(
+                &progress_for_bytes,
+                AiDownloadProgress {
+                    tier: tier_for_bytes.clone(),
                     downloaded: done,
                     total: if total > 0 { total } else { total_hint },
                     state: "downloading".into(),
                     message: None,
-                });
-            }
+                },
+            );
         });
-        if let Err(e) = aec_ai::download_to_file(&url, &partial_path, total_hint, Some(cb)) {
-            publish_progress_to(
-                &progress,
-                AiDownloadProgress {
-                    tier: tier_slug.clone(),
-                    downloaded: 0,
-                    total: total_hint,
-                    state: "failed".into(),
-                    message: Some(e.to_string()),
-                },
-            );
-            return Err(BridgeServiceError::Ai(format!("download failed: {e}")));
-        }
-        // Verify the partial before promoting it to the final path.
-        publish_progress_to(
-            &progress,
-            AiDownloadProgress {
-                tier: tier_slug.clone(),
-                downloaded: total_hint,
-                total: total_hint,
-                state: "verifying".into(),
-                message: None,
-            },
-        );
-        match aec_ai::ModelManager::verify_file(&partial_path, &descriptor.blake3_hex) {
-            Ok(true) => {}
-            Ok(false) => {
-                let _ = std::fs::remove_file(&partial_path);
-                publish_progress_to(
-                    &progress,
-                    AiDownloadProgress {
-                        tier: tier_slug.clone(),
-                        downloaded: 0,
-                        total: total_hint,
-                        state: "failed".into(),
-                        message: Some("BLAKE3 checksum mismatch".into()),
-                    },
-                );
-                return Err(BridgeServiceError::Ai(
-                    "downloaded file failed BLAKE3 verification".into(),
-                ));
-            }
-            Err(e) => {
-                publish_progress_to(
-                    &progress,
-                    AiDownloadProgress {
-                        tier: tier_slug.clone(),
-                        downloaded: 0,
-                        total: total_hint,
-                        state: "failed".into(),
-                        message: Some(e.to_string()),
-                    },
-                );
-                return Err(BridgeServiceError::Ai(format!("verify failed: {e}")));
-            }
-        }
-        std::fs::rename(&partial_path, &final_path).map_err(|e| {
-            publish_progress_to(
-                &progress,
-                AiDownloadProgress {
-                    tier: tier_slug.clone(),
-                    downloaded: total_hint,
-                    total: total_hint,
-                    state: "failed".into(),
-                    message: Some(format!("rename failed: {e}")),
-                },
-            );
-            BridgeServiceError::Ai(format!(
-                "rename {} -> {}: {e}",
-                partial_path.display(),
-                final_path.display(),
-            ))
-        })?;
-        let size_bytes = std::fs::metadata(&final_path).map_or(0, |m| m.len());
+        // Lifecycle: map `DownloadState` transitions to `AiDownloadProgress`
+        // snapshots. The renderer polls the progress slot and switches
+        // between “downloading X / Y bytes”, “verifying…”, “done”, or
+        // “failed: …” based on the `state` field.
+        let progress_for_state = Arc::clone(&progress);
+        let tier_for_state = tier_slug.clone();
+        let on_state: Arc<dyn Fn(aec_ai::DownloadState) + Send + Sync> =
+            Arc::new(move |state| match state {
+                aec_ai::DownloadState::Downloading => {
+                    publish_progress_to(
+                        &progress_for_state,
+                        AiDownloadProgress {
+                            tier: tier_for_state.clone(),
+                            downloaded: 0,
+                            total: total_hint,
+                            state: "downloading".into(),
+                            message: None,
+                        },
+                    );
+                }
+                aec_ai::DownloadState::Verifying => {
+                    publish_progress_to(
+                        &progress_for_state,
+                        AiDownloadProgress {
+                            tier: tier_for_state.clone(),
+                            downloaded: total_hint,
+                            total: total_hint,
+                            state: "verifying".into(),
+                            message: None,
+                        },
+                    );
+                }
+                aec_ai::DownloadState::Completed => {
+                    // Final snapshot is published once the rename
+                    // succeeds and we know the on-disk size below.
+                }
+                aec_ai::DownloadState::Failed { msg, .. } => {
+                    publish_progress_to(
+                        &progress_for_state,
+                        AiDownloadProgress {
+                            tier: tier_for_state.clone(),
+                            downloaded: 0,
+                            total: total_hint,
+                            state: "failed".into(),
+                            message: Some(msg),
+                        },
+                    );
+                }
+            });
+        let callbacks = aec_ai::DownloadCallbacks {
+            on_progress: Some(on_progress),
+            on_state: Some(on_state),
+        };
+        let path = mgr
+            .download_model(tier, callbacks)
+            .map_err(|e| BridgeServiceError::Ai(format!("download failed: {e}")))?;
+        let size_bytes = std::fs::metadata(&path).map_or(0, |m| m.len());
         publish_progress_to(
             &progress,
             AiDownloadProgress {
@@ -5718,9 +5662,10 @@ impl BridgeService {
                 message: None,
             },
         );
+        debug_assert_eq!(path, final_path, "ModelManager renamed into expected slot");
         Ok(AiDownloadResult {
             tier: tier_slug,
-            path: final_path.display().to_string(),
+            path: path.display().to_string(),
             size_bytes,
         })
     }

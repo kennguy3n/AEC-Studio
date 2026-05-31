@@ -85,12 +85,34 @@ const PROGRESS_EVERY_CHUNKS: usize = 16;
 
 /// Allowed hosts for HF model downloads (HF issues 302s to its CDN).
 /// Any redirect to a host outside this list is rejected.
+///
+/// ## Safety against suffix-confusion attacks
+///
+/// The naïve form of this check (`host.ends_with(".huggingface.co")`)
+/// is already robust against the classic `evil-huggingface.co`
+/// mistake — `-huggingface.co` does not end with `.huggingface.co`;
+/// the literal `.` separator is required. We additionally reject:
+///
+/// * **Empty hosts** — `validate_redirect` should already have caught
+///   these, but a `.ends_with("")` style trap on the empty string
+///   technically returns true for any non-empty suffix, so we guard
+///   defensively.
+/// * **Leading-dot hosts** (e.g. `.huggingface.co`) — these are not
+///   valid DNS hostnames per RFC 1035 and shouldn't reach us via a
+///   well-formed `Location` header, but rejecting them removes a
+///   latent foot-gun where `.foo.bar` would `ends_with(".foo.bar")`.
+///
+/// DNS is case-insensitive, so we lowercase the host before checking.
 fn host_is_allowed(host: &str) -> bool {
+    if host.is_empty() || host.starts_with('.') {
+        return false;
+    }
+    let h = host.to_ascii_lowercase();
     matches!(
-        host,
+        h.as_str(),
         "huggingface.co" | "cdn-lfs.huggingface.co" | "cdn-lfs.hf.co" | "cas-bridge.xethub.hf.co"
-    ) || host.ends_with(".huggingface.co")
-        || host.ends_with(".hf.co")
+    ) || h.ends_with(".huggingface.co")
+        || h.ends_with(".hf.co")
 }
 
 /// Validate that a redirect target is to an allowed host. Returns the
@@ -382,12 +404,32 @@ mod tests {
 
     #[test]
     fn host_allowlist_accepts_hf_domains_and_rejects_others() {
+        // Positive cases: HF root + known CDN subdomains + any
+        // sub-subdomain (HF rotates CDN hostnames).
         assert!(host_is_allowed("huggingface.co"));
         assert!(host_is_allowed("cdn-lfs.huggingface.co"));
         assert!(host_is_allowed("foo.bar.huggingface.co"));
         assert!(host_is_allowed("cdn-lfs.hf.co"));
+        // Plain unrelated domain.
         assert!(!host_is_allowed("example.com"));
+        // Suffix appending: `host.attacker.com` must not match the
+        // rule even though `host` contains "huggingface.co".
         assert!(!host_is_allowed("evil.huggingface.co.attacker.com"));
+        // Dash-prefix forgery: the `.huggingface.co` / `.hf.co`
+        // suffix checks REQUIRE the literal dot separator, so an
+        // attacker domain like `malicious-huggingface.co` (which
+        // ends with `-huggingface.co`, not `.huggingface.co`) is
+        // rejected. This is a defense-in-depth guarantee against
+        // the classic `ends_with` suffix-confusion mistake.
+        assert!(!host_is_allowed("malicious-huggingface.co"));
+        assert!(!host_is_allowed("malicious-hf.co"));
+        // Empty / placeholder inputs.
+        assert!(!host_is_allowed(""));
+        assert!(!host_is_allowed(".huggingface.co"));
+        // Case insensitivity: DNS is case-insensitive, so
+        // `Huggingface.co` and `HUGGINGFACE.CO` are valid.
+        assert!(host_is_allowed("Huggingface.co"));
+        assert!(host_is_allowed("HUGGINGFACE.CO"));
     }
 
     #[test]

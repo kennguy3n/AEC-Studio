@@ -55,7 +55,8 @@ pub use lighting_balance::{
 };
 pub use model_download::{download_to_file, DownloadError, ProgressCallback};
 pub use model_manager::{
-    select_tier as select_model_tier, ModelDescriptor, ModelManager, ModelManagerError, ModelTier,
+    select_tier as select_model_tier, DownloadCallbacks, DownloadState, ModelDescriptor,
+    ModelManager, ModelManagerError, ModelTier,
 };
 pub use plan_detection::{PlanDetectionResult, PolylineProposal};
 pub use plan_to_wall::{

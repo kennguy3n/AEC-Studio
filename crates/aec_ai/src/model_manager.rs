@@ -226,6 +226,52 @@ pub struct ModelManager {
     active_tier: ModelTier,
 }
 
+/// Lifecycle states a download passes through. Emitted via
+/// [`DownloadCallbacks::on_state`] so callers (e.g. the bridge
+/// service's progress slot) can publish UI-visible status transitions
+/// without re-implementing the download / verify / rename sequence.
+///
+/// On a fresh, successful download the order is:
+/// `Downloading` → `Verifying` → `Completed`. On a fast-path (file
+/// already present with correct BLAKE3) only `Completed` fires. On
+/// any failure the last state is `Failed { stage, msg }`.
+#[derive(Debug, Clone)]
+pub enum DownloadState {
+    /// HTTPS transfer in flight. Followed by `Verifying` once the
+    /// transfer completes.
+    Downloading,
+    /// All bytes are on disk and BLAKE3 hashing has started.
+    Verifying,
+    /// File is verified and renamed into the final path.
+    Completed,
+    /// Terminal failure. `stage` is one of `"download"`, `"verify"`,
+    /// `"rename"` so the renderer can build a useful error message
+    /// without parsing `msg`.
+    Failed { stage: &'static str, msg: String },
+}
+
+/// Bundle of optional callbacks for [`ModelManager::download_model`].
+///
+/// * `on_progress` — invoked on every ~1 MiB chunk during the HTTPS
+///   transfer with `(downloaded_bytes, total_bytes)`.
+/// * `on_state` — invoked on each [`DownloadState`] transition.
+///
+/// `DownloadCallbacks::default()` opts out of both — useful for CLI
+/// tools or tests that just want a blocking download.
+#[derive(Default, Clone)]
+pub struct DownloadCallbacks {
+    pub on_progress: Option<ProgressCallback>,
+    pub on_state: Option<Arc<dyn Fn(DownloadState) + Send + Sync>>,
+}
+
+impl DownloadCallbacks {
+    fn fire_state(&self, s: DownloadState) {
+        if let Some(f) = &self.on_state {
+            f(s);
+        }
+    }
+}
+
 impl ModelManager {
     /// Create a manager rooted at `models_dir`. The `descriptors` list
     /// defines the known model files and their expected checksums.
@@ -411,15 +457,17 @@ impl ModelManager {
     /// already exists from a previous attempt, a `Range: bytes=N-` header
     /// is sent and the new bytes are appended.
     ///
-    /// `on_progress` is called periodically during the download with
-    /// `(downloaded_bytes, total_bytes)`. Pass `None` to disable
-    /// progress reporting.
+    /// `callbacks.on_progress` is called periodically during the
+    /// download with `(downloaded_bytes, total_bytes)`. `callbacks.on_state`
+    /// is called on each lifecycle transition
+    /// ([`DownloadState`]); pass `DownloadCallbacks::default()` to
+    /// disable both.
     ///
     /// Returns the absolute path to the verified model file.
     pub fn download_model(
         &self,
         tier: ModelTier,
-        on_progress: Option<ProgressCallback>,
+        callbacks: DownloadCallbacks,
     ) -> Result<PathBuf, ModelManagerError> {
         let descriptor = self
             .descriptor(tier)
@@ -434,6 +482,7 @@ impl ModelManager {
         if final_path.is_file() {
             let actual = blake3_file(&final_path)?;
             if actual == descriptor.blake3_hex {
+                callbacks.fire_state(DownloadState::Completed);
                 return Ok(final_path);
             }
             // File exists but checksum is wrong — delete and re-download.
@@ -442,28 +491,57 @@ impl ModelManager {
         let partial_path = self
             .models_dir
             .join(format!("{}.partial", descriptor.filename));
-        model_download::download_to_file(
+        callbacks.fire_state(DownloadState::Downloading);
+        if let Err(e) = model_download::download_to_file(
             &url,
             &partial_path,
             descriptor.size_bytes,
-            on_progress.clone(),
-        )?;
+            callbacks.on_progress.clone(),
+        ) {
+            callbacks.fire_state(DownloadState::Failed {
+                stage: "download",
+                msg: e.to_string(),
+            });
+            return Err(e.into());
+        }
         // Verify BLAKE3 of the partial file before renaming.
-        let actual = blake3_file(&partial_path)?;
+        callbacks.fire_state(DownloadState::Verifying);
+        let actual = match blake3_file(&partial_path) {
+            Ok(h) => h,
+            Err(e) => {
+                callbacks.fire_state(DownloadState::Failed {
+                    stage: "verify",
+                    msg: e.to_string(),
+                });
+                return Err(e);
+            }
+        };
         if actual != descriptor.blake3_hex {
             // Bad checksum: delete the partial so the next attempt starts
             // from scratch rather than resuming a corrupt file.
             let _ = std::fs::remove_file(&partial_path);
-            return Err(ModelManagerError::ChecksumMismatch {
+            let err = ModelManagerError::ChecksumMismatch {
                 path: partial_path.display().to_string(),
                 expected: descriptor.blake3_hex.clone(),
                 actual,
+            };
+            callbacks.fire_state(DownloadState::Failed {
+                stage: "verify",
+                msg: err.to_string(),
             });
+            return Err(err);
         }
         // Atomic rename: on every platform std::fs::rename is atomic when
         // both paths are on the same filesystem (which they are here —
         // both inside models_dir).
-        std::fs::rename(&partial_path, &final_path)?;
+        if let Err(e) = std::fs::rename(&partial_path, &final_path) {
+            callbacks.fire_state(DownloadState::Failed {
+                stage: "rename",
+                msg: e.to_string(),
+            });
+            return Err(e.into());
+        }
+        callbacks.fire_state(DownloadState::Completed);
         Ok(final_path)
     }
 
