@@ -5,15 +5,15 @@
 //! here, for three reasons:
 //!
 //!   1. **Loopback only.** The sidecar listens on `127.0.0.1:<port>` and the
-//!      safety posture (`workers/ai/config.json#safety.deny_network`) explicitly
-//!      forbids any outbound traffic. We never need DNS, TLS, redirects, or
-//!      cookies — so a 100-line `std::net::TcpStream` client is a strictly
-//!      smaller attack surface than a general-purpose HTTP library.
-//!   2. **Zero new transitive deps.** The workspace forbids `unsafe_code`
-//!      and pins a careful set of crates; introducing ureq pulls rustls + ring
-//!      (or native-tls) and ~25 transitive crates for no benefit. The
-//!      Phase 10 PR-V scoping doc mentioned ureq as a *placeholder name* for
-//!      "small sync HTTP client"; this module satisfies the same role.
+//!      AI safety posture forbids any outbound traffic from tool calls. We
+//!      never need DNS, TLS, redirects, or cookies — so a 100-line
+//!      `std::net::TcpStream` client is a strictly smaller attack surface
+//!      than a general-purpose HTTP library.
+//!   2. **Separate from `model_download.rs`.** Model downloads from the
+//!      public internet (HuggingFace) need TLS + redirect handling, and use
+//!      `ureq + rustls` in `crate::model_download`. That path runs only at
+//!      install time and never during inference; this loopback path runs on
+//!      every tool call and stays minimal.
 //!   3. **Testability.** Every byte that goes on the wire is visible in this
 //!      file, so the `tests/sidecar_mock.rs` integration test can pin the
 //!      exact request line and headers against a tiny `TcpListener` mock

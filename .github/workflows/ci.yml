@@ -143,6 +143,130 @@ jobs:
             echo "- OS matrix: \`$os\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # ---------------------------------------------------------------
+  # no-python-runtime: enforce the "no Python in the shipped runtime"
+  # invariant on every PR.
+  #
+  # Phase 9 removed the Blender and IFC Python workers, and Phase 18
+  # eliminated the last lingering Python AI-runtime artifacts (the
+  # workers/ai/ config.json and the MLXAdapter doc-fiction). The two
+  # remaining .py files (scripts/generate_template_previews.py and
+  # packaging/generate_icons.py) are **build-time tooling** that runs
+  # on the CI runner to emit PNGs; they are not invoked at app runtime
+  # and are not bundled in any installer. They are pinned in the
+  # allow-list below.
+  #
+  # This job is fast (~5 s) and runs unconditionally so a contributor
+  # accidentally reintroducing a Python dependency or a Python runtime
+  # worker gets a clear, immediate signal at the PR stage rather than
+  # only after `package-*` runs on `main`.
+  # ---------------------------------------------------------------
+  no-python-runtime:
+    name: No Python in runtime
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reject new Python runtime artifacts
+        run: |
+          set -euo pipefail
+          fail=0
+
+          # Allow-list of build-time .py scripts. Any other .py file
+          # added under the repo (outside .git / node_modules / target)
+          # fails the job.
+          allowed='^\(scripts/generate_template_previews\.py\|packaging/generate_icons\.py\)$'
+          unexpected_py=$(
+            find . \
+              -path ./node_modules -prune -o \
+              -path ./target -prune -o \
+              -path ./.git -prune -o \
+              -name '*.py' -print 2>/dev/null \
+              | sed 's|^\./||' \
+              | grep -v "$allowed" || true
+          )
+          if [ -n "$unexpected_py" ]; then
+            echo '::error::Unexpected Python files in the repo:'
+            echo "$unexpected_py"
+            echo
+            echo 'Only build-time tooling .py files are allowed; the shipped runtime must contain no Python. See docs/AI_RUNTIME.md for the policy. To add a new build-time .py, update the allow-list in .github/workflows/ci.yml::no-python-runtime.'
+            fail=1
+          fi
+
+          # Reject every Python dependency manifest. The shipped
+          # runtime must not pull a Python interpreter.
+          dep_files=$(
+            find . \
+              -path ./node_modules -prune -o \
+              -path ./target -prune -o \
+              -path ./.git -prune -o \
+              \( -name 'requirements*.txt' \
+                 -o -name 'pyproject.toml' \
+                 -o -name 'Pipfile' \
+                 -o -name 'Pipfile.lock' \
+                 -o -name 'poetry.lock' \
+                 -o -name 'uv.lock' \
+                 -o -name 'environment.yml' \
+                 -o -name 'conda*.yaml' \
+                 -o -name 'setup.py' \
+                 -o -name 'setup.cfg' \
+              \) -print 2>/dev/null || true
+          )
+          if [ -n "$dep_files" ]; then
+            echo '::error::Python dependency manifests are not allowed:'
+            echo "$dep_files"
+            fail=1
+          fi
+
+          # Reject workers/ai|blender|ifc directories. Phase 9 + 18
+          # eliminated all three.
+          for d in workers/ai workers/blender workers/ifc; do
+            if [ -d "$d" ]; then
+              echo "::error::Removed-in-prior-phase directory has been re-added: $d"
+              fail=1
+            fi
+          done
+
+          # Reject MLXAdapter / mlx-lm / gemlite references *in source*
+          # (docs that document the no-Python decision are allowed; the
+          # grep below excludes .md files). gemlite / HQQ are Python
+          # quantization runtimes for the bonsai-image-* models that
+          # cannot ship under the no-Python constraint.
+          bad_imports=$(
+            grep -RIn --include='*.rs' --include='*.ts' --include='*.tsx' \
+              --include='*.js' --include='*.jsx' \
+              -e 'MLXAdapter' -e 'mlx-lm' -e '"gemlite"' -e "'gemlite'" \
+              -e '"HQQ"' -e "'HQQ'" \
+              . 2>/dev/null \
+              | grep -v '^./node_modules' \
+              | grep -v '^./target' \
+              || true
+          )
+          if [ -n "$bad_imports" ]; then
+            echo '::error::Python-only AI runtime references found in source:'
+            echo "$bad_imports"
+            fail=1
+          fi
+
+          # Reject electron-builder configs that bundle Python or MLX.
+          for cfg in packaging/macos/electron-builder.macos.yml \
+                     packaging/windows/electron-builder.windows.yml \
+                     packaging/linux/electron-builder.linux.yml; do
+            if [ -f "$cfg" ]; then
+              hits=$(grep -in -E 'python|mlx|gemlite|conda' "$cfg" || true)
+              if [ -n "$hits" ]; then
+                echo "::error::Forbidden Python/MLX references in $cfg:"
+                echo "$hits"
+                fail=1
+              fi
+            fi
+          done
+
+          if [ "$fail" -ne 0 ]; then
+            exit 1
+          fi
+          echo 'OK — no Python runtime artifacts found.'
+
   rust:
     name: Rust (${{ matrix.os }})
     needs: gate

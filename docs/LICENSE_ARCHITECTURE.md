@@ -22,7 +22,6 @@ fork, what we invoke as a process, and what users may swap.
 | napi-rs (`napi`, `napi-derive`, `napi-build`) | MIT | Electron ↔ Rust bridge | Linked into the bridge crate (cdylib) | Yes (permissive) |
 | SQLCipher + OpenSSL | BSD-style (SQLCipher) + Apache-2.0 (OpenSSL ≥ 3.0) | Encrypted local project DB | Linked statically via `rusqlite` `bundled-sqlcipher-vendored-openssl` | Yes (permissive) |
 | Electron | MIT | Desktop shell | Bundled binary | Yes (permissive) |
-| MLX | MIT | Apple-Silicon AI acceleration adapter | Linked into the inference adapter | Yes (permissive) |
 | `printpdf` | MIT | PDF generation for client deliverables | Linked into `aec_export` | Yes (permissive) |
 | `glam` | MIT OR Apache-2.0 | Linear algebra for geometry and viewport | Linked into Rust crates | Yes (permissive) |
 | `sysinfo` | MIT | Hardware profiler | Linked into `aec_governor` | Yes (permissive) |
@@ -121,8 +120,8 @@ and cross-platform packaging (no Python runtime dependency).
 The PrismML fork inherits MIT (see [kennguy3n/llama.cpp](https://github.com/kennguy3n/llama.cpp)).
 
 MIT is fully permissive and AGPL-compatible. AEC Studio invokes the
-`llama-server` binary as a **subprocess** (`workers/ai/`) and talks to it via
-**loopback HTTP** on `127.0.0.1`. We do not link `libllama` directly.
+`llama-server` binary as a **subprocess** (managed by `crates/aec_ai/src/sidecar.rs`)
+and talks to it via **loopback HTTP** on `127.0.0.1`. We do not link `libllama` directly.
 
 **Why subprocess, not library.** Even though MIT permits linking:
 

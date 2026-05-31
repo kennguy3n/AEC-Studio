@@ -19,6 +19,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { aec, RuntimeStatus } from "../api/aec";
+import { AiModelsSection } from "../components/AiModelsSection";
 import {
   parseLoopbackInstance,
   type KChatLoopbackInstance,
@@ -374,6 +375,8 @@ export function Settings() {
           <option value="large">Large — workstation only</option>
         </select>
       </section>
+
+      <AiModelsSection />
 
       <section
         className="settings-section"

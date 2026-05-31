@@ -805,7 +805,7 @@ This document tracks AEC Studio's phased delivery from open-source foundation to
 | **CAD** | Native 2D, DXF roundtrip, DWG converter adapter (opt-in), PDF / SVG export |
 | **BIM** | IFC2x3 / IFC4 / IFC4x3 import + export with GUID preservation, BOQ-lite |
 | **AI** | Plan detection, style assistant, layout suggestions, CAD cleanup, classification, property fill, render doctor — all local |
-| **Runtime** | PrismML sidecar (Bonsai 1.7B / 4B / 8B); MLX on Apple Silicon; Vulkan / CUDA on Windows |
+| **Runtime** | `llama-server` sidecar (PrismML llama.cpp fork) loading Ternary-Bonsai 1.7B / 4B / 8B 1.58-bit GGUF; Metal on Apple Silicon, CUDA / Vulkan on Windows + Linux; no Python in shipped runtime |
 | **Core** | Rust workspace (14 crates), command engine, undo/redo journal, audit trail, SQLCipher project package |
 
 ---

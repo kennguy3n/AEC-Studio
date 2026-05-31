@@ -448,6 +448,13 @@ const api = {
       ipcRenderer.invoke("ai:rejectDiff", { diffId, reason: reason ?? null }),
     cancelJob: (jobId: string) => ipcRenderer.invoke("ai:cancelJob", { jobId }),
     runtimeStatus: () => ipcRenderer.invoke("ai:runtimeStatus"),
+    // Phase 18 Group A — text-model download surface.
+    modelAvailability: () => ipcRenderer.invoke("ai:modelAvailability"),
+    downloadModel: (tier: "small" | "medium" | "large") =>
+      ipcRenderer.invoke("ai:downloadModel", { tier }),
+    downloadProgress: () => ipcRenderer.invoke("ai:downloadProgress"),
+    setActiveTier: (tier: "small" | "medium" | "large") =>
+      ipcRenderer.invoke("ai:setActiveTier", { tier }),
   },
 
   // ----- Extensions (Phase 16) -----

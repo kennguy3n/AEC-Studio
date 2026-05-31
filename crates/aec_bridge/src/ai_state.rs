@@ -78,6 +78,7 @@
 //! |-----------------------|-------------|-----------------------|---------------|
 //! | `ensure_ready`        | take (lock) | brief write (×1-4)    | —             |
 //! | `cancel_job`          | take (lock) | brief write           | —             |
+//! | `reload_with_config`  | take (lock) | brief write           | —             |
 //! | `snapshot`            | —           | read                  | lock          |
 //! | `state` / `last_error`| —           | read                  | —             |
 //! | `insert_diff`         | —           | —                     | lock          |
@@ -188,10 +189,10 @@ fn poisoned<T>(err: std::sync::PoisonError<T>) -> AiStateError {
 }
 
 impl AiState {
-    /// Initialise with the sidecar config baked from
-    /// `workers/ai/config.json`. Does NOT spawn the sidecar yet —
-    /// spawning is deferred until the first `ai_plan` call so the
-    /// renderer can boot without paying the model-load cost.
+    /// Initialise with the supplied sidecar config (see
+    /// [`aec_ai::RuntimeConfig::default`]). Does NOT spawn the sidecar
+    /// yet — spawning is deferred until the first `ai_plan` call so
+    /// the renderer can boot without paying the model-load cost.
     pub fn new(config: RuntimeConfig) -> Self {
         Self {
             runtime: RwLock::new(SidecarRuntime::new(config)),
@@ -323,6 +324,47 @@ impl AiState {
                 .transport()
                 .clone())
         }
+    }
+
+    /// Swap the in-process [`SidecarRuntime`]'s config (and kill any
+    /// currently-running sidecar handle so the next [`Self::ensure_ready`]
+    /// cold-spawns with the new config).
+    ///
+    /// Used when the user picks a different model tier in Settings:
+    /// [`crate::service::BridgeService::ai_set_active_tier`] calls
+    /// [`aec_ai::ModelManager::set_tier`] + [`aec_ai::ModelManager::active_config`]
+    /// to derive the new [`RuntimeConfig`], then invokes this so the
+    /// next `ai_plan` actually loads the newly-selected GGUF rather
+    /// than continuing to use the boot-time default.
+    ///
+    /// ## Lock ordering
+    ///
+    /// Acquires `handle_slot` first, then `runtime` (write) — the
+    /// canonical order from the module doc, so this method is
+    /// deadlock-free against every other [`AiState`] method.
+    ///
+    /// ## Concurrency with `ensure_ready`
+    ///
+    /// If a cold-spawn is in flight when this is called, the
+    /// `handle_slot.lock()` blocks until that spawn finishes (success
+    /// or failure). On success the just-spawned handle is then
+    /// dropped (`Drop for SidecarHandle` kills the child), so the
+    /// renderer never observes a sidecar speaking the old tier's
+    /// model after `reload_with_config` returns. On failure the slot
+    /// was already `None`; nothing to drop.
+    pub fn reload_with_config(&self, new_config: RuntimeConfig) -> Result<(), AiStateError> {
+        let mut slot = self.handle_slot.lock().map_err(poisoned)?;
+        // Dropping the previous handle (if any) kills the running
+        // `llama-server` child via `Drop for SidecarHandle`. Setting
+        // to `None` first means the brief `runtime` write below
+        // observes a clean handle slot — important because the next
+        // `ensure_ready` checks `slot.is_none()` to decide whether to
+        // cold-spawn, and we want it to cold-spawn under the new
+        // config rather than reuse a stale handle.
+        *slot = None;
+        let mut runtime = self.runtime.write().map_err(poisoned)?;
+        *runtime = SidecarRuntime::new(new_config);
+        Ok(())
     }
 
     /// Test-only constructor: attach a pre-existing transport (e.g.

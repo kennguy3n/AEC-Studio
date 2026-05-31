@@ -798,6 +798,43 @@ export function rendererInProcessBackend(): AecApi {
       }),
       cancelJob: async () => ({ cancelled: true }),
       runtimeStatus: async () => ({ state: "idle", lastError: null }),
+      modelAvailability: async () => ({
+        tiers: [
+          {
+            tier: "small" as const,
+            name: "Ternary-Bonsai 1.7B (1.58-bit GGUF Q2_0)",
+            filename: "Ternary-Bonsai-1.7B-Q2_0.gguf",
+            sizeBytes: 463_290_464,
+            available: false,
+            sizeOnDisk: 0,
+          },
+          {
+            tier: "medium" as const,
+            name: "Ternary-Bonsai 4B (1.58-bit GGUF Q2_0)",
+            filename: "Ternary-Bonsai-4B-Q2_0.gguf",
+            sizeBytes: 1_074_969_344,
+            available: false,
+            sizeOnDisk: 0,
+          },
+          {
+            tier: "large" as const,
+            name: "Ternary-Bonsai 8B (1.58-bit GGUF Q2_0)",
+            filename: "Ternary-Bonsai-8B-Q2_0.gguf",
+            sizeBytes: 2_182_184_672,
+            available: false,
+            sizeOnDisk: 0,
+          },
+        ],
+        activeTier: "small" as const,
+        modelsDir: "",
+      }),
+      downloadModel: async (tier: "small" | "medium" | "large") => ({
+        tier,
+        path: "",
+        sizeBytes: 0,
+      }),
+      downloadProgress: async () => null,
+      setActiveTier: async (_tier: "small" | "medium" | "large") => {},
     },
     extensions: {
       // Vitest fallback: there are no extensions loaded in the

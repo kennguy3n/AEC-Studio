@@ -1,17 +1,28 @@
-//! Sidecar runtime (llama.cpp / PrismML). The runtime is *the* place where
-//! AEC Studio talks to a local AI process; everything else in the crate
-//! consumes structured tool requests.
+//! Sidecar runtime (llama.cpp / PrismML fork). The runtime is *the* place
+//! where AEC Studio talks to a local AI process; everything else in the
+//! crate consumes structured tool requests.
 //!
-//! In Phase 1 the runtime is in-process: it owns the configuration, the
-//! lifecycle state machine (Idle/Loading/Ready/Failed), and exposes an
-//! `is_available()` hook the planner uses to gate calls. The actual sidecar
-//! process is launched by `aec_bridge` (which holds the OS-level handles).
+//! The runtime owns the configuration, the lifecycle state machine
+//! (Idle/Loading/Ready/Failed), and exposes an `is_available()` hook the
+//! planner uses to gate calls. The actual sidecar process is launched by
+//! `aec_bridge` (which holds the OS-level handles).
+//!
+//! ## Defaults are self-contained
+//!
+//! [`RuntimeConfig::default`] does **not** read from disk. The canonical
+//! defaults live in this file, and the platform-appropriate models
+//! directory is computed at runtime via [`default_models_dir`]. The
+//! Python-era `workers/ai/config.json` parser ([`from_sidecar_config_json`])
+//! remains for callers that still ship the file, but the sidecar runtime
+//! no longer requires it (no Python ships in the production app).
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::model_manager::ModelTier;
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -36,14 +47,14 @@ pub struct RuntimeConfig {
 }
 
 impl Default for RuntimeConfig {
-    /// Default configuration. **Must** match the canonical sidecar config
-    /// at `workers/ai/config.json` — that JSON file is the source of truth
-    /// the Python sidecar starts from, and the Rust runtime needs to talk
-    /// to the *same* sidecar. The `runtime_config_default_matches_workers_ai_config_json`
-    /// test below pins the two together so drift is caught at build time.
+    /// Self-contained default. The model path points at the
+    /// platform-appropriate per-user data directory + the canonical
+    /// `ModelTier::Small` (Ternary-Bonsai 1.7B Q2_0) filename. Callers
+    /// that want a different tier should construct the config via
+    /// [`crate::model_manager::ModelManager::active_config`].
     fn default() -> Self {
         Self {
-            model_path: PathBuf::from("${HOME}/.aec/models/prismml-7b-q4_k_m.gguf"),
+            model_path: default_models_dir().join(ModelTier::Small.filename()),
             port: 13579,
             parallel: 2,
             idle_timeout: Duration::from_secs(60),
@@ -53,12 +64,62 @@ impl Default for RuntimeConfig {
     }
 }
 
+/// Per-platform per-user models directory.
+///
+/// - macOS:   `~/Library/Application Support/AEC Studio/models`
+/// - Linux:   `$XDG_DATA_HOME/aec-studio/models`, fallback
+///   `~/.local/share/aec-studio/models`
+/// - Windows: `%LOCALAPPDATA%\AEC Studio\models`
+///
+/// Falls back to `./models` only if no home directory can be resolved
+/// from environment (effectively impossible on a normal user account;
+/// kept so tests in containers don't panic).
+pub fn default_models_dir() -> PathBuf {
+    let app_name = "AEC Studio";
+    let snake_app = "aec-studio";
+    if cfg!(target_os = "macos") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
+                .join(app_name)
+                .join("models");
+        }
+    } else if cfg!(target_os = "windows") {
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            return PathBuf::from(local).join(app_name).join("models");
+        }
+        if let Some(profile) = std::env::var_os("USERPROFILE") {
+            return PathBuf::from(profile)
+                .join("AppData")
+                .join("Local")
+                .join(app_name)
+                .join("models");
+        }
+    } else {
+        // Linux / *BSD: XDG Base Directory.
+        if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
+            let xdg_str = xdg.to_string_lossy();
+            if !xdg_str.is_empty() {
+                return PathBuf::from(xdg.clone()).join(snake_app).join("models");
+            }
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home)
+                .join(".local")
+                .join("share")
+                .join(snake_app)
+                .join("models");
+        }
+    }
+    PathBuf::from("models")
+}
+
 impl RuntimeConfig {
-    /// Parse a runtime config from the on-disk sidecar config JSON
-    /// (`workers/ai/config.json`). This is the canonical loader: the
-    /// Python sidecar reads the same JSON, so loading via this constructor
-    /// guarantees the Rust client and the sidecar agree on host/port,
-    /// context size, and timeouts.
+    /// Parse a runtime config from a legacy sidecar JSON file with the
+    /// same shape as the pre-Phase-18 `workers/ai/config.json`. Kept
+    /// for callers that still ship such a file out-of-band; the
+    /// in-tree defaults no longer depend on it.
     pub fn from_sidecar_config_json(text: &str) -> Result<Self, serde_json::Error> {
         #[derive(Deserialize)]
         struct Server {
@@ -198,32 +259,61 @@ mod tests {
         assert_eq!(r.last_error(), Some("oom"));
     }
 
-    /// Pin `RuntimeConfig::default()` to the canonical sidecar JSON. The
-    /// Rust client and the Python sidecar must agree on host/port, context
-    /// size, and timeouts — if either drifts, this test fails at build time.
+    /// `from_sidecar_config_json` still parses the legacy shape — exercise
+    /// it against an inline literal so the parser stays alive even now that
+    /// no `workers/ai/config.json` file ships in-tree.
     #[test]
-    fn runtime_config_default_matches_workers_ai_config_json() {
-        let path =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../workers/ai/config.json");
-        let text = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
-        let parsed = RuntimeConfig::from_sidecar_config_json(&text)
-            .expect("workers/ai/config.json must parse cleanly");
+    fn from_sidecar_config_json_parses_legacy_shape() {
+        let text = r#"{
+            "default_model": "Ternary-Bonsai-1.7B-Q2_0.gguf",
+            "models_dir": "${HOME}/.local/share/aec-studio/models",
+            "server": {
+                "host": "127.0.0.1",
+                "port": 13579,
+                "context_size": 4096,
+                "parallel": 2
+            },
+            "idle_timeout_seconds": 60,
+            "request_timeout_seconds": 120
+        }"#;
+        let parsed = RuntimeConfig::from_sidecar_config_json(text).expect("parses");
         let defaults = RuntimeConfig::default();
-        assert_eq!(parsed.port, defaults.port, "port drift");
-        assert_eq!(parsed.parallel, defaults.parallel, "parallel drift");
-        assert_eq!(
-            parsed.idle_timeout, defaults.idle_timeout,
-            "idle_timeout drift"
+        assert_eq!(parsed.port, defaults.port);
+        assert_eq!(parsed.parallel, defaults.parallel);
+        assert_eq!(parsed.idle_timeout, defaults.idle_timeout);
+        assert_eq!(parsed.request_timeout, defaults.request_timeout);
+        assert_eq!(parsed.max_context_tokens, defaults.max_context_tokens);
+        assert!(parsed
+            .model_path
+            .to_string_lossy()
+            .ends_with("Ternary-Bonsai-1.7B-Q2_0.gguf"));
+    }
+
+    #[test]
+    fn default_uses_ternary_bonsai_small_filename() {
+        let cfg = RuntimeConfig::default();
+        let s = cfg.model_path.to_string_lossy().into_owned();
+        assert!(
+            s.ends_with("Ternary-Bonsai-1.7B-Q2_0.gguf"),
+            "default model path {s} should end with the Small tier filename",
         );
-        assert_eq!(
-            parsed.request_timeout, defaults.request_timeout,
-            "request_timeout drift"
-        );
-        assert_eq!(
-            parsed.max_context_tokens, defaults.max_context_tokens,
-            "context_size drift"
-        );
+    }
+
+    #[test]
+    fn default_models_dir_picks_platform_appropriate_path() {
+        let dir = default_models_dir();
+        let s = dir.to_string_lossy();
+        if cfg!(target_os = "macos") {
+            assert!(
+                s.contains("Library/Application Support/AEC Studio/models"),
+                "macOS path was {s}",
+            );
+        } else if cfg!(target_os = "windows") {
+            assert!(s.contains("AEC Studio\\models") || s.contains("AEC Studio/models"));
+        } else {
+            // On Linux either XDG_DATA_HOME or ~/.local/share + aec-studio/models.
+            assert!(s.contains("aec-studio/models"), "Linux path was {s}");
+        }
     }
 
     #[test]

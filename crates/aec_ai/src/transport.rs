@@ -42,7 +42,8 @@ pub enum TransportError {
 }
 
 /// Subset of the llama.cpp `/completion` request envelope. Anything we don't
-/// set explicitly inherits the server's defaults from `workers/ai/config.json`.
+/// set explicitly inherits the server's defaults from the sidecar runtime
+/// config (`aec_ai::RuntimeConfig`).
 #[derive(Debug, Clone, Serialize)]
 pub struct CompletionRequest {
     pub prompt: String,

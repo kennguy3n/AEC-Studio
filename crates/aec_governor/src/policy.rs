@@ -84,11 +84,23 @@ impl RenderPolicy {
     }
 }
 
+/// AI model size tier. Maps 1:1 to a Ternary-Bonsai 1.58-bit GGUF Q2_0
+/// file on disk; see [`aec_ai::ModelTier`] for the on-disk filenames and
+/// the canonical BLAKE3 checksums.
+///
+/// | Tier   | Family               | Quant      | On disk  | Resident |
+/// |--------|----------------------|------------|----------|----------|
+/// | Small  | Ternary-Bonsai 1.7B  | 1.58-bit   |   442 MiB |  ~1.5 GiB |
+/// | Medium | Ternary-Bonsai 4B    | 1.58-bit   |  1.00 GiB |  ~2.5 GiB |
+/// | Large  | Ternary-Bonsai 8B    | 1.58-bit   |  2.03 GiB |  ~4.5 GiB |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AiModelTier {
+    /// Ternary-Bonsai 1.7B (1.58-bit GGUF Q2_0). Default for the Low tier.
     Small,
+    /// Ternary-Bonsai 4B (1.58-bit GGUF Q2_0). Default for the High tier.
     Medium,
+    /// Ternary-Bonsai 8B (1.58-bit GGUF Q2_0). Default for the Pro tier.
     Large,
 }
 

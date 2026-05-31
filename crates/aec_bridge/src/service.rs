@@ -1464,6 +1464,160 @@ pub struct AiRuntimeStatusReport {
     pub pending_diff_ids: Vec<String>,
 }
 
+/// One model tier's availability + sizing data for the Settings UI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiModelTierInfo {
+    /// Lowercase tier slug: `"small" | "medium" | "large"`. The same
+    /// values [`BridgeService::ai_download_model`] accepts.
+    pub tier: String,
+    /// Human-readable name (e.g. `"Ternary-Bonsai 1.7B (1.58-bit GGUF Q2_0)"`).
+    pub name: String,
+    /// On-disk filename inside `models_dir`.
+    pub filename: String,
+    /// Expected file size in bytes (from the HuggingFace LFS pointer
+    /// and `ModelTier::download_size_bytes`).
+    pub size_bytes: u64,
+    /// `true` iff the file is present on disk **and** its byte length
+    /// matches `size_bytes`. We deliberately do **not** run a BLAKE3
+    /// check here on every poll — verification is an explicit user
+    /// action — but a length mismatch is enough to flip `available`
+    /// back to `false` so the Settings UI can re-offer a download.
+    pub available: bool,
+    /// Actual byte length of the on-disk file (0 when missing). Used
+    /// by the Settings UI to render a "<partial> / <total>" hint when
+    /// the size doesn't match.
+    pub size_on_disk: u64,
+}
+
+/// Aggregate availability snapshot for the three text-model tiers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiModelAvailability {
+    pub tiers: Vec<AiModelTierInfo>,
+    /// The currently-active tier slug (`"small" | "medium" | "large"`).
+    /// Mirrors [`aec_ai::ModelManager::active_tier`].
+    pub active_tier: String,
+    /// Absolute path to the directory the bridge stores model files in.
+    pub models_dir: String,
+}
+
+/// Live snapshot of an in-flight model download. The renderer polls
+/// [`BridgeService::ai_download_progress`] every ~500 ms while a
+/// download is in flight to update the Settings progress bar.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiDownloadProgress {
+    /// Lowercase tier slug of the download this snapshot refers to.
+    pub tier: String,
+    /// Bytes received so far (including any resumed bytes that were
+    /// already on disk when the download started).
+    pub downloaded: u64,
+    /// Expected total size in bytes — the manifest's
+    /// `ModelTier::download_size_bytes` value, populated *before* the
+    /// HTTP `Content-Length` lands.
+    pub total: u64,
+    /// One of `"downloading" | "verifying" | "completed" | "failed"`.
+    pub state: String,
+    /// Populated on `"failed"`; cleared on every other state.
+    pub message: Option<String>,
+}
+
+/// Successful return of [`BridgeService::ai_download_model`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AiDownloadResult {
+    /// Lowercase tier slug that was downloaded.
+    pub tier: String,
+    /// Absolute path the verified GGUF lives at on disk.
+    pub path: String,
+    /// Byte length of the final file.
+    pub size_bytes: u64,
+}
+
+/// Owned, fully self-contained handle on an in-flight model
+/// download. Built by [`BridgeService::ai_prepare_download`] under a
+/// **brief** model_manager lock, then handed to
+/// [`BridgeService::run_ai_download`] which performs the HTTPS
+/// transfer + BLAKE3 verify + atomic rename **without** any
+/// `BridgeService` lock held.
+///
+/// This is the split that keeps a multi-minute download from
+/// blocking writers (`project_save`, `command_apply`, …) on the
+/// outer N-API `RwLock<Option<BridgeService>>`: the napi handler
+/// only holds the read lock long enough to clone these owned values,
+/// then drops it before invoking `run_ai_download`.
+#[derive(Debug, Clone)]
+pub struct AiDownloadContext {
+    /// Lowercase tier slug (`"small" | "medium" | "large"`). Echoed
+    /// back into the progress snapshots so the renderer can match
+    /// snapshots against the tier it requested.
+    pub tier_slug: String,
+    /// The tier as a typed [`aec_ai::ModelTier`]. Used to build the
+    /// temporary [`aec_ai::ModelManager`] inside
+    /// [`BridgeService::run_ai_download`] without re-parsing the
+    /// slug.
+    pub tier: aec_ai::ModelTier,
+    /// Cloned out of [`aec_ai::ModelManager`] under the lock — owns
+    /// the canonical filename, BLAKE3, download URL, and expected
+    /// size hint.
+    pub descriptor: aec_ai::ModelDescriptor,
+    /// Directory the download lands in (created if missing).
+    pub models_dir: PathBuf,
+    /// Shared progress slot the bridge service publishes into, cloned
+    /// out of [`BridgeService::download_progress`]. Held as an
+    /// `Arc<Mutex<…>>` rather than a borrow so the download body
+    /// runs with **no** `BridgeService`-level lock held — the
+    /// `Mutex` is acquired only for the microseconds it takes to
+    /// swap in each progress snapshot.
+    pub progress: Arc<Mutex<Option<AiDownloadProgress>>>,
+    /// Process-wide download serialisation guard, cloned out of
+    /// [`BridgeService::download_guard`]. Held for the **entire**
+    /// HTTPS transfer + BLAKE3 verify + atomic rename inside
+    /// [`BridgeService::run_ai_download`] — a second concurrent call
+    /// for the same tier (or a different tier, while we still write
+    /// to one shared `models_dir`) blocks on this `Mutex<()>` until
+    /// the first call completes.
+    ///
+    /// **Why this exists.** The UI in `AiModelsSection.tsx` already
+    /// guards against double-clicks via `pendingTier !== null`, and
+    /// [`aec_ai::ModelManager`] serialises *context construction* via
+    /// its own `Mutex`. But neither of those covers the window
+    /// between `ai_prepare_download` (which drops the
+    /// `model_manager` lock) and `run_ai_download` (which holds no
+    /// `BridgeService` lock at all). A programmatic caller — an
+    /// extension, a CLI flag, the future first-run wizard, or a
+    /// second renderer window — could fire two concurrent
+    /// `ai_download_model("medium")` calls and have both threads
+    /// write into the same `<filename>.partial` file. BLAKE3
+    /// verification at the end would catch the corruption and the
+    /// user would see a checksum-mismatch retry, but the UX is
+    /// confusing.
+    ///
+    /// **What the guard guarantees.** The first caller drives the
+    /// download to completion; the second caller waits on the
+    /// `Mutex<()>` and, when it finally acquires the guard, finds
+    /// the file already on disk and short-circuits via
+    /// `ModelManager::download_model`'s existing
+    /// "file present + BLAKE3 verified" early return — no
+    /// duplicate transfer, no double-publish of progress
+    /// snapshots, no `.partial` file racing.
+    ///
+    /// **Per-feature, not bridge-wide.** This is a download-only
+    /// guard: `project_save`, `command_apply`, `ai_plan`, etc. do
+    /// **not** block on it. The bridge service's outer
+    /// `RwLock<Option<BridgeService>>` is also unaffected — we
+    /// release that long before reaching here.
+    pub download_guard: Arc<Mutex<()>>,
+}
+
+/// Swap a fresh [`AiDownloadProgress`] snapshot into the shared slot.
+/// Free function (not a method) so [`BridgeService::run_ai_download`]
+/// can publish progress without holding `&self` — letting the napi
+/// handler drop its outer `RwLock` reader guard before kicking off
+/// the HTTP transfer.
+fn publish_progress_to(slot: &Mutex<Option<AiDownloadProgress>>, p: AiDownloadProgress) {
+    if let Ok(mut g) = slot.lock() {
+        *g = Some(p);
+    }
+}
+
 /// Configuration for [`BridgeService`].
 #[derive(Debug, Clone)]
 pub struct BridgeConfig {
@@ -1571,6 +1725,44 @@ pub struct BridgeService {
     /// touch only the diff registry. See `crate::ai_state` module
     /// doc for the full concurrency rationale.
     ai_state: AiState,
+    /// Process-wide [`aec_ai::ModelManager`]: tracks the active model
+    /// tier, the per-tier manifest (filename + URL + BLAKE3 + size),
+    /// and the on-disk `models_dir`. Held behind a [`Mutex`] for
+    /// interior mutability — `set_tier`, `install_model`, and
+    /// `download_model` all need `&mut`-ish semantics on the manager
+    /// even though [`BridgeService`] only takes `&self` on every
+    /// public method. The lock is taken briefly per call (a few
+    /// hashmap lookups + a clone), **not** for the duration of a
+    /// download: `ai_download_model` clones the descriptor under the
+    /// lock, drops the lock, and then calls the lower-level
+    /// [`aec_ai::download_to_file`] free function so concurrent
+    /// `ai_model_availability` / `ai_download_progress` polls return
+    /// in microseconds.
+    model_manager: Mutex<aec_ai::ModelManager>,
+    /// In-process slot holding the most recent
+    /// [`AiDownloadProgress`] snapshot. The `Arc` is so the
+    /// per-chunk progress callback (which runs on the download
+    /// thread inside [`aec_ai::download_to_file`]) can write into
+    /// the same slot the renderer's poll path reads from. Single
+    /// global slot because the Settings UI only ever drives one
+    /// download at a time.
+    download_progress: Arc<Mutex<Option<AiDownloadProgress>>>,
+    /// Process-wide guard that serialises model downloads. Cloned
+    /// into every [`AiDownloadContext`] by
+    /// [`Self::ai_prepare_download`] and held for the full
+    /// HTTPS-transfer + BLAKE3-verify + rename flow inside
+    /// [`Self::run_ai_download`]. A second concurrent download call
+    /// blocks here until the first finishes; when it finally
+    /// acquires the guard the file is already on disk and the inner
+    /// `ModelManager::download_model` short-circuits via its
+    /// "file present + BLAKE3 verified" early return.
+    ///
+    /// **Per-feature, not bridge-wide.** Only download requests
+    /// contend on this mutex — unrelated bridge calls (`project_save`,
+    /// `command_apply`, `ai_plan`, viewport ticks, …) run unblocked.
+    /// See the doc on [`AiDownloadContext::download_guard`] for the
+    /// threat model.
+    download_guard: Arc<Mutex<()>>,
     /// Process-wide KChat accounting state. In Phase 15 the
     /// in-process publisher is always an
     /// [`aec_core::InMemoryPublisher`] — the real publisher is the
@@ -1907,6 +2099,9 @@ impl BridgeService {
             render_state: Mutex::new(RenderState::new()),
             asset_state,
             ai_state: AiState::new(default_ai_runtime_config()),
+            model_manager: Mutex::new(default_model_manager()),
+            download_progress: Arc::new(Mutex::new(None)),
+            download_guard: Arc::new(Mutex::new(())),
             kchat_state: crate::kchat_state::KChatState::new(),
             viewport_service: crate::viewport_service::ViewportService::new(),
             extension_registry,
@@ -5337,6 +5532,292 @@ impl BridgeService {
         })
     }
 
+    /// Snapshot of which Ternary-Bonsai tiers are present on disk and
+    /// the active tier. Cheap — locks the [`Mutex<ModelManager>`] for
+    /// the duration of three `metadata()` syscalls (one per tier) and
+    /// drops it. The Settings page calls this on mount and after
+    /// every `ai_download_model` / `ai_delete_model` to refresh its
+    /// per-tier "Download" / "Available" badges.
+    pub fn ai_model_availability(&self) -> Result<AiModelAvailability, BridgeServiceError> {
+        let mgr = self
+            .model_manager
+            .lock()
+            .map_err(|_| BridgeServiceError::Ai("model_manager mutex poisoned".into()))?;
+        let mut tiers = Vec::with_capacity(3);
+        for tier in aec_ai::ModelTier::all() {
+            let descriptor = mgr.descriptor(tier).ok_or_else(|| {
+                BridgeServiceError::Ai(format!(
+                    "missing descriptor for tier {slug}",
+                    slug = tier.slug()
+                ))
+            })?;
+            let path = mgr.model_path_for(tier);
+            let size_on_disk = std::fs::metadata(&path).map_or(0, |m| m.len());
+            tiers.push(AiModelTierInfo {
+                tier: tier.slug().into(),
+                name: tier.display_name().into(),
+                filename: descriptor.filename.clone(),
+                size_bytes: descriptor.size_bytes,
+                available: path.is_file() && size_on_disk == descriptor.size_bytes,
+                size_on_disk,
+            });
+        }
+        Ok(AiModelAvailability {
+            tiers,
+            active_tier: mgr.active_tier().slug().into(),
+            models_dir: mgr.models_dir().display().to_string(),
+        })
+    }
+
+    /// Build an [`AiDownloadContext`] for `tier_str` while holding
+    /// the model_manager lock just long enough to clone the
+    /// descriptor + paths + the shared progress slot. The returned
+    /// context is fully owned — the napi handler drops the outer
+    /// `RwLock<Option<BridgeService>>` reader guard and then calls
+    /// [`Self::run_ai_download`] without holding **any**
+    /// `BridgeService` lock, so concurrent `with_service` writers
+    /// (`project_save`, `command_apply`, …) run in parallel with
+    /// the multi-minute HTTP download.
+    pub fn ai_prepare_download(
+        &self,
+        tier_str: &str,
+    ) -> Result<AiDownloadContext, BridgeServiceError> {
+        let tier = aec_ai::ModelTier::from_slug(tier_str)
+            .ok_or_else(|| BridgeServiceError::Ai(format!("unknown tier {tier_str:?}")))?;
+        let (descriptor, models_dir) = {
+            let mgr = self
+                .model_manager
+                .lock()
+                .map_err(|_| BridgeServiceError::Ai("model_manager mutex poisoned".into()))?;
+            let descriptor = mgr
+                .descriptor(tier)
+                .ok_or_else(|| {
+                    BridgeServiceError::Ai(format!("missing descriptor for tier {tier_str}"))
+                })?
+                .clone();
+            (descriptor, mgr.models_dir().to_path_buf())
+        };
+        Ok(AiDownloadContext {
+            tier_slug: tier_str.into(),
+            tier,
+            descriptor,
+            models_dir,
+            progress: Arc::clone(&self.download_progress),
+            download_guard: Arc::clone(&self.download_guard),
+        })
+    }
+
+    /// Drive a model download to completion using the owned `ctx`.
+    /// Performs HTTPS download → BLAKE3 verify → atomic rename and
+    /// updates `ctx.progress` from inside the download callback.
+    /// **Does not hold any `BridgeService` lock** — the progress
+    /// `Arc<Mutex<…>>` is the only shared state, and the `Mutex` is
+    /// acquired only for the microseconds it takes to swap each
+    /// snapshot. Safe to invoke from a `spawn_blocking` task while
+    /// concurrent writers run in parallel.
+    pub fn run_ai_download(ctx: AiDownloadContext) -> Result<AiDownloadResult, BridgeServiceError> {
+        let AiDownloadContext {
+            tier_slug,
+            tier,
+            descriptor,
+            models_dir,
+            progress,
+            download_guard,
+        } = ctx;
+        // Serialise concurrent downloads. The guard is held for the
+        // **entire** transfer + verify + rename so a second concurrent
+        // caller for any tier blocks here until the first finishes, at
+        // which point it finds the file already on disk and
+        // `ModelManager::download_model` short-circuits via its
+        // "file present + BLAKE3 verified" early return.
+        //
+        // The guarded data is `()`, so a poisoned lock (from a
+        // previous download that panicked) carries no corruption — we
+        // recover transparently via `into_inner`. The poison stays
+        // visible on the inner `Mutex` for any caller that wants to
+        // diagnose it, but the download must still proceed.
+        let _serialise = download_guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let total_hint = descriptor.size_bytes;
+        // Build a temporary, lock-free ModelManager that owns just this
+        // tier's descriptor. The real `BridgeService::model_manager`
+        // mutex was already dropped by `ai_prepare_download`, so the
+        // download here uses zero `BridgeService` locks of any kind.
+        // Delegating to `ModelManager::download_model` keeps the
+        // download / verify / rename sequence in exactly one place;
+        // this method is now only responsible for translating
+        // `DownloadState` transitions and per-chunk progress into the
+        // bridge's `AiDownloadProgress` snapshots.
+        let mgr = aec_ai::ModelManager::with_tier(models_dir, vec![descriptor.clone()], tier);
+        let final_path = mgr.model_path_for(tier);
+        // Per-chunk progress: publish a `downloading` snapshot on
+        // every byte-counter update.
+        let progress_for_bytes = Arc::clone(&progress);
+        let tier_for_bytes = tier_slug.clone();
+        let on_progress: aec_ai::ProgressCallback = Arc::new(move |done, total| {
+            publish_progress_to(
+                &progress_for_bytes,
+                AiDownloadProgress {
+                    tier: tier_for_bytes.clone(),
+                    downloaded: done,
+                    total: if total > 0 { total } else { total_hint },
+                    state: "downloading".into(),
+                    message: None,
+                },
+            );
+        });
+        // Lifecycle: map `DownloadState` transitions to `AiDownloadProgress`
+        // snapshots. The renderer polls the progress slot and switches
+        // between “downloading X / Y bytes”, “verifying…”, “done”, or
+        // “failed: …” based on the `state` field.
+        let progress_for_state = Arc::clone(&progress);
+        let tier_for_state = tier_slug.clone();
+        let on_state: Arc<dyn Fn(aec_ai::DownloadState) + Send + Sync> =
+            Arc::new(move |state| match state {
+                aec_ai::DownloadState::Downloading => {
+                    publish_progress_to(
+                        &progress_for_state,
+                        AiDownloadProgress {
+                            tier: tier_for_state.clone(),
+                            downloaded: 0,
+                            total: total_hint,
+                            state: "downloading".into(),
+                            message: None,
+                        },
+                    );
+                }
+                aec_ai::DownloadState::Verifying => {
+                    publish_progress_to(
+                        &progress_for_state,
+                        AiDownloadProgress {
+                            tier: tier_for_state.clone(),
+                            downloaded: total_hint,
+                            total: total_hint,
+                            state: "verifying".into(),
+                            message: None,
+                        },
+                    );
+                }
+                aec_ai::DownloadState::Completed => {
+                    // Final snapshot is published once the rename
+                    // succeeds and we know the on-disk size below.
+                }
+                aec_ai::DownloadState::Failed { msg, .. } => {
+                    publish_progress_to(
+                        &progress_for_state,
+                        AiDownloadProgress {
+                            tier: tier_for_state.clone(),
+                            downloaded: 0,
+                            total: total_hint,
+                            state: "failed".into(),
+                            message: Some(msg),
+                        },
+                    );
+                }
+            });
+        let callbacks = aec_ai::DownloadCallbacks {
+            on_progress: Some(on_progress),
+            on_state: Some(on_state),
+        };
+        let path = mgr
+            .download_model(tier, callbacks)
+            .map_err(|e| BridgeServiceError::Ai(format!("download failed: {e}")))?;
+        let size_bytes = std::fs::metadata(&path).map_or(0, |m| m.len());
+        publish_progress_to(
+            &progress,
+            AiDownloadProgress {
+                tier: tier_slug.clone(),
+                downloaded: size_bytes,
+                total: size_bytes,
+                state: "completed".into(),
+                message: None,
+            },
+        );
+        debug_assert_eq!(path, final_path, "ModelManager renamed into expected slot");
+        Ok(AiDownloadResult {
+            tier: tier_slug,
+            path: path.display().to_string(),
+            size_bytes,
+        })
+    }
+
+    /// Convenience: prepare + run a model download in one call.
+    /// Internal callers (and the `ai_model_download_surface`
+    /// integration tests) that don't go through the napi `RwLock`
+    /// keep this shape; the napi handler instead calls
+    /// [`Self::ai_prepare_download`] under the read lock, drops the
+    /// lock, then calls [`Self::run_ai_download`] so a multi-minute
+    /// HTTP transfer doesn't block writers.
+    pub fn ai_download_model(
+        &self,
+        tier_str: &str,
+    ) -> Result<AiDownloadResult, BridgeServiceError> {
+        let ctx = self.ai_prepare_download(tier_str)?;
+        Self::run_ai_download(ctx)
+    }
+
+    /// Read the latest progress snapshot published by an in-flight
+    /// (or recently-completed) [`Self::ai_download_model`]. Returns
+    /// `None` when no download has run yet this session. The
+    /// renderer polls this every ~500 ms while the Settings download
+    /// panel is open.
+    pub fn ai_download_progress(&self) -> Result<Option<AiDownloadProgress>, BridgeServiceError> {
+        let g = self
+            .download_progress
+            .lock()
+            .map_err(|_| BridgeServiceError::Ai("download_progress mutex poisoned".into()))?;
+        Ok(g.clone())
+    }
+
+    /// Switch the in-process active model tier. Two effects, applied
+    /// atomically from the caller's POV:
+    ///
+    /// 1. **`ModelManager::set_tier`** — the per-tier descriptor lookup
+    ///    [`ai_model_availability`](Self::ai_model_availability) returns
+    ///    now reports the new tier as `active_tier`.
+    /// 2. **`AiState::reload_with_config`** — the
+    ///    [`SidecarRuntime`](aec_ai::SidecarRuntime) inside the bridge's
+    ///    [`AiState`](crate::ai_state::AiState) has its `RuntimeConfig`
+    ///    swapped to the new tier's
+    ///    [`active_config()`](aec_ai::ModelManager::active_config), and
+    ///    any running `llama-server` child is killed by dropping its
+    ///    [`SidecarHandle`](aec_ai::sidecar::SidecarHandle). The next
+    ///    `ai_plan` cold-spawns the **new** tier's GGUF.
+    ///
+    /// Without step 2 the renderer would silently keep talking to the
+    /// previous tier's model until the bridge restarted.
+    ///
+    /// The Settings page calls this when the user picks a different
+    /// tier from the radio group; the renderer doesn't need to do
+    /// anything else (no explicit "restart sidecar" step).
+    pub fn ai_set_active_tier(&self, tier_str: &str) -> Result<(), BridgeServiceError> {
+        let tier = aec_ai::ModelTier::from_slug(tier_str)
+            .ok_or_else(|| BridgeServiceError::Ai(format!("unknown tier {tier_str:?}")))?;
+        // Step 1: mutate the manager and clone out the new config in
+        // a single short critical section, so the manager mutex isn't
+        // held across the `AiState::reload_with_config` call (which
+        // briefly takes both the `handle_slot` and `runtime` locks).
+        let new_config = {
+            let mut mgr = self
+                .model_manager
+                .lock()
+                .map_err(|_| BridgeServiceError::Ai("model_manager mutex poisoned".into()))?;
+            mgr.set_tier(tier);
+            mgr.active_config()
+        };
+        // Step 2: propagate to the sidecar runtime. If this fails
+        // (lock poison only — the method does no I/O), the manager
+        // state is now inconsistent with the runtime; we still
+        // surface the error so the renderer can retry. A successful
+        // retry will re-derive `new_config` from the already-updated
+        // manager state.
+        self.ai_state
+            .reload_with_config(new_config)
+            .map_err(|e| BridgeServiceError::Ai(format!("reload ai runtime: {e}")))?;
+        Ok(())
+    }
+
     // ----- Draft scope (DXF import/export + drawing + sheet/layer ----- //
 
     /// Import a DXF file at `dxf_path` into the project graph. Each
@@ -5903,13 +6384,34 @@ fn state_string(s: aec_ai::RuntimeState) -> String {
     }
 }
 
-/// Default sidecar runtime config: in production this comes from
-/// `workers/ai/config.json`; here we bake the same defaults so the
-/// bridge can boot without the file on disk (the renderer never
-/// reads this — the sidecar Python wrapper does — but the bridge
-/// needs a `RuntimeConfig` to drive the lifecycle state machine).
+/// Default sidecar runtime config. The bridge needs a `RuntimeConfig`
+/// to drive the lifecycle state machine; the canonical defaults
+/// (loopback port, idle timeout, request timeout, context window, and
+/// the platform-appropriate `~/Library/Application Support/AEC Studio/models/`
+/// (etc.) path + Ternary-Bonsai 1.7B filename) are baked into
+/// [`aec_ai::RuntimeConfig::default`].
 fn default_ai_runtime_config() -> aec_ai::RuntimeConfig {
     aec_ai::RuntimeConfig::default()
+}
+
+/// Default [`aec_ai::ModelManager`] for a fresh bridge boot. Uses
+/// [`aec_ai::default_models_dir`] as the on-disk root (platform
+/// appropriate: `~/Library/Application Support/AEC Studio/models/` on
+/// macOS, `$XDG_DATA_HOME/aec-studio/models/` on Linux, `%LOCALAPPDATA%
+/// \AEC Studio\models\` on Windows) and the three Ternary-Bonsai
+/// tiers from [`aec_ai::ModelManager::default_descriptors`].
+fn default_model_manager() -> aec_ai::ModelManager {
+    // We can't call `with_default_descriptors` here because it picks the
+    // active tier from a hardware profile we don't have yet at bridge
+    // boot — the governor's `HardwareProfiler` lives on the napi side
+    // and is consulted lazily. Default to `Small` (the safest tier for
+    // every device class) and let `ai_set_active_tier` overwrite it
+    // once the renderer surfaces the user / governor choice.
+    aec_ai::ModelManager::with_tier(
+        aec_ai::default_models_dir(),
+        aec_ai::ModelManager::default_descriptors(),
+        aec_ai::ModelTier::Small,
+    )
 }
 
 /// Parse a caller-supplied `scene_json` parameter into a
