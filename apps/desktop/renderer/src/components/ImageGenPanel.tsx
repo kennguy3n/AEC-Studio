@@ -195,16 +195,18 @@ export function ImageGenPanel(): JSX.Element {
     void refreshRuntime();
   }, [refreshAvailability, refreshRuntime]);
 
-  // Phase 18 Group C Task 17 — policy snapshot on mount. Cheap;
-  // we don't poll because the policy only changes when the user
-  // switches hardware tiers, which is a deliberate user action
-  // that should already trigger a refresh elsewhere. If we miss
-  // a swap the worst case is a stale "paused" banner for ~1 s
-  // until the user reloads Settings — acceptable trade-off vs.
-  // a permanent polling tick.
+  // Phase 18 Group C Task 17 — policy snapshot on mount + slow
+  // refresh while mounted. The policy only changes on
+  // `governor.applyHardwareTier`, which is a deliberate user
+  // action elsewhere in Settings, so a 3 s cadence is more than
+  // fast enough to pick up tier swaps without burning IPC. We
+  // can't share the `renderInProgress` tick because the policy
+  // determines *whether* we even need that tick — the gating
+  // effect below depends on `policy.allowDuringPathtracedRender`.
   useEffect(() => {
     let cancelled = false;
-    void (async () => {
+    let timer: ReturnType<typeof setInterval> | null = null;
+    const tick = async () => {
       try {
         const p = await aec.imageGen.activePolicy();
         if (!cancelled) setPolicy(p as ImageGenPolicy);
@@ -213,19 +215,37 @@ export function ImageGenPanel(): JSX.Element {
         // (which defaults to "no banner" / generate enabled). The
         // server-side gate is the source of truth.
       }
-    })();
+    };
+    void tick();
+    timer = setInterval(() => void tick(), 3000);
     return () => {
       cancelled = true;
+      if (timer !== null) clearInterval(timer);
     };
   }, []);
 
   // Phase 18 Group C Task 17 — poll the render-queue inspector
-  // every 1 s while the panel is mounted. The poll is unconditional
-  // (no in-flight gate like the download / runtime polls) because
-  // the render queue state changes asynchronously without any
-  // image-gen action — a render started from the Render page must
-  // still show up in the banner here.
+  // every 1 s while the panel is mounted, *but only on tiers
+  // whose policy actually pauses image-gen during a path-traced
+  // render*. On High / Pro (`allowDuringPathtracedRender = true`)
+  // the banner is never shown and the Generate button is never
+  // gated by the render state, so polling there is pure waste —
+  // both IPC and a wakeup every second on a likely-idle settings
+  // tab. We resolve `shouldPoll` after `policy` is first
+  // populated; until then we err on the side of polling so the
+  // very first tick on Low / Medium still reflects an in-progress
+  // render that started before the panel opened. The dependency
+  // on `policy` re-runs this effect when the tier changes, so
+  // moving Low → Pro stops the tick and Pro → Low restarts it.
+  const shouldPollRenderQueue =
+    policy === null || policy.allowDuringPathtracedRender !== true;
   useEffect(() => {
+    if (!shouldPollRenderQueue) {
+      // Tier doesn't gate generate on render — clear any stale
+      // banner state and don't burn IPC on a poll we won't use.
+      setRenderInProgress(false);
+      return;
+    }
     let cancelled = false;
     let timer: ReturnType<typeof setInterval> | null = null;
     const tick = async () => {
@@ -242,7 +262,7 @@ export function ImageGenPanel(): JSX.Element {
       cancelled = true;
       if (timer !== null) clearInterval(timer);
     };
-  }, []);
+  }, [shouldPollRenderQueue]);
 
   // Progress poll. Mirrors `AiModelsSection` — only runs while a
   // download is in flight to keep idle Settings sessions IPC-quiet.
