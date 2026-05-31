@@ -182,6 +182,31 @@ pub fn download_to_file(
     expected_total: u64,
     on_progress: Option<ProgressCallback>,
 ) -> Result<(), DownloadError> {
+    // Defence-in-depth: validate the *initial* URL against the host
+    // allow-list before issuing any request. In practice today the only
+    // callers pass canonical HuggingFace descriptors, but a future
+    // caller (e.g. a `ModelManager` constructed from an external
+    // descriptor file, a CLI flag, or a test harness) could supply an
+    // arbitrary URL — we want this function to refuse to even open a
+    // socket to a disallowed host, not just to refuse to follow
+    // redirects into one. The redirect-chain check at
+    // [`validate_redirect`] inside [`download_to_file_impl`] guards the
+    // 302 hops; this guards the entry point.
+    validate_redirect(url)?;
+    download_to_file_impl(url, dest, expected_total, on_progress)
+}
+
+/// Internal helper that performs the actual HTTP transfer once the
+/// caller has decided the URL is safe to fetch. Unit tests that exercise
+/// the transfer mechanism against a loopback mock server call this
+/// directly to bypass the host allow-list (which deliberately does not
+/// permit `127.0.0.1`).
+fn download_to_file_impl(
+    url: &str,
+    dest: &Path,
+    expected_total: u64,
+    on_progress: Option<ProgressCallback>,
+) -> Result<(), DownloadError> {
     let agent = build_agent();
     let resume_from = match std::fs::metadata(dest) {
         Ok(m) if m.is_file() => m.len(),
@@ -519,7 +544,7 @@ mod tests {
         let cb: ProgressCallback = Arc::new(move |done, _total| {
             p.store(done, Ordering::SeqCst);
         });
-        download_to_file(
+        download_to_file_impl(
             &format!("http://127.0.0.1:{port}/file"),
             &dest,
             body.len() as u64,
@@ -542,7 +567,7 @@ mod tests {
         let dest = dir.path().join("out.bin");
         // Pre-seed the partial with the first 1024 bytes.
         std::fs::write(&dest, &body[..1024]).unwrap();
-        download_to_file(
+        download_to_file_impl(
             &format!("http://127.0.0.1:{port}/file"),
             &dest,
             body.len() as u64,
@@ -574,7 +599,10 @@ mod tests {
         );
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("out.bin");
-        let err = download_to_file(
+        // Call the impl directly so the initial URL validation does not
+        // short-circuit before we ever reach the redirect — we want the
+        // 302 hop itself to trigger the host allow-list rejection.
+        let err = download_to_file_impl(
             &format!("http://127.0.0.1:{redirect_port}/file"),
             &dest,
             body.len() as u64,
@@ -587,6 +615,33 @@ mod tests {
             DownloadError::DisallowedRedirect(_) => {}
             other => panic!("expected DisallowedRedirect, got {other:?}"),
         }
+    }
+
+    /// The public [`download_to_file`] must validate the initial URL
+    /// against the host allow-list *before* opening a socket — a future
+    /// caller (a CLI flag, an external descriptor JSON, a test harness)
+    /// could supply an arbitrary URL, and we should refuse to even
+    /// reach a disallowed host. The redirect-chain check is
+    /// already covered by [`follows_redirect_to_allowed_host`] above;
+    /// this test pins the entry-point check.
+    #[test]
+    fn rejects_disallowed_initial_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("out.bin");
+        let err =
+            download_to_file("https://evil.example.com/model.bin", &dest, 0, None).unwrap_err();
+        match err {
+            DownloadError::DisallowedRedirect(host) => {
+                assert_eq!(
+                    host, "evil.example.com",
+                    "error should name the rejected host"
+                );
+            }
+            other => panic!("expected DisallowedRedirect, got {other:?}"),
+        }
+        // Confirm we never even created the destination — i.e. no
+        // partial write happened before the host check fired.
+        assert!(!dest.exists(), "dest should not exist after rejected URL");
     }
 
     #[test]

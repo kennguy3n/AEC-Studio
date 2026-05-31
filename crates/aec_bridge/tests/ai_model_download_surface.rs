@@ -18,6 +18,7 @@
 //!   * Slug-parser errors come back as
 //!     [`BridgeServiceError::Ai`], not panics.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use aec_ai::{RuntimeConfig, SidecarTransport};
@@ -175,4 +176,65 @@ fn ai_set_active_tier_resets_runtime_so_next_plan_uses_new_model() {
     // pre-existing round-trip test).
     let a = s.ai_model_availability().expect("availability");
     assert_eq!(a.active_tier, "medium");
+}
+
+/// PR #92 Devin Review pin: two concurrent
+/// `ai_prepare_download` calls must produce contexts that share
+/// **one** process-wide `download_guard`, so a second concurrent
+/// `run_ai_download` blocks behind the first instead of both
+/// threads racing into the same `<filename>.partial` file.
+///
+/// We can't drive `run_ai_download` end-to-end in a unit test
+/// without hitting the network, but the guard's contract is purely
+/// about identity — every context cloned out of one
+/// `BridgeService` must point at the same `Mutex<()>`. We pin that
+/// with `Arc::ptr_eq` here. Then we *also* prove the guard
+/// actually serialises by holding it in the test thread and
+/// asserting that a second `try_lock` would block (i.e. returns
+/// `WouldBlock`), which is the exact wait the second
+/// `run_ai_download` caller experiences in production.
+#[test]
+fn ai_prepare_download_shares_one_download_guard_across_callers() {
+    let (s, _tmp) = make_service();
+    let ctx_small = s.ai_prepare_download("small").expect("prepare small");
+    let ctx_medium = s.ai_prepare_download("medium").expect("prepare medium");
+    let ctx_large = s.ai_prepare_download("large").expect("prepare large");
+    // All three contexts must point at the same `Arc<Mutex<()>>`.
+    // If a future refactor accidentally constructs a fresh guard
+    // per call, two concurrent callers would each get their own
+    // mutex and never serialise.
+    assert!(
+        Arc::ptr_eq(&ctx_small.download_guard, &ctx_medium.download_guard),
+        "small + medium contexts must share the same download_guard Arc"
+    );
+    assert!(
+        Arc::ptr_eq(&ctx_medium.download_guard, &ctx_large.download_guard),
+        "medium + large contexts must share the same download_guard Arc"
+    );
+
+    // The guard is freshly-constructed and acquirable.
+    let held = ctx_small
+        .download_guard
+        .lock()
+        .expect("acquire fresh guard");
+
+    // While the test thread holds the guard, a second
+    // `try_lock` from the same process must observe the lock as
+    // contended — this is exactly the wait a second
+    // `run_ai_download` thread would block on.
+    assert!(
+        ctx_medium.download_guard.try_lock().is_err(),
+        "guard must be contended while held; otherwise two concurrent \
+         downloads could race into the same .partial file"
+    );
+
+    drop(held);
+
+    // After release the guard is acquirable again — the second
+    // downloader proceeds, finds the file already on disk, and
+    // short-circuits via ModelManager's BLAKE3 early-return.
+    let _again = ctx_large
+        .download_guard
+        .lock()
+        .expect("re-acquire after release");
 }

@@ -1567,6 +1567,44 @@ pub struct AiDownloadContext {
     /// `Mutex` is acquired only for the microseconds it takes to
     /// swap in each progress snapshot.
     pub progress: Arc<Mutex<Option<AiDownloadProgress>>>,
+    /// Process-wide download serialisation guard, cloned out of
+    /// [`BridgeService::download_guard`]. Held for the **entire**
+    /// HTTPS transfer + BLAKE3 verify + atomic rename inside
+    /// [`BridgeService::run_ai_download`] — a second concurrent call
+    /// for the same tier (or a different tier, while we still write
+    /// to one shared `models_dir`) blocks on this `Mutex<()>` until
+    /// the first call completes.
+    ///
+    /// **Why this exists.** The UI in `AiModelsSection.tsx` already
+    /// guards against double-clicks via `pendingTier !== null`, and
+    /// [`aec_ai::ModelManager`] serialises *context construction* via
+    /// its own `Mutex`. But neither of those covers the window
+    /// between `ai_prepare_download` (which drops the
+    /// `model_manager` lock) and `run_ai_download` (which holds no
+    /// `BridgeService` lock at all). A programmatic caller — an
+    /// extension, a CLI flag, the future first-run wizard, or a
+    /// second renderer window — could fire two concurrent
+    /// `ai_download_model("medium")` calls and have both threads
+    /// write into the same `<filename>.partial` file. BLAKE3
+    /// verification at the end would catch the corruption and the
+    /// user would see a checksum-mismatch retry, but the UX is
+    /// confusing.
+    ///
+    /// **What the guard guarantees.** The first caller drives the
+    /// download to completion; the second caller waits on the
+    /// `Mutex<()>` and, when it finally acquires the guard, finds
+    /// the file already on disk and short-circuits via
+    /// `ModelManager::download_model`'s existing
+    /// "file present + BLAKE3 verified" early return — no
+    /// duplicate transfer, no double-publish of progress
+    /// snapshots, no `.partial` file racing.
+    ///
+    /// **Per-feature, not bridge-wide.** This is a download-only
+    /// guard: `project_save`, `command_apply`, `ai_plan`, etc. do
+    /// **not** block on it. The bridge service's outer
+    /// `RwLock<Option<BridgeService>>` is also unaffected — we
+    /// release that long before reaching here.
+    pub download_guard: Arc<Mutex<()>>,
 }
 
 /// Swap a fresh [`AiDownloadProgress`] snapshot into the shared slot.
@@ -1709,6 +1747,22 @@ pub struct BridgeService {
     /// global slot because the Settings UI only ever drives one
     /// download at a time.
     download_progress: Arc<Mutex<Option<AiDownloadProgress>>>,
+    /// Process-wide guard that serialises model downloads. Cloned
+    /// into every [`AiDownloadContext`] by
+    /// [`Self::ai_prepare_download`] and held for the full
+    /// HTTPS-transfer + BLAKE3-verify + rename flow inside
+    /// [`Self::run_ai_download`]. A second concurrent download call
+    /// blocks here until the first finishes; when it finally
+    /// acquires the guard the file is already on disk and the inner
+    /// `ModelManager::download_model` short-circuits via its
+    /// "file present + BLAKE3 verified" early return.
+    ///
+    /// **Per-feature, not bridge-wide.** Only download requests
+    /// contend on this mutex — unrelated bridge calls (`project_save`,
+    /// `command_apply`, `ai_plan`, viewport ticks, …) run unblocked.
+    /// See the doc on [`AiDownloadContext::download_guard`] for the
+    /// threat model.
+    download_guard: Arc<Mutex<()>>,
     /// Process-wide KChat accounting state. In Phase 15 the
     /// in-process publisher is always an
     /// [`aec_core::InMemoryPublisher`] — the real publisher is the
@@ -2047,6 +2101,7 @@ impl BridgeService {
             ai_state: AiState::new(default_ai_runtime_config()),
             model_manager: Mutex::new(default_model_manager()),
             download_progress: Arc::new(Mutex::new(None)),
+            download_guard: Arc::new(Mutex::new(())),
             kchat_state: crate::kchat_state::KChatState::new(),
             viewport_service: crate::viewport_service::ViewportService::new(),
             extension_registry,
@@ -5548,6 +5603,7 @@ impl BridgeService {
             descriptor,
             models_dir,
             progress: Arc::clone(&self.download_progress),
+            download_guard: Arc::clone(&self.download_guard),
         })
     }
 
@@ -5566,7 +5622,23 @@ impl BridgeService {
             descriptor,
             models_dir,
             progress,
+            download_guard,
         } = ctx;
+        // Serialise concurrent downloads. The guard is held for the
+        // **entire** transfer + verify + rename so a second concurrent
+        // caller for any tier blocks here until the first finishes, at
+        // which point it finds the file already on disk and
+        // `ModelManager::download_model` short-circuits via its
+        // "file present + BLAKE3 verified" early return.
+        //
+        // The guarded data is `()`, so a poisoned lock (from a
+        // previous download that panicked) carries no corruption — we
+        // recover transparently via `into_inner`. The poison stays
+        // visible on the inner `Mutex` for any caller that wants to
+        // diagnose it, but the download must still proceed.
+        let _serialise = download_guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let total_hint = descriptor.size_bytes;
         // Build a temporary, lock-free ModelManager that owns just this
         // tier's descriptor. The real `BridgeService::model_manager`
