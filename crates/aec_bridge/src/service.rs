@@ -6168,10 +6168,20 @@ impl BridgeService {
         let descriptor = mgr.descriptor().clone();
         let path = mgr.model_path();
         let size_on_disk = std::fs::metadata(&path).map_or(0, |m| m.len());
+        // Phase 18 Group E Devin Review fix — parity with
+        // [`ImageGenModelManager::is_available`], which short-
+        // circuits to `false` when `descriptor.size_bytes == 0`.
+        // Without that guard, a zero-byte file on disk paired with
+        // a zero-size descriptor would report `available = true`,
+        // while the manager (the source of truth for ensure_ready
+        // / generate paths) would report `false`. The two reports
+        // must agree so the renderer never surfaces a "Ready"
+        // badge for a model the generate path would refuse to use.
         Ok(ImageGenModelAvailability {
             filename: descriptor.filename.clone(),
             size_bytes: descriptor.size_bytes,
             available: !descriptor.filename.is_empty()
+                && descriptor.size_bytes != 0
                 && path.is_file()
                 && size_on_disk == descriptor.size_bytes,
             size_on_disk,
@@ -6222,11 +6232,22 @@ impl BridgeService {
     ///
     /// **Validation**: rejects descriptors with an empty filename
     /// (the bridge has nowhere to write the download) or with a
-    /// `download_url` that is non-empty but not a valid http(s) URL.
+    /// `download_url` that is non-empty but not an `https://` URL.
     /// All other fields (size, blake3) are accepted as the caller
     /// supplied them — the BLAKE3 verification at
     /// `image_gen_download_model` time is the authoritative integrity
     /// check.
+    ///
+    /// **Phase 18 Group E Devin Review fix** — descriptor URLs are
+    /// constrained to `https://` only. Earlier this branch also
+    /// permitted `http://`, which conflicts with the project's
+    /// TLS-only outbound posture (see
+    /// [`crate::ai_state`](crate::ai_state) and the `host_is_allowed`
+    /// allow-list in [`aec_ai::model_download`]). The downstream
+    /// download path only allow-lists HuggingFace domains, which are
+    /// HTTPS-only, so a plain-HTTP descriptor URL would fail at
+    /// download time anyway — but catching it here surfaces a clear
+    /// error at descriptor-setting time rather than at first download.
     pub fn image_gen_set_descriptor(
         &self,
         descriptor: ImageGenModelDescriptor,
@@ -6237,9 +6258,9 @@ impl BridgeService {
             ));
         }
         if let Some(url) = descriptor.download_url.as_deref() {
-            if !(url.starts_with("http://") || url.starts_with("https://")) {
+            if !url.starts_with("https://") {
                 return Err(BridgeServiceError::Invalid(format!(
-                    "image_gen_set_descriptor: download_url {url:?} is not http(s)"
+                    "image_gen_set_descriptor: download_url {url:?} must use https:// scheme (TLS-only outbound posture; cleartext http:// is rejected by the descriptor validator and would be rejected again by the downstream host allow-list)"
                 )));
             }
         }
@@ -11069,13 +11090,166 @@ END-ISO-10303-21;\n";
                 "preset has empty filename"
             );
             let url = got.descriptor.download_url.as_deref().unwrap_or("");
+            // Phase 18 Group E Devin Review fix — every shipped
+            // preset must use `https://`. The TLS-only outbound
+            // posture is enforced at `image_gen_set_descriptor`
+            // time; this assertion catches a regression where a
+            // future contributor pins a plain-HTTP preset that
+            // would land in the registry but be rejected by the
+            // bridge at first-use.
             assert!(
-                url.starts_with("https://") || url.starts_with("http://"),
-                "preset {:?} has non-http(s) download_url {:?}",
+                url.starts_with("https://"),
+                "preset {:?} has non-https download_url {:?} \
+                 — plain http:// is rejected by image_gen_set_descriptor",
                 got.id,
                 url,
             );
         }
+    }
+
+    #[test]
+    fn image_gen_set_descriptor_rejects_plain_http_url() {
+        // Phase 18 Group E Devin Review fix — the TLS-only outbound
+        // posture forbids `http://` for any non-empty `download_url`.
+        // Earlier this branch accepted both `http://` and `https://`
+        // (validation lived at `model_download::host_is_allowed`
+        // which only allow-lists HF domains — all HTTPS-only — so a
+        // plain-HTTP URL would have failed at download time anyway).
+        // Catching it here surfaces a clear, actionable error at
+        // descriptor-pin time instead.
+        //
+        // We also pin the error message contains `https://` so the
+        // renderer-side error parser can surface a targeted hint.
+        let (s, _g) = service();
+        let descriptor = ImageGenModelDescriptor {
+            filename: "plain-http.gguf".into(),
+            blake3_hex: String::new(),
+            size_bytes: 0,
+            download_url: Some("http://example.com/plain-http.gguf".into()),
+            vae_filename: None,
+        };
+        let err = s
+            .image_gen_set_descriptor(descriptor)
+            .expect_err("plain http:// must be rejected");
+        match err {
+            BridgeServiceError::Invalid(msg) => {
+                assert!(
+                    msg.contains("https://"),
+                    "error message must reference https:// requirement: {msg}"
+                );
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn image_gen_set_descriptor_accepts_https_url() {
+        // Companion to `…_rejects_plain_http_url`: the happy path
+        // for the TLS-only validator. Pins that a descriptor with
+        // a valid `https://` URL is accepted byte-identical — i.e.
+        // the validator does NOT silently rewrite the URL or strip
+        // any field.
+        let (s, _g) = service();
+        let descriptor = ImageGenModelDescriptor {
+            filename: "good.gguf".into(),
+            blake3_hex: String::new(),
+            size_bytes: 0,
+            download_url: Some("https://huggingface.co/example/good.gguf".into()),
+            vae_filename: None,
+        };
+        s.image_gen_set_descriptor(descriptor)
+            .expect("valid https:// descriptor must be accepted");
+    }
+
+    #[test]
+    fn image_gen_set_descriptor_accepts_empty_url() {
+        // The TLS-only validator only fires on a *non-empty*
+        // `download_url`. A `None` (manual-entry / local model)
+        // is still accepted — the bridge has no URL to validate.
+        // This matches the rest of the image-gen lifecycle: the
+        // download endpoint is the one that requires a URL.
+        let (s, _g) = service();
+        let descriptor = ImageGenModelDescriptor {
+            filename: "local-only.gguf".into(),
+            blake3_hex: String::new(),
+            size_bytes: 0,
+            download_url: None,
+            vae_filename: None,
+        };
+        s.image_gen_set_descriptor(descriptor)
+            .expect("None download_url must be accepted");
+    }
+
+    #[test]
+    fn image_gen_model_availability_matches_manager_is_available_on_zero_size() {
+        // Phase 18 Group E Devin Review fix — the service-side
+        // `image_gen_model_availability` and the manager-side
+        // `is_available` must agree on every input. The bug:
+        // before this fix, when a descriptor declared
+        // `size_bytes == 0` and a 0-byte file existed on disk at
+        // `model_path`, the service reported `available = true`
+        // (descriptor filename non-empty + path is_file + sizes
+        // match — both zero) while the manager reported `false`
+        // (it short-circuits on `size_bytes == 0` first).
+        //
+        // The two reports are consumed by different code paths:
+        // the service one drives the renderer's badge; the
+        // manager one drives `ensure_ready`'s decision to spawn
+        // or refuse. A disagreement could surface a "Ready"
+        // badge for a model the generate path would refuse to
+        // load. The fix adds the `size_bytes != 0` short-circuit
+        // to the service path too.
+        let (s, _g) = service();
+        // Build a descriptor with size_bytes == 0 + a real 0-byte
+        // file on disk at the matching path. The manager's
+        // `models_dir` is resolved via [`aec_ai::default_models_dir`],
+        // not the test's TempDir, so we ask the manager for the
+        // resolved `model_path()` and write the 0-byte file there.
+        // We delete it at the end of the test to avoid polluting
+        // the user's models directory.
+        let zero_filename = "zero-bytes-availability-parity-test.gguf";
+        let path = {
+            let mut mgr = s.image_gen_model_manager.lock().unwrap();
+            let mut desc = mgr.descriptor().clone();
+            desc.filename = zero_filename.into();
+            desc.size_bytes = 0;
+            mgr.set_descriptor(desc);
+            mgr.model_path()
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::File::create(&path).unwrap();
+        // Sanity: the on-disk file is exactly the size the
+        // descriptor declares (both zero).
+        let on_disk = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(on_disk, 0);
+
+        let svc_view = s.image_gen_model_availability().unwrap();
+        let mgr_view = {
+            let mgr = s.image_gen_model_manager.lock().unwrap();
+            mgr.is_available()
+        };
+        assert_eq!(
+            svc_view.available, mgr_view,
+            "service-side image_gen_model_availability disagrees with manager-side \
+             is_available on size_bytes == 0 + 0-byte file on disk: service={} manager={}",
+            svc_view.available, mgr_view,
+        );
+        // Both must be `false` — a 0-byte file is never a usable
+        // model. Pinning the *value* (not just "agreement") so a
+        // future refactor that flips both to `true` is also
+        // caught.
+        assert!(
+            !svc_view.available,
+            "0-byte zero-sized descriptor must NOT be considered available"
+        );
+
+        // Clean up the artifact we wrote into the default
+        // image-gen models directory. `_ = ...` because the file
+        // may already be gone (e.g. another test parallel-ran);
+        // we don't fail the test on cleanup-side errors.
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

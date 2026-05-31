@@ -13,7 +13,7 @@ pub use memory::{
     EvictionCounter, FakeSampler, MemoryMonitor, MemoryPressureListener, MemorySample,
     MemorySampler, MemoryState, MemoryThresholds, SysinfoSampler,
 };
-pub use policy::{AiModelTier, AiPolicy, GovernorPolicy, PresetKey, RenderPolicy};
+pub use policy::{AiModelTier, AiPolicy, GovernorPolicy, ImageGenPolicy, PresetKey, RenderPolicy};
 pub use profiler::{CpuProfile, GpuProfile, HardwareProfile, HardwareProfiler};
 pub use report::ProfileReport;
 pub use scheduler::{BackoffReason, GovernorScheduler, ScheduleVerdict, SchedulerError};

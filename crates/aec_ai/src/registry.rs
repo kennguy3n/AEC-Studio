@@ -675,7 +675,7 @@ mod tests {
             "image_gen": { "presets": [] }
         }"#;
         let r: Result<ModelRegistry, _> = serde_json::from_str(bad);
-        assert!(r.is_err(), "serde must reject format=\"mlx\"; got: {r:?}",);
+        assert!(r.is_err(), "serde must reject format=\"mlx\"; got: {r:?}");
         let err = r.unwrap_err().to_string();
         assert!(
             err.to_lowercase().contains("mlx") || err.to_lowercase().contains("variant"),
