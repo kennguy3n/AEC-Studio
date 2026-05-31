@@ -62,6 +62,73 @@ const DEFAULT_HEIGHT = 512;
 const DEFAULT_STEPS = 20;
 const DEFAULT_CFG_SCALE = 7;
 
+/**
+ * Server-side request validation lives in
+ * `crates/aec_bridge/src/service.rs::image_gen_generate`. We mirror
+ * the same constraints client-side so the user sees normalized
+ * values in the form *before* round-tripping through the bridge —
+ * the bridge still re-validates as the authoritative gate (any
+ * future API change updates only the bridge), but pushing a 511×511
+ * request that's going to fail with "must be multiples of 8" wastes
+ * the user's time on a 30 s cold spawn.
+ *
+ * Keep these in lockstep with the Rust-side numeric constants.
+ */
+const IMAGE_GEN_DIM_MIN = 64;
+const IMAGE_GEN_DIM_MAX = 2048;
+const IMAGE_GEN_DIM_STEP = 8;
+const IMAGE_GEN_STEPS_MIN = 1;
+const IMAGE_GEN_STEPS_MAX = 150;
+const IMAGE_GEN_CFG_MIN = 0;
+const IMAGE_GEN_CFG_MAX = 30;
+
+/**
+ * Snap `value` to the nearest multiple of `IMAGE_GEN_DIM_STEP` and
+ * clamp into `[IMAGE_GEN_DIM_MIN, IMAGE_GEN_DIM_MAX]`. Used on
+ * width/height blur + on submit so an in-progress edit ("typing 1024
+ * one digit at a time") isn't fought on every keystroke while a
+ * committed value is still guaranteed valid.
+ */
+function normalizeImageGenDimension(value: number): number {
+  // NaN → MIN (no signal which direction the user meant). ±Infinity
+  // falls through to the clamp below, which routes them to the
+  // appropriate bound.
+  if (Number.isNaN(value)) return IMAGE_GEN_DIM_MIN;
+  const snapped =
+    Math.round(value / IMAGE_GEN_DIM_STEP) * IMAGE_GEN_DIM_STEP;
+  return Math.min(IMAGE_GEN_DIM_MAX, Math.max(IMAGE_GEN_DIM_MIN, snapped));
+}
+
+function clampImageGenSteps(value: number): number {
+  if (Number.isNaN(value)) return IMAGE_GEN_STEPS_MIN;
+  // Math.round(±Infinity) is ±Infinity; the clamp below handles it.
+  return Math.min(
+    IMAGE_GEN_STEPS_MAX,
+    Math.max(IMAGE_GEN_STEPS_MIN, Math.round(value)),
+  );
+}
+
+function clampImageGenCfg(value: number): number {
+  if (Number.isNaN(value)) return IMAGE_GEN_CFG_MIN;
+  return Math.min(IMAGE_GEN_CFG_MAX, Math.max(IMAGE_GEN_CFG_MIN, value));
+}
+
+/**
+ * Exposed for tests + as defense-in-depth at submit time.
+ */
+export const __imageGenPanelTestables = {
+  normalizeImageGenDimension,
+  clampImageGenSteps,
+  clampImageGenCfg,
+  IMAGE_GEN_DIM_MIN,
+  IMAGE_GEN_DIM_MAX,
+  IMAGE_GEN_DIM_STEP,
+  IMAGE_GEN_STEPS_MIN,
+  IMAGE_GEN_STEPS_MAX,
+  IMAGE_GEN_CFG_MIN,
+  IMAGE_GEN_CFG_MAX,
+};
+
 export function ImageGenPanel(): JSX.Element {
   const [availability, setAvailability] =
     useState<ImageGenModelAvailability | null>(null);
@@ -285,14 +352,32 @@ export function ImageGenPanel(): JSX.Element {
       if (seedValue !== null && !Number.isInteger(seedValue)) {
         throw new Error("Seed must be an integer (or empty for random).");
       }
+      // Defense-in-depth: re-normalize numeric fields at submit
+      // time. The onBlur handlers already do this for "user clicks
+      // away from the field", but if the user types a value and
+      // hits Enter without blurring, the in-state value is still
+      // the raw onChange value (which only clamps to >= 1). Doing
+      // the snap here too means the bridge always receives a
+      // server-acceptable request — and the snapped values get
+      // pushed back into form state below so the user sees what
+      // was actually sent.
+      const normalizedWidth = normalizeImageGenDimension(width);
+      const normalizedHeight = normalizeImageGenDimension(height);
+      const normalizedSteps = clampImageGenSteps(steps);
+      const normalizedCfg = clampImageGenCfg(cfgScale);
+      if (normalizedWidth !== width) setWidth(normalizedWidth);
+      if (normalizedHeight !== height) setHeight(normalizedHeight);
+      if (normalizedSteps !== steps) setSteps(normalizedSteps);
+      if (normalizedCfg !== cfgScale) setCfgScale(normalizedCfg);
+
       const r = await aec.imageGen.generate({
         prompt,
         negativePrompt:
           negativePrompt.trim().length === 0 ? null : negativePrompt,
-        width,
-        height,
-        steps,
-        cfgScale,
+        width: normalizedWidth,
+        height: normalizedHeight,
+        steps: normalizedSteps,
+        cfgScale: normalizedCfg,
         seed: seedValue,
         sampler: sampler.trim().length === 0 ? null : sampler,
       });
@@ -504,12 +589,22 @@ export function ImageGenPanel(): JSX.Element {
                 type="number"
                 data-testid="settings-image-gen-width"
                 value={width}
-                min={64}
-                max={2048}
-                step={64}
+                min={IMAGE_GEN_DIM_MIN}
+                max={IMAGE_GEN_DIM_MAX}
+                step={IMAGE_GEN_DIM_STEP}
                 disabled={generating}
                 onChange={(e) =>
                   setWidth(Math.max(1, Number(e.target.value) || 0))
+                }
+                // Snap-to-multiple-of-8 + range clamp happens on
+                // blur (not on every keystroke), so the user can
+                // type "1024" one digit at a time without the field
+                // jumping. Defense-in-depth normalization also runs
+                // at submit time inside `onGenerate`.
+                onBlur={(e) =>
+                  setWidth(
+                    normalizeImageGenDimension(Number(e.target.value) || 0),
+                  )
                 }
               />
             </label>
@@ -519,12 +614,17 @@ export function ImageGenPanel(): JSX.Element {
                 type="number"
                 data-testid="settings-image-gen-height"
                 value={height}
-                min={64}
-                max={2048}
-                step={64}
+                min={IMAGE_GEN_DIM_MIN}
+                max={IMAGE_GEN_DIM_MAX}
+                step={IMAGE_GEN_DIM_STEP}
                 disabled={generating}
                 onChange={(e) =>
                   setHeight(Math.max(1, Number(e.target.value) || 0))
+                }
+                onBlur={(e) =>
+                  setHeight(
+                    normalizeImageGenDimension(Number(e.target.value) || 0),
+                  )
                 }
               />
             </label>
@@ -534,12 +634,15 @@ export function ImageGenPanel(): JSX.Element {
                 type="number"
                 data-testid="settings-image-gen-steps"
                 value={steps}
-                min={1}
-                max={150}
+                min={IMAGE_GEN_STEPS_MIN}
+                max={IMAGE_GEN_STEPS_MAX}
                 step={1}
                 disabled={generating}
                 onChange={(e) =>
                   setSteps(Math.max(1, Number(e.target.value) || 0))
+                }
+                onBlur={(e) =>
+                  setSteps(clampImageGenSteps(Number(e.target.value) || 0))
                 }
               />
             </label>
@@ -549,11 +652,14 @@ export function ImageGenPanel(): JSX.Element {
                 type="number"
                 data-testid="settings-image-gen-cfg"
                 value={cfgScale}
-                min={0}
-                max={30}
+                min={IMAGE_GEN_CFG_MIN}
+                max={IMAGE_GEN_CFG_MAX}
                 step={0.5}
                 disabled={generating}
                 onChange={(e) => setCfgScale(Number(e.target.value) || 0)}
+                onBlur={(e) =>
+                  setCfgScale(clampImageGenCfg(Number(e.target.value) || 0))
+                }
               />
             </label>
           </div>

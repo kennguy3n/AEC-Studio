@@ -161,6 +161,30 @@ pub struct ImageGenPolicy {
     pub allow_during_pathtraced_render: bool,
 }
 
+impl Default for ImageGenPolicy {
+    /// Returns the Medium-tier policy. We mirror Medium because
+    /// that's the same "safe middle ground" the bridge advertises
+    /// as the boot default (see [`crate::bridge::image_gen_active_policy`]
+    /// in `aec_bridge`). The intent of this impl is to back
+    /// `#[serde(default)]` on the [`GovernorPolicy::image_gen`]
+    /// field — if a future binary deserializes a [`GovernorPolicy`]
+    /// JSON written by an older version that pre-dates the
+    /// `image_gen` field, the field comes in as Medium-tier
+    /// defaults rather than failing the entire decode with a
+    /// missing-field error. Construction at runtime always goes
+    /// through [`GovernorPolicy::for_tier`] which picks the
+    /// tier-correct values explicitly, so this `Default` is only
+    /// ever observed on the deserialize-from-stale-data path.
+    fn default() -> Self {
+        Self {
+            idle_timeout_secs: 120,
+            load_budget_secs: 60,
+            max_parallel_requests: 1,
+            allow_during_pathtraced_render: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct GovernorPolicy {
     pub tier: HardwareTier,
@@ -168,6 +192,16 @@ pub struct GovernorPolicy {
     pub ai: AiPolicy,
     /// Phase 18 Group C — image-gen sidecar policy. See
     /// [`ImageGenPolicy`] for the per-tier semantics.
+    ///
+    /// `#[serde(default)]` so a [`GovernorPolicy`] JSON written by
+    /// a pre-Group-C binary (no `image_gen` field) still
+    /// deserializes — the field comes in as
+    /// [`ImageGenPolicy::default`] (Medium-tier) instead of failing
+    /// the whole decode. Defensive: no caller persists
+    /// [`GovernorPolicy`] today, but the type implements `Deserialize`
+    /// so future config-file persistence MUST round-trip across
+    /// schema additions without bricking older configs.
+    #[serde(default)]
     pub image_gen: ImageGenPolicy,
     pub mesh_cache_budget_mb: u32,
 }
@@ -348,6 +382,55 @@ mod tests {
                 .image_gen
                 .allow_during_pathtraced_render
         );
+    }
+
+    #[test]
+    fn image_gen_policy_default_matches_medium_tier_for_serde_default_fallback() {
+        // `#[serde(default)]` on `GovernorPolicy::image_gen` relies on
+        // `ImageGenPolicy::default` returning the Medium-tier policy,
+        // because Medium is the "safe middle ground" the bridge
+        // advertises as the boot default. Pinning the equality here
+        // keeps the default impl from drifting away from the for_tier
+        // values without a corresponding test failure.
+        let default_policy = ImageGenPolicy::default();
+        let medium_policy = GovernorPolicy::for_tier(HardwareTier::Medium).image_gen;
+        assert_eq!(default_policy, medium_policy);
+    }
+
+    #[test]
+    fn governor_policy_deserializes_legacy_json_without_image_gen_field() {
+        // Forward-compat: a `GovernorPolicy` JSON written by a
+        // pre-Group-C binary will have no `image_gen` field. The
+        // `#[serde(default)]` attribute on `GovernorPolicy::image_gen`
+        // must cause that missing field to come in as
+        // `ImageGenPolicy::default` (Medium-tier) rather than fail
+        // the whole decode with a missing-field error. Without this
+        // attribute, any future config-file persistence path would
+        // brick the moment a Group-C-aware binary read a Group-A-era
+        // config.
+        // We construct the legacy JSON by serializing a full
+        // Medium-tier policy and then *removing* the `image_gen`
+        // field, rather than hand-writing the JSON. This keeps the
+        // test resilient to future rename / alias attributes on
+        // unrelated fields (e.g. `eevee_resolution_scale` on
+        // `RenderPolicy`) — only the `image_gen` removal is the
+        // property under test.
+        let medium_full = GovernorPolicy::for_tier(HardwareTier::Medium);
+        let mut as_value =
+            serde_json::to_value(medium_full).expect("Medium policy must round-trip to JSON value");
+        let obj = as_value
+            .as_object_mut()
+            .expect("GovernorPolicy must serialize as a JSON object");
+        assert!(
+            obj.remove("image_gen").is_some(),
+            "expected `image_gen` field on serialized policy to remove"
+        );
+        let legacy_json =
+            serde_json::to_string(&as_value).expect("legacy JSON must reserialize cleanly");
+        let decoded: GovernorPolicy = serde_json::from_str(&legacy_json)
+            .expect("legacy GovernorPolicy without image_gen must still decode");
+        assert_eq!(decoded.image_gen, ImageGenPolicy::default());
+        assert_eq!(decoded.tier, HardwareTier::Medium);
     }
 
     #[test]

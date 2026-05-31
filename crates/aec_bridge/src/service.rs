@@ -6137,11 +6137,24 @@ impl BridgeService {
             mgr.model_path()
         };
         // Step 2: kill any running sidecar so the next `ensure_ready`
-        // cold-spawns with the new model path. We re-derive the runtime
-        // config from defaults + the new model path; the user-facing
-        // tunables (idle timeout, port) are unchanged.
-        let mut new_config = ImageGenRuntimeConfig::default();
-        new_config.spawn_config.model_path = new_path;
+        // cold-spawns with the new model path. We snapshot the
+        // *current* runtime config and mutate only `model_path` —
+        // every other field (port, threads, request_timeout,
+        // vae_path on the spawn side; idle_timeout, load_budget at
+        // the lifecycle side) is governor-owned and must survive a
+        // descriptor swap. Same pattern as
+        // [`Self::image_gen_apply_policy`]; reverting to
+        // [`ImageGenRuntimeConfig::default`] here would silently
+        // overwrite a Pro-tier 300 s idle window with the 120 s boot
+        // default the moment the user pinned a different model.
+        let new_config = {
+            let current = self.image_gen_state.snapshot_config().map_err(|e| {
+                BridgeServiceError::ImageGen(format!("snapshot image-gen runtime config: {e}"))
+            })?;
+            let mut next = current;
+            next.spawn_config.model_path = new_path;
+            next
+        };
         self.image_gen_state
             .reload_with_config(new_config)
             .map_err(|e| BridgeServiceError::ImageGen(format!("reload image-gen runtime: {e}")))?;
@@ -10636,6 +10649,63 @@ END-ISO-10303-21;\n";
                     .image_gen
                     .load_budget_secs as u64
             ),
+        );
+    }
+
+    #[test]
+    fn image_gen_set_descriptor_preserves_governor_applied_lifecycle_budgets() {
+        // Regression for Devin Review BUG (round 2): swapping the
+        // active image-gen descriptor must NOT reset the
+        // governor-applied `idle_timeout` / `load_budget` to the
+        // boot defaults. The previous implementation built the new
+        // runtime config from `ImageGenRuntimeConfig::default()` and
+        // overwrote only `model_path`, so a Pro-tier 300 s idle
+        // window collapsed to the 120 s default the moment the user
+        // pinned a new GGUF in Settings. The fix mirrors
+        // [`image_gen_apply_policy`] — snapshot the current config,
+        // mutate only `model_path`, preserve every other field.
+        let (s, _g) = service();
+        s.governor_apply_hardware_tier(HardwareTier::Pro).unwrap();
+        let pro = GovernorPolicy::for_tier(HardwareTier::Pro).image_gen;
+        let expected_idle = std::time::Duration::from_secs(pro.idle_timeout_secs as u64);
+        let expected_load = std::time::Duration::from_secs(pro.load_budget_secs as u64);
+
+        // Sanity: governor_apply_hardware_tier did push the Pro
+        // budgets down. Without this we couldn't distinguish "set
+        // never ran" from "set ran and then got reset".
+        let before = s.image_gen_state.snapshot_config().unwrap();
+        assert_eq!(before.idle_timeout, expected_idle);
+        assert_eq!(before.load_budget, expected_load);
+
+        // Now swap the descriptor. The new model path must end up
+        // in `spawn_config`, but the governor-applied budgets MUST
+        // be unchanged.
+        let descriptor = ImageGenModelDescriptor {
+            filename: "swapped-model.gguf".into(),
+            blake3_hex: String::new(),
+            size_bytes: 0,
+            download_url: Some("https://huggingface.co/example/swapped-model.gguf".into()),
+            vae_filename: None,
+        };
+        s.image_gen_set_descriptor(descriptor).unwrap();
+
+        let after = s.image_gen_state.snapshot_config().unwrap();
+        assert_eq!(
+            after.idle_timeout, expected_idle,
+            "idle_timeout regressed to default after descriptor swap",
+        );
+        assert_eq!(
+            after.load_budget, expected_load,
+            "load_budget regressed to default after descriptor swap",
+        );
+        assert!(
+            after
+                .spawn_config
+                .model_path
+                .to_string_lossy()
+                .ends_with("swapped-model.gguf"),
+            "new descriptor model_path did not land in spawn_config: {:?}",
+            after.spawn_config.model_path,
         );
     }
 

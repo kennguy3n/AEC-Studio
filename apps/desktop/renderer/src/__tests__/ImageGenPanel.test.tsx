@@ -16,8 +16,23 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ImageGenPanel } from "../components/ImageGenPanel";
+import {
+  ImageGenPanel,
+  __imageGenPanelTestables,
+} from "../components/ImageGenPanel";
 import { aec } from "../api/aec";
+
+const {
+  normalizeImageGenDimension,
+  clampImageGenSteps,
+  clampImageGenCfg,
+  IMAGE_GEN_DIM_MIN,
+  IMAGE_GEN_DIM_MAX,
+  IMAGE_GEN_STEPS_MIN,
+  IMAGE_GEN_STEPS_MAX,
+  IMAGE_GEN_CFG_MIN,
+  IMAGE_GEN_CFG_MAX,
+} = __imageGenPanelTestables;
 
 const SIZE = 463_290_464;
 const PIXEL_BASE64 =
@@ -48,6 +63,55 @@ function availability(opts?: {
 afterEach(() => {
   vi.restoreAllMocks();
   vi.useRealTimers();
+});
+
+describe("ImageGenPanel form-field normalization helpers", () => {
+  // Devin Review round 2 INFO: client-side form previously allowed
+  // non-multiple-of-8 dimensions + out-of-range steps / cfg to
+  // round-trip to the bridge, which then rejected the request after
+  // the cold spawn. The Rust-side validator at
+  // `crates/aec_bridge/src/service.rs::image_gen_generate` is still
+  // the authoritative gate, but mirroring it here lets the user see
+  // normalized values *before* paying the spawn cost. These tests
+  // pin the lockstep between the JS-side helpers and the documented
+  // Rust-side constraints.
+  it("normalizes dimensions to nearest multiple of 8 within [64, 2048]", () => {
+    expect(normalizeImageGenDimension(512)).toBe(512);
+    // Snap to nearest multiple of 8: 515 → 512, 519 → 520.
+    expect(normalizeImageGenDimension(515)).toBe(512);
+    expect(normalizeImageGenDimension(519)).toBe(520);
+    // Clamp below MIN: 1 → 64, 0 → 64, negative → 64.
+    expect(normalizeImageGenDimension(0)).toBe(IMAGE_GEN_DIM_MIN);
+    expect(normalizeImageGenDimension(1)).toBe(IMAGE_GEN_DIM_MIN);
+    expect(normalizeImageGenDimension(-100)).toBe(IMAGE_GEN_DIM_MIN);
+    // Clamp above MAX: 9999 → 2048.
+    expect(normalizeImageGenDimension(9999)).toBe(IMAGE_GEN_DIM_MAX);
+    // NaN / Infinity → MIN (never propagated as-is).
+    expect(normalizeImageGenDimension(Number.NaN)).toBe(IMAGE_GEN_DIM_MIN);
+    expect(normalizeImageGenDimension(Number.POSITIVE_INFINITY)).toBe(
+      IMAGE_GEN_DIM_MAX,
+    );
+  });
+
+  it("clamps steps to integer in [1, 150] mirroring the Rust validator", () => {
+    expect(clampImageGenSteps(20)).toBe(20);
+    expect(clampImageGenSteps(0)).toBe(IMAGE_GEN_STEPS_MIN);
+    expect(clampImageGenSteps(-5)).toBe(IMAGE_GEN_STEPS_MIN);
+    expect(clampImageGenSteps(500)).toBe(IMAGE_GEN_STEPS_MAX);
+    // Non-integer input rounds.
+    expect(clampImageGenSteps(20.4)).toBe(20);
+    expect(clampImageGenSteps(20.6)).toBe(21);
+    expect(clampImageGenSteps(Number.NaN)).toBe(IMAGE_GEN_STEPS_MIN);
+  });
+
+  it("clamps cfg_scale to [0.0, 30.0] preserving fractional precision", () => {
+    expect(clampImageGenCfg(7)).toBe(7);
+    expect(clampImageGenCfg(7.5)).toBe(7.5);
+    expect(clampImageGenCfg(-1)).toBe(IMAGE_GEN_CFG_MIN);
+    expect(clampImageGenCfg(100)).toBe(IMAGE_GEN_CFG_MAX);
+    expect(clampImageGenCfg(Number.NaN)).toBe(IMAGE_GEN_CFG_MIN);
+    expect(clampImageGenCfg(Number.POSITIVE_INFINITY)).toBe(IMAGE_GEN_CFG_MAX);
+  });
 });
 
 describe("ImageGenPanel", () => {
