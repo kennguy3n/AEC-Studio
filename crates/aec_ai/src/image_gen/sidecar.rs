@@ -260,6 +260,129 @@ fn poll_until_healthy(
     }
 }
 
+/// Phase 18 Group D Task 21 — restart policy with exponential
+/// backoff for the image-gen sidecar.
+///
+/// Mirrors [`crate::sidecar::RestartPolicy`] for the text sidecar
+/// (same delay schedule, same `record_failure` / `next_delay` /
+/// `reset` contract) but kept as a separate type so a future tuning
+/// pass can dial the image-gen base / cap independently — image-gen
+/// cold spawns are longer than text spawns (60 s vs 30 s budget),
+/// so the failure semantics differ subtly (a 60 s `HealthTimeout`
+/// might warrant a longer initial backoff than a 30 s text-side
+/// timeout).
+///
+/// Delay schedule: each call to [`Self::record_failure`] first
+/// bumps the consecutive-failure counter and then returns
+/// `500 ms * 2^counter`, capped at the configured `max_delay`
+/// (default 30 s). So the first failure returns 1 s, the second
+/// 2 s, the third 4 s, etc. Reset on first success.
+#[derive(Debug, Clone)]
+pub struct ImageGenRestartPolicy {
+    consecutive_failures: u32,
+    max_delay: Duration,
+}
+
+impl Default for ImageGenRestartPolicy {
+    fn default() -> Self {
+        Self {
+            consecutive_failures: 0,
+            max_delay: Duration::from_secs(30),
+        }
+    }
+}
+
+impl ImageGenRestartPolicy {
+    pub fn new(max_delay: Duration) -> Self {
+        Self {
+            consecutive_failures: 0,
+            max_delay,
+        }
+    }
+
+    /// Record a spawn failure. Returns the delay the caller should
+    /// wait before the next attempt.
+    pub fn record_failure(&mut self) -> Duration {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.next_delay()
+    }
+
+    /// Compute the delay for the current failure count without
+    /// recording a new failure. Used by callers that want to
+    /// inspect the policy before deciding whether to retry.
+    pub fn next_delay(&self) -> Duration {
+        let base_ms = 500_u64;
+        let shift = self.consecutive_failures.min(20);
+        let multiplier = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
+        let delay_ms = base_ms.saturating_mul(multiplier);
+        Duration::from_millis(delay_ms).min(self.max_delay)
+    }
+
+    /// Reset after a successful spawn + health check.
+    pub fn reset(&mut self) {
+        self.consecutive_failures = 0;
+    }
+
+    pub fn consecutive_failures(&self) -> u32 {
+        self.consecutive_failures
+    }
+}
+
+/// Phase 18 Group D Task 21 — spawn the image-gen sidecar with
+/// automatic retry. On failure, the [`ImageGenRestartPolicy`] is
+/// advanced — `record_failure()` bumps the consecutive-failure
+/// counter and returns the back-off duration to sleep before the
+/// next attempt. Up to `max_attempts` total spawns are tried.
+///
+/// Returns the live handle on the first successful attempt. If all
+/// attempts fail, returns the error from the **last** attempt — the
+/// caller can inspect it with [`ImageGenSpawnError`].
+///
+/// Hard-stops on [`ImageGenSpawnError::EmptyModelPath`]: an empty
+/// model path will never become non-empty by retrying, so retry
+/// loops on this branch are wasteful. Every other error variant
+/// (`Spawn`, `HealthTimeout`, `EarlyExit`) is potentially
+/// transient (filesystem hiccup, slow CUDA init, OOM-kill of the
+/// child) and is therefore retried.
+pub fn spawn_with_retry(
+    config: &ImageGenConfig,
+    health_poll_timeout: Duration,
+    policy: &mut ImageGenRestartPolicy,
+    max_attempts: u32,
+) -> Result<ImageGenHandle, ImageGenSpawnError> {
+    if max_attempts == 0 {
+        return Err(ImageGenSpawnError::HealthTimeout(health_poll_timeout));
+    }
+    let mut last_err: Option<ImageGenSpawnError> = None;
+    let mut next_delay: Option<Duration> = None;
+    for _ in 0..max_attempts {
+        if let Some(delay) = next_delay.take() {
+            std::thread::sleep(delay);
+        }
+        match spawn(config, health_poll_timeout) {
+            Ok(handle) => {
+                policy.reset();
+                return Ok(handle);
+            }
+            Err(ImageGenSpawnError::EmptyModelPath) => {
+                // Non-recoverable: no amount of retry will materialise
+                // a model path. Surface the underlying error
+                // immediately so the caller can fix the descriptor.
+                return Err(ImageGenSpawnError::EmptyModelPath);
+            }
+            Err(e) => {
+                // `record_failure` bumps the failure counter and
+                // returns the exact delay to wait before the next
+                // attempt, so the sleep above and the policy state
+                // are always in lock-step.
+                next_delay = Some(policy.record_failure());
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or(ImageGenSpawnError::HealthTimeout(health_poll_timeout)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -397,5 +520,155 @@ mod tests {
         let text_default = crate::runtime::RuntimeConfig::default().port;
         assert_eq!(text_default, 13579);
         assert_eq!(DEFAULT_IMAGE_GEN_PORT, text_default + 1);
+    }
+
+    // Phase 18 Group D Task 21 — exponential-backoff retry tests.
+
+    #[test]
+    fn image_gen_restart_policy_default_state_returns_base_delay() {
+        // With zero consecutive failures, `next_delay` must return
+        // the base (500 ms). `record_failure` increments first, so
+        // the FIRST call to `record_failure` must return 1 s
+        // (500 ms * 2^1).
+        let mut policy = ImageGenRestartPolicy::default();
+        assert_eq!(policy.consecutive_failures(), 0);
+        assert_eq!(policy.next_delay(), Duration::from_millis(500));
+        assert_eq!(policy.record_failure(), Duration::from_secs(1));
+        assert_eq!(policy.consecutive_failures(), 1);
+    }
+
+    #[test]
+    fn image_gen_restart_policy_doubles_until_max_delay_then_clamps() {
+        // 500 ms × 2^n schedule, clamped at 30 s. Pin every step of
+        // the schedule so a future tuning change cannot silently
+        // alter the back-off curve.
+        let mut policy = ImageGenRestartPolicy::default();
+        let expected = [
+            Duration::from_secs(1),  // 2^1 * 500ms
+            Duration::from_secs(2),  // 2^2 * 500ms
+            Duration::from_secs(4),  // 2^3 * 500ms
+            Duration::from_secs(8),  // 2^4 * 500ms
+            Duration::from_secs(16), // 2^5 * 500ms
+            Duration::from_secs(30), // 2^6 * 500ms = 32s, clamped to 30s
+            Duration::from_secs(30), // clamp holds
+            Duration::from_secs(30), // clamp holds
+        ];
+        for (i, want) in expected.iter().enumerate() {
+            let got = policy.record_failure();
+            assert_eq!(
+                got,
+                *want,
+                "step {i}: failure #{} returned {got:?}, expected {want:?}",
+                i + 1
+            );
+        }
+    }
+
+    #[test]
+    fn image_gen_restart_policy_reset_clears_failure_count() {
+        let mut policy = ImageGenRestartPolicy::default();
+        policy.record_failure();
+        policy.record_failure();
+        policy.record_failure();
+        assert_eq!(policy.consecutive_failures(), 3);
+        policy.reset();
+        assert_eq!(policy.consecutive_failures(), 0);
+        // Post-reset, the next failure should return the same value
+        // as the first-ever failure (1 s).
+        assert_eq!(policy.record_failure(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn image_gen_restart_policy_saturates_under_extreme_failure_count() {
+        // Defense-in-depth: extreme failure counts (e.g. unbounded
+        // sidecar loop) must not overflow the shift or the
+        // millisecond multiplication. `consecutive_failures.min(20)`
+        // bounds the shift; `saturating_mul` is just belt-and-
+        // braces. The final delay is clamped at `max_delay`.
+        let mut policy = ImageGenRestartPolicy::default();
+        for _ in 0..100 {
+            policy.record_failure();
+        }
+        assert_eq!(policy.consecutive_failures(), 100);
+        // After many failures, the schedule is at its hard ceiling.
+        assert_eq!(policy.next_delay(), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn spawn_with_retry_short_circuits_on_empty_model_path() {
+        // `EmptyModelPath` is non-recoverable: no retry will ever
+        // materialise a non-empty model path, and the retry loop
+        // would be a multi-second waste of latency. The retry
+        // helper must short-circuit on this error without
+        // advancing the policy or sleeping.
+        let _g = EnvGuard::acquire();
+        let mut policy = ImageGenRestartPolicy::default();
+        let cfg = ImageGenConfig::default();
+        let start = std::time::Instant::now();
+        let result = spawn_with_retry(&cfg, Duration::from_millis(1), &mut policy, 5);
+        assert!(
+            matches!(result, Err(ImageGenSpawnError::EmptyModelPath)),
+            "expected EmptyModelPath, got {result:?}"
+        );
+        assert_eq!(
+            policy.consecutive_failures(),
+            0,
+            "EmptyModelPath must not advance the policy",
+        );
+        // Pin that we did NOT sleep through 5 retries (each retry
+        // would sleep at least 1 s) — fast-fail.
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "EmptyModelPath fast-fail must be < 500 ms, took {:?}",
+            start.elapsed(),
+        );
+    }
+
+    #[test]
+    fn spawn_with_retry_retries_on_spawn_failure_until_attempt_budget_exhausted() {
+        // Wire a non-existent binary so every spawn attempt fails
+        // with `Spawn { source: NotFound }`. Use `max_delay = 1ms`
+        // to keep this test fast (otherwise the back-off would dominate).
+        let _g = EnvGuard::acquire();
+        std::env::set_var(
+            IMAGE_GEN_BIN_ENV,
+            "/nonexistent/aec-test-sd-server-image-gen-retry",
+        );
+        let mut policy = ImageGenRestartPolicy::new(Duration::from_millis(1));
+        let cfg = ImageGenConfig {
+            model_path: PathBuf::from("/tmp/fake-model.gguf"),
+            ..ImageGenConfig::default()
+        };
+        let result = spawn_with_retry(&cfg, Duration::from_millis(1), &mut policy, 3);
+        assert!(
+            matches!(result, Err(ImageGenSpawnError::Spawn { .. })),
+            "expected Spawn error, got {result:?}"
+        );
+        assert_eq!(
+            policy.consecutive_failures(),
+            3,
+            "each of the 3 attempts must advance the policy",
+        );
+    }
+
+    #[test]
+    fn spawn_with_retry_zero_max_attempts_returns_health_timeout() {
+        // Defense-in-depth: a `max_attempts == 0` config (which the
+        // call sites should never construct) must not panic and
+        // must return a deterministic error so the caller can log /
+        // surface it. We pin `HealthTimeout` so the caller has a
+        // stable variant to match against.
+        let _g = EnvGuard::acquire();
+        let mut policy = ImageGenRestartPolicy::default();
+        let cfg = ImageGenConfig {
+            model_path: PathBuf::from("/tmp/fake-model.gguf"),
+            ..ImageGenConfig::default()
+        };
+        let result = spawn_with_retry(&cfg, Duration::from_millis(1), &mut policy, 0);
+        assert!(
+            matches!(result, Err(ImageGenSpawnError::HealthTimeout(_))),
+            "expected HealthTimeout for max_attempts=0, got {result:?}"
+        );
+        assert_eq!(policy.consecutive_failures(), 0);
     }
 }

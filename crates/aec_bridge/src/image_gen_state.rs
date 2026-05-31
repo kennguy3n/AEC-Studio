@@ -65,13 +65,35 @@ pub struct ImageGenStatusSnapshot {
     pub last_error: Option<String>,
 }
 
+/// Phase 18 Group D Task 21 — maximum number of spawn attempts the
+/// retry loop will make before surfacing the underlying spawn
+/// error to the caller. Three is the standard "transient flake"
+/// retry count: a single retry would not exercise the back-off
+/// schedule, while four-plus would push worst-case latency past
+/// 30 s, longer than most users will tolerate before hitting
+/// "Cancel". Each retry's delay is governed by
+/// [`aec_ai::image_gen::sidecar::ImageGenRestartPolicy`].
+const DEFAULT_IMAGE_GEN_MAX_SPAWN_ATTEMPTS: u32 = 3;
+
 /// Process-wide image-gen runtime state. All methods take `&self`
-/// because the two internal primitives provide the synchronisation
+/// because the three internal primitives provide the synchronisation
 /// directly — [`crate::service::BridgeService`] can hold it by Arc
 /// without an outer mutex.
+///
+/// The `restart_policy` field is a `Mutex` (not `RwLock`) because
+/// every access mutates it (`record_failure` / `reset`); a writer-
+/// only lock has the same cost as a `RwLock::write` and the value
+/// is so cheap to clone that we could even snapshot it instead,
+/// but the `Mutex` keeps the API symmetric with the other slots.
+/// Lock order vs the other two locks: **last** —
+/// `handle_slot → runtime → restart_policy`. `record_failure` /
+/// `reset` are only ever called inside `ensure_ready` while
+/// `handle_slot` is already held, so this is consistent with the
+/// canonical order documented at the top of this file.
 pub struct ImageGenState {
     runtime: RwLock<ImageGenRuntime>,
     handle_slot: Mutex<Option<ImageGenHandle>>,
+    restart_policy: Mutex<sidecar::ImageGenRestartPolicy>,
 }
 
 fn poisoned<T>(err: std::sync::PoisonError<T>) -> ImageGenStateError {
@@ -86,6 +108,7 @@ impl ImageGenState {
         Self {
             runtime: RwLock::new(ImageGenRuntime::new(config)),
             handle_slot: Mutex::new(None),
+            restart_policy: Mutex::new(sidecar::ImageGenRestartPolicy::default()),
         }
     }
 
@@ -187,7 +210,25 @@ impl ImageGenState {
                 })?;
                 runtime.config().clone()
             };
-            match sidecar::spawn(&cfg.spawn_config, cfg.load_budget.min(spawn_timeout)) {
+            // Phase 18 Group D Task 21 — wrap the cold-spawn in an
+            // exponential-backoff retry loop. `spawn_with_retry`
+            // exhausts up to `DEFAULT_IMAGE_GEN_MAX_SPAWN_ATTEMPTS`
+            // attempts on transient errors (`Spawn`,
+            // `HealthTimeout`, `EarlyExit`) and short-circuits
+            // immediately on `EmptyModelPath` (which retry cannot
+            // help). The policy state is owned per-ImageGenState
+            // so that subsequent `ensure_ready` calls within the
+            // same session continue the back-off curve rather than
+            // restarting it on each generate request — important
+            // when the user mashes "Generate" on a misconfigured
+            // descriptor.
+            let mut policy = self.restart_policy.lock().map_err(poisoned)?;
+            match sidecar::spawn_with_retry(
+                &cfg.spawn_config,
+                cfg.load_budget.min(spawn_timeout),
+                &mut policy,
+                DEFAULT_IMAGE_GEN_MAX_SPAWN_ATTEMPTS,
+            ) {
                 Ok(handle) => {
                     let transport = handle.transport().clone();
                     *slot = Some(handle);
@@ -275,6 +316,7 @@ impl ImageGenState {
         Self {
             runtime: RwLock::new(runtime),
             handle_slot: Mutex::new(Some(sidecar::adopt(transport))),
+            restart_policy: Mutex::new(sidecar::ImageGenRestartPolicy::default()),
         }
     }
 

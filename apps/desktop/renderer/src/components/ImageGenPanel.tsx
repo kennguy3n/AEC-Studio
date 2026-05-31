@@ -35,6 +35,7 @@ import type {
   ImageGenGenerateResult,
   ImageGenModelAvailability,
   ImageGenPolicy,
+  ImageGenPresetEntry,
   ImageGenRuntimeStatus,
 } from "../../../electron/bridge";
 
@@ -162,6 +163,20 @@ export function ImageGenPanel(): JSX.Element {
   const [policy, setPolicy] = useState<ImageGenPolicy | null>(null);
   const [renderInProgress, setRenderInProgress] = useState(false);
 
+  // Phase 18 Group D Task 20 — first-run wizard state. We load the
+  // curated preset list once on mount; the registry is baked into
+  // the binary so this is cheap (no HTTP, no disk I/O — just a
+  // serde round-trip across the napi boundary). `presets === null`
+  // means "the wizard has not finished loading yet" and renders the
+  // loading spinner; `presets === []` is the intentional empty
+  // ship-state where the wizard shows the manual-entry CTA only.
+  const [presets, setPresets] = useState<ImageGenPresetEntry[] | null>(null);
+  // Truthy while a `setDescriptor` is in flight in response to a
+  // preset-pin click. Disables every preset button while the bridge
+  // round-trip is in flight so the user can't double-tap a slow
+  // network or queue two competing descriptors.
+  const [pinningPresetId, setPinningPresetId] = useState<string | null>(null);
+
   // ---- form state ----
   const [prompt, setPrompt] = useState("");
   const [negativePrompt, setNegativePrompt] = useState("");
@@ -194,6 +209,39 @@ export function ImageGenPanel(): JSX.Element {
     void refreshAvailability();
     void refreshRuntime();
   }, [refreshAvailability, refreshRuntime]);
+
+  // Phase 18 Group D Task 20 — first-run wizard: load the curated
+  // preset list once on mount. The registry is compile-time
+  // embedded so this is cheap; we don't refresh it because
+  // `ai_models.json` only ever changes between releases. On
+  // failure we surface to the top-level error banner so the
+  // wizard's "preset section" gracefully degrades to the manual-
+  // entry form.
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const r = (await aec.imageGen.listPresets()) as ImageGenPresetEntry[];
+        if (!cancelled) setPresets(r);
+      } catch (e) {
+        if (!cancelled) {
+          // Fall back to "no curated presets" — the manual-entry
+          // form is still usable. Don't clobber the top-level
+          // error since this is a soft failure.
+          setPresets([]);
+          // eslint-disable-next-line no-console
+          console.warn(
+            "image-gen list_presets failed; falling back to manual entry",
+            e,
+          );
+        }
+      }
+    };
+    void load();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Phase 18 Group C Task 17 — policy snapshot on mount + slow
   // refresh while mounted. The policy only changes on
@@ -321,6 +369,37 @@ export function ImageGenPanel(): JSX.Element {
       window.clearInterval(id);
     };
   }, [generating]);
+
+  // Phase 18 Group D Task 20 — pin a curated preset's descriptor.
+  // The wizard's "one-click pin" UX: clicking a preset entry fires
+  // `imageGen.setDescriptor` with the embedded
+  // `ImageGenModelDescriptor`. After a successful pin we refresh
+  // the availability snapshot so the rest of the panel transitions
+  // out of the `noDescriptor` branch into the "ready to download"
+  // branch. The pinned descriptor only sets the configured model
+  // path; the user still needs to click Download next to fetch the
+  // actual GGUF bytes.
+  const onPinPreset = useCallback(
+    async (p: ImageGenPresetEntry) => {
+      setError(null);
+      setPinningPresetId(p.id);
+      try {
+        await aec.imageGen.setDescriptor({
+          filename: p.filename,
+          sizeBytes: p.sizeBytes,
+          blake3Hex: p.blake3Hex,
+          downloadUrl: p.downloadUrl,
+          vaeFilename: p.vaeFilename,
+        });
+        await refreshAvailability();
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setPinningPresetId(null);
+      }
+    },
+    [refreshAvailability],
+  );
 
   const onDownload = useCallback(async () => {
     setError(null);
@@ -490,6 +569,66 @@ export function ImageGenPanel(): JSX.Element {
         >
           No image-gen model is configured. Complete the first-run wizard
           to pin a model.
+        </div>
+      )}
+      {/* Phase 18 Group D Task 20 — first-run wizard. Renders only
+          when no descriptor is pinned (the wizard is for "first
+          run" only; once pinned, the user can swap via the
+          Download row's per-model controls). The wizard always
+          shows even when `presets === []` so the user has clear
+          visual confirmation that no curated entries are offered
+          this build — falling back to the manual-entry path. */}
+      {noDescriptor && (
+        <div
+          className="settings-image-gen-wizard"
+          data-testid="settings-image-gen-wizard"
+        >
+          <h3>Choose an image-gen model</h3>
+          {presets === null && (
+            <p data-testid="settings-image-gen-wizard-loading">
+              Loading curated presets…
+            </p>
+          )}
+          {presets !== null && presets.length === 0 && (
+            <p
+              className="settings-image-gen-wizard__empty"
+              data-testid="settings-image-gen-wizard-empty"
+            >
+              No curated presets are shipped in this build. Use the
+              manual descriptor entry below to pin a model URL +
+              BLAKE3 hash by hand.
+            </p>
+          )}
+          {presets !== null && presets.length > 0 && (
+            <ul
+              className="settings-image-gen-wizard__list"
+              data-testid="settings-image-gen-wizard-list"
+            >
+              {presets.map((p) => (
+                <li
+                  key={p.id}
+                  className="settings-image-gen-wizard__row"
+                  data-testid={`settings-image-gen-wizard-row-${p.id}`}
+                >
+                  <div className="settings-image-gen-wizard__meta">
+                    <strong>{p.displayName}</strong>
+                    <span className="settings-image-gen-wizard__filename">
+                      <code>{p.filename}</code> ·{" "}
+                      {formatBytes(p.sizeBytes)}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void onPinPreset(p)}
+                    disabled={pinningPresetId !== null}
+                    data-testid={`settings-image-gen-wizard-pin-${p.id}`}
+                  >
+                    {pinningPresetId === p.id ? "Pinning…" : "Pin"}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
       )}
       {!noDescriptor && (

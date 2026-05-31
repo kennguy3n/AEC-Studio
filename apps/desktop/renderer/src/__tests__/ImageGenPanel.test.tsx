@@ -509,3 +509,209 @@ describe("ImageGenPanel", () => {
     ).not.toBeInTheDocument();
   });
 });
+
+// Phase 18 Group D Task 20 — first-run wizard test suite. The wizard
+// renders only when no descriptor is pinned (`noDescriptor === true`);
+// it loads `aec.imageGen.listPresets()` once on mount and either
+// surfaces the curated entries as one-click pin buttons or falls back
+// to the "no curated presets" CTA. These tests pin every UI branch:
+// the loading spinner, the empty-array fallback, the populated
+// preset list, the pin round-trip (mocked `setDescriptor` + post-pin
+// availability refresh), and the failure-soft-degrades-to-empty path.
+describe("ImageGenPanel first-run wizard", () => {
+  function preset(id: string, displayName: string) {
+    return {
+      id,
+      displayName,
+      filename: `${id}.gguf`,
+      sizeBytes: 1_073_741_824,
+      blake3Hex: "a".repeat(64),
+      downloadUrl: `https://huggingface.co/example/${id}/resolve/main/${id}.gguf`,
+      vaeFilename: null,
+    };
+  }
+
+  it("renders the loading spinner while the preset list is in flight", async () => {
+    // Trap `listPresets` in a never-resolving promise so the wizard
+    // stays in its loading state for the duration of the assertion.
+    let _unblock: ((v: typeof presets) => void) | null = null;
+    type Preset = ReturnType<typeof preset>;
+    const presets: Preset[] = [];
+    vi.spyOn(aec.imageGen, "listPresets").mockImplementation(
+      () =>
+        new Promise<Preset[]>((resolve) => {
+          _unblock = resolve;
+        }),
+    );
+    vi.spyOn(aec.imageGen, "modelAvailability").mockResolvedValue(
+      availability({ hasDescriptor: false }),
+    );
+    vi.spyOn(aec.imageGen, "runtimeStatus").mockResolvedValue({
+      state: "idle",
+      lastError: null,
+    });
+
+    render(<ImageGenPanel />);
+    await screen.findByTestId("settings-image-gen-no-descriptor");
+    expect(
+      screen.getByTestId("settings-image-gen-wizard-loading"),
+    ).toBeInTheDocument();
+  });
+
+  it("renders the empty-state CTA when listPresets resolves to an empty array", async () => {
+    vi.spyOn(aec.imageGen, "listPresets").mockResolvedValue([]);
+    vi.spyOn(aec.imageGen, "modelAvailability").mockResolvedValue(
+      availability({ hasDescriptor: false }),
+    );
+    vi.spyOn(aec.imageGen, "runtimeStatus").mockResolvedValue({
+      state: "idle",
+      lastError: null,
+    });
+
+    render(<ImageGenPanel />);
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("settings-image-gen-wizard-empty"),
+      ).toBeInTheDocument();
+    });
+    expect(
+      screen.queryByTestId("settings-image-gen-wizard-list"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("renders one pin button per curated preset and disables others while pinning", async () => {
+    vi.spyOn(aec.imageGen, "listPresets").mockResolvedValue([
+      preset("sd-v1-5", "Stable Diffusion 1.5"),
+      preset("sd-xl", "Stable Diffusion XL"),
+    ]);
+    vi.spyOn(aec.imageGen, "modelAvailability").mockResolvedValue(
+      availability({ hasDescriptor: false }),
+    );
+    vi.spyOn(aec.imageGen, "runtimeStatus").mockResolvedValue({
+      state: "idle",
+      lastError: null,
+    });
+    let resolveSetDescriptor: (() => void) | null = null;
+    const setDescriptorSpy = vi
+      .spyOn(aec.imageGen, "setDescriptor")
+      .mockImplementation(
+        () =>
+          new Promise<void>((resolve) => {
+            resolveSetDescriptor = () => resolve();
+          }),
+      );
+
+    render(<ImageGenPanel />);
+    const pinV15 = await screen.findByTestId(
+      "settings-image-gen-wizard-pin-sd-v1-5",
+    );
+    const pinXL = await screen.findByTestId(
+      "settings-image-gen-wizard-pin-sd-xl",
+    );
+    expect(pinV15).not.toBeDisabled();
+    expect(pinXL).not.toBeDisabled();
+
+    fireEvent.click(pinV15);
+
+    // Both buttons must be disabled while a pin is in flight (defense
+    // against double-tap / race between two competing descriptors).
+    await waitFor(() => {
+      expect(pinV15).toBeDisabled();
+      expect(pinXL).toBeDisabled();
+    });
+    expect(pinV15.textContent).toBe("Pinning…");
+    expect(pinXL.textContent).toBe("Pin");
+
+    // Resolve the in-flight setDescriptor; both buttons re-enable.
+    await act(async () => {
+      resolveSetDescriptor?.();
+    });
+    await waitFor(() => {
+      expect(setDescriptorSpy).toHaveBeenCalledWith({
+        filename: "sd-v1-5.gguf",
+        sizeBytes: 1_073_741_824,
+        blake3Hex: "a".repeat(64),
+        downloadUrl:
+          "https://huggingface.co/example/sd-v1-5/resolve/main/sd-v1-5.gguf",
+        vaeFilename: null,
+      });
+    });
+  });
+
+  it("surfaces the wizard for noDescriptor only — disappears after the descriptor is pinned", async () => {
+    // First mount: no descriptor → wizard visible. Then after a
+    // successful pin the availability snapshot refreshes with the
+    // pinned filename, and the wizard branch unmounts.
+    const availabilityMock = vi
+      .spyOn(aec.imageGen, "modelAvailability")
+      .mockResolvedValueOnce(availability({ hasDescriptor: false }))
+      .mockResolvedValue(availability({ hasDescriptor: true, available: false }));
+    vi.spyOn(aec.imageGen, "listPresets").mockResolvedValue([
+      preset("sd-v1-5", "Stable Diffusion 1.5"),
+    ]);
+    vi.spyOn(aec.imageGen, "setDescriptor").mockResolvedValue(undefined);
+    vi.spyOn(aec.imageGen, "runtimeStatus").mockResolvedValue({
+      state: "idle",
+      lastError: null,
+    });
+
+    render(<ImageGenPanel />);
+    const pinV15 = await screen.findByTestId(
+      "settings-image-gen-wizard-pin-sd-v1-5",
+    );
+    await act(async () => {
+      fireEvent.click(pinV15);
+    });
+    await waitFor(() => {
+      expect(
+        screen.queryByTestId("settings-image-gen-wizard"),
+      ).not.toBeInTheDocument();
+    });
+    expect(availabilityMock).toHaveBeenCalled();
+  });
+
+  it("does not render the wizard when a descriptor is already pinned", async () => {
+    vi.spyOn(aec.imageGen, "listPresets").mockResolvedValue([
+      preset("sd-v1-5", "Stable Diffusion 1.5"),
+    ]);
+    vi.spyOn(aec.imageGen, "modelAvailability").mockResolvedValue(
+      availability({ hasDescriptor: true, available: false }),
+    );
+    vi.spyOn(aec.imageGen, "runtimeStatus").mockResolvedValue({
+      state: "idle",
+      lastError: null,
+    });
+
+    render(<ImageGenPanel />);
+    await screen.findByTestId("settings-image-gen-download");
+    expect(
+      screen.queryByTestId("settings-image-gen-wizard"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("falls back to the empty CTA when listPresets rejects (graceful degrade)", async () => {
+    vi.spyOn(aec.imageGen, "listPresets").mockRejectedValue(
+      new Error("napi boundary failed"),
+    );
+    vi.spyOn(aec.imageGen, "modelAvailability").mockResolvedValue(
+      availability({ hasDescriptor: false }),
+    );
+    vi.spyOn(aec.imageGen, "runtimeStatus").mockResolvedValue({
+      state: "idle",
+      lastError: null,
+    });
+
+    render(<ImageGenPanel />);
+    // Soft-degrades to the empty-state CTA — the wizard never throws.
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("settings-image-gen-wizard-empty"),
+      ).toBeInTheDocument();
+    });
+    // The top-level error banner must NOT be shown — the rejected
+    // preset load is soft-degraded, not surfaced as a panel error.
+    expect(
+      screen.queryByTestId("settings-image-gen-error"),
+    ).not.toBeInTheDocument();
+  });
+});

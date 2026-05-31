@@ -697,6 +697,13 @@ export function registerIpcHandlers(): void {
   ipcMain.handle("imageGen:modelAvailability", async () =>
     getBridge().imageGenModelAvailability(),
   );
+  // Phase 18 Group D Task 20 — list curated image-gen presets for
+  // the first-run wizard. No payload to validate; the response is a
+  // (potentially empty) array of preset entries. The bridge layer
+  // is responsible for narrowing `BigInt` to `number`.
+  ipcMain.handle("imageGen:listPresets", async () =>
+    getBridge().imageGenListPresets(),
+  );
   ipcMain.handle("imageGen:setDescriptor", async (_e, payload) => {
     assertObject(payload, "params");
     const { descriptor } = payload as { descriptor?: unknown };

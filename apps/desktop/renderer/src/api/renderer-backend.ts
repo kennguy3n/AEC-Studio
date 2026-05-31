@@ -862,6 +862,22 @@ export function rendererInProcessBackend(): AecApi {
         blake3Hex: "",
         modelsDir: "",
       }),
+      // Phase 18 Group D Task 20 — vitest fallback for the
+      // first-run wizard's preset list. The Electron-side bridge
+      // reads the curated list from the embedded model registry;
+      // the in-process renderer backend has no such registry, so
+      // we surface an empty array — the wizard renders its
+      // manual-entry form off this branch.
+      listPresets: async () =>
+        [] as Array<{
+          id: string;
+          displayName: string;
+          filename: string;
+          sizeBytes: number;
+          blake3Hex: string;
+          downloadUrl: string | null;
+          vaeFilename: string | null;
+        }>,
       setDescriptor: async (_d: {
         filename: string;
         sizeBytes: number;

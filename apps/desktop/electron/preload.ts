@@ -486,6 +486,20 @@ const api = {
       blake3Hex: string;
       modelsDir: string;
     }> => ipcRenderer.invoke("imageGen:modelAvailability"),
+    // Phase 18 Group D Task 20 — surface the curated image-gen
+    // preset registry to the first-run wizard. Cheap (registry is
+    // baked into the binary); panel calls this once on mount.
+    listPresets: (): Promise<
+      Array<{
+        id: string;
+        displayName: string;
+        filename: string;
+        sizeBytes: number;
+        blake3Hex: string;
+        downloadUrl: string | null;
+        vaeFilename: string | null;
+      }>
+    > => ipcRenderer.invoke("imageGen:listPresets"),
     setDescriptor: (descriptor: {
       filename: string;
       sizeBytes: number;

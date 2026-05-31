@@ -37,7 +37,8 @@ pub use model_manager::{
 };
 pub use runtime::{ImageGenRuntime, ImageGenRuntimeError, ImageGenRuntimeState};
 pub use sidecar::{
-    build_image_gen_spawn_args, image_gen_bin, ImageGenConfig, ImageGenHandle, ImageGenSpawnError,
+    build_image_gen_spawn_args, image_gen_bin, spawn_with_retry as image_gen_spawn_with_retry,
+    ImageGenConfig, ImageGenHandle, ImageGenRestartPolicy, ImageGenSpawnError,
     DEFAULT_IMAGE_GEN_BIN, DEFAULT_IMAGE_GEN_PORT, IMAGE_GEN_BIN_ENV,
 };
 pub use transport::{

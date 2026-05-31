@@ -3138,6 +3138,48 @@ pub async fn image_gen_model_availability() -> Result<ImageGenModelAvailabilityJ
     .await
 }
 
+/// Phase 18 Group D Task 20 — single curated preset entry returned
+/// by [`image_gen_list_presets`]. `size_bytes` is the BigInt-widened
+/// JS shape; the renderer narrows it to `number` at the
+/// adapter boundary just like
+/// [`ImageGenModelAvailabilityJs::size_bytes`].
+#[napi(object)]
+pub struct ImageGenPresetEntryJs {
+    pub id: String,
+    pub display_name: String,
+    pub filename: String,
+    pub size_bytes: BigInt,
+    pub blake3_hex: String,
+    pub download_url: Option<String>,
+    pub vae_filename: Option<String>,
+}
+
+/// List the curated image-gen presets the first-run wizard offers
+/// as one-click pin buttons. Returns an empty `Vec` when
+/// `ai_models.json::image_gen.presets` is `[]` — the wizard treats
+/// the empty case as "no presets curated yet, render the manual-
+/// entry form only".
+#[napi]
+pub fn image_gen_list_presets() -> Result<Vec<ImageGenPresetEntryJs>> {
+    with_service_ref_fallible(|svc| {
+        let presets: Vec<super::service::ImageGenPresetEntry> = svc.image_gen_list_presets();
+        Ok::<_, super::service::BridgeServiceError>(
+            presets
+                .into_iter()
+                .map(|p| ImageGenPresetEntryJs {
+                    id: p.id,
+                    display_name: p.display_name,
+                    filename: p.descriptor.filename,
+                    size_bytes: BigInt::from(p.descriptor.size_bytes),
+                    blake3_hex: p.descriptor.blake3_hex,
+                    download_url: p.descriptor.download_url,
+                    vae_filename: p.descriptor.vae_filename,
+                })
+                .collect(),
+        )
+    })
+}
+
 /// Caller-supplied image-gen descriptor. Mirrors the Rust
 /// [`aec_ai::image_gen::ImageGenModelDescriptor`] but flattens
 /// `size_bytes` from `u64` to `BigInt` for the napi boundary.
@@ -3250,6 +3292,18 @@ pub struct ImageGenGenerateResultJs {
     pub info: Option<String>,
 }
 
+/// Submit a `txt2img` request to the image-gen sidecar. **Phase 18
+/// Group D Task 21 — prepare/run split.** Same lock-discipline
+/// pattern as [`image_gen_download_model`] / [`ai_download_model`]:
+/// the `SERVICE` `RwLock` reader guard is held only for the brief
+/// [`BridgeService::image_gen_prepare_generate`] step (request
+/// validation + governor policy snapshot + `Arc<ImageGenState>`
+/// clone), then dropped **before** the multi-minute
+/// `ensure_ready` + `transport.generate` phase. Without this split
+/// a single in-flight generate would block every other bridge
+/// writer (`command_apply`, `project_save`, …) for up to 240 s
+/// (60 s cold spawn + 180 s sampling) on the outer N-API
+/// `RwLock<Option<BridgeService>>`.
 #[napi]
 pub async fn image_gen_generate(
     request: ImageGenGenerateRequestJs,
@@ -3265,15 +3319,23 @@ pub async fn image_gen_generate(
             seed: request.seed,
             sampler: request.sampler,
         };
-        with_service_ref_fallible(|svc| svc.image_gen_generate(inner)).map(|r| {
-            ImageGenGenerateResultJs {
-                png_base64: r.png_base64,
-                seed: r.seed,
-                width: r.width,
-                height: r.height,
-                steps: r.steps,
-                info: r.info,
-            }
+        // Step 1: brief lock to validate the request shape, run the
+        // governor policy gate, and clone the `Arc<ImageGenState>`
+        // out of the service. The reader guard returned by
+        // `with_service_ref_fallible` is dropped at the closing `?`.
+        let ctx = with_service_ref_fallible(|svc| svc.image_gen_prepare_generate(inner))?;
+        // Step 2: lock-free run — cold-spawn (60 s) + sampling
+        // (180 s) happens here, but no `BridgeService` lock is held
+        // so concurrent writers run in parallel.
+        let r = BridgeService::run_image_gen_generate(ctx)
+            .map_err(|e| Error::from_reason(e.to_string()))?;
+        Ok(ImageGenGenerateResultJs {
+            png_base64: r.png_base64,
+            seed: r.seed,
+            width: r.width,
+            height: r.height,
+            steps: r.steps,
+            info: r.info,
         })
     })
     .await

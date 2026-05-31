@@ -244,7 +244,11 @@ mod tests {
         let r = ModelRegistry::embedded();
         for tier in ModelTier::all() {
             let d = r.text_tier(tier);
-            assert_eq!(d.filename, tier.filename(), "filename mismatch for {tier:?}");
+            assert_eq!(
+                d.filename,
+                tier.filename(),
+                "filename mismatch for {tier:?}"
+            );
             assert_eq!(
                 d.display_name,
                 tier.display_name(),

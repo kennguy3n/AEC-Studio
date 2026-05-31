@@ -317,6 +317,31 @@ export interface ImageGenModelDescriptor {
 }
 
 /**
+ * Phase 18 Group D Task 20 — a single curated preset offered by the
+ * first-run wizard. Each entry maps to a one-click "pin this
+ * preset" button: pressing it fires
+ * {@link BridgeBackend.imageGenSetDescriptor} with the embedded
+ * descriptor. The `id` is the stable handle the wizard de-duplicates
+ * clicks on; the `displayName` is the human-readable label shown in
+ * the list.
+ *
+ * Sourced from the compile-time-embedded
+ * `crates/aec_ai/data/ai_models.json::image_gen.presets`. The Rust
+ * side widens `size_bytes` to BigInt on the napi boundary; the
+ * `adaptNative` adapter narrows it back to `number` here. Safe for
+ * any preset of size < 2 ** 53 bytes (~9 PB).
+ */
+export interface ImageGenPresetEntry {
+  id: string;
+  displayName: string;
+  filename: string;
+  sizeBytes: number;
+  blake3Hex: string;
+  downloadUrl: string | null;
+  vaeFilename: string | null;
+}
+
+/**
  * Phase 18 Group C — live progress snapshot of an in-flight image-gen
  * model download. Mirrors {@link AiDownloadProgress} but identifies
  * the model by filename rather than tier slug.
@@ -813,6 +838,18 @@ export interface BridgeBackend {
    * mount and after every download / set-descriptor.
    */
   imageGenModelAvailability(): Promise<ImageGenModelAvailability>;
+
+  /**
+   * Phase 18 Group D Task 20 — list curated image-gen presets the
+   * first-run wizard offers as one-click pin buttons. Read off the
+   * compile-time-embedded registry; the wizard renders a manual-
+   * entry form for the empty case.
+   *
+   * Async even though the Rust side is sync because the IPC hop is
+   * the only call shape we expose; the renderer should still treat
+   * this as cheap.
+   */
+  imageGenListPresets(): Promise<ImageGenPresetEntry[]>;
 
   /**
    * Phase 18 Group C — pin the descriptor (URL + BLAKE3 + size) the
@@ -2385,6 +2422,12 @@ interface NativeApi {
   // safely below `Number.MAX_SAFE_INTEGER`.
   image_gen_runtime_status(): Promise<unknown>;
   image_gen_model_availability(): Promise<unknown>;
+  // Phase 18 Group D Task 20 — sync because the underlying
+  // `BridgeService::image_gen_list_presets` is a const-time read
+  // off the embedded registry. Returns an `unknown[]` shaped as
+  // `ImageGenPresetEntryJs` (BigInt `size_bytes` narrowed at the
+  // adapter boundary).
+  image_gen_list_presets(): unknown;
   image_gen_set_descriptor(descriptor: {
     filename: string;
     sizeBytes: bigint;
@@ -2652,6 +2695,10 @@ export const NATIVE_WIRED_METHODS: ReadonlyArray<keyof BridgeBackend> = [
   // transfer) so a multi-minute download cannot wedge the bridge.
   "imageGenRuntimeStatus",
   "imageGenModelAvailability",
+  // Phase 18 Group D Task 20 — wizard preset list. Synchronous on
+  // the Rust side; surfaced async here to match the rest of the
+  // family.
+  "imageGenListPresets",
   "imageGenSetDescriptor",
   "imageGenDownloadModel",
   "imageGenDownloadProgress",
@@ -3546,6 +3593,33 @@ function adaptNative(n: NativeApi): BridgeBackend {
         blake3Hex: r.blake3Hex,
         modelsDir: r.modelsDir,
       };
+    },
+    imageGenListPresets: async () => {
+      // Phase 18 Group D Task 20 — read curated presets from the
+      // embedded `ai_models.json::image_gen.presets`. The Rust side
+      // is synchronous (`#[napi]` fn, no `async`); we wrap the call
+      // here so callers can `await` it uniformly with the other
+      // image-gen async methods. The `size_bytes` field is
+      // BigInt-widened on the napi boundary; narrow once to
+      // `number` here.
+      const r = (await Promise.resolve(n.image_gen_list_presets())) as Array<{
+        id: string;
+        displayName: string;
+        filename: string;
+        sizeBytes: bigint;
+        blake3Hex: string;
+        downloadUrl: string | null;
+        vaeFilename: string | null;
+      }>;
+      return r.map((p) => ({
+        id: p.id,
+        displayName: p.displayName,
+        filename: p.filename,
+        sizeBytes: Number(p.sizeBytes),
+        blake3Hex: p.blake3Hex,
+        downloadUrl: p.downloadUrl,
+        vaeFilename: p.vaeFilename,
+      }));
     },
     imageGenSetDescriptor: async (descriptor) => {
       // Widen `number` → `bigint` once at the boundary so napi-rs's
@@ -4799,6 +4873,15 @@ export function inProcessBackend(): BridgeBackend {
         blake3Hex: "",
         modelsDir: "",
       };
+    },
+    async imageGenListPresets() {
+      // Phase 18 Group D Task 20 — vitest fallback. The embedded
+      // registry ships zero presets in the current build, so the
+      // honest fallback is also `[]`. If a future build ships
+      // curated presets that the renderer's unit tests want to
+      // assert on, the test should mock the bridge directly rather
+      // than calling through this in-process surface.
+      return [];
     },
     async imageGenSetDescriptor(_descriptor) {},
     async imageGenDownloadModel() {

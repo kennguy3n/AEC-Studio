@@ -1715,6 +1715,36 @@ pub struct ImageGenDownloadProgress {
     pub message: Option<String>,
 }
 
+/// Phase 18 Group D Task 20 — a single image-gen preset entry as
+/// surfaced to the renderer's first-run wizard.
+///
+/// The wizard maps each entry to a one-click "pin this preset"
+/// button: pressing it fires `imageGen.setDescriptor(descriptor)`
+/// with the embedded [`ImageGenModelDescriptor`]. The `id` lets the
+/// wizard de-duplicate clicks + correlate analytics-free internal
+/// state without depending on the human-readable display name.
+///
+/// Backed by [`aec_ai::registry::ImageGenPresetDescriptor`]; this is
+/// the JS-facing flattening (`download_url` reshaped to
+/// `Option<String>` matching [`ImageGenModelDescriptor::download_url`],
+/// preset metadata lifted out of the descriptor shape).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageGenPresetEntry {
+    /// Stable preset id from `ai_models.json` (hyphenated lowercase
+    /// by convention; e.g. `"sd-v1-5-q4-0"`). Empty preset arrays
+    /// at the registry layer return an empty `Vec` here.
+    pub id: String,
+    /// Human-readable label rendered as the wizard list-item title.
+    pub display_name: String,
+    /// Descriptor to feed into
+    /// [`BridgeService::image_gen_set_descriptor`] when the user
+    /// picks this preset. Pre-filled with the
+    /// registry's verified BLAKE3 / size / URL so the wizard does
+    /// not need to round-trip those into the bridge — only the
+    /// final "pin" call.
+    pub descriptor: ImageGenModelDescriptor,
+}
+
 /// Successful return of [`BridgeService::image_gen_download_model`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImageGenDownloadResult {
@@ -1760,6 +1790,59 @@ pub struct ImageGenGenerateRequest {
     /// sidecar choose.
     #[serde(default)]
     pub sampler: Option<String>,
+}
+
+/// Phase 18 Group D Task 21 — owned, fully self-contained handle on
+/// an in-flight `txt2img` request. Built by
+/// [`BridgeService::image_gen_prepare_generate`] under a **brief**
+/// process-wide lock, then handed to
+/// [`BridgeService::run_image_gen_generate`] which performs the
+/// (potentially multi-minute) sidecar cold-spawn + sampling
+/// **without** holding any `BridgeService` lock.
+///
+/// Same shape as [`AiDownloadContext`] / [`ImageGenDownloadContext`]:
+/// the napi handler holds the `SERVICE` `RwLock` reader guard only
+/// long enough to clone these owned values, then drops it before
+/// invoking `run_image_gen_generate`. This is what keeps a slow
+/// generate (60 s cold spawn + up to 180 s sampling for high-step /
+/// large-dimension requests) from starving concurrent writers like
+/// `command_apply` / `project_save` on the outer N-API
+/// `RwLock<Option<BridgeService>>`.
+///
+/// `Debug` is hand-rolled: [`crate::image_gen_state::ImageGenState`]
+/// intentionally does not implement `Debug` because its handle slot
+/// owns a `Child` process. The hand-rolled impl prints the request
+/// and spawn budget so test failures and structured logs surface
+/// the generate parameters without exposing the inner state.
+#[derive(Clone)]
+pub struct ImageGenGenerateContext {
+    /// Cloned-out [`ImageGenGenerateRequest`] — all primitive owned
+    /// values, no borrow.
+    pub request: ImageGenGenerateRequest,
+    /// Process-wide image-gen sidecar state shared with
+    /// [`BridgeService::image_gen_state`]. Cloned `Arc` so the
+    /// `BridgeService` lock can be released for the duration of
+    /// `ensure_ready` + `transport.generate`. Note that
+    /// [`crate::image_gen_state::ImageGenState`]'s own locks
+    /// (`handle_slot` + `runtime`) are still respected on the
+    /// inside; this only releases the *outer* `SERVICE` `RwLock`
+    /// read guard.
+    pub image_gen_state: Arc<crate::image_gen_state::ImageGenState>,
+    /// Cold-spawn budget passed to [`crate::image_gen_state::ImageGenState::ensure_ready`].
+    /// Snapshotted from the runtime config + clamped to the
+    /// per-tier load budget under the prepare lock so the actual
+    /// `ensure_ready` call does not need to re-read the policy.
+    pub spawn_timeout: std::time::Duration,
+}
+
+impl std::fmt::Debug for ImageGenGenerateContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImageGenGenerateContext")
+            .field("request", &self.request)
+            .field("image_gen_state", &"<ImageGenState>")
+            .field("spawn_timeout", &self.spawn_timeout)
+            .finish()
+    }
 }
 
 /// Successful return of [`BridgeService::image_gen_generate`].
@@ -6098,6 +6181,40 @@ impl BridgeService {
         })
     }
 
+    /// Phase 18 Group D Task 20 — curated image-gen preset list
+    /// surfaced to the first-run wizard.
+    ///
+    /// Reads directly from the compile-time-embedded
+    /// [`aec_ai::registry::ModelRegistry`] so the wizard, the
+    /// `set_descriptor` validator, and the BLAKE3-pinning
+    /// integrity invariant all reference the same source of truth.
+    /// The returned [`ImageGenPresetEntry`]s are
+    /// [`ImageGenModelDescriptor`]-shaped + a small `id` /
+    /// `display_name` label pair so the wizard can render a one-
+    /// click "pin this preset" button per entry.
+    ///
+    /// The result MAY be empty — that's the intentional ship state
+    /// of `ai_models.json::image_gen.presets`. The wizard renders
+    /// its "no presets curated — paste a HuggingFace URL" manual-
+    /// entry affordance off the empty branch.
+    pub fn image_gen_list_presets(&self) -> Vec<ImageGenPresetEntry> {
+        let r = aec_ai::registry::ModelRegistry::embedded();
+        r.image_gen_presets()
+            .iter()
+            .map(|p| ImageGenPresetEntry {
+                id: p.id.clone(),
+                display_name: p.display_name.clone(),
+                descriptor: ImageGenModelDescriptor {
+                    filename: p.filename.clone(),
+                    blake3_hex: p.blake3_hex.clone(),
+                    size_bytes: p.size_bytes,
+                    download_url: Some(p.download_url.clone()),
+                    vae_filename: p.vae_filename.clone(),
+                },
+            })
+            .collect()
+    }
+
     /// Replace the currently-configured image-gen descriptor and kill
     /// any in-flight sidecar so the next `image_gen_generate` cold-
     /// spawns with the new model. Used by the renderer's first-run
@@ -6347,12 +6464,47 @@ impl BridgeService {
     /// requires this; the sidecar would reject otherwise with a less
     /// readable error), and steps must be in `[1, 150]` (the
     /// stable-diffusion.cpp sampler hard-caps at 150).
+    ///
+    /// **Phase 18 Group D Task 21 — prepare/run split.** This
+    /// convenience entry point calls
+    /// [`Self::image_gen_prepare_generate`] then
+    /// [`Self::run_image_gen_generate`] in sequence and is intended
+    /// for in-process callers (e.g. integration tests). The napi
+    /// handler instead uses the prepare/run split **directly** so
+    /// the `SERVICE` `RwLock` reader guard is dropped before the
+    /// multi-minute spawn + sampling phase — see
+    /// [`crate::napi_api::image_gen_generate`] for the boundary call.
     pub fn image_gen_generate(
         &self,
         request: ImageGenGenerateRequest,
     ) -> Result<ImageGenGenerateResult, BridgeServiceError> {
+        let ctx = self.image_gen_prepare_generate(request)?;
+        Self::run_image_gen_generate(ctx)
+    }
+
+    /// Build an [`ImageGenGenerateContext`] under a brief lock.
+    /// Performs every check that needs in-process bridge state
+    /// (request validation, governor policy gate, model descriptor
+    /// snapshot) so that [`Self::run_image_gen_generate`] can drive
+    /// the (potentially multi-minute) cold-spawn + `/sdapi/v1/txt2img`
+    /// round-trip with **no** `BridgeService` lock held.
+    ///
+    /// Same lock-discipline split as
+    /// [`Self::ai_prepare_download`] / [`Self::image_gen_prepare_download`]:
+    /// the napi handler holds the `SERVICE` `RwLock` reader guard
+    /// only long enough to clone the owned values into the returned
+    /// context, then drops it before invoking the run phase. This
+    /// prevents image generation from starving concurrent writers
+    /// like `command_apply` / `project_save` on the outer N-API
+    /// `RwLock<Option<BridgeService>>`.
+    pub fn image_gen_prepare_generate(
+        &self,
+        request: ImageGenGenerateRequest,
+    ) -> Result<ImageGenGenerateContext, BridgeServiceError> {
         // Local validation — rejects with a readable error before we
-        // pay the spawn cost.
+        // pay the spawn cost. (Hot-path validation stays under the
+        // prepare lock so we never even build a context for a
+        // malformed request.)
         if request.prompt.trim().is_empty() {
             return Err(BridgeServiceError::Invalid(
                 "image_gen_generate: prompt must not be empty".into(),
@@ -6397,6 +6549,14 @@ impl BridgeService {
         // Realtime-preview renders are not gated — they share no
         // contended path-tracer state, so concurrent image-gen is
         // safe even on a low-end laptop.
+        //
+        // NB: the gate must run **under** the prepare lock so its
+        // policy / render-queue snapshot is consistent with the
+        // moment the bridge admitted the request — a later swap of
+        // tier (via `governor_apply_hardware_tier`) cannot retro-
+        // actively invalidate an already-admitted generate. The
+        // policy is snapshot-cloned so the run phase observes the
+        // same `load_budget_secs` that was in effect at admit time.
         let policy = self.image_gen_active_policy()?;
         if !policy.allow_during_pathtraced_render && self.pathtraced_render_in_progress()? {
             return Err(BridgeServiceError::ImageGen(
@@ -6406,13 +6566,40 @@ impl BridgeService {
                     .into(),
             ));
         }
+        // The cold-spawn budget is the smaller of the per-tier
+        // policy load_budget (e.g. Pro = 90 s) and the hard ceiling
+        // (`DEFAULT_IMAGE_GEN_SPAWN_TIMEOUT` = 60 s, defending
+        // against a misconfigured snapshot that pushes the budget
+        // beyond what a healthy sidecar should ever need). Matching
+        // `ImageGenState::ensure_ready`'s own `min` shape so the
+        // run phase does not double-clamp.
+        let spawn_timeout = std::time::Duration::from_secs(policy.load_budget_secs as u64)
+            .min(DEFAULT_IMAGE_GEN_SPAWN_TIMEOUT);
+        Ok(ImageGenGenerateContext {
+            request,
+            image_gen_state: Arc::clone(&self.image_gen_state),
+            spawn_timeout,
+        })
+    }
+
+    /// Drive an image-gen generate to completion. Performs the
+    /// (potentially multi-minute) sidecar cold-spawn + `/sdapi/v1/txt2img`
+    /// round-trip + base64 encode. **Holds no `BridgeService`
+    /// lock** — safe to invoke from a `spawn_blocking` task while
+    /// concurrent writers run in parallel.
+    pub fn run_image_gen_generate(
+        ctx: ImageGenGenerateContext,
+    ) -> Result<ImageGenGenerateResult, BridgeServiceError> {
+        let ImageGenGenerateContext {
+            request,
+            image_gen_state,
+            spawn_timeout,
+        } = ctx;
         // Ensure the runtime config points at the currently-configured
         // model file — `set_descriptor` keeps these in sync, but cover
         // the case where the bridge booted with a pre-populated
         // descriptor (e.g. a future config-file path).
-        let transport: ImageGenTransport = self
-            .image_gen_state
-            .ensure_ready(DEFAULT_IMAGE_GEN_SPAWN_TIMEOUT)?;
+        let transport: ImageGenTransport = image_gen_state.ensure_ready(spawn_timeout)?;
         let mut sd_request =
             ImageGenRequest::new(request.prompt, request.width, request.height, request.steps)
                 .with_cfg_scale(request.cfg_scale);
@@ -10786,14 +10973,13 @@ END-ISO-10303-21;\n";
         };
         s.image_gen_set_descriptor(with_vae).unwrap();
         // Sanity: the VAE landed.
-        assert!(
-            s.image_gen_state
-                .snapshot_config()
-                .unwrap()
-                .spawn_config
-                .vae_path
-                .is_some(),
-        );
+        assert!(s
+            .image_gen_state
+            .snapshot_config()
+            .unwrap()
+            .spawn_config
+            .vae_path
+            .is_some(),);
 
         // Step 2: swap to a descriptor without a VAE. The VAE path
         // must clear.
@@ -10812,12 +10998,82 @@ END-ISO-10303-21;\n";
             "vae_path leaked across descriptor swap: {:?}",
             after.spawn_config.vae_path,
         );
-        assert!(
-            after
-                .spawn_config
-                .model_path
-                .to_string_lossy()
-                .ends_with("sd15-pruned.gguf"),
+        assert!(after
+            .spawn_config
+            .model_path
+            .to_string_lossy()
+            .ends_with("sd15-pruned.gguf"),);
+    }
+
+    #[test]
+    fn image_gen_list_presets_matches_embedded_registry() {
+        // Phase 18 Group D Task 20 — the wizard endpoint must
+        // return entries that round-trip 1:1 with the embedded
+        // `ai_models.json::image_gen.presets`. We assert four
+        // properties simultaneously:
+        //
+        //   1. The length matches the registry.
+        //   2. The ordering matches the registry (the wizard
+        //      surfaces presets in declaration order).
+        //   3. Every preset entry's descriptor is a valid input to
+        //      [`BridgeService::image_gen_set_descriptor`] — i.e.
+        //      it has a non-empty filename and a valid http(s)
+        //      `download_url`. This is what makes the wizard's
+        //      "one-click pin" UX safe.
+        //   4. The BLAKE3 hex, size, and filename pass through
+        //      byte-identical so the integrity-pinning invariant of
+        //      the registry is never weakened by a layer 1
+        //      transformation.
+        let (s, _g) = service();
+        let presets = s.image_gen_list_presets();
+        let registry = aec_ai::registry::ModelRegistry::embedded();
+        let raw = registry.image_gen_presets();
+        assert_eq!(presets.len(), raw.len());
+        for (got, want) in presets.iter().zip(raw.iter()) {
+            assert_eq!(got.id, want.id);
+            assert_eq!(got.display_name, want.display_name);
+            assert_eq!(got.descriptor.filename, want.filename);
+            assert_eq!(got.descriptor.blake3_hex, want.blake3_hex);
+            assert_eq!(got.descriptor.size_bytes, want.size_bytes);
+            assert_eq!(
+                got.descriptor.download_url.as_deref(),
+                Some(want.download_url.as_str()),
+            );
+            assert_eq!(got.descriptor.vae_filename, want.vae_filename);
+            // (3): each descriptor must be a valid set_descriptor
+            // input. We do NOT actually call set_descriptor on it
+            // here because that would mutate the singleton state;
+            // a separate test below exercises the round-trip.
+            assert!(
+                !got.descriptor.filename.is_empty(),
+                "preset has empty filename"
+            );
+            let url = got.descriptor.download_url.as_deref().unwrap_or("");
+            assert!(
+                url.starts_with("https://") || url.starts_with("http://"),
+                "preset {:?} has non-http(s) download_url {:?}",
+                got.id,
+                url,
+            );
+        }
+    }
+
+    #[test]
+    fn image_gen_list_presets_is_empty_in_current_ship() {
+        // Defensive: the current ship intentionally curates zero
+        // image-gen presets (see `$doc` in
+        // `crates/aec_ai/data/ai_models.json`). If a future PR
+        // adds a preset without auditing the BLAKE3 / size / URL,
+        // this assertion fires and the contributor is forced to
+        // either (a) update this test with the new count + a doc
+        // comment pointing at the verification evidence, or (b)
+        // walk back the unverified addition. The test serves as a
+        // commit-time tripwire on the integrity invariant.
+        let (s, _g) = service();
+        assert_eq!(
+            s.image_gen_list_presets().len(),
+            0,
+            "image-gen preset added without updating the integrity-pin tripwire test",
         );
     }
 
@@ -10972,6 +11228,179 @@ END-ISO-10303-21;\n";
         assert!(
             !msg.contains("paused while a path-traced render"),
             "Pro tier must bypass the gate; got gate error: {msg}",
+        );
+    }
+
+    #[test]
+    fn image_gen_prepare_generate_validates_request_under_lock() {
+        // Phase 18 Group D Task 21 — request-shape validation must
+        // happen in the prepare phase (under the SERVICE lock) so a
+        // malformed request never reaches the lock-free run phase
+        // and never gets a chance to allocate / spawn / sample. Pin
+        // every validator that the run phase relies on:
+        //
+        //   * empty prompt
+        //   * non-multiple-of-8 dimension
+        //   * out-of-range dimension
+        //   * out-of-range steps
+        //   * non-finite / out-of-range cfg_scale
+        //
+        // Each case must return `BridgeServiceError::Invalid` (NOT
+        // `ImageGen`) so the renderer can render a per-field
+        // validation banner instead of the sidecar-failed banner.
+        let (s, _g) = service();
+        let good = ImageGenGenerateRequest {
+            prompt: "a teapot".into(),
+            negative_prompt: None,
+            width: 64,
+            height: 64,
+            steps: 1,
+            cfg_scale: 7.0,
+            seed: None,
+            sampler: None,
+        };
+        // Empty prompt.
+        let mut bad = good.clone();
+        bad.prompt = "   ".into();
+        assert!(matches!(
+            s.image_gen_prepare_generate(bad).unwrap_err(),
+            BridgeServiceError::Invalid(_)
+        ));
+        // Non-multiple-of-8 width.
+        let mut bad = good.clone();
+        bad.width = 65;
+        assert!(matches!(
+            s.image_gen_prepare_generate(bad).unwrap_err(),
+            BridgeServiceError::Invalid(_)
+        ));
+        // Below-range dimension.
+        let mut bad = good.clone();
+        bad.height = 32;
+        assert!(matches!(
+            s.image_gen_prepare_generate(bad).unwrap_err(),
+            BridgeServiceError::Invalid(_)
+        ));
+        // Above-range dimension.
+        let mut bad = good.clone();
+        bad.height = 4096;
+        assert!(matches!(
+            s.image_gen_prepare_generate(bad).unwrap_err(),
+            BridgeServiceError::Invalid(_)
+        ));
+        // Out-of-range steps.
+        let mut bad = good.clone();
+        bad.steps = 0;
+        assert!(matches!(
+            s.image_gen_prepare_generate(bad).unwrap_err(),
+            BridgeServiceError::Invalid(_)
+        ));
+        let mut bad = good.clone();
+        bad.steps = 200;
+        assert!(matches!(
+            s.image_gen_prepare_generate(bad).unwrap_err(),
+            BridgeServiceError::Invalid(_)
+        ));
+        // Non-finite cfg_scale.
+        let mut bad = good.clone();
+        bad.cfg_scale = f32::NAN;
+        assert!(matches!(
+            s.image_gen_prepare_generate(bad).unwrap_err(),
+            BridgeServiceError::Invalid(_)
+        ));
+        let mut bad = good.clone();
+        bad.cfg_scale = f32::INFINITY;
+        assert!(matches!(
+            s.image_gen_prepare_generate(bad).unwrap_err(),
+            BridgeServiceError::Invalid(_)
+        ));
+        // Out-of-range cfg_scale.
+        let mut bad = good.clone();
+        bad.cfg_scale = 100.0;
+        assert!(matches!(
+            s.image_gen_prepare_generate(bad).unwrap_err(),
+            BridgeServiceError::Invalid(_)
+        ));
+    }
+
+    #[test]
+    fn image_gen_prepare_generate_returns_context_with_cloned_state_arc() {
+        // Phase 18 Group D Task 21 — the prepare phase must return
+        // an owned `ImageGenGenerateContext` whose
+        // `image_gen_state` field points at the **same**
+        // `ImageGenState` that the BridgeService owns. This is the
+        // property the napi handler relies on: it drops the SERVICE
+        // RwLock reader guard, then drives the sidecar against the
+        // same long-lived `Arc<ImageGenState>` (so a concurrent
+        // `image_gen_apply_policy` / `image_gen_set_descriptor`
+        // running in parallel observes the same state).
+        //
+        // We pin the pointer equality directly via `Arc::ptr_eq`.
+        // This is the smoking-gun assertion that fails if anyone
+        // ever rebuilds a fresh `ImageGenState` inside the prepare
+        // phase (which would silently regress the lock-discipline
+        // fix).
+        let (s, _g) = service();
+        let req = ImageGenGenerateRequest {
+            prompt: "anything".into(),
+            negative_prompt: None,
+            width: 64,
+            height: 64,
+            steps: 1,
+            cfg_scale: 7.0,
+            seed: None,
+            sampler: None,
+        };
+        let ctx = s.image_gen_prepare_generate(req.clone()).unwrap();
+        assert!(
+            Arc::ptr_eq(&ctx.image_gen_state, &s.image_gen_state),
+            "prepare must clone the SAME Arc<ImageGenState> the service owns",
+        );
+        // Spawn timeout must be > 0 and bounded by the per-tier
+        // load_budget AND the hard ceiling. The Medium-tier default
+        // load_budget is 60 s, which equals
+        // DEFAULT_IMAGE_GEN_SPAWN_TIMEOUT — so the min collapses to
+        // 60 s in the default-boot config.
+        assert!(
+            ctx.spawn_timeout.as_secs() > 0,
+            "spawn_timeout must be positive",
+        );
+        assert!(
+            ctx.spawn_timeout <= DEFAULT_IMAGE_GEN_SPAWN_TIMEOUT,
+            "spawn_timeout must not exceed the hard ceiling",
+        );
+        // Request must round-trip byte-identically through the
+        // context so the run phase observes the user's submitted
+        // parameters and not the validated-but-modified copy.
+        assert_eq!(ctx.request, req);
+    }
+
+    #[test]
+    fn image_gen_prepare_generate_does_not_call_ensure_ready() {
+        // Phase 18 Group D Task 21 — the prepare phase MUST NOT
+        // attempt to spawn the sidecar; that is the run phase's
+        // job. We can't observe "did spawn happen" directly without
+        // a mock, but we can pin the necessary contract: prepare
+        // returns successfully even when there's no `sd-server` on
+        // PATH (the spawn would fail). If a future refactor
+        // accidentally moves `ensure_ready` into the prepare phase,
+        // this test fires with a sidecar-spawn error instead of an
+        // `Ok(_)` context.
+        let (s, _g) = service();
+        let req = ImageGenGenerateRequest {
+            prompt: "trip the wire".into(),
+            negative_prompt: None,
+            width: 64,
+            height: 64,
+            steps: 1,
+            cfg_scale: 7.0,
+            seed: None,
+            sampler: None,
+        };
+        let result = s.image_gen_prepare_generate(req);
+        assert!(
+            result.is_ok(),
+            "prepare must succeed without a real sidecar; got {:?}",
+            result.err(),
         );
     }
 }
