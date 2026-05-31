@@ -656,20 +656,36 @@ export function ImageGenPanel(): JSX.Element {
             )}
           </div>
           <div className="settings-models-row__actions">
-            {!availability.available && (
-              <button
-                type="button"
-                data-testid="settings-image-gen-download"
-                disabled={downloading}
-                onClick={() => void onDownload()}
-              >
-                {progress?.state === "downloading"
-                  ? "Downloading…"
-                  : progress?.state === "verifying"
-                    ? "Verifying…"
-                    : "Download"}
-              </button>
-            )}
+            {!availability.available &&
+              (availability.downloadUrl !== null ? (
+                <button
+                  type="button"
+                  data-testid="settings-image-gen-download"
+                  disabled={downloading}
+                  onClick={() => void onDownload()}
+                >
+                  {progress?.state === "downloading"
+                    ? "Downloading…"
+                    : progress?.state === "verifying"
+                      ? "Verifying…"
+                      : "Download"}
+                </button>
+              ) : (
+                // Side-loaded descriptor — no `downloadUrl` configured.
+                // Hiding the Download button here is defense-in-depth:
+                // the Rust side `image_gen_download_model` returns
+                // `NoDownloadUrl` for this case (the failure banner
+                // surfaces it), but a button you can press that always
+                // fails is bad UX. The hint below tells the user what
+                // to do instead (drop the GGUF into the configured
+                // model dir at the path shown in the row metadata).
+                <span
+                  data-testid="settings-image-gen-no-download-url"
+                  className="settings-models-row__hint"
+                >
+                  Side-loaded — place the file at the path above.
+                </span>
+              ))}
           </div>
         </div>
       )}

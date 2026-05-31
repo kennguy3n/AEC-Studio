@@ -101,28 +101,6 @@ pub struct ImageGenModelDescriptor {
     pub vae_filename: Option<String>,
 }
 
-/// Default image-gen model descriptor.
-///
-/// Phase 18 Group C ships an empty `download_url`: the bridge
-/// surface, runtime, and renderer are all live and exercised by
-/// tests, but the actual remote model URL is deferred to Group D
-/// alongside the canonical small-SD-GGUF + bundled binary. Until
-/// then the user side-loads a `.gguf` into `<models_dir>/` and the
-/// runtime picks it up by filename.
-///
-/// `filename` and `blake3_hex` are placeholders that Group D will
-/// replace with the canonical small-SD-GGUF entries. They are
-/// deliberately non-empty so callers can exercise the
-/// "file present + size matches" availability check end-to-end
-/// against a side-loaded model.
-pub const DEFAULT_IMAGE_GEN_MODEL: ImageGenModelDescriptor = ImageGenModelDescriptor {
-    filename: String::new(),
-    blake3_hex: String::new(),
-    size_bytes: 0,
-    download_url: None,
-    vae_filename: None,
-};
-
 /// Manages the image-gen model file on disk.
 #[derive(Debug, Clone)]
 pub struct ImageGenModelManager {
@@ -141,7 +119,8 @@ impl ImageGenModelManager {
         }
     }
 
-    /// Build a manager seeded with [`DEFAULT_IMAGE_GEN_MODEL`].
+    /// Build a manager seeded with the empty default descriptor.
+    /// See [`default_image_gen_descriptor`] for the seed shape.
     pub fn with_default_descriptor(models_dir: PathBuf) -> Self {
         Self::new(models_dir, default_image_gen_descriptor())
     }
@@ -363,9 +342,15 @@ impl ImageGenModelManager {
     }
 }
 
-/// Cloneable default — we can't `const` the descriptor because
-/// `Option<String>` etc. are non-const, so this is the runtime
-/// alternative. Equivalent to [`DEFAULT_IMAGE_GEN_MODEL`].
+/// Empty seed descriptor for first-run / side-load workflows.
+///
+/// `filename` and `blake3_hex` are intentionally empty so the
+/// availability check ("file present + size matches") fails closed
+/// until the user pins a real descriptor through the first-run
+/// wizard or `image_gen_set_descriptor`. Returning a fresh value
+/// each call keeps the function cheap (`String::new()` is
+/// zero-alloc) and avoids any temptation to mutate a shared
+/// `static`.
 pub fn default_image_gen_descriptor() -> ImageGenModelDescriptor {
     ImageGenModelDescriptor {
         filename: String::new(),

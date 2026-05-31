@@ -157,6 +157,35 @@ describe("ImageGenPanel", () => {
     ).toBeInTheDocument();
   });
 
+  // Devin Review round 6 INFO: when a user pins a descriptor without
+  // a `downloadUrl` (e.g. side-loading a GGUF that's not on a HF-
+  // allow-listed host), the bridge returns `NoDownloadUrl` from
+  // `image_gen_download_model`. The button used to render anyway and
+  // surface a failure banner on click — bad UX. Now the row shows a
+  // "side-loaded" hint instead and the button is suppressed entirely.
+  // This pin is the architecturally-correct fix: the renderer never
+  // offers an action it knows the bridge will reject.
+  it("hides the Download button and shows side-loaded hint when downloadUrl is null", async () => {
+    vi.spyOn(aec.imageGen, "modelAvailability").mockResolvedValue({
+      ...availability({ available: false, hasDescriptor: true }),
+      downloadUrl: null,
+    });
+    vi.spyOn(aec.imageGen, "runtimeStatus").mockResolvedValue({
+      state: "idle",
+      lastError: null,
+    });
+
+    render(<ImageGenPanel />);
+    await waitFor(() => {
+      expect(
+        screen.getByTestId("settings-image-gen-no-download-url"),
+      ).toBeInTheDocument();
+    });
+    expect(
+      screen.queryByTestId("settings-image-gen-download"),
+    ).not.toBeInTheDocument();
+  });
+
   it("calls aec.imageGen.downloadModel and surfaces progress + completion", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
 

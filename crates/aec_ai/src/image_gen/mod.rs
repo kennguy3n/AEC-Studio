@@ -18,8 +18,8 @@
 //!     native binary. The bridge surface here is deliberately
 //!     model-agnostic — when a native bonsai-image server ships, swap
 //!     the binary via [`IMAGE_GEN_BIN_ENV`] and the default model
-//!     descriptor via [`model_manager::DEFAULT_IMAGE_GEN_MODEL`], and
-//!     nothing else in the bridge / renderer / governor needs to
+//!     descriptor via [`model_manager::default_image_gen_descriptor`],
+//!     and nothing else in the bridge / renderer / governor needs to
 //!     change.
 //!   * **Idle unload.** Image models are large (1–5 GiB on disk, 2–10
 //!     GiB resident). The runtime's idle-unload timer (default 120 s)
@@ -32,8 +32,8 @@ pub mod sidecar;
 pub mod transport;
 
 pub use model_manager::{
-    ImageGenModelDescriptor, ImageGenModelManager, ImageGenModelManagerError,
-    DEFAULT_IMAGE_GEN_MODEL,
+    default_image_gen_descriptor, ImageGenModelDescriptor, ImageGenModelManager,
+    ImageGenModelManagerError,
 };
 pub use runtime::{ImageGenRuntime, ImageGenRuntimeError, ImageGenRuntimeState};
 pub use sidecar::{
